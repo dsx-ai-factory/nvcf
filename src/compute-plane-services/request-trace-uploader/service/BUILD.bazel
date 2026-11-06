@@ -26,6 +26,7 @@ go_test(
         "capture_test.go",
         "loadenv_test.go",
         "service_test.go",
+        "settings_e2e_test.go",
         "suppression_e2e_test.go",
         "uploader_guard_test.go",
     ],
