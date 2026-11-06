@@ -83,6 +83,9 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	}
 	metrics = telemetry.Safe(metrics)
 	telemetry.Preset(metrics)
+	if receiver, ok := client.(telemetry.Receiver); ok {
+		receiver.UseMetrics(metrics)
+	}
 	rules.preset(metrics)
 	threshold := opts.HeaderCheckRecords
 	if threshold <= 0 {
@@ -250,6 +253,11 @@ func (u *Uploader) export(ctx context.Context, item segment.Segment) error {
 		return backendError("read backend status", u.client, err)
 	}
 	slog.Info("submitted request trace segment", "segment", item.Index, "records", result.Written, "status", status)
+	switch status {
+	case backend.StatusPending, backend.StatusSucceeded, backend.StatusFailed, backend.StatusNotFound:
+	default:
+		u.metrics.Add(telemetry.JobStatusUnknown, 1, nil)
+	}
 	if status != backend.StatusSucceeded {
 		return nil
 	}
