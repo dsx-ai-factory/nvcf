@@ -25,7 +25,7 @@ const (
 	EnvStateDir             = "REQUEST_TRACE_UPLOADER_STATE_DIR"
 	EnvQuarantineDir        = "REQUEST_TRACE_UPLOADER_QUARANTINE_DIR"
 	EnvHealthAddr           = "HEALTH_ADDR"
-	EnvScanInterval         = "REQUEST_TRACE_UPLOADER_SCAN_INTERVAL_SECONDS"
+	EnvScanInterval         = "REQUEST_TRACE_UPLOADER_SCAN_INTERVAL"
 	EnvKratosStatusInterval = "REQUEST_TRACE_UPLOADER_KRATOS_STATUS_INTERVAL_SECONDS"
 	EnvKratosStatusTimeout  = "REQUEST_TRACE_UPLOADER_KRATOS_STATUS_TIMEOUT_SECONDS"
 	EnvAttemptTimeout       = "REQUEST_TRACE_UPLOADER_ATTEMPT_TIMEOUT"
@@ -110,6 +110,24 @@ type Config struct {
 	// Suppression is the validated suppression rule list. No rules turns
 	// suppression off.
 	Suppression suppress.Config
+	// AuditPrefix names a second segment family to upload, or is empty.
+	AuditPrefix string
+	// SkipRedaction turns redaction of inline media off. The zero value
+	// redacts, so a Config built by hand never exports media by accident.
+	SkipRedaction bool
+	// DrainTimeout bounds the shutdown drain after SIGTERM.
+	DrainTimeout time.Duration
+	// MaxJobAge is how long a submitted job may stay unfinished before it
+	// is reported stranded.
+	MaxJobAge time.Duration
+	// StatusInterval is how often every open job is polled.
+	StatusInterval time.Duration
+	// QuarantineTrip is how many segments quarantined in a row stop intake.
+	// Zero, as in a Config built by hand, uses the fault handling default.
+	QuarantineTrip int
+	// QuarantineResume is how long intake stays stopped after a trip before
+	// it reads new segments again. Zero uses the fault handling default.
+	QuarantineResume time.Duration
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -196,7 +214,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		return Config{}, nil, fmt.Errorf("%s must not be empty", EnvHealthAddr)
 	}
 
-	scanInterval := durationSeconds(lookup, EnvScanInterval, DefaultScanInterval, time.Second, 24*time.Hour, &warnings)
+	scanInterval := duration(lookup, EnvScanInterval, DefaultScanInterval, time.Second, 24*time.Hour, &warnings)
 	statusInterval := durationSeconds(lookup, EnvKratosStatusInterval, DefaultStatusInterval, time.Second, time.Hour, &warnings)
 	statusTimeout := durationSeconds(lookup, EnvKratosStatusTimeout, DefaultStatusTimeout, time.Second, 24*time.Hour, &warnings)
 	if statusTimeout < statusInterval {
@@ -235,6 +253,34 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	auditPrefix, err := auditPrefixValue(lookup, segmentPrefix)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	redactMultimodal, err := strictBool(lookup, EnvRedactMultimodal, true)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	drainTimeout, err := strictDuration(lookup, EnvDrainTimeout, DefaultDrainTimeout, 0, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	maxJobAge, err := strictDuration(lookup, EnvMaxJobAge, DefaultMaxJobAge, time.Minute, 7*24*time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	pollInterval, err := strictDuration(lookup, EnvStatusInterval, DefaultPollInterval, time.Second, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	quarantineTrip, err := strictInt(lookup, EnvQuarantineTrip, DefaultQuarantineTrip, 1, maxQuarantineTrip)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	quarantineResume, err := strictDuration(lookup, EnvQuarantineResume, DefaultQuarantineResume, time.Minute, 24*time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -260,6 +306,14 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		ObjectStore:    objectStore,
 		DebugVerbosity: debugVerbosity,
 		Suppression:    suppression,
+		AuditPrefix:    auditPrefix,
+		SkipRedaction:  !redactMultimodal,
+		DrainTimeout:   drainTimeout,
+		MaxJobAge:      maxJobAge,
+		StatusInterval: pollInterval,
+
+		QuarantineTrip:   quarantineTrip,
+		QuarantineResume: quarantineResume,
 	}, warnings, nil
 }
 
