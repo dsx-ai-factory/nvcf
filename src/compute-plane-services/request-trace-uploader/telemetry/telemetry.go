@@ -91,6 +91,9 @@ const (
 	// RecordsIncomplete counts payload records whose source says
 	// payload_complete is false.
 	RecordsIncomplete = "records_incomplete"
+	// JobStatusUnknown counts job status reads that returned a job status
+	// the core does not know. The job is not treated as finished.
+	JobStatusUnknown = "job_status_unknown"
 )
 
 // Labels are the attributes of one observation, without BackendLabel.
@@ -166,6 +169,7 @@ var catalog = []Instrument{
 		Values: map[string][]string{"action": SuppressionActions}},
 	{Name: SuppressionHeaderPresent, Kind: Counter, Unit: "1", Labels: []string{"rule"}},
 	{Name: RecordsIncomplete, Kind: Counter, Unit: "1", Labels: []string{"record_type"}, Values: payloadRecords},
+	{Name: JobStatusUnknown, Kind: Counter, Unit: "1"},
 }
 
 var byName = func() map[string]Instrument {
@@ -301,4 +305,13 @@ func seriesKey(labels Labels) string {
 		key += k + "=" + labels[k] + ","
 	}
 	return key
+}
+
+// Receiver is implemented by a component, such as a backend, that records
+// its own observations. The service hands it the shared recorder, wrapped by
+// Safe, so its series carry the same backend label and limits as the core's.
+// The instrument catalog is closed: Validate rejects any other name, so a
+// component can record only the core's instruments.
+type Receiver interface {
+	UseMetrics(Metrics)
 }

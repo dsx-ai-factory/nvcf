@@ -320,3 +320,31 @@ func TestAQuarantinedSegmentMovesToTheQuarantineDir(t *testing.T) {
 		t.Fatalf("quarantined copy: %v", err)
 	}
 }
+
+// A status the core does not know is counted, and the segment is not
+// treated as exported.
+func TestAnUnknownJobStatusIsCounted(t *testing.T) {
+	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
+	closed := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("a", 1)).Bytes())
+	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
+	fake := resubmitSafeFake()
+	fake.Script(backendtest.SubmitStep{Statuses: []backendtest.StatusStep{{Status: "weird_new_state"}}})
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader, err := service.NewUploader(cfg, fake, service.Options{Metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := metrics.Value(telemetry.JobStatusUnknown, nil); got != 1 {
+		t.Fatalf("job_status_unknown = %v, want 1", got)
+	}
+	if _, err := os.Stat(closed); err != nil {
+		t.Fatalf("source after an unknown status: %v, want it kept", err)
+	}
+}
