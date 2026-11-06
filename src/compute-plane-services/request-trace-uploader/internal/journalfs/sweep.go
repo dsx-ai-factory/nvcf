@@ -29,7 +29,7 @@ func (s *Store) Sweep() (int, error) {
 		if seg.State != journal.StateDone || seg.DoneAt.After(cutoff) {
 			continue
 		}
-		if err := removeDurably(filepath.Join(s.layout.segments(), segmentFileName(seg.Name, seg.ID))); err != nil {
+		if err := removeDurably(s.hooks, filepath.Join(s.layout.segments(), segmentFileName(seg.Name, seg.ID))); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -49,7 +49,7 @@ func (s *Store) Sweep() (int, error) {
 		if !terminalBatch(b.State) || referenced[id] || b.UpdatedAt.After(cutoff) {
 			continue
 		}
-		if err := removeDurably(filepath.Join(s.layout.batches(), batchFileName(id))); err != nil {
+		if err := removeDurably(s.hooks, filepath.Join(s.layout.batches(), batchFileName(id))); err != nil {
 			errs = append(errs, err)
 			continue
 		}

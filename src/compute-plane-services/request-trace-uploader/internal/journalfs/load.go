@@ -33,7 +33,7 @@ func (s *Store) loadSegments() error {
 		file := entry.Name()
 		path := filepath.Join(s.layout.segments(), file)
 		if strings.HasSuffix(file, tmpExt) {
-			if err := removeDurably(path); err != nil {
+			if err := removeDurably(s.hooks, path); err != nil {
 				return err
 			}
 			continue
@@ -86,7 +86,7 @@ func (s *Store) loadBatches() error {
 		file := entry.Name()
 		path := filepath.Join(s.layout.batches(), file)
 		if strings.HasSuffix(file, tmpExt) {
-			if err := removeDurably(path); err != nil {
+			if err := removeDurably(s.hooks, path); err != nil {
 				return err
 			}
 			continue
