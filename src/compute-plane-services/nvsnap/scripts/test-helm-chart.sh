@@ -154,7 +154,7 @@ fi
 LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
   --set-string 'server.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internal') \
   || fail "a LoadBalancer nvsnap-server with annotations should render"
-grep -q 'service.beta.kubernetes.io/aws-load-balancer-scheme: internal' <<<"$LB" \
+grep -q 'service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"' <<<"$LB" \
   || fail "server.service.annotations not rendered on the nvsnap-server Service"
 # Each entry is one or more comma-separated annotations that together do
 # not make the load balancer internal: unrelated, external, misspelled
