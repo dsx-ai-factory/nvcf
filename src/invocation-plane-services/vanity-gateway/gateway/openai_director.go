@@ -74,6 +74,8 @@ type ModelDirector struct {
 	embeddings         ModelMapping
 	responses          ModelMapping
 	messages           ModelMapping
+	decisions          ModelMapping
+	systemOne          ModelMapping
 	imageGenerations   ModelMapping
 	imageEdits         ModelMapping
 	imageVariations    ModelMapping
@@ -83,6 +85,13 @@ type ModelDirector struct {
 	shadower           *TrafficShadower
 	shadowRandomBucket func() int
 	shadowBodyRewriter func(body []byte, modelName string) ([]byte, error)
+
+	// Private models are listed only for callers whose API key may access the
+	// function version they route to. privateModels is nil when private model
+	// listing is disabled.
+	privateIndex  privateModelIndex
+	privateModels *privateModelAccess
+	sections      []endpointModelMapping // every model section with its path, in listing order
 
 	// Cache for filtered models
 	filteredModelsCache        []ModelInfo
@@ -140,8 +149,9 @@ type shadowConfig struct {
 }
 
 type ModelMapping struct {
-	modelNameToNVCFUrl   map[string]FunctionInfo
-	modelNameToModelInfo map[string]ModelInfo // only contains public models
+	modelNameToNVCFUrl          map[string]FunctionInfo
+	modelNameToModelInfo        map[string]ModelInfo // only contains public models
+	privateModelNameToModelInfo map[string]ModelInfo
 }
 
 type ModelInfo struct {
@@ -282,6 +292,7 @@ func buildModelMapping(
 	privateModelMatcher *regexp.Regexp) (ModelMapping, error) {
 
 	modelNameToModelInfo := make(map[string]ModelInfo, len(modelNameToFunctionIdVersionId))
+	privateModelNameToModelInfo := make(map[string]ModelInfo)
 	modelNameToNVCFUrl := make(map[string]FunctionInfo, len(modelNameToFunctionIdVersionId))
 	// build the mapping for models to nvcf pexec url
 	for modelName, entry := range modelNameToFunctionIdVersionId {
@@ -311,17 +322,75 @@ func buildModelMapping(
 		}
 
 		// build the modelInfo list and modelName to modelInfo map
-		if !privateModelMatcher.MatchString(modelName) {
-			modelInfo := ModelInfo{
-				Id:      modelName,
-				Object:  "model",
-				Created: 735790403, // filler (year NVIDIA was founded)
-				OwnedBy: strings.Split(modelName, "/")[0],
-			}
+		modelInfo := ModelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 735790403, // filler (year NVIDIA was founded)
+			OwnedBy: strings.Split(modelName, "/")[0],
+		}
+		if publicModelName != "" {
 			modelNameToModelInfo[modelName] = modelInfo
+		} else {
+			privateModelNameToModelInfo[modelName] = modelInfo
 		}
 	}
-	return ModelMapping{modelNameToNVCFUrl, modelNameToModelInfo}, nil
+	return ModelMapping{
+		modelNameToNVCFUrl:          modelNameToNVCFUrl,
+		modelNameToModelInfo:        modelNameToModelInfo,
+		privateModelNameToModelInfo: privateModelNameToModelInfo,
+	}, nil
+}
+
+type endpointModelMapping struct {
+	path    string
+	mapping ModelMapping
+}
+
+// listModelInfos merges one model list across all endpoint sections, dedups by
+// model ID, attaches configured metadata, and sorts alphabetically. Aliases
+// that support a native protocol (Messages, decisions or System One) are
+// annotated so shared discovery does not imply that such a model accepts
+// OpenAI chat requests. Each endpoint map gets the merged entry back so
+// single-model lookups match the list.
+func listModelInfos(endpoints []endpointModelMapping, native []ModelMapping, metadata map[string]map[string]stdjson.RawMessage, models func(ModelMapping) map[string]ModelInfo) []ModelInfo {
+	seen := make(map[string]ModelInfo)
+	for _, endpoint := range endpoints {
+		for id, info := range models(endpoint.mapping) {
+			seen[id] = info
+		}
+	}
+	nativeIDs := make(map[string]struct{})
+	for _, mapping := range native {
+		for id := range models(mapping) {
+			nativeIDs[id] = struct{}{}
+		}
+	}
+	for id := range nativeIDs {
+		info := seen[id]
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				info.SupportedEndpoints = append(info.SupportedEndpoints, endpoint.path)
+			}
+		}
+		seen[id] = info
+	}
+	for id, info := range seen {
+		info.modelInfoFields = metadata[id]
+		seen[id] = info
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				models(endpoint.mapping)[id] = info
+			}
+		}
+	}
+	return sortModels(maps.Values(seen))
+}
+
+func sortModels(models []ModelInfo) []ModelInfo {
+	slices.SortFunc(models, func(a, b ModelInfo) int {
+		return cmp.Compare(a.Id, b.Id)
+	})
+	return models
 }
 
 func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*ModelDirector, error) {
@@ -350,6 +419,16 @@ func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp
 		return nil, err
 	}
 
+	decisions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Decisions, "openai.decisions"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	systemOne, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.TypeSafeSystemOne, "typesafeSystemOne"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
 	imageGenerations, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageGenerations, "openai.imageGenerations"), privateModelMatcher)
 	if err != nil {
 		return nil, err
@@ -365,76 +444,31 @@ func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp
 		return nil, err
 	}
 
-	// Merge model lists across all endpoint sections, dedup by model ID, sort alphabetically
-	seen := make(map[string]ModelInfo)
-	for _, models := range []map[string]ModelInfo{
-		chatCompletions.modelNameToModelInfo,
-		completions.modelNameToModelInfo,
-		embeddings.modelNameToModelInfo,
-		responses.modelNameToModelInfo,
-		messages.modelNameToModelInfo,
-		imageGenerations.modelNameToModelInfo,
-		imageEdits.modelNameToModelInfo,
-		imageVariations.modelNameToModelInfo,
-	} {
-		for id, info := range models {
-			seen[id] = info
-		}
+	endpoints := []endpointModelMapping{
+		{"/v1/chat/completions", chatCompletions},
+		{"/v1/completions", completions},
+		{"/v1/embeddings", embeddings},
+		{"/v1/responses", responses},
+		{"/v1/messages", messages},
+		{decisionsPath, decisions},
+		{systemOnePath, systemOne},
+		{"/v1/images/generations", imageGenerations},
+		{"/v1/images/edits", imageEdits},
+		{"/v1/images/variations", imageVariations},
 	}
-	// Annotate aliases that support Messages so shared discovery does not
-	// imply that a Messages-only model accepts OpenAI requests.
-	for id := range messages.modelNameToModelInfo {
-		info := seen[id]
-		for _, endpoint := range []struct {
-			path   string
-			models map[string]ModelInfo
-		}{
-			{"/v1/chat/completions", chatCompletions.modelNameToModelInfo},
-			{"/v1/completions", completions.modelNameToModelInfo},
-			{"/v1/embeddings", embeddings.modelNameToModelInfo},
-			{"/v1/responses", responses.modelNameToModelInfo},
-			{"/v1/messages", messages.modelNameToModelInfo},
-			{"/v1/images/generations", imageGenerations.modelNameToModelInfo},
-			{"/v1/images/edits", imageEdits.modelNameToModelInfo},
-			{"/v1/images/variations", imageVariations.modelNameToModelInfo},
-		} {
-			if _, ok := endpoint.models[id]; ok {
-				info.SupportedEndpoints = append(info.SupportedEndpoints, endpoint.path)
-			}
-		}
-		seen[id] = info
-		for _, models := range []map[string]ModelInfo{chatCompletions.modelNameToModelInfo, completions.modelNameToModelInfo, embeddings.modelNameToModelInfo, responses.modelNameToModelInfo, messages.modelNameToModelInfo, imageGenerations.modelNameToModelInfo, imageEdits.modelNameToModelInfo, imageVariations.modelNameToModelInfo} {
-			if _, ok := models[id]; ok {
-				models[id] = info
-			}
-		}
-	}
+	native := []ModelMapping{messages, decisions, systemOne}
 	metadata := mapping.ModelInfoFieldsByName()
-	for id, info := range seen {
-		info.modelInfoFields = metadata[id]
-		seen[id] = info
-		for _, models := range []map[string]ModelInfo{
-			chatCompletions.modelNameToModelInfo, completions.modelNameToModelInfo,
-			embeddings.modelNameToModelInfo, responses.modelNameToModelInfo,
-			imageGenerations.modelNameToModelInfo, imageEdits.modelNameToModelInfo,
-			imageVariations.modelNameToModelInfo, messages.modelNameToModelInfo,
-		} {
-			if _, ok := models[id]; ok {
-				models[id] = info
-			}
-		}
-	}
-	allModels := maps.Values(seen)
-	slices.SortFunc(allModels, func(a, b ModelInfo) int {
-		return cmp.Compare(a.Id, b.Id)
-	})
+	allModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.modelNameToModelInfo })
+	allPrivateModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.privateModelNameToModelInfo })
 
-	return &ModelDirector{
+	d := &ModelDirector{
 		chatCompletions:    chatCompletions,
 		completions:        completions,
 		embeddings:         embeddings,
 		responses:          responses,
 		messages:           messages,
+		decisions:          decisions,
+		systemOne:          systemOne,
 		imageGenerations:   imageGenerations,
 		imageEdits:         imageEdits,
 		imageVariations:    imageVariations,
@@ -442,7 +476,10 @@ func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp
 		vanityDirector:     vanityDirector,
 		llmGatewayDirector: llmGatewayDirector,
 		shadower:           shadower,
-	}, nil
+	}
+	d.sections = endpoints
+	d.privateIndex = indexPrivateModels(allPrivateModels, d.allMappings()...)
+	return d, nil
 }
 
 // filterExpiredModels returns a new slice with expired models removed
@@ -489,20 +526,26 @@ func (d *ModelDirector) getFilteredModels() []ModelInfo {
 	}
 
 	// Compute filtered models
-	d.filteredModelsCache = filterExpiredModels(
-		d.allPublicModels,
+	d.filteredModelsCache = filterExpiredModels(d.allPublicModels, d.allMappings()...)
+	d.filteredModelsLastComputed = time.Now()
+
+	return d.filteredModelsCache
+}
+
+// allMappings returns the model routes of every endpoint section.
+func (d *ModelDirector) allMappings() []map[string]FunctionInfo {
+	return []map[string]FunctionInfo{
 		d.chatCompletions.modelNameToNVCFUrl,
 		d.completions.modelNameToNVCFUrl,
 		d.embeddings.modelNameToNVCFUrl,
 		d.responses.modelNameToNVCFUrl,
 		d.messages.modelNameToNVCFUrl,
+		d.decisions.modelNameToNVCFUrl,
+		d.systemOne.modelNameToNVCFUrl,
 		d.imageGenerations.modelNameToNVCFUrl,
 		d.imageEdits.modelNameToNVCFUrl,
 		d.imageVariations.modelNameToNVCFUrl,
-	)
-	d.filteredModelsLastComputed = time.Now()
-
-	return d.filteredModelsCache
+	}
 }
 
 func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]config.ModelFunctionDetails, sectionName string) map[string]ModelNameToFunctionIdVersionId {
@@ -586,7 +629,23 @@ func (d *ModelDirector) ServeResponses(writer http.ResponseWriter, request *http
 }
 
 func (d *ModelDirector) ServeMessages(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolMessages)
 	d.proxyModelMappedRequest(writer, request, d.messages.modelNameToNVCFUrl, shadowSamplingEndpointMessages)
+}
+
+// ServeDecisions passes POST /v1/decisions through to the model's function.
+// The body is not parsed beyond model, and errors the gateway writes use the
+// OpenAI shape.
+func (d *ModelDirector) ServeDecisions(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolDecisions)
+	d.proxyModelMappedRequest(writer, request, d.decisions.modelNameToNVCFUrl, shadowSamplingEndpointNone)
+}
+
+// ServeSystemOne passes POST /v1/systemone through to the model's function.
+// Errors the gateway writes use the System One shape.
+func (d *ModelDirector) ServeSystemOne(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolSystemOne)
+	d.proxyModelMappedRequest(writer, request, d.systemOne.modelNameToNVCFUrl, shadowSamplingEndpointNone)
 }
 
 func (d *ModelDirector) ServeImageGenerations(writer http.ResponseWriter, request *http.Request) {
@@ -602,15 +661,25 @@ func (d *ModelDirector) ServeImageVariations(writer http.ResponseWriter, request
 }
 
 // ListModels answers in the caller's API: Anthropic clients get the Messages
-// models in the Anthropic shape, everyone else the shared OpenAI list.
+// models in the Anthropic shape, everyone else the shared OpenAI list. A
+// request with a bearer API key also gets the private models that key may
+// access.
 func (d *ModelDirector) ListModels(writer http.ResponseWriter, request *http.Request) {
+	// A keyed request can also list private models, so shared caches must keep
+	// responses for different keys apart.
+	writer.Header().Add("Vary", "Authorization")
 	if middleware.IsAnthropicRequest(request) {
-		d.listAnthropicModels(writer, request)
+		d.listAnthropicModels(writer, request, d.authorizedPrivateModels(writer, request, d.messagesSections()))
 		return
 	}
+	privateModels := d.authorizedPrivateModels(writer, request, d.sections)
 
 	// Get filtered models with lazy caching
 	activeModels := d.getFilteredModels()
+	if len(privateModels) > 0 {
+		privateModels = filterExpiredModels(privateModels, d.allMappings()...)
+		activeModels = sortModels(append(slices.Clone(activeModels), privateModels...))
+	}
 
 	m := ModelListResponse{
 		Object: "list",
@@ -626,12 +695,16 @@ func (d *ModelDirector) ListModels(writer http.ResponseWriter, request *http.Req
 }
 
 func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Request) {
-	// support "/" in model name to follow pre established format
+	// support "/" in model name to follow pre established format. Private
+	// names often carry a prefix, as in private/company/model.
+	prefix := chi.URLParam(request, "prefix")
 	company := chi.URLParam(request, "company")
 	model := chi.URLParam(request, "model")
 
 	var modelName string
-	if company != "" && model != "" {
+	if prefix != "" && company != "" && model != "" {
+		modelName = prefix + "/" + company + "/" + model
+	} else if company != "" && model != "" {
 		modelName = company + "/" + model
 	} else if model != "" {
 		modelName = model
@@ -651,10 +724,15 @@ func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Reque
 		d.chatCompletions.modelNameToModelInfo,
 		d.responses.modelNameToModelInfo,
 		d.messages.modelNameToModelInfo,
+		d.decisions.modelNameToModelInfo,
+		d.systemOne.modelNameToModelInfo,
 		d.imageGenerations.modelNameToModelInfo,
 		d.imageEdits.modelNameToModelInfo,
 		d.imageVariations.modelNameToModelInfo,
 	)
+	if !ok {
+		modelInfo, ok = d.authorizedPrivateModel(writer, request, modelName, d.sections)
+	}
 	if !ok {
 		modelMissingError := "Model does not exist by the name of " + modelName
 		markGatewayRejected(writer, request)
@@ -669,6 +747,8 @@ func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Reque
 		d.chatCompletions.modelNameToNVCFUrl,
 		d.responses.modelNameToNVCFUrl,
 		d.messages.modelNameToNVCFUrl,
+		d.decisions.modelNameToNVCFUrl,
+		d.systemOne.modelNameToNVCFUrl,
 		d.imageGenerations.modelNameToNVCFUrl,
 		d.imageEdits.modelNameToNVCFUrl,
 		d.imageVariations.modelNameToNVCFUrl,
@@ -689,11 +769,7 @@ func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Reque
 
 func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo, endpoint shadowSamplingEndpoint) {
 	span := trace.SpanFromContext(request.Context())
-	endpointType := traceAttrValueEndpointOpenAI
-	if request.URL.Path == "/v1/messages" {
-		endpointType = traceAttrValueEndpointAnthropic
-	}
-	span.SetAttributes(traceAttrEndpointType.String(endpointType))
+	span.SetAttributes(traceAttrEndpointType.String(endpointTypeForPath(request.URL.Path, traceAttrValueEndpointOpenAI)))
 	setShadowSpanAttribute(span, request)
 
 	resolved, handled := d.resolveModelMappedRequest(writer, request, modelToNVCFUrl)
@@ -730,22 +806,24 @@ func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, requ
 }
 
 func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (resolvedOpenAIRequest, bool) {
-	body, err := extractOpenAIRequestBody(request)
+	extract := extractOpenAIRequestBody
+	if isDecisionRoute(request) {
+		if !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
+			if request.Body != nil {
+				_ = request.Body.Close()
+			}
+			markGatewayRejected(writer, request)
+			writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
+			return resolvedOpenAIRequest{}, true
+		}
+		extract = extractDecisionRequestBody
+	}
+	body, err := extract(request)
 	if err != nil {
 		markGatewayRejected(writer, request)
-		if request.URL.Path == "/v1/messages" {
-			status, message := http.StatusInternalServerError, "failed to read Messages request"
-			if errors.Is(err, errInvalidJSONBody) || errors.Is(err, errModelFieldMissing) {
-				status, message = http.StatusBadRequest, "invalid Messages request JSON"
-			}
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(err, &maxBytesErr) {
-				status, message = http.StatusRequestEntityTooLarge, "request body is too large"
-			}
-			if errors.Is(err, errModelFieldMissing) {
-				message = "model field is required"
-			}
-			writeAnthropicError(writer, status, message)
+		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+			status, kind, message := requestReadFailure(protocol, err)
+			writeNativeError(writer, request, status, kind, message)
 			return resolvedOpenAIRequest{}, true
 		}
 		var maxBytesErr *http.MaxBytesError
@@ -796,9 +874,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	if !ok {
 		_ = request.Body.Close()
 		markGatewayRejected(writer, request)
-		if request.URL.Path == "/v1/messages" {
-			writeAnthropicError(writer, http.StatusNotFound, "model not found")
-		} else {
+		if !writeNativeError(writer, request, http.StatusNotFound, "", "model not found") {
 			http.NotFound(writer, request)
 		}
 		return resolvedOpenAIRequest{}, true
@@ -806,32 +882,20 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	middleware.SetPreUpstreamModel(request.Context(), nvcfUrl.publicModelName)
 	middleware.AddOpenAIRequestMetricAttributes(request.Context(), body.Model, nvcfUrl.functionId)
 
-	statusHandled := false
-	if request.URL.Path == "/v1/messages" {
-		if nvcfUrl.offlineMessage != "" {
-			markGatewayRejected(writer, request)
-			writer.Header().Set("Retry-After", "10800")
-			writeAnthropicError(writer, http.StatusServiceUnavailable, nvcfUrl.offlineMessage)
-			statusHandled = true
-		} else if isModelExpired(nvcfUrl.eol) {
-			markGatewayRejected(writer, request)
-			writeAnthropicError(writer, http.StatusGone, "model has reached end of life")
-			statusHandled = true
-		}
-	} else {
-		statusHandled = writeFunctionStatusError(writer, request, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model)
-	}
+	statusHandled := writeFunctionStatusError(writer, request, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model)
 	if statusHandled {
 		_ = request.Body.Close()
 		return resolvedOpenAIRequest{}, true
 	}
 
-	if nvcfUrl.tooManyRequestsMessage != "" {
+	// Decision backend 429 bodies pass through byte for byte.
+	if nvcfUrl.tooManyRequestsMessage != "" && !isDecisionRoute(request) {
 		ctx := context.WithValue(request.Context(), tooManyRequestsKey, nvcfUrl.tooManyRequestsMessage)
 		request = request.WithContext(ctx)
 	}
 
-	// setPollingHeaderIfNotPresent checks the Accept header, so we have to override it first
+	// setPollingHeaderIfNotPresent checks the Accept header, so we have to override it first.
+	// Decision routes never read stream, so body.Stream is false there.
 	if body.Stream {
 		request.Header.Set("Accept", "text/event-stream")
 	}
@@ -900,7 +964,7 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 	var droppedTargetModels []string
 	finishers := make([]func(error), 0, len(shadows))
 	for _, shadow := range shadows {
-		shadowBody, err := d.rewriteShadowBody(rawBody, shadow.modelName)
+		shadowBody, err := d.rewriteShadowBody(resolved.request, rawBody, shadow.modelName)
 		if err != nil {
 			zap.L().Warn("shadow body rewrite failed, dropping target", append(
 				middleware.TraceFields(resolved.request.Context()),
@@ -952,9 +1016,15 @@ func (d *ModelDirector) randomShadowBucket() int {
 	return rand.IntN(100)
 }
 
-func (d *ModelDirector) rewriteShadowBody(body []byte, modelName string) ([]byte, error) {
+// rewriteShadowBody points a shadow copy at its target model. Decision routes
+// replace only the model value so the shadow keeps every other byte, as the
+// primary does.
+func (d *ModelDirector) rewriteShadowBody(request *http.Request, body []byte, modelName string) ([]byte, error) {
 	if d.shadowBodyRewriter != nil {
 		return d.shadowBodyRewriter(body, modelName)
+	}
+	if isDecisionRoute(request) {
+		return replaceTopLevelModel(body, modelName)
 	}
 	return rewriteShadowRequestModel(body, modelName)
 }
@@ -982,7 +1052,11 @@ func (d *ModelDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved r
 		return nil
 	}
 
-	rewritten, err := rewriteShadowRequestModel(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
+	rewrite := rewriteShadowRequestModel
+	if isDecisionRoute(resolved.request) {
+		rewrite = replaceTopLevelModel
+	}
+	rewritten, err := rewrite(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, err)
 		return nil
@@ -1006,6 +1080,16 @@ func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolve
 	if resolved.functionInfo.sessionTimeout > 0 {
 		span := trace.SpanFromContext(resolved.request.Context())
 		span.SetAttributes(traceAttrSessionTimeoutSeconds.Int(int(resolved.functionInfo.sessionTimeout)))
+	}
+
+	// endpoint.type names the native route, so upstream.kind records whether
+	// it went through the LLM Gateway.
+	if requestProtocol(resolved.request) != nativeProtocolNone {
+		kind := traceAttrValueUpstreamDirect
+		if resolved.functionInfo.targetsLLMGateway() {
+			kind = traceAttrValueUpstreamLLMGateway
+		}
+		trace.SpanFromContext(resolved.request.Context()).SetAttributes(traceAttrUpstreamKind.String(kind))
 	}
 
 	if resolved.functionInfo.targetsLLMGateway() {
@@ -1051,6 +1135,50 @@ func rewriteShadowRequestModel(body []byte, modelName string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode shadow request body: %w", err)
 	}
 	return rewritten, nil
+}
+
+// replaceTopLevelModel replaces the value of every top-level model member in
+// place and keeps every other byte of body. Go decoders match keys without
+// regard to case and differ on which duplicate wins, so every key that equals
+// model in any case is replaced and the LLM Gateway cannot read a value the
+// gateway did not resolve.
+func replaceTopLevelModel(body []byte, modelName string) ([]byte, error) {
+	modelValue, err := stdjson.Marshal(modelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode model name: %w", err)
+	}
+	decoder := stdjson.NewDecoder(bytes.NewReader(body))
+	if token, err := decoder.Token(); err != nil || token != stdjson.Delim('{') {
+		return nil, fmt.Errorf("request body is not a JSON object")
+	}
+	type span struct{ start, end int64 }
+	var spans []span
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body key: %w", err)
+		}
+		key, _ := token.(string)
+		var value stdjson.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("failed to read request body value: %w", err)
+		}
+		if strings.EqualFold(key, "model") {
+			end := decoder.InputOffset()
+			spans = append(spans, span{end - int64(len(value)), end})
+		}
+	}
+	if len(spans) == 0 {
+		return nil, fmt.Errorf("request body has no model member")
+	}
+	rewritten := make([]byte, 0, len(body)+len(spans)*len(modelValue))
+	var last int64
+	for _, s := range spans {
+		rewritten = append(rewritten, body[last:s.start]...)
+		rewritten = append(rewritten, modelValue...)
+		last = s.end
+	}
+	return append(rewritten, body[last:]...), nil
 }
 
 // errModelFieldMissing signals that the client sent a valid request body that did
@@ -1143,6 +1271,52 @@ func readMultipartModelField(r io.Reader, boundary string) (string, error) {
 		}
 		return string(value), nil
 	}
+}
+
+// isDecisionContentType reports whether a decision route accepts the
+// Content-Type header. A missing header is read as JSON, as on the chat
+// completions route.
+func isDecisionContentType(header string) bool {
+	if header == "" {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(header)
+	return err == nil && mediaType == contentTypeApplicationJSON
+}
+
+// errInvalidRequestBody signals a body that is valid JSON but not an object
+// with a string model. Callers render this as HTTP 400 invalid_request.
+var errInvalidRequestBody = errors.New("invalid request body")
+
+// extractDecisionRequestBody reads only model from a decision route body. The
+// rest of the body is the backend's to validate, so a field the gateway does
+// not use, such as a non-boolean stream, never fails the request here. Only a
+// JSON syntax error is errInvalidJSONBody.
+func extractDecisionRequestBody(request *http.Request) (openAIRequestBody, error) {
+	bodyBytes, err := readOpenAIRequestBody(request, "json body")
+	if err != nil {
+		return openAIRequestBody{}, err
+	}
+	if !stdjson.Valid(bodyBytes.peek()) {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, errInvalidJSONBody
+	}
+	if bytes.Equal(bytes.TrimSpace(bodyBytes.peek()), []byte("null")) {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, fmt.Errorf("%w: body is null", errInvalidRequestBody)
+	}
+	var decoded struct {
+		Model string `json:"model"`
+	}
+	if err := json.UnmarshalWithOption(bodyBytes.peek(), &decoded, json.DecodeFieldPriorityFirstWin()); err != nil {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidRequestBody, err)
+	}
+	if decoded.Model == "" {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, errModelFieldMissing
+	}
+	return openAIRequestBody{Model: strings.Clone(decoded.Model), raw: bodyBytes.peek()}, nil
 }
 
 // extractOpenAIJSONBody reads the full request body into a pooled ReadCloser and
@@ -1240,4 +1414,36 @@ type OpenAIDirector = ModelDirector
 
 func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*ModelDirector, error) {
 	return NewModelDirector(mapping, privateModelMatcher, vanityDirector, llmGatewayDirector, shadower)
+}
+
+func isDecisionRoute(request *http.Request) bool {
+	protocol := requestProtocol(request)
+	return protocol == nativeProtocolDecisions || protocol == nativeProtocolSystemOne
+}
+
+// requestReadFailure maps a failure to read or parse the request body to the
+// status, error code and message of the route's native error.
+func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
+	status, kind := http.StatusInternalServerError, ""
+	message := "failed to read request"
+	if protocol == nativeProtocolMessages {
+		message = "failed to read Messages request"
+	}
+	if errors.Is(err, errInvalidJSONBody) || errors.Is(err, errModelFieldMissing) {
+		status, kind, message = http.StatusBadRequest, errKindInvalidJSON, "request body is not valid JSON"
+		if protocol == nativeProtocolMessages {
+			message = "invalid Messages request JSON"
+		}
+	}
+	if errors.Is(err, errInvalidRequestBody) {
+		status, kind, message = http.StatusBadRequest, errKindInvalidRequest, "request body must be a JSON object with a string model"
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		status, kind, message = http.StatusRequestEntityTooLarge, "", "request body is too large"
+	}
+	if errors.Is(err, errModelFieldMissing) {
+		kind, message = errKindInvalidRequest, "model field is required"
+	}
+	return status, kind, message
 }

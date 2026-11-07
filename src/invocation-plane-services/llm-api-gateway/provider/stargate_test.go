@@ -40,11 +40,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 func TestStargateProviderMetricsIncludeFunctionID(t *testing.T) {
@@ -780,6 +780,72 @@ func TestStargateProviderReadStreamDoesNotBlockOnFullEventChannelAfterCancellati
 	}
 }
 
+// A client that goes away while an event is still buffered must not be
+// recorded as an upstream failure.
+func TestStargateProviderReadStreamReportsCancellationBeforeTrailingData(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	events := make(chan StreamEvent, 1)
+	// The first line of a multi-line event, cut off when the client went away.
+	body := io.NopCloser(strings.NewReader(`data: {"id":`))
+	(&StargateProvider{}).readStream(ctx, cancel, body, events)
+
+	event, ok := <-events
+	require.True(t, ok, "the stream closed without reporting the cancellation")
+	require.ErrorIs(t, event.Err, context.Canceled)
+	require.NotErrorIs(t, event.Err, ErrStreamIncomplete)
+}
+
+// A missed request deadline must reach a reader that is behind, or the stream
+// ends like a finished one ([DONE] or a partial 200).
+func TestStargateProviderReadStreamDeliversDeadlineToSlowReader(t *testing.T) {
+	t.Parallel()
+
+	chunk := sseChatBody(t, models.ChatCompletionChunk{
+		ID:      "chatcmpl-deadline",
+		Object:  models.ObjectChatCompletionChunk,
+		Choices: []models.ChatCompletionChunkChoice{{Delta: models.ChatCompletionChunkDelta{Content: ptr.To("hi")}}},
+	})
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "deadline while sending a chunk", body: chunk},
+		{name: "deadline at end of stream", body: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			t.Cleanup(cancel)
+			// A full buffer stands for a reader that has not caught up yet.
+			events := make(chan StreamEvent, 1)
+			events <- StreamEvent{Chunk: &models.ChatCompletionChunk{}}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				(&StargateProvider{}).readStream(ctx, cancel, io.NopCloser(strings.NewReader(tt.body)), events)
+			}()
+			// Read only after readStream has returned or is waiting to send, so the
+			// reader is behind when the deadline is reported.
+			select {
+			case <-done:
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			<-events
+			event, ok := <-events
+			require.True(t, ok, "the stream closed without reporting the deadline")
+			require.ErrorIs(t, event.Err, context.DeadlineExceeded)
+			require.ErrorIs(t, event.Err, ErrStreamIncomplete)
+		})
+	}
+}
+
 func TestStargateProviderCompletePropagatesTraceContext(t *testing.T) {
 	oldPropagator := otel.GetTextMapPropagator()
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -1444,4 +1510,89 @@ func TestStargateMessagesCredentialsStopBeforeWorker(t *testing.T) {
 	resp, err := p.Proxy(context.Background(), &requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-messages"}, &ProxyRequest{Method: "POST", Path: "/v1/messages", Header: http.Header{"Authorization": {"Bearer injected"}, "X-Api-Key": {"secret"}, "Proxy-Authorization": {"secret"}}, Body: io.NopCloser(strings.NewReader(`{}`))})
 	require.NoError(t, err)
 	defer resp.Body.Close()
+}
+
+func TestStargateDecisionRouteCredentialsStopBeforeWorker(t *testing.T) {
+	for _, path := range []string{"/v1/decisions", "/v1/systemone"} {
+		t.Run(path, func(t *testing.T) {
+			p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+			require.NoError(t, err)
+			p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				for _, name := range []string{"Authorization", "X-Api-Key", "Proxy-Authorization", "Cookie"} {
+					require.Empty(t, r.Header.Values(name), name)
+				}
+				require.Equal(t, "fn-decisions", r.Header.Get(headerRoutingKey))
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			resp, err := p.Proxy(context.Background(),
+				&requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-decisions"},
+				&ProxyRequest{Method: "POST", Path: path, Header: http.Header{
+					"Authorization": {"Bearer injected"}, "X-Api-Key": {"secret"},
+					"Proxy-Authorization": {"secret"}, "Cookie": {"session=secret"},
+				}, Body: io.NopCloser(strings.NewReader(`{}`))})
+			require.NoError(t, err)
+			defer resp.Body.Close()
+		})
+	}
+}
+
+func TestStargateDecisionRouteControlHeaders(t *testing.T) {
+	for _, path := range []string{"/v1/decisions", "/v1/systemone"} {
+		for _, tc := range []struct {
+			name       string
+			estimate   int
+			wantTokens string
+		}{
+			{"positive estimate is sent", 42, "42"},
+			{"zero estimate is sent as one", 0, "1"},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+				require.NoError(t, err)
+				var got http.Header
+				p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					got = r.Header.Clone()
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+				})}
+				resp, err := p.Proxy(context.Background(),
+					&requestctx.RequestContext{RoutingKey: "fn-decisions"},
+					&ProxyRequest{Method: "POST", Path: path, Header: http.Header{
+						"X-Input-Tokens":       {"999999"},
+						"X-Token-Estimate":     {"999999"},
+						"X-Max-Wait-Ms":        {"abc"},
+						"X-Request-Slo-Ms":     {"abc"},
+						"X-Cache-Affinity-Key": {"client-key"},
+						"Accept-Encoding":      {"gzip, br"},
+						"X-Vendor":             {"kept"},
+					}, Body: io.NopCloser(strings.NewReader(`{}`)), InputTokens: tc.estimate, TokenEstimate: tc.estimate})
+				require.NoError(t, err)
+				defer resp.Body.Close()
+
+				require.Equal(t, []string{tc.wantTokens}, got.Values(headerInputTokens))
+				require.Equal(t, []string{tc.wantTokens}, got.Values(headerTokenEstimate))
+				for _, name := range []string{"X-Max-Wait-Ms", "X-Request-Slo-Ms", headerCacheAffinityKey} {
+					require.Empty(t, got.Values(name), name)
+				}
+				// Identity keeps the response readable for the usage observer.
+				require.Equal(t, []string{"identity"}, got.Values("Accept-Encoding"))
+				require.Equal(t, "kept", got.Get("X-Vendor"))
+			})
+		}
+	}
+}
+
+func TestStargateNonDecisionRouteKeepsZeroEstimateUnset(t *testing.T) {
+	p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+	var got http.Header
+	p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.Header.Clone()
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+	})}
+	resp, err := p.Proxy(context.Background(), &requestctx.RequestContext{RoutingKey: "fn"},
+		&ProxyRequest{Method: "POST", Path: "/v1/embeddings", Header: http.Header{"Accept-Encoding": {"gzip"}}, Body: io.NopCloser(strings.NewReader(`{}`))})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Empty(t, got.Values(headerInputTokens))
+	require.Equal(t, "gzip", got.Get("Accept-Encoding"))
 }

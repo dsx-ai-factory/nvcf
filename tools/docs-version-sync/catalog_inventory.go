@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -20,8 +21,7 @@ func updateCatalogFromGitHub(repoRoot, sourceRef string, base *Catalog) (*Catalo
 	if err != nil {
 		return nil, err
 	}
-	sourcePaths := effectiveStackPinSourcePaths(effectiveStackPins)
-	snapshot, err := loadStackSourceSnapshot(repoRoot, release, sourcePaths)
+	snapshot, err := loadEffectiveStackPinSnapshot(repoRoot, release, effectiveStackPins)
 	if err != nil {
 		return nil, err
 	}
@@ -51,14 +51,44 @@ func updateCatalogFromGitHubInventories(repoRoot string, sourceRefs map[string]s
 		}
 		inventories[spec.Key] = inventory
 	}
+	return buildCatalogFromStackInventories(repoRoot, inventories, base)
+}
 
+// updateCatalogFromManifest uses only the inventories bound by the selected
+// manifest. Publication status still comes from the existing public catalog.
+func updateCatalogFromManifest(repoRoot, manifestPath, inventoryDir string, base *Catalog) (*Catalog, error) {
+	if base != nil && base.DocsEdition != nil && base.DocsEdition.Status == ReleaseSetQualified {
+		return nil, fmt.Errorf("cannot refresh a qualified docs edition; prepare a new edition from development sources")
+	}
+	manifest, _, err := loadUmbrellaManifest(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	inventories, err := validateUmbrellaSources(repoRoot, manifest, inventoryDir)
+	if err != nil {
+		return nil, err
+	}
+	if base != nil {
+		selected := *base
+		selected.Compatibility = manifest.catalog().Compatibility
+		base = &selected
+	}
+	catalog, err := buildCatalogFromStackInventories(repoRoot, inventories, base)
+	if err != nil {
+		return nil, err
+	}
+	// Exact peer pins describe this selection, not a wider support range.
+	catalog.Compatibility = manifest.catalog().Compatibility
+	return catalog, ValidateCatalog(catalog)
+}
+
+func buildCatalogFromStackInventories(repoRoot string, inventories map[string]resolvedStackInventory, base *Catalog) (*Catalog, error) {
 	combined, err := mergeResolvedStackInventories(inventories)
 	if err != nil {
 		return nil, err
 	}
 	selfManaged := inventories[selfManagedStackKey]
-	sourcePaths := effectiveStackPinSourcePaths(effectiveStackPins)
-	snapshot, err := loadStackSourceSnapshot(repoRoot, selfManaged.Source, sourcePaths)
+	snapshot, err := loadEffectiveStackPinSnapshot(repoRoot, selfManaged.Source, effectiveStackPins)
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +259,7 @@ func buildCatalogFromResolvedStackInventory(inventory resolvedStackInventory, sn
 	if err := materializeMissingEffectiveStackPins(catalog, base, snapshot.Files); err != nil {
 		return nil, err
 	}
+	migrateManifestArtifactIDs(catalog, base)
 	if base != nil {
 		catalog.Stack.Name = base.Stack.Name
 		catalog.Stack.Registry = base.Stack.Registry
@@ -236,7 +267,10 @@ func buildCatalogFromResolvedStackInventory(inventory resolvedStackInventory, sn
 	}
 	catalog.Stack.SourceTag = inventory.Source.Tag
 	catalog.Stack.SourceCommit = inventory.Source.Commit
-	catalog.Stack.PinSources = effectiveStackPinSourcePaths(effectiveStackPins)
+	catalog.Stack.PinSources, err = effectiveStackPinSourcesUsed(snapshot.Files, effectiveStackPins)
+	if err != nil {
+		return nil, err
+	}
 	catalog.Stack.PinSourceDigest, err = pinSourceDigest(snapshot.Files, effectiveStackPins)
 	if err != nil {
 		return nil, err
@@ -319,6 +353,77 @@ func catalogArtifactsFromResolvedStackInventory(inventory resolvedStackInventory
 	preserveCatalogArtifactIdentity(artifacts, base)
 	assignCatalogArtifactIDs(artifacts)
 	return artifacts, nil
+}
+
+// migrateManifestArtifactIDs keeps manifest entries attached to an artifact
+// name and type when the refresh changes its catalog key. A bare name key
+// becomes <name>-<type> when another artifact type starts to use the same name,
+// for example a chart and an image both named nvcf-otel-collector. It becomes
+// <name>-<type>-<version> when a stack starts to ship two versions of one
+// artifact. An entry whose key disappeared moves to the new keys of the same
+// name and type, and repeats for each new version. Ambiguous changes are left
+// for a maintainer to classify.
+func migrateManifestArtifactIDs(catalog, base *Catalog) {
+	if base == nil {
+		return
+	}
+	currentKeys := make(map[string]struct{})
+	currentByIdentity := make(map[string][]string)
+	for _, artifact := range append(append([]Artifact{}, catalog.Artifacts...), catalog.SupplementalArtifacts...) {
+		currentKeys[artifact.catalogKey()] = struct{}{}
+		identity := artifactNameAndTypeKey(artifact)
+		currentByIdentity[identity] = append(currentByIdentity[identity], artifact.catalogKey())
+	}
+	previousKeys := make(map[string]struct{})
+	previousByIdentity := make(map[string][]string)
+	for _, artifact := range append(append([]Artifact{}, base.Artifacts...), base.SupplementalArtifacts...) {
+		previousKeys[artifact.catalogKey()] = struct{}{}
+		identity := artifactNameAndTypeKey(artifact)
+		previousByIdentity[identity] = append(previousByIdentity[identity], artifact.catalogKey())
+	}
+	referenced := make(map[string]struct{}, len(catalog.Manifest.Entries))
+	for _, entry := range catalog.Manifest.Entries {
+		referenced[entry.ArtifactID] = struct{}{}
+	}
+
+	renamed := make(map[string][]string)
+	for identity, keys := range previousByIdentity {
+		var removed, added []string
+		for _, key := range keys {
+			if _, retained := currentKeys[key]; !retained {
+				removed = append(removed, key)
+			}
+		}
+		for _, key := range currentByIdentity[identity] {
+			_, existed := previousKeys[key]
+			_, classified := referenced[key]
+			if !existed && !classified {
+				added = append(added, key)
+			}
+		}
+		if len(removed) != 1 || len(added) == 0 {
+			continue
+		}
+		sort.Strings(added)
+		renamed[removed[0]] = added
+	}
+	if len(renamed) == 0 {
+		return
+	}
+	entries := make([]ManifestEntry, 0, len(catalog.Manifest.Entries))
+	for _, entry := range catalog.Manifest.Entries {
+		next, ok := renamed[entry.ArtifactID]
+		if !ok {
+			entries = append(entries, entry)
+			continue
+		}
+		for _, key := range next {
+			migrated := entry
+			migrated.ArtifactID = key
+			entries = append(entries, migrated)
+		}
+	}
+	catalog.Manifest.Entries = entries
 }
 
 func resolvedArtifactSourceIsRequired(source resolvedArtifactSource, releaseRequirements map[string]bool) bool {
@@ -480,11 +585,20 @@ func isPublicCatalogRegistry(registry Registry) bool {
 }
 
 func publicUpstreamRepository(repository string, artifactType ArtifactType) string {
+	if artifactType == ArtifactTypeChart && isBundledChartRepository(repository) {
+		return repository
+	}
 	repository = canonicalPublicRepository(repository, artifactType)
 	if _, ok := publicUpstreamRegistry(repository, artifactType); !ok || isNVCFPublicationRepository(repository) {
 		return ""
 	}
 	return repository
+}
+
+var bundledChartRepositoryPattern = regexp.MustCompile(`^https://github\.com/(NVIDIA|dsx-ai-factory)/nvcf/tree/[0-9a-f]{40}/deploy/(stacks|helm)/[A-Za-z0-9_./-]+$`)
+
+func isBundledChartRepository(repository string) bool {
+	return bundledChartRepositoryPattern.MatchString(repository) && !strings.Contains(repository, "/../")
 }
 
 func canonicalPublicRepository(repository string, artifactType ArtifactType) string {
@@ -541,6 +655,9 @@ func isNVCFPublicationRepository(repository string) bool {
 
 func upstreamArtifactPath(artifact Artifact) string {
 	repository := strings.TrimSuffix(artifact.UpstreamRepository, "/")
+	if artifact.Type == ArtifactTypeChart && isBundledChartRepository(repository) {
+		return repository + "/" + artifact.Name + "@" + artifact.Version
+	}
 	reference := repository
 	if artifact.Type == ArtifactTypeChart {
 		name := artifact.RepositoryName
