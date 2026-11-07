@@ -22,11 +22,14 @@ Use the [release workflow](../../../docs/dev/github-release-process.md) for sour
 ## About
 
 The Vanity Gateway fronts invocation APIs with route mappings from a YAML config
-file. It supports three request shapes:
+file. It supports four request shapes:
 
 - OpenAI-compatible `/v1/*` endpoints that map public model names to functions.
 - The native Anthropic Messages endpoint, `POST /v1/messages`, configured under
   `v2config.anthropicMessages`.
+- Beta decision model endpoints, `POST /v1/decisions` and
+  `POST /v1/systemone`, configured under `v2config.openai.decisions` and
+  `v2config.typesafeSystemOne`.
 - Vanity URL routes that forward caller-defined paths to function executions and polling.
 
 The gateway is meant to run against an upstream invocation service with pexec
@@ -42,6 +45,7 @@ Configuration is passed through environment variables.
 | `MAPPING_PATH` | Yes | None | Path to the rendered mapping config file. |
 | `MAPPING_LOAD_TIMEOUT` | No | `15s` | Maximum time to wait at startup for `MAPPING_PATH` to appear. Increase this when a ConfigMap projection or remote-config sidecar materializes the file after the main container starts. Duration strings require a unit, such as `2m` or `90s`. A value without a unit is rejected when configuration is loaded, and a negative value is rejected at startup. |
 | `NVCF_API_ENDPOINT` | No | Service default | Upstream invocation service endpoint. In cluster deployments, this usually points to the in-cluster invocation service. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` | No | Empty | NVCF API base URL used to list the private models a caller's API key may access. Empty disables private model listing. See [Private Models](#private-models). |
 | `LLM_GATEWAY_ENDPOINT` | No | Empty | Upstream LLM Gateway endpoint. Required only when a model sets `functionType: LLM`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Empty | OTLP endpoint for tracing. Empty disables OTLP export. |
 | `TRACING_ACCESS_TOKEN` | No | Empty | Access token for OTLP tracing. Also configurable in the secrets file under `$.tracingAccessToken`. |
@@ -156,6 +160,7 @@ v2config:
     completions: {}
     embeddings: {}
     responses: {}
+    decisions: {}
     imageGenerations: {}
     imageEdits: {}
     imageVariations: {}
@@ -191,7 +196,7 @@ v2config:
 | `customHeaders` | No | Map of static request headers to set on the upstream request. Configured values overwrite caller-provided values for the same header. Reserved routing, protocol, auth, proxy, and `NVCF-*` headers are rejected. |
 | `eol` | No | RFC3339 timestamp. Future dates add a `Deprecation` header; past dates return `410 Gone` and hide the model from `/v1/models`. |
 | `offlineMessage` | No | Non-empty value returns `503 Service Unavailable` with this message. |
-| `tooManyRequestsMessage` | No | Message appended to upstream `429 Too Many Requests` responses for this model. Recognizes an OpenAI error object, an RFC 7807 problem document, and a bare `{"message": "..."}`. Any other body is returned unchanged. |
+| `tooManyRequestsMessage` | No | Message appended to upstream `429 Too Many Requests` responses for this model. Recognizes an OpenAI error object, an RFC 7807 problem document, and a bare `{"message": "..."}`. Any other body is returned unchanged. Rejected on the decision routes. |
 | `shadows` | No | List of per-target shadow configs. It must be a list; `null` is rejected, and so is `null` for any field inside an entry. It cannot be combined with any legacy top-level shadow field. Not supported for multipart image edit or variation endpoints. |
 | `shadows[].modelName` | Yes | Target model name in the same mapping section. It cannot match the primary model or another shadow target. |
 | `shadows[].percentage` | No | Percentage of primary requests sent to this target, from `1` to `100`. Defaults to `100`. |
@@ -208,7 +213,8 @@ v2config:
 
 Shadow traffic is supported for mapping sections with JSON request bodies:
 `chatCompletions`, `completions`, `embeddings`, `responses`, `imageGenerations`,
-and `anthropicMessages`. Shadow targets must be model names in the same mapping
+`anthropicMessages`, `decisions`, and `typesafeSystemOne`. The decision sections
+support `random` and `perBearerKey` sampling only. Shadow targets must be model names in the same mapping
 section as the primary model. The gateway rewrites the request `model` field to
 the shadow target and marks the replay with `NVCF-Shadow: true` so shadow
 requests do not recursively shadow.
@@ -352,8 +358,8 @@ added to logs, traces, or metric labels.
 
 Set `functionType: LLM` on a model entry to serve it from the LLM Gateway
 instead of the invocation service. Supported in `openai.chatCompletions`,
-`openai.responses`, `openai.embeddings`, and `anthropicMessages`, the four
-routes the LLM Gateway serves.
+`openai.responses`, `openai.embeddings`, `anthropicMessages`, `openai.decisions`,
+and `typesafeSystemOne`, the routes the LLM Gateway serves.
 
 ```yaml
 v2config:
@@ -383,7 +389,7 @@ forwarded: the mapping is what decides which function a caller reaches.
 Vanity Gateway passes `Authorization`, `NVCF-POLL-SECONDS`, and the caller's
 other headers to the LLM Gateway.
 
-Config validation rejects `functionType: LLM` outside the four supported
+Config validation rejects `functionType: LLM` outside the supported
 sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`
 on those entries because the LLM Gateway ignores them. An `X-Priority` entry in
 `customHeaders` is rejected too: the LLM Gateway answers `400 Bad Request` for
@@ -508,7 +514,8 @@ YAML merge defaults and explicit overrides are supported.
 For a repeated `modelName`, disjoint metadata keys merge. A conflicting key
 keeps its first value, including null, in this section order:
 `chatCompletions`, `completions`, `embeddings`, `responses`, `imageGenerations`,
-`imageEdits`, `imageVariations`, then `anthropicMessages`. Within each section,
+`imageEdits`, `imageVariations`, `anthropicMessages`, `decisions`, then
+`typesafeSystemOne`. Within each section,
 YAML entry order decides precedence. Programmatically constructed configs
 without source order use alphabetical entry keys. Nested objects are whole
 values; their contents do not merge. Both OpenAI discovery endpoints use the
@@ -518,6 +525,64 @@ Config reloads refresh metadata. Invalid configuration keeps the last accepted
 snapshot. Metadata advertises configured values only; it adds no upstream
 lookup or limit enforcement. Anthropic-shaped discovery keeps its existing
 schema, including for aliases shared with OpenAI sections.
+
+### Private Models
+
+`GET /v1/models` lists public model names. When the request carries an NVCF
+API key in `Authorization: Bearer`, the list also includes the private models
+that key may access:
+
+```shell
+curl -s -H "Host: api.example.com" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
+  http://localhost:10081/v1/models
+```
+
+The gateway does not validate the key. It sends the key to
+`GET /v2/nvcf/functions?visibility=authorized,private` on
+`NVCF_CONTROL_PLANE_ENDPOINT`, and the NVCF API applies the same account and
+API key resource checks as invocation, version by version. A model whose name
+matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
+the function version it routes to. An entry without `functionVersionID` is
+listed when any version of its function is returned. Expiry,
+`supported_endpoints`, and metadata follow the public-model rules, and
+Anthropic clients get the same models in the Anthropic shape. An alias can
+route to different functions per section. A key sees it only for the sections
+whose route it may use: `supported_endpoints` lists only those, and Anthropic
+clients see the alias only when its Messages route is usable.
+
+`GET /v1/models/{model}` follows the same rule, including three-part names
+such as `private/acme/model`. A private name returns its model only when the
+key may access the function version it routes to. Otherwise the response is
+the same 404 as for an unknown name.
+
+The lookup never fails a request:
+
+| Case | Response |
+| --- | --- |
+| No bearer key | Public list, no NVCF API call |
+| Key accepted | Public list plus the private models the key may access |
+| NVCF API rejects the key (`401`) | Public list |
+| Key has no `list_functions` or `list_functions_details` scope (`403`) | Public list |
+| NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
+
+Keyed responses carry `Cache-Control: private, no-store` and
+`NVCF-Private-Models`, which reports the lookup result: `authorized`,
+`unauthenticated`, `forbidden`, or `unavailable`. The NVCF API can answer
+`403` for an unrecognized `nvapi-` key, so that key reports `forbidden`. Model
+list responses carry `Vary: Authorization`.
+
+Results are cached per key for one minute, for up to 4096 keys, and survive
+mapping reloads. A reload that changes the set of private functions refreshes
+each key on its next request. Concurrent requests with the same key share one
+lookup. Each pod runs at most 16 lookups at once, each with a 5 second
+timeout, and a request never waits for a free slot. Keys without an
+authorized result share a per-pod budget of 50 lookups per second, so random
+tokens cannot drive NVCF API calls. Without a private alias in the mapping,
+there is no lookup. The lookup never follows a redirect, so the key goes only
+to `NVCF_CONTROL_PLANE_ENDPOINT`. A request that the gateway skips under these
+limits gets the key's last successful result or the public list.
 
 ## Invoking the Anthropic Messages Endpoint
 
@@ -582,6 +647,139 @@ are left out as in the OpenAI list. These responses also carry `request-id`.
 The Messages path requires compatible LLM Gateway, Stargate router, and Pylon
 worker builds. See `docs/overview/llm-gateway.md` for upgrade order, token
 accounting, session affinity, and Claude Code configuration.
+
+## Invoking Decision Models (Beta)
+
+Decision models answer typed questions about an input and return
+probabilities instead of generated text. Two beta routes pass these requests
+through on the shared API host set by `openai.host`:
+
+- `POST /v1/decisions` serves the OpenAI Decisions format. Map models under
+  `v2config.openai.decisions`.
+- `POST /v1/systemone` serves the TypeSafe System One format. Map models under
+  `v2config.typesafeSystemOne`, a top-level sibling of `anthropicMessages`.
+
+Entries use the same fields as `openai.chatCompletions`, except that
+`tooManyRequestsMessage` is rejected because backend `429` bodies pass
+through unchanged, and shadow sampling is limited to `random` and
+`perBearerKey`. Each `modelName` may appear once per section. A model
+is enabled for a route only when it is listed in that route's section. A
+function that serves both formats is listed in both sections. A request for a
+model that is not listed in the section of the route it called returns `404`.
+
+```yaml
+v2config:
+  openai:
+    host: api.example.com
+    decisions:
+      example_decision-model:
+        modelName: example/decision-model
+        functionID: 00000000-0000-0000-0000-000000000001
+        functionVersionID: 11111111-1111-1111-1111-111111111111
+      example_decision-model-llm:
+        modelName: example/decision-model-llm
+        functionID: 00000000-0000-0000-0000-000000000002
+        functionType: LLM
+  typesafeSystemOne:
+    example_decision-model:
+      modelName: example/decision-model
+      functionID: 00000000-0000-0000-0000-000000000001
+      functionVersionID: 11111111-1111-1111-1111-111111111111
+```
+
+In this example `example/decision-model` is one function that serves both
+formats, so it appears in both sections. `example/decision-model-llm` is served
+through the LLM Gateway on `/v1/decisions` only.
+
+The gateway reads only `model` from the body and never translates between the
+two formats, so the backend must implement each route it is configured for.
+Request bodies are forwarded unchanged except for the model value: on the LLM
+Gateway path the gateway replaces the value of `model` with the
+function-qualified name in place and keeps every other byte. Response bodies
+pass through unchanged, including backend 4xx and 5xx responses. The routes
+are meant for non-streaming responses: the gateway does not read `stream` and
+does not ask for an event stream itself. Whether a backend streams depends on
+the request it receives, which the gateway forwards as described above.
+Requests must use `Content-Type: application/json`. A request without
+a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
+other media type returns `415`. Vendor headers such as
+`TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
+may be up to 25 MB.
+
+```shell
+source .env
+curl http://localhost:10081/v1/decisions \
+-H "Host: api.example.com" \
+-H "Content-Type: application/json" \
+-H "Authorization: Bearer ${API_TOKEN}" \
+-d '{
+"model": "example/decision-model",
+"input": "The sky is clear.",
+"questions": [{"type": "predicate", "text": "Is it raining?"}]
+}'
+```
+
+Direct models: with `usePexec: false` and no `outgoingPathOverride`, the
+gateway keeps the path, `/v1/decisions` or `/v1/systemone`, and selects the
+function with function ID headers. With `usePexec: true` the gateway calls the
+pexec path of the function, and the invocation service then normally sends the request to
+the default invocation path registered for that function, whichever route the
+client called. A `usePexec: true` function therefore serves only its default path. A
+function that serves both routes should use `usePexec: false`.
+
+Errors generated by the Vanity Gateway use the native shape of the route:
+
+- `/v1/decisions` uses the OpenAI error shape. The `type` is
+  `authentication_error` for `401`, `permission_error` for `403`,
+  `rate_limit_error` for `429`, `overloaded_error` for `529`, `server_error`
+  for other `5xx`, and `invalid_request_error` otherwise.
+- `/v1/systemone` uses
+  `{"error":{"code":"...","message":"...","request_id":"..."},"request_id":"..."}`,
+  where `request_id` has the same value as the `X-Request-Id` response header.
+  The gateway does not set `X-System-One-*` headers.
+
+The error code depends on the status. The LLM Gateway uses the same codes.
+
+| Status | `/v1/decisions` code | `/v1/systemone` code |
+|---|---|---|
+| `400`, body is not valid JSON | `invalid_json` | `invalid_json` |
+| `400`, any other bad request | `invalid_request` | `invalid_request` |
+| `401` | `invalid_api_key` | `invalid_api_key` |
+| `403` | `forbidden` | `forbidden` |
+| `404` | `model_not_found` | `not_found` |
+| `410` | `model_expired` | `not_found` |
+| `413` | `request_too_large` | `request_too_large` |
+| `415` | `unsupported_media_type` | `unsupported_media_type` |
+| `422` | `invalid_request` | `invalid_request` |
+| `429` | `rate_limit_exceeded` | `rate_limit_exceeded` |
+| `499` | `request_cancelled` | `request_cancelled` |
+| `502`, `503`, `529` | `provider_unavailable` | `provider_unavailable` |
+| `504` | `provider_timeout` | `provider_timeout` |
+| Other `5xx` | `internal_error` | `internal_error` |
+| Other `4xx` | `invalid_request` | `invalid_request` |
+
+A JSON syntax error returns `400` `invalid_json`. Valid JSON that is not an
+object with a string `model`, such as `{"model":1}`, or a missing `model`
+returns `400` `invalid_request`. An unknown model returns `404`, a body over
+the size limit returns `413`, a non-JSON `Content-Type` returns `415`, an
+offline model returns `503` with `Retry-After`, an end-of-life model returns
+`410`, and a failed upstream request returns `502`. Upstream status codes and
+bodies pass through unchanged.
+
+A vanity path entry whose path is `/v1/decisions` or `/v1/systemone` is a
+generic vanity route, not a decision route, and keeps the
+`application/problem+json` error shape.
+
+Spans set `endpoint.type` to `decisions` or `systemone`, and `upstream.kind` to
+`llm_gateway` or `direct`.
+
+`/v1/models` and `/v1/models/{model}` list decision models and add
+`supported_endpoints`, for example `["/v1/decisions"]`.
+
+`promptCacheKeyHeaders` is not valid in the decision sections.
+
+A model with `functionType: LLM` needs LLM Gateway and Stargate builds that
+serve these routes. Enable it only after those builds run in the environment.
 
 ## Invoking Vanity URL Routes
 
@@ -665,6 +863,17 @@ combinations are emitted at zero on startup. The primary request span records
 the deciding methods in the `shadow.sampling_methods` attribute. Neither
 records cache keys, credentials, or message content.
 
+`nvcf_ai_api_gateway_private_model_lookups_total` counts private model access
+lookups. The `result` label is `authorized`, `unauthenticated`, `forbidden`,
+`unavailable`, or `limited`. The `cached` label is `true` for cache hits. A
+failed lookup counts as `unavailable` even when the key's last successful
+result is served, and a request inside the retry window after a failure counts
+as a cached `unavailable`. `limited` counts lookups the gateway skipped under
+its own limits.
+Requests that share an in-flight lookup are not counted again. All label
+combinations are emitted at zero on startup. The request span records
+`private_models.cached` and `private_models.result`.
+
 Every response on the model API host (`openai.host`) carries one
 `X-Request-Id`. The gateway keeps the caller's value or creates a UUID and sends
 the same value upstream, so the LLM Gateway logs the request under the same ID.
@@ -703,7 +912,8 @@ labels to distinguish calls and failures:
 
 - `gateway_call_kind` is `inference` for proxied requests (including shadows),
   `poll` for status polls on `/v1/status/{requestId}`, which can long-poll for
-  minutes, and `health` for upstream readiness checks.
+  minutes, `health` for upstream readiness checks, and `model_access` for
+  private model access lookups to the NVCF API.
 - `error_source` is present on non-2xx responses. It accepts
   `invocation_service` or `worker` from the upstream `NVCF-Error-Source`
   response header. Missing or unrecognized values become `unknown`.

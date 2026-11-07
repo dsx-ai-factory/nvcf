@@ -9,7 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
 )
 
 // captureHoldPatches gives a pod a CRIU capture may freeze the

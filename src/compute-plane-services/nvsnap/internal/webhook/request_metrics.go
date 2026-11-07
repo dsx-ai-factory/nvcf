@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 )
 
 // countRequests counts every admission request next answers, by status, and

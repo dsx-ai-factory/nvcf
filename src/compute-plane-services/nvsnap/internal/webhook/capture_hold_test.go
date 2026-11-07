@@ -10,7 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
 )
 
 func holdGates(p *corev1.Pod) int {

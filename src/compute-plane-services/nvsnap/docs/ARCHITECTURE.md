@@ -251,7 +251,7 @@ the capture before anything is frozen, each finding naming the process:
 - MPTCP sockets (`IPPROTO_MPTCP`, 262): CRIU cannot dump them (`inet: Unsupported proto 262`). Go 1.24 and later
   open MPTCP listeners by default, so a recent Go service such as a NATS server holds them without asking.
   Setting `GODEBUG=multipathtcp=0` on that service makes it capturable. Support is tracked in
-  [#2926](https://github.com/NVIDIA/nvcf/issues/2926) (`socketScan`).
+  [#2926](https://github.com/dsx-ai-factory/nvcf/issues/2926) (`socketScan`).
 
 A refused instance keeps running and later instances of it start cold.
 

@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/fnstatus"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/fnstatus"
 )
 
 // functionGVR is NvsnapFunction: one object per function version, what

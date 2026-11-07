@@ -173,6 +173,9 @@ func TestIPrepareHelmfileEnvironmentRestoresExistingDestination(t *testing.T) {
 	if err := os.WriteFile(dest, original, 0o640); err != nil {
 		t.Fatalf("seed destination: %v", err)
 	}
+	if err := os.Chmod(dest, 0o640); err != nil {
+		t.Fatalf("set destination mode: %v", err)
+	}
 	table := docTable(t, [][]string{{"observability.mode", "install"}})
 
 	if err := sc.iPrepareHelmfileEnvironment("existing", "observability", fixture, table); err != nil {
@@ -271,6 +274,9 @@ func TestIPrepareSelfManagedSecretsFileRestoresExistingDestination(t *testing.T)
 	original := []byte("operator-authored: original\n")
 	if err := os.WriteFile(destAbs, original, 0o640); err != nil {
 		t.Fatalf("seed destination: %v", err)
+	}
+	if err := os.Chmod(destAbs, 0o640); err != nil {
+		t.Fatalf("set destination mode: %v", err)
 	}
 
 	if err := sc.iPrepareSelfManagedSecretsFile(destRel, templateRel); err != nil {
@@ -2042,6 +2048,24 @@ func TestRenderedManifestsShouldContainAcceptsExplicitMarkers(t *testing.T) {
 	}
 	if len(fake.runs) != 0 {
 		t.Fatalf("runs = %d, want 0", len(fake.runs))
+	}
+}
+
+func TestRenderedWorkloadEnvShouldEqual(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	renderDir := filepath.Join(sc.Suite.Config.RepoRoot, "out", "rendered")
+	if err := os.MkdirAll(renderDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "kind: Job\nmetadata:\n  name: migrations\nspec:\n  template:\n    spec:\n      containers:\n        - name: migrate\n          env:\n            - name: ALLOWED_DOMAINS\n              value: example.invalid\n"
+	if err := os.WriteFile(filepath.Join(renderDir, "job.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.renderedWorkloadEnvShouldEqual("Job", "migrations", "out/rendered", "migrate", "ALLOWED_DOMAINS", "example.invalid"); err != nil {
+		t.Fatalf("assert rendered environment: %v", err)
+	}
+	if len(fake.runs) != 0 {
+		t.Fatal("render assertion unexpectedly invoked a command")
 	}
 }
 

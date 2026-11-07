@@ -29,7 +29,7 @@ func editionGitFixture(t *testing.T) (string, *Catalog, string) {
 	editionGit(t, root, "remote", "add", "origin", root)
 	catalog := editionTestCatalog()
 	catalog.DocsEdition.Status = ReleaseSetQualified
-	catalog.DocsEdition.Qualification = "https://github.com/NVIDIA/nvcf/pull/123"
+	catalog.DocsEdition.Qualification = "https://github.com/dsx-ai-factory/nvcf/pull/123"
 	for _, name := range releaseSetStackNames {
 		stack, _ := catalog.ReleaseSet.Stacks.byName(name)
 		stack.SourceCommit = source
@@ -43,6 +43,13 @@ func editionGitFixture(t *testing.T) (string, *Catalog, string) {
 	}
 	writeFile(t, filepath.Join(root, "docs", "page.md"), "# Edition fixture\n")
 	if err := os.Symlink("page.md", filepath.Join(root, "docs", "shared.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(root, "docs", "samples", "check.py"), "print('ok')\n")
+	if err := os.MkdirAll(filepath.Join(root, "fern", "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../docs/samples", filepath.Join(root, "fern", "assets", "checks")); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(root, "fern", "docs.yml"), "versions:\n  - display-name: '1.0.0'\n    path: navigation.yml\n")
@@ -82,6 +89,9 @@ func TestEditionPrepareIsIsolatedAndIdempotent(t *testing.T) {
 	}
 	if target, err := os.Readlink(filepath.Join(out, "docs", "shared.md")); err != nil || target != "page.md" {
 		t.Fatalf("shared guide symlink was not preserved: %q, %v", target, err)
+	}
+	if target, err := os.Readlink(filepath.Join(out, "fern", "assets", "checks")); err != nil || target != "../../docs/samples" {
+		t.Fatalf("asset directory symlink was not preserved: %q, %v", target, err)
 	}
 	if err := prepareEdition(root, out, plan); err != nil {
 		t.Fatalf("retry failed: %v", err)
