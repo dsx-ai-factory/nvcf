@@ -40,7 +40,7 @@ nvsnap had cached, before or after a deploy:
 
 ## Design
 
-```
+```console
 $ kubectl get nvsnapfunctions
 NAME   FUNCTION   TENANT   STATE      METHOD     RANKS   VERIFIED   LAST-RESTORE-S   AGE
 v-1    f-1        t-1      complete   criu       8       2h         42.5             3d

@@ -150,7 +150,7 @@ One `NvsnapFunction` per function version nvsnap holds anything for, kept
 by nvsnap-server from the group records within 30 seconds, and readable by
 anyone with the `view` role ([design](../design/FUNCTION-CACHE-STATUS.md)):
 
-```
+```bash
 kubectl get nvsnapfunctions                            # every version: state, method, ranks, last restore
 kubectl get nvsnapfunctions -o wide                    # with the reason a version does not restore
 kubectl get nvsnapfunctions -l nvsnap.io/function-id=<id>
