@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/config"
@@ -62,6 +63,8 @@ type Plugin struct {
 	retryClient *retryablehttp.Client
 	logger      *zap.Logger
 	auditLogger *zap.Logger
+	// logURL is the configured URL without userinfo, query or fragment.
+	logURL string
 }
 
 // Request represents the request sent to webhook endpoint.
@@ -115,9 +118,20 @@ func NewPlugin(configData any, logger *zap.Logger) (*Plugin, error) {
 		retryClient: retryClient,
 		logger:      logger.With(zap.String("plugin", "webhook")),
 		auditLogger: newAuditLogger(zapcore.AddSync(os.Stdout)),
+		logURL:      redactedURL(webhookConfig.URL),
 	}
 
 	return plugin, nil
+}
+
+// redactedURL returns the scheme, host and path of rawURL for logging. The userinfo,
+// query and fragment are dropped because they can carry credentials.
+func redactedURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}).String()
 }
 
 // newAuditLogger returns a logger that writes entries at the AUDIT level. It does
@@ -161,7 +175,7 @@ func (p *Plugin) callWebhook(ctx context.Context, account, pluginName, payload s
 	p.logger.Info("Performing webhook authentication",
 		zap.String("account", account),
 		zap.String("plugin_name", pluginName),
-		zap.String("url", p.config.URL))
+		zap.String("url", p.logURL))
 
 	webhookReq := Request{
 		Account:    account,
@@ -206,6 +220,16 @@ func (p *Plugin) callWebhook(ctx context.Context, account, pluginName, payload s
 // as a redirect Location into their error text, and the configured URL can carry
 // credentials in its userinfo or query string, so none of that text is kept.
 func describeRequestError(err error) string {
+	if category, ok := requestErrorCategory(err); ok {
+		return category
+	}
+	// The retryable client returns a plain error once every attempt has failed.
+	return "retries exhausted"
+}
+
+// requestErrorCategory maps a request error to a fixed category and reports
+// whether it recognized the error.
+func requestErrorCategory(err error) (string, bool) {
 	var (
 		urlErr  *url.Error
 		netErr  net.Error
@@ -225,12 +249,12 @@ func describeRequestError(err error) string {
 	case errors.As(err, &urlErr):
 		category = "request error"
 	default:
-		return "retries exhausted"
+		return "", false
 	}
 	if errors.As(err, &urlErr) {
-		return urlErr.Op + ": " + category
+		return urlErr.Op + ": " + category, true
 	}
-	return category
+	return category, true
 }
 
 // handleErrorResponse handles non-2xx HTTP responses and converts them to appropriate auth errors.
@@ -242,32 +266,32 @@ func (p *Plugin) handleErrorResponse(resp *http.Response) error {
 			// Authentication/authorization errors - don't retry
 			p.logger.Warn("Authentication denied",
 				zap.Int("status_code", resp.StatusCode),
-				zap.String("url", p.config.URL))
+				zap.String("url", p.logURL))
 			return types.NewAuthError(types.ErrTypeUnauthorized, "webhook authentication failed", resp.StatusCode)
 		case http.StatusRequestTimeout:
 			// Request timeout - can retry
 			p.logger.Warn("Webhook request timeout",
 				zap.Int("status_code", resp.StatusCode),
-				zap.String("url", p.config.URL))
+				zap.String("url", p.logURL))
 			return types.NewAuthError(types.ErrTypeInternalError, "webhook request timeout", resp.StatusCode)
 		case http.StatusTooManyRequests:
 			// Rate limiting - can retry with backoff
 			p.logger.Warn("Webhook rate limited",
 				zap.Int("status_code", resp.StatusCode),
-				zap.String("url", p.config.URL))
+				zap.String("url", p.logURL))
 			return types.NewAuthError(types.ErrTypeRateLimit, "webhook rate limited", resp.StatusCode)
 		default:
 			// All other 4xx errors are permanent client errors - don't retry
 			p.logger.Warn("Invalid authentication response",
 				zap.Int("status_code", resp.StatusCode),
-				zap.String("url", p.config.URL))
+				zap.String("url", p.logURL))
 			return types.NewAuthError(types.ErrTypeInvalidRequest, fmt.Sprintf("webhook client error: %d", resp.StatusCode), resp.StatusCode)
 		}
 	}
 	// 5xx server errors - can be retried
 	p.logger.Error("Request failed with status",
 		zap.Int("status_code", resp.StatusCode),
-		zap.String("url", p.config.URL))
+		zap.String("url", p.logURL))
 	return types.NewAuthError(types.ErrTypeInternalError, fmt.Sprintf("webhook service error: %d", resp.StatusCode), resp.StatusCode)
 }
 
@@ -347,10 +371,11 @@ func (l *leveledLoggerAdapter) Warn(msg string, keysAndValues ...any) {
 	l.Logger.Warn(msg, mapKvToZapFields(keysAndValues...)...)
 }
 
-// mapKvToZapFields converts key-value pairs to zap fields.
+// mapKvToZapFields converts key-value pairs to zap fields. The retryable client puts
+// the request URL into its url, request and error values, so those are redacted.
 func mapKvToZapFields(keysAndValues ...any) []zap.Field {
 	if len(keysAndValues)%2 != 0 {
-		return []zap.Field{zap.Any("invalid_kv_pairs", keysAndValues)}
+		return []zap.Field{zap.Int("invalid_kv_pairs", len(keysAndValues))}
 	}
 
 	fields := make([]zap.Field, 0, len(keysAndValues)/2)
@@ -359,7 +384,38 @@ func mapKvToZapFields(keysAndValues ...any) []zap.Field {
 		if !ok {
 			key = fmt.Sprintf("key_%d", i/2)
 		}
-		fields = append(fields, zap.Any(key, keysAndValues[i+1]))
+		fields = append(fields, zap.Any(key, logSafeValue(key, keysAndValues[i+1])))
 	}
 	return fields
+}
+
+// logSafeValue strips URL credentials from a retryable client log value. A url value
+// is a URL, a request value is "METHOD URL" with an optional status suffix, and an
+// error value can embed the request URL or a redirect Location.
+func logSafeValue(key string, value any) any {
+	if err, ok := value.(error); ok {
+		// The retryable client logs each failed attempt, so an unrecognized error
+		// here is not the final one.
+		if category, ok := requestErrorCategory(err); ok {
+			return category
+		}
+		return "request failed"
+	}
+	s, ok := value.(string)
+	if !ok {
+		return value
+	}
+	switch key {
+	case "url":
+		return redactedURL(s)
+	case "request":
+		parts := strings.SplitN(s, " ", 3)
+		if len(parts) < 2 {
+			return ""
+		}
+		parts[1] = redactedURL(parts[1])
+		return strings.Join(parts, " ")
+	default:
+		return value
+	}
 }

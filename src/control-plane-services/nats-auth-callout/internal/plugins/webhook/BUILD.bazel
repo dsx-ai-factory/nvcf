@@ -45,6 +45,7 @@ go_test(
         "//src/control-plane-services/nats-auth-callout/internal/plugins/types",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@org_uber_go_zap//:zap",
         "@org_uber_go_zap//zapcore",
         "@org_uber_go_zap//zaptest",
     ],

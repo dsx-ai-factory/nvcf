@@ -33,6 +33,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest"
 )
@@ -538,6 +539,96 @@ func TestWebhookPluginAuditLogOmitsURLCredentials(t *testing.T) {
 			for _, secret := range secrets {
 				assert.NotContains(t, err.Error(), secret, "error must not contain URL credentials")
 				assert.NotContains(t, out.String(), secret, "audit entry must not contain URL credentials")
+			}
+		})
+	}
+}
+
+// TestLogSafeValueUnrecognizedError checks that an error the categories don't
+// cover is logged without its text, and without claiming the retries ran out.
+func TestLogSafeValueUnrecognizedError(t *testing.T) {
+	err := errors.New("POST http://user:secret@example.com/?token=secret failed")
+	assert.Equal(t, "request failed", logSafeValue("error", err))
+}
+
+// TestWebhookPluginServiceLogsOmitURLCredentials checks that the service log lines
+// written by the plugin and the retryable client keep only the scheme, host and path
+// of the configured webhook URL.
+func TestWebhookPluginServiceLogsOmitURLCredentials(t *testing.T) {
+	secrets := []string{"audit-user", "audit-password", "audit-query-secret", "redirect-secret"}
+	tests := []struct {
+		name     string
+		handler  http.HandlerFunc
+		wantLogs []string
+	}{
+		{
+			name: "success",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(createSuccessfulResponse())
+			},
+		},
+		{
+			name: "error response",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			wantLogs: []string{"Authentication denied"},
+		},
+		{
+			name: "retried error response",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			},
+			wantLogs: []string{"(status: 503)"},
+		},
+		{
+			name: "transport failure",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					conn.Close()
+				}
+			},
+			wantLogs: []string{`"error":"Post: connection failed"`},
+		},
+		{
+			name: "malformed redirect location",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Location", "http://[::1%zz?token="+secrets[3])
+				w.WriteHeader(http.StatusFound)
+			},
+			wantLogs: []string{`"error":"Post: request error"`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(tt.handler)
+			defer server.Close()
+			webhookURL, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			webhookURL.User = url.UserPassword(secrets[0], secrets[1])
+			webhookURL.RawQuery = "token=" + secrets[2]
+			webhookURL.Fragment = secrets[2]
+
+			var out bytes.Buffer
+			encoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+			logger := zap.New(zapcore.NewCore(encoder, zapcore.Lock(zapcore.AddSync(&out)), zapcore.DebugLevel))
+			plugin, err := NewPlugin(Config{URL: webhookURL.String(), Timeout: 5 * time.Second, RetryAttempts: 1}, logger)
+			require.NoError(t, err)
+			plugin.auditLogger = zap.NewNop()
+
+			authReq := &types.Request{Account: "test-account", PluginName: "webhook-alias", Payload: "test-token"}
+			_, _ = plugin.Authenticate(context.Background(), authReq)
+
+			logs := out.String()
+			assert.Contains(t, logs, `"url":"`+server.URL+`"`)
+			for _, want := range tt.wantLogs {
+				assert.Contains(t, logs, want)
+			}
+			for _, secret := range secrets {
+				assert.NotContains(t, logs, secret, "service logs must not contain URL credentials")
 			}
 		})
 	}
