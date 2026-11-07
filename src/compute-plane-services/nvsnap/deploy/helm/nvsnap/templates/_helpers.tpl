@@ -153,3 +153,24 @@ imagePullSecrets:
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{/*
+nvsnap.server.internalLB prints "true" when server.service.annotations hold
+an annotation that makes a cloud provider's load balancer internal, and
+nothing otherwise. Only these keys and values count: an unrelated or
+misspelled annotation would leave the load balancer public.
+*/}}
+{{- define "nvsnap.server.internalLB" -}}
+{{- $a := .Values.server.service.annotations | default dict -}}
+{{- $is := dict
+  "service.beta.kubernetes.io/aws-load-balancer-internal" "true"
+  "service.beta.kubernetes.io/aws-load-balancer-scheme" "internal"
+  "networking.gke.io/load-balancer-type" "internal"
+  "cloud.google.com/load-balancer-type" "internal"
+  "service.beta.kubernetes.io/azure-load-balancer-internal" "true"
+  "service.beta.kubernetes.io/oci-load-balancer-internal" "true"
+  "oci-network-load-balancer.oraclecloud.com/internal" "true" -}}
+{{- range $k, $v := $is -}}
+{{- if and (hasKey $a $k) (eq (lower (toString (index $a $k))) $v) }}true{{ end -}}
+{{- end -}}
+{{- end }}

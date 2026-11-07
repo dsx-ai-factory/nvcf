@@ -199,8 +199,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "nvsnap.server.labels" . | nindent 4 }}
-  {{- if and (eq .Values.server.service.type "LoadBalancer") (empty .Values.server.service.annotations) }}
-  {{- fail "server.service.type=LoadBalancer needs server.service.annotations that make the load balancer internal; the server API must not be public. Use ClusterIP and kubectl port-forward instead." }}
+  {{- if and (eq .Values.server.service.type "LoadBalancer") (not (include "nvsnap.server.internalLB" .)) }}
+  {{- fail "server.service.type=LoadBalancer needs a server.service.annotations entry that makes the load balancer internal (aws-load-balancer-scheme: internal, aws-load-balancer-internal: \"true\", networking.gke.io/load-balancer-type: Internal, azure-load-balancer-internal: \"true\", oci-load-balancer-internal: \"true\" or oci-network-load-balancer.oraclecloud.com/internal: \"true\"); the server API must not be public. Use ClusterIP and kubectl port-forward instead." }}
   {{- end }}
   {{- with .Values.server.service.annotations }}
   annotations:

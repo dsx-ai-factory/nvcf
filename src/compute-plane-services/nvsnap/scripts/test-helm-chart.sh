@@ -142,8 +142,8 @@ done
 pass "empty image tags fail the chart render with a clear error"
 
 # 7. The server API must not get a public address: the default Service
-# is ClusterIP, and a LoadBalancer without annotations (which must make
-# it internal) fails the render.
+# is ClusterIP, and a LoadBalancer without an annotation that makes it
+# internal on its cloud fails the render.
 SVC_BLOCK=$(awk 'BEGIN{RS="\n---\n"} /kind: Service\n/ && /name: nvsnap-server\n/ {print; exit}' <<<"$RENDER")
 [[ -n "$SVC_BLOCK" ]] || fail "no Service named 'nvsnap-server' in rendered output"
 echo "$SVC_BLOCK" | grep -qE '^\s*type: ClusterIP$' \
@@ -156,6 +156,17 @@ LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.ty
   || fail "a LoadBalancer nvsnap-server with annotations should render"
 grep -q 'service.beta.kubernetes.io/aws-load-balancer-scheme: internal' <<<"$LB" \
   || fail "server.service.annotations not rendered on the nvsnap-server Service"
-pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs annotations"
+for bad in 'foo=bar' 'service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing'; do
+  if helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
+    --set-string "server.service.annotations.$bad" >/dev/null 2>&1; then
+    fail "a LoadBalancer nvsnap-server with only '$bad' is not internal and should fail the chart render but didn't"
+  fi
+done
+for good in 'networking\.gke\.io/load-balancer-type=Internal' 'service\.beta\.kubernetes\.io/oci-load-balancer-internal=true' 'service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
+  helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
+    --set-string "server.service.annotations.$good" >/dev/null 2>&1 \
+    || fail "a LoadBalancer nvsnap-server with '$good' is internal and should render"
+done
+pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs an annotation that makes it internal"
 
 echo "OK — all helm chart checks passed"

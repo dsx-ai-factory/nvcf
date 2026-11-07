@@ -99,7 +99,7 @@ pod is prepared for capture or restore, and every pod starts cold.
 | `agent.election.enabled` | `false` | One downloader per hash when a chart starts many workers (cachedir only) |
 | `agent.l2.storageClass` | | The StorageClass of the per-checkpoint volume pair; empty keeps checkpoints on their nodes |
 | `agent.auth.enabled`, `agent.auth.mode` | `false`, `permissive` | Bearer-token checks on the agent API. Turn on, run `permissive` until no unauthenticated calls are counted, then `required` |
-| `server.service.type` | `ClusterIP` | Reach the server with `kubectl port-forward`. `LoadBalancer` renders only with `server.service.annotations` that make it internal |
+| `server.service.type` | `ClusterIP` | Reach the server with `kubectl port-forward`. `LoadBalancer` renders only with a `server.service.annotations` entry that makes it internal ([Reaching nvsnap-server](#reaching-nvsnap-server)) |
 
 ## Turning nvsnap off for some or all pods
 
@@ -119,6 +119,13 @@ helm upgrade nvsnap deploy/helm/nvsnap --namespace nvsnap-system --reuse-values
 
 The agent DaemonSet rolls one node at a time. An instance capture does not
 start while agents run different revisions.
+
+Before this chart version `server.service.type` defaulted to
+`LoadBalancer`. An install that kept that default becomes `ClusterIP` on
+upgrade, and the server's external address goes away; reach it with
+`kubectl port-forward` ([Reaching nvsnap-server](#reaching-nvsnap-server)).
+An install that sets `LoadBalancer` explicitly must also set an internal
+annotation, or the upgrade fails before anything changes.
 
 ## Uninstall
 
@@ -154,9 +161,21 @@ with ones that match your GPU nodes, in a values file passed with `-f`.
 
 The server's Service is `ClusterIP`, so it has no external IP. Use
 `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080:8080`.
-A `LoadBalancer` renders only with `server.service.annotations` that make
-it internal on your cloud; without them `helm template` and `helm upgrade`
-fail.
+A `LoadBalancer` renders only when `server.service.annotations` has one of
+these entries, which make it internal on its cloud; otherwise `helm
+template` and `helm upgrade` fail. The check is `nvsnap.server.internalLB`
+in [`_helpers.tpl`](../../deploy/helm/nvsnap/templates/_helpers.tpl), used
+by the `nvsnap-server` Service in
+[`server.yaml`](../../deploy/helm/nvsnap/templates/server.yaml).
+
+| Cloud | Annotation |
+|---|---|
+| AWS | `service.beta.kubernetes.io/aws-load-balancer-scheme: internal` or `service.beta.kubernetes.io/aws-load-balancer-internal: "true"` |
+| GKE | `networking.gke.io/load-balancer-type: Internal` (or the older `cloud.google.com/load-balancer-type: Internal`) |
+| Azure | `service.beta.kubernetes.io/azure-load-balancer-internal: "true"` |
+| OCI | `service.beta.kubernetes.io/oci-load-balancer-internal: "true"` or `oci-network-load-balancer.oraclecloud.com/internal: "true"` |
+
+On another platform, keep `ClusterIP` and expose the server your own way.
 
 ### Restored pods start cold
 
