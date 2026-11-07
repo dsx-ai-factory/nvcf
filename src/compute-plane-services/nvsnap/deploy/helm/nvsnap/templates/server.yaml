@@ -204,7 +204,10 @@ metadata:
   {{- end }}
   {{- with .Values.server.service.annotations }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- /* Kubernetes takes only string values; --set makes true a bool. */}}
+    {{- range $k, $v := . }}
+    {{ $k }}: {{ toString $v | quote }}
+    {{- end }}
   {{- end }}
 spec:
   type: {{ .Values.server.service.type }}

@@ -178,6 +178,12 @@ for good in 'networking\.gke\.io/load-balancer-type=Internal' 'service\.beta\.ku
     --set-string "server.service.annotations.$good" >/dev/null 2>&1 \
     || fail "a LoadBalancer nvsnap-server with '$good' is internal and should render"
 done
+# --set makes "true" a bool; Kubernetes takes only string annotation values.
+LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
+  --set 'server.service.annotations.service\.beta\.kubernetes\.io/oci-load-balancer-internal=true') \
+  || fail "a LoadBalancer nvsnap-server with a bool internal annotation should render"
+grep -q 'service.beta.kubernetes.io/oci-load-balancer-internal: "true"' <<<"$LB" \
+  || fail "nvsnap-server annotation values are not rendered as strings"
 pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs an annotation that makes it internal"
 
 echo "OK — all helm chart checks passed"
