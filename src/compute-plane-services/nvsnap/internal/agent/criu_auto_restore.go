@@ -108,7 +108,7 @@ func (a *Agent) startCRIUAutoRestore(ctx context.Context) error {
 	}
 	c := a.criuRestorer()
 	c.watchStart = time.Now()
-	metrics.SetBuildInfo(a.currentBundle())
+	a.publishBuildInfo()
 	go c.recoverInterruptedCaptures(ctx, c.watchStart)
 	factory := informers.NewSharedInformerFactoryWithOptions(a.kubeClient, 30*time.Second,
 		informers.WithTweakListOptions(func(o *metav1.ListOptions) { o.FieldSelector = "spec.nodeName=" + a.config.NodeName }))

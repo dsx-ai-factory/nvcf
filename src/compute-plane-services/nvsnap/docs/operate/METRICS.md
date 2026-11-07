@@ -164,21 +164,53 @@ listed starts cold.
 ## Install
 
 The agent serves `/metrics` on its API port (8081, `http-api`), without
-authentication. To have the cluster's Prometheus keep it:
+authentication. The chart has the cluster's Prometheus keep it: on a
+cluster that serves the Prometheus Operator's ServiceMonitor API, it
+installs a ServiceMonitor for the agents. A collector that discovers
+ServiceMonitors then scrapes the agents with no step after the install.
+The defaults suit two such collectors:
+
+- a Prometheus Operator Prometheus that reads monitors in `monitoring`
+  labelled `prometheus.agent/servicemonitor-discover: "true"`, as the NVCA
+  monitor of `examples/cluster-monitoring-sample` expects;
+- the `deploy/stacks/observability` collector, which reads monitors
+  labelled `nvcf.nvidia.com/observability-target: "true"` in any namespace.
 
 ```yaml
 agent:
   metrics:
     serviceMonitor:
-      enabled: true
-      namespace: ""     # one whose monitors the cluster's Prometheus reads ("" is the release's)
-      labels: {}        # what the cluster's Prometheus selects monitors by
+      enabled: auto     # auto: when the cluster serves the API; true: always; false: never
+      namespace: monitoring   # one whose monitors the cluster's Prometheus reads
+      labels:                 # what that Prometheus selects monitors by
+        prometheus.agent/servicemonitor-discover: "true"
+        nvcf.nvidia.com/observability-target: "true"
       interval: 30s
     dashboard:
       enabled: true     # a Grafana dashboard ConfigMap (grafana_dashboard: "1")
       labels: {}
 ```
 
-The ServiceMonitor needs the Prometheus Operator CRDs. The dashboard is
+- **A cluster without the namespace.** The ServiceMonitor goes into the
+  release's namespace instead, so the install does not fail. The chart
+  can tell only on a live install; under `helm template` or a GitOps
+  renderer it uses the configured namespace.
+- **A Prometheus that selects monitors differently.** Set `namespace` and
+  `labels` to what it reads. Remove a default label by setting it to
+  `null`.
+
+- **A collector that does not read ServiceMonitors.** The OpenTelemetry
+  collector of `examples/cluster-monitoring-sample/otel-collector-k8s.yaml`
+  has its own scrape jobs. Add one for the agents: Kubernetes endpoints of
+  the `nvsnap-agent` Service in the release's namespace, port `http-api`,
+  path `/metrics`.
+- **An installer that may not read namespaces.** The chart looks up the
+  configured namespace before using it. Set `namespace: ""` to use the
+  release's namespace without a lookup.
+
+To check that the agents are scraped, query `nvsnap_build_info` in the
+cluster's Prometheus: there is one series per agent.
+
+The dashboard is
 `deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`; import
 it by hand into a Grafana without the dashboard sidecar.

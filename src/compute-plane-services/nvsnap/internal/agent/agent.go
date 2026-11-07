@@ -556,6 +556,9 @@ func New(cfg Config) (*Agent, error) {
 // Run starts the agent
 func (a *Agent) Run(ctx context.Context) error {
 	metrics.RegisterAgent()
+	// Every agent exports nvsnap_build_info, whatever its capture method,
+	// so a missing series means an agent is not scraped.
+	a.publishBuildInfo()
 	// A capture this agent was holding pods for ended with its last run.
 	a.recoverPodHolds(a.log.WithField("subsys", "pod-hold"))
 	// So did a dump it was running: replace what it may have left stopped.

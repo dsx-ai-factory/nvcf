@@ -17,9 +17,11 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -288,4 +290,40 @@ func TestValidBundleID(t *testing.T) {
 		}
 	}
 	_ = webhook.BundleMeta
+}
+
+// TestPublishBuildInfo: every agent exports nvsnap_build_info, with the
+// bundle it serves or "unknown" before one is installed, so a missing
+// series means an agent is not scraped (docs/operate/METRICS.md).
+func TestPublishBuildInfo(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.BuildInfo)
+	buildInfo := func() map[string]float64 {
+		t.Helper()
+		mfs, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]float64{}
+		for _, mf := range mfs {
+			for _, m := range mf.GetMetric() {
+				got[m.GetLabel()[0].GetValue()] = m.GetGauge().GetValue()
+			}
+		}
+		return got
+	}
+
+	a := bundleAgent(t)
+	a.publishBuildInfo()
+	if got := buildInfo(); len(got) != 1 || got["unknown"] != 1 {
+		t.Fatalf("nvsnap_build_info before a bundle = %v, want {unknown: 1}", got)
+	}
+	stageVersion(t, a, "c0", 0)
+	if err := os.WriteFile(filepath.Join(a.bundleRoot(), "current-bundle"), []byte("c0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.publishBuildInfo()
+	if got := buildInfo(); len(got) != 1 || got["c0"] != 1 {
+		t.Fatalf("nvsnap_build_info with bundle c0 = %v, want {c0: 1}", got)
+	}
 }

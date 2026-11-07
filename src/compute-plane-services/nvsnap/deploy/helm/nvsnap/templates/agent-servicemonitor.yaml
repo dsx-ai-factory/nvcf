@@ -1,4 +1,6 @@
-{{- if and .Values.agent.enabled .Values.agent.metrics.serviceMonitor.enabled }}
+{{- $sm := .Values.agent.metrics.serviceMonitor }}
+{{- $on := toString $sm.enabled }}
+{{- if and .Values.agent.enabled (or (eq $on "true") (and (eq $on "auto") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor"))) }}
 {{- /* Guard first: a disabled feature must emit nothing at all (see grafana-dashboard.yaml). */ -}}
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -21,10 +23,21 @@ apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: nvsnap-agent
-  namespace: {{ .Values.agent.metrics.serviceMonitor.namespace | default .Release.Namespace }}
+  {{- /* A namespace the cluster lacks would fail the install: use the
+       release's instead. lookup answers only against a live cluster; under
+       helm template or a GitOps renderer it finds nothing, not even
+       kube-system, and the configured namespace stands. The release's own
+       namespace is used without a lookup. A lookup the installer may not
+       make fails the install; an installer that may create the agent's
+       ClusterRole (agent-rbac.yaml grants get on namespaces) may make it,
+       unless it creates roles through the escalate verb alone: such an
+       installer sets namespace "" (the release's). */}}
+  {{- $smNS := $sm.namespace | default .Release.Namespace }}
+  {{- if and (ne $smNS .Release.Namespace) (lookup "v1" "Namespace" "" "kube-system") (not (lookup "v1" "Namespace" "" $smNS)) }}{{ $smNS = .Release.Namespace }}{{ end }}
+  namespace: {{ $smNS }}
   labels:
     {{- include "nvsnap.agent.labels" . | nindent 4 }}
-    {{- range $k, $v := .Values.agent.metrics.serviceMonitor.labels }}
+    {{- range $k, $v := $sm.labels }}
     {{ $k }}: {{ $v | toString | quote }}
     {{- end }}
 spec:
@@ -39,5 +52,5 @@ spec:
   endpoints:
     - port: http-api
       path: /metrics
-      interval: {{ .Values.agent.metrics.serviceMonitor.interval }}
+      interval: {{ $sm.interval }}
 {{- end }}

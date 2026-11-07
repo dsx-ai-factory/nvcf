@@ -488,13 +488,25 @@ agent:
   # The capture and restore history (docs/operate/METRICS.md): the agents'
   # /metrics, scraped by the cluster's Prometheus so it outlives the agents.
   metrics:
-    # A Prometheus Operator ServiceMonitor for the agents. Off by default;
-    # set labels to what the cluster's Prometheus selects monitors by, and
-    # namespace to one whose monitors it reads ("" is the release's).
+    # A Prometheus Operator ServiceMonitor for the agents, so the history
+    # is scraped from the moment the chart is installed.
+    #   enabled: auto  - when the cluster serves the ServiceMonitor API
+    #            true  - always (the install fails without the CRDs)
+    #            false - never
+    # namespace is one whose monitors the cluster's Prometheus reads; when
+    # the cluster has no such namespace the release's is used. labels are
+    # what the collectors select monitors by. The defaults suit both
+    # collectors this repository knows: the cluster Prometheus agent of
+    # examples/cluster-monitoring-sample (namespace monitoring and its
+    # discover label) and the deploy/stacks/observability collector (its
+    # observability-target label, any namespace). To drop a default label,
+    # set it to null.
     serviceMonitor:
-      enabled: false
-      namespace: ""
-      labels: {}
+      enabled: auto
+      namespace: monitoring
+      labels:
+        prometheus.agent/servicemonitor-discover: "true"
+        nvcf.nvidia.com/observability-target: "true"
       interval: 30s
     # A Grafana dashboard of the history, as a ConfigMap labelled for the
     # Grafana dashboard sidecar (grafana_dashboard: "1").

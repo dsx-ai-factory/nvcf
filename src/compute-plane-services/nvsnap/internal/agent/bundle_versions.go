@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -468,3 +469,7 @@ func (a *Agent) nodeArch(ctx context.Context, node string) string {
 	}
 	return n.Labels[corev1.LabelArchStable]
 }
+
+// publishBuildInfo sets nvsnap_build_info to the bundle this agent serves
+// ("unknown" before one is installed).
+func (a *Agent) publishBuildInfo() { metrics.SetBuildInfo(a.currentBundle()) }
