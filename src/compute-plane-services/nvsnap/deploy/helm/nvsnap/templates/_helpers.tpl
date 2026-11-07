@@ -155,22 +155,31 @@ imagePullSecrets:
 {{- end }}
 
 {{/*
-nvsnap.server.internalLB prints "true" when server.service.annotations hold
-an annotation that makes a cloud provider's load balancer internal, and
-nothing otherwise. Only these keys and values count: an unrelated or
-misspelled annotation would leave the load balancer public.
+nvsnap.server.internalLB prints "true" when server.service.annotations
+make a cloud provider's load balancer internal, and nothing otherwise.
+At least one of the keys below must be present, and every one of them that
+is present must have its internal value, exactly as the provider spells
+it: an unrelated, misspelled or contradicting annotation (GKE's legacy key
+"Internal" with the current one "External", say) could leave the load
+balancer public.
 */}}
 {{- define "nvsnap.server.internalLB" -}}
 {{- $a := .Values.server.service.annotations | default dict -}}
 {{- $is := dict
   "service.beta.kubernetes.io/aws-load-balancer-internal" "true"
   "service.beta.kubernetes.io/aws-load-balancer-scheme" "internal"
-  "networking.gke.io/load-balancer-type" "internal"
-  "cloud.google.com/load-balancer-type" "internal"
+  "networking.gke.io/load-balancer-type" "Internal"
+  "cloud.google.com/load-balancer-type" "Internal"
   "service.beta.kubernetes.io/azure-load-balancer-internal" "true"
   "service.beta.kubernetes.io/oci-load-balancer-internal" "true"
   "oci-network-load-balancer.oraclecloud.com/internal" "true" -}}
+{{- $seen := false -}}
+{{- $bad := false -}}
 {{- range $k, $v := $is -}}
-{{- if and (hasKey $a $k) (eq (lower (toString (index $a $k))) $v) }}true{{ end -}}
+{{- if hasKey $a $k -}}
+{{- $seen = true -}}
+{{- if ne (toString (index $a $k)) $v }}{{ $bad = true }}{{ end -}}
 {{- end -}}
+{{- end -}}
+{{- if and $seen (not $bad) }}true{{ end -}}
 {{- end }}

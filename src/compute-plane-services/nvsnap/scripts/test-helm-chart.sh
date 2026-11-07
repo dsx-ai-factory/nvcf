@@ -156,10 +156,21 @@ LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.ty
   || fail "a LoadBalancer nvsnap-server with annotations should render"
 grep -q 'service.beta.kubernetes.io/aws-load-balancer-scheme: internal' <<<"$LB" \
   || fail "server.service.annotations not rendered on the nvsnap-server Service"
-for bad in 'foo=bar' 'service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing'; do
+# Each entry is one or more comma-separated annotations that together do
+# not make the load balancer internal: unrelated, external, misspelled
+# values, and an internal annotation contradicted by another one.
+for bad in 'foo=bar' \
+  'service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
+  'networking\.gke\.io/load-balancer-type=internal' \
+  'service\.beta\.kubernetes\.io/azure-load-balancer-internal=True' \
+  'cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=External' \
+  'service\.beta\.kubernetes\.io/aws-load-balancer-internal=true,service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing'; do
+  args=()
+  IFS=, read -ra kvs <<<"$bad"
+  for kv in "${kvs[@]}"; do args+=(--set-string "server.service.annotations.$kv"); done
   if helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
-    --set-string "server.service.annotations.$bad" >/dev/null 2>&1; then
-    fail "a LoadBalancer nvsnap-server with only '$bad' is not internal and should fail the chart render but didn't"
+    "${args[@]}" >/dev/null 2>&1; then
+    fail "a LoadBalancer nvsnap-server with '$bad' is not internal and should fail the chart render but didn't"
   fi
 done
 for good in 'networking\.gke\.io/load-balancer-type=Internal' 'service\.beta\.kubernetes\.io/oci-load-balancer-internal=true' 'service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do

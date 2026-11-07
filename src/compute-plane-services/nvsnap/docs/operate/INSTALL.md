@@ -175,6 +175,9 @@ by the `nvsnap-server` Service in
 | Azure | `service.beta.kubernetes.io/azure-load-balancer-internal: "true"` |
 | OCI | `service.beta.kubernetes.io/oci-load-balancer-internal: "true"` or `oci-network-load-balancer.oraclecloud.com/internal: "true"` |
 
+Values must be spelled exactly as shown. If more than one of these keys is
+set, every one must have its internal value: GKE's older key at `Internal`
+beside the current one at `External`, for example, fails the render.
 On another platform, keep `ClusterIP` and expose the server your own way.
 
 ### Restored pods start cold
