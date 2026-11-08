@@ -125,6 +125,9 @@ type Config struct {
 	// QuarantineResume is how long intake stays stopped after a trip before
 	// it reads new segments again. Zero uses the fault handling default.
 	QuarantineResume time.Duration
+	// Spool bounds spool use: when data is deleted to keep the spool from
+	// filling, and how much free space preparing leaves.
+	Spool SpoolPolicy
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -267,6 +270,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	spool, err := spoolPolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -296,6 +303,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 
 		QuarantineTrip:   quarantineTrip,
 		QuarantineResume: quarantineResume,
+		Spool:            spool,
 	}, warnings, nil
 }
 
