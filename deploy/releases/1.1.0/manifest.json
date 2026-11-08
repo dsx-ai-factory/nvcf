@@ -16,30 +16,30 @@
       "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
       "inventory_sha256": "sha256:ee76f728cfdf8d23ded4e5e63cba0e96bb3a53b7055e5ebb966204d33f27c9d1",
       "compatible_with": {
-        "control-plane": "1.1.4",
-        "observability": "1.0.0"
+        "control-plane": "1.1.5",
+        "observability": "1.1.0"
       }
     },
     "control-plane": {
-      "version": "1.1.4",
-      "source_tag": "deploy/stacks/self-managed/v1.1.4",
-      "source_commit": "c2cd56319bddb7ac8b9c8037d44aa0a95f5aa1bf",
+      "version": "1.1.5",
+      "source_tag": "deploy/stacks/self-managed/v1.1.5",
+      "source_commit": "e11b44050c3770d650d5fd4bf0b8e8bebca6786c",
       "inventory_asset": "nvcf-self-managed-stack-inventory.json",
-      "inventory_sha256": "sha256:ca5bf57cfb7053fbca84eab62db9e5175bb5b431883c522f0d3dde1952e65992",
+      "inventory_sha256": "sha256:2e4ce14b997e2ceda8dbdd54419193ccdc65a1cffe65734d7d3bada3c4f2543f",
       "compatible_with": {
         "compute-plane": "1.1.0",
-        "observability": "1.0.0"
+        "observability": "1.1.0"
       }
     },
     "observability": {
-      "version": "1.0.0",
-      "source_tag": "deploy/stacks/observability/v1.0.0",
-      "source_commit": "b77e96a3f8c18e9318b93e697e33e596c4ede7d7",
+      "version": "1.1.0",
+      "source_tag": "deploy/stacks/observability/v1.1.0",
+      "source_commit": "d1918a811df7e7bc6be7d6cc625844b6f5e30b42",
       "inventory_asset": "nvcf-observability-stack-inventory.json",
-      "inventory_sha256": "sha256:28ff55447c9223be0472ce9157fa9f4eb6dc7c5092a7c4281e29826e9f3df6de",
+      "inventory_sha256": "sha256:3833771ad85f14af832fcd60b9de95a48dd05af2f5e666c5a5d6324a5af91c82",
       "compatible_with": {
         "compute-plane": "1.1.0",
-        "control-plane": "1.1.4"
+        "control-plane": "1.1.5"
       }
     }
   }
