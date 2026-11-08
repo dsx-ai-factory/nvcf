@@ -606,7 +606,7 @@ func TestFailGroup_RecordsOnlyOnItsOwnRecord(t *testing.T) {
 }
 
 // A group's failure, as its record keeps it, names every member with the
-// start of its own error, however long each member's error is: the member
+// start and end of its own error, however long each member's error is: the member
 // that failed on its own is not hidden behind the others' aborts.
 func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	abort := "checkpoint failed: CRIU dump failed (criu-v2): action.sh exited, status=1 " + strings.Repeat("Unseizing 4174664 into 1 | ", 400)
@@ -626,6 +626,27 @@ func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	}
 	if len(reason) > groupReasonMax || len(reason) > 3*(groupMemberErrorMax+16)+64 {
 		t.Errorf("reason of %d bytes, want each member bounded", len(reason))
+	}
+}
+
+// A member's error keeps its end: a tool's own error comes after its
+// command line and its progress, which alone fill the bound.
+func TestMemberFailureKeepsTheEnd(t *testing.T) {
+	err := "500 Internal Server Error: restore failed: gpushare resume: nvsnap-gpu-suspend --hold-gate --fabric-map /w/.fabric-s1 resume " +
+		strings.Repeat("123 ", 60) + ": exit status 1 (output: " + strings.Repeat("pid=883 fabmap /w/out.883: ok 267 fabric handle(s) | ", 12) +
+		"fabric map: 267 handle(s) in /w/out; waiting for /w/in | no /w/in after 600 s)"
+	got := memberFailure("fn/worker-0", err)
+	if !strings.HasPrefix(got, "fn/worker-0: 500 Internal Server Error: restore failed: gpushare resume") {
+		t.Errorf("lost the start: %q", got[:80])
+	}
+	if !strings.HasSuffix(got, "no /w/in after 600 s)") {
+		t.Errorf("lost the cause at the end: %q", got[len(got)-80:])
+	}
+	if n := len(got) - len("fn/worker-0: "); n != groupMemberErrorMax {
+		t.Errorf("member error of %d bytes, want %d", n, groupMemberErrorMax)
+	}
+	if short := memberFailure("p", "boom"); short != "p: boom" {
+		t.Errorf("a short error changed: %q", short)
 	}
 }
 
