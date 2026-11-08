@@ -478,9 +478,11 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	companions, companionContainers, err := a.discoverCompanions(ctx, ranks, log)
 	if err != nil {
-		log.WithError(err).Warn("CRIU group capture: skipped; a companion of the instance cannot be captured")
-		return false
+		// Labelled by the ranks' configuration: the instance's own key
+		// takes its companions too.
+		return c.companionsUnknown(ctx, criuGroupKey(instanceConfigURI(ranks), scope), leader, len(ranks), err, log)
 	}
+	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
 		if webhook.DynamoComponent(r) && len(companions) == 0 {
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
@@ -672,6 +674,35 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		// record).
 		c.deleteInstance(context.WithoutCancel(ctx), members, log)
 	}
+	return false
+}
+
+// companionMaxFailures bounds the attempts to tell an instance's
+// companions: each follows the last by a pod event and criuGroupWarmup.
+const companionMaxFailures = 5
+
+// companionsUnknown handles an instance whose companions could not be
+// told (err): a node's agent that did not answer, a pod that was
+// restarting. Such a failure passes, so the capture is tried again on a
+// later event of the leader (again true); one that keeps failing is
+// counted as a refusal, with its reason, in the metric, the summary line
+// and an event on the pod, rather than leave the instance uncaptured with
+// nothing but a log line to say so. No record is written: without its
+// companions the instance's configuration, its record's key, is not known.
+func (c *criuAutoRestorer) companionsUnknown(ctx context.Context, key string, leader *corev1.Pod, ranks int, err error, log *logrus.Entry) (again bool) {
+	n := 1
+	if v, ok := c.companionFailures.Load(leader.UID); ok {
+		n = v.(int) + 1
+	}
+	c.companionFailures.Store(leader.UID, n)
+	if n < companionMaxFailures {
+		log.WithError(err).WithField("attempt", n).Warn("CRIU group capture: the instance's companions cannot be told yet; trying again")
+		return true
+	}
+	c.companionFailures.Delete(leader.UID)
+	why := fmt.Sprintf("a companion of the instance cannot be captured (%d attempts): %v", n, err)
+	log.WithError(err).Warn("CRIU group capture: skipped; " + why)
+	c.observeRefusal(ctx, key, leader, ranks, why, log)
 	return false
 }
 

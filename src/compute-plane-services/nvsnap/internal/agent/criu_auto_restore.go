@@ -92,7 +92,10 @@ type criuAutoRestorer struct {
 	// readyObserved: pod UID -> struct{}: its start was recorded
 	// (lifecycle_metrics.go); pods Ready before watchStart are not.
 	readyObserved sync.Map
-	watchStart    time.Time
+	// companionFailures: leader pod UID -> int: its instance's companions
+	// could not be told this many times in a row (criu_group.go).
+	companionFailures sync.Map
+	watchStart        time.Time
 
 	mu        sync.Mutex
 	blocked   map[string]bool

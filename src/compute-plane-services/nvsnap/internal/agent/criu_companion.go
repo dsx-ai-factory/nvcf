@@ -124,14 +124,18 @@ func (a *Agent) discoverCompanions(ctx context.Context, ranks []*corev1.Pod, log
 			if found[p.Name] != nil || p.Status.PodIP == "" || p.Spec.NodeName == "" {
 				continue
 			}
+			running := runningContainers(p)
+			if len(running) == 0 {
+				continue
+			}
 			base, err := a.peerAgentURL(ctx, p.Spec.NodeName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("pod %s: %w", p.Name, err)
 			}
-			for _, c := range p.Spec.Containers {
-				ips, err := fetchPeers(ctx, base, p.Namespace, p.Name, c.Name, false)
+			for _, c := range running {
+				ips, err := fetchPeers(ctx, base, p.Namespace, p.Name, c, false)
 				if err != nil {
-					return nil, nil, fmt.Errorf("pod %s: container %s: connections: %w", p.Name, c.Name, err)
+					return nil, nil, fmt.Errorf("pod %s: container %s: connections: %w", p.Name, c, err)
 				}
 				peersOf[p.Name] = append(peersOf[p.Name], ips...)
 			}
@@ -233,6 +237,27 @@ func companionCandidates(pods []corev1.Pod, ranks []*corev1.Pod) []*corev1.Pod {
 			continue
 		}
 		out = append(out, p)
+	}
+	return out
+}
+
+// runningContainers returns the containers of p that run. Only they can
+// hold connections: a pod of the namespace whose container is down (a
+// telemetry agent in a crash loop, say) is no client of the instance while
+// it is, and asking its node for that container's connections fails, which
+// must not keep the instance from being captured (2026-11-08).
+func runningContainers(p *corev1.Pod) []string {
+	run := map[string]bool{}
+	for i := range p.Status.ContainerStatuses {
+		if cs := &p.Status.ContainerStatuses[i]; cs.State.Running != nil {
+			run[cs.Name] = true
+		}
+	}
+	var out []string
+	for i := range p.Spec.Containers {
+		if name := p.Spec.Containers[i].Name; run[name] {
+			out = append(out, name)
+		}
 	}
 	return out
 }
