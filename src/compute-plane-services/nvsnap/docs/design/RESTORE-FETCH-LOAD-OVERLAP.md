@@ -25,21 +25,21 @@ rails fetch tool, and `nvsnap-gpu-suspend resume` (gpushare). Goes with the cloc
 ## 1. The problem
 
 A restore on a node that does not hold the checkpoint fetches all of it to the node's NVMe, then restores
-from there. The two steps run one after the other. A 2-node Kimi-K3 scale-out (mv194):
+from there. The two steps run one after the other. A 2-node Kimi-K3 scale-out (2 nodes with 4x GB300 each,
+2026-10-24, agent `v0.2.76-mv194`, driver not recorded; [the record](../results/KIMI-K3-RESTORE-2026-10-24.md),
+section 3):
 
 | Step | Time |
 |---|---|
 | Rails fetch, both nodes in parallel, 781 GiB per rank | 66 s (16:34:17 to 16:35:23) |
-| CRIU restore | 5 s |
-| GPU load, from NVMe into GPU memory | 42 s |
+| CRIU restore | about 2 s (16:35:28 to 16:35:30) |
+| GPU load, from NVMe into GPU memory, both ranks | about 40 s (16:35:30 to 16:36:10, the handle exchange) |
 | Remap, resume (and the clock wait, section 6 of the clock doc) | the rest |
 
-Of the 781 GiB, 747 GiB is the gpushare chunk store, the GPU memory; the CRIU images are 34 GiB. The store
-is content-addressed (a chunk's name is its hash), so zeros and repeated data are already stored once: 15,705
-chunk references, 14,403 chunks. There is little to shrink without changing what is restored.
-
-So the fetch and the load each move the whole GPU memory, one after the other: fetch at about 12 GiB/s per
-node, load at about 18 GiB/s.
+So the fetch and the load each move the whole checkpoint, one after the other: the fetch at about 12 GiB/s
+per node (781 GiB in 66 s), the load in about 40 s. Most of it is the gpushare chunk store, the GPU memory;
+the store is content-addressed (a chunk's name is its hash), so zeros and repeated data are already stored
+once. There is little to shrink without changing what is restored.
 
 ## 2. What has to hold
 
@@ -83,15 +83,15 @@ is there and the chunk still is not (a checkpoint missing a chunk). A new option
 
 ### Expected effect
 
-The load becomes bound by the fetch: it reads each chunk shortly after it lands, at the fetch's 12 GiB/s
-rather than its own 18. On the scale-out above:
+The load becomes bound by the fetch: it reads each chunk shortly after it lands, at the fetch's rate
+rather than its own. On the scale-out above:
 
 | | Today | Overlapped |
 |---|---|---|
 | Fetch | 66 s | 66 s |
-| CRIU | 5 s, after the fetch | 5 s, starting a few seconds into the fetch |
-| GPU load | 42 s, after CRIU | runs during the fetch, ends shortly after it |
-| Fetch start to load done | about 113 s | about 70 s |
+| CRIU | about 2 s, after the fetch | about 2 s, starting a few seconds into the fetch |
+| GPU load | about 40 s, after CRIU | runs during the fetch, ends shortly after it |
+| Fetch start to load done | 113 s (16:34:17 to 16:36:10) | about 70 s (estimate) |
 
 About 40 s off a fetched restore. A restore from a checkpoint on the node is unchanged.
 

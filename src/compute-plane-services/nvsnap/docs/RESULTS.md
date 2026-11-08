@@ -75,6 +75,7 @@ Time to ready, cold and restored. nvsnap build: not recorded.
 |---|---|
 | [results/BENCHMARK.md](results/BENCHMARK.md) | The tables above with their phase breakdowns and method; the page-cache prewarm A/B (September 2026) |
 | [results/PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows; empty until the next run |
+| [results/KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | Kimi-K3 group restores on 2 nodes with 4x GB300 each (2026-10-24): clock budgets and waits, fetch, CRIU and GPU-load times, remap times |
 | [design/GPUSHARE.md](design/GPUSHARE.md#validation) | gpushare validation |
 | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) | Model volume results (H100, NVMesh, September 2026) |
 | [design/helm-chart-cache-election.md](design/helm-chart-cache-election.md) | Election results (H100, NVMesh, 2026-09-25) |

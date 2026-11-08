@@ -33,7 +33,8 @@ checkpoint's last CRIU restore on the node (`restore_clock.go`).
 
 With gpushare, CRIU's restore is not the end. The workload's processes stay held after CRIU while
 `nvsnap-gpu-suspend` loads their GPU memory, remaps the fabric handles and resumes them. All that time,
-their clocks run. In a 2-node scale-out of a 2-node GB300 engine:
+their clocks run. In a 2-node restore of a 2-node engine (Kimi-K3, 2 nodes with 4x GB300 each, 2026-10-24, nvsnap build
+and driver not recorded; [the record](../results/KIMI-K3-RESTORE-2026-10-24.md), section 1):
 
 | Step | Time |
 |---|---|
@@ -41,7 +42,7 @@ their clocks run. In a 2-node scale-out of a 2-node GB300 engine:
 | GPU memory loaded, handles exchanged, remapped | 00:03:31 → 00:05:08 |
 | `resume hold`: the processes run | 00:05:08 |
 
-At 00:05:13, five seconds after it resumed, vLLM's EngineCore logged
+At 00:05:08, as it resumed, vLLM's EngineCore logged
 `No available shared memory broadcast block found in 60 seconds`. The same line appears after every GPU
 restore since. Each restored process sees about 90 s go by at once.
 
@@ -136,7 +137,8 @@ leaves the overrun counted, as CRIU's budget does today. The recorded span makes
 
 ### What the first runs showed
 
-Kimi-K3, 2 nodes, mv194 (gpushare with the host-buffer prefault). Both ranks agree within 0.1 s.
+Kimi-K3, 2 nodes with 4x GB300 each, 2026-10-24, agent `v0.2.76-mv194` (gpushare with the host-buffer prefault),
+driver not recorded; [the record](../results/KIMI-K3-RESTORE-2026-10-24.md), sections 2 and 3. Both ranks agree within 0.1 s.
 
 | Restore | Budget | Work (CRIU start to GPU resume) | Waited for the clock |
 |---|---|---|---|
@@ -147,7 +149,8 @@ The clock fix works: no restored process saw time jump, and nothing timed out. B
 a third of each restore. Two things make the budget too large:
 
 - **The first-restore estimate** adds 60 s for the GPU resume (`restoreGPUSlack`). It was sized for the
-  30-48 s first remap per node that the prefault has since removed: remaps now take 3-8 s.
+  slow first remap per node that the prefault has since removed (that remap time is not in the record): remaps
+  now take 3-8 s.
 - **The margin over the last restore.** Restores of one checkpoint vary: 72.8 s, then 55.5 s, the second with
   every remap at 3 s instead of up to 7.6 s. Budgeting the last restore plus 10 % and 5 s turns that
   variance, and the margin, into waiting.
