@@ -176,7 +176,11 @@ NOTES=$(notes_render --set server.service.type=LoadBalancer) \
   || fail "NOTES does not render with server.service.type=LoadBalancer: $NOTES"
 grep -q 'server.service.type=LoadBalancer is no longer read' <<<"$NOTES" \
   || fail "NOTES does not say a leftover server.service.type is not read"
+grep -q 'nvsnap-server (REST API + UI, port 8080, type ClusterIP)' <<<"$NOTES" \
+  || fail "NOTES does not give nvsnap-server's type as ClusterIP when server.service.type=LoadBalancer"
 NOTES=$(notes_render) || fail "NOTES does not render: $NOTES"
+grep -q 'nvsnap-server (REST API + UI, port 8080, type ClusterIP)' <<<"$NOTES" \
+  || fail "NOTES does not give nvsnap-server's type as ClusterIP"
 grep -q 'port-forward svc/nvsnap-server' <<<"$NOTES" \
   || fail "NOTES does not say how to reach nvsnap-server"
 grep -q 'is no longer read' <<<"$NOTES" \

@@ -5,7 +5,7 @@ Components deployed:
   - nvsnap-agent (DaemonSet on GPU nodes)
 {{- end }}
 {{- if .Values.server.enabled }}
-  - nvsnap-server (REST API + UI, port {{ .Values.server.service.port }}, type {{ .Values.server.service.type }})
+  - nvsnap-server (REST API + UI, port {{ .Values.server.service.port }}, type ClusterIP)
 {{- end }}
 {{- if .Values.webhook.enabled }}
   - nvsnap-webhook (mutating admission, in-agent)
