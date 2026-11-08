@@ -310,3 +310,22 @@ func TestGPUShareTargets_ShimWithoutGPU(t *testing.T) {
 		t.Fatalf("pids=%v ok=%v err=%v", pids, ok, err)
 	}
 }
+
+// A group restore needs the tool's GPU gate; a tool from before it, or one
+// whose text cannot be read, has none.
+func TestGpushareHoldGateSupported(t *testing.T) {
+	tool := "--hold-gate: (resume after CRIU restore) ...\n" +
+		"         open         (after resume --hold-gate: let the pids' GPU launches through)\n"
+	if !gpushareHoldGateSupported(tool) {
+		t.Error("a tool with the gate and open")
+	}
+	for name, text := range map[string]string{
+		"before the gate": "--timeout-ms MS --gpu-map FILE --fabric-map DIR suspend resume",
+		"gate, no open":   "--hold-gate: (resume after CRIU restore) ...",
+		"unreadable":      "",
+	} {
+		if gpushareHoldGateSupported(text) {
+			t.Errorf("%s: reported as supported", name)
+		}
+	}
+}

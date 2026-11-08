@@ -439,6 +439,14 @@ func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, 
 	return append(append(args, "resume"), intsToStrings(pids)...)
 }
 
+// gpushareHoldGateSupported reports whether the GPU tool (its binary's
+// text, gpuToolText) has resume --hold-gate and open; tools from before the
+// gate reject the option. "" (the text could not be read) is false.
+func gpushareHoldGateSupported(toolText string) bool {
+	return strings.Contains(toolText, "--hold-gate") &&
+		strings.Contains(toolText, "let the pids' GPU launches through")
+}
+
 // gpushareOpen lets the GPU launches of pids, resumed with holdGate,
 // through. A group's pods resume on their own nodes, each rebinding its
 // share of the memory multicast across nodes; one that launched first

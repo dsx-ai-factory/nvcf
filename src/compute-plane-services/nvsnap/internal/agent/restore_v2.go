@@ -213,6 +213,13 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// handle exchange of the resume).
 	var sess *restoreSession
 	if group.Session != "" {
+		// Its GPU launches must wait until every rank has resumed: a rank
+		// that launched first could write to a GPU not bound yet. A tool
+		// that cannot hold them (a bundle from before the gate) is refused
+		// here, before CRIU runs, rather than resumed ungated.
+		if gs != nil && !gpushareHoldGateSupported(tools.gpuToolText()) {
+			return nil, fmt.Errorf("gpushare: the GPU tool of node bundle %s cannot hold the GPU launches of a group restore until every rank has resumed (it has no --hold-gate and open); refusing the restore", tools.version)
+		}
 		if group.InetAddrMap != "" && !criuSupportsNetMigration(a.agentCRIUHelp()) {
 			return nil, errors.New("criu-v2: the agent's CRIU has no --inet-addr-map/net-unlock")
 		}
