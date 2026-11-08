@@ -417,7 +417,8 @@ struct mcobj {
     unsigned long long key;              /* id at the creator */
     CUdevice devs[MAX_DEV];              /* added by this process */
     int ndev;
-    int app_released, released, dead;    /* dead: app done with it */
+    int app_released, released, dead;    /* dead: app done with it (importers only) */
+    int own;                             /* cur_h is ours: re-created or re-imported after the app released it */
     int fab;                             /* imported as a fabric handle */
     CUmemFabricHandle fh;                /* from another node: its handle */
 };
@@ -583,6 +584,7 @@ static CUresult mc_recreate(struct mcobj *m)
     if (r != CUDA_SUCCESS) return r;
     m->cur_h = h;
     m->released = 0;
+    m->own = m->app_released;
     return CUDA_SUCCESS;
 }
 
@@ -1246,13 +1248,18 @@ static void do_release(char *reply, size_t n, const char *args)
         r = REAL(r_mc_unbind, "cuMulticastUnbind")(mcs[b->mc].cur_h, b->dev, b->mcoff, b->size);
         if (r == CUDA_SUCCESS) b->unbound = 1;
     }
+    /* A creator cannot tell whether its object is still used once the app
+     * has let go of it here: by importers in other processes, or by this
+     * one through its own export (an entry with peer = our pid). It stays
+     * restorable, and is re-created when an importer asks (export_id). */
     for (int i = 0; r == CUDA_SUCCESS && i < n_mcs; i++) {
         if (mcs[i].dead || mcs[i].released) continue;
-        if (!mc_live(i)) { mcs[i].dead = 1; continue; }
+        int live = mc_live(i);
+        if (!live && !mcs[i].creator) { mcs[i].dead = 1; continue; }
         what = "release multicast";
-        if (!mcs[i].app_released) r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h);
-        if (r == CUDA_SUCCESS) mcs[i].released = 1;
-        nmc++;
+        if (!mcs[i].app_released || mcs[i].own) r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h);
+        if (r == CUDA_SUCCESS) mcs[i].released = 1, mcs[i].own = 0;
+        nmc += live;
     }
     size_t nb = 0;
     double t0 = secs();
@@ -1623,6 +1630,7 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
     for (int i = 0; i < n_mcs; i++) {
         struct mcobj *m = &mcs[i];
         if (m->dead || !m->released) continue;  /* a creator may be re-created by a peer's request */
+        if (m->creator && !mc_live(i)) continue;  /* only importers use it: re-created when one asks */
         nmc++;
         if (m->creator) {
             if ((r = mc_recreate(m)) != CUDA_SUCCESS) {
@@ -1647,6 +1655,7 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
         }
         m->cur_h = h;
         m->released = 0;
+        m->own = m->app_released;
     }
     tmc = secs() - t;
     snprintf(reply, n, "ok remapped %d mapping(s), %d freed by their exporter, %d multicast object(s), "
