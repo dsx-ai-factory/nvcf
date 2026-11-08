@@ -249,7 +249,14 @@ func (a *Agent) fetchOverRails(ctx context.Context, checkpointID, localDir strin
 	}
 
 	timeout := railsFetchTimeout(size)
-	defer removeRailsEntries(localDir)
+	// bedrock-peer's staging entries go with the fetch, unless it may
+	// still write into them: railsFetchStillRunning removes them once it
+	// has ended.
+	defer func() {
+		if !errors.Is(err, errRailsFetchRunning) {
+			removeRailsEntries(localDir)
+		}
+	}()
 
 	// The claims cover the wait for the pods and the whole fetch: a source
 	// node's agent deletes its rails pod only once every claim has passed.
@@ -343,6 +350,7 @@ func (a *Agent) railsFetchStillRunning(ctx context.Context, checkpointID string)
 		return true
 	}
 	r.job.remove()
+	removeRailsEntries(filepath.Join(a.config.CheckpointDir, checkpointID))
 	a.railsRunning.Delete(checkpointID)
 	return false
 }

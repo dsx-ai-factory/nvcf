@@ -259,10 +259,12 @@ func TestRemoveRailsEntries(t *testing.T) {
 // runs the copy (fetchFn) and ends with exit code exit, unless hang holds
 // it until it is cancelled.
 type railsCluster struct {
-	kube     *fake.Clientset
-	serveOK  bool
-	exit     int32
-	hang     bool
+	kube    *fake.Clientset
+	serveOK bool
+	exit    int32
+	hang    bool
+	// stuck: a running fetch ignores its cancel request.
+	stuck    bool
 	fetchFn  func(args []string)
 	mu       sync.Mutex
 	created  []*corev1.Pod
@@ -291,7 +293,7 @@ func (c *railsCluster) runJobs(t *testing.T, dir string) {
 			if cs, _ := filepath.Glob(filepath.Join(jd, "*.cancel")); len(cs) > 0 {
 				for _, cf := range cs {
 					j := strings.TrimSuffix(cf, ".cancel")
-					if running[j] {
+					if running[j] && !c.stuck {
 						_ = os.Rename(cf, j+".cancelled")
 						_ = os.WriteFile(j+".out", nil, 0o600)
 						_ = os.WriteFile(j+".exit", []byte("143\n"), 0o600)
@@ -586,6 +588,56 @@ func TestFetchOverRails_CleansUpAfterCancel(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, railsJobsDir, "*")); len(left) != 0 {
 		t.Errorf("job files left after the cancel: %v", left)
+	}
+}
+
+// The restore's context ends mid-fetch and the fetch cannot be stopped
+// (it ignores its cancel and its rails pod cannot be deleted): its staging
+// entries stay while it may write into them, and go once it has ended.
+func TestFetchOverRails_KeepsStagingOfAFetchThatMayRun(t *testing.T) {
+	defer func(p, s, g time.Duration) { railsJobPoll, railsStopWait, railsPodGoneWait = p, s, g }(railsJobPoll, railsStopWait, railsPodGoneWait)
+	railsJobPoll, railsStopWait, railsPodGoneWait = 5*time.Millisecond, 50*time.Millisecond, 100*time.Millisecond
+	peerURL, id, _ := newPeerAgent(t)
+	c := newRailsCluster(t)
+	c.hang, c.stuck = true, true
+	c.kube.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("forbidden")
+	})
+	a, dir := railsAgent(t, "", c)
+	local := filepath.Join(dir, id)
+	staging := filepath.Join(local, railsOwnName+"stage")
+	ctx, cancel := context.WithCancel(t.Context())
+	c.fetchFn = func([]string) {
+		_ = os.MkdirAll(staging, 0o755)
+		_ = os.WriteFile(filepath.Join(staging, "part"), []byte("x"), 0o600)
+		cancel()
+	}
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := a.fetchOverRails(ctx, id, local, []peerInfo{{NodeName: "node-A", AgentURL: peerURL}})
+	if !errors.Is(err, errRailsFetchRunning) {
+		t.Fatalf("err %v, want errRailsFetchRunning", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "part")); err != nil {
+		t.Fatalf("the staging of a fetch that may still run was removed: %v", err)
+	}
+	if !a.railsFetchStillRunning(t.Context(), id) {
+		t.Fatal("a fetch that may run counts as ended")
+	}
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("staging removed while the fetch may run: %v", err)
+	}
+	// It ends.
+	jobs, _ := filepath.Glob(filepath.Join(dir, railsJobsDir, "*.run"))
+	for _, j := range jobs {
+		_ = os.WriteFile(strings.TrimSuffix(j, ".run")+".exit", []byte("143\n"), 0o600)
+	}
+	if a.railsFetchStillRunning(t.Context(), id) {
+		t.Fatal("an ended fetch still counts as running")
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Errorf("the staging of the ended fetch was kept: %v", err)
 	}
 }
 
