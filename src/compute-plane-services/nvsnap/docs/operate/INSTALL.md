@@ -99,7 +99,6 @@ pod is prepared for capture or restore, and every pod starts cold.
 | `agent.election.enabled` | `false` | One downloader per hash when a chart starts many workers (cachedir only) |
 | `agent.l2.storageClass` | | The StorageClass of the per-checkpoint volume pair; empty keeps checkpoints on their nodes |
 | `agent.auth.enabled`, `agent.auth.mode` | `false`, `permissive` | Bearer-token checks on the agent API. Turn on, run `permissive` until no unauthenticated calls are counted, then `required` |
-| `server.service.type` | `ClusterIP` | Reach the server with `kubectl port-forward`. `LoadBalancer` renders only with `server.service.loadBalancerCloud` set and a `server.service.annotations` entry that makes it internal on that cloud ([Reaching nvsnap-server](#reaching-nvsnap-server)) |
 
 ## Turning nvsnap off for some or all pods
 
@@ -120,22 +119,15 @@ helm upgrade nvsnap deploy/helm/nvsnap --namespace nvsnap-system --reuse-values
 The agent DaemonSet rolls one node at a time. An instance capture does not
 start while agents run different revisions.
 
-Before this chart version `server.service.type` defaulted to
-`LoadBalancer`. `--reuse-values` keeps the old chart's defaults, so an
-install that kept that default is still `LoadBalancer` after the command
-above, and the upgrade fails at the render before anything changes. Name
-what the server's Service should be on the upgrade:
-
-- No external address: add `--set server.service.type=ClusterIP`. The
-  load balancer is deleted; reach the server with `kubectl port-forward`
-  ([Reaching nvsnap-server](#reaching-nvsnap-server)).
-- An internal load balancer: add `--set server.service.loadBalancerCloud=<cloud>`
-  and that cloud's internal annotation, for example on AWS
-  `--set-string 'server.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internal'`.
-  Changing a load balancer's scheme usually replaces it, with a new
-  address.
-
-An install without `--reuse-values` gets the new default, `ClusterIP`.
+Before this chart version the server's Service was a `LoadBalancer` by
+default (`server.service.type`). It is now always `ClusterIP`, and
+`server.service.type` is not read. The upgrade turns an existing load
+balancer into a `ClusterIP` Service: the cloud deletes the load balancer
+and its address stops answering. Kubernetes drops the Service's node ports
+on that change. Reach the server with `kubectl port-forward` afterwards
+([Reaching nvsnap-server](#reaching-nvsnap-server)). A
+`server.service.type` that `--reuse-values` carries over changes nothing;
+the install notes say it is not read.
 
 ## Uninstall
 
@@ -169,32 +161,12 @@ with ones that match your GPU nodes, in a values file passed with `-f`.
 
 ### Reaching nvsnap-server
 
-The server's Service is `ClusterIP`, so it has no external IP. Use
+The server's Service is always `ClusterIP`, so it has no address outside the
+cluster: its API deletes checkpoints and labels pods. Use
 `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080:8080`.
-A `LoadBalancer` renders only when `server.service.loadBalancerCloud` names
-the cluster's cloud and `server.service.annotations` has one of that
-cloud's entries below, which make it internal; otherwise `helm template`
-and `helm upgrade` fail and say why. The check is
-`nvsnap.server.internalLBError` in
-[`_helpers.tpl`](../../deploy/helm/nvsnap/templates/_helpers.tpl), used by
-the `nvsnap-server` Service in
-[`server.yaml`](../../deploy/helm/nvsnap/templates/server.yaml).
-
-| `loadBalancerCloud` | Annotation |
-|---|---|
-| `aws` | `service.beta.kubernetes.io/aws-load-balancer-scheme: internal` or `service.beta.kubernetes.io/aws-load-balancer-internal: "true"` |
-| `gcp` | `networking.gke.io/load-balancer-type: Internal` (or the older `cloud.google.com/load-balancer-type: Internal`) |
-| `azure` | `service.beta.kubernetes.io/azure-load-balancer-internal: "true"` |
-| `oci` | `service.beta.kubernetes.io/oci-load-balancer-internal: "true"` or `oci-network-load-balancer.oraclecloud.com/internal: "true"` |
-
-The chart cannot tell which cloud it runs on, and a cloud ignores another
-cloud's annotation: an AWS annotation on GKE would leave the load balancer
-public. So the cloud is named, and an annotation from another row fails
-the render. Values must be spelled exactly as shown. If more than one of
-the cloud's keys is set, every one must have its internal value: GKE's
-older key at `Internal` beside the current one at `External`, for example,
-fails the render. On another platform, keep `ClusterIP` and expose the
-server your own way.
+The chart has no option for a load balancer; an operator who needs the
+server reachable from elsewhere exposes it themselves, with their own
+authentication in front.
 
 ### Restored pods start cold
 

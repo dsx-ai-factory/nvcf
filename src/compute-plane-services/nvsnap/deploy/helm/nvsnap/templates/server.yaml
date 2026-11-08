@@ -199,20 +199,10 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "nvsnap.server.labels" . | nindent 4 }}
-  {{- if eq .Values.server.service.type "LoadBalancer" }}
-  {{- with include "nvsnap.server.internalLBError" . }}
-  {{- fail (printf "server.service.type=LoadBalancer must be internal; the server API must not be public: %s. Or use ClusterIP and kubectl port-forward (docs/operate/INSTALL.md, Reaching nvsnap-server)." .) }}
-  {{- end }}
-  {{- end }}
-  {{- with .Values.server.service.annotations }}
-  annotations:
-    {{- /* Kubernetes takes only string values; --set makes true a bool. */}}
-    {{- range $k, $v := . }}
-    {{ $k | quote }}: {{ toString $v | quote }}
-    {{- end }}
-  {{- end }}
 spec:
-  type: {{ .Values.server.service.type }}
+  # The server's API deletes checkpoints and labels pods: it gets no
+  # address outside the cluster. server.service.type is not read.
+  type: ClusterIP
   selector:
     {{- include "nvsnap.server.selectorLabels" . | nindent 4 }}
   ports:

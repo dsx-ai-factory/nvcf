@@ -141,80 +141,46 @@ for img in agent server; do
 done
 pass "empty image tags fail the chart render with a clear error"
 
-# 7. The server API must not get a public address: the default Service
-# is ClusterIP, and a LoadBalancer without its cloud named and an
-# annotation that makes it internal on that cloud fails the render.
-SVC_BLOCK=$(awk 'BEGIN{RS="\n---\n"} /kind: Service\n/ && /name: nvsnap-server\n/ {print; exit}' <<<"$RENDER")
-[[ -n "$SVC_BLOCK" ]] || fail "no Service named 'nvsnap-server' in rendered output"
-echo "$SVC_BLOCK" | grep -qE '^\s*type: ClusterIP$' \
-  || fail "nvsnap-server Service is not ClusterIP by default"
-# lb_render CLOUD ANNOTATIONS renders a LoadBalancer nvsnap-server on
-# CLOUD (empty: unset) with ANNOTATIONS, one or more comma-separated
-# key=value pairs (--set-string; empty: none).
-lb_render() {
-  local args=(--set server.service.type=LoadBalancer) kvs kv
-  [[ -n "$1" ]] && args+=(--set "server.service.loadBalancerCloud=$1")
-  if [[ -n "$2" ]]; then
-    IFS=, read -ra kvs <<<"$2"
-    for kv in "${kvs[@]}"; do args+=(--set-string "server.service.annotations.$kv"); done
-  fi
-  helm template "$RELEASE" "$CHART" --namespace "$NS" "${args[@]}"
+# 7. The server API gets no address outside the cluster: its Service is
+# ClusterIP whatever server.service.type says, including a LoadBalancer
+# that --reuse-values carries over from an older chart, and NOTES says the
+# value is not read.
+svc_type() {
+  awk 'BEGIN{RS="\n---\n"} /kind: Service\n/ && /name: nvsnap-server\n/ {print; exit}' \
+    | sed -n 's/^  type: //p'
 }
-AWS_INTERNAL='service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internal'
-LB=$(lb_render aws "$AWS_INTERNAL") \
-  || fail "an internal AWS LoadBalancer nvsnap-server should render"
-grep -q '"service.beta.kubernetes.io/aws-load-balancer-scheme": "internal"' <<<"$LB" \
-  || fail "server.service.annotations not rendered, quoted, on the nvsnap-server Service"
-# Each entry is CLOUD|ANNOTATIONS that do not make the load balancer
-# internal on CLOUD: none, no or an unknown cloud, unrelated, external or
-# misspelled values, an internal annotation contradicted by another one,
-# and an internal annotation of another cloud, which the Service's own
-# cloud ignores.
-for bad in 'aws|' \
-  "|$AWS_INTERNAL" \
-  "gke|networking\.gke\.io/load-balancer-type=Internal" \
-  'aws|foo=bar' \
-  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
-  'gcp|networking\.gke\.io/load-balancer-type=internal' \
-  'azure|service\.beta\.kubernetes\.io/azure-load-balancer-internal=True' \
-  'gcp|cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=External' \
-  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-internal=true,service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
-  "gcp|$AWS_INTERNAL" \
-  "gcp|networking\.gke\.io/load-balancer-type=Internal,$AWS_INTERNAL" \
-  'oci|service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
-  if err=$(lb_render "${bad%%|*}" "${bad#*|}" 2>&1 >/dev/null); then
-    fail "a LoadBalancer nvsnap-server with '$bad' is not internal and should fail the chart render but didn't"
-  fi
-  grep -q 'server.service.type=LoadBalancer must be internal' <<<"$err" \
-    || fail "a LoadBalancer nvsnap-server with '$bad' failed for another reason: $err"
+[[ "$(svc_type <<<"$RENDER")" == ClusterIP ]] \
+  || fail "nvsnap-server Service is not ClusterIP by default"
+for t in LoadBalancer NodePort; do
+  OUT=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set "server.service.type=$t") \
+    || fail "the chart should render with a leftover server.service.type=$t"
+  [[ "$(svc_type <<<"$OUT")" == ClusterIP ]] \
+    || fail "server.service.type=$t made the nvsnap-server Service other than ClusterIP"
 done
-for good in "aws|$AWS_INTERNAL" \
-  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-internal=true' \
-  'gcp|networking\.gke\.io/load-balancer-type=Internal' \
-  'gcp|cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=Internal' \
-  'oci|service\.beta\.kubernetes\.io/oci-load-balancer-internal=true' \
-  'oci|oci-network-load-balancer\.oraclecloud\.com/internal=true' \
-  'azure|service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
-  lb_render "${good%%|*}" "${good#*|}" >/dev/null 2>&1 \
-    || fail "a LoadBalancer nvsnap-server with '$good' is internal and should render"
-done
-# The render names what is wrong.
-err=$(lb_render gcp "$AWS_INTERNAL" 2>&1 >/dev/null || true)
-grep -q 'aws-load-balancer-scheme is an annotation of aws, not of gcp' <<<"$err" \
-  || fail "a cloud mismatch fails without naming the annotation: $err"
-# --set makes "true" a bool; Kubernetes takes only string annotation values.
-LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
-  --set server.service.loadBalancerCloud=oci \
-  --set 'server.service.annotations.service\.beta\.kubernetes\.io/oci-load-balancer-internal=true') \
-  || fail "a LoadBalancer nvsnap-server with a bool internal annotation should render"
-grep -q '"service.beta.kubernetes.io/oci-load-balancer-internal": "true"' <<<"$LB" \
-  || fail "nvsnap-server annotation values are not rendered as strings"
-# Keys are quoted too: an unquoted "on" or "null" key would be a YAML bool
-# or null.
-LB=$(lb_render aws "$AWS_INTERNAL,on=x,null=y") \
-  || fail "a LoadBalancer nvsnap-server with annotation keys on and null should render"
-grep -q '"on": "x"' <<<"$LB" && grep -q '"null": "y"' <<<"$LB" \
-  || fail "nvsnap-server annotation keys are not rendered quoted"
-pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs its cloud named and an internal annotation of that cloud"
+# NOTES.txt, rendered without a cluster: helm template does not print it,
+# so a copy of the chart renders it into a ConfigMap.
+notes_render() {
+  local tmp out rc
+  tmp=$(mktemp -d)
+  cp -r "$CHART" "$tmp/chart"
+  cp "$CHART/templates/NOTES.txt" "$tmp/chart/notes-render.txt"
+  printf '%s\n' 'apiVersion: v1' 'kind: ConfigMap' 'metadata:' '  name: notes-render' 'data:' '  notes: |' \
+    '{{- tpl (.Files.Get "notes-render.txt") . | nindent 4 }}' >"$tmp/chart/templates/notes-render.yaml"
+  out=$(helm template "$RELEASE" "$tmp/chart" --namespace "$NS" --show-only templates/notes-render.yaml "$@" 2>&1)
+  rc=$?
+  rm -rf "$tmp"
+  echo "$out"
+  return $rc
+}
+NOTES=$(notes_render --set server.service.type=LoadBalancer) \
+  || fail "NOTES does not render with server.service.type=LoadBalancer: $NOTES"
+grep -q 'server.service.type=LoadBalancer is no longer read' <<<"$NOTES" \
+  || fail "NOTES does not say a leftover server.service.type is not read"
+NOTES=$(notes_render) || fail "NOTES does not render: $NOTES"
+grep -q 'port-forward svc/nvsnap-server' <<<"$NOTES" \
+  || fail "NOTES does not say how to reach nvsnap-server"
+grep -q 'is no longer read' <<<"$NOTES" \
+  && fail "NOTES warns about server.service.type when it is not set"
+pass "nvsnap-server is ClusterIP whatever server.service.type says"
 
 echo "OK — all helm chart checks passed"

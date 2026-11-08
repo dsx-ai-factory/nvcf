@@ -499,20 +499,11 @@ server:
     accessMode: ReadWriteOnce
 
   service:
-    # ClusterIP (the default) keeps the API inside the cluster; reach it
-    # with `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080`.
-    # The server's API deletes checkpoints and labels pods, so it must
-    # not sit on a public address. LoadBalancer renders only with
-    # loadBalancerCloud set and annotations that make the load balancer
-    # internal on that cloud (for example, aws with
-    # service.beta.kubernetes.io/aws-load-balancer-scheme: internal); any
-    # other cloud's annotation fails the render. The accepted annotations
-    # per cloud are in docs/operate/INSTALL.md, Reaching nvsnap-server.
-    type: ClusterIP
+    # The Service is always ClusterIP: the server's API deletes
+    # checkpoints and labels pods, so it gets no address outside the
+    # cluster. Reach it with
+    # `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080`.
     port: 8080
-    # aws, gcp, azure or oci; only read when type is LoadBalancer.
-    loadBalancerCloud: ""
-    annotations: {}
 
   resources:
     requests:
@@ -701,9 +692,8 @@ jaeger:
   storage:
     type: memory
 
-  # Query/UI service. ClusterIP by default — operators expose via
-  # `kubectl port-forward svc/nvsnap-jaeger-query 16686:16686` or
-  # bump this to LoadBalancer for a public-IP demo.
+  # Query/UI service. ClusterIP by default — operators reach it with
+  # `kubectl port-forward svc/nvsnap-jaeger-query 16686:16686`.
   provisionDataStore:
     cassandra: false
     elasticsearch: false
