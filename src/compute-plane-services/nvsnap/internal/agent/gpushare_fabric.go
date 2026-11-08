@@ -65,6 +65,9 @@ const (
 	// The tool treats any verdict but "go" as "retry" and gives up at its
 	// own timeout, rolling the workload back.
 	fabricVerdictAbort = "abort"
+	// fabricVerdictUnlock tells a restored rank that every pod of its
+	// instance has resumed.
+	fabricVerdictUnlock = "unlock"
 
 	fabricPollInterval = 200 * time.Millisecond
 )
@@ -266,7 +269,7 @@ func waitFabricVerdictFile(ctx context.Context, s *fabricSessionDir, name string
 	for {
 		if b, err := s.read(name, fabricSmallLimit); err == nil {
 			v := strings.TrimSpace(string(b))
-			if v == "unlock" || v == fabricVerdictAbort {
+			if v == fabricVerdictUnlock || v == fabricVerdictAbort {
 				return v, nil
 			}
 			return "", fmt.Errorf("group restore: unexpected verdict %q", v)

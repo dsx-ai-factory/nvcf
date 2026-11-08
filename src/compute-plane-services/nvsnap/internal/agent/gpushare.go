@@ -464,6 +464,24 @@ func gpushareOpen(ctx context.Context, hostPID int, pids []int, log *logrus.Entr
 	return nil
 }
 
+// openHeldGPUOnUnlock ends a group rank's wait for the instance's verdict
+// (verdict and err, from awaitUnlock): only "unlock" lets its held GPU
+// launches through, by open. On an error or an abort they stay held: another
+// rank may not have rebound its memory, so a launch could spin as
+// gpushareOpen says, and the failed instance's pods are deleted (failGroup).
+func openHeldGPUOnUnlock(session, verdict string, err error, open func() error) error {
+	if err != nil {
+		return err
+	}
+	if verdict != fabricVerdictUnlock {
+		return fmt.Errorf("criu-v2: group restore %s aborted: another pod of the instance failed to restore; this pod stays locked, its GPU launches held, until it is deleted", session)
+	}
+	if err := open(); err != nil {
+		return fmt.Errorf("gpushare open: %w", err)
+	}
+	return nil
+}
+
 func intsToStrings(v []int) []string {
 	out := make([]string, len(v))
 	for i, n := range v {

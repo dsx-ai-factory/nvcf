@@ -37,7 +37,7 @@ log gives.
 | Log line | Node 1 | Node 2 |
 |---|---|---|
 | `the restored clocks continue from the dump when the GPU processes resume`, `budget=` | 2m3s (16:18:18) | 2m3s (16:18:18) |
-| `the restored tasks resumed ...`, `restoreSpan=` (CRIU start to GPU resume) | 1m12.793s | 1m12.725s |
+| `the restored tasks resumed ...`, `restoreSpan=` (CRIU start to GPU resume, less the wait for the dumped clock in the next row) | 1m12.793s | 1m12.725s |
 | `gpushare: pid=... clock ...s behind the dump` | 50.513 s | 49.940 s |
 | `gpushare: pid=... remap ... in` | 4.48, 4.70, 6.40, 7.62 s | 3.28, 3.28, 3.29, 3.77 s |
 
@@ -53,7 +53,7 @@ The checkpoint was not on either node: each fetched it over the rails tier, then
 | `CRIU restore: the instance's captured addresses lead to its restored pods` (CRIU done) | 16:35:30 |
 | `gpushare fabric: handle lists exchanged` (both ranks' GPU memory loaded) | 16:36:10 |
 | `gpushare: resumed thawed all pids`, `duration=` | 16:36:53, 1m22.579s and 1m22.978s |
-| `restoreSpan=` (CRIU start to GPU resume) | 55.422 s and 55.517 s |
+| `restoreSpan=` (CRIU start to GPU resume, less the wait for the dumped clock in the next row) | 55.422 s and 55.517 s |
 | `clock ...s behind the dump` | 29.759 s and 29.739 s |
 | `remap ... in` (8 processes) | 2.96 s to 3.35 s |
 | `criu-v2: restore completed`, `duration=` | 16:36:59, 95.79 s and 95.81 s |

@@ -20,6 +20,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -327,5 +328,42 @@ func TestGpushareHoldGateSupported(t *testing.T) {
 		if gpushareHoldGateSupported(text) {
 			t.Errorf("%s: reported as supported", name)
 		}
+	}
+}
+
+// A group rank's held GPU launches go through only on "unlock": on an abort
+// or an error another rank may not have rebound its memory.
+func TestOpenHeldGPUOnUnlock(t *testing.T) {
+	waitErr := errors.New("context canceled")
+	openErr := errors.New("open failed")
+	for _, tc := range []struct {
+		name     string
+		verdict  string
+		err      error
+		openErr  error
+		wantOpen bool
+		wantErr  string
+	}{
+		{name: "unlock", verdict: fabricVerdictUnlock, wantOpen: true},
+		{name: "abort", verdict: fabricVerdictAbort, wantErr: "group restore s1 aborted"},
+		{name: "wait error", err: waitErr, wantErr: "context canceled"},
+		{name: "unlock, open fails", verdict: fabricVerdictUnlock, openErr: openErr, wantOpen: true, wantErr: "gpushare open: open failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opened := false
+			err := openHeldGPUOnUnlock("s1", tc.verdict, tc.err, func() error {
+				opened = true
+				return tc.openErr
+			})
+			if opened != tc.wantOpen {
+				t.Errorf("opened = %v, want %v", opened, tc.wantOpen)
+			}
+			if tc.wantErr == "" && err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

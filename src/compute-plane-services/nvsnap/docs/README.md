@@ -42,7 +42,7 @@ was not re-checked against the code.
 | Page | Answers | Status |
 |---|---|---|
 | [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with three measured numbers | Current, 2026-10-21 |
-| [RESULTS.md](RESULTS.md) | Every measured number, with date, hardware, build and source | Current, 2026-10-21 |
+| [RESULTS.md](RESULTS.md) | Every measured number, with date, hardware, build and source | Current, 2026-11-07 |
 | [GLOSSARY.md](GLOSSARY.md) | What each nvsnap word means, including the storage tiers L1–L4, and which words are retired | Current, 2026-10-21 |
 | [REFERENCE.md](REFERENCE.md) | Every `nvsnap.io/*` annotation and label, environment variable and agent route | Generated from the code; CI fails when it is stale |
 | [figures/README.md](figures/README.md) | Every architecture figure, the script that draws it, the style it follows, and how to regenerate it | Current, 2026-10-21 |
@@ -94,6 +94,7 @@ the column below is that status, corrected where the code disagrees.
 |---|---|---|
 | [BENCHMARK.md](results/BENCHMARK.md) | Measured restore times with phase breakdowns: single-GPU CRIU (July 2026), cachedir (June 2026), page-cache prewarm (September 2026) | Record |
 | [PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows | Empty until the next run |
+| [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | How long a Kimi-K3 group restore over 2 GB300 nodes took, step by step: fetch over rails, CRIU, GPU load, clock wait | Record |
 
 ## Using the API
 
