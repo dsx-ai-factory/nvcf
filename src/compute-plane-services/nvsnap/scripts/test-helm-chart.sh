@@ -142,48 +142,79 @@ done
 pass "empty image tags fail the chart render with a clear error"
 
 # 7. The server API must not get a public address: the default Service
-# is ClusterIP, and a LoadBalancer without an annotation that makes it
-# internal on its cloud fails the render.
+# is ClusterIP, and a LoadBalancer without its cloud named and an
+# annotation that makes it internal on that cloud fails the render.
 SVC_BLOCK=$(awk 'BEGIN{RS="\n---\n"} /kind: Service\n/ && /name: nvsnap-server\n/ {print; exit}' <<<"$RENDER")
 [[ -n "$SVC_BLOCK" ]] || fail "no Service named 'nvsnap-server' in rendered output"
 echo "$SVC_BLOCK" | grep -qE '^\s*type: ClusterIP$' \
   || fail "nvsnap-server Service is not ClusterIP by default"
-if helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer >/dev/null 2>&1; then
-  fail "a LoadBalancer nvsnap-server without annotations should fail the chart render but didn't"
-fi
-LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
-  --set-string 'server.service.annotations.service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internal') \
-  || fail "a LoadBalancer nvsnap-server with annotations should render"
-grep -q 'service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"' <<<"$LB" \
-  || fail "server.service.annotations not rendered on the nvsnap-server Service"
-# Each entry is one or more comma-separated annotations that together do
-# not make the load balancer internal: unrelated, external, misspelled
-# values, and an internal annotation contradicted by another one.
-for bad in 'foo=bar' \
-  'service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
-  'networking\.gke\.io/load-balancer-type=internal' \
-  'service\.beta\.kubernetes\.io/azure-load-balancer-internal=True' \
-  'cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=External' \
-  'service\.beta\.kubernetes\.io/aws-load-balancer-internal=true,service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing'; do
-  args=()
-  IFS=, read -ra kvs <<<"$bad"
-  for kv in "${kvs[@]}"; do args+=(--set-string "server.service.annotations.$kv"); done
-  if helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
-    "${args[@]}" >/dev/null 2>&1; then
+# lb_render CLOUD ANNOTATIONS renders a LoadBalancer nvsnap-server on
+# CLOUD (empty: unset) with ANNOTATIONS, one or more comma-separated
+# key=value pairs (--set-string; empty: none).
+lb_render() {
+  local args=(--set server.service.type=LoadBalancer) kvs kv
+  [[ -n "$1" ]] && args+=(--set "server.service.loadBalancerCloud=$1")
+  if [[ -n "$2" ]]; then
+    IFS=, read -ra kvs <<<"$2"
+    for kv in "${kvs[@]}"; do args+=(--set-string "server.service.annotations.$kv"); done
+  fi
+  helm template "$RELEASE" "$CHART" --namespace "$NS" "${args[@]}"
+}
+AWS_INTERNAL='service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internal'
+LB=$(lb_render aws "$AWS_INTERNAL") \
+  || fail "an internal AWS LoadBalancer nvsnap-server should render"
+grep -q '"service.beta.kubernetes.io/aws-load-balancer-scheme": "internal"' <<<"$LB" \
+  || fail "server.service.annotations not rendered, quoted, on the nvsnap-server Service"
+# Each entry is CLOUD|ANNOTATIONS that do not make the load balancer
+# internal on CLOUD: none, no or an unknown cloud, unrelated, external or
+# misspelled values, an internal annotation contradicted by another one,
+# and an internal annotation of another cloud, which the Service's own
+# cloud ignores.
+for bad in 'aws|' \
+  "|$AWS_INTERNAL" \
+  "gke|networking\.gke\.io/load-balancer-type=Internal" \
+  'aws|foo=bar' \
+  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
+  'gcp|networking\.gke\.io/load-balancer-type=internal' \
+  'azure|service\.beta\.kubernetes\.io/azure-load-balancer-internal=True' \
+  'gcp|cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=External' \
+  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-internal=true,service\.beta\.kubernetes\.io/aws-load-balancer-scheme=internet-facing' \
+  "gcp|$AWS_INTERNAL" \
+  "gcp|networking\.gke\.io/load-balancer-type=Internal,$AWS_INTERNAL" \
+  'oci|service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
+  if err=$(lb_render "${bad%%|*}" "${bad#*|}" 2>&1 >/dev/null); then
     fail "a LoadBalancer nvsnap-server with '$bad' is not internal and should fail the chart render but didn't"
   fi
+  grep -q 'server.service.type=LoadBalancer must be internal' <<<"$err" \
+    || fail "a LoadBalancer nvsnap-server with '$bad' failed for another reason: $err"
 done
-for good in 'networking\.gke\.io/load-balancer-type=Internal' 'service\.beta\.kubernetes\.io/oci-load-balancer-internal=true' 'service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
-  helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
-    --set-string "server.service.annotations.$good" >/dev/null 2>&1 \
+for good in "aws|$AWS_INTERNAL" \
+  'aws|service\.beta\.kubernetes\.io/aws-load-balancer-internal=true' \
+  'gcp|networking\.gke\.io/load-balancer-type=Internal' \
+  'gcp|cloud\.google\.com/load-balancer-type=Internal,networking\.gke\.io/load-balancer-type=Internal' \
+  'oci|service\.beta\.kubernetes\.io/oci-load-balancer-internal=true' \
+  'oci|oci-network-load-balancer\.oraclecloud\.com/internal=true' \
+  'azure|service\.beta\.kubernetes\.io/azure-load-balancer-internal=true'; do
+  lb_render "${good%%|*}" "${good#*|}" >/dev/null 2>&1 \
     || fail "a LoadBalancer nvsnap-server with '$good' is internal and should render"
 done
+# The render names what is wrong.
+err=$(lb_render gcp "$AWS_INTERNAL" 2>&1 >/dev/null || true)
+grep -q 'aws-load-balancer-scheme is an annotation of aws, not of gcp' <<<"$err" \
+  || fail "a cloud mismatch fails without naming the annotation: $err"
 # --set makes "true" a bool; Kubernetes takes only string annotation values.
 LB=$(helm template "$RELEASE" "$CHART" --namespace "$NS" --set server.service.type=LoadBalancer \
+  --set server.service.loadBalancerCloud=oci \
   --set 'server.service.annotations.service\.beta\.kubernetes\.io/oci-load-balancer-internal=true') \
   || fail "a LoadBalancer nvsnap-server with a bool internal annotation should render"
-grep -q 'service.beta.kubernetes.io/oci-load-balancer-internal: "true"' <<<"$LB" \
+grep -q '"service.beta.kubernetes.io/oci-load-balancer-internal": "true"' <<<"$LB" \
   || fail "nvsnap-server annotation values are not rendered as strings"
-pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs an annotation that makes it internal"
+# Keys are quoted too: an unquoted "on" or "null" key would be a YAML bool
+# or null.
+LB=$(lb_render aws "$AWS_INTERNAL,on=x,null=y") \
+  || fail "a LoadBalancer nvsnap-server with annotation keys on and null should render"
+grep -q '"on": "x"' <<<"$LB" && grep -q '"null": "y"' <<<"$LB" \
+  || fail "nvsnap-server annotation keys are not rendered quoted"
+pass "nvsnap-server is ClusterIP by default; a LoadBalancer needs its cloud named and an internal annotation of that cloud"
 
 echo "OK — all helm chart checks passed"

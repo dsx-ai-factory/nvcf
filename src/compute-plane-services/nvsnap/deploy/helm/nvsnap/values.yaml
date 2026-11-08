@@ -503,12 +503,15 @@ server:
     # with `kubectl -n nvsnap-system port-forward svc/nvsnap-server 8080`.
     # The server's API deletes checkpoints and labels pods, so it must
     # not sit on a public address. LoadBalancer renders only with
-    # annotations, which must make the load balancer internal on your
-    # cloud (for example service.beta.kubernetes.io/aws-load-balancer-scheme:
-    # internal, or service.beta.kubernetes.io/oci-load-balancer-internal:
-    # "true"); without them the render fails.
+    # loadBalancerCloud set and annotations that make the load balancer
+    # internal on that cloud (for example, aws with
+    # service.beta.kubernetes.io/aws-load-balancer-scheme: internal); any
+    # other cloud's annotation fails the render. The accepted annotations
+    # per cloud are in docs/operate/INSTALL.md, Reaching nvsnap-server.
     type: ClusterIP
     port: 8080
+    # aws, gcp, azure or oci; only read when type is LoadBalancer.
+    loadBalancerCloud: ""
     annotations: {}
 
   resources:
