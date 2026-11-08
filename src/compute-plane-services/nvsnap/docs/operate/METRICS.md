@@ -49,7 +49,11 @@ Labels:
 - `ranks`: the instance's GPU ranks, bucketed `1`, `2-4`, `5-8`, `9-16`,
   `17+`; companions (etcd, NATS) are not ranks.
 - `reason`: the class of a failure or refusal: `mptcp`, `rdma`, `gpushare`,
-  `fetch`, `timeout`, `criu`, `other`.
+  `fetch`, `timeout`, `criu`, `other`, and two that are the workload's own
+  doing, not a fault of nvsnap's: `workload_exited` (the container's process
+  had ended when its dump failed: it is gone, or a later process holds its
+  pid) and `no_gpu_process` (a pod of a multi-node instance had no process on
+  the GPU under the gpushare library to capture).
 - `source`: where a checkpoint fetched to a node came from: `rails`, `peer`,
   `fsstore`, `volume` (`unknown` for a fetch that found no source). A
   checkpoint already on the node is no fetch.
@@ -80,9 +84,12 @@ What is measured:
   stopped), `rank`. Per instance: `group` (the dump of every member) and
   `verify` (capture start to its restored pods serving). Cachedir: `rank`.
 - **Capture outcomes**: `captured` (its restore verifies it), `verified`,
-  `unverified` (its restored pods never served), `failed`, `refused` (the
-  preflight refuses the configuration), `gpushare-failed` (its pods never
-  started under the gpushare library).
+  `unverified` (its restored pods never served), `abandoned` (its namespace
+  was removed before a restore of it served, so nothing can verify it; found
+  by the agents' node sweep, every 10 minutes, and counted by the one agent
+  that marks the record), `failed`, `refused` (the preflight refuses the
+  configuration), `gpushare-failed` (its pods never started under the
+  gpushare library).
 - **Capture size** by `part`: `gpu` (GPU state), `rootfs` (rootfs diff),
   `memory` (the rest: process images), `cachedir`.
 - **Admissions**: the webhook's decision for a GPU rank of a captured
@@ -123,8 +130,16 @@ Each agent logs one line at the end of each capture, restore and pod start:
 `msg="nvsnap capture summary"`, `"nvsnap restore summary"`,
 `"nvsnap pod ready summary"`. Fields: `pod` or `criuGroup`, `method`,
 `outcome`, `reason`, `error`, `ranks`, `gpu`, `seconds` and, where they
-apply, `bytes`, `restoredToReadySeconds`, `fallbackReason`, `bundle`. Search
-the log store by namespace or pod for one function's history.
+apply, `bytes`, `restoredToReadySeconds`, `fallbackReason`, `bundle`. An
+`abandoned` capture's line has `namespace` (the namespace that went),
+`restores` (how many restores of it ran) and `seconds` (since the capture
+started). Search the log store by namespace or pod for one function's
+history.
+
+A pod's start is recorded from the first event that shows it Ready. A
+restored pod's readiness waits on its restored condition, which the agent
+sets after it marks the pod restored, so the start is counted `criu`, not
+`cold`.
 
 ## Events and the group record
 

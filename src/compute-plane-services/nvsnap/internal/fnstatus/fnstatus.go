@@ -43,6 +43,14 @@ const (
 	// run MaxStalls times: admission starts its pods cold, keeping it.
 	StateStalled = "stalled"
 
+	// StateAbandoned is a capture being verified whose namespace went
+	// before a restore of it served (the agent marked its record
+	// AbandonedKey): nothing can verify it, and the configuration's next
+	// deployment captures it again.
+	StateAbandoned = "abandoned"
+	// AbandonedKey is the agent's groupAbandonedKey.
+	AbandonedKey = "abandonedAt"
+
 	// MaxStalls is the agent's criuGroupMaxStalls.
 	MaxStalls = 3
 
@@ -206,6 +214,8 @@ func configuration(key string, d, c map[string]string) Configuration {
 		cfg.Cachedir = cachedirRanks(c, cfg.Ranks)
 	}
 	switch {
+	case cfg.State == StateVerifying && d[AbandonedKey] != "":
+		cfg.State = StateAbandoned
 	case Restorable(d):
 		cfg.Method = MethodCRIU
 	case cfg.State == StateComplete && cfg.Stalls >= MaxStalls:
@@ -271,7 +281,7 @@ func cachedirRanks(c map[string]string, ranks int) string {
 // is the best configuration's.
 var stateOrder = map[string]int{
 	StateComplete: 0, StateVerifying: 1, StateCapturing: 2, StateStalled: 3,
-	StateRestoreFailed: 4, StateFailed: 5, StateGPUShareFailed: 6,
+	StateAbandoned: 4, StateRestoreFailed: 5, StateFailed: 6, StateGPUShareFailed: 7,
 }
 
 func rank(c Configuration) int {

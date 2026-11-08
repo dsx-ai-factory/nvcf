@@ -112,7 +112,10 @@ stale but stay readable; admission, capture and restore never read them.
 **What the status says.** For each configuration, `state` is the record's
 (`capturing`, `verifying`, `complete`, `failed`, `restore-failed`,
 `gpushare-failed`), or `stalled` for a complete capture admission no longer
-restores (its restores stalled `MaxStalls` times). `method` is how
+restores (its restores stalled `MaxStalls` times), or `abandoned` for a
+capture being verified whose namespace was removed before a restore of it
+served (the agent marks its record `abandonedAt`; the next deployment
+captures the configuration again). `method` is how
 admission starts the next pod: `criu` when it restores (the agent's
 `parseCRIUGroup`: complete, or verifying for its own instance, not
 stalled, a checkpoint for every rank), `cachedir` when a failed
