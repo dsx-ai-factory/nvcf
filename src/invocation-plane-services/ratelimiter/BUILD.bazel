@@ -99,6 +99,7 @@ go_test(
     name = "ratelimiter_test",
     srcs = [
         "nvcf_client_test.go",
+        "olric_store_test.go",
         "rate_limiter_test.go",
         "version_test.go",
     ],
@@ -106,8 +107,11 @@ go_test(
     deps = [
         "//src/invocation-plane-services/ratelimiter/nvcf/pb",
         "@com_github_carlmjohnson_versioninfo//:versioninfo",
+        "@com_github_olric_data_olric//:olric",
+        "@com_github_olric_data_olric//config",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
+        "@com_github_ulule_limiter_v3//:limiter",
         "@com_github_ulule_limiter_v3//drivers/store/memory",
         "@org_golang_google_grpc//:grpc",
         "@org_uber_go_zap//:zap",

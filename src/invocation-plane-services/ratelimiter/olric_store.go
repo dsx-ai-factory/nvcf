@@ -20,6 +20,7 @@ package ratelimiter
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -80,10 +81,19 @@ func (store *Store) Increment(ctx context.Context, key string, count int64, rate
 	return limiter.Context{}, errors.ErrUnsupported
 }
 
+// maxCompareAndSwapAttempts caps the CompareAndSwap retry loop. A mismatch
+// means another check incremented the same key between the read and the swap;
+// each retry reuses the authoritative current value returned by the failed
+// swap, so the loop converges within a few attempts. Exhausting the cap fails
+// the check instead of writing an unvalidated value.
+const maxCompareAndSwapAttempts = 100
+
 // Get returns the limit for the given identifier.
 func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (limiter.Context, error) {
-	// This logic is from drivers/store/redis/store.go
-	// Olric operations(expire, increment, put) all eventually go down to Put. Thus, this is all written with Put
+	// This logic is from drivers/store/redis/store.go. The counter update is
+	// not a Get+Put pair: Get followed by Put is not atomic, so concurrent
+	// checks could read the same value and lose one increment. increment
+	// below performs the read-modify-write with CompareAndSwap.
 
 	tracer := otel.Tracer("Olric")
 	ctx, span := tracer.Start(ctx, "Olric-get")
@@ -91,66 +101,87 @@ func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (lim
 	span.SetAttributes(attribute.String("key", key))
 
 	fullKey := store.getCacheKey(key)
-	result, err := store.dmap.Get(ctx, fullKey)
-	if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-		zap.L().Error("Failed to get value", zap.Error(err))
+	value, expiration, err := store.increment(ctx, fullKey, rate)
+	if err != nil {
 		return limiter.Context{}, err
-	}
-	value := 1
-	// initialize the value to 1 if key doesn't exist
-	if errors.Is(err, olric.ErrKeyNotFound) {
-		err = store.dmap.Put(ctx, fullKey, 1)
-		if err != nil {
-			return limiter.Context{}, err
-		}
-	} else {
-		if result != nil && result.TTL() > 0 {
-			// update the existing value by incrementing 1
-			old, _ := result.Int()
-			value = old + 1
-			putOption := olric.PX(time.Until(time.UnixMilli(result.TTL())))
-			err := store.dmap.Put(ctx, fullKey, value, putOption)
-			if err != nil {
-				zap.L().Error("Failed to update value", zap.Error(err))
-				return limiter.Context{}, err
-			}
-		} else {
-			// when ttl is 0, reset the value to 1
-			err = store.dmap.Put(ctx, fullKey, 1)
-			if err != nil {
-				zap.L().Error("Failed to update value", zap.Error(err))
-				return limiter.Context{}, err
-			}
-		}
 	}
 	span.SetAttributes(attribute.String("value", strconv.Itoa(value)))
+	span.SetAttributes(attribute.String("expiration", expiration.String()))
 
 	now := time.Now()
-	expiration := now.Add(rate.Period)
-	if value == 1 {
-		if rate.Period.Milliseconds() > 0 {
-			ttlOption := olric.PX(rate.Period)
-			err = store.dmap.Put(ctx, fullKey, value, ttlOption)
+	return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+}
 
-			// ignore key not found error
-			if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-				zap.L().Error("Failed to set expiration", zap.Error(err))
-				return limiter.Context{}, err
+// increment bumps the per-key counter by one and returns the new value with
+// the window expiration.
+//
+// The read-modify-write is a CompareAndSwap retry loop, the same primitive the
+// LLM API gateway uses for its buckets (see
+// llm-api-gateway/ratelimit/olric_store.go). On a mismatch the failed swap
+// returns the authoritative current value, so a retry needs no extra Get.
+//
+// The first check in a window swaps with a nil expected value, which only
+// succeeds when the key does not exist. Counter creation and window TTL
+// arming are therefore a single atomic write. dmap.Incr cannot do this: it
+// has no TTL option, and arming the TTL in a follow-up call would leave the
+// counter without a window whenever that call fails.
+func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.Rate) (int, time.Time, error) {
+	// current is the value the next swap compares against. nil means the key
+	// does not exist and the next swap must insert it.
+	var current *olric.GetResponse
+
+	for attempt := 0; attempt < maxCompareAndSwapAttempts; attempt++ {
+		var (
+			expected   []byte
+			newValue   int
+			options    []olric.PutOption
+			expiration time.Time
+		)
+
+		if current == nil {
+			// Insert-if-absent: the first check in a window creates the
+			// counter at 1 and arms the window TTL in the same atomic write.
+			newValue = 1
+			if rate.Period.Milliseconds() > 0 {
+				options = append(options, olric.PX(rate.Period))
+			}
+			expiration = time.Now().Add(rate.Period)
+		} else {
+			old, err := current.Int()
+			if err != nil {
+				zap.L().Error("Failed to decode counter value", zap.Error(err))
+				return 0, time.Time{}, err
+			}
+			expected = current.RawValue()
+			if ttl := current.TTL(); ttl > 0 {
+				// Same window: increment in place and keep the remaining TTL.
+				newValue = old + 1
+				options = append(options, olric.PX(time.Until(time.UnixMilli(ttl))))
+				expiration = time.Now().Add(time.Duration(ttl) * time.Millisecond)
+			} else {
+				// No TTL left on the key: restart the window at 1.
+				newValue = 1
+				if rate.Period.Milliseconds() > 0 {
+					options = append(options, olric.PX(rate.Period))
+				}
+				expiration = time.Now().Add(rate.Period)
 			}
 		}
-		return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+
+		swapped, next, err := store.dmap.CompareAndSwap(ctx, fullKey, expected, newValue, options...)
+		if err != nil {
+			zap.L().Error("Failed to update value", zap.Error(err))
+			return 0, time.Time{}, err
+		}
+		if swapped {
+			return newValue, expiration, nil
+		}
+		// Another check updated the key first. next holds what is stored now,
+		// nil when the key expired in between. Retry against that value.
+		current = next
 	}
 
-	if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-		zap.L().Error("Failed to get remaining ttl", zap.Error(err))
-		return limiter.Context{}, err
-	}
-
-	if result.TTL() > 0 {
-		expiration = now.Add(time.Duration(result.TTL()) * time.Millisecond)
-	}
-	span.SetAttributes(attribute.String("expiration", expiration.String()))
-	return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+	return 0, time.Time{}, fmt.Errorf("counter for %q did not stabilize after %d compare-and-swap attempts", fullKey, maxCompareAndSwapAttempts)
 }
 
 // Peek returns the limit for the given identifier, without modification on current values.
