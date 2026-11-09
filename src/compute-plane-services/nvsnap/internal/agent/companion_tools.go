@@ -65,9 +65,8 @@ var attachReadOnly = func(src, dst string) error {
 // started before its version was mounted on its companion directory, whose
 // mount of it does not propagate. The mount is cloned detached and made
 // read-only here, then attached from a thread that has entered the
-// namespace; that thread is never returned to the runtime, so it exits
-// with its goroutine. dst is resolved in the workload's root and a
-// trailing symlink is not followed.
+// namespace (attachInNamespace). dst is resolved in the workload's root
+// and a trailing symlink is not followed.
 var injectReadOnly = func(src, nsPath, dst string) error {
 	fd, err := unix.OpenTree(unix.AT_FDCWD, src, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
 	if err != nil {
@@ -98,24 +97,43 @@ var injectReadOnly = func(src, nsPath, dst string) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		runtime.LockOSThread() // never unlocked: the thread leaves the agent's mount namespace
-		// A thread shares its filesystem context with the others until it
-		// unshares it, and setns into a mount namespace refuses a shared one.
-		if err := unix.Unshare(unix.CLONE_FS); err != nil {
-			errc <- fmt.Errorf("unshare the filesystem context: %w", err)
-			return
-		}
-		if err := unix.Setns(ns, unix.CLONE_NEWNS); err != nil {
-			errc <- fmt.Errorf("enter the workload's mount namespace: %w", err)
-			return
-		}
-		if err := unix.MoveMount(fd, "", unix.AT_FDCWD, dst, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
-			errc <- fmt.Errorf("move_mount onto %s in the workload: %w", dst, err)
-			return
-		}
-		errc <- nil
+		// Never unlocked: the thread's filesystem context is its own from
+		// here on, so it exits with this goroutine (or, the main thread,
+		// is parked by the runtime).
+		runtime.LockOSThread()
+		errc <- attachInNamespace(ns, fd, dst)
 	}()
 	return <-errc
+}
+
+// attachInNamespace attaches the detached mount fd at dst inside the mount
+// namespace ns, from the calling thread, which the caller has locked and
+// never unlocks. The thread returns to its own mount namespace before this
+// returns: the runtime cannot end the main thread, which it parks instead,
+// and a main thread left in a workload's namespace would keep that
+// namespace alive for the agent's life and show it at /proc/self.
+func attachInNamespace(ns, fd int, dst string) error {
+	// A thread shares its filesystem context with the others until it
+	// unshares it, and setns into a mount namespace refuses a shared one.
+	if err := unix.Unshare(unix.CLONE_FS); err != nil {
+		return fmt.Errorf("unshare the filesystem context: %w", err)
+	}
+	own, err := unix.Open("/proc/thread-self/ns/mnt", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the agent's mount namespace: %w", err)
+	}
+	defer func() { _ = unix.Close(own) }()
+	if err = unix.Setns(ns, unix.CLONE_NEWNS); err != nil {
+		return fmt.Errorf("enter the workload's mount namespace: %w", err)
+	}
+	moved := unix.MoveMount(fd, "", unix.AT_FDCWD, dst, unix.MOVE_MOUNT_F_EMPTY_PATH)
+	if err = unix.Setns(own, unix.CLONE_NEWNS); err != nil {
+		return fmt.Errorf("return to the agent's mount namespace: %w", err)
+	}
+	if moved != nil {
+		return fmt.Errorf("move_mount onto %s in the workload: %w", dst, moved)
+	}
+	return nil
 }
 
 // unmountDir detaches the mount on dir.

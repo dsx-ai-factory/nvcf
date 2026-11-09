@@ -114,7 +114,8 @@ the volume, is left without it and is not captured or restored.
     `ensureCompanionToolsIn`): an agent rollout or a failed fetch can leave a
     running companion with an empty directory. When a capture checks it, the
     agent clones the version read-only, enters the companion's mount
-    namespace from a thread of its own, and attaches it at `/criu-bundle`.
+    namespace from a thread of its own, attaches it at `/criu-bundle`, and
+    returns that thread to its own namespace (`attachInNamespace`).
     Only a companion in the initial user namespace, without `CAP_SYS_ADMIN`,
     whose mount namespace the initial user namespace owns, gets it: any other
     could make the mount writable, and is not captured or restored anyway.

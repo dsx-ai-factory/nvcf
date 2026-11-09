@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8stesting "k8s.io/client-go/testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -575,6 +578,43 @@ func TestCompanionToolsVersion(t *testing.T) {
 	}
 }
 
+// startInMountNS runs a stand-in workload, sleep under unshare with args,
+// and returns its pid once it is in a mount namespace of its own. Where the
+// kernel refuses unshare (a container without CAP_SYS_ADMIN, or user
+// namespaces turned off), the test is skipped; any other early exit fails it.
+func startInMountNS(t *testing.T, args ...string) int {
+	t.Helper()
+	var stderr strings.Builder
+	//nolint:gosec // args are this file's constant unshare flags
+	cmd := exec.CommandContext(context.Background(), "unshare", append(args, "sleep", "60")...)
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var waitErr error
+	exited := make(chan struct{}) // closed once waitErr is set
+	go func() { waitErr = cmd.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = cmd.Process.Kill(); <-exited })
+	nsPath := fmt.Sprintf("/proc/%d/ns/mnt", cmd.Process.Pid)
+	self, _ := os.Readlink("/proc/self/ns/mnt")
+	deadline := time.After(10 * time.Second)
+	for {
+		if ns, _ := os.Readlink(nsPath); ns != "" && ns != self {
+			return cmd.Process.Pid
+		}
+		select {
+		case <-exited:
+			if strings.Contains(stderr.String(), "Operation not permitted") {
+				t.Skipf("the kernel refuses unshare %v here: %s", args, strings.TrimSpace(stderr.String()))
+			}
+			t.Fatalf("unshare %v exited before entering its mount namespace: %v: %s", args, waitErr, strings.TrimSpace(stderr.String()))
+		case <-deadline:
+			t.Fatalf("unshare %v did not enter a mount namespace of its own", args)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
 // A companion's mount namespace gets the version mounted read-only at its
 // tools path; the agent's own namespace does not. Run as root, or in a
 // user namespace: unshare -Urm go test -run TestInjectReadOnly_Kernel.
@@ -589,29 +629,15 @@ func TestInjectReadOnly_Kernel(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "criu"), []byte("x"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	pod := exec.CommandContext(context.Background(), "unshare", "-m", "--propagation", "private", "sleep", "60")
-	if err := pod.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = pod.Process.Kill(); _ = pod.Wait() })
-	nsPath := fmt.Sprintf("/proc/%d/ns/mnt", pod.Process.Pid)
-	self, _ := os.Readlink("/proc/self/ns/mnt")
-	for i := 0; ; i++ {
-		if ns, _ := os.Readlink(nsPath); ns != "" && ns != self {
-			break
-		}
-		if i == 100 {
-			t.Fatal("the workload's mount namespace did not appear")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	pod := startInMountNS(t, "-m", "--propagation", "private")
+	nsPath := fmt.Sprintf("/proc/%d/ns/mnt", pod)
 	if err := injectReadOnly(src, nsPath, dst); err != nil {
 		if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EPERM) {
 			t.Skipf("the mount API is not available here: %v", err)
 		}
 		t.Fatal(err)
 	}
-	inPod := fmt.Sprintf("/proc/%d/root%s", pod.Process.Pid, dst)
+	inPod := fmt.Sprintf("/proc/%d/root%s", pod, dst)
 	if _, err := os.Stat(filepath.Join(inPod, "criu")); err != nil {
 		t.Fatalf("the workload does not see the version: %v", err)
 	}
@@ -624,27 +650,70 @@ func TestInjectReadOnly_Kernel(t *testing.T) {
 
 	// A mount namespace the workload owns through a user namespace of its
 	// own is refused: there it could make the mount writable.
-	own := exec.CommandContext(context.Background(), "unshare", "-U", "-r", "-m", "--propagation", "private", "sleep", "60")
-	if err := own.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = own.Process.Kill(); _ = own.Wait() })
-	ownNS := fmt.Sprintf("/proc/%d/ns/mnt", own.Process.Pid)
-	for i := 0; ; i++ {
-		if ns, _ := os.Readlink(ownNS); ns != "" && ns != self {
-			break
-		}
-		if i == 100 {
-			t.Fatal("the workload's mount namespace did not appear")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	own := startInMountNS(t, "-U", "-r", "-m", "--propagation", "private")
+	ownNS := fmt.Sprintf("/proc/%d/ns/mnt", own)
 	dst2 := t.TempDir()
 	if err := injectReadOnly(src, ownNS, dst2); err == nil || !strings.Contains(err.Error(), "user namespace") {
 		t.Errorf("injecting into a mount namespace the workload owns = %v, want refused", err)
 	}
-	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root%s/criu", own.Process.Pid, dst2)); err == nil {
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root%s/criu", own, dst2)); err == nil {
 		t.Error("the version was mounted into a mount namespace the workload owns")
+	}
+}
+
+// The thread that attached the version returns to its own mount namespace,
+// whichever thread it is: the runtime parks a locked main thread rather
+// than end it, and one left in a workload's namespace would hold it for the
+// agent's life and show it at /proc/self. Run as root, or in a container
+// with CAP_SYS_ADMIN.
+func TestAttachInNamespace_ReturnsToOwnNamespace(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to mount")
+	}
+	src, dst := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "criu"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pod := startInMountNS(t, "-m", "--propagation", "private")
+	type result struct {
+		before, after string
+		err           error
+	}
+	done := make(chan result, 1)
+	go func() {
+		goruntime.LockOSThread() // never unlocked, as in injectReadOnly
+		var r result
+		r.before, _ = os.Readlink("/proc/thread-self/ns/mnt")
+		fd, err := unix.OpenTree(unix.AT_FDCWD, src, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+		if err != nil {
+			r.err = err
+			done <- r
+			return
+		}
+		defer func() { _ = unix.Close(fd) }()
+		ns, err := unix.Open(fmt.Sprintf("/proc/%d/ns/mnt", pod), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			r.err = err
+			done <- r
+			return
+		}
+		defer func() { _ = unix.Close(ns) }()
+		r.err = attachInNamespace(ns, fd, dst)
+		r.after, _ = os.Readlink("/proc/thread-self/ns/mnt")
+		done <- r
+	}()
+	r := <-done
+	if r.err != nil {
+		if errors.Is(r.err, syscall.ENOSYS) || errors.Is(r.err, syscall.EPERM) {
+			t.Skipf("the mount API is not available here: %v", r.err)
+		}
+		t.Fatal(r.err)
+	}
+	if r.after != r.before {
+		t.Errorf("the attaching thread is left in %s, want its own %s", r.after, r.before)
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root%s/criu", pod, dst)); err != nil {
+		t.Errorf("the workload does not see the version: %v", err)
 	}
 }
 
