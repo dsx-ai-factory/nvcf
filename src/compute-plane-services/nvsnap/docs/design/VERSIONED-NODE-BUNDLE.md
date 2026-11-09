@@ -132,9 +132,3 @@ the volume, is left without it and is not captured or restored.
   agent driving the restore ends it as not run as soon as it sees that,
   rather than after the group's placeholder wait, so the checkpoints stay
   usable and the instance is started cold.
-- An agent rollout rolled back part way: a companion an upgraded webhook
-  admitted to a node whose agent was not yet upgraded, and that started before
-  an upgraded agent reached it, keeps an empty `/criu-bundle`. The earlier
-  agent neither mounts the companion directory nor attaches into the pod, so
-  the instance is not captured until the companion is recreated. The pod runs
-  and the instance serves; nothing captured before is affected.
