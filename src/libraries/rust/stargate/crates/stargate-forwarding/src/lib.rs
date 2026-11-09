@@ -1068,13 +1068,14 @@ mod tests {
         let peer_task = tokio::spawn(async move {
             let incoming = peer_server.accept().await.expect("peer should accept");
             let connection = incoming.await.expect("peer connection should complete");
-            let (mut send, recv) = connection.open_bi().await.expect("open request stream");
+            let (mut send, mut recv) = connection.open_bi().await.expect("open request stream");
             send.write_all(b"request").await.expect("write request");
             send.finish().expect("finish request");
             request_read_rx
                 .await
                 .expect("pylon should read the request");
-            drop(recv);
+            // A non-zero code shows the relay forwards the code, not its own drop's 0.
+            recv.stop(7u32.into()).expect("stop the response stream");
             // Keep the connection open: only the stream is abandoned.
             std::future::pending::<()>().await;
         });
@@ -1113,9 +1114,10 @@ mod tests {
         let stopped = tokio::time::timeout(Duration::from_secs(5), send.stopped())
             .await
             .expect("a silent pylon stream must see STOP_SENDING through the relay");
-        assert!(
-            matches!(stopped, Ok(Some(_))),
-            "expected STOP_SENDING, got {stopped:?}"
+        assert_eq!(
+            stopped,
+            Ok(Some(7u32.into())),
+            "pylon must see the peer's STOP_SENDING code"
         );
         client_connection.close(0u32.into(), b"test complete");
         relay_task.abort();
