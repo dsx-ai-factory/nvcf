@@ -90,3 +90,51 @@ the volume, is left without it and is not captured or restored.
 - During an agent rollout, a pod admitted by an upgraded agent may be
   scheduled to a node whose agent has not staged the new version yet; it starts
   once that node's agent has (the kubelet retries the mount).
+- A companion (a pod without GPUs a capture may dump) may be scheduled to a
+  node no agent runs on, such as a CPU node NVCA sends a helm chart's CPU-only
+  pod to. So it mounts not the version itself but its companion directory,
+  `<root>/companion/versions/<id>`, which the kubelet creates empty where it is missing
+  (`DirectoryOrCreate`); its scheduling is left as it is. The mount asks for
+  no propagation: a container runtime refuses to start a container whose
+  `HostToContainer` mount source is on a private mount, which a node no agent
+  runs on may have. On a node an agent runs on, the agent mounts each staged
+  version on its companion directory, read-only from the moment it is attached
+  (`open_tree`, `mount_setattr`, `move_mount`; Linux 5.12 or later), at start,
+  on each node sweep, and for a companion pending on the node before it starts,
+  so a companion that starts after sees it. A companion that started first
+  (an agent rollout, a failed fetch) has the version mounted into its own
+  mount namespace when a capture checks it: the agent clones the version
+  read-only, enters the companion's mount namespace from a thread of its own,
+  and attaches it at `/criu-bundle`. Only a companion in the initial user
+  namespace, without `CAP_SYS_ADMIN`, whose mount namespace the initial user
+  namespace owns, gets it: any other could make the mount writable, and is
+  not captured or restored anyway. A version not on the node yet is fetched
+  by the node sweep, and a capture of its instance waits up to 5 minutes for
+  it before the instance is not captured; before, such a companion stayed
+  Pending, and its instance unready, until the fetch
+  succeeded. The capture's checks are unchanged: the
+  pod's `/criu-bundle` must be a staged version, read-only. A companion on a
+  node with no agent runs, without the tools, and the instance it belongs to
+  is not captured (counted as reason `no_agent`); so is one where a pod on
+  such a node is connected to a companion of the instance, as the companion's
+  agent sees it: from the pod's address, or from its node's (a source-NATed
+  connection, or the node's network). A pod there that no companion is
+  connected to does not matter. A node the
+  agent's placement covers (its node selector and affinity, and its
+  tolerations with those every DaemonSet pod gets) but whose agent pod is not
+  running (an agent rollout, a new node) is not such a node: the capture is
+  tried again, for up to 5 minutes, after which the instance is not captured
+  (reason `no_agent`). A companion's restore
+  placeholder mounts the version itself, as a GPU rank's does, which every
+  agent version restores from (an agent rollout runs both). It is a pod
+  that runs nothing until it is restored. One scheduled to a node no agent
+  runs on or will (by its placement) cannot start or be restored there: the
+  agent driving the restore ends it as not run as soon as it sees that,
+  rather than after the group's placeholder wait, so the checkpoints stay
+  usable and the instance is started cold.
+- An agent rollout rolled back part way: a companion an upgraded webhook
+  admitted to a node whose agent was not yet upgraded, and that started before
+  an upgraded agent reached it, keeps an empty `/criu-bundle`. The earlier
+  agent neither mounts the companion directory nor attaches into the pod, so
+  the instance is not captured until the companion is recreated. The pod runs
+  and the instance serves; nothing captured before is affected.
