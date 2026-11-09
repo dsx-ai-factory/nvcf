@@ -21,7 +21,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -113,9 +112,11 @@ func TestStoreGetConcurrentIncrementsCounted(t *testing.T) {
 		require.NoError(t, errs[i])
 	}
 
+	// limiter.Context carries the accepted count as Limit-Remaining (it has
+	// no Counter field in ulule/limiter v3).
 	var sum int64
 	for _, lc := range contexts {
-		sum += lc.Counter
+		sum += lc.Limit - lc.Remaining
 	}
 
 	resp, err := store.GetDMap().Get(ctx, store.getCacheKey(key))
@@ -124,6 +125,42 @@ func TestStoreGetConcurrentIncrementsCounted(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, calls, stored, "lost or duplicated increments under concurrency")
 	require.EqualValues(t, calls*(calls+1)/2, sum, "per-call counters must cover 1..N exactly once")
+}
+
+// TestStoreGetOverCapContention pushes more concurrent checks through one
+// key than the compare-and-swap attempt budget (100): with the retry
+// backoff the losers must still be counted, none dropped.
+func TestStoreGetOverCapContention(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping embedded Olric test in -short mode")
+	}
+
+	ctx := context.Background()
+	store := newTestStore(t)
+	rate := limiter.Rate{Limit: 1_000_000, Period: time.Hour}
+	key := "2394-over-cap"
+
+	const calls = 128
+	contexts := make([]limiter.Context, calls)
+	errs := make([]error, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			contexts[i], errs[i] = store.Get(ctx, key, rate)
+		}(i)
+	}
+	wg.Wait()
+	for i := range errs {
+		require.NoError(t, errs[i])
+	}
+
+	var sum int64
+	for _, lc := range contexts {
+		sum += lc.Limit - lc.Remaining
+	}
+	require.EqualValues(t, calls*(calls+1)/2, sum, "per-call counters must cover 1..N exactly once over the attempt cap")
 }
 
 // TestStoreGetWindowLifecycle pins the window semantics around the atomic
@@ -143,7 +180,7 @@ func TestStoreGetWindowLifecycle(t *testing.T) {
 	rate := limiter.Rate{Limit: 1000, Period: 250 * time.Millisecond}
 	first, err := store.Get(ctx, key, rate)
 	require.NoError(t, err)
-	require.EqualValues(t, 1, first.Counter)
+	require.EqualValues(t, 1, first.Limit-first.Remaining)
 
 	resp, err := dmap.Get(ctx, store.getCacheKey(key))
 	require.NoError(t, err)
@@ -151,12 +188,14 @@ func TestStoreGetWindowLifecycle(t *testing.T) {
 
 	second, err := store.Get(ctx, key, rate)
 	require.NoError(t, err)
-	require.EqualValues(t, 2, second.Counter)
+	require.EqualValues(t, 2, second.Limit-second.Remaining)
+	require.LessOrEqual(t, second.Reset, time.Now().Add(rate.Period).Unix()+1,
+		"the in-window increment must keep the original window expiration")
 
 	time.Sleep(700 * time.Millisecond)
 	restarted, err := store.Get(ctx, key, rate)
 	require.NoError(t, err)
-	require.EqualValues(t, 1, restarted.Counter, "the counter must restart after the window expires")
+	require.EqualValues(t, 1, restarted.Limit-restarted.Remaining, "the counter must restart after the window expires")
 }
 
 // TestStoreGetRestartsKeyWithoutTTL covers the branch that resets a TTL-less
@@ -176,7 +215,7 @@ func TestStoreGetRestartsKeyWithoutTTL(t *testing.T) {
 
 	got, err := store.Get(ctx, key, rate)
 	require.NoError(t, err)
-	require.EqualValues(t, 1, got.Counter, "a key without TTL must restart the window at 1")
+	require.EqualValues(t, 1, got.Limit-got.Remaining, "a key without TTL must restart the window at 1")
 
 	resp, err := store.GetDMap().Get(ctx, store.getCacheKey(key))
 	require.NoError(t, err)

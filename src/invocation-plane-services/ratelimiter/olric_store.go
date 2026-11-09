@@ -21,12 +21,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"strconv"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-
-	"strconv"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -131,6 +131,9 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 	var current *olric.GetResponse
 
 	for attempt := 0; attempt < maxCompareAndSwapAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, time.Time{}, err
+		}
 		var (
 			expected   []byte
 			newValue   int
@@ -149,15 +152,17 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		} else {
 			old, err := current.Int()
 			if err != nil {
-				zap.L().Error("Failed to decode counter value", zap.Error(err))
-				return 0, time.Time{}, err
+				zap.L().Error("Failed to decode counter value", zap.String("key", fullKey), zap.Error(err))
+				return 0, time.Time{}, fmt.Errorf("decode counter for %q: %w", fullKey, err)
 			}
 			expected = current.RawValue()
 			if ttl := current.TTL(); ttl > 0 {
 				// Same window: increment in place and keep the remaining TTL.
+				// GetResponse.TTL reports the stored expiry as an absolute Unix
+				// millisecond timestamp, so the swap re-arms exactly what is left.
 				newValue = old + 1
 				options = append(options, olric.PX(time.Until(time.UnixMilli(ttl))))
-				expiration = time.Now().Add(time.Duration(ttl) * time.Millisecond)
+				expiration = time.UnixMilli(ttl)
 			} else {
 				// No TTL left on the key: restart the window at 1.
 				newValue = 1
@@ -170,8 +175,8 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 
 		swapped, next, err := store.dmap.CompareAndSwap(ctx, fullKey, expected, newValue, options...)
 		if err != nil {
-			zap.L().Error("Failed to update value", zap.Error(err))
-			return 0, time.Time{}, err
+			zap.L().Error("Failed to update value", zap.String("key", fullKey), zap.Error(err))
+			return 0, time.Time{}, fmt.Errorf("compare-and-swap counter for %q: %w", fullKey, err)
 		}
 		if swapped {
 			return newValue, expiration, nil
@@ -179,6 +184,16 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		// Another check updated the key first. next holds what is stored now,
 		// nil when the key expired in between. Retry against that value.
 		current = next
+		// Yield for a short random interval, so a hot key with 100+ concurrent
+		// checks spreads its retries instead of exhausting the attempt budget
+		// in a tight spin.
+		timer := time.NewTimer(time.Duration(rand.Int64N(4)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, time.Time{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
 
 	return 0, time.Time{}, fmt.Errorf("counter for %q did not stabilize after %d compare-and-swap attempts", fullKey, maxCompareAndSwapAttempts)
