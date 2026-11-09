@@ -47,6 +47,9 @@ spring:
           reval:
             client-id: unused
             client-secret: unused
+          event-ledger:
+            client-id: unused
+            client-secret: unused
         provider:
           api-keys:
             token-uri: unused
@@ -57,6 +60,8 @@ spring:
           ess:
             token-uri: unused
           reval:
+            token-uri: unused
+          event-ledger:
             token-uri: unused
 
 management:
@@ -134,14 +139,11 @@ nvcf:
     # base-url: http://api.icms.svc.cluster.local:8080 -- Use when self-hosted stack is ready
     static:
       token: ${kv.tokens.icms}
+  event-ledger:
+    enabled: false
   api-keys:
     base-url: http://api-keys.api-keys.svc.cluster.local:8080
     # base-url: http://api-keys.nvcf.svc.cluster.local:8080 -- Use when self-hosted stack is ready
-    static:
-      token: ${kv.tokens.api-keys}
-  # This evaluation is served by the same api-keys evaluations gateway; without this, the
-  # OAuth2 fallback picks up api-keys' client-id/token-uri above, which are "unused" here.
-  service-account:
     static:
       token: ${kv.tokens.api-keys}
   registries:
