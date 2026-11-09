@@ -428,6 +428,15 @@ func TestApikeyRevoke_NotFoundUnderAllIssuers(t *testing.T) {
 	assert.Contains(t, err.Error(), "function, task or event-ledger")
 }
 
+func TestApikeyList_EmptyJSONIsArray(t *testing.T) {
+	srv, _ := fakeAPIKeysListServer(t, nil, nil, nil)
+	configureApikeyTest(t, srv.URL)
+	out := captureListJSON(t)
+	keys, ok := out["keys"].([]interface{})
+	require.True(t, ok, "empty keys must be an array, not null")
+	assert.Empty(t, keys)
+}
+
 func TestApikeyClearAll_DeletesFunctionAndTaskKeys(t *testing.T) {
 	srv, rec := fakeAPIKeysListServer(t, []string{"fn-1"}, []string{"task-1", "task-2"}, nil)
 	configureApikeyTest(t, srv.URL)
