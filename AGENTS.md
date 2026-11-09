@@ -350,6 +350,20 @@ whether `src/clis/nvcf-cli` needs a matching change, and list affected clients
 in the Pull Request "Related Pull Requests" section. If the CLI needs an
 update, file a follow-up issue.
 
+## Compatibility between independently deployed components
+
+Preserve existing API, protobuf, transport, configuration, and telemetry
+contracts during rolling upgrades and rollback. Add fields and capabilities;
+do not remove, renumber, repurpose, or change the meaning of existing ones.
+New optional data must not become mandatory for an existing routing policy or
+default. Use an explicit opt-in or capability negotiation with a working
+legacy path. New public endpoints do not justify breaking internal protocols.
+
+Test old/new producer and consumer combinations, absent optional fields, and
+rollback before enabling a new default. Schema checks alone do not establish
+behavioral compatibility. Keep compatibility fixtures from released versions;
+do not regenerate them from the candidate to make a failing check pass.
+
 ## Tests
 
 Code changes must include tests. If a change does not include tests, explain why

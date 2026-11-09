@@ -47,14 +47,29 @@ to kubectl calls made by the local integration and manifest-rendering helpers.
 
 ## PR Checks
 
-The PR gate runs repository header and diff checks, then runs the code-change
-gates only when code-impacting paths changed.
+The required Bazel workflow checks protobuf compatibility before selecting
+changed subtrees. Runtime compatibility tests run in the Stargate row.
 
 Run the support-script tests after changing repository tooling:
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
+
+## Protocol compatibility
+
+With Buf on `PATH`, run `scripts/check_buf_breaking.sh origin/main` from this
+directory's parent. It checks both protobuf APIs against the supplied Git
+base with strict `FILE` rules and no deletion exceptions. Candidate Buf
+configuration cannot disable the check. CI supplies the pull request or
+merge queue base, or the previous commit for a push.
+
+`cargo test --locked -p stargate --test compatibility -- --test-threads=1`
+sends frozen released stats through gRPC registration and HTTP/QUIC streaming.
+It checks the default policy and explicit legacy modes for both Pulsar variants
+with old-only, mixed, new-only, and rollback states. This checks released wire
+data with current transport code; it does not run historical Pylon binaries.
+Frozen maximum-bearing stats also exercise the current Pulsar defaults.
 
 ## Last-Cluster End-to-End Check
 

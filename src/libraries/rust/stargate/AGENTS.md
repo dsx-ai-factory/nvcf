@@ -31,6 +31,35 @@ cargo fmt --all -- --check
 For other Rust changes, select the affected workspace packages with `-p`.
 For documentation changes, check whitespace and link targets.
 
+## Compatibility contract
+
+Stargate, Pylon, registration relays, and gateways upgrade independently.
+Preserve registration, discovery, tunnel, HTTP, stats, and configuration
+contracts in both upgrade and rollback directions. Do not add exceptions to
+the protobuf breaking-change check. Deprecate fields and RPCs while keeping
+them functional; use a separately versioned protocol for incompatible changes.
+
+An additive protobuf change can still break routing. Missing new telemetry
+must retain the existing policy's behavior. Gate new requirements behind an
+explicit opt-in or negotiated capability, with a tested legacy mode. Verify
+that relays preserve the new fields before enabling a dependent policy.
+
+Run these from this directory, with Buf installed:
+
+```sh
+scripts/check_buf_breaking.sh origin/main
+python3 -m unittest discover -s scripts -p 'test_check_buf_breaking.py'
+cargo test --locked -p stargate --test compatibility -- --test-threads=1
+```
+
+CI runs the strict schema check against the target base and the frozen-wire
+routing test through Bazel. Extend the compatibility test when changing a
+contract. Cover old-only, new-only, and mixed backends, absent optional stats,
+streaming completion, and rollback. Preserve released fixtures. Document the
+supported policy modes, upgrade order, and how existing function launch
+specifications and running Pylons receive an image update. An agent or chart
+upgrade alone does not prove that running function Pylons changed.
+
 ## Mandatory Pull Request validation
 
 Before marking a Pull Request ready or merging, run at least one local, AWS,

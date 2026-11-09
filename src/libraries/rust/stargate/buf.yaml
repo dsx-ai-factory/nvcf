@@ -15,9 +15,7 @@
 
 version: v2
 modules:
-  # Keep the module rooted at the repository so the first breaking check can
-  # compare against main before main has this buf.yaml; includes keep Buf scoped
-  # to Stargate's public protobuf API sources.
+  # Scope direct Buf commands to the public protobuf API sources.
   - path: .
     includes:
       - crates/proto/proto
