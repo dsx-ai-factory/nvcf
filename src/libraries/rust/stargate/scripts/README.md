@@ -62,10 +62,20 @@ With Buf on `PATH`, run `scripts/check_buf_breaking.sh origin/main` from this
 directory's parent. It checks both protobuf APIs against the supplied Git
 base with strict `FILE` rules and no deletion exceptions. Candidate Buf
 configuration cannot disable the check. CI supplies the pull request or
-merge queue base, or the previous commit for a push.
+merge queue base, or the previous commit for a push. It also checks the oldest
+supported stable release, selected by UTC publication date from the upstream
+GitHub release inventory. The rolling support window is 90 days. Older versions
+still deployed or needed for rollback must remain in
+`compatibility_retained_releases.json`; remove them only after verified migration
+and closure of the rollback window. Missing inventory or retained-release
+metadata fails CI. The selected tag, publication date, and cutoff appear in the
+job log.
 
 `cargo test --locked -p stargate --test compatibility -- --test-threads=1`
-sends frozen released stats through gRPC registration and HTTP/QUIC streaming.
+sends released stats through gRPC registration and HTTP/QUIC streaming.
+CI encodes these stats using the selected oldest release's protobuf schema and
+passes the hex payload through `STARGATE_COMPAT_STATS_HEX`. Local runs without
+that variable use the frozen v0.8.0 fixture.
 It checks the default policy and explicit legacy modes for both Pulsar variants
 with old-only, mixed, new-only, and rollback states. This checks released wire
 data with current transport code; it does not run historical Pylon binaries.

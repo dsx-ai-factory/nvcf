@@ -20,7 +20,7 @@ use stargate_proto::pb::{
     ModelStats,
 };
 
-// Frozen protoc output from stargate v0.19.3 (c60aca1375ccd15b992d6e5efe91cd8120ae01f7).
+// Frozen wire output from stargate v0.8.0 (30d16b1eb7e8d04143e0d0907b4c4dff246669db).
 // Input: last_mean_input_tps:100 max_output_tps:50
 // kv_cache_capacity_tokens:4096 kv_cache_free_tokens:4096. No field 18 exists.
 // Do not regenerate using the candidate schema: the old wire contract is the fixture.
@@ -40,7 +40,26 @@ const MAX_STATS: &[u8] = &[
 #[tokio::test]
 async fn released_stats_route_alone_mixed_and_after_rollback() {
     init_crypto();
-    let legacy = ModelStats::decode(LEGACY_STATS).expect("released stats must decode");
+    // CI encodes this payload with the oldest supported release's schema.
+    // Local runs retain the frozen release fixture when no CI payload is supplied.
+    let wire = match std::env::var("STARGATE_COMPAT_STATS_HEX") {
+        Ok(hex) => {
+            assert!(
+                !hex.is_empty() && hex.len() % 2 == 0,
+                "invalid released stats hex"
+            );
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                        .expect("invalid released stats hex")
+                })
+                .collect::<Vec<_>>()
+        }
+        Err(std::env::VarError::NotPresent) => LEGACY_STATS.to_vec(),
+        Err(error) => panic!("invalid released stats environment: {error}"),
+    };
+    let legacy = ModelStats::decode(wire.as_slice()).expect("released stats must decode");
     assert_eq!(legacy.last_mean_input_tps, 100.0);
     assert_eq!(legacy.max_output_tps, 50.0);
     assert_eq!(legacy.kv_cache_capacity_tokens, 4096);

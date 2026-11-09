@@ -33,6 +33,13 @@ For documentation changes, check whitespace and link targets.
 
 ## Compatibility contract
 
+Support every stable release published in the past 90 days, using UTC release
+publication timestamps. CI selects the oldest release in that window from
+the upstream GitHub release inventory. Add older versions still deployed or
+needed for rollback to `compatibility_retained_releases.json` before they age
+out. Entries do not expire automatically; remove one only after verified
+migration and closure of its rollback window. Missing release metadata fails CI.
+
 Stargate, Pylon, registration relays, and gateways upgrade independently.
 Preserve registration, discovery, tunnel, HTTP, stats, and configuration
 contracts in both upgrade and rollback directions. Do not add exceptions to
@@ -49,11 +56,13 @@ Run these from this directory, with Buf installed:
 ```sh
 scripts/check_buf_breaking.sh origin/main
 python3 -m unittest discover -s scripts -p 'test_check_buf_breaking.py'
+python3 -m unittest discover -s scripts -p 'test_select_compatibility_baseline.py'
 cargo test --locked -p stargate --test compatibility -- --test-threads=1
 ```
 
-CI runs the strict schema check against the target base and the frozen-wire
-routing test through Bazel. Extend the compatibility test when changing a
+CI checks schemas against the target base and the oldest supported release.
+It encodes stats with that release's schema for the Bazel routing test. Local
+runs use a frozen release fixture. Extend the compatibility test when changing a
 contract. Cover old-only, new-only, and mixed backends, absent optional stats,
 streaming completion, and rollback. Preserve released fixtures. Document the
 supported policy modes, upgrade order, and how existing function launch

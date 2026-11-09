@@ -352,6 +352,12 @@ update, file a follow-up issue.
 
 ## Compatibility between independently deployed components
 
+Maintain compatibility with stable releases published within the previous
+90 days, measured from their UTC publication timestamps. Keep supporting older
+versions still deployed or needed for rollback. Retire a version only after
+its support window ends and deployment inventory confirms migration and the
+rollback window has closed. CI must exercise the oldest supported release.
+
 Preserve existing API, protobuf, transport, configuration, and telemetry
 contracts during rolling upgrades and rollback. Add fields and capabilities;
 do not remove, renumber, repurpose, or change the meaning of existing ones.

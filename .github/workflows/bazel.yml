@@ -74,6 +74,7 @@ jobs:
       matrix: ${{ steps.detect.outputs.matrix }}
       matrix_docker: ${{ steps.detect.outputs.matrix_docker }}
       any: ${{ steps.detect.outputs.any }}
+      compatibility_stats: ${{ steps.compatibility.outputs.stats }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,7 +95,10 @@ jobs:
           echo "$RUNNER_TEMP/buf-bin" >> "$GITHUB_PATH"
 
       - name: Check Stargate protocol compatibility
+        id: compatibility
         env:
+          GH_TOKEN: ${{ github.token }}
+          CONTRACT_RELEASE_REPO: dsx-ai-factory/nvcf
           CONTRACT_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'HEAD^' }}
           CONTRACT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -103,7 +107,28 @@ jobs:
             CONTRACT_BASE="origin/$CONTRACT_DEFAULT_BRANCH"
           fi
           python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_check_buf_breaking.py'
+          python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_select_compatibility_baseline.py'
           bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$CONTRACT_BASE"
+          gh api --paginate "repos/$CONTRACT_RELEASE_REPO/releases?per_page=100" \
+            --jq '.[] | {tag_name,published_at,draft,prerelease} | @json' \
+            > "$RUNNER_TEMP/stargate-releases.jsonl"
+          python3 src/libraries/rust/stargate/scripts/select_compatibility_baseline.py \
+            < "$RUNNER_TEMP/stargate-releases.jsonl" > "$RUNNER_TEMP/stargate-baseline.json"
+          cat "$RUNNER_TEMP/stargate-baseline.json"
+          baseline="$(jq -er .tag "$RUNNER_TEMP/stargate-baseline.json")"
+          git fetch --no-tags "https://github.com/$CONTRACT_RELEASE_REPO.git" "refs/tags/$baseline"
+          baseline_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+          bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$baseline_sha"
+          mkdir -p "$RUNNER_TEMP/stargate-compatibility/proto"
+          git archive "$baseline_sha:src/libraries/rust/stargate/crates/proto/proto" \
+            | tar -xf - -C "$RUNNER_TEMP/stargate-compatibility/proto"
+          echo '{"lastMeanInputTps":100,"maxOutputTps":50,"kvCacheCapacityTokens":"4096","kvCacheFreeTokens":"4096"}' \
+            > "$RUNNER_TEMP/stargate-compatibility/stats.json"
+          buf convert "$RUNNER_TEMP/stargate-compatibility/proto" --type stargate.ModelStats \
+            --from "$RUNNER_TEMP/stargate-compatibility/stats.json" \
+            --to "$RUNNER_TEMP/stargate-compatibility/stats.binpb"
+          python3 -c 'import pathlib, sys; print("stats=" + pathlib.Path(sys.argv[1]).read_bytes().hex())' \
+            "$RUNNER_TEMP/stargate-compatibility/stats.binpb" >> "$GITHUB_OUTPUT"
 
       - name: Check Java import boundaries
         run: |
@@ -539,6 +564,7 @@ jobs:
     env:
       CACHE_TOKEN: ${{ secrets.BAZEL_REMOTE_CACHE_TOKEN }}
       CACHE_ENDPOINT: ${{ vars.BAZEL_REMOTE_CACHE_ENDPOINT }}
+      STARGATE_COMPAT_STATS_HEX: ${{ needs.detect.outputs.compatibility_stats }}
     container:
       # This pinned image is built in the internal nvcf/bazel-ci-templates
       # project and mirrored to GHCR. It supplies Temurin 25 at JAVA_HOME;
@@ -947,6 +973,10 @@ jobs:
           # They still compile in the build step; only their execution is
           # deferred to that lane (see the bazel-integration job).
           COMMON=(--flaky_test_attempts=3 --test_tag_filters=-requires-docker)
+          if [ "${{ matrix.subtree.id }}" = "stargate" ]; then
+            : "${STARGATE_COMPAT_STATS_HEX:?oldest-release stats are required}"
+            COMMON+=(--test_env=STARGATE_COMPAT_STATS_HEX)
+          fi
           if [ "${{ matrix.subtree.id }}" = "byoo-otel-collector" ]; then
             # Memory guard, not throughput. See the build step for the full
             # rationale (~6 GB peak RSS per collector build, no per-action
