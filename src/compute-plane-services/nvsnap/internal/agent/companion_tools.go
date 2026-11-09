@@ -134,6 +134,10 @@ func (a *Agent) ensureCompanionTools(id string) error {
 	if !validBundleID(id) {
 		return fmt.Errorf("bundle version %q", id)
 	}
+	// Pod events, a capture and the node sweep all get here: checked and
+	// mounted under the lock, a second caller sees the first one's mount.
+	a.companionMu.Lock()
+	defer a.companionMu.Unlock()
 	src := filepath.Join(a.bundleVersionsDir(), id)
 	//nolint:gosec // id passed validBundleID: one path element, no leading dot, no separator
 	if fi, err := os.Stat(filepath.Join(src, "criu")); err != nil || fi.Mode()&0o111 == 0 {
@@ -149,12 +153,22 @@ func (a *Agent) ensureCompanionTools(id string) error {
 	return attachReadOnly(src, dst)
 }
 
-// releaseCompanionTools unmounts version id from its companion directory
-// and removes the directory, before the version itself is removed. A pod
-// that still mounts the directory keeps it.
+// maxCompanionUnmounts bounds the mounts releaseCompanionTools detaches
+// from one companion directory. One is expected; more were stacked by an
+// agent before companionMu.
+const maxCompanionUnmounts = 16
+
+// releaseCompanionTools unmounts version id from its companion directory,
+// every mount of it stacked there, and removes the directory, before the
+// version itself is removed. A pod that still mounts the directory keeps
+// it. The caller holds companionMu.
 func (a *Agent) releaseCompanionTools(id string) error {
 	dst := a.companionToolsDir(id)
-	if sameDir(filepath.Join(a.bundleVersionsDir(), id), dst) {
+	src := filepath.Join(a.bundleVersionsDir(), id)
+	for n := 0; sameDir(src, dst); n++ {
+		if n == maxCompanionUnmounts {
+			return fmt.Errorf("%s is still mounted after %d unmounts", dst, n)
+		}
 		if err := unmountDir(dst); err != nil {
 			return fmt.Errorf("unmount %s: %w", dst, err)
 		}
@@ -163,6 +177,20 @@ func (a *Agent) releaseCompanionTools(id string) error {
 		return err
 	}
 	return nil
+}
+
+// removeBundleVersion releases version id's companion directory and removes
+// the version, under companionMu: a mount of it started in between would
+// outlive it.
+func (a *Agent) removeBundleVersion(id string) error {
+	a.companionMu.Lock()
+	defer a.companionMu.Unlock()
+	// Unmounted from its companion directory first, else the version is
+	// kept: a mount of it must not outlive it.
+	if err := a.releaseCompanionTools(id); err != nil {
+		return fmt.Errorf("release its companion directory: %w", err)
+	}
+	return os.RemoveAll(filepath.Join(a.bundleVersionsDir(), id))
 }
 
 // syncCompanionTools mounts every staged version on this node on its

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -146,6 +147,93 @@ func TestReapBundleVersions_ReleasesCompanionTools(t *testing.T) {
 	a.reapBundleVersions(nil, time.Now())
 	if _, err := os.Stat(filepath.Join(a.bundleVersionsDir(), "stuck")); err != nil {
 		t.Errorf("a version whose companion directory could not be released was removed: %v", err)
+	}
+}
+
+// Pod events, a capture and the node sweep may mount the same version at
+// once: each sees the directory unmounted, but only one mount is attached.
+func TestEnsureCompanionTools_Concurrent(t *testing.T) {
+	savedA := attachReadOnly
+	t.Cleanup(func() { attachReadOnly = savedA })
+	var attached atomic.Int32
+	attachReadOnly = func(src, dst string) error {
+		attached.Add(1)
+		time.Sleep(20 * time.Millisecond) // the window a second caller checks in
+		_ = os.Remove(dst)
+		return os.Symlink(src, dst)
+	}
+	a := bundleAgent(t)
+	stagedVersion(t, a, "v9")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = a.ensureCompanionTools("v9")
+		}()
+	}
+	wg.Wait()
+	if n := attached.Load(); n != 1 {
+		t.Errorf("attached %d mounts on one companion directory, want 1", n)
+	}
+}
+
+// Mounts stacked on a companion directory (by an agent before companionMu)
+// are all detached before it is removed; one that does not go after
+// maxCompanionUnmounts keeps the version.
+func TestReleaseCompanionTools_Stacked(t *testing.T) {
+	savedA, savedU := attachReadOnly, unmountDir
+	t.Cleanup(func() { attachReadOnly, unmountDir = savedA, savedU })
+	depth, detached := 0, 0
+	attachReadOnly = func(src, dst string) error {
+		depth++
+		_ = os.Remove(dst)
+		return os.Symlink(src, dst)
+	}
+	unmountDir = func(dir string) error {
+		detached++
+		depth--
+		if depth > 0 {
+			return nil // the mount below still shows the version
+		}
+		if err := os.Remove(dir); err != nil {
+			return err
+		}
+		return os.Mkdir(dir, 0o755)
+	}
+	a := bundleAgent(t)
+	stagedVersion(t, a, "v9")
+	dst := a.companionToolsDir("v9")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ { // stacked as an unserialized agent could
+		if err := attachReadOnly(filepath.Join(a.bundleVersionsDir(), "v9"), dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.removeBundleVersion("v9"); err != nil {
+		t.Fatal(err)
+	}
+	if detached != 3 {
+		t.Errorf("detached %d of 3 stacked mounts", detached)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the companion directory is left: %v", err)
+	}
+
+	stagedVersion(t, a, "stuck")
+	if err := a.ensureCompanionTools("stuck"); err != nil {
+		t.Fatal(err)
+	}
+	detached = 0
+	unmountDir = func(string) error { detached++; return nil } // never goes
+	a.reapBundleVersions(nil, time.Now())
+	if detached != maxCompanionUnmounts {
+		t.Errorf("tried %d unmounts, want the bound %d", detached, maxCompanionUnmounts)
+	}
+	if _, err := os.Stat(filepath.Join(a.bundleVersionsDir(), "stuck")); err != nil {
+		t.Errorf("a version still mounted on its companion directory was removed: %v", err)
 	}
 }
 

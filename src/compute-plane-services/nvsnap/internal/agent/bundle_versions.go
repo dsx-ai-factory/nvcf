@@ -137,14 +137,8 @@ func (a *Agent) reapBundleVersions(pods []corev1.Pod, now time.Time) {
 		if !strings.HasPrefix(e.Name(), ".") && keep[e.Name()] {
 			continue
 		}
-		// Unmounted from its companion directory first, else the
-		// version is kept: a mount of it must not outlive it.
-		if err := a.releaseCompanionTools(e.Name()); err != nil {
-			a.log.WithError(err).WithField("bundle", e.Name()).Warn("node reaper: cannot release an unused bundle version's companion directory; keeping the version")
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
-			a.log.WithError(err).WithField("bundle", e.Name()).Warn("node reaper: cannot remove an unused bundle version")
+		if err := a.removeBundleVersion(e.Name()); err != nil {
+			a.log.WithError(err).WithField("bundle", e.Name()).Warn("node reaper: cannot remove an unused bundle version; keeping it")
 			continue
 		}
 		a.log.WithField("bundle", e.Name()).Info("node reaper: removed an unused bundle version")
