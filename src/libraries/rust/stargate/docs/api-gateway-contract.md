@@ -235,7 +235,7 @@ Common errors:
 | `503` | `overloaded_error` | Capacity or admission rejection. | Treat as serving failure. |
 | `503` | `local_connect_failure` | Pylon could not connect to its model server. | Treat as serving failure. |
 | `503` | `model_generation_unavailable` | Pylon has not admitted the model generation. | Treat as serving failure. |
-| `504` | `upstream_timeout` | No response headers before `--quic-request-timeout-ms`. | Treat as serving failure. |
+| `504` | `upstream_timeout` | The request was sent, but Pylon sent no response headers before `--quic-request-timeout-ms`. A timeout while opening the tunnel stream returns `502`. | Treat as serving failure. |
 
 Stargate strips pylon retry metadata before returning downstream:
 `x-stargate-retryable`, `x-stargate-retry-reason`,
