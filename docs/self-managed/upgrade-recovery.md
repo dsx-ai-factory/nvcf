@@ -85,7 +85,7 @@ while IFS= read -r image; do
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}
     ' | kt create -f - -o jsonpath='{.metadata.name}')
   printf 'Checking %s with pod %s\n' "$image" "$pod"
-  deadline=$((SECONDS + 150))
+  deadline=$((SECONDS + ${IMAGEID_WAIT_SECONDS:-150}))
   imageID=""
   until [ -n "$imageID" ]; do
     imageID=$(kt get "pod/$pod" -o jsonpath='{.status.containerStatuses[0].imageID}')
