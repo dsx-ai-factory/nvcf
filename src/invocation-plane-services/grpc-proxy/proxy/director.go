@@ -722,6 +722,19 @@ func (s *StreamDirector) serveStatefulRequest(w http.ResponseWriter, r *http.Req
 	}
 	reqLogger.Info("client directed to worker connection", zap.Stringer("request id", workerConn.RequestId))
 
+	// The transport fails a response only once its read of the request body
+	// returns, and a client that is only receiving sends nothing more. Closing
+	// the body when the tunnel goes away lets that client see its worker is
+	// gone. Only an HTTP/2 body can be closed while a read is blocked on it.
+	if r.ProtoMajor == 2 && r.Body != nil && r.Body != http.NoBody {
+		stop := context.AfterFunc(workerConn.TunnelContext(), func() { _ = r.Body.Close() })
+		defer stop()
+	}
+
+	if s.eventLedger != nil && workerConn.ClaimFirstRpc() {
+		s.serveReportedRpc(upstreamHandler, workerConn, w, r)
+		return nil
+	}
 	upstreamHandler.ServeHTTP(w, r)
 	return nil
 }

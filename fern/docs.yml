@@ -145,6 +145,10 @@ redirects:
     destination: /nvcf/release-notes/2026/7/14
   - source: /nvcf/overview/legacy-0-5-0-to-0-6-0-upgrade
     destination: /nvcf/release-notes/legacy-0-5-0-to-0-6-0-upgrade
+  - source: /nvcf/release-notes/1-0-x-to-1-1-0-upgrade
+    destination: /nvcf/release-notes/1-0-1-to-1-1-0-upgrade
+  - source: /nvcf/dev/release-notes/1-0-x-to-1-1-0-upgrade
+    destination: /nvcf/dev/release-notes/1-0-1-to-1-1-0-upgrade
   - source: /nvcf/dev/overview/release-notes-overview
     destination: /nvcf/dev/release-notes
   - source: /nvcf/dev/overview/1-0-1-release-notes
