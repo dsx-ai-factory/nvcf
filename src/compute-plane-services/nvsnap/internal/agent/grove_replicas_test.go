@@ -299,8 +299,9 @@ func TestGroupPlaceholders_SparesCompanionsClaimedByAnotherLeader(t *testing.T) 
 	}
 	pods := []corev1.Pod{*leader, *other, *leaving,
 		claimed("etcd-0", other), claimed("nats-0", leaving), claimed("front-0", leader), claimed("idle-0", nil)}
-	var got []string
-	for _, p := range groupPlaceholders(pods, leader, "k", false) {
+	ended := groupPlaceholders(pods, leader, "k", false)
+	got := make([]string, 0, len(ended))
+	for _, p := range ended {
 		got = append(got, p.Name)
 	}
 	want := "w-0-ldr,nats-0,front-0,idle-0"
@@ -398,5 +399,38 @@ func TestAgentRBACAllowsListingGroveScalingGroups(t *testing.T) {
 	}
 	if !regexp.MustCompile(`apiGroups: \["grove.io"\]\s+resources: \["podcliquescalinggroups"\]\s+verbs: \[[^\]]*"list"`).Match(raw) {
 		t.Error(`the agent ClusterRole does not allow list on grove.io podcliquescalinggroups`)
+	}
+}
+
+// A read that keeps failing is retried without a wait after the last try,
+// and a cancelled context ends the waits: admission waits for it.
+func TestGroveScalingGroupReplicas_RetriesBounded(t *testing.T) {
+	saved := groveReadBackoff
+	groveReadBackoff = 100 * time.Millisecond
+	t.Cleanup(func() { groveReadBackoff = saved })
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{groveScalingGroups: "PodCliqueScalingGroupList"})
+	var tries atomic.Int32
+	dyn.PrependReactor("list", "podcliquescalinggroups", func(k8stesting.Action) (bool, runtime.Object, error) {
+		tries.Add(1)
+		return true, nil, apierrors.NewServiceUnavailable("etcd timeout")
+	})
+	a := &Agent{dynClient: dyn}
+	t0 := time.Now()
+	if _, err := a.groveScalingGroupReplicas(context.Background(), "fn"); err == nil {
+		t.Fatal("a failing read returned no error")
+	}
+	// 3 tries, waits of 100 and 200 ms between them, none after the last.
+	if d := time.Since(t0); tries.Load() != 3 || d >= 500*time.Millisecond {
+		t.Errorf("%d tries in %s; want 3 tries in about 300ms", tries.Load(), d)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	t0 = time.Now()
+	if _, err := a.groveScalingGroupReplicas(ctx, "fn"); err == nil {
+		t.Fatal("a failing read returned no error")
+	}
+	if d := time.Since(t0); d >= 50*time.Millisecond {
+		t.Errorf("a cancelled read took %s", d)
 	}
 }

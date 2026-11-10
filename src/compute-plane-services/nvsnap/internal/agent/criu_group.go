@@ -436,9 +436,9 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 
 // sharedCompanionsBlockCapture reports whether leader's instance must not
 // be captured now because its namespace's Grove instances share their
-// companions (skip), and whether to try again later (retry): when their
+// companions (skip), and whether to try again later (again): when their
 // count cannot be read yet.
-func (c *criuAutoRestorer) sharedCompanionsBlockCapture(ctx context.Context, leader *corev1.Pod, pods []corev1.Pod, log *logrus.Entry) (retry, skip bool) {
+func (c *criuAutoRestorer) sharedCompanionsBlockCapture(ctx context.Context, leader *corev1.Pod, pods []corev1.Pod, log *logrus.Entry) (again, skip bool) {
 	why, err := c.a.sharedCompanionsReason(ctx, leader, pods)
 	if err != nil {
 		log.WithError(err).Info("CRIU group capture: waiting to read the namespace's scaling groups")
@@ -467,8 +467,8 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods")
 		return true
 	}
-	if retry, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
-		return retry
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
+		return again
 	}
 	// A rank the webhook never mutated is never one of the instance's ranks
 	// below: say so once, rather than wait for it as "not ready"
@@ -607,8 +607,8 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	// Again just before the instance is held: the namespace's scaling
 	// groups may have grown while the instance warmed up.
-	if retry, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
-		return retry
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
+		return again
 	}
 	// Held for the capture before it is claimed: a member already
 	// released into service (its hold expired) is not stopped for it.

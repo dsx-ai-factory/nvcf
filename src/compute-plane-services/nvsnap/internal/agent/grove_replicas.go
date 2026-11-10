@@ -65,7 +65,13 @@ func (a *Agent) groveScalingGroupReplicas(ctx context.Context, ns string) (map[s
 		if err == nil || apierrors.IsNotFound(err) || apierrors.IsForbidden(err) || ctx.Err() != nil {
 			break
 		}
-		time.Sleep(time.Duration(i+1) * groveReadBackoff)
+		if i == groveReadTries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(i+1) * groveReadBackoff):
+		}
 	}
 	if apierrors.IsNotFound(err) {
 		return map[string]int{}, nil // no Grove on this cluster
@@ -177,7 +183,7 @@ func (a *Agent) namespaceSharesCompanions(ctx context.Context, ns string, pods [
 // claimedByAnother reports whether p is a companion claimed by a group
 // restore other than leader's whose leader is among pods and not being
 // deleted: that restore's to restore or end, not leader's.
-func claimedByAnother(p *corev1.Pod, leader *corev1.Pod, pods []corev1.Pod) bool {
+func claimedByAnother(p, leader *corev1.Pod, pods []corev1.Pod) bool {
 	by := p.Annotations[companionClaimAnnotation]
 	if by == "" || by == string(leader.UID) || !isCompanion(p) {
 		return false
