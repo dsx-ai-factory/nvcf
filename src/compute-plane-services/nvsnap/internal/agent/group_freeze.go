@@ -443,15 +443,20 @@ func (h *instanceHold) holdRanks() {
 }
 
 // holdCompanions holds the companions' pods, in the background, once the
-// ranks' holds begun have landed; companions() is closed when it is done.
+// ranks' holds have landed; companions() is closed when it is done.
+//
+// Every member waits at the freeze point only after the vote went, so the
+// ranks' hold is due by then even if the driver has not yet seen the go
+// (the members can read it a poll before the driver does): it is begun
+// here, at most once, and waited for, so no rank's sidecar still runs
+// once the gate opens.
 func (h *instanceHold) holdCompanions() {
 	h.companionsOnce.Do(func() {
 		h.companionsBegun.Store(true)
+		h.holdRanks()
 		go func() {
 			defer close(h.companionsDone)
-			if h.ranksBegun.Load() {
-				<-h.ranksDone
-			}
+			<-h.ranksDone
 			holdMembers(h.ctx, h.client, h.session, h.members, h.bases, true, h.log)
 		}()
 	})

@@ -304,7 +304,8 @@ func TestInstanceHold_CompanionsHeldOnceRanksWait(t *testing.T) {
 	rec := &holdRecorder{holds: map[string]time.Time{}}
 	aRank, bRank := rec.server(t)
 	aEtcd, bEtcd := rec.server(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	members := []CheckpointRequest{
 		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
 		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
@@ -314,21 +315,33 @@ func TestInstanceHold_CompanionsHeldOnceRanksWait(t *testing.T) {
 	hold.holdRanks() // the vote went
 	var rankWaits, released atomic.Int64
 	errs := make(chan error, 2)
+	saved := make(chan struct{})                                                   // the rank has saved its GPU memory
 	go func() { errs <- aEtcd.awaitGroupFreeze(ctx, "s8", "ns", "etcd-0", log) }() // a companion is ready at once
 	go func() {
-		time.Sleep(400 * time.Millisecond) // the rank saves its GPU memory
+		select {
+		case <-saved:
+		case <-ctx.Done():
+			errs <- ctx.Err()
+			return
+		}
 		rankWaits.Store(time.Now().UnixNano())
 		err := aRank.awaitGroupFreeze(ctx, "s8", "ns", "worker-0", log)
 		released.Store(time.Now().UnixNano())
 		errs <- err
 	}()
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-hold.ranksDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the GPU rank's hold")
+	}
 	if _, ok := rec.at("worker-0"); !ok {
 		t.Error("the GPU rank's pod was not held when the vote went")
 	}
+	time.Sleep(100 * time.Millisecond) // the companion waits at the freeze point; the rank still saves
 	if _, ok := rec.at("etcd-0"); ok {
 		t.Fatal("the companion's pod was held while the GPU rank still saved its GPU memory")
 	}
+	close(saved)
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s8", "", []freezeMember{
 		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
 	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions())
@@ -349,6 +362,57 @@ func TestInstanceHold_CompanionsHeldOnceRanksWait(t *testing.T) {
 		t.Errorf("the companion was held %s before the GPU rank reached the freeze point", time.Duration(rankWaits.Load()-etcdHeld.UnixNano()))
 	case etcdHeld.UnixNano() > released.Load():
 		t.Errorf("the members were released %s before the companion was held", time.Duration(etcdHeld.UnixNano()-released.Load()))
+	}
+}
+
+// Every member can wait at the freeze point before the driver has seen the
+// vote go (the members read the go a poll earlier). The GPU ranks' pods
+// are still held, before the companions', and before the release.
+func TestInstanceHold_FreezePointBeforeTheDriverSeesTheGo(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	rec := &holdRecorder{holds: map[string]time.Time{}}
+	aRank, bRank := rec.server(t)
+	aEtcd, bEtcd := rec.server(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	members := []CheckpointRequest{
+		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
+		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
+	}
+	hold := newInstanceHold(ctx, http.DefaultClient, "s10", members, []string{bRank, bEtcd}, log)
+	var released atomic.Int64
+	errs := make(chan error, 2)
+	go func() { errs <- aEtcd.awaitGroupFreeze(ctx, "s10", "ns", "etcd-0", log) }()
+	go func() {
+		err := aRank.awaitGroupFreeze(ctx, "s10", "ns", "worker-0", log)
+		released.Store(time.Now().UnixNano())
+		errs <- err
+	}()
+	// No holdRanks: the driver has not seen the go yet.
+	ok := driveGroupFreeze(ctx, http.DefaultClient, "s10", "", []freezeMember{
+		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
+	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions())
+	if !ok {
+		t.Fatal("driver did not release the group")
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("member: %v", err)
+		}
+	}
+	hold.holdRanks() // the driver sees the go late: nothing more to do
+	hold.wait()
+	rankHeld, rok := rec.at("worker-0")
+	etcdHeld, eok := rec.at("etcd-0")
+	switch {
+	case !rok:
+		t.Fatal("the GPU rank's pod was never held")
+	case !eok:
+		t.Fatal("the companion's pod was never held")
+	case rankHeld.After(etcdHeld):
+		t.Errorf("the companion was held %s before the GPU rank", rankHeld.Sub(etcdHeld))
+	case rankHeld.UnixNano() > released.Load():
+		t.Errorf("the members were released %s before the GPU rank was held", time.Duration(rankHeld.UnixNano()-released.Load()))
 	}
 }
 
