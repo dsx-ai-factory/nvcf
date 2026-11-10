@@ -12,7 +12,7 @@ import unittest
 
 from test_recovery_upgrade_check import DOCS, block_containing
 
-UPGRADE_11 = DOCS / "overview/release-notes/1.0.x-to-1.1.0-upgrade.md"
+UPGRADE_11 = DOCS / "overview/release-notes/1.0.1-to-1.1.0-upgrade.md"
 
 
 class UpgradeGuide110Checks(unittest.TestCase):

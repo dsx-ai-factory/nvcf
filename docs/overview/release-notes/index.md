@@ -7,7 +7,7 @@ lists the stack releases that are qualified to run together.
 ## Current
 
 - [1.0.1 Release Notes](./1.0.1.md)
-- [Upgrade from NVCF 1.0.x to NVCF 1.1.0](./1.0.x-to-1.1.0-upgrade.md)
+- [Upgrade from NVCF 1.0.1 to NVCF 1.1.0](./1.0.1-to-1.1.0-upgrade.md)
 - [Upgrade from 0.6.2 to 1.0.1](./0.6.1-to-1.0.1-upgrade.md)
 
 ## Legacy

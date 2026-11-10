@@ -33,4 +33,4 @@ to a maintained train before moving further.
 The tables show the stack versions documented by the selected release.
 
 For the upgrade path from NVCF 1.0.x, see its
-[cross-stack upgrade order](release-notes/1.0.x-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
+[cross-stack upgrade order](release-notes/1.0.1-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
