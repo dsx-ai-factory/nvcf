@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -146,6 +148,47 @@ func TestIdleColdStart(t *testing.T) {
 		}
 		_ = c.Process.Kill()
 		_ = c.Wait()
+	}
+}
+
+// While it idles, a placeholder given a cold start shows only its own
+// arguments, so a tool that finds the workload by its command line (a gang
+// health sidecar matching "-m dynamo.vllm", pkill -f) does not take it, or
+// its ticking children, for the workload. The agent still finds the marker.
+func TestIdleColdStartHidesWorkload(t *testing.T) {
+	bin := buildIdle(t)
+	marker := filepath.Join(t.TempDir(), "cold-start")
+	cmd := exec.CommandContext(t.Context(), bin, "--cold-start", marker, "--", "python3", "-m", "dynamo.vllm", "--model", "/m") //nolint:gosec // runs the program under test
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	time.Sleep(300 * time.Millisecond)
+	args := func(pid int) []string {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			return nil
+		}
+		var out []string
+		for _, a := range strings.Split(string(b), "\x00") {
+			if a != "" {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	want := []string{bin, "--cold-start", marker, "--"}
+	if got := args(cmd.Process.Pid); !slices.Equal(got, want) {
+		t.Errorf("idle command line %q, want %q", got, want)
+	}
+	b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", cmd.Process.Pid, cmd.Process.Pid))
+	kids := strings.Fields(string(b))
+	if len(kids) != 1 {
+		t.Fatalf("want one live child, got %v", kids)
+	}
+	kid, _ := strconv.Atoi(kids[0])
+	if got := args(kid); got != nil && !slices.Equal(got, want) {
+		t.Errorf("child command line %q, want %q", got, want)
 	}
 }
 
