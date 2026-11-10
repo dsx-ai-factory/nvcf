@@ -74,8 +74,8 @@ func TestTopLevelModelSpans(t *testing.T) {
 		},
 		{
 			name: "escaped key",
-			body: `{"model":"a","model":"b"}`,
-			want: `{"model":"X","model":"X"}`,
+			body: `{"model":"a","\u006dodel":"b","MO\u0044EL":"c","mo\u0064el_x":"d"}`,
+			want: `{"model":"X","\u006dodel":"X","MO\u0044EL":"X","mo\u0064el_x":"d"}`,
 		},
 		{
 			name: "whitespace and non-string model",
@@ -113,6 +113,13 @@ func TestTopLevelModelSpansRejectsInvalidBodies(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			_, err := topLevelModelSpans([]byte(body))
 			assert.Error(t, err)
+		})
+	}
+	// Strict JSON rejects these; the model extractor accepts them.
+	for name, body := range lenientJSONBodies("m") {
+		t.Run(name, func(t *testing.T) {
+			_, err := topLevelModelSpans([]byte(body))
+			assert.ErrorIs(t, err, errInvalidJSONBody)
 		})
 	}
 }
@@ -284,4 +291,39 @@ func TestLLMGatewayPrimaryBodySurvivesShadowRelease(t *testing.T) {
 	defer upstream.mu.Unlock()
 	assert.Equal(t, wantBody(publicModel), upstream.bodiesByName[llmFunctionID+"/"+publicModel])
 	assert.Equal(t, wantBody(shadowModel), upstream.bodiesByName[llmFunctionID+"/"+shadowModel])
+}
+
+// lenientJSONBodies returns bodies with model set that goccy/go-json decodes
+// but json.Valid rejects.
+func lenientJSONBodies(model string) map[string]string {
+	prefix := `{"model":"` + model + `","x":`
+	return map[string]string{
+		"raw newline in string": prefix + "\"a\nb\"}",
+		"raw tab in string":     prefix + "\"a\tb\"}",
+		"invalid escape":        prefix + `"C:\path"}`,
+		"leading zero number":   prefix + `010}`,
+	}
+}
+
+// The LLM Gateway path must answer bodies that strict JSON rejects with 400
+// invalid_json, as the decision routes do, instead of a 502.
+func TestLLMGatewayRejectsLenientJSONBodiesWithBadRequest(t *testing.T) {
+	llmRequests := make(chan capturedRequest, 1)
+	llmBackend := captureServer(t, llmRequests, nil)
+	mux := openAIMux(t, llmMappings(llmModelEntry()), "http://nvcf.invalid", llmBackend.URL)
+
+	for name, body := range lenientJSONBodies(publicModel) {
+		t.Run(name, func(t *testing.T) {
+			_, err := extractOpenAIJSONBody(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body)))
+			require.NoError(t, err, "the model extractor must accept this body for the test to cover the rewrite path")
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, openAIRequest(t, "/v1/chat/completions", body))
+			require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+			var payload OpenAIError
+			require.NoError(t, stdjson.Unmarshal(rec.Body.Bytes(), &payload))
+			assert.Equal(t, "invalid_json", payload.Error.Code)
+			assert.Empty(t, llmRequests, "an invalid body must not reach the LLM Gateway")
+		})
+	}
 }

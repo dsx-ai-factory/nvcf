@@ -1065,6 +1065,12 @@ func (d *ModelDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved r
 	// holds its own buffer reference, so the primary body can close now.
 	rewritten, err := body.withTopLevelModel(resolved.functionInfo.functionId + "/" + resolved.modelName)
 	_ = body.Close()
+	if errors.Is(err, errInvalidJSONBody) {
+		// The model extractor accepts some bodies strict JSON rejects, such as
+		// raw control characters in strings. The caller sent them, so answer 400.
+		writeInvalidJSONBody(writer, resolved.request, err)
+		return nil
+	}
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, err)
 		return nil
@@ -1323,6 +1329,18 @@ func isDecisionRoute(request *http.Request) bool {
 
 // requestReadFailure maps a failure to read or parse the request body to the
 // status, error code and message of the route's native error.
+// writeInvalidJSONBody answers a request whose body is not valid JSON with 400
+// invalid_json in the route's error shape.
+func writeInvalidJSONBody(writer http.ResponseWriter, request *http.Request, err error) {
+	markGatewayRejected(writer, request)
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+		status, kind, message := requestReadFailure(protocol, err)
+		writeNativeError(writer, request, status, kind, message)
+		return
+	}
+	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
+}
+
 func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
 	status, kind := http.StatusInternalServerError, ""
 	message := "failed to read request"

@@ -246,7 +246,7 @@ type byteSpan struct {
 // scans body in place, so large bodies are not copied.
 func topLevelModelSpans(body []byte) ([]byteSpan, error) {
 	if !stdjson.Valid(body) {
-		return nil, errors.New("request body is not valid JSON")
+		return nil, errInvalidJSONBody
 	}
 	i := skipJSONSpace(body, 0)
 	if body[i] != '{' {
