@@ -26,9 +26,11 @@ import com.datastax.oss.driver.api.core.config.OptionsMap;
 import com.datastax.oss.driver.api.core.config.TypedDriverOption;
 import com.datastax.oss.driver.api.core.context.DriverContext;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
+import com.google.common.annotations.VisibleForTesting;
 import com.nvidia.boot.cassandra.retry.NextHostRetryPolicy;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import lombok.extern.slf4j.Slf4j;
@@ -38,14 +40,10 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 
-/**
- * Registers the {@code cassandraSession} health contributor. Applications opt in by adding it to
- * the liveness group, for example
- * {@code management.endpoint.health.group.liveness.include: [livenessState, cassandraSession]}.
- * Setting {@code app.cassandra.session-liveness.enabled=false} turns the check off: the
- * contributor stays registered, because Spring Boot rejects a group that names a missing
- * contributor, but always reports UP.
- */
+// Registers the cassandraSession health contributor. A service opts in by adding it to its
+// liveness group. With app.cassandra.session-liveness.enabled=false the contributor is still
+// registered, because Spring Boot rejects a group that names a missing contributor, but it
+// always reports UP.
 @Slf4j
 @Configuration
 public class CassandraSessionLivenessConfiguration {
@@ -53,7 +51,7 @@ public class CassandraSessionLivenessConfiguration {
     private static final String HEALTH_QUERY = "SELECT release_version FROM system.local";
 
     @Bean
-    CassandraSessionLivenessIndicator cassandraSessionHealthIndicator(
+    public CassandraSessionLivenessIndicator cassandraSessionHealthIndicator(
             ObjectProvider<CqlSession> sessions,
             ObjectProvider<CqlSessionBuilder> sessionBuilders,
             ObjectProvider<DriverConfigLoader> configLoaders,
@@ -67,14 +65,12 @@ public class CassandraSessionLivenessConfiguration {
         if (!enabled) {
             log.info("Cassandra session liveness check is disabled; "
                      + "cassandraSession always reports UP");
-            return new CassandraSessionLivenessIndicator(() -> true, () -> false, gracePeriod,
-                                                         Clock.systemUTC());
+            return alwaysUp(gracePeriod, "the check is disabled");
         }
         var session = sessions.getIfUnique();
         if (session == null) {
             log.info("No unique CqlSession; the cassandraSession liveness check always reports UP");
-            return new CassandraSessionLivenessIndicator(() -> true, () -> false, gracePeriod,
-                                                         Clock.systemUTC());
+            return alwaysUp(gracePeriod, "no unique session");
         }
         var profile = session.getContext().getConfig().getDefaultProfile()
                 .withClass(RETRY_POLICY_CLASS, NextHostRetryPolicy.class);
@@ -83,11 +79,19 @@ public class CassandraSessionLivenessConfiguration {
                 .build();
         return new CassandraSessionLivenessIndicator(
                 () -> succeeds(() -> session.execute(healthQuery)),
+                () -> CassandraSessionPools.of(session),
                 () -> freshSessionSucceeds(sessionBuilders, configLoaders),
                 gracePeriod,
                 checkInterval);
     }
 
+    private static CassandraSessionLivenessIndicator alwaysUp(Duration gracePeriod, String reason) {
+        return new CassandraSessionLivenessIndicator(
+                () -> true, () -> CassandraSessionPools.incomplete(reason), () -> false,
+                gracePeriod, Clock.systemUTC());
+    }
+
+    @VisibleForTesting
     static boolean freshSessionSucceeds(ObjectProvider<CqlSessionBuilder> sessionBuilders,
                                         ObjectProvider<DriverConfigLoader> configLoaders) {
         // A probe that cannot be set up proves nothing about the application session, so it
@@ -114,12 +118,10 @@ public class CassandraSessionLivenessConfiguration {
         }
     }
 
-    /**
-     * The application's driver settings with schema metadata off, which keeps the probe cheap
-     * when many pods check at once, and driver metrics off, so the probe works with any metrics
-     * factory and registers no meters. The probe only reads the application's loader: a session
-     * registers with its loader on start and closes it on close.
-     */
+    // The application's driver settings with schema metadata off, so the probe stays cheap when
+    // many pods check at once, and driver metrics off, so it registers no meters. The probe only
+    // reads the application's loader, because a session closes its loader when it closes.
+    @VisibleForTesting
     static DriverConfigLoader probeConfigLoader(DriverConfigLoader applicationLoader) {
         var overrides = new OptionsMap();
         overrides.put(TypedDriverOption.METADATA_SCHEMA_ENABLED, false);

@@ -18,24 +18,38 @@ package com.nvidia.boot.cassandra.configuration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.datastax.oss.driver.api.core.loadbalancing.NodeDistance;
+import com.datastax.oss.driver.api.core.metadata.NodeState;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.health.contributor.Status;
 
 class CassandraSessionLivenessIndicatorTest {
 
     private static final Duration GRACE = Duration.ofMinutes(3);
+    private static final CassandraSessionPools EMPTY = pools(0);
+    private static final CassandraSessionPools CONNECTED = pools(1);
+    private static final CassandraSessionPools UNKNOWN =
+            CassandraSessionPools.incomplete("unreadable");
 
     private final MutableClock clock = new MutableClock();
     private boolean sessionWorks;
+    private CassandraSessionPools pools = EMPTY;
     private boolean freshSessionWorks;
+    private int freshSessionChecks;
     private final CassandraSessionLivenessIndicator indicator =
             new CassandraSessionLivenessIndicator(
-                    () -> sessionWorks, () -> freshSessionWorks, GRACE, clock);
+                    () -> sessionWorks, () -> pools,
+                    () -> {
+                        freshSessionChecks++;
+                        return freshSessionWorks;
+                    },
+                    GRACE, clock);
 
     @Test
     void upWhenSessionWorks() {
@@ -107,10 +121,70 @@ class CassandraSessionLivenessIndicatorTest {
         assertThat(indicator.health().getStatus()).isEqualTo(Status.DOWN);
     }
 
+    // An overloaded session fails its query but keeps its connections: never restart it, and do
+    // not open a new session against Cassandra while the pod is already under load.
+    @Test
+    void sessionWithPoolConnectionsNeverRestarts() {
+        sessionWorks = false;
+        pools = CONNECTED;
+        freshSessionWorks = true;
+        for (int i = 0; i < 10; i++) {
+            indicator.evaluate();
+            clock.advance(GRACE);
+        }
+        assertThat(indicator.health().getStatus()).isEqualTo(Status.UP);
+        assertThat(indicator.health().getDetails()).containsEntry("connectionPools", "connected");
+        assertThat(freshSessionChecks).isZero();
+    }
+
+    @Test
+    void unreadablePoolsNeverRestart() {
+        sessionWorks = false;
+        pools = UNKNOWN;
+        freshSessionWorks = true;
+        for (int i = 0; i < 10; i++) {
+            indicator.evaluate();
+            clock.advance(GRACE);
+        }
+        assertThat(indicator.health().getStatus()).isEqualTo(Status.UP);
+        assertThat(indicator.health().getDetails()).containsEntry("connectionPools", "unknown");
+    }
+
+    @Test
+    void connectionReturningRestartsTheGracePeriod() {
+        assertGracePeriodRestartsAfterOneCheckWith(CONNECTED);
+    }
+
+    @Test
+    void unreadablePoolsRestartTheGracePeriod() {
+        assertGracePeriodRestartsAfterOneCheckWith(UNKNOWN);
+    }
+
+    private void assertGracePeriodRestartsAfterOneCheckWith(CassandraSessionPools interruption) {
+        sessionWorks = false;
+        freshSessionWorks = true;
+        indicator.evaluate();
+        clock.advance(Duration.ofMinutes(2));
+
+        pools = interruption;
+        indicator.evaluate();
+        clock.advance(Duration.ofMinutes(2));
+
+        pools = EMPTY;
+        indicator.evaluate();
+        clock.advance(GRACE.minusSeconds(1));
+        indicator.evaluate();
+        assertThat(indicator.health().getStatus()).isEqualTo(Status.UP);
+
+        clock.advance(Duration.ofSeconds(1));
+        indicator.evaluate();
+        assertThat(indicator.health().getStatus()).isEqualTo(Status.DOWN);
+    }
+
     @Test
     void scheduledCheckReportsDownWhenSessionStaysStuck() throws InterruptedException {
         var scheduled = new CassandraSessionLivenessIndicator(
-                () -> false, () -> true, Duration.ZERO, Duration.ofMillis(10));
+                () -> false, () -> EMPTY, () -> true, Duration.ZERO, Duration.ofMillis(10));
         try {
             var deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
             while (scheduled.health().getStatus() != Status.DOWN) {
@@ -121,6 +195,12 @@ class CassandraSessionLivenessIndicatorTest {
         } finally {
             scheduled.destroy();
         }
+    }
+
+    private static CassandraSessionPools pools(int poolSize) {
+        return new CassandraSessionPools(null, List.of(new CassandraSessionPools.NodePool(
+                "/10.0.0.1:9042", NodeState.UP, NodeDistance.LOCAL, true, true, poolSize + 1,
+                poolSize, 0, poolSize * 1024, 0)));
     }
 
     private static final class MutableClock extends Clock {

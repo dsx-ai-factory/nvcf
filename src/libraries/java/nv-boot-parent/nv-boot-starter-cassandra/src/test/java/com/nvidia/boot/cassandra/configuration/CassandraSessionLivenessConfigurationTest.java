@@ -37,11 +37,21 @@ import com.datastax.oss.driver.api.core.config.OptionsMap;
 import com.datastax.oss.driver.api.core.config.TypedDriverOption;
 import com.datastax.oss.driver.api.core.context.DriverContext;
 import com.datastax.oss.driver.api.core.cql.Statement;
+import com.datastax.oss.driver.api.core.loadbalancing.NodeDistance;
+import com.datastax.oss.driver.api.core.metadata.Metadata;
+import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.internal.core.context.InternalDriverContext;
+import com.datastax.oss.driver.internal.core.control.ControlConnection;
+import com.datastax.oss.driver.internal.core.metadata.DefaultEndPoint;
+import com.datastax.oss.driver.internal.core.pool.ChannelPool;
+import com.datastax.oss.driver.internal.core.session.PoolManager;
 import com.nvidia.boot.cassandra.retry.NextHostRetryPolicy;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
@@ -69,21 +79,36 @@ class CassandraSessionLivenessConfigurationTest {
     }
 
     @Test
-    void reportsDownWhenTheSessionStaysBrokenAndANewSessionWorks() {
-        var brokenSession = session();
+    void reportsDownWhenTheBrokenSessionHasEmptyPoolsAndANewSessionWorks() {
+        assertThat(statusOfBrokenSession(sessionWithPool(0))).isEqualTo(Status.DOWN);
+    }
+
+    @Test
+    void staysUpWhenTheBrokenSessionStillHasPoolConnections() {
+        assertThat(statusOfBrokenSession(sessionWithPool(1))).isEqualTo(Status.UP);
+    }
+
+    @Test
+    void staysUpWhenTheBrokenSessionsPoolsCannotBeRead() {
+        assertThat(statusOfBrokenSession(session())).isEqualTo(Status.UP);
+    }
+
+    private Status statusOfBrokenSession(CqlSession brokenSession) {
         when(brokenSession.execute(any(Statement.class)))
                 .thenThrow(new IllegalStateException("session is broken"));
         var builder = mock(CqlSessionBuilder.class);
         when(builder.withMetricRegistry(any())).thenReturn(builder);
         when(builder.build()).thenReturn(mock(CqlSession.class));
+        var status = new Status[1];
         contextRunner.withPropertyValues("app.cassandra.session-liveness.grace-period=0s")
                 .withBean(CqlSession.class, () -> brokenSession)
                 .withBean(CqlSessionBuilder.class, () -> builder)
                 .run(context -> {
                     var indicator = context.getBean(CassandraSessionLivenessIndicator.class);
                     indicator.evaluate();
-                    assertThat(indicator.health().getStatus()).isEqualTo(Status.DOWN);
+                    status[0] = indicator.health().getStatus();
                 });
+        return status[0];
     }
 
     @Test
@@ -206,8 +231,31 @@ class CassandraSessionLivenessConfigurationTest {
     }
 
     private static CqlSession session() {
+        return session(mock(DriverContext.class));
+    }
+
+    // A session whose driver context exposes one local node with a pool of the given size.
+    private static CqlSession sessionWithPool(int poolSize) {
+        var context = mock(InternalDriverContext.class);
+        var session = session(context);
+        var node = mock(Node.class);
+        when(node.getEndPoint())
+                .thenReturn(new DefaultEndPoint(new InetSocketAddress("10.0.0.1", 9042)));
+        when(node.getDistance()).thenReturn(NodeDistance.LOCAL);
+        var pool = mock(ChannelPool.class);
+        when(pool.size()).thenReturn(poolSize);
+        var poolManager = mock(PoolManager.class);
+        when(poolManager.getPools()).thenReturn(Map.of(node, pool));
+        when(context.getPoolManager()).thenReturn(poolManager);
+        when(context.getControlConnection()).thenReturn(mock(ControlConnection.class));
+        var metadata = mock(Metadata.class);
+        when(metadata.getNodes()).thenReturn(Map.of(UUID.randomUUID(), node));
+        when(session.getMetadata()).thenReturn(metadata);
+        return session;
+    }
+
+    private static CqlSession session(DriverContext context) {
         var session = mock(CqlSession.class);
-        var context = mock(DriverContext.class);
         var config = mock(DriverConfig.class);
         var profile = mock(DriverExecutionProfile.class);
         when(session.getContext()).thenReturn(context);
