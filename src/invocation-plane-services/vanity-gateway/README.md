@@ -69,6 +69,11 @@ vanityGateway:
     maxRequestSizeBytes: 67108864
 ```
 
+The gateway buffers full request bodies, and shadow requests add body copies.
+When raising this limit, raise `vanityGateway.resources.limits.memory` to allow
+for concurrent requests and shadow models. The chart's default memory limit is
+`512Mi`.
+
 The limit applies to all model API POST routes, including JSON and multipart
 image requests. Bodies exactly at the limit are accepted. Generic vanity
 pass-through routes and private-model lookup response limits are unchanged.

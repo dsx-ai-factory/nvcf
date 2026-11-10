@@ -1142,6 +1142,11 @@ addons:
       maxRequestSizeBytes: 67108864
 ```
 
+The gateway buffers full request bodies, and shadow requests add body copies.
+When raising this limit, raise `addons.vanityGateway.resources.limits.memory`
+to allow for concurrent requests and shadow models. The chart's default memory
+limit is `512Mi`.
+
 The stack passes this value to the chart's
 `vanityGateway.config.maxRequestSizeBytes`, which sets the service environment
 variable `MAX_REQUEST_SIZE_BYTES`. Invalid or non-positive values are rejected.
