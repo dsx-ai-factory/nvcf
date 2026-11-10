@@ -437,3 +437,42 @@ func TestInstanceHold_WaitCoversTheStepsBegun(t *testing.T) {
 		t.Error("the companions' step did not end")
 	}
 }
+
+// The steps the group capture driver wires in (gpushare_fabric.go) hold
+// only the GPU ranks at the vote and the companions at the freeze point:
+// wiring the companions' hold to the vote again would fail here.
+func TestInstanceHold_StepsHoldRanksAtTheVoteAndCompanionsAtTheFreezePoint(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	rec := &holdRecorder{holds: map[string]time.Time{}}
+	_, bRank := rec.server(t)
+	_, bEtcd := rec.server(t)
+	members := []CheckpointRequest{
+		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
+		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
+	}
+	hold := newInstanceHold(context.Background(), http.DefaultClient, "s11", members, []string{bRank, bEtcd}, log)
+	steps := hold.steps()
+	steps.onGo()
+	waited := make(chan struct{})
+	go func() { hold.wait(); close(waited) }() // every hold the vote began
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the vote's step did not end")
+	}
+	if _, ok := rec.at("worker-0"); !ok {
+		t.Error("the vote's step did not hold the GPU rank")
+	}
+	if _, ok := rec.at("etcd-0"); ok {
+		t.Fatal("the vote's step held a companion")
+	}
+	steps.atFreezePoint()
+	select {
+	case <-steps.gate:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the freeze point's gate did not open")
+	}
+	if _, ok := rec.at("etcd-0"); !ok {
+		t.Error("the freeze point's step did not hold the companion")
+	}
+}

@@ -462,6 +462,20 @@ func (h *instanceHold) holdCompanions() {
 	})
 }
 
+// holdSteps are when a group capture holds its instance's pods: onGo
+// when the quiesce vote goes, atFreezePoint once every member waits at
+// the freeze point, whose release waits for gate.
+type holdSteps struct {
+	onGo, atFreezePoint func()
+	gate                <-chan struct{}
+}
+
+// steps is the order the group capture driver holds h's pods in: the GPU
+// ranks at the vote, the companions only at the freeze point.
+func (h *instanceHold) steps() holdSteps {
+	return holdSteps{onGo: h.holdRanks, atFreezePoint: h.holdCompanions, gate: h.companions()}
+}
+
 // companions is closed once the companions are held: the freeze point's gate.
 func (h *instanceHold) companions() <-chan struct{} { return h.companionsDone }
 

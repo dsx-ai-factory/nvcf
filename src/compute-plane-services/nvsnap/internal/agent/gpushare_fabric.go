@@ -906,7 +906,8 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	freezeDone := make(chan struct{})
 	go func() {
 		defer close(freezeDone)
-		if driveGroupFreeze(ctx, fabricHTTPClient, session, "", freezeMembers, 200*time.Millisecond, log, hold.holdCompanions, hold.companions()) {
+		steps := hold.steps()
+		if driveGroupFreeze(ctx, fabricHTTPClient, session, "", freezeMembers, 200*time.Millisecond, log, steps.atFreezePoint, steps.gate) {
 			// Dumped, the members wait stopped until all are: none
 			// resumes to talk to one not dumped yet.
 			driveGroupFreeze(ctx, fabricHTTPClient, session, "post", freezeMembers, 100*time.Millisecond, log, nil, nil)
@@ -924,7 +925,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		}
 		return false
 	}
-	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: hold.holdRanks}, log)
+	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: hold.steps().onGo}, log)
 	wg.Wait()
 	<-freezeDone
 
