@@ -52,7 +52,7 @@ func TestGroupFreeze_ReleasesTogether(t *testing.T) {
 	}()
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s1", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: b2, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, nil)
+	}, 20*time.Millisecond, log, nil, nil)
 	if !ok {
 		t.Fatal("driver did not release the group")
 	}
@@ -77,7 +77,7 @@ func TestGroupFreeze_WaitsForTheGate(t *testing.T) {
 	gate := make(chan struct{})
 	opened := time.Now().Add(300 * time.Millisecond)
 	time.AfterFunc(300*time.Millisecond, func() { close(gate) })
-	ok := driveGroupFreeze(ctx, http.DefaultClient, "s5", "", []freezeMember{{Base: b1, Namespace: "ns", Pod: "worker-0"}}, 20*time.Millisecond, log, gate)
+	ok := driveGroupFreeze(ctx, http.DefaultClient, "s5", "", []freezeMember{{Base: b1, Namespace: "ns", Pod: "worker-0"}}, 20*time.Millisecond, log, nil, gate)
 	if !ok || time.Now().Before(opened) {
 		t.Fatalf("released before the gate opened (ok=%v)", ok)
 	}
@@ -97,7 +97,7 @@ func TestGroupFreeze_AbortsWhenAMemberEnds(t *testing.T) {
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s2", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"},
 		{Base: b2, Namespace: "ns", Pod: "etcd-0", Done: func() bool { return true }},
-	}, 20*time.Millisecond, log, nil)
+	}, 20*time.Millisecond, log, nil, nil)
 	if ok {
 		t.Fatal("driver released a group with a failed member")
 	}
@@ -176,7 +176,7 @@ func TestGroupFreeze_PostPhaseAcceptsAMemberWithoutHook(t *testing.T) {
 	markPostDumpReached(a.postDumpDir("s4", "ns", "etcd-0"), log)
 	ok := driveGroupFreeze(context.Background(), http.DefaultClient, "s4", "post", []freezeMember{
 		{Base: base, Namespace: "ns", Pod: "etcd-0", Done: func() bool { return true }},
-	}, 20*time.Millisecond, log, nil)
+	}, 20*time.Millisecond, log, nil, nil)
 	if !ok {
 		t.Fatal("a member past its dump aborted the group")
 	}
@@ -199,7 +199,7 @@ func TestGroupFreeze_PostPhaseAbortsOnAFailedDump(t *testing.T) {
 	ok := driveGroupFreeze(context.Background(), http.DefaultClient, "s6", "post", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"},
 		{Base: b2, Namespace: "ns", Pod: "worker-1"},
-	}, 20*time.Millisecond, log, nil)
+	}, 20*time.Millisecond, log, nil, nil)
 	if ok {
 		t.Fatal("a failed dump released the group")
 	}
@@ -240,7 +240,7 @@ func TestGroupFreeze_AbortsWhenAReleaseIsNotTaken(t *testing.T) {
 	t0 := time.Now()
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s7", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: down.URL, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, nil)
+	}, 20*time.Millisecond, log, nil, nil)
 	if ok {
 		t.Fatal("driver reported the group released though a member never got its release")
 	}
@@ -259,5 +259,117 @@ func TestGroupFreeze_AbortsWhenAReleaseIsNotTaken(t *testing.T) {
 	defer mu.Unlock()
 	if want := []string{":true", ":true", ":true", ":false", ":false", ":false", "post:false", "post:false", "post:false"}; strings.Join(gone, ",") != strings.Join(want, ",") {
 		t.Errorf("the unreachable member was asked %v, want %v", gone, want)
+	}
+}
+
+// holdRecorder serves a member's freeze point and records the hold requests
+// it gets, with when they came, instead of freezing anything.
+type holdRecorder struct {
+	mu    sync.Mutex
+	holds map[string]time.Time // pod -> when its hold was requested
+}
+
+func (h *holdRecorder) server(t *testing.T) (a *Agent, base string) {
+	t.Helper()
+	a = &Agent{}
+	r := mux.NewRouter()
+	r.HandleFunc("/v1/group-freeze/{session}/{namespace}/{pod}", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get("phase") == "hold" {
+			h.mu.Lock()
+			h.holds[mux.Vars(req)["pod"]] = time.Now()
+			h.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		a.freezeHandler(w, req)
+	}).Methods("GET", "POST")
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	return a, srv.URL
+}
+
+func (h *holdRecorder) at(pod string) (time.Time, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	at, ok := h.holds[pod]
+	return at, ok
+}
+
+// A GPU rank's pod is held when the vote goes; a companion's (etcd) only
+// once the rank, its GPU memory saved, waits at the freeze point: while the
+// rank saves, its engine runs and must still reach etcd. The members are
+// released only after both holds landed.
+func TestInstanceHold_CompanionsHeldOnceRanksWait(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	rec := &holdRecorder{holds: map[string]time.Time{}}
+	aRank, bRank := rec.server(t)
+	aEtcd, bEtcd := rec.server(t)
+	ctx := context.Background()
+	members := []CheckpointRequest{
+		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
+		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
+	}
+	hold := newInstanceHold(ctx, http.DefaultClient, "s8", members, []string{bRank, bEtcd}, log)
+
+	hold.holdRanks() // the vote went
+	var rankWaits, released atomic.Int64
+	errs := make(chan error, 2)
+	go func() { errs <- aEtcd.awaitGroupFreeze(ctx, "s8", "ns", "etcd-0", log) }() // a companion is ready at once
+	go func() {
+		time.Sleep(400 * time.Millisecond) // the rank saves its GPU memory
+		rankWaits.Store(time.Now().UnixNano())
+		err := aRank.awaitGroupFreeze(ctx, "s8", "ns", "worker-0", log)
+		released.Store(time.Now().UnixNano())
+		errs <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if _, ok := rec.at("worker-0"); !ok {
+		t.Error("the GPU rank's pod was not held when the vote went")
+	}
+	if _, ok := rec.at("etcd-0"); ok {
+		t.Fatal("the companion's pod was held while the GPU rank still saved its GPU memory")
+	}
+	ok := driveGroupFreeze(ctx, http.DefaultClient, "s8", "", []freezeMember{
+		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
+	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions())
+	if !ok {
+		t.Fatal("driver did not release the group")
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("member: %v", err)
+		}
+	}
+	hold.wait()
+	etcdHeld, held := rec.at("etcd-0")
+	switch {
+	case !held:
+		t.Fatal("the companion's pod was never held")
+	case etcdHeld.UnixNano() < rankWaits.Load():
+		t.Errorf("the companion was held %s before the GPU rank reached the freeze point", time.Duration(rankWaits.Load()-etcdHeld.UnixNano()))
+	case etcdHeld.UnixNano() > released.Load():
+		t.Errorf("the members were released %s before the companion was held", time.Duration(etcdHeld.UnixNano()-released.Load()))
+	}
+}
+
+// wait returns at once when no step began, and after each step begun.
+func TestInstanceHold_WaitCoversTheStepsBegun(t *testing.T) {
+	log := logrus.NewEntry(logrus.New())
+	hold := newInstanceHold(context.Background(), http.DefaultClient, "s9", nil, nil, log)
+	done := make(chan struct{})
+	go func() { hold.wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wait blocked with no step begun")
+	}
+	hold.holdRanks()
+	hold.holdCompanions()
+	hold.holdCompanions() // once only
+	hold.wait()
+	select {
+	case <-hold.companions():
+	default:
+		t.Error("the companions' step did not end")
 	}
 }

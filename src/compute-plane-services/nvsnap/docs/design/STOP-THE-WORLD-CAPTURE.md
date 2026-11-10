@@ -33,13 +33,24 @@ An instance resumed after a failed capture was left half dead.
 
 ## Design
 
-1. **The instance stops at one moment.** When the GPU ranks' quiesce vote
-   goes, the capture holds every member pod (`pod_hold.go`): each container is
-   frozen through its cgroup v2 freezer, sidecars included, and so are the
-   companions (etcd, NATS, frontends). A GPU rank's engine container stays
-   running only while gpushare saves its GPU memory; the dump then stops it. A
-   companion's container is thawed just before its dump, which stops it again.
-   Nothing of the instance counts the time the capture takes.
+1. **The instance stops at one moment.** The capture holds every member pod
+   (`pod_hold.go`, `instanceHold`): each container is frozen through its
+   cgroup v2 freezer. It does so in two steps, so that nothing a GPU rank's
+   engine talks to stops before the engine does:
+   - When the GPU ranks' quiesce vote goes, each rank's pod is held but for
+     its engine container, which keeps running while gpushare saves its GPU
+     memory (a minute or more for a large model): its sidecars stop before
+     they can count the suspending engine as failed.
+   - Once every member waits at the group freeze point, the ranks are
+     suspended, and the companions (etcd, NATS, frontends) are held. Until
+     then they run: an etcd held from the vote stopped answering a Dynamo
+     engine still running its save, the engine lost its lease and began to
+     shut down, the dump saved it shutting down, and its restore finished the
+     shutdown a few seconds after the network unlock.
+
+   The dump then stops each rank's engine container. A companion's container
+   is thawed just before its dump, which stops it again. Nothing of the
+   instance counts the time the capture takes.
 2. **The captured instance is not resumed.** Its members are dumped without
    `--leave-running`, and its pods are deleted. Their controllers replace them,
    and the webhook admits the replacements as the restore's placeholders: the

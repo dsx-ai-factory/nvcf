@@ -254,7 +254,7 @@ type freezeMember struct {
 // driveGroupFreeze releases every member from the freeze point of phase
 // ("" before the dump, "post" after it) once all wait there, or aborts them
 // all when one ends before it, or none of that happens in time.
-func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase string, members []freezeMember, poll time.Duration, log *logrus.Entry, gate <-chan struct{}) bool {
+func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase string, members []freezeMember, poll time.Duration, log *logrus.Entry, reached func(), gate <-chan struct{}) bool {
 	wait := groupFreezeWait
 	if phase == "post" {
 		wait = postDumpWait
@@ -305,6 +305,9 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 			all = false
 		}
 		if all {
+			if reached != nil {
+				reached()
+			}
 			if gate != nil {
 				// The rest of the instance is being held; bounded, a
 				// hold that does not finish leaves its pod running.
@@ -395,11 +398,90 @@ func freezeState(ctx context.Context, client *http.Client, base, session, phase,
 // to be held.
 const holdGateWait = 30 * time.Second
 
-// holdMembers holds every member pod of capture session (pod_hold.go): a
-// companion's whole pod, a GPU rank's but for the container it saves.
-func holdMembers(ctx context.Context, client *http.Client, session string, members []CheckpointRequest, bases []string, log *logrus.Entry) {
+// instanceHold holds the member pods of a group capture (pod_hold.go) in
+// two steps, so that nothing the GPU ranks talk to stops before they do:
+//
+//   - When the ranks' quiesce vote goes, the GPU ranks' pods are held, each
+//     but for the container it saves: a sidecar such as a gang-health
+//     watchdog stops before it can count the suspending engine as failed.
+//   - Once every member waits at the freeze point, the GPU ranks are
+//     suspended and the companions' pods are held. Holding a companion
+//     earlier stopped it for the whole of the ranks' GPU save (a minute
+//     for a large model) while their engines still ran: a Dynamo engine
+//     lost its lease to the stopped etcd and began to shut down, the dump
+//     saved it shutting down, and its restore finished the shutdown.
+//
+// Each step runs at most once; wait returns when the steps begun have
+// landed.
+type instanceHold struct {
+	ctx     context.Context
+	client  *http.Client
+	session string
+	members []CheckpointRequest
+	bases   []string
+	log     *logrus.Entry
+
+	ranksOnce, companionsOnce   sync.Once
+	ranksBegun, companionsBegun atomic.Bool
+	ranksDone, companionsDone   chan struct{}
+}
+
+func newInstanceHold(ctx context.Context, client *http.Client, session string, members []CheckpointRequest, bases []string, log *logrus.Entry) *instanceHold {
+	return &instanceHold{ctx: ctx, client: client, session: session, members: members, bases: bases, log: log,
+		ranksDone: make(chan struct{}), companionsDone: make(chan struct{})}
+}
+
+// holdRanks holds the GPU ranks' pods, in the background.
+func (h *instanceHold) holdRanks() {
+	h.ranksOnce.Do(func() {
+		h.ranksBegun.Store(true)
+		go func() {
+			defer close(h.ranksDone)
+			holdMembers(h.ctx, h.client, h.session, h.members, h.bases, false, h.log)
+		}()
+	})
+}
+
+// holdCompanions holds the companions' pods, in the background, once the
+// ranks' holds begun have landed; companions() is closed when it is done.
+func (h *instanceHold) holdCompanions() {
+	h.companionsOnce.Do(func() {
+		h.companionsBegun.Store(true)
+		go func() {
+			defer close(h.companionsDone)
+			if h.ranksBegun.Load() {
+				<-h.ranksDone
+			}
+			holdMembers(h.ctx, h.client, h.session, h.members, h.bases, true, h.log)
+		}()
+	})
+}
+
+// companions is closed once the companions are held: the freeze point's gate.
+func (h *instanceHold) companions() <-chan struct{} { return h.companionsDone }
+
+// wait returns when every step begun has landed or failed: a hold still on
+// its way would land after the members' release and keep its pod frozen.
+func (h *instanceHold) wait() {
+	if h.ranksBegun.Load() {
+		<-h.ranksDone
+	}
+	if h.companionsBegun.Load() {
+		<-h.companionsDone
+	}
+}
+
+// holdMembers holds the member pods of capture session that are
+// companions, or GPU ranks (pod_hold.go): a companion's whole pod, a GPU
+// rank's but for the container it saves.
+func holdMembers(ctx context.Context, client *http.Client, session string, members []CheckpointRequest, bases []string, companions bool, log *logrus.Entry) {
 	var wg sync.WaitGroup
+	n := 0
 	for i := range members {
+		if members[i].Companion != companions {
+			continue
+		}
+		n++
 		wg.Add(1)
 		go func(base string, m *CheckpointRequest) {
 			defer wg.Done()
@@ -411,7 +493,11 @@ func holdMembers(ctx context.Context, client *http.Client, session string, membe
 		}(bases[i], &members[i])
 	}
 	wg.Wait()
-	log.WithField("members", len(members)).Info("group capture: the instance's pods are held")
+	what := "the GPU ranks' pods are held, each but for its saving container"
+	if companions {
+		what = "the companions' pods are held"
+	}
+	log.WithField("members", n).Info("group capture: " + what)
 }
 
 // releaseMembers ends every member's hold; a member ends its own with its
