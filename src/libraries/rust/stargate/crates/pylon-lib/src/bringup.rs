@@ -1723,10 +1723,18 @@ mod tests {
                 stop.clone(),
             ));
 
-            // The server counts only accepted canaries, so three of them show
-            // that the earlier results did not demote the model.
+            // The server counts a canary before Pylon has its result, so the
+            // count alone can miss a demotion. Each poll checks readiness.
             tokio::time::timeout(Duration::from_secs(2), async {
-                while canary_requests.load(Ordering::SeqCst) < 3 {
+                loop {
+                    assert_eq!(
+                        runtime_state.model_bringup_ready("test-model"),
+                        Some(true),
+                        "backend rejects `{rejected_field}`"
+                    );
+                    if canary_requests.load(Ordering::SeqCst) >= 3 {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
@@ -1734,11 +1742,6 @@ mod tests {
             .unwrap_or_else(|_| {
                 panic!("a backend that rejects `{rejected_field}` should accept active canaries")
             });
-            assert_eq!(
-                runtime_state.model_bringup_ready("test-model"),
-                Some(true),
-                "backend rejects `{rejected_field}`"
-            );
 
             stop.cancel();
             task.await.unwrap();
