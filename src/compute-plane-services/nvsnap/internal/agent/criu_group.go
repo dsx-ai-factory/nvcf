@@ -1459,8 +1459,16 @@ func (c *criuAutoRestorer) endGroup(ctx context.Context, leader *corev1.Pod, key
 		log.WithError(cause).Error("CRIU group restore failed; its capture was verified, so it is kept and the replacements restore from it again")
 	}
 	for _, p := range members {
-		if err := c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID); err != nil {
-			log.WithError(err).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
+		var del error
+		if isCompanion(p) {
+			// Another leader may claim it between the list above and the
+			// delete (grove_replicas.go).
+			del = deleteCompanionUnlessClaimed(ctx, c.a.kubeClient, p, leader, log)
+		} else {
+			del = c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID)
+		}
+		if del != nil {
+			log.WithError(del).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
 		}
 	}
 }

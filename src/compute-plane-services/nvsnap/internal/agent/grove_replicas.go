@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -277,4 +278,48 @@ func claimCompanions(ctx context.Context, kc kubernetes.Interface, members []*co
 		}
 	}
 	return nil
+}
+
+// deleteCompanionUnlessClaimed deletes companion p, as leader's restore
+// ends, unless another live leader has claimed it since p was read: the
+// delete carries p's resourceVersion, which a claim changes, and a
+// conflict is answered by reading the pod again.
+func deleteCompanionUnlessClaimed(ctx context.Context, kc kubernetes.Interface, p, leader *corev1.Pod, log *logrus.Entry) error {
+	uid, rv := p.UID, p.ResourceVersion
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		opts := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
+		if rv != "" {
+			opts.Preconditions.ResourceVersion = &rv
+		}
+		err = kc.CoreV1().Pods(p.Namespace).Delete(ctx, p.Name, opts)
+		if err == nil || apierrors.IsNotFound(err) {
+			return nil
+		}
+		if !apierrors.IsConflict(err) {
+			continue
+		}
+		cur, gerr := kc.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(gerr) || (gerr == nil && cur.UID != uid) {
+			return nil // gone, or replaced: not this restore's to delete
+		}
+		if gerr != nil {
+			err = gerr
+			continue
+		}
+		if by := cur.Annotations[companionClaimAnnotation]; by != "" && by != string(leader.UID) {
+			alive, aerr := leaderAlive(ctx, kc, cur.Namespace, by)
+			if aerr != nil {
+				err = aerr
+				continue
+			}
+			if alive {
+				log.WithFields(logrus.Fields{"placeholder": cur.Name, "claimedBy": by}).
+					Info("CRIU group restore: a companion is now another restore's; not deleting it")
+				return nil
+			}
+		}
+		rv = cur.ResourceVersion
+	}
+	return err
 }

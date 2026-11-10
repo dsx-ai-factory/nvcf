@@ -434,3 +434,60 @@ func TestGroveScalingGroupReplicas_RetriesBounded(t *testing.T) {
 		t.Errorf("a cancelled read took %s", d)
 	}
 }
+
+// withDeletePreconditions makes kc's pod deletes honour a UID and
+// resourceVersion precondition, as the API server does.
+func withDeletePreconditions(kc *fake.Clientset) {
+	gvr := corev1.SchemeGroupVersion.WithResource("pods")
+	kc.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		da := action.(k8stesting.DeleteActionImpl)
+		obj, err := kc.Tracker().Get(gvr, da.GetNamespace(), da.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		cur := obj.(*corev1.Pod)
+		if pc := da.DeleteOptions.Preconditions; pc != nil {
+			if (pc.UID != nil && *pc.UID != cur.UID) || (pc.ResourceVersion != nil && *pc.ResourceVersion != cur.ResourceVersion) {
+				return true, nil, apierrors.NewConflict(gvr.GroupResource(), cur.Name, fmt.Errorf("precondition failed"))
+			}
+		}
+		return true, nil, kc.Tracker().Delete(gvr, cur.Namespace, cur.Name)
+	})
+}
+
+// A restore ending deletes its companions, but one another live leader
+// claimed after this restore read it is that leader's: the delete, made
+// with the resourceVersion it read, conflicts and leaves it alone. An
+// unclaimed companion is deleted.
+func TestDeleteCompanionUnlessClaimed(t *testing.T) {
+	ctx := context.Background()
+	log := logrus.NewEntry(logrus.New())
+	ending, other := groveRank("w-0-ldr", "0", "0"), groveRank("w-2-ldr", "2", "0")
+	etcd, nats := claimablePlaceholder("etcd-0"), claimablePlaceholder("nats-0")
+	etcd.UID, nats.UID = "etcd-uid", "nats-uid"
+	kc := conditionalPatchClient(ending, other, etcd, nats)
+	withDeletePreconditions(kc)
+	read := func(name string) *corev1.Pod {
+		p, err := kc.CoreV1().Pods("fn").Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	seenEtcd, seenNats := read("etcd-0"), read("nats-0") // what the ending restore listed
+	if err := claimCompanions(ctx, kc, []*corev1.Pod{other, read("etcd-0")}, other); err != nil {
+		t.Fatal(err) // the other leader claims etcd after the list
+	}
+	if err := deleteCompanionUnlessClaimed(ctx, kc, seenEtcd, ending, log); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteCompanionUnlessClaimed(ctx, kc, seenNats, ending, log); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kc.CoreV1().Pods("fn").Get(ctx, "etcd-0", metav1.GetOptions{}); err != nil {
+		t.Errorf("the companion another live leader claimed was deleted: %v", err)
+	}
+	if _, err := kc.CoreV1().Pods("fn").Get(ctx, "nats-0", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the unclaimed companion was not deleted: %v", err)
+	}
+}
