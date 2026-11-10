@@ -4,7 +4,7 @@
 #[allow(dead_code)]
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ const MAX_STATS: &[u8] = &[
 ];
 
 #[tokio::test]
-async fn released_stats_route_alone_mixed_and_after_rollback() {
+async fn released_stats_route_alone_mixed_and_after_backend_replacement() {
     init_crypto();
     // CI encodes this payload with the oldest supported release's schema.
     // Local runs retain the frozen release fixture when no CI payload is supplied.
@@ -68,12 +68,14 @@ async fn released_stats_route_alone_mixed_and_after_rollback() {
     let modern = ModelStats::decode(MAX_STATS).expect("released maximum stats must decode");
     assert_eq!(modern.max_input_tps, Some(100.0));
 
-    for (algorithm, legacy_mode) in [
-        ("power-of-n", true),
-        ("pulsar", true),
-        ("pulsar-wait-and-widen", true),
-        ("pulsar", false),
-        ("pulsar-wait-and-widen", false),
+    for (algorithm, legacy_mode, reported_maximum) in [
+        ("power-of-n", true, None),
+        ("pulsar", true, None),
+        ("pulsar-wait-and-widen", true, None),
+        ("pulsar", false, None),
+        ("pulsar-wait-and-widen", false, None),
+        ("pulsar", false, Some(0.0)),
+        ("pulsar-wait-and-widen", false, Some(0.0)),
     ] {
         let mut policy = serde_json::json!({"algorithm": algorithm});
         if legacy_mode && algorithm.starts_with("pulsar") {
@@ -98,11 +100,13 @@ async fn released_stats_route_alone_mixed_and_after_rollback() {
         let mut registrations = Vec::new();
         let mut tunnels = Vec::new();
 
-        let mut versions = vec![("modern", modern.clone())];
-        if legacy_mode {
-            versions.insert(0, ("legacy", legacy.clone()));
-        }
-        for (id, stats) in versions {
+        // Decode released stats, then register through the current client.
+        // This does not exercise a historical registration envelope or consumer.
+        // Missing maxima also occur in current Pylons; aggregation normalizes
+        // invalid backend maxima to the same absent state.
+        let mut mean_only = legacy.clone();
+        mean_only.max_input_tps = reported_maximum;
+        for (id, stats) in [("legacy", mean_only), ("modern", modern.clone())] {
             let (_, quic_url, tunnel) = start_dummy_inst("compatibility").await;
             tunnels.push(tunnel);
             let mut grpc = StargateControlPlaneClient::connect(format!("http://{grpc_addr}"))
@@ -135,25 +139,43 @@ async fn released_stats_route_alone_mixed_and_after_rollback() {
                 .expect("registration stream closed");
             registrations.push((registration, tx, stream));
             wait_for_backend_count(&handle, registrations.len()).await;
-            assert_stream(&client, http_addr).await;
+            if registrations.len() == 1 {
+                assert_eq!(
+                    assert_stream(&client, http_addr, "old-only").await,
+                    "legacy"
+                );
+            }
         }
 
-        if legacy_mode {
-            // New-only, then restore the old backend before withdrawing the new one.
-            let (registration, tx, _) = &mut registrations[0];
-            registration.models.get_mut("compatibility").unwrap().status =
-                InferenceServerStatus::Inactive as i32;
-            tx.send_async(registration.clone()).await.unwrap();
-            wait_for_backend_count(&handle, 1).await;
-            assert_eq!(assert_stream(&client, http_addr).await, "modern");
-            registration.models.get_mut("compatibility").unwrap().status =
-                InferenceServerStatus::Active as i32;
-            tx.send_async(registration.clone()).await.unwrap();
-            wait_for_backend_count(&handle, 2).await;
-            drop(registrations.pop());
-            wait_for_backend_count(&handle, 1).await;
-            assert_eq!(assert_stream(&client, http_addr).await, "legacy");
+        let mut served = HashSet::new();
+        for index in 0..128 {
+            served.insert(assert_stream(&client, http_addr, &format!("mixed-{index}")).await);
+            if served.len() == 2 {
+                break;
+            }
         }
+        assert_eq!(served, HashSet::from(["legacy".into(), "modern".into()]));
+
+        // Replace backends on the current Stargate; this is not consumer rollback.
+        let (registration, tx, _) = &mut registrations[0];
+        registration.models.get_mut("compatibility").unwrap().status =
+            InferenceServerStatus::Inactive as i32;
+        tx.send_async(registration.clone()).await.unwrap();
+        wait_for_backend_count(&handle, 1).await;
+        assert_eq!(
+            assert_stream(&client, http_addr, "new-only").await,
+            "modern"
+        );
+        registration.models.get_mut("compatibility").unwrap().status =
+            InferenceServerStatus::Active as i32;
+        tx.send_async(registration.clone()).await.unwrap();
+        wait_for_backend_count(&handle, 2).await;
+        drop(registrations.pop());
+        wait_for_backend_count(&handle, 1).await;
+        assert_eq!(
+            assert_stream(&client, http_addr, "restored-old").await,
+            "legacy"
+        );
 
         drop(registrations);
         handle.begin_shutdown();
@@ -174,12 +196,12 @@ async fn wait_for_backend_count(handle: &stargate::runtime::StargateHandle, coun
     .await;
 }
 
-async fn assert_stream(client: &reqwest::Client, addr: std::net::SocketAddr) -> String {
+async fn assert_stream(client: &reqwest::Client, addr: std::net::SocketAddr, key: &str) -> String {
     let response = with_proxy_headers_cache_affinity(
         client.post(format!("http://{addr}/v1/chat/completions")),
         "compatibility",
         "compatibility-request",
-        "stable-prefix",
+        key,
     )
     .json(&serde_json::json!({
         "model": "compatibility", "messages": [{"role": "user", "content": "hello"}],

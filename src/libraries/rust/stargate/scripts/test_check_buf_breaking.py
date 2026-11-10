@@ -47,8 +47,11 @@ class BreakingCheckTest(unittest.TestCase):
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True,
                               capture_output=True, text=True)
 
-    def check(self, base="HEAD", cwd=None):
-        return subprocess.run(["bash", str(self.script), base],
+    def check(self, base="HEAD", cwd=None, schemas=None):
+        args = ["bash", str(self.script), base]
+        if schemas is not None:
+            args.append(schemas)
+        return subprocess.run(args,
                               cwd=cwd or self.repo, capture_output=True, text=True,
                               env={**os.environ, "XDG_CACHE_HOME": str(self.repo / "cache")})
 
@@ -112,6 +115,25 @@ class BreakingCheckTest(unittest.TestCase):
         self.proto.parent.mkdir(parents=True)
         self.proto.write_text(SCHEMA)
         self.assertNotEqual(self.check().returncode, 0)
+
+    def test_gateway_server_and_client_copies_are_checked_independently(self):
+        paths = ["src/control-plane-services/cloud-functions/nvcf-core/src/main/proto",
+                 "src/invocation-plane-services/llm-api-gateway/nvcf/pb"]
+        for path in paths:
+            proto = self.repo / path / "llm_gateway.proto"
+            proto.parent.mkdir(parents=True)
+            proto.write_text(SCHEMA)
+        self.git("add", ".")
+        self.git("-c", "user.name=Contract Test", "-c", "user.email=test@example.com",
+                 "-c", "commit.gpgsign=false", "commit", "-q", "-s", "-m", "test: gateway copies")
+        for path in paths:
+            with self.subTest(path=path):
+                proto = self.repo / path / "llm_gateway.proto"
+                proto.write_text(SCHEMA.replace("string id = 1;", "uint64 id = 1;"))
+                self.assertNotEqual(self.check(schemas=path).returncode, 0)
+                self.assertEqual(self.check().returncode, 0)
+                proto.write_text(SCHEMA)
+                self.assertEqual(self.check(schemas=path).returncode, 0)
 
 
 if __name__ == "__main__":

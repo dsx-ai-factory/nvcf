@@ -61,6 +61,15 @@ class CompatibilityBaselineTest(unittest.TestCase):
             with self.subTest(date=date), self.assertRaises(ValueError):
                 select_release([release("0.1.0", 1, published_at=date)], [], NOW)
 
+    def test_inventory_includes_later_backports_and_retained_tags(self):
+        rows = [release("0.18.3", 1), release("0.29.2", 20),
+                release("0.18.2", 2), release("0.1.0", 200),
+                release("0.0.1", 201)]
+        result = select_release(rows, [PREFIX + "0.1.0"], NOW)
+        self.assertEqual(result["supported_tags"], [PREFIX + version for version in
+                         ["0.1.0", "0.29.2", "0.18.2", "0.18.3"]])
+        self.assertEqual(result["tag"], result["supported_tags"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

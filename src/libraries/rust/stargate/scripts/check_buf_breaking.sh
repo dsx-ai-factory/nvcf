@@ -16,8 +16,8 @@
 
 set -euo pipefail
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: scripts/check_buf_breaking.sh <base-ref>" >&2
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: scripts/check_buf_breaking.sh <base-ref> [repo-relative-schema-directory]" >&2
   exit 2
 fi
 if ! command -v buf >/dev/null 2>&1; then
@@ -28,13 +28,14 @@ fi
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repo="$(git -C "$workspace" rev-parse --show-toplevel)"
 prefix="$(git -C "$workspace" rev-parse --show-prefix)"
+schemas="${2:-${prefix}crates/proto/proto}"
 base="$(git -C "$repo" rev-parse --verify --end-of-options "$1^{commit}")"
 baseline="$(mktemp -d)"
 trap 'rm -rf "$baseline"' EXIT
 
 # Export only the base schemas. Candidate config cannot weaken this check,
 # and a missing base/schema is an error rather than a skipped comparison.
-git -C "$repo" archive "$base:${prefix}crates/proto/proto" | tar -x -C "$baseline"
-buf breaking "$workspace/crates/proto/proto" \
+git -C "$repo" archive "$base:$schemas" | tar -x -C "$baseline"
+buf breaking "$repo/$schemas" \
   --against "$baseline" \
   --config '{"version":"v2","breaking":{"use":["FILE"]}}'

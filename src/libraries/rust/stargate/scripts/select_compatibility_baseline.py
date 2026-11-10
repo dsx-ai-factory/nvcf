@@ -31,9 +31,11 @@ def select_release(releases, retained, now):
     supported = [entry for tag, entry in stable.items() if entry[0] >= cutoff or tag in retained]
     if not supported:
         raise ValueError("no stable release in the 90-day window or retained release list")
-    published, release = min(supported, key=lambda entry: (entry[0], entry[1]["tag_name"]))
+    supported.sort(key=lambda entry: (entry[0], entry[1]["tag_name"]))
+    published, release = supported[0]
     return {
         "tag": release["tag_name"],
+        "supported_tags": [entry[1]["tag_name"] for entry in supported],
         "published_at": published.isoformat(),
         "support_days": SUPPORT_DAYS,
         "as_of": now.isoformat(),

@@ -59,27 +59,42 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ## Protocol compatibility
 
 With Buf on `PATH`, run `scripts/check_buf_breaking.sh origin/main` from this
-directory's parent. It checks both protobuf APIs against the supplied Git
+directory's parent. It checks the Stargate registration and gateway client
+protobuf APIs against the supplied Git
 base with strict `FILE` rules and no deletion exceptions. Candidate Buf
 configuration cannot disable the check. CI supplies the pull request or
-merge queue base, or the previous commit for a push. It also checks the oldest
-supported stable release, selected by UTC publication date from the upstream
-GitHub release inventory. The rolling support window is 90 days. Older versions
+merge queue base, or the previous commit for a push. CI also checks the gateway
+server schema in `nvcf-core` and the client copy in `llm-api-gateway` against
+that base. Historical gateway releases have no release matrix in this gate;
+existing drift between copies is not reconciled by these checks.
+
+Stargate schemas are compared against every supported stable Stargate release,
+including backports. Releases are selected by UTC publication date from the
+upstream GitHub release inventory. The rolling support window is 90 days. Older versions
 still deployed or needed for rollback must remain in
 `compatibility_retained_releases.json`; remove them only after verified migration
 and closure of the rollback window. Missing inventory or retained-release
 metadata fails CI. The selected tag, publication date, and cutoff appear in the
-job log.
+job log, along with the full supported tag list.
 
 `cargo test --locked -p stargate --test compatibility -- --test-threads=1`
-sends released stats through gRPC registration and HTTP/QUIC streaming.
+decodes released stats values, then re-encodes them with the current client for
+gRPC registration and HTTP/QUIC streaming.
 CI encodes these stats using the selected oldest release's protobuf schema and
 passes the hex payload through `STARGATE_COMPAT_STATS_HEX`. Local runs without
 that variable use the frozen v0.8.0 fixture.
-It checks the default policy and explicit legacy modes for both Pulsar variants
-with old-only, mixed, new-only, and rollback states. This checks released wire
-data with current transport code; it does not run historical Pylon binaries.
-Frozen maximum-bearing stats also exercise the current Pulsar defaults.
+It checks power-of-n, both Pulsar defaults, and their explicit mean-based modes
+with old-only, mixed, and new-only backends, then restores the older backend
+and withdraws the newer one. Both backends must serve requests in the mixed
+state. An absent aggregate maximum falls back to the positive finite last mean.
+Cluster aggregation treats missing or invalid backend maxima as absent. This
+also covers current Pylons that have not established a maximum.
+
+This checks released stats values with current registration envelopes and
+transports. It does not send an untouched historical registration frame or run
+historical Pylon/Stargate binaries. Restoring an older backend is a producer
+replacement scenario; consumer downgrade, relay compatibility, and production
+rolling upgrades require separate qualification.
 
 ## Last-Cluster End-to-End Check
 

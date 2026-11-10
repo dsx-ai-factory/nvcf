@@ -94,7 +94,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/buf-bin/buf"
           echo "$RUNNER_TEMP/buf-bin" >> "$GITHUB_PATH"
 
-      - name: Check Stargate protocol compatibility
+      - name: Check LLM protocol compatibility
         id: compatibility
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,16 +109,29 @@ jobs:
           python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_check_buf_breaking.py'
           python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_select_compatibility_baseline.py'
           bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$CONTRACT_BASE"
+          for schemas in \
+            src/control-plane-services/cloud-functions/nvcf-core/src/main/proto \
+            src/invocation-plane-services/llm-api-gateway/nvcf/pb; do
+            bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$CONTRACT_BASE" "$schemas"
+          done
           gh api --paginate "repos/$CONTRACT_RELEASE_REPO/releases?per_page=100" \
             --jq '.[] | {tag_name,published_at,draft,prerelease} | @json' \
             > "$RUNNER_TEMP/stargate-releases.jsonl"
           python3 src/libraries/rust/stargate/scripts/select_compatibility_baseline.py \
             < "$RUNNER_TEMP/stargate-releases.jsonl" > "$RUNNER_TEMP/stargate-baseline.json"
           cat "$RUNNER_TEMP/stargate-baseline.json"
-          baseline="$(jq -er .tag "$RUNNER_TEMP/stargate-baseline.json")"
-          git fetch --no-tags "https://github.com/$CONTRACT_RELEASE_REPO.git" "refs/tags/$baseline"
+          jq -er '.supported_tags[]' "$RUNNER_TEMP/stargate-baseline.json" > "$RUNNER_TEMP/stargate-tags.txt"
+          release_refs=()
+          while IFS= read -r tag; do
+            release_refs+=("refs/tags/$tag")
+          done < "$RUNNER_TEMP/stargate-tags.txt"
+          git fetch --no-tags "https://github.com/$CONTRACT_RELEASE_REPO.git" "${release_refs[@]}"
+          # The selector orders tags oldest first. Check every fetched release,
+          # including backports that are not ancestors of the target base.
           baseline_sha="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
-          bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$baseline_sha"
+          while read -r release_sha _; do
+            bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$release_sha"
+          done < "$(git rev-parse --git-path FETCH_HEAD)"
           mkdir -p "$RUNNER_TEMP/stargate-compatibility/proto"
           git archive "$baseline_sha:src/libraries/rust/stargate/crates/proto/proto" \
             | tar -xf - -C "$RUNNER_TEMP/stargate-compatibility/proto"

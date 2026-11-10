@@ -370,6 +370,13 @@ rollback before enabling a new default. Schema checks alone do not establish
 behavioral compatibility. Keep compatibility fixtures from released versions;
 do not regenerate them from the candidate to make a failing check pass.
 
+Current CI checks Stargate schemas against every supported Stargate release
+and tests released stats values with current Stargate transports. Gateway
+server and client schema copies are checked against the target base only.
+Historical gateway releases, other components, historical binaries, relay
+combinations, and consumer downgrades need separate qualification. Extend the
+owning component's release matrix when changing one of those contracts.
+
 ## Tests
 
 Code changes must include tests. If a change does not include tests, explain why

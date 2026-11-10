@@ -696,17 +696,34 @@ fn max_rendezvous_weight_keeps_mean_input_work_capacity() {
 }
 
 #[test]
-fn pulsar_input_work_capacity_excludes_backends_missing_the_selected_maximum() {
+fn pulsar_input_work_capacity_includes_legacy_but_excludes_invalid_maxima() {
     let target = target();
     let request = request(&target, Some("prefix-a"), Some(100));
     let ready = work_candidate("ready", 5, 50.0, 50);
-    let mut legacy_backend = work_candidate("legacy", 5, 10_000.0, 0);
-    legacy_backend.stats.max_input_tps = None;
     for algorithm in [
         LoadBalancerAlgorithm::Pulsar,
         LoadBalancerAlgorithm::PulsarWaitAndWiden,
     ] {
         let mut config = LoadBalancerAlgorithmConfig::from(algorithm);
+        let mut legacy_backend = work_candidate("legacy", 5, 10_000.0, 0);
+        legacy_backend.stats.max_input_tps = None;
+        assert_eq!(
+            input_work_seconds_for_request(
+                &config,
+                &request,
+                &[ready.clone(), legacy_backend.clone()]
+            ),
+            Some(150.0 / 10_050.0)
+        );
+        assert_eq!(
+            input_work_seconds_for_request(
+                &config,
+                &request,
+                std::slice::from_ref(&legacy_backend)
+            ),
+            Some(0.01)
+        );
+        legacy_backend.stats.max_input_tps = Some(0.0);
         assert_eq!(
             input_work_seconds_for_request(
                 &config,
@@ -3240,7 +3257,7 @@ fn pulsar_max_ranking_cache_tracks_only_the_selected_weight() {
 }
 
 #[test]
-fn both_pulsar_defaults_ignore_mean_changes_and_reject_missing_maxima() {
+fn both_pulsar_defaults_use_maxima_and_fall_back_to_mean_when_absent() {
     let target = target();
     for algorithm in [
         LoadBalancerAlgorithm::Pulsar,
@@ -3248,6 +3265,10 @@ fn both_pulsar_defaults_ignore_mean_changes_and_reject_missing_maxima() {
     ] {
         let config = LoadBalancerAlgorithmConfig::from(algorithm);
         let balancer = create_load_balancer_with_config(&config).unwrap();
+        let legacy_config = parse_json(&format!(
+            r#"{{"algorithm":"{algorithm}","rendezvous_weight":"last-mean-input-tps"}}"#
+        ));
+        let legacy_balancer = create_load_balancer_with_config(&legacy_config).unwrap();
         let initial = vec![
             work_candidate("a", 5, 100.0, 0),
             work_candidate("b", 5, 200.0, 0),
@@ -3265,7 +3286,11 @@ fn both_pulsar_defaults_ignore_mean_changes_and_reject_missing_maxima() {
             let before = balancer.choose_candidate(&request, &initial).unwrap();
             let after = balancer.choose_candidate(&request, &changed).unwrap();
             assert_eq!(before.candidate_index, after.candidate_index);
-            assert!(balancer.choose_candidate(&request, &missing).is_none());
+            let fallback = balancer.choose_candidate(&request, &missing).unwrap();
+            let legacy = legacy_balancer
+                .choose_candidate(&request, &missing)
+                .unwrap();
+            assert_eq!(fallback.candidate_index, legacy.candidate_index);
         }
     }
 }
@@ -3321,7 +3346,49 @@ fn pulsar_uses_generation_max_input_tps_as_weight_by_default() {
 
     candidate.stats.last_mean_input_tps = 123.0;
     candidate.stats.max_input_tps = None;
-    assert_eq!(pulsar.weight(&candidate), None, "no fallback to the mean");
+    assert_eq!(pulsar.weight(&candidate), Some(123.0));
+    for invalid_mean in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        candidate.stats.last_mean_input_tps = invalid_mean;
+        assert_eq!(pulsar.weight(&candidate), None);
+    }
+}
+
+#[test]
+fn pulsar_fallback_cache_tracks_mean_changes_and_maximum_presence() {
+    let pulsar = PulsarLoadBalancer::new(seeded_pulsar_algorithm_config("seed-1"));
+    let legacy = PulsarLoadBalancer::new(parse_json(
+        r#"{"algorithm":"pulsar","seed":"seed-1","rendezvous_weight":"last-mean-input-tps"}"#,
+    ));
+    let target = target();
+    let mut snapshots = vec![
+        work_candidate("a", 5, 100.0, 0),
+        work_candidate("b", 5, 100.0, 0),
+    ];
+    for (a, b) in [(10_000.0, 1.0), (1.0, 10_000.0)] {
+        for (candidate, mean) in snapshots.iter_mut().zip([a, b]) {
+            candidate.stats.max_input_tps = None;
+            candidate.stats.last_mean_input_tps = mean;
+        }
+        for index in 0..64 {
+            let key = format!("fallback-{index}");
+            let request = request(&target, Some(&key), Some(128));
+            assert_eq!(
+                choose(&pulsar, &request, &snapshots).candidate.cluster_id,
+                choose(&legacy, &request, &snapshots).candidate.cluster_id,
+            );
+        }
+        snapshots[0].stats.max_input_tps = Some(10_000.0);
+        snapshots[1].stats.max_input_tps = Some(1.0);
+        let uncached = PulsarLoadBalancer::new(seeded_pulsar_algorithm_config("seed-1"));
+        for index in 0..64 {
+            let key = format!("fallback-{index}");
+            let request = request(&target, Some(&key), Some(128));
+            assert_eq!(
+                choose(&pulsar, &request, &snapshots).candidate.cluster_id,
+                choose(&uncached, &request, &snapshots).candidate.cluster_id,
+            );
+        }
+    }
 }
 
 #[test]

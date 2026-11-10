@@ -85,8 +85,9 @@ Cluster latest-wins fields:
 - `last_mean_input_tps` is the sum of active backend reports.
 - `max_input_tps` is the greatest active backend generation maximum, available
   only when every active backend reports a positive finite value. Historical
-  peaks from Pylons observing the same engine are not summed. Missing maximum
-  data makes the cluster ineligible for default Pulsar ranking.
+  peaks from Pylons observing the same engine are not summed. A missing or
+  invalid maximum on any backend clears the aggregate maximum. Default Pulsar
+  then uses the cluster's positive finite summed `last_mean_input_tps`.
 - Because the mean is summed and the maximum is not, a shared cluster weighs
   less against single-Pylon clusters under maximum weighting than under mean
   weighting. This applies to per-Pylon `--initial-input-tps` contributions and
