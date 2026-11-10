@@ -28,7 +28,7 @@ The LLM Gateway path has these runtime components:
 ![LLM invocation path](images/nvcf-llm-invocation-path.svg)
 
 1. Client sends a native protocol request to the LLM invocation route.
-2. LLM API Gateway extracts the routing key from the `model` field, validates authorization, applies request and token rate limits, and validates endpoint-specific request fields.
+2. LLM API Gateway extracts the routing key from the `model` field, validates authorization, applies the function's request rate limit and the token rate limits, and validates endpoint-specific request fields.
 3. LLM API Gateway forwards the request to LLM request router with routing metadata such as request ID, routing key, model name, routing method, token estimate, and cache affinity key when present.
 4. LLM request router selects a healthy backend for the requested function and model.
 5. The `pylon` sidecar on the selected workload forwards the request to the user container through the configured inference port.
@@ -122,6 +122,36 @@ These per-model routing fields are mutable. Use `nvcf-cli function update --llm-
 `llmConfig.uris` and `llmConfig.tokenizer` cannot be changed after creation. A `modelUpdates` request that sets either one is rejected with `400 Bad Request`.
 
 For request admission and rate limiting, the gateway uses request estimates until the upstream service returns usage data. Do not depend on gateway-side exact token counts.
+
+### Request Rate Limits
+
+A function version's `rateLimit` policy also limits LLM requests on every LLM route, when NVCF API has `nvcf.llm-request-rate-limit-enabled` set (off by default; set it through the chart's `api.env`, for example `NVCF_LLM_REQUEST_RATE_LIMIT_ENABLED: "true"`). The policy is the `rateLimit` object on the function version, with the default rate in its nested `rateLimit` field:
+
+```json
+{
+  "rateLimit": {
+    "rateLimit": "5-M",
+    "perUserRate": "2-S",
+    "exemptedNcaIds": [],
+    "perNcaIdRate": {}
+  }
+}
+```
+
+NVCF API resolves the policy for each caller and the gateway enforces it:
+
+- `rateLimit` counts requests per caller account and function. The account is the API key owner's account; for a caller without one, such as a JWT caller or a key that carries no owner account, it is the account the request is authorized for. `perNcaIdRate` replaces `rateLimit` for that account, and `exemptedNcaIds` skips `rateLimit` for that account. The API rejects a policy that lists the same account in both; if a stored policy already has both, the `perNcaIdRate` entry applies.
+- `perUserRate` counts requests per caller and applies to exempt accounts too.
+- The gateway enforces these limits, like token limits, only when its rate limiter runs: `RATE_LIMIT_ENABLED` (on by default) and `OLRIC_ENABLED=true`. With Olric off and the default `RATE_LIMIT_FAIL_OPEN=true`, every request is admitted.
+- Limits use `<count>-<unit>` windows with `S`, `M`, `H`, or `D`, comma-separated, such as `5-S,300-H`. As in classic invocation, an entry that does not parse, or a `W` or `MO` window, is skipped, and if a unit repeats, the stricter value applies.
+- A request over the limit returns `429` in the route's error shape with `Retry-After`, and does not reach the backend. The gateway gives back what the request took from other windows and limits; if that refund fails, the charge stays until the window refills. A request refused by a token limit never reaches the backend either, so it is given back to the request limits the same way. `X-Ratelimit-Limit-Requests`, `X-Ratelimit-Remaining-Requests`, and `X-Ratelimit-Reset-Requests` describe the window with the least room left.
+
+Differences from classic invocation:
+
+- The budget refills continuously over the window instead of resetting at a fixed time.
+- One budget covers all active versions of the function, using the strictest rate per window across them.
+- `syncCheck` has no effect; the gateway always checks before forwarding.
+- Changes to the policy take effect after cached authorization responses expire, which can take a few minutes.
 
 ## Endpoint Behavior
 
@@ -796,4 +826,5 @@ histogram_quantile(
 - The LLM API Gateway chart and LLM request router chart are installed as self-managed stack components.
 - The Gateway Routes chart creates the external HTTPRoute for LLM invocation.
 - Token rate limits are evaluated per model when `llmConfig.tokenRateLimit` is set.
+- Request rate limits are evaluated per caller account and function when the function version has a `rateLimit` policy and NVCF API has `nvcf.llm-request-rate-limit-enabled` set.
 - The LLM request router and `pylon` worker sidecar images must be from a stack release that includes the endpoint support documented here.

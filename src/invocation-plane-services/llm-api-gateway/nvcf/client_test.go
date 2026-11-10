@@ -370,6 +370,10 @@ type stubInvocationService struct {
 	priority           *uint32
 	expectedAuthHeader string
 	traceparent        string
+
+	functionRequestRateLimit     *string
+	functionUserRequestRateLimit *string
+	ownerNCAID                   string
 }
 
 func (s *stubInvocationService) AuthLlmInvocation(
@@ -406,11 +410,13 @@ func (s *stubInvocationService) AuthLlmInvocation(
 	}
 
 	resp := &llmgatewaypb.AuthLlmInvokeResponse{
-		RoutingKey:                  "fn-123",
-		ClientAuthSubject:           clientAuthID,
-		Priority:                    s.priority,
-		AccountInputTokenRateLimit:  stringPtr("9-M"),
-		AccountOutputTokenRateLimit: stringPtr("4-M"),
+		RoutingKey:                   "fn-123",
+		ClientAuthSubject:            clientAuthID,
+		Priority:                     s.priority,
+		AccountInputTokenRateLimit:   stringPtr("9-M"),
+		AccountOutputTokenRateLimit:  stringPtr("4-M"),
+		FunctionRequestRateLimit:     s.functionRequestRateLimit,
+		FunctionUserRequestRateLimit: s.functionUserRequestRateLimit,
 		ModelSpecs: map[string]*llmgatewaypb.AuthLlmInvokeResponse_ModelSpec{
 			"gateway-model": {
 				Uris:           []string{"https://example.com/model"},
@@ -425,6 +431,9 @@ func (s *stubInvocationService) AuthLlmInvocation(
 		}
 		if s.clientProjectID != "" {
 			resp.AuthContext["projectId"] = s.clientProjectID
+		}
+		if s.ownerNCAID != "" {
+			resp.AuthContext["ownerNcaId"] = s.ownerNCAID
 		}
 	}
 

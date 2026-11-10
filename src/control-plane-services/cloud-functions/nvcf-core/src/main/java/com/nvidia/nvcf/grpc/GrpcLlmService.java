@@ -37,6 +37,7 @@ import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult;
 import com.nvidia.nvcf.service.apikeys.LlmApiKeyService;
 import com.nvidia.nvcf.service.function.FunctionLlmService;
 import com.nvidia.nvcf.service.function.FunctionMapperService;
+import com.nvidia.nvcf.service.function.LlmRequestRateLimitResolver;
 import com.nvidia.nvcf.service.function.invocation.FunctionInvocationValidationService;
 import com.nvidia.nvcf.service.function.invocation.FunctionInvocationValidationService.FunctionContext;
 import com.nvidia.nvcf.service.token.GrpcAuthService;
@@ -76,6 +77,7 @@ public class GrpcLlmService extends LlmGatewayImplBase {
     private final AccountRateLimitService accountRateLimitService;
     private final LlmApiKeyService llmApiKeyService;
     private final boolean accountTokenRateLimitEnabled;
+    private final boolean llmRequestRateLimitEnabled;
 
     public GrpcLlmService(
             GrpcAuthService grpcAuthService,
@@ -86,7 +88,8 @@ public class GrpcLlmService extends LlmGatewayImplBase {
             FunctionInvocationValidationService functionInvocationValidationService,
             AccountRateLimitService accountRateLimitService,
             LlmApiKeyService llmApiKeyService,
-            @Value("${nvcf.account-token-rate-limit-enabled:false}") boolean accountTokenRateLimitEnabled) {
+            @Value("${nvcf.account-token-rate-limit-enabled:false}") boolean accountTokenRateLimitEnabled,
+            @Value("${nvcf.llm-request-rate-limit-enabled:false}") boolean llmRequestRateLimitEnabled) {
         this.grpcAuthService = grpcAuthService;
         this.grpcTokenService = grpcTokenService;
         this.accountService = accountService;
@@ -96,6 +99,7 @@ public class GrpcLlmService extends LlmGatewayImplBase {
         this.accountRateLimitService = accountRateLimitService;
         this.llmApiKeyService = llmApiKeyService;
         this.accountTokenRateLimitEnabled = accountTokenRateLimitEnabled;
+        this.llmRequestRateLimitEnabled = llmRequestRateLimitEnabled;
     }
 
     @Override
@@ -147,6 +151,18 @@ public class GrpcLlmService extends LlmGatewayImplBase {
             validAccountRate(ncaId, "outputTokenRateLimit", rl.outputTokenRateLimit())
                     .ifPresent(responseBuilder::setAccountOutputTokenRateLimit);
         });
+
+        if (llmRequestRateLimitEnabled) {
+            // Like the rate limiter service, request limits count against the key owner's account.
+            var requestLimitNcaId = accountService.getOwnerNcaId(authentication, ncaId);
+            var policies = functions.stream()
+                    .map(context -> context.targetFunction().getRateLimit())
+                    .toList();
+            var requestLimits = LlmRequestRateLimitResolver.resolve(policies, requestLimitNcaId);
+            responseBuilder.putAuthContext("ownerNcaId", requestLimitNcaId);
+            requestLimits.accountRate().ifPresent(responseBuilder::setFunctionRequestRateLimit);
+            requestLimits.userRate().ifPresent(responseBuilder::setFunctionUserRequestRateLimit);
+        }
 
         for (var model : functionModels) {
             var modelSpecBuilder = AuthLlmInvokeResponse.ModelSpec.newBuilder();

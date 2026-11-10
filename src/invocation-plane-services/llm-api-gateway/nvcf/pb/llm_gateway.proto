@@ -44,6 +44,16 @@ message AuthLlmInvokeResponse {
     // NVCF API derived it (tier, override, or otherwise).
     optional string accountInputTokenRateLimit = 6;
     optional string accountOutputTokenRateLimit = 7;
+    // Function request rate limit for this caller, resolved by NVCF API from the
+    // function's rateLimit policy (per-account override, exemption, strictest
+    // across versions). Comma-separated <count>-<S|M|H|D> windows, for example
+    // "5-M" or "5-S,300-H". Counted per account and function. Absent when none
+    // applies.
+    optional string functionRequestRateLimit = 8;
+    // Per-caller request rate limit from the policy's perUserRate, counted per
+    // clientAuthSubject, account and function. Same format. Absent when none
+    // applies.
+    optional string functionUserRequestRateLimit = 9;
 
     message ModelSpec {
         reserved 3, 5, 6;

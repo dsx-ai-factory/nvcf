@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	echo "github.com/labstack/echo/v4"
@@ -31,6 +32,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 type LimitResolver interface {
@@ -122,6 +124,116 @@ func (r CallerLimitResolver) ResolveLimits(
 	default:
 		return nil, nil
 	}
+}
+
+// FunctionRequestLimitResolver applies the function's request rate limits that
+// NVCF API resolved for this caller. The per-user limit comes first, then the
+// account limit, so a request refused per user does not use the account's
+// budget. Both count against the key owner's account (RequestLimitAccount,
+// else OrgID) and the function, without the project split token limits use.
+type FunctionRequestLimitResolver struct{}
+
+func (r FunctionRequestLimitResolver) ResolveLimits(
+	ctx context.Context,
+	reqCtx *requestctx.RequestContext,
+	_ string,
+) ([]ratelimit.ResourceLimit, error) {
+	_ = r
+
+	if reqCtx == nil || reqCtx.RoutingKey == "" {
+		return nil, nil
+	}
+	account := reqCtx.RequestLimitAccount
+	if account == "" {
+		account = reqCtx.OrgID
+	}
+	if account == "" {
+		return nil, nil
+	}
+
+	var limits []ratelimit.ResourceLimit
+	// The per-user limit is keyed by APIKeyID, which holds the caller's client
+	// auth subject for API key and JWT callers alike: the classic per-user tier
+	// identity.
+	if reqCtx.FunctionUserRequestRateLimit != "" && reqCtx.APIKeyID != "" {
+		if limit, ok := resolveRequestRateLimit(ctx, reqCtx, account, "user", reqCtx.FunctionUserRequestRateLimit); ok {
+			limit.SubjectKey = fmt.Sprintf("nvcf:%s:user:%s:routing_key:%s", account, reqCtx.APIKeyID, reqCtx.RoutingKey)
+			limit.SubjectRepr = "caller of routing key `" + reqCtx.RoutingKey + "`"
+			limit.Level = ratelimit.LevelAPIKey
+			limits = append(limits, limit)
+		}
+	}
+	if reqCtx.FunctionRequestRateLimit != "" {
+		if limit, ok := resolveRequestRateLimit(ctx, reqCtx, account, "account", reqCtx.FunctionRequestRateLimit); ok {
+			limits = append(limits, scopedOrgLimit(limit, account, reqCtx.RoutingKey))
+		}
+	}
+	return limits, nil
+}
+
+// loggedMalformedRequestRates holds the function policies already reported as
+// malformed, so a bad policy logs once per gateway process, not per request.
+var loggedMalformedRequestRates sync.Map
+
+// resolveRequestRateLimit parses one function request rate limit and warns,
+// once per function, tier and policy, about entries it had to drop. ok is
+// false when no entry is valid.
+func resolveRequestRateLimit(
+	ctx context.Context,
+	reqCtx *requestctx.RequestContext,
+	account string,
+	tier string,
+	raw string,
+) (ratelimit.ResourceLimit, bool) {
+	limit, dropped := parseRequestRateLimit(raw)
+	if len(dropped) > 0 {
+		key := reqCtx.RoutingKey + "\x00" + tier + "\x00" + raw
+		if _, logged := loggedMalformedRequestRates.LoadOrStore(key, struct{}{}); !logged {
+			telemetry.Logger(ctx).Warn().
+				Str("requestID", reqCtx.RequestID).
+				Str("routingKey", reqCtx.RoutingKey).
+				Str("ncaId", account).
+				Str("tier", tier).
+				Strs("droppedEntries", dropped).
+				Msg("skipping malformed function request rate limit entries; logged once per function and policy")
+		}
+	}
+	hasWindow := limit.RequestsPerSecond+limit.RequestsPerMinute+limit.RequestsPerHour+limit.RequestsPerDay > 0
+	return limit, hasWindow
+}
+
+// parseRequestRateLimit reads a function request rate limit such as "5-M" or
+// "5-S,300-H" into request windows the way the classic rate limiter reads a
+// rateLimit policy: each entry uses the token limit syntax, an entry that does
+// not parse or has no request window (week, month) is dropped and returned in
+// dropped, and two entries for one window keep the stricter. A policy with no
+// valid entry gives a limit with no windows, so the caller skips it instead of
+// failing every request.
+func parseRequestRateLimit(raw string) (limit ratelimit.ResourceLimit, dropped []string) {
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parsed, err := parseTokenRateLimit(entry)
+		if err != nil || parsed.tokensPerWeek != 0 || parsed.tokensPerMonth != 0 {
+			dropped = append(dropped, entry)
+			continue
+		}
+		limit.RequestsPerSecond = stricterWindow(limit.RequestsPerSecond, parsed.tokensPerSecond)
+		limit.RequestsPerMinute = stricterWindow(limit.RequestsPerMinute, parsed.tokensPerMinute)
+		limit.RequestsPerHour = stricterWindow(limit.RequestsPerHour, parsed.tokensPerHour)
+		limit.RequestsPerDay = stricterWindow(limit.RequestsPerDay, parsed.tokensPerDay)
+	}
+	return limit, dropped
+}
+
+// stricterWindow returns the lower of two window limits, where 0 means unset.
+func stricterWindow(current, next int64) int64 {
+	if current == 0 || (next != 0 && next < current) {
+		return next
+	}
+	return current
 }
 
 // AccountLimitResolver applies the account-scoped token rate limit NVCF API resolves by
@@ -289,11 +401,28 @@ func (ctx *RateLimitContext) RevertAndRecalculateStats() {
 	}
 
 	for _, results := range ctx.Results {
-		for _, result := range results {
+		for dim, result := range results {
+			// A refused request's slots were refunded and reverted already;
+			// a slot whose refund failed stays counted, so the headers keep it.
+			if isRequestDimension(dim) {
+				continue
+			}
 			result.Revert()
 		}
 	}
 	ctx.calculateStats()
+}
+
+func isRequestDimension(dim ratelimit.LimitDimension) bool {
+	switch dim {
+	case ratelimit.RequestsPerSecond,
+		ratelimit.RequestsPerMinute,
+		ratelimit.RequestsPerHour,
+		ratelimit.RequestsPerDay:
+		return true
+	default:
+		return false
+	}
 }
 
 func (ctx *RateLimitContext) calculateStats() {
@@ -371,9 +500,12 @@ func (ctx *RateLimitContext) applyRateLimitHeaders(dst http.Header) {
 type rateLimitResults []map[ratelimit.LimitDimension]*ratelimit.RateLimitResult
 
 type rateLimitStats struct {
-	LimitRequests     *int64         // unused in the current token-only live path; set only when request-based dimensions are enabled
-	RemainingRequests *int64         // unused in the current token-only live path; set only when request-based dimensions are enabled
-	ResetRequests     *time.Duration // unused in the current token-only live path; set only when request-based dimensions are enabled
+	// The request stats describe the request window with the least room left;
+	// they are set only when a request limit applies, such as a function
+	// request rate limit.
+	LimitRequests     *int64
+	RemainingRequests *int64
+	ResetRequests     *time.Duration
 
 	LimitTokens     *int64
 	RemainingTokens *int64
@@ -504,7 +636,7 @@ func (p *AdmissionPlan) CheckRequests(ctx context.Context) error {
 	)
 
 	for _, group := range p.groups {
-		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, requestsOnly, p.requestID)
+		rlCtx, err := admitRequests(ctx, p.rl, group.limits, requestsOnly, p.requestID)
 		if rlCtx != nil {
 			lastCtx = rlCtx
 		}
@@ -549,12 +681,20 @@ func (p *AdmissionPlan) CheckTokensAndFinalize(ctx context.Context) (*RateLimitC
 			lastCtx = combinedCtx
 		}
 		if err != nil {
+			// A request refused on tokens never reaches the backend, so it gets
+			// its request slots back, like a request refused on count.
+			refundRequests(ctx, p.rl, group.limits, firstPassCtx.Results, p.requestID)
 			lastErr = err
 			continue
 		}
 
+		// Requests were counted in CheckRequests; commit tokens only.
+		tokensOnly := p.consumeRequest
+		tokensOnly.Requests = 0
 		for _, plan := range group.plans {
-			if _, commitErr := plan.Commit(ctx, p.consumeRequest); commitErr != nil {
+			if _, commitErr := plan.Commit(ctx, tokensOnly); commitErr != nil {
+				// The request is not forwarded, so it gets its request slots back.
+				refundRequests(ctx, p.rl, group.limits, firstPassCtx.Results, p.requestID)
 				return nil, echo.NewHTTPError(http.StatusInternalServerError, commitErr.Error())
 			}
 		}
@@ -643,6 +783,73 @@ func getLimitGroups(
 	}
 
 	return []limitGroup{group}, nil
+}
+
+// admitRequests counts the request against each limit in order, consuming only
+// when it fits, so parallel requests cannot share the last slot. It stops at
+// the first limit that refuses, and a refused request costs nothing: windows and
+// earlier limits that took it are refunded, later limits are not charged. A
+// limiter error (possible only with fail-open off) refunds earlier limits too.
+// Limits without request windows are not touched.
+func admitRequests(
+	ctx context.Context,
+	rl ratelimit.RateLimiter,
+	resourceLimits []ratelimit.ResourceLimit,
+	request ratelimit.ResourceRequest,
+	requestID string,
+) (*RateLimitContext, error) {
+	rlCtx := &RateLimitContext{
+		Applied: resourceLimits,
+		Results: make(rateLimitResults, 0, len(resourceLimits)),
+	}
+
+	limited := false
+	for _, resourceLimit := range resourceLimits {
+		results, err := ratelimit.ConsumeResourceLimit(ctx, rl, resourceLimit, request, requestID)
+		if err != nil {
+			refundRequests(ctx, rl, resourceLimits, rlCtx.Results, requestID)
+			return nil, err
+		}
+		rlCtx.Results = append(rlCtx.Results, results)
+		for _, result := range results {
+			if result != nil && !result.Allowed() {
+				limited = true
+				break
+			}
+		}
+		if limited {
+			break
+		}
+	}
+
+	if limited {
+		refundRequests(ctx, rl, resourceLimits, rlCtx.Results, requestID)
+	}
+
+	rlCtx.calculateStats()
+	if limited {
+		return rlCtx, echo.NewHTTPError(http.StatusTooManyRequests, "rate limit exceeded")
+	}
+
+	return rlCtx, nil
+}
+
+// refundRequests gives back what each limit in results took for a request the
+// gateway did not admit. It is best effort: a failed refund is logged and the
+// charge stays until the window refills.
+func refundRequests(
+	ctx context.Context,
+	rl ratelimit.RateLimiter,
+	resourceLimits []ratelimit.ResourceLimit,
+	results rateLimitResults,
+	requestID string,
+) {
+	for i, limitResults := range results {
+		if err := ratelimit.RefundResourceLimit(ctx, rl, resourceLimits[i], limitResults, requestID); err != nil {
+			telemetry.Logger(ctx).Warn().Err(err).Str("requestID", requestID).
+				Msg("could not refund a refused request; it stays counted until the window refills")
+		}
+	}
 }
 
 func checkRateLimit(
@@ -742,19 +949,28 @@ func scopedProjectLimit(
 	return limit
 }
 
+// chooseRequestResult returns the request window with the least room left, so
+// the request headers describe the window that binds first.
 func chooseRequestResult(
 	results map[ratelimit.LimitDimension]*ratelimit.RateLimitResult,
 ) *ratelimit.RateLimitResult {
+	var chosen *ratelimit.RateLimitResult
 	for _, dim := range []ratelimit.LimitDimension{
+		ratelimit.RequestsPerSecond,
 		ratelimit.RequestsPerMinute,
+		ratelimit.RequestsPerHour,
 		ratelimit.RequestsPerDay,
 	} {
-		if result := results[dim]; result != nil {
-			return result
+		result := results[dim]
+		if result == nil {
+			continue
+		}
+		if chosen == nil || result.RemainingValue() < chosen.RemainingValue() {
+			chosen = result
 		}
 	}
 
-	return nil
+	return chosen
 }
 
 func chooseTokenStats(

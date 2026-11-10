@@ -62,6 +62,7 @@ go_test(
         "ratelimit_result_test.go",
         "ratelimit_sync_test.go",
         "ratelimit_test.go",
+        "request_window_limits_test.go",
         "sync_events_test.go",
     ],
     embed = [":ratelimit"],

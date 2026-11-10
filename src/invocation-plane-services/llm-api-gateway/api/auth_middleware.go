@@ -146,6 +146,9 @@ func applyInvocationAuth(
 	reqCtx.Priority = authResponse.Priority
 	reqCtx.AccountInputTokenRateLimit = authResponse.AccountInputTokenRateLimit
 	reqCtx.AccountOutputTokenRateLimit = authResponse.AccountOutputTokenRateLimit
+	reqCtx.FunctionRequestRateLimit = authResponse.FunctionRequestRateLimit
+	reqCtx.FunctionUserRequestRateLimit = authResponse.FunctionUserRequestRateLimit
+	reqCtx.RequestLimitAccount = authResponse.RequestLimitAccount
 
 	return nil
 }

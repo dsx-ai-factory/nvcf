@@ -100,7 +100,7 @@ func NewHandlers(
 		config:        cfg,
 		provider:      p,
 		rateLimiter:   limiter,
-		limitResolver: CompositeLimitResolver{CallerLimitResolver{}, AccountLimitResolver{}},
+		limitResolver: CompositeLimitResolver{CallerLimitResolver{}, AccountLimitResolver{}, FunctionRequestLimitResolver{}},
 		observability: newObservabilityMetrics(),
 	}
 	if proxyProvider, ok := any(p).(provider.OpenAIProxyProvider); ok {

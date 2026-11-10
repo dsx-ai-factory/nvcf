@@ -19,6 +19,7 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -48,7 +49,9 @@ const (
 )
 
 const (
+	RequestsPerSecond     LimitDimension = "requests_second"
 	RequestsPerMinute     LimitDimension = "requests_minute"
+	RequestsPerHour       LimitDimension = "requests_hour"
 	RequestsPerDay        LimitDimension = "requests_day"
 	TokensPerSecond       LimitDimension = "tokens_second"
 	TokensPerMinute       LimitDimension = "tokens_minute"
@@ -71,7 +74,9 @@ const (
 )
 
 var allLimitDimensions = []LimitDimension{
+	RequestsPerSecond,
 	RequestsPerMinute,
+	RequestsPerHour,
 	RequestsPerDay,
 	TokensPerSecond,
 	TokensPerMinute,
@@ -100,7 +105,9 @@ type ResourceLimit struct {
 	// AllowDebt carries post-response overage into the next period instead of dropping it.
 	AllowDebt bool
 
+	RequestsPerSecond     int64
 	RequestsPerMinute     int64
+	RequestsPerHour       int64
 	RequestsPerDay        int64
 	TokensPerSecond       int64
 	TokensPerMinute       int64
@@ -248,6 +255,48 @@ func MustConsumeResourceLimit(
 	return doResourceLimit(ctx, limiter, limit, request, false, requestID, true)
 }
 
+// RefundResourceLimit gives back what each allowed result took from limit, for
+// a request that another window or limit refused. A refused result took
+// nothing, so it gets nothing back; neither does a fail-open result, which
+// reports more than the limit and never touched the bucket. Refunded results
+// are reverted so response headers do not count the request.
+//
+// A refund is approximate in the same way as the output token release: if the
+// window refilled between the charge and the refund, or a remote cluster
+// skipped the charge, the refund can return at most the units charged.
+func RefundResourceLimit(
+	ctx context.Context,
+	limiter RateLimiter,
+	limit ResourceLimit,
+	results map[LimitDimension]*RateLimitResult,
+	requestID string,
+) error {
+	var errs []error
+	for dimension, result := range results {
+		if result == nil || result.Requested <= 0 || !result.Allowed() {
+			continue
+		}
+		if result.CurrentValue > result.RateLimit.Limit {
+			continue
+		}
+		_, err := limiter.CheckLimit(
+			ctx,
+			keyForDimension(limit, dimension),
+			result.RateLimit,
+			-result.Requested,
+			false,
+			requestID,
+			true,
+		)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("refund %s: %w", dimension, err))
+			continue
+		}
+		result.Revert()
+	}
+	return errors.Join(errs...)
+}
+
 func ResetAllLimits(limiter RateLimiter, limit ResourceLimit) error {
 	keys := make([]string, len(allLimitDimensions))
 	for i, dimension := range allLimitDimensions {
@@ -283,10 +332,18 @@ func doResourceLimit(
 			)
 
 			switch dimension {
+			case RequestsPerSecond:
+				units = resourceRequest.Requests
+				limit = resourceLimit.RequestsPerSecond
+				period = time.Second
 			case RequestsPerMinute:
 				units = resourceRequest.Requests
 				limit = resourceLimit.RequestsPerMinute
 				period = time.Minute
+			case RequestsPerHour:
+				units = resourceRequest.Requests
+				limit = resourceLimit.RequestsPerHour
+				period = time.Hour
 			case RequestsPerDay:
 				units = resourceRequest.Requests
 				limit = resourceLimit.RequestsPerDay

@@ -49,6 +49,7 @@ go_test(
     srcs = [
         "auth_cache_test.go",
         "client_test.go",
+        "function_request_rate_limit_test.go",
     ],
     embed = [":nvcf"],
     deps = [

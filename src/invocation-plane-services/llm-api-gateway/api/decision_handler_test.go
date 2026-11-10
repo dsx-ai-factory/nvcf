@@ -311,7 +311,8 @@ func TestDecisionRoutesRateLimitRefusal(t *testing.T) {
 				require.Zero(t, hits.Load(), "a refused request must not reach the backend")
 				var sawLimit bool
 				for _, call := range limiter.Calls() {
-					require.False(t, call.mustConsume, "a refused request must not consume")
+					// A refund is a must-consume call with negative units.
+					require.False(t, call.mustConsume && call.tokensRequested > 0, "a refused request must not consume")
 					sawLimit = sawLimit || strings.HasSuffix(call.key, ":"+string(tc.exhausted))
 				}
 				require.True(t, sawLimit, "the %s dimension must be checked", tc.exhausted)

@@ -32,7 +32,7 @@ const (
 
 type RequestContext struct {
 	RequestID        string
-	APIKeyID         string // client auth subject; reserved for attribution, auditing, or future API-key policy hooks
+	APIKeyID         string // client auth subject from NVCF API, set for API key and JWT callers; keys the per-user function request rate limit, so it must stay the subject, not a key ID
 	OrgID            string // auth-derived rate limit key; currently used to scope rate limiting
 	ProjectID        string // used to further scope rate limiting when auth provides a project ID
 	BearerToken      string
@@ -58,4 +58,11 @@ type RequestContext struct {
 	// (ncaId) rather than any one function. Empty when none applies.
 	AccountInputTokenRateLimit  string
 	AccountOutputTokenRateLimit string
+	// FunctionRequestRateLimit and FunctionUserRequestRateLimit are the
+	// function's request rate limits for this caller, resolved by NVCF API.
+	// RequestLimitAccount is the account they count against (the key owner's
+	// account, else OrgID). Empty limits mean no request limit applies.
+	FunctionRequestRateLimit     string
+	FunctionUserRequestRateLimit string
+	RequestLimitAccount          string
 }

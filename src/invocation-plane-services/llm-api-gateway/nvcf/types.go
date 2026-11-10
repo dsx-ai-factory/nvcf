@@ -43,6 +43,13 @@ type InvocationAuthResponse struct {
 	// rather than any one function. Empty when none applies.
 	AccountInputTokenRateLimit  string
 	AccountOutputTokenRateLimit string
+	// FunctionRequestRateLimit and FunctionUserRequestRateLimit are the
+	// function's request rate limits for this caller, resolved by NVCF API.
+	// RequestLimitAccount is the account they count against: the key owner's
+	// account, else ncaId. Empty limits mean no request limit applies.
+	FunctionRequestRateLimit     string
+	FunctionUserRequestRateLimit string
+	RequestLimitAccount          string
 }
 
 // clone returns a copy that shares no mutable state with the receiver, so a
@@ -73,6 +80,16 @@ func deriveRateLimitKey(authContext map[string]string) string {
 		return ""
 	}
 	return authContext["ncaId"]
+}
+
+// deriveRequestLimitAccount returns the account function request limits count
+// against: the key owner's account when NVCF API sends it, else ncaId. Token
+// limits keep using deriveRateLimitKey.
+func deriveRequestLimitAccount(authContext map[string]string) string {
+	if owner := authContext["ownerNcaId"]; owner != "" {
+		return owner
+	}
+	return deriveRateLimitKey(authContext)
 }
 
 func deriveProjectID(authContext map[string]string) string {

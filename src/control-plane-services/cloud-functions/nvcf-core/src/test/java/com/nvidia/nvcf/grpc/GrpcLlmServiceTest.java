@@ -40,6 +40,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.nvidia.nvcf.persistence.function.entity.FunctionStatus;
 import com.nvidia.nvcf.persistence.function.entity.FunctionType;
+import com.nvidia.nvcf.persistence.function.entity.RateLimitUdt;
 import com.nvidia.nvcf.proto.llm_gateway.AuthLlmInvokeRequest;
 import com.nvidia.nvcf.proto.llm_gateway.AuthLlmInvokeResponse;
 import com.nvidia.nvcf.proto.llm_gateway.AuthLlmWorkerRequest;
@@ -59,6 +60,7 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.stub.MetadataUtils;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -636,6 +638,108 @@ class GrpcLlmServiceTest extends BaseFunctionInvocationTest {
     // ---------------------------------------------------------------------------
     // Priority resolution tests
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // Function request rate limits
+    // ---------------------------------------------------------------------------
+
+    private void storeRateLimit(UUID functionVersionId, RateLimitUdt rateLimit) {
+        var entity = functionsRepository.findAll().stream()
+                .filter(f -> functionVersionId.equals(f.getFunctionVersionId()))
+                .findFirst()
+                .orElseThrow();
+        entity.setRateLimit(rateLimit);
+        functionsRepository.save(entity);
+    }
+
+    private AuthLlmInvokeResponse callLlmAuthWithApiKey(String ownerNcaId) {
+        setLlmApiKeyValidationResponse(TEST_NCA_ID, ownerNcaId, TEST_OWNER_ID,
+                List.of(new Resource("account-functions", "*")),
+                List.of(SCOPE_INVOKE_FUNCTION), true);
+        var serviceToken = MOCK_OAUTH2_TOKEN_SERVER.getJwt("llm:check_invocation");
+        return callLlmAuth(serviceToken, "nvapi-stg-some-key", TEST_FUNCTION_ID);
+    }
+
+    @Test
+    void authLlmInvocation_sendsFunctionRequestRateLimits() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        storeRateLimit(TEST_VERSION_ID_1,
+                RateLimitUdt.builder().rate("5-M").perUserRate("2-S").syncCheck(true).build());
+
+        var response = callLlmAuthWithApiKey(TEST_NCA_ID);
+
+        assertThat(response.getFunctionRequestRateLimit()).isEqualTo("5-M");
+        assertThat(response.getFunctionUserRequestRateLimit()).isEqualTo("2-S");
+        assertThat(response.getAuthContextOrDefault("ownerNcaId", "")).isEqualTo(TEST_NCA_ID);
+    }
+
+    @Test
+    void authLlmInvocation_countsRequestLimitsAgainstTheKeyOwnersAccount() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        storeRateLimit(TEST_VERSION_ID_1, RateLimitUdt.builder()
+                .rate("5-M").perNcaIdRate(Map.of("nca-key-owner", "50-M")).build());
+
+        var response = callLlmAuthWithApiKey("nca-key-owner");
+
+        assertThat(response.getAuthContextOrDefault("ncaId", "")).isEqualTo(TEST_NCA_ID);
+        assertThat(response.getAuthContextOrDefault("ownerNcaId", "")).isEqualTo("nca-key-owner");
+        assertThat(response.getFunctionRequestRateLimit()).isEqualTo("50-M");
+    }
+
+    @Test
+    void authLlmInvocation_exemptCallerGetsNoFunctionRequestRateLimit() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        storeRateLimit(TEST_VERSION_ID_1, RateLimitUdt.builder()
+                .rate("5-M").exemptedNcaIds(Set.of(TEST_NCA_ID)).perUserRate("2-S").build());
+
+        var response = callLlmAuthWithApiKey(TEST_NCA_ID);
+
+        assertThat(response.hasFunctionRequestRateLimit()).isFalse();
+        assertThat(response.getFunctionUserRequestRateLimit()).isEqualTo("2-S");
+    }
+
+    @Test
+    void authLlmInvocation_noFunctionRequestRateLimitWithoutPolicy() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+
+        var response = callLlmAuthWithApiKey(TEST_NCA_ID);
+
+        assertThat(response.hasFunctionRequestRateLimit()).isFalse();
+        assertThat(response.hasFunctionUserRequestRateLimit()).isFalse();
+    }
+
+    @Test
+    void authLlmInvocation_jwtCallerGetsFunctionRequestRateLimit() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        storeRateLimit(TEST_VERSION_ID_1, RateLimitUdt.builder().rate("5-M").build());
+        var serviceToken = MOCK_OAUTH2_TOKEN_SERVER.getJwt("llm:check_invocation");
+        var clientToken = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                          List.of(SCOPE_INVOKE_FUNCTION), 100);
+
+        var response = callLlmAuth(serviceToken, clientToken, TEST_FUNCTION_ID);
+
+        assertThat(response.getFunctionRequestRateLimit()).isEqualTo("5-M");
+        assertThat(response.getAuthContextOrDefault("ownerNcaId", ""))
+                .isEqualTo(response.getAuthContextOrDefault("ncaId", "missing"));
+    }
+
+    @Test
+    void authLlmInvocation_noFunctionRequestRateLimitWhenFlagDisabled() {
+        setFunctionActiveLlm(TEST_FUNCTION_ID, TEST_VERSION_ID_1);
+        storeRateLimit(TEST_VERSION_ID_1,
+                RateLimitUdt.builder().rate("5-M").perUserRate("2-S").build());
+
+        ReflectionTestUtils.setField(grpcLlmService, "llmRequestRateLimitEnabled", false);
+        try {
+            var response = callLlmAuthWithApiKey(TEST_NCA_ID);
+
+            assertThat(response.hasFunctionRequestRateLimit()).isFalse();
+            assertThat(response.hasFunctionUserRequestRateLimit()).isFalse();
+            assertThat(response.containsAuthContext("ownerNcaId")).isFalse();
+        } finally {
+            ReflectionTestUtils.setField(grpcLlmService, "llmRequestRateLimitEnabled", true);
+        }
+    }
 
     private void storeLlmConfig(UUID functionVersionId, LlmInvocationConfigDto dto) {
         storeRawLlmConfig(functionVersionId, functionMapperService.toLlmInvocationConfigJson(dto));

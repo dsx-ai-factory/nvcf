@@ -111,6 +111,18 @@ public class MockApiKeysServer {
              ncaId, ncaId, ownerId, resources, scopes, allowed, accountTokenRateLimit);
     }
 
+    // For LLM keys whose owner account differs from the authorized ncaId.
+    public static void setLlmApiKeyValidationResponse(
+            String ncaId,
+            String ownerNcaId,
+            String ownerId,
+            List<Resource> resources,
+            List<String> scopes,
+            boolean allowed) {
+        stub("apikey.llm_allow", LLM_API_KEY_PATH,
+             ncaId, ownerNcaId, ownerId, resources, scopes, allowed, null);
+    }
+
     @SneakyThrows
     private static void stub(
             String policyName,

@@ -265,6 +265,10 @@ func (c *GRPCClient) AuthorizeInvocation(
 		Priority:                    priorityFromProto(resp),
 		AccountInputTokenRateLimit:  resp.GetAccountInputTokenRateLimit(),
 		AccountOutputTokenRateLimit: resp.GetAccountOutputTokenRateLimit(),
+
+		FunctionRequestRateLimit:     resp.GetFunctionRequestRateLimit(),
+		FunctionUserRequestRateLimit: resp.GetFunctionUserRequestRateLimit(),
+		RequestLimitAccount:          deriveRequestLimitAccount(authContext),
 	}, nil
 }
 
