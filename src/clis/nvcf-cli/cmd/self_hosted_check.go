@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
@@ -60,6 +62,10 @@ var (
 	checkClusterValidatorProbeImage  string
 	checkClusterValidatorExternal    []string
 	checkShowLogs                    bool
+	checkHAMode                      string
+	// checkModeFlag is --mode, looked up once the flag is defined. Read
+	// through selfHostedCheckCmd, it would close an initialization cycle.
+	checkModeFlag *pflag.Flag
 )
 
 // Test seam.
@@ -176,6 +182,16 @@ func init() {
 			"Can also be set in nvcf-cli config as cluster_validator_external_components, a list of names.")
 	_ = viper.BindPFlag("cluster_validator_external_components",
 		selfHostedCheckCmd.Flags().Lookup("cluster-validator-external-components"))
+	selfHostedCheckCmd.Flags().StringVar(&checkHAMode, "mode", "",
+		"High-availability mode the control plane was installed with: none, preferred or enforced. The "+
+			"control-plane validator checks the HA guarantee and topology that mode requires. Defaults to "+
+			"NVCF_HA_MODE, then to the nvcf-cli config key ha_mode, then to the stack's highAvailability.mode "+
+			"when check reads the install's environment file. With none of these the validator judges "+
+			"placement from the rendered terms and warns that no mode was supplied. Any other value fails "+
+			"the command. Under preferred or enforced, a validator image that does not support it is a warning, "+
+			"or an error with this flag.")
+	checkModeFlag = selfHostedCheckCmd.Flags().Lookup("mode")
+	_ = viper.BindPFlag("ha_mode", checkModeFlag)
 	selfHostedCheckCmd.Flags().BoolVar(&checkShowLogs, "show-logs", false,
 		"Print each cluster-validator transcript to stderr after the check output, framed with the check "+
 			"category it ran for. The transcript is not JSON, so leave this off when a parser reads --json.")
@@ -208,6 +224,9 @@ func runSelfHostedCheck(c *cobra.Command, _ []string) error {
 		return err
 	}
 	if _, err := configuredExternalComponents(); err != nil {
+		return err
+	}
+	if _, err := configuredHAMode(); err != nil {
 		return err
 	}
 	for _, name := range []string{envLocalOnly, envSkipClusterValidation, envSkipInotify} {
@@ -1098,8 +1117,15 @@ func runPreflightByRole(
 	registriesFromCP := registryTarget().name == controlPlaneStackTarget().name
 	switch {
 	case clusterValidatorImage != "":
+		leftOut := "the stack's registries, Gateway names, Envoy Gateway namespace, external components and StorageClass"
+		// The stack's HA mode is used only when the operator names none.
+		// Validated before the run starts.
+		if mode, _ := configuredHAMode(); mode == "" {
+			leftOut = "the stack's registries, Gateway names, Envoy Gateway namespace, external components, " +
+				"StorageClass and HA mode"
+		}
 		cpSkips = append(cpSkips, stackEnvironmentSkip(selfhosted.CategoryControlPlane, controlPlaneStackTarget(),
-			"the stack's registries, Gateway names, Envoy Gateway namespace, external components and StorageClass")...)
+			leftOut)...)
 	case registriesFromCP:
 		cpSkips = append(cpSkips, stackEnvironmentSkip(selfhosted.CategoryControlPlane, controlPlaneStackTarget(),
 			"the stack's registries")...)
@@ -1142,10 +1168,13 @@ func runPreflightByRole(
 		extras, _ := configuredValidatorRegistries()
 		registries = selfhosted.EnumerateRegistries(cmp.Or(clusterValidatorImage, unresolvedImage), cpStack, extras)
 	}
-	validatorEnv := clusterValidatorJobEnv(validatorStackValues())
+	validatorStack := validatorStackValues()
+	validatorEnv := clusterValidatorJobEnv(validatorStack)
 	// Validated before the run starts.
 	validatorTolerations, _ := configuredValidatorTolerations()
-	cpValidatorEnv := validatorEnvForRole(validatorEnv, controlPlaneStackTarget().beforeInstall)
+	haMode, haModeExplicit := controlPlaneHAMode(validatorStack)
+	cpValidatorEnv := controlPlaneValidatorEnv(
+		validatorEnvForRole(validatorEnv, controlPlaneStackTarget().beforeInstall), haMode)
 	gpuValidatorEnv := validatorEnvForRole(validatorEnv, computePlaneStackTarget().beforeInstall)
 
 	// The cluster-validator image is the same for both roles; VALIDATOR_ROLE
@@ -1190,6 +1219,7 @@ func runPreflightByRole(
 					ClusterValidatorPullSecret:      checkClusterValidatorPullSecret,
 					ClusterValidatorNoCleanup:       checkClusterValidatorNoCleanup,
 					ClusterValidatorEnv:             cpValidatorEnv,
+					ClusterValidatorHAModeExplicit:  haModeExplicit,
 					ClusterValidatorTolerations:     validatorTolerations,
 					ClusterValidatorUnresolvedImage: unresolvedImage,
 					ClusterValidatorRegistries:      registries,
@@ -1264,6 +1294,7 @@ func runPreflightByRole(
 				ClusterValidatorPullSecret:      checkClusterValidatorPullSecret,
 				ClusterValidatorNoCleanup:       checkClusterValidatorNoCleanup,
 				ClusterValidatorEnv:             cpValidatorEnv,
+				ClusterValidatorHAModeExplicit:  haModeExplicit,
 				ClusterValidatorTolerations:     validatorTolerations,
 				ClusterValidatorUnresolvedImage: unresolvedImage,
 				ClusterValidatorRegistries:      registries,
@@ -1365,6 +1396,50 @@ func clusterValidatorJobEnv(stack selfhosted.StackValues) map[string]string {
 		env["NVCF_STORAGE_CLASS"] = class
 	}
 	return env
+}
+
+// controlPlaneValidatorEnv returns env with what only the control-plane check
+// set reads: NVCF_HA_MODE, the mode its HA rows judge the cluster against,
+// when one is known. env itself is not modified.
+func controlPlaneValidatorEnv(env map[string]string, haMode string) map[string]string {
+	if haMode == "" {
+		return env
+	}
+	out := make(map[string]string, len(env)+1)
+	maps.Copy(out, env)
+	out["NVCF_HA_MODE"] = haMode
+	return out
+}
+
+// controlPlaneHAMode returns the HA mode the control-plane validator judges
+// the cluster against, and whether the operator passed it with --mode: the
+// mode configuredHAMode names, else the stack's highAvailability.mode when
+// stack holds the values that describe the install. Empty when neither is
+// known; the validator then judges placement from the rendered terms.
+func controlPlaneHAMode(stack selfhosted.StackValues) (mode string, explicit bool) {
+	// Validated before the run starts.
+	if mode, _ := configuredHAMode(); mode != "" {
+		return mode, checkModeFlag.Changed
+	}
+	return stack.HAMode, false
+}
+
+// configuredHAMode returns the HA mode the operator names: --mode, then
+// NVCF_HA_MODE, then the config key ha_mode, all read as viper's ha_mode.
+// Empty when none is set. An error names the setting that holds a bad value.
+func configuredHAMode() (string, error) {
+	mode, err := selfhosted.ParseHAMode(viper.GetString("ha_mode"))
+	if err == nil {
+		return mode, nil
+	}
+	source := "config key ha_mode"
+	switch {
+	case checkModeFlag.Changed:
+		source = "--mode"
+	case os.Getenv("NVCF_HA_MODE") != "":
+		source = "NVCF_HA_MODE"
+	}
+	return "", fmt.Errorf("%s %w", source, err)
 }
 
 // configuredProbeImage is the busybox-style image the probe pods the check

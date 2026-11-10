@@ -375,6 +375,13 @@ func TestCheck_UnreadEnvironmentFileIsAWarningRow(t *testing.T) {
 				"--cluster-validator-image", pinnedValidatorImage},
 			category: "control-plane-cluster",
 			message: envFile(missing, "prod") + " is missing; the stack's registries, Gateway names, " +
+				"Envoy Gateway namespace, external components, StorageClass and HA mode are not used",
+		},
+		"with the cluster-validator and --mode": {
+			args: []string{"--control-plane", "--env", "prod", "--control-plane-stack", missing,
+				"--cluster-validator-image", pinnedValidatorImage, "--mode", "none"},
+			category: "control-plane-cluster",
+			message: envFile(missing, "prod") + " is missing; the stack's registries, Gateway names, " +
 				"Envoy Gateway namespace, external components and StorageClass are not used",
 		},
 		"compute plane": {
