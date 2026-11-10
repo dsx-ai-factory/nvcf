@@ -42,6 +42,14 @@ The generated image tables below record the selected tags. The `k8s` image
 provides a CLI toolbox used by two independently configured hooks. It is not a
 Kubernetes server image. Retain the selected helper versions when mirroring.
 
+The `kubectl` inside `alpine/k8s:<tag>` must stay within one minor version of
+the API server of the cluster each hook runs against (the upstream kubectl
+skew policy). The selected `1.37.0` tag serves clusters on Kubernetes 1.36
+through 1.38. For an older cluster, pick the `alpine/k8s` tag whose number
+matches the cluster minor - the tag is the packaged `kubectl` version - and
+qualify it for both hooks (`api.accountBootstrap.image` and
+`upgradeReceipt.image`); confirm with `kubectl version` from a job pod.
+
 Other enabled stacks and optional components use upstream registries; inspect
 every image in the render and generated inventory, not just this helper table.
 

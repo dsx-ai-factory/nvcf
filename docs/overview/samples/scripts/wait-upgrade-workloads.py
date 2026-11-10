@@ -9,14 +9,19 @@ import sys
 
 
 def main():
-    if len(sys.argv) != 4 or not all(sys.argv[1:]):
-        raise ValueError("Usage: python3 wait-upgrade-workloads.py KUBECONFIG CONTEXT NAMESPACE")
-    kubeconfig, context, namespace = sys.argv[1:]
+    if len(sys.argv) not in (4, 5) or not all(sys.argv[1:4]):
+        raise ValueError(
+            "Usage: python3 wait-upgrade-workloads.py KUBECONFIG CONTEXT NAMESPACE [ALLOW_EMPTY]")
+    kubeconfig, context, namespace = sys.argv[1:4]
+    allow_empty = len(sys.argv) == 5 and sys.argv[4] == "ALLOW_EMPTY"
     kc = ["kubectl", "--kubeconfig", kubeconfig, "--context", context, "-n", namespace]
     result = subprocess.run(kc + ["--request-timeout=30s", "get", "deployments,statefulsets,daemonsets", "-o", "json"],
                             text=True, capture_output=True, check=True, timeout=60)
     workloads = json.loads(result.stdout)["items"]
     if not workloads:
+        if allow_empty:
+            print(f"{namespace}: no workloads; the caller marked this namespace optional", flush=True)
+            return
         raise ValueError("No workloads returned; check the context and namespace")
     for workload in workloads:
         name = f'{workload["kind"]}/{workload["metadata"]["name"]}'

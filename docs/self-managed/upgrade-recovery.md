@@ -85,7 +85,17 @@ while IFS= read -r image; do
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}
     ' | kt create -f - -o jsonpath='{.metadata.name}')
   printf 'Checking %s with pod %s\n' "$image" "$pod"
-  kt wait --for=jsonpath='{.status.containerStatuses[0].imageID}' "pod/$pod" --timeout=150s
+  deadline=$((SECONDS + 150))
+  imageID=""
+  until [ -n "$imageID" ]; do
+    imageID=$(kt get "pod/$pod" -o jsonpath='{.status.containerStatuses[0].imageID}')
+    if [ -z "$imageID" ] && [ "$SECONDS" -ge "$deadline" ]; then
+      kt describe "pod/$pod" || true
+      echo "imageID stayed empty after 150s; the image was not pulled" >&2
+      exit 1
+    fi
+    [ -n "$imageID" ] || sleep 5
+  done
   kt get "pod/$pod" -o jsonpath='{.spec.nodeName}{" "}{.status.containerStatuses[0].imageID}{"\n"}'
   kt delete "pod/$pod"
 done <<< "$TASK_IMAGES"
