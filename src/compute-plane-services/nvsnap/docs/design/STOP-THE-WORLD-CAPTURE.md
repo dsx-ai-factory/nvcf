@@ -11,6 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 - [Problem](#problem)
 - [Design](#design)
 - [Cost](#cost)
+- [Scaling groups of several replicas](#scaling-groups-of-several-replicas)
 - [Not covered](#not-covered)
 <!-- /toc -->
 
