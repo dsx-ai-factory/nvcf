@@ -36,11 +36,9 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.io.ClassPathResource;
 
-/**
- * Kubernetes restarts a container whose liveness probe fails. Cassandra is
- * shared by every replica, so it must only gate readiness. Liveness fails
- * only when the cassandraSession contributor reports a session stuck after an outage.
- */
+// Kubernetes restarts a container whose liveness probe fails. Cassandra is
+// shared by every replica, so it must only gate readiness. Liveness fails
+// only when the cassandraSession contributor reports a session stuck after an outage.
 class HealthProbeGroupsTest {
 
     private static ApplicationContextRunner contextRunner(Status cassandraSession) {

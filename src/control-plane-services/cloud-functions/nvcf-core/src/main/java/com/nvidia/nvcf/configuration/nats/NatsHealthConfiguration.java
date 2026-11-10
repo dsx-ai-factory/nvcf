@@ -57,11 +57,10 @@ public class NatsHealthConfiguration extends
         return createContributor(connections);
     }
 
-    /**
-     * The {@code natsLiveness} contributor for the liveness group. It fails only when a pooled
-     * connection is closed; a reconnecting connection stays UP, so a NATS outage does not restart
-     * the pod.
-     */
+    // The natsLiveness contributor for the liveness group. During a NATS outage the connections
+    // keep reconnecting, so this stays UP and the pod is not restarted; the nats readiness check
+    // fails instead, so the pod gets no traffic until NATS is back. It fails only when a
+    // connection is closed, because nothing reopens a closed connection.
     @Bean
     HealthIndicator natsLivenessHealthIndicator(Map<String, FixedNatsPool> connections) {
         return () -> connections.values().stream().anyMatch(FixedNatsPool::anyClosed)
