@@ -638,6 +638,8 @@ The client-facing `model` value must include a routing key and model name:
 
 The gateway uses `<function-id>` to authorize the request and select the NVCF function deployment. It rewrites the upstream model to `<model-name>` before forwarding the request.
 
+The model server never receives caller credentials. On every route, the gateway removes `Authorization`, `X-Api-Key`, `Proxy-Authorization`, and `Cookie` before forwarding, because they authorize NVCF, not the model server.
+
 The configured `llmConfig.uris` must match the paths served by the container. For example, a model that declares `/v1/responses` must have a container backend that can answer `POST /v1/responses`.
 
 ## Session Stickiness
