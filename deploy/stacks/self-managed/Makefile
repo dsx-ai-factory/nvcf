@@ -16,6 +16,7 @@ test:
 	@tests/gateway-routes-default-ownership.sh
 	@tests/grpc-proxy-nats-endpoint.sh
 	@tests/grpc-proxy-event-ledger-addr.sh
+	@tests/event-ledger-dependencies.sh
 	@tests/nats-image-overrides.sh
 	@tests/cert-manager-image-overrides.sh
 	@tests/llm-pki-openbao-migration.sh
