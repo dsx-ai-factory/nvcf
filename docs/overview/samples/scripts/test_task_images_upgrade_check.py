@@ -61,9 +61,14 @@ class TaskImageChecks(unittest.TestCase):
                 }, hostname=hostname, repository=repository)
                 self.assertNotEqual(result.returncode, 0)
 
-    def run_probe(self, phase="Succeeded", imageid_wait_seconds=None, **extra):
+    def run_probe(self, phase="Succeeded", imageid_wait_seconds=None,
+                  poll_state=None, **extra):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            if poll_state is not None:
+                # Seed the poll countdown the stub reads, under this call's
+                # own root (run_probe creates a fresh directory per call).
+                (root / "poll-state").write_text(str(poll_state))
             command = block_containing(RECOVERY, "TASK_PULL_SECRETS=")
             stub = r'''
 kubectl() {
@@ -129,14 +134,20 @@ kubectl() {
         self.assertEqual(sum("delete pod/task-image-check-test" in c for c in calls), 2)
 
     def test_probe_polls_until_the_image_id_is_reported(self):
-        (Path(self.temp.name) / "poll-state").write_text("1")
-        result, calls, pods = self.run_probe()
+        # One poll per pod comes back with the imageID still empty; the
+        # second pod's first query then finds it. Seeded via poll_state so
+        # the countdown lives under this call's own temporary root.
+        result, calls, pods = self.run_probe(poll_state="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(pods), 2)
         self.assertGreaterEqual(sum("-o jsonpath={.status.containerStatuses[0].imageID}" in c for c in calls), 3)
 
     def test_an_image_that_never_pulls_fails_before_deleting_the_probe(self):
-        result, calls, pods = self.run_probe(PULL_POLLS_BEFORE_IMAGE="999",
+        # The stub keeps answering "imageID still empty" for as long as
+        # the poll state counts down, so 999 never resolves inside the
+        # 1-second deadline: the probe times out, describes the pod and
+        # exits without deleting anything.
+        result, calls, pods = self.run_probe(poll_state="999",
                                              imageid_wait_seconds=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(pods), 1)
