@@ -287,7 +287,12 @@ Mean-based fallback weights can change during traffic until then.
 The fallback also applies to current Pylons without an established maximum.
 For shared clusters, one backend with missing or invalid maximum data clears
 the aggregate maximum, so the whole cluster uses its summed mean. This can
-change its weight relative to clusters with a known maximum.
+change its weight relative to clusters with a known maximum. A fallback mean
+can count cached prompt tokens as prefill and inflate the weight relative to
+peers with calibrated maxima. The selected request span records
+`selected_inst.pulsar_weight_source`: `max-input-tps`,
+`last-mean-input-tps-fallback`, or explicit `last-mean-input-tps`. Use it with
+`selected_cluster.id` to identify traffic using fallback weights.
 
 `rendezvous_weight` is a field of a detailed algorithm configuration object.
 The top-level `default`, an algorithm name in `models` or `request_algorithms`,

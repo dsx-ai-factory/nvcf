@@ -88,6 +88,11 @@ Cluster latest-wins fields:
   peaks from Pylons observing the same engine are not summed. A missing or
   invalid maximum on any backend clears the aggregate maximum. Default Pulsar
   then uses the cluster's positive finite summed `last_mean_input_tps`.
+  Restarting one Pylon clears its generation maximum and can switch the whole
+  cluster to mean weighting until a max-eligible sample restores the maximum.
+  Affinity keys can move away and return, reducing prefix-cache reuse. Mean
+  changes also invalidate cached rankings. Include this restart sequence in
+  churn qualification; selected request spans expose the Pulsar weight source.
 - Because the mean is summed and the maximum is not, a shared cluster weighs
   less against single-Pylon clusters under maximum weighting than under mean
   weighting. This applies to per-Pylon `--initial-input-tps` contributions and

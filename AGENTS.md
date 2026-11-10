@@ -350,10 +350,11 @@ whether `src/clis/nvcf-cli` needs a matching change, and list affected clients
 in the Pull Request "Related Pull Requests" section. If the CLI needs an
 update, file a follow-up issue.
 
-## Compatibility between independently deployed components
+## LLM stack compatibility
 
-Maintain compatibility with stable releases published within the previous
-90 days, measured from their UTC publication timestamps. Keep supporting older
+For independently deployed LLM stack components, maintain compatibility with
+stable releases published within the previous 90 days, measured from their
+UTC publication timestamps. Keep supporting older
 versions still deployed or needed for rollback. Retire a version only after
 its support window ends and deployment inventory confirms migration and the
 rollback window has closed. CI must exercise the oldest supported release.
@@ -370,8 +371,9 @@ rollback before enabling a new default. Schema checks alone do not establish
 behavioral compatibility. Keep compatibility fixtures from released versions;
 do not regenerate them from the candidate to make a failing check pass.
 
-Current CI checks Stargate schemas against every supported Stargate release
-and tests released stats values with current Stargate transports. Gateway
+On the default branch, path-selected CI checks Stargate schemas against every
+supported Stargate release. All branches check against their target base.
+Behavioral tests use frozen released stats with current transports. Gateway
 server and client schema copies are checked against the target base only.
 Historical gateway releases, other components, historical binaries, relay
 combinations, and consumer downgrades need separate qualification. Extend the

@@ -135,6 +135,23 @@ class BreakingCheckTest(unittest.TestCase):
                 proto.write_text(SCHEMA)
                 self.assertEqual(self.check(schemas=path).returncode, 0)
 
+    def test_gateway_file_scope_excludes_core_api_changes(self):
+        path = "src/control-plane-services/cloud-functions/nvcf-core/src/main/proto"
+        directory = self.repo / path
+        directory.mkdir(parents=True)
+        gateway = directory / "llm_gateway.proto"
+        gateway.write_text(SCHEMA)
+        core = directory / "nvcf.proto"
+        core.write_text('syntax = "proto3"; package nvcf; message Core { string id = 1; }')
+        self.git("add", ".")
+        self.git("-c", "user.name=Contract Test", "-c", "user.email=test@example.com",
+                 "-c", "commit.gpgsign=false", "commit", "-q", "-s", "-m", "test: core and gateway")
+        core.write_text('syntax = "proto3"; package nvcf; message Core {}')
+        self.assertNotEqual(self.check(schemas=path).returncode, 0)
+        self.assertEqual(self.check(schemas=path + "/llm_gateway.proto").returncode, 0)
+        gateway.write_text(SCHEMA.replace("string id = 1;", "uint64 id = 1;"))
+        self.assertNotEqual(self.check(schemas=path + "/llm_gateway.proto").returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

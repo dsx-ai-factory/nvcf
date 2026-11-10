@@ -34,10 +34,10 @@ For documentation changes, check whitespace and link targets.
 ## Compatibility contract
 
 Support every stable release published in the past 90 days, using UTC release
-publication timestamps. CI checks schemas against every supported release from
-the upstream GitHub release inventory, including later backports. It selects
-the oldest by publication date for the stats fixture. Add older versions still
-deployed or needed for rollback to `compatibility_retained_releases.json` before
+publication timestamps. For relevant changes targeting the default branch, CI
+checks schemas against every supported release from the upstream GitHub release
+inventory, including later backports and the oldest by publication date. Add
+older versions still deployed or needed for rollback to `compatibility_retained_releases.json` before
 they age out. Entries do not expire automatically; remove one only after verified
 migration and closure of its rollback window. Missing release metadata fails CI.
 
@@ -61,12 +61,17 @@ python3 -m unittest discover -s scripts -p 'test_select_compatibility_baseline.p
 cargo test --locked -p stargate --test compatibility -- --test-threads=1
 ```
 
-CI checks Stargate schemas against the target base and every supported release.
+For maintenance work, use that maintenance branch instead of `origin/main`.
+
+CI checks Stargate schemas against the target base on all branches. The full
+release matrix runs only when targeting the default branch: an older maintenance
+branch need not contain optional fields added in newer releases.
 Gateway server and client copies are checked against the target base only;
 historical gateway release coverage needs separate qualification.
-CI encodes stats with the oldest release's schema for the Bazel routing test.
-Local runs use a frozen release fixture. Extend the compatibility test when changing a
-contract. Cover old-only, new-only, and mixed backends, absent optional stats,
+The Bazel routing test uses frozen released stats fixtures on every branch.
+Compatibility checks run separately from subtree detection and build jobs;
+unrelated docs and Java changes do not contact release services. Extend the
+compatibility test when changing a contract. Cover old-only, new-only, and mixed backends, absent optional stats,
 and streaming completion. Require both backends to serve in the mixed state.
 The test decodes released stats and re-encodes registrations with the current
 client. Backend replacement exercises a return to older stats on the current

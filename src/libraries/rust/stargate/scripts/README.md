@@ -47,8 +47,9 @@ to kubectl calls made by the local integration and manifest-rendering helpers.
 
 ## PR Checks
 
-The required Bazel workflow checks protobuf compatibility before selecting
-changed subtrees. Runtime compatibility tests run in the Stargate row.
+The Bazel workflow runs protobuf compatibility in a separate path-selected job.
+Its result is required when selected, while other build rows run independently.
+Runtime compatibility tests use frozen released fixtures in the Stargate row.
 
 Run the support-script tests after changing repository tooling:
 
@@ -63,14 +64,17 @@ directory's parent. It checks the Stargate registration and gateway client
 protobuf APIs against the supplied Git
 base with strict `FILE` rules and no deletion exceptions. Candidate Buf
 configuration cannot disable the check. CI supplies the pull request or
-merge queue base, or the previous commit for a push. CI also checks the gateway
-server schema in `nvcf-core` and the client copy in `llm-api-gateway` against
-that base. Historical gateway releases have no release matrix in this gate;
+merge queue base, or the previous commit for a push. CI also checks only
+`llm_gateway.proto` in `nvcf-core` and the client copy in `llm-api-gateway` against that base. The adjacent `nvcf.proto` is outside
+this gate. Historical gateway releases have no release matrix in this gate;
 existing drift between copies is not reconciled by these checks.
 
-Stargate schemas are compared against every supported stable Stargate release,
-including backports. Releases are selected by UTC publication date from the
-upstream GitHub release inventory. The rolling support window is 90 days. Older versions
+For relevant changes targeting the default branch, Stargate schemas are compared
+against every supported stable Stargate release, including backports and the
+oldest release. Maintenance branches keep target-base checks without comparing
+their older schemas against fields introduced in newer releases. Releases are
+selected by UTC publication date from the upstream GitHub release inventory.
+The rolling support window is 90 days. Older versions
 still deployed or needed for rollback must remain in
 `compatibility_retained_releases.json`; remove them only after verified migration
 and closure of the rollback window. Missing inventory or retained-release
@@ -80,9 +84,8 @@ job log, along with the full supported tag list.
 `cargo test --locked -p stargate --test compatibility -- --test-threads=1`
 decodes released stats values, then re-encodes them with the current client for
 gRPC registration and HTTP/QUIC streaming.
-CI encodes these stats using the selected oldest release's protobuf schema and
-passes the hex payload through `STARGATE_COMPAT_STATS_HEX`. Local runs without
-that variable use the frozen v0.8.0 fixture.
+The frozen v0.8.0 and v0.25.0 fixtures run locally and in CI. There is no
+release-service dependency or generated payload passed to the runtime test.
 It checks power-of-n, both Pulsar defaults, and their explicit mean-based modes
 with old-only, mixed, and new-only backends, then restores the older backend
 and withdraws the newer one. Both backends must serve requests in the mixed

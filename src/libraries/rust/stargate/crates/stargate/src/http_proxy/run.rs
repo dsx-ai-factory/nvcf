@@ -303,7 +303,7 @@ impl<'a> ProxyRequestRun<'a> {
     fn record_routing_selection(&mut self, routing: RoutingTraceFields<'_>) {
         let span = Span::current();
         span.record("routing.retry_attempts", self.routing_retry_attempts);
-        record_routing_to_span(&span, routing);
+        record_routing_to_span(&span, routing, self.request.lb_resolution.config());
         let Some(routing_started_at) = self.routing_started_at.take() else {
             return;
         };

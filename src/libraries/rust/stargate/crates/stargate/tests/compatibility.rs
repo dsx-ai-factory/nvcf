@@ -40,26 +40,7 @@ const MAX_STATS: &[u8] = &[
 #[tokio::test]
 async fn released_stats_route_alone_mixed_and_after_backend_replacement() {
     init_crypto();
-    // CI encodes this payload with the oldest supported release's schema.
-    // Local runs retain the frozen release fixture when no CI payload is supplied.
-    let wire = match std::env::var("STARGATE_COMPAT_STATS_HEX") {
-        Ok(hex) => {
-            assert!(
-                !hex.is_empty() && hex.len() % 2 == 0,
-                "invalid released stats hex"
-            );
-            hex.as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
-                        .expect("invalid released stats hex")
-                })
-                .collect::<Vec<_>>()
-        }
-        Err(std::env::VarError::NotPresent) => LEGACY_STATS.to_vec(),
-        Err(error) => panic!("invalid released stats environment: {error}"),
-    };
-    let legacy = ModelStats::decode(wire.as_slice()).expect("released stats must decode");
+    let legacy = ModelStats::decode(LEGACY_STATS).expect("released stats must decode");
     assert_eq!(legacy.last_mean_input_tps, 100.0);
     assert_eq!(legacy.max_output_tps, 50.0);
     assert_eq!(legacy.kv_cache_capacity_tokens, 4096);

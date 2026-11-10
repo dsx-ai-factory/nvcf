@@ -3392,6 +3392,38 @@ fn pulsar_fallback_cache_tracks_mean_changes_and_maximum_presence() {
 }
 
 #[test]
+fn pulsar_shared_cluster_restart_changes_affinity_until_maximum_returns() {
+    let pulsar = PulsarLoadBalancer::new(seeded_pulsar_algorithm_config("restart"));
+    let target = target();
+    let keys: Vec<_> = (0..1024).map(|i| format!("restart-{i}")).collect();
+    let ownership = |snapshots: &[RoutedClusterSnapshot]| {
+        keys.iter()
+            .map(|key| {
+                choose(&pulsar, &request(&target, Some(key), Some(128)), snapshots)
+                    .candidate
+                    .cluster_id
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut snapshots = vec![
+        work_candidate("shared", 5, 200.0, 0),
+        work_candidate("peer", 5, 1000.0, 0),
+    ];
+    for snapshot in &mut snapshots {
+        snapshot.stats.max_input_tps = Some(1000.0);
+    }
+    let before = ownership(&snapshots);
+    // One restarted backend clears the shared cluster's aggregate maximum.
+    snapshots[0].stats.max_input_tps = None;
+    let restarted = ownership(&snapshots);
+    assert_ne!(restarted, before);
+    snapshots[0].stats.last_mean_input_tps = 400.0;
+    assert_ne!(ownership(&snapshots), restarted);
+    snapshots[0].stats.max_input_tps = Some(1000.0);
+    assert_eq!(ownership(&snapshots), before);
+}
+
+#[test]
 fn pulsar_excludes_candidate_with_invalid_max_input_tps() {
     let pulsar = PulsarLoadBalancer::new(seeded_pulsar_algorithm_config("seed-1"));
 
