@@ -33,6 +33,17 @@
  * command line (a gang health sidecar looking for "-m dynamo.vllm",
  * pkill -f) must not take the placeholder for it. The arguments are only
  * needed by a start that finds MARKER, which execs before this.
+ *
+ * Stopping: a restored workload runs in this container, as this program's
+ * descendants or beside it in the pod's shared pid namespace. On SIGTERM
+ * this program passes the signal to every other process of its container
+ * (its cgroup) and waits until they have exited, so the workload shuts down
+ * as it would have without nvsnap, instead of being killed when this program
+ * exits. The kubelet's SIGKILL at the end of the grace period still ends
+ * everything. Only in a Kubernetes pod's container (KUBERNETES_SERVICE_HOST
+ * set, its cgroup "/" in a private cgroup namespace or a kubepods path):
+ * run elsewhere, this program's cgroup may hold unrelated processes.
+ * NVSNAP_IDLE_PROCS, for tests, names a file to read the pids from instead.
  */
 #include <errno.h>
 #include <signal.h>
@@ -58,6 +69,79 @@ static void hide_args(int argc, char **argv, int from) {
 }
 
 static volatile sig_atomic_t stop;
+
+/* procs_path finds the file listing this container's processes: the
+ * cgroup v2 cgroup.procs of this process's cgroup, if that cgroup is a
+ * Kubernetes container's. Returns 0 when there is none. */
+static int procs_path(char *buf, size_t n) {
+	const char *override = getenv("NVSNAP_IDLE_PROCS");
+	if (override && override[0]) {
+		snprintf(buf, n, "%s", override);
+		return 1;
+	}
+	const char *k8s = getenv("KUBERNETES_SERVICE_HOST");
+	if (!k8s || !k8s[0])
+		return 0;
+	FILE *f = fopen("/proc/self/cgroup", "r");
+	if (!f)
+		return 0;
+	char line[4096];
+	int ok = 0;
+	while (fgets(line, sizeof line, f)) {
+		if (strncmp(line, "0::", 3) != 0)
+			continue;
+		line[strcspn(line, "\n")] = '\0';
+		const char *path = line + 3;
+		/* In a private cgroup namespace the container's cgroup is "/". */
+		if (strstr(path, "kubepods") || strcmp(path, "/") == 0) {
+			snprintf(buf, n, "/sys/fs/cgroup%s/cgroup.procs", strcmp(path, "/") == 0 ? "" : path);
+			ok = 1;
+		}
+		break;
+	}
+	fclose(f);
+	return ok;
+}
+
+/* signal_others sends sig to every process listed in procs other than this
+ * one; returns how many there were, or -1 when procs cannot be read. */
+static int signal_others(const char *procs, int sig) {
+	FILE *f = fopen(procs, "r");
+	if (!f)
+		return -1;
+	pid_t self = getpid();
+	int n = 0;
+	long pid;
+	while (fscanf(f, "%ld", &pid) == 1) {
+		if ((pid_t)pid == self || pid <= 0)
+			continue;
+		if (sig == 0 && kill((pid_t)pid, 0) != 0)
+			continue; /* gone, or listed in a file only a test keeps */
+		if (sig != 0)
+			kill((pid_t)pid, sig);
+		n++;
+	}
+	fclose(f);
+	return n;
+}
+
+/* forward_term passes SIGTERM to the rest of the container and waits,
+ * reaping what is this program's, until none of it is left. */
+static void forward_term(void) {
+	char procs[4200];
+	if (!procs_path(procs, sizeof procs))
+		return;
+	if (signal_others(procs, SIGTERM) <= 0)
+		return;
+	for (;;) {
+		while (waitpid(-1, NULL, WNOHANG) > 0) {
+		}
+		if (signal_others(procs, 0) <= 0)
+			return;
+		struct timespec ts = {0, 100 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+}
 
 static void on_term(int sig) { (void)sig; stop = 1; }
 
@@ -111,5 +195,6 @@ int main(int argc, char **argv) {
 			}
 		}
 	}
+	forward_term();
 	return 0;
 }

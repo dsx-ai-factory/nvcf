@@ -240,3 +240,90 @@ func TestIdleUsage(t *testing.T) {
 		}
 	}
 }
+
+// startWorkload starts a stand-in for a restored workload beside the
+// placeholder (not its child): on SIGTERM it notes the signal, takes a
+// moment to shut down, and notes that it is done.
+func startWorkload(t *testing.T, dir string) *exec.Cmd {
+	t.Helper()
+	got, done := filepath.Join(dir, "got-term"), filepath.Join(dir, "done")
+	w := exec.CommandContext(t.Context(), "/bin/sh", "-c", //nolint:gosec // a test fixture
+		"trap 'touch "+got+"; sleep 1; touch "+done+"; exit 0' TERM; while :; do sleep 0.1; done")
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Process.Kill(); _ = w.Wait() })
+	return w
+}
+
+// On SIGTERM the placeholder passes the signal to the rest of its container
+// (here, the pids NVSNAP_IDLE_PROCS lists) and exits only once they have
+// exited: a restored workload shuts down as it would have without nvsnap.
+func TestIdleForwardsTermToTheContainer(t *testing.T) {
+	bin := buildIdle(t)
+	dir := t.TempDir()
+	w := startWorkload(t, dir)
+	waited := make(chan struct{})
+	go func() { _ = w.Wait(); close(waited) }() // reaps the workload as its parent
+	procs := filepath.Join(dir, "cgroup.procs")
+	if err := os.WriteFile(procs, []byte(strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idle := exec.CommandContext(t.Context(), bin, "--cold-start", filepath.Join(dir, "cold-start"), "--", "/bin/true") //nolint:gosec // runs the program under test
+	idle.Env = append(os.Environ(), "NVSNAP_IDLE_PROCS="+procs)
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := idle.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- idle.Wait() }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("placeholder: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the placeholder did not exit after the workload did")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "got-term")); err != nil {
+		t.Fatal("the workload never got SIGTERM")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "done")); err != nil {
+		t.Error("the placeholder exited before the workload finished shutting down")
+	}
+	<-waited
+}
+
+// Outside a Kubernetes pod the placeholder's cgroup may hold unrelated
+// processes: nothing is passed the signal.
+func TestIdleForwardsNothingOutsideAPod(t *testing.T) {
+	bin := buildIdle(t)
+	dir := t.TempDir()
+	w := startWorkload(t, dir)
+	idle := exec.CommandContext(t.Context(), bin) //nolint:gosec // runs the program under test
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "KUBERNETES_SERVICE_HOST=") && !strings.HasPrefix(e, "NVSNAP_IDLE_PROCS=") {
+			env = append(env, e)
+		}
+	}
+	idle.Env = env
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_ = idle.Process.Signal(syscall.SIGTERM)
+	if err := idle.Wait(); err != nil {
+		t.Fatalf("placeholder: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(dir, "got-term")); err == nil {
+		t.Error("a process outside a pod's container got SIGTERM")
+	}
+	if w.ProcessState != nil {
+		t.Error("the unrelated process exited")
+	}
+}
