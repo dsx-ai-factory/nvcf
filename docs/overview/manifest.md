@@ -285,7 +285,9 @@ existing mounts have migrated. Follow the
 [upgrade procedure](release-notes/1.0.2-to-1.0.4-upgrade.md) before changing
 mount selections or removing legacy binaries.
 
-The following tables list the complete artifact inventory.
+The following tables list the artifacts that the stack inventories declare.
+Seven upstream images that operators create at runtime are not in those
+inventories. See [Runtime images created by operators](#runtime-images-created-by-operators).
 
 {/*docs-version-sync:BEGIN manifest-artifact-registry-paths*/}
 
@@ -453,3 +455,25 @@ The following tables list the complete artifact inventory.
 | `nvcf-self-managed-stack` | `1.1.5` | `self-managed` | Provides the Helmfile bundle for control-plane deployment. | `Publication pending` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/self-managed) |
 
 {/*docs-version-sync:END manifest-artifact-registry-paths*/}
+
+### Runtime images created by operators
+
+Two operators create pods at runtime from images that no chart or Helm value
+lists, so the tables above do not include them. Add these images to your
+registry mirror or allowlist when you enable the matching component. They are
+third-party images that NVIDIA does not republish under `nvidia/nvcf`. Pull them
+from `ghcr.io` or mirror them with the other upstream images.
+
+The versions match the operator versions that the selected stack releases pin:
+OpenTelemetry operator `0.158.0` and KAI Scheduler `v0.17.1`. If you pin a
+different operator version, use the matching image tags.
+
+| Artifact | Version | Stack | Required | Description | Distribution | Source code |
+| --- | --- | --- | --- | --- | --- | --- |
+| `target-allocator` | `0.158.0` | `observability` | Required | Distributes scrape targets to the OpenTelemetry Collector. The OpenTelemetry operator creates it when `observability.profile` is `control`, `compute`, or `all` and the target allocator component is not disabled. | `ghcr.io/open-telemetry/opentelemetry-operator/target-allocator:0.158.0` | [Upstream](https://github.com/open-telemetry/opentelemetry-operator) |
+| `admission` | `v0.17.1` | `compute-plane` | Optional | Handles admission of KAI Scheduler workloads. The KAI Scheduler operator creates it when `addons.kaiScheduler.enabled` is `true`. | `ghcr.io/kai-scheduler/kai-scheduler/admission:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `binder` | `v0.17.1` | `compute-plane` | Optional | Binds pods to nodes for KAI Scheduler. Created by the KAI Scheduler operator. | `ghcr.io/kai-scheduler/kai-scheduler/binder:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `podgrouper` | `v0.17.1` | `compute-plane` | Optional | Groups workload pods into pod groups for KAI Scheduler. Created by the KAI Scheduler operator. | `ghcr.io/kai-scheduler/kai-scheduler/podgrouper:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `podgroupcontroller` | `v0.17.1` | `compute-plane` | Optional | Reconciles pod groups for KAI Scheduler. Created by the KAI Scheduler operator. | `ghcr.io/kai-scheduler/kai-scheduler/podgroupcontroller:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `queuecontroller` | `v0.17.1` | `compute-plane` | Optional | Reconciles scheduling queues for KAI Scheduler. Created by the KAI Scheduler operator. | `ghcr.io/kai-scheduler/kai-scheduler/queuecontroller:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `scheduler` | `v0.17.1` | `compute-plane` | Optional | Schedules workloads for KAI Scheduler. Created by the KAI Scheduler operator. | `ghcr.io/kai-scheduler/kai-scheduler/scheduler:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
