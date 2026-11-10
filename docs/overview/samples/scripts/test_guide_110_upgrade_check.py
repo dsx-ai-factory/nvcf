@@ -161,7 +161,9 @@ class CassandraExpansionPreparation(unittest.TestCase):
     STUBS = r"""
 kc() {
   case "$*" in
+    *'get statefulset'*'jsonpath'*) printf '%s members now\n' "${LIVE_REPLICAS:-1}" ;;
     *'get statefulset'*) printf '%s\n' "$STATEFULSET" ;;
+    *'logs deploy/nvcf-api'*) if [ -n "$LOGS_FAIL" ]; then return 1; fi; printf '%s\n' "$LOGS_TEXT" ;;
     *'patch statefulset'*) echo "patch $*" >> "$CQL_LOG" ;;
     *'get nodes'*) echo "nodes $*" >> "$CQL_LOG" ;;
     *'scale statefulset'*) echo "scale $*" >> "$CQL_LOG" ;;
@@ -176,6 +178,7 @@ kc() {
     *) return 99 ;;
   esac
 }
+yq() { printf '%s\n' "$HA_MODE_STUB"; }
 """
 
     CQLSH = r"""#!/usr/bin/env python3
@@ -191,16 +194,23 @@ if 'system_auth.roles' in query and os.environ.get('FAIL_POD') == os.environ.get
 if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
 """
 
-    def run_block(self, marker_blocks, replicas="1", fail_pod="", datacenter="custom_dc"):
+    def run_block(self, marker_blocks, replicas="1", fail_pod="", datacenter="custom_dc",
+                  ha_mode="preferred", logs_fail="", logs_text="", saved_replicas="same"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "cqlsh").write_text(self.CQLSH)
             (root / "cqlsh").chmod(0o755)
             statefulset = {"spec": {"template": {"spec": {"containers": [
                 {"name": "cassandra", "env": [{"name": "CASSANDRA_DC", "value": datacenter}]}]}}}}
+            backup = root / "backup"
+            backup.mkdir()
+            if saved_replicas is not None:
+                (backup / "cassandra-replicas").write_text((replicas if saved_replicas == "same" else saved_replicas) + "\n")
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "TMPDIR": directory,
                    "CQL_LOG": str(root / "calls"), "STATEFULSET": json.dumps(statefulset),
-                   "CASSANDRA_REPLICAS": replicas, "FAIL_POD": fail_pod}
+                   "FAIL_POD": fail_pod, "BACKUP_DIR": str(backup), "CONTROL_STACK": "/stack",
+                   "HELMFILE_ENV": "env", "HA_MODE_STUB": ha_mode, "LOGS_FAIL": logs_fail, "LOGS_TEXT": logs_text}
+            env.pop("CASSANDRA_REPLICAS", None)
             commands = "\n".join(block_containing(UPGRADE_11, marker) for marker in marker_blocks)
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", self.STUBS + commands + "\necho CONTINUED"],
                                     env=env, input="fixture-secret\n", capture_output=True, text=True)
@@ -211,18 +221,26 @@ if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
     AUTH = 'cql_on cassandra-0 "ALTER KEYSPACE system_auth'
     APPS = 'cql_on cassandra-0 "SELECT keyspace_name FROM system_schema.keyspaces;"'
 
-    def test_zone_spread_rule_is_valid_and_keyed_on_the_zone_label(self):
-        result, calls = self.run_block(["topologySpreadConstraints"])
-        self.assertEqual(0, result.returncode, result.stderr)
-        patch = next(line for line in calls.splitlines() if line.startswith("patch"))
-        body = json.loads(re.search(r" -p (\{.*\})$", patch).group(1))
-        rule = body["spec"]["template"]["spec"]["topologySpreadConstraints"]
-        self.assertEqual(1, len(rule))
-        self.assertEqual("topology.kubernetes.io/zone", rule[0]["topologyKey"])
-        self.assertEqual("DoNotSchedule", rule[0]["whenUnsatisfiable"])
-        self.assertEqual(1, rule[0]["maxSkew"])
-        self.assertEqual({"app.kubernetes.io/name": "cassandra"}, rule[0]["labelSelector"]["matchLabels"])
-        self.assertIn("rollout", calls)
+    def test_zone_spread_rule_is_hard_under_enforced_and_soft_under_preferred(self):
+        for mode, expected in (("enforced", "DoNotSchedule"), ("preferred", "ScheduleAnyway")):
+            with self.subTest(mode=mode):
+                result, calls = self.run_block(["topologySpreadConstraints"], ha_mode=mode)
+                self.assertEqual(0, result.returncode, result.stderr)
+                patch = next(line for line in calls.splitlines() if line.startswith("patch"))
+                body = json.loads(re.search(r" -p (\{.*\})$", patch).group(1))
+                rule = body["spec"]["template"]["spec"]["topologySpreadConstraints"]
+                self.assertEqual(1, len(rule))
+                self.assertEqual("topology.kubernetes.io/zone", rule[0]["topologyKey"])
+                self.assertEqual(expected, rule[0]["whenUnsatisfiable"])
+                self.assertEqual(1, rule[0]["maxSkew"])
+                self.assertEqual({"app.kubernetes.io/name": "cassandra"}, rule[0]["labelSelector"]["matchLabels"])
+                self.assertIn("rollout", calls)
+
+    def test_zone_spread_rule_stops_on_an_unknown_mode(self):
+        result, calls = self.run_block(["topologySpreadConstraints"], ha_mode="none")
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("patch", calls)
+        self.assertNotIn("CONTINUED", result.stdout)
 
     def test_scale_runs_only_for_a_single_member(self):
         result, calls = self.run_block([self.SCALE], replicas="1")
@@ -233,6 +251,28 @@ if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
         self.assertNotEqual(0, result.returncode)
         self.assertNotIn("scale", calls)
         self.assertNotIn("CONTINUED", result.stdout)
+
+    def test_scale_restores_the_saved_count_and_stops_without_it(self):
+        result, calls = self.run_block([self.SCALE], replicas="1")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("members now", result.stdout + calls + result.stderr)
+        result, calls = self.run_block([self.SCALE], saved_replicas=None)
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("scale", calls)
+
+    LOGS = "AUTH_LOGS=$(kc -n nvcf logs"
+
+    def test_log_check_counts_errors_and_stops_when_the_logs_cannot_be_read(self):
+        result, calls = self.run_block([self.LOGS], logs_text="ok\nAuthenticationException: bad\nAuthenticationException: bad")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("2", result.stdout.split()[0])
+        result, calls = self.run_block([self.LOGS], logs_text="all quiet")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("0", result.stdout.split()[0])
+        result, calls = self.run_block([self.LOGS], logs_fail="1")
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("CONTINUED", result.stdout)
+        self.assertNotIn("0", result.stdout.split())
 
     def test_system_auth_is_raised_repaired_and_checked_on_every_member(self):
         result, calls = self.run_block([self.AUTH])

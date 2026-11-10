@@ -159,6 +159,14 @@ helmfile -e <env> apply
 An invalid mode fails the render fast with a clear error, so a typo cannot
 silently disable HA.
 
+> **Single-member Cassandra:** if your Cassandra runs a single member, do not
+> enable HA by setting the mode and applying. The Cassandra chart raises the
+> `system_auth` replication factor in a hook that runs after the StatefulSet
+> scales, and it does not repair the data, so administrator and service logins can
+> fail while every member shows `UN`. Expand and repair Cassandra first, with the
+> steps in [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
+> then apply.
+
 ## What HA changes, by tier
 
 ### Replica-safe Deployments
