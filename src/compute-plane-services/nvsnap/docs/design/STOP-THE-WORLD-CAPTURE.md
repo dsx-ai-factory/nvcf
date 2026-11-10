@@ -76,6 +76,29 @@ The first instance of a configuration is out of service for the capture and
 one restore, once per configuration. It should be captured before traffic is
 routed to it (or drained first); its in-flight requests fail otherwise.
 
+## Scaling groups of several replicas
+
+An instance is one replica of a Grove scaling group (one worker group of a
+Dynamo deployment), with the companions it talks to. When the scaling group
+runs several replicas, they all use the same companions (one etcd, one NATS,
+one frontend). A capture of one replica would stop companions the others
+still use, and each replica's restore would restore the same companions
+again. So the agent does not capture or restore such a scaling group as a
+group:
+
+- Admission reads the scaling group's `spec.replicas` (or a replica index
+  above 0 on the pod). With more than one replica, its GPU ranks and the
+  namespace's companions are admitted cold, to start from the caches. If
+  the replica count cannot be read, they are admitted cold too.
+- The capture of such an instance is skipped.
+- A group restore claims each companion placeholder before it restores
+  it (the `nvsnap.io/criu-companion-claimed-by` annotation, written with
+  the pod's `resourceVersion`). A companion another live leader has
+  claimed is not restored again. A claim left by a leader that is gone is
+  taken over.
+
+Capturing every replica, with its companions, as one instance is future work.
+
 ## Not covered
 
 - Skipping all-zero blocks of large shared-memory buffers at dump time (the

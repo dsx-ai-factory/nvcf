@@ -38,6 +38,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	k8sevents "k8s.io/client-go/tools/record"
 
@@ -397,6 +398,14 @@ type Agent struct {
 	// enabled; populated by startRootfsCapture before the webhook
 	// server starts.
 	kubeClient kubernetes.Interface
+
+	// dynClient reads custom resources (grove_replicas.go); nil without
+	// a kube client.
+	dynClient dynamic.Interface
+
+	// groveReplicas, when set, reads a namespace's Grove scaling groups'
+	// replicas in place of the API (grove_replicas.go); for tests.
+	groveReplicas func(ctx context.Context, ns string) (map[string]int, error)
 
 	// gpuProducts caches node name -> GPU product (lifecycle_metrics.go).
 	gpuProducts sync.Map

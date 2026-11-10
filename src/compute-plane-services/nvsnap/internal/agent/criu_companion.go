@@ -417,6 +417,9 @@ func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod) (bool,
 	if err != nil {
 		return false, fmt.Sprintf("cannot list the namespace's pods: %v", err)
 	}
+	if why := a.namespaceSharesCompanions(ctx, pod.Namespace, pods.Items); why != "" {
+		return false, why
+	}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.DeletionTimestamp != nil || !hasGPU(p) {
