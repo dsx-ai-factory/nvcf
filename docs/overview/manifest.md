@@ -43,12 +43,25 @@ provides a CLI toolbox used by two independently configured hooks. It is not a
 Kubernetes server image. Retain the selected helper versions when mirroring.
 
 The `kubectl` inside `alpine/k8s:<tag>` must stay within one minor version of
-the API server of the cluster each hook runs against (the upstream kubectl
-skew policy). The selected `1.37.0` tag serves clusters on Kubernetes 1.36
-through 1.38. For an older cluster, pick the `alpine/k8s` tag whose number
-matches the cluster minor - the tag is the packaged `kubectl` version - and
-qualify it for both hooks (`api.accountBootstrap.image` and
-`upgradeReceipt.image`); confirm with `kubectl version` from a job pod.
+every API server the hooks reach (the upstream kubectl skew policy). During a
+control-plane upgrade the cluster serves two versions at once - a `1.37.0`
+client is outside the skew of a `1.35` API server even when `1.36` servers
+exist - so qualify against the oldest API server in the fleet. The selected
+`1.37.0` tag serves clusters whose oldest API server is Kubernetes 1.36. For
+an older fleet, pick the `alpine/k8s` tag matching that oldest minor (the tag
+is the packaged `kubectl` version) for both hooks (`api.accountBootstrap.image`
+and `upgradeReceipt.image`).
+
+To qualify, run a one-off probe job with the selected image - the receipt job
+container exits after writing its ConfigMap, so it cannot be exec'd into - and
+read the versions from the job's logs:
+
+```bash
+kubectl run k8s-version-check --image=docker.io/alpine/k8s:1.37.0 \
+  --restart=Never --command -- kubectl version --client
+kubectl logs k8s-version-check
+kubectl delete pod k8s-version-check
+```
 
 Other enabled stacks and optional components use upstream registries; inspect
 every image in the render and generated inventory, not just this helper table.
