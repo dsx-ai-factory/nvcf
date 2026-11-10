@@ -850,7 +850,7 @@ func (s *Server) processCloudEvents(traceCtx context.Context, cloudEvents []*clo
 // without putting event and primary-stats persistence back on the per-event LWT path.
 func (s *Server) completeCloudEvent(traceCtx context.Context, event *EventV3, result *EventProcessingResult) {
 	if s.isFilteredStatsEnabled(event.EventName) {
-		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
+		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Source, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
 			logging.GetLogger(traceCtx).ErrorContext(traceCtx, "Failed to store event in filtered stats view", zap.Error(err))
 			result.FailureCount++
 			result.LastError = err
@@ -882,7 +882,7 @@ func (s *Server) storeK8sEvent(traceCtx context.Context, event *EventV3) error {
 
 	// Store in stats_v3 (only latest event per context) - if event is enabled
 	if s.isStatsEnabled(event.EventName) {
-		if err := s.conns.DbHandlerV2.UpsertStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp); err != nil {
+		if err := s.conns.DbHandlerV2.UpsertStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Source, event.Timestamp); err != nil {
 			return fmt.Errorf("failed to store in stats_v3: %w", err)
 		}
 	} else {
@@ -892,7 +892,7 @@ func (s *Server) storeK8sEvent(traceCtx context.Context, event *EventV3) error {
 
 	// Store the latest event per context in the opt-in filtered stats view.
 	if s.isFilteredStatsEnabled(event.EventName) {
-		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
+		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Source, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
 			return fmt.Errorf("failed to store in filtered stats view: %w", err)
 		}
 	}

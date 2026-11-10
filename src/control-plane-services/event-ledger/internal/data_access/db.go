@@ -95,8 +95,8 @@ type DBHandlerV2 interface {
 	ReadDeploymentDeploymentStats(traceCtx context.Context, functionVersionId, deploymentId uuid.UUID) (types.DeploymentStats, error)
 	// V3 Methods (events)
 	UpsertEventV3(traceCtx context.Context, namespace, eventContext, eventName, source string, details json.RawMessage, timestamp time.Time) error
-	UpsertStatsV3(traceCtx context.Context, namespace, eventContext, eventName string, timestamp time.Time) error
-	UpsertFilteredStatsV3(traceCtx context.Context, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error
+	UpsertStatsV3(traceCtx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time) error
+	UpsertFilteredStatsV3(traceCtx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error
 	BulkUpsertEventsV3(traceCtx context.Context, events []EventV3UpsertRecord) error
 	BulkUpsertStatsV3(traceCtx context.Context, events []EventV3UpsertRecord) error
 	GetStatsV3(traceCtx context.Context, namespace string) ([]StatsV3Record, error)

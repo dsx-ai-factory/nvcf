@@ -100,11 +100,11 @@ func (p *passDBHandlerV2) UpsertEventV3(ctx context.Context, namespace, eventCon
 	return nil
 }
 
-func (p *passDBHandlerV2) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time) error {
+func (p *passDBHandlerV2) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time) error {
 	return nil
 }
 
-func (p *passDBHandlerV2) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error {
+func (p *passDBHandlerV2) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error {
 	return nil
 }
 
@@ -182,11 +182,11 @@ func (p *failDBHandlerV2) UpsertEventV3(ctx context.Context, namespace, eventCon
 	return fmt.Errorf("v2 upsert event fail")
 }
 
-func (p *failDBHandlerV2) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time) error {
+func (p *failDBHandlerV2) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time) error {
 	return fmt.Errorf("v2 upsert stats fail")
 }
 
-func (p *failDBHandlerV2) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error {
+func (p *failDBHandlerV2) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error {
 	return fmt.Errorf("v2 upsert filtered stats fail")
 }
 

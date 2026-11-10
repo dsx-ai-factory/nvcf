@@ -156,6 +156,8 @@ func (c *CliArgs) SetupCache() {
 
 func (c *CliArgs) SetupV3() {
 	c.bool("v3.account-columns-enabled", false, "Store nca_id and function_id in their own columns. Enable only after the event_ledger 04 migration has been applied", true)
+	c.int("v3.grpc-proxy-event-ttl-seconds", DefaultGrpcProxyEventTTLSeconds, "TTL in seconds for gRPC proxy event rows", true)
+	c.int("v3.grpc-proxy-stats-ttl-seconds", DefaultGrpcProxyStatsTTLSeconds, "TTL in seconds for gRPC proxy stats rows", true)
 }
 
 func (c *CliArgs) SetupPublisher() {

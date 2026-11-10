@@ -66,6 +66,9 @@ func registerUnauthenticatedRoutes(router *mux.Router, server *service.Server, i
 }
 
 func runService(cfg config.Config) error {
+	if err := cfg.V3.Validate(); err != nil {
+		return err
+	}
 	ctx := context.Background()
 
 	logger, undoLogger := logging.SetupLoggingFromConfig(&cfg.Logging, &cfg.Telemetry)

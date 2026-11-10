@@ -42,6 +42,22 @@ func TestConfigDefaultsAuthenticationEnabled(t *testing.T) {
 	assert.True(t, cfg.Auth.Enabled)
 }
 
+func TestV3RetentionConfigFromFlags(t *testing.T) {
+	v := newConfigViper()
+	cmd := &cobra.Command{Use: "test"}
+	config.NewCliArgs(cmd, v, nil).SetupV3()
+	var cfg config.Config
+	require.NoError(t, v.Unmarshal(&cfg))
+	assert.Equal(t, config.DefaultGrpcProxyEventTTLSeconds, cfg.V3.GrpcProxyEventTTLSeconds)
+	assert.Equal(t, config.DefaultGrpcProxyStatsTTLSeconds, cfg.V3.GrpcProxyStatsTTLSeconds)
+
+	require.NoError(t, cmd.Flags().Set("v3.grpc-proxy-event-ttl-seconds", "7"))
+	require.NoError(t, cmd.Flags().Set("v3.grpc-proxy-stats-ttl-seconds", "12"))
+	require.NoError(t, v.Unmarshal(&cfg))
+	assert.Equal(t, 7, cfg.V3.GrpcProxyEventTTLSeconds)
+	assert.Equal(t, 12, cfg.V3.GrpcProxyStatsTTLSeconds)
+}
+
 func TestConfigAllowsAuthenticationToBeExplicitlyDisabled(t *testing.T) {
 	v := newConfigViper()
 	v.SetConfigType("json")
