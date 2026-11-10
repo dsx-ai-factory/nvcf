@@ -117,8 +117,6 @@ pub(super) async fn send_canary_request(
         "messages": [{"role": "user", "content": "1+1="}],
         "max_tokens": canary_max_generation_threshold,
         "seed": 33,
-        "temperature": 0.7,
-        "top_p": 1.0,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
