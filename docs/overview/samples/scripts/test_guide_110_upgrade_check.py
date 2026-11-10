@@ -3,6 +3,7 @@
 """Execute the NVCF 1.0.x to 1.1.0 upgrade guide commands with synthetic adapters."""
 
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -129,7 +130,7 @@ kc() {
             statefulset = {"spec": {"template": {"spec": {"containers": [{"name": "cassandra", "env": [{"name": "CASSANDRA_DC", "value": configured}]}]}}}}
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "TMPDIR": directory,
                    "CQL_LOG": str(root / "calls"), "LIVE_DC": live, "STATEFULSET": json.dumps(statefulset)}
-            command = block_containing(UPGRADE_11, "CASSANDRA_DC=$(")
+            command = block_containing(UPGRADE_11, "LIVE_DC=$(cql")
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", stubs + command + "\necho CONTINUED"],
                                     env=env, input="fixture-secret\n", capture_output=True, text=True)
             calls = (root / "calls").read_text() if (root / "calls").exists() else ""
@@ -154,6 +155,110 @@ kc() {
                 self.assertNotIn("repair", calls)
                 self.assertNotIn("CONTINUED", result.stdout)
                 self.assertEqual([], leftovers)
+
+
+class CassandraExpansionPreparation(unittest.TestCase):
+    STUBS = r"""
+kc() {
+  case "$*" in
+    *'get statefulset'*) printf '%s\n' "$STATEFULSET" ;;
+    *'patch statefulset'*) echo "patch $*" >> "$CQL_LOG" ;;
+    *'get nodes'*) echo "nodes $*" >> "$CQL_LOG" ;;
+    *'scale statefulset'*) echo "scale $*" >> "$CQL_LOG" ;;
+    *'rollout status'*) echo "rollout $*" >> "$CQL_LOG" ;;
+    *'exec -i '*' -- sh '*)
+      prev=; POD=; for a in "$@"; do if [ "$prev" = -i ]; then POD=$a; break; fi; prev=$a; done; export POD
+      while [ "$1" != -- ]; do shift; done
+      shift
+      "$@" ;;
+    *'nodetool repair'*) echo "repair $*" >> "$CQL_LOG" ;;
+    *'nodetool status'*) echo "status $*" >> "$CQL_LOG" ;;
+    *) return 99 ;;
+  esac
+}
+"""
+
+    CQLSH = r"""#!/usr/bin/env python3
+import json, os, pathlib, stat, sys
+args = sys.argv[1:]
+credentials = pathlib.Path(next(a.split('=', 1)[1] for a in args if a.startswith('--credentials=')))
+assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
+assert 'password = fixture-secret' in credentials.read_text()
+assert all('fixture-secret' not in a for a in args)
+query = args[-1]
+with open(os.environ['CQL_LOG'], 'a') as log: log.write(json.dumps([os.environ.get('POD'), query]) + '\n')
+if 'system_auth.roles' in query and os.environ.get('FAIL_POD') == os.environ.get('POD'): sys.exit(1)
+if 'SELECT keyspace_name FROM' in query: print('nvcf_api')
+"""
+
+    def run_block(self, marker_blocks, replicas="1", fail_pod="", datacenter="custom_dc"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cqlsh").write_text(self.CQLSH)
+            (root / "cqlsh").chmod(0o755)
+            statefulset = {"spec": {"template": {"spec": {"containers": [
+                {"name": "cassandra", "env": [{"name": "CASSANDRA_DC", "value": datacenter}]}]}}}}
+            env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"], "TMPDIR": directory,
+                   "CQL_LOG": str(root / "calls"), "STATEFULSET": json.dumps(statefulset),
+                   "CASSANDRA_REPLICAS": replicas, "FAIL_POD": fail_pod}
+            commands = "\n".join(block_containing(UPGRADE_11, marker) for marker in marker_blocks)
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", self.STUBS + commands + "\necho CONTINUED"],
+                                    env=env, input="fixture-secret\n", capture_output=True, text=True)
+            calls = (root / "calls").read_text() if (root / "calls").exists() else ""
+            return result, calls
+
+    SCALE = "scale statefulset cassandra"
+    AUTH = 'cql_on cassandra-0 "ALTER KEYSPACE system_auth'
+    APPS = 'cql_on cassandra-0 "SELECT keyspace_name FROM system_schema.keyspaces;"'
+
+    def test_zone_spread_rule_is_valid_and_keyed_on_the_zone_label(self):
+        result, calls = self.run_block(["topologySpreadConstraints"])
+        self.assertEqual(0, result.returncode, result.stderr)
+        patch = next(line for line in calls.splitlines() if line.startswith("patch"))
+        body = json.loads(re.search(r" -p (\{.*\})$", patch).group(1))
+        rule = body["spec"]["template"]["spec"]["topologySpreadConstraints"]
+        self.assertEqual(1, len(rule))
+        self.assertEqual("topology.kubernetes.io/zone", rule[0]["topologyKey"])
+        self.assertEqual("DoNotSchedule", rule[0]["whenUnsatisfiable"])
+        self.assertEqual(1, rule[0]["maxSkew"])
+        self.assertEqual({"app.kubernetes.io/name": "cassandra"}, rule[0]["labelSelector"]["matchLabels"])
+        self.assertIn("rollout", calls)
+
+    def test_scale_runs_only_for_a_single_member(self):
+        result, calls = self.run_block([self.SCALE], replicas="1")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("--replicas=3", calls)
+        self.assertIn("rollout", calls)
+        result, calls = self.run_block([self.SCALE], replicas="3")
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("scale", calls)
+        self.assertNotIn("CONTINUED", result.stdout)
+
+    def test_system_auth_is_raised_repaired_and_checked_on_every_member(self):
+        result, calls = self.run_block([self.AUTH])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("'custom_dc': '3'", calls)
+        self.assertNotIn("'ncp': '3'", calls)
+        for pod in ("cassandra-0", "cassandra-1", "cassandra-2"):
+            self.assertIn(f"exec {pod} -c cassandra -- nodetool repair --full system_auth", calls)
+            self.assertIn(f'["{pod}", "SELECT role FROM system_auth.roles LIMIT 1;"]', calls)
+            self.assertIn(f"administrator login ok on {pod}", result.stdout)
+        self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
+
+    def test_a_failed_login_on_any_member_stops_the_procedure(self):
+        result, calls = self.run_block([self.AUTH], fail_pod="cassandra-1")
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("CONTINUED", result.stdout)
+        self.assertNotIn("login ok on cassandra-2", result.stdout)
+
+    def test_application_keyspaces_are_raised_only_when_present_then_repaired(self):
+        result, calls = self.run_block([self.AUTH, self.APPS])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("ALTER KEYSPACE nvcf_api", calls)
+        self.assertNotIn("ALTER KEYSPACE nvct_api", calls)
+        self.assertIn("skipping nvct_api: not present", result.stdout)
+        self.assertEqual(3, calls.count("nodetool repair --full\n"))
+        self.assertNotIn("fixture-secret", calls + result.stdout + result.stderr)
 
 
 class Receipt11Checks(unittest.TestCase):
