@@ -430,7 +430,10 @@ direct entry, one without `functionType: LLM`, of a function that serves both
 routes, set `usePexec: false`. A direct `usePexec: true` entry reaches only the
 function's default invocation path. On the decision routes the Vanity Gateway
 returns `415` when a request sets a `Content-Type` other than
-`application/json`, and accepts request bodies up to 25 MB.
+`application/json`, and accepts request bodies up to its configured limit,
+25 MiB by default. In the self-managed stack, set it with
+`addons.vanityGateway.config.maxRequestSizeBytes`. The LLM Gateway itself
+rejects request bodies over 50 MiB by default.
 
 ### Anthropic Messages
 

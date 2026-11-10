@@ -2397,6 +2397,20 @@ func TestConfigDecodesRequestSizeLimit(t *testing.T) {
 	}
 }
 
+func TestStartupReadsRequestSizeLimitAsDecimal(t *testing.T) {
+	for value, expected := range map[string]int64{"010": 10, "08": 8, "067108864": 67108864} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			cmd := &cobra.Command{Use: "gateway"}
+			registerConfigFlags(cmd)
+			cfg, err := loadConfig(cmd, "")
+			require.NoError(t, err)
+			require.NotNil(t, cfg.MaxRequestSizeBytes)
+			require.Equal(t, expected, *cfg.MaxRequestSizeBytes)
+		})
+	}
+}
+
 func TestStartupRejectsInvalidRequestSizeLimit(t *testing.T) {
 	for _, value := range []string{"", "0", "-1", "1.5", "64MiB", "nope", "9223372036854775808"} {
 		t.Run(value, func(t *testing.T) {

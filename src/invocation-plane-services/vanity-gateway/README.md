@@ -69,10 +69,17 @@ vanityGateway:
     maxRequestSizeBytes: 67108864
 ```
 
-The gateway buffers full request bodies, and shadow requests add body copies.
-When raising this limit, raise `vanityGateway.resources.limits.memory` to allow
-for concurrent requests and shadow models. The chart's default memory limit is
-`512Mi`.
+The gateway holds each model API request body in memory while it routes the
+request. LLM Gateway routes and shadow models add more copies. In one
+in-process test, a single 64 MiB request raised gateway heap use by about
+224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
+900 MiB with one shadow model. Treat these numbers as examples, not limits.
+When raising this limit, also raise `vanityGateway.resources.limits.memory`.
+Size it from a load test at your expected concurrency, with headroom. The
+chart's default memory limit is `512Mi`.
+
+Requests for models with `functionType: LLM` are also limited by the LLM
+Gateway, which rejects request bodies over 50 MiB (52428800 bytes) by default.
 
 The limit applies to all model API POST routes, including JSON and multipart
 image requests. Bodies exactly at the limit are accepted. Generic vanity
