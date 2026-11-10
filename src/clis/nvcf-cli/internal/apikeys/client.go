@@ -416,7 +416,22 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 		return fmt.Errorf("%w: %s", ErrKeyNotFound, string(body))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		message := string(body)
+		var problem struct {
+			Title  string `json:"title"`
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(body, &problem); err == nil {
+			switch {
+			case problem.Title != "" && problem.Detail != "":
+				message = problem.Title + " - " + problem.Detail
+			case problem.Title != "":
+				message = problem.Title
+			case problem.Detail != "":
+				message = problem.Detail
+			}
+		}
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, message)
 	}
 
 	logging.Debug("Successfully deleted API key %s", keyID)

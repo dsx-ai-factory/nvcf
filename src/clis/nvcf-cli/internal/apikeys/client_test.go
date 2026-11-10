@@ -209,3 +209,39 @@ func TestDefaultScopes_IncludeManageTelemetries(t *testing.T) {
 	payload, _ := captureRequest(t, &Config{ServiceID: "svc-id"}, nil)
 	assert.Contains(t, scopesFrom(policyFrom(t, payload)), "manage_telemetries")
 }
+
+func TestDeleteAPIKey_ErrorResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		body    string
+		wantErr string
+	}{
+		{"problem details", http.StatusForbidden, `{"type":"about:blank","title":"Forbidden","status":403,"detail":"Access denied"}`, "API error 403: Forbidden - Access denied"},
+		{"title only", http.StatusUnauthorized, `{"title":"Unauthorized"}`, "API error 401: Unauthorized"},
+		{"detail only", http.StatusForbidden, `{"detail":"Access denied"}`, "API error 403: Access denied"},
+		{"plain text", http.StatusInternalServerError, "upstream unavailable", "API error 500: upstream unavailable"},
+		{"malformed JSON", http.StatusInternalServerError, `{"title":`, `API error 500: {"title":`},
+		{"unknown JSON", http.StatusInternalServerError, `{"error":"unavailable"}`, `API error 500: {"error":"unavailable"}`},
+		{"invalid field type", http.StatusForbidden, `{"title":403}`, `API error 403: {"title":403}`},
+		{"HTTP status wins", http.StatusForbidden, `{"title":"Forbidden","status":404,"detail":"Access denied"}`, "API error 403: Forbidden - Access denied"},
+		{"not found", http.StatusNotFound, `{"title":"Not Found","detail":"Key not found"}`, `api key not found: {"title":"Not Found","detail":"Key not found"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodDelete, r.Method)
+				assert.Equal(t, "/v1/keys/test-key", r.URL.Path)
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(srv.Close)
+			err := NewClient(&Config{ServiceURL: srv.URL}).DeleteAPIKey(context.Background(), "test-key")
+			require.EqualError(t, err, tc.wantErr)
+			if tc.status == http.StatusNotFound {
+				assert.ErrorIs(t, err, ErrKeyNotFound)
+			} else {
+				assert.NotErrorIs(t, err, ErrKeyNotFound)
+			}
+		})
+	}
+}
