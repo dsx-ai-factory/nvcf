@@ -51,6 +51,12 @@ An instance resumed after a failed capture was left half dead.
    The dump then stops each rank's engine container. A companion's container
    is thawed just before its dump, which stops it again. Nothing of the
    instance counts the time the capture takes.
+
+   The members are released to dump only once every hold has landed. A hold
+   still on its way after a bounded wait aborts the capture: landing in the
+   middle of the dumps, it would leave some pods held and others running. A
+   hold that fails outright leaves its pod running, as in a capture without
+   holds.
 2. **The captured instance is not resumed.** Its members are dumped without
    `--leave-running`, and its pods are deleted. Their controllers replace them,
    and the webhook admits the replacements as the restore's placeholders: the

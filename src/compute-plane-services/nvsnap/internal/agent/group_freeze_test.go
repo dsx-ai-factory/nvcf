@@ -476,3 +476,31 @@ func TestInstanceHold_StepsHoldRanksAtTheVoteAndCompanionsAtTheFreezePoint(t *te
 		t.Error("the freeze point's step did not hold the companion")
 	}
 }
+
+// Holds still on their way when the gate's wait ends abort the capture:
+// the members are told to stop, not to dump with some pods held and
+// others running.
+func TestDriveGroupFreeze_HoldsNotInTimeAbort(t *testing.T) {
+	saved := holdGateWait
+	holdGateWait = 100 * time.Millisecond
+	t.Cleanup(func() { holdGateWait = saved })
+	log := logrus.NewEntry(logrus.New())
+	a1, b1 := freezeServer(t)
+	a2, b2 := freezeServer(t)
+	ctx := context.Background()
+	errs := make(chan error, 2)
+	go func() { errs <- a1.awaitGroupFreeze(ctx, "s12", "ns", "worker-0", log) }()
+	go func() { errs <- a2.awaitGroupFreeze(ctx, "s12", "ns", "etcd-0", log) }()
+	never := make(chan struct{}) // the companions' hold never lands
+	ok := driveGroupFreeze(ctx, http.DefaultClient, "s12", "", []freezeMember{
+		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: b2, Namespace: "ns", Pod: "etcd-0"},
+	}, 20*time.Millisecond, log, nil, never)
+	if ok {
+		t.Fatal("the members were released to dump with the instance's holds still pending")
+	}
+	for range 2 {
+		if err := <-errs; err == nil {
+			t.Error("a member was released to dump; want it aborted")
+		}
+	}
+}

@@ -309,13 +309,24 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 				reached()
 			}
 			if gate != nil {
-				// The rest of the instance is being held; bounded, a
-				// hold that does not finish leaves its pod running.
+				// The rest of the instance is being held. A hold still
+				// on its way when the members dump could land in the
+				// middle of the dumps, with some companions stopped and
+				// others running: the capture is aborted instead, and
+				// the instance starts again to be captured later. (A
+				// hold that failed outright has ended: its pod runs, as
+				// in a capture without holds.)
+				held := false
 				select {
 				case <-gate:
+					held = true
 				case <-time.After(holdGateWait):
-					log.Warn("group capture: the instance's pods are not all held yet; releasing the members anyway")
+					log.WithField("wait", holdGateWait).Warn("group capture: the instance's pods are not all held in time; aborting the capture rather than dump it partly held")
 				case <-ctx.Done():
+				}
+				if !held {
+					release(false, phase)
+					return false
 				}
 			}
 			if !release(true, phase) {
@@ -396,7 +407,7 @@ func freezeState(ctx context.Context, client *http.Client, base, session, phase,
 
 // holdGateWait bounds the wait at the freeze point for the members' pods
 // to be held.
-const holdGateWait = 30 * time.Second
+var holdGateWait = 30 * time.Second
 
 // instanceHold holds the member pods of a group capture (pod_hold.go) in
 // two steps, so that nothing the GPU ranks talk to stops before they do:
