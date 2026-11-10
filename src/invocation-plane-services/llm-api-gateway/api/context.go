@@ -55,7 +55,18 @@ func NewGatewayContext(ectx echo.Context) *GatewayContext {
 	}
 }
 
+// Bind decodes the request into i. A request without a Content-Type is bound
+// as JSON, as requestContentType reads it, on a copy so the forwarded headers
+// stay as the client sent them.
 func (c *GatewayContext) Bind(i any) error {
+	req := c.Request()
+	if req.Header.Get(echo.HeaderContentType) != "" {
+		return c.Echo().Binder.Bind(i, c)
+	}
+	jsonReq := req.Clone(req.Context())
+	jsonReq.Header.Set(echo.HeaderContentType, requestContentType(req))
+	c.SetRequest(jsonReq)
+	defer c.SetRequest(req)
 	return c.Echo().Binder.Bind(i, c)
 }
 
