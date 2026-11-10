@@ -91,7 +91,7 @@ while IFS= read -r image; do
     imageID=$(kt get "pod/$pod" -o jsonpath='{.status.containerStatuses[0].imageID}')
     if [ -z "$imageID" ] && [ "$SECONDS" -ge "$deadline" ]; then
       kt describe "pod/$pod" || true
-      echo "imageID stayed empty after 150s; the image was not pulled" >&2
+      echo "imageID stayed empty after ${IMAGEID_WAIT_SECONDS:-150}s; the image was not pulled" >&2
       exit 1
     fi
     [ -n "$imageID" ] || sleep 5

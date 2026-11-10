@@ -28,7 +28,8 @@ other. The declarations for the current edition:
 | Observability | `1.0.0` | Compute plane `1.0.5`, Self-managed `1.0.10` |
 
 Source: the `compatibility` entries in
-[`docs/version-catalog/main.yaml`](../version-catalog/main.yaml). The generated
+[`docs/version-catalog/main.yaml`](https://github.com/dsx-ai-factory/nvcf/blob/main/docs/version-catalog/main.yaml).
+The generated
 block above records the selected releases for this edition; this table records
 the declared cross-stack compatibility an operator needs when choosing
 releases. Future editions update it with their catalog.

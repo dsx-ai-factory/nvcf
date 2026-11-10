@@ -74,9 +74,11 @@ kubectl() {
       printf '%s\n' 'task-image-check-test'
       ;;
     *'get pod/'*imageID*)
-      # jsonpath imageID poll: empty until PULL_POLLS_BEFORE_IMAGE successful polls
-      if [ "${PULL_POLLS_BEFORE_IMAGE:-0}" -gt 0 ]; then
-        PULL_POLLS_BEFORE_IMAGE=$((PULL_POLLS_BEFORE_IMAGE - 1))
+      # jsonpath imageID poll: the remaining empty polls persist in $POLL_STATE
+      # because a function's env changes do not survive the $( ) subshell.
+      remaining=$(cat "$POLL_STATE" 2>/dev/null || true)
+      if [ -n "$remaining" ] && [ "$remaining" -gt 0 ]; then
+        echo $((remaining - 1)) > "$POLL_STATE"
         : # imageID still empty; keep polling
       else
         printf '%s\n' 'sha256:pulled'
@@ -96,6 +98,7 @@ kubectl() {
             env = {**os.environ, "CALL_LOG": str(root / "calls"),
                    "POD_LOG": str(root / "pods"), "POD_PHASE": phase,
                    "IMAGEID_WAIT_SECONDS": str(imageid_wait_seconds or 150),
+                   "POLL_STATE": str(root / "poll-state"),
                    "TASK_IMAGES": "mirror.example/init:4\nmirror.example/task:5", **extra}
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", stub + command],
                                     env=env, capture_output=True, text=True)
@@ -126,7 +129,8 @@ kubectl() {
         self.assertEqual(sum("delete pod/task-image-check-test" in c for c in calls), 2)
 
     def test_probe_polls_until_the_image_id_is_reported(self):
-        result, calls, pods = self.run_probe(PULL_POLLS_BEFORE_IMAGE="1")
+        (Path(self.temp.name) / "poll-state").write_text("1")
+        result, calls, pods = self.run_probe()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(pods), 2)
         self.assertGreaterEqual(sum("-o jsonpath={.status.containerStatuses[0].imageID}" in c for c in calls), 3)
@@ -143,13 +147,6 @@ kubectl() {
         for phase in ("Running", "Failed"):
             with self.subTest(phase=phase):
                 result, calls, _ = self.run_probe(phase=phase)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(sum("delete pod/" in call for call in calls), 2)
-
-    def test_pulled_image_does_not_require_application_success(self):
-        for phase in ("Running", "Failed"):
-            with self.subTest(phase=phase):
-                result, calls, _ = self.run_probe(0, phase=phase)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(sum("delete pod/" in call for call in calls), 2)
 
