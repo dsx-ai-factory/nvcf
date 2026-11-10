@@ -2371,3 +2371,51 @@ func TestConfigDecodesMappingLoadTimeout(t *testing.T) {
 		require.ErrorContains(t, err, "missing unit in duration")
 	})
 }
+
+func TestConfigDecodesRequestSizeLimit(t *testing.T) {
+	for _, value := range []string{"omitted", "26214400", "67108864", "1"} {
+		t.Run(value, func(t *testing.T) {
+			if value != "omitted" {
+				t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			}
+			cmd := &cobra.Command{Use: "gateway"}
+			registerConfigFlags(cmd)
+			v, err := config.InitConfig(cmd, "", "", "")
+			require.NoError(t, err)
+			cmd.Flags().VisitAll(func(f *pflag.Flag) { v.MustBindEnv(f.Name) })
+			var cfg gateway.Config
+			require.NoError(t, v.Unmarshal(&cfg))
+			if value == "omitted" {
+				require.Nil(t, cfg.MaxRequestSizeBytes)
+			} else {
+				expected, err := strconv.ParseInt(value, 10, 64)
+				require.NoError(t, err)
+				require.NotNil(t, cfg.MaxRequestSizeBytes)
+				require.Equal(t, expected, *cfg.MaxRequestSizeBytes)
+			}
+		})
+	}
+}
+
+func TestStartupRejectsInvalidRequestSizeLimit(t *testing.T) {
+	for _, value := range []string{"", "0", "-1", "1.5", "64MiB", "nope", "9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			cmd := NewRootCommand(nil)
+			cmd.SetArgs(nil)
+			require.ErrorContains(t, cmd.Execute(), "MAX_REQUEST_SIZE_BYTES")
+		})
+	}
+}
+
+func TestStartupRejectsInvalidRequestSizeConfigFile(t *testing.T) {
+	for _, value := range []string{"0", "-1", "1.5", "true", `""`, "9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte("MAX_REQUEST_SIZE_BYTES: "+value+"\n"), 0600))
+			cmd := NewRootCommand(nil)
+			cmd.SetArgs([]string{"--config", path})
+			require.ErrorContains(t, cmd.Execute(), "MAX_REQUEST_SIZE_BYTES")
+		})
+	}
+}

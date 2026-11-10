@@ -18,7 +18,10 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
+	"os"
 	"reflect"
+	"strconv"
 
 	"ai-api-gateway-service/gateway"
 
@@ -67,6 +70,14 @@ func NewRootCommand(zapLogger *logs.ZapLogger) *cobra.Command {
 			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
 				v.MustBindEnv(flag.Name)
 			})
+			if value, set := os.LookupEnv("MAX_REQUEST_SIZE_BYTES"); set && value == "" {
+				return fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+			}
+			if v.IsSet("MAX_REQUEST_SIZE_BYTES") {
+				if _, err := strconv.ParseInt(v.GetString("MAX_REQUEST_SIZE_BYTES"), 10, 64); err != nil {
+					return fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes: %w", err)
+				}
+			}
 			c := gateway.Config{}
 			err = v.Unmarshal(&c)
 			if err != nil {

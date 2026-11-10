@@ -2377,6 +2377,7 @@ vanityGateway:
     privateModelNameRegexPattern: {{ dig "addons" "vanityGateway" "config" "privateModelNameRegexPattern" "" .Values | quote }}
     awsRegion: {{ dig "addons" "vanityGateway" "config" "awsRegion" "" .Values | quote }}
     shadowMaxConcurrent: {{ dig "addons" "vanityGateway" "config" "shadowMaxConcurrent" 256 .Values }}
+    maxRequestSizeBytes: {{ dig "addons" "vanityGateway" "config" "maxRequestSizeBytes" 26214400 .Values }}
   mappingConfig:
     {{ dig "addons" "vanityGateway" "mappingConfig" (dict "v2config" (dict "openai" (dict) "vanity" (dict))) .Values | toYaml | nindent 4 | trim }}
   serviceMonitor:

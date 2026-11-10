@@ -53,11 +53,28 @@ Configuration is passed through environment variables.
 | `PRIVATE_MODEL_NAME_REGEX_PATTERN` | No | See below | Regex used to hide private model names from `/v1/models`. |
 | `POD_IP` | No | Empty | Added to trace attributes as `host.ip`. |
 | `AWS_REGION` | No | Empty | Added to trace attributes as `host.dc`. |
+| `MAX_REQUEST_SIZE_BYTES` | No | `26214400` (25 MiB) | Maximum model API request body size in bytes. Explicit values must be positive integers. Invalid values stop startup. |
 | `SHADOW_MAX_CONCURRENT` | No | `256` | Maximum concurrent shadow requests. Non-positive values use the default. |
 
 `PRIVATE_MODEL_NAME_REGEX_PATTERN` defaults to the value compiled into the
 service. Override it when your deployment uses different private model naming
 conventions.
+
+Set `MAX_REQUEST_SIZE_BYTES=67108864` for a 64 MiB limit. The native chart
+exposes the same setting as `vanityGateway.config.maxRequestSizeBytes`:
+
+```yaml
+vanityGateway:
+  config:
+    maxRequestSizeBytes: 67108864
+```
+
+The limit applies to all model API POST routes, including JSON and multipart
+image requests. Bodies exactly at the limit are accepted. Generic vanity
+pass-through routes and private-model lookup response limits are unchanged.
+Existing logs, spans, and request metrics still record rejected requests.
+Changing the environment setting requires a process restart; mapping reloads
+retain the configured limit.
 
 ## Configuration Sources
 
@@ -716,7 +733,7 @@ Requests must use `Content-Type: application/json`. A request without
 a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
 other media type returns `415`. Vendor headers such as
 `TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
-may be up to 25 MB.
+may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default).
 
 ```shell
 source .env
