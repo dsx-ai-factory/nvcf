@@ -218,6 +218,9 @@ func gpushareGroupInfo(req CheckpointRequest) *GPUShareGroupInfo {
 type restoreV2Group struct {
 	Session, InetAddrMap string
 	Namespace, Pod       string
+	// SpanMS is the restore span every GPU rank of the group budgets its
+	// clocks with (groupSpanBudget); 0 outside a group restore.
+	SpanMS int64
 }
 
 // restoreSession is one pod's directory in a group restore.

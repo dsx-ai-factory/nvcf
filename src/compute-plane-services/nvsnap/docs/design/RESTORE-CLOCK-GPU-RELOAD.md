@@ -79,6 +79,19 @@ from the `timens` image).
 A restore faster than its budget waits the difference at the resume, before the tasks run. A slower one
 leaves the overrun counted, as CRIU's budget does today. The recorded span makes the next one right.
 
+**One budget for a group's ranks.** The GPU ranks of a group restore start CRIU together and resume when
+their clocks reach the dump, so a rank's budget decides when it resumes. The recorded span is per node and
+per checkpoint, and an instance's ranks are not always placed on the nodes that restored them before. With
+budgets of their own, a rank new to its node waits out the estimate while the others resume on their last
+span. The others then run with their network locked until the last rank restores. On a 4-node Kimi-K3
+instance one rank took the 1m52s estimate and the others about 50 s. They waited 61 s locked, and the
+leader's workload exited before the unlock, which failed the restore.
+
+So the driver reads each rank's recorded span from its node's agent (`restore-span-ms`, through the
+checkpoint file endpoint) and hands every rank the same one in the restore request (`groupRestoreSpanMs`):
+the largest, or -1 when a rank has none, for which every rank takes the estimate. Companions keep their
+own budget, which covers CRIU only.
+
 | Part | Change | Owner |
 |---|---|---|
 | CRIU (our fork) | a restore option that applies `--timens-budget` without waiting; used with `--leave-stopped` | nvsnap |
@@ -127,6 +140,9 @@ leaves the overrun counted, as CRIU's budget does today. The recorded span makes
 
 - **Agent:** the budget is the recorded whole span with its margin, falls back to the estimate, and is
   bounded. The span is recorded only for a restore that resumed.
+- **Agent, group restore:** every GPU rank gets the slowest rank's span, or the estimate when any rank
+  has none or its span does not parse; companions get none (`TestGroupRestore_OneClockSpanForTheRanks`,
+  `TestGroupRestoreSpanBudget`).
 - **CRIU:** with the new option, the restored clock starts behind by the budget and CRIU returns without
   waiting.
 - **On the cluster:** a Kimi-K3 2-node restore logs no `No available shared memory broadcast block`

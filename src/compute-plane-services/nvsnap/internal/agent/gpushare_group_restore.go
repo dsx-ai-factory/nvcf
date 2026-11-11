@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,11 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	// (which fetch the checkpoints there first).
 	res := &GroupRestoreResult{Members: make([]GroupRestoreMemberResult, len(req.Members))}
 	entries := make([]groupRestoreEntry, len(req.Members))
+	// spans[i] is rank i's last restore of its checkpoint on its node
+	// (spanKnown[i]): the ranks budget their clocks with the largest
+	// (groupSpanBudget).
+	spans := make([]int64, len(req.Members))
+	spanKnown := make([]bool, len(req.Members))
 	bases := make([]string, len(req.Members))
 	// Every node fetches its rank's checkpoint at once: each is the size of
 	// its rank's GPU memory.
@@ -211,6 +217,9 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 				fetchErrs[i] = fmt.Errorf("%s: checkpoint %s: %w", name, m.CheckpointID, err)
 				return
 			}
+			if md.GPUShareGroup != nil && !md.GPUShareGroup.Companion {
+				spans[i], spanKnown[i] = fetchRestoreSpan(ctx, fabricHTTPClient, base, m.CheckpointID)
+			}
 			entries[i] = groupRestoreEntry{Name: name, OldIP: md.SourcePodIP, NewIP: newIPs[i], Group: md.GPUShareGroup}
 			res.Members[i] = GroupRestoreMemberResult{CheckpointID: m.CheckpointID, Pod: name, OldIP: md.SourcePodIP, NewIP: newIPs[i]}
 		}(i, m)
@@ -227,7 +236,15 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	res.InetAddrMap = addrMap
 	res.Session = newFabricSession()
 	log = log.WithFields(logrus.Fields{"fabricSession": res.Session, "inetAddrMap": addrMap})
-	log.Info("group restore: starting every member's restore")
+	var rankSpans []int64
+	var rankKnown []bool
+	for i := range req.Members {
+		if !entries[i].Group.Companion {
+			rankSpans, rankKnown = append(rankSpans, spans[i]), append(rankKnown, spanKnown[i])
+		}
+	}
+	groupSpan := groupRestoreSpan(rankSpans, rankKnown)
+	log.WithField("rankSpanMs", groupSpan).Info("group restore: starting every member's restore")
 
 	// c-e. Restore every pod and unlock them together. The GPU ranks go
 	// first: each reloads its GPU memory (exchanging handle lists with the
@@ -261,6 +278,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 				ReservePIDs:              m.ReservePIDs,
 				GPUShareFabricSession:    res.Session,
 				InetAddrMap:              addrMap,
+				GroupRestoreSpanMS:       rankSpan(entries[i].Group, groupSpan),
 			})
 			mu.Lock()
 			defer mu.Unlock()
@@ -478,6 +496,39 @@ func fetchCheckpointMetadata(ctx context.Context, client *http.Client, base, id 
 		return nil, fmt.Errorf("decode metadata: %w", err)
 	}
 	return &md, nil
+}
+
+// fetchRestoreSpan reads what the last restore of checkpoint id took on
+// the agent at base (restoreSpanFile); false when it has none or it cannot
+// be read, which leaves the group on the estimate.
+func fetchRestoreSpan(ctx context.Context, client *http.Client, base, id string) (int64, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/checkpoints/"+url.PathEscape(id)+"/file?path="+restoreSpanFile, http.NoBody)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || ms < 0 {
+		return 0, false
+	}
+	return ms, true
+}
+
+// rankSpan is the span a member's restore budgets its clocks with: the
+// group's for a GPU rank, none (its own budget) for a companion.
+func rankSpan(g *GPUShareGroupInfo, groupSpan int64) int64 {
+	if g == nil || g.Companion {
+		return 0
+	}
+	return groupSpan
 }
 
 // postRestore runs one member's restore on its node's agent.

@@ -240,7 +240,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// the GPU resume: every task stays stopped until the clocks are there
 	// (restore_clock_gpu.go).
 	clockThroughGPU := gs != nil && clockThroughGPUSupported(a.agentCRIUHelp(), tools.gpuToolText())
-	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU); clockArgs != nil {
+	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU, group.SpanMS); clockArgs != nil {
 		args = append(args, clockArgs...)
 		msg := "criu-v2: the restored clocks continue from the dump once the restore has taken its budget"
 		if clockThroughGPU {
