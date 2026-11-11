@@ -55,8 +55,8 @@ An instance resumed after a failed capture was left half dead.
    The members are released to dump only once every hold has landed. A hold
    still on its way after a bounded wait aborts the capture: landing in the
    middle of the dumps, it would leave some pods held and others running.
-   The abort also cancels the holds still on their way
-   (`group_freeze.go` `driveInstanceFreeze`), so the driver's failure
+   The abort first cancels the holds still on their way, then tells the members
+   to stop (`group_freeze.go` `driveInstanceFreeze`), so the driver's failure
    handling does not wait for a stalled one until the capture's deadline;
    the members' hold releases end any that landed, and an agent refuses a
    hold that comes after its release. A hold that fails outright leaves its

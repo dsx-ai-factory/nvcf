@@ -52,7 +52,7 @@ func TestGroupFreeze_ReleasesTogether(t *testing.T) {
 	}()
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s1", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: b2, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, nil, nil)
+	}, 20*time.Millisecond, log, nil, nil, nil)
 	if !ok {
 		t.Fatal("driver did not release the group")
 	}
@@ -77,7 +77,7 @@ func TestGroupFreeze_WaitsForTheGate(t *testing.T) {
 	gate := make(chan struct{})
 	opened := time.Now().Add(300 * time.Millisecond)
 	time.AfterFunc(300*time.Millisecond, func() { close(gate) })
-	ok := driveGroupFreeze(ctx, http.DefaultClient, "s5", "", []freezeMember{{Base: b1, Namespace: "ns", Pod: "worker-0"}}, 20*time.Millisecond, log, nil, gate)
+	ok := driveGroupFreeze(ctx, http.DefaultClient, "s5", "", []freezeMember{{Base: b1, Namespace: "ns", Pod: "worker-0"}}, 20*time.Millisecond, log, nil, gate, nil)
 	if !ok || time.Now().Before(opened) {
 		t.Fatalf("released before the gate opened (ok=%v)", ok)
 	}
@@ -97,7 +97,7 @@ func TestGroupFreeze_AbortsWhenAMemberEnds(t *testing.T) {
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s2", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"},
 		{Base: b2, Namespace: "ns", Pod: "etcd-0", Done: func() bool { return true }},
-	}, 20*time.Millisecond, log, nil, nil)
+	}, 20*time.Millisecond, log, nil, nil, nil)
 	if ok {
 		t.Fatal("driver released a group with a failed member")
 	}
@@ -176,7 +176,7 @@ func TestGroupFreeze_PostPhaseAcceptsAMemberWithoutHook(t *testing.T) {
 	markPostDumpReached(a.postDumpDir("s4", "ns", "etcd-0"), log)
 	ok := driveGroupFreeze(context.Background(), http.DefaultClient, "s4", "post", []freezeMember{
 		{Base: base, Namespace: "ns", Pod: "etcd-0", Done: func() bool { return true }},
-	}, 20*time.Millisecond, log, nil, nil)
+	}, 20*time.Millisecond, log, nil, nil, nil)
 	if !ok {
 		t.Fatal("a member past its dump aborted the group")
 	}
@@ -199,7 +199,7 @@ func TestGroupFreeze_PostPhaseAbortsOnAFailedDump(t *testing.T) {
 	ok := driveGroupFreeze(context.Background(), http.DefaultClient, "s6", "post", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"},
 		{Base: b2, Namespace: "ns", Pod: "worker-1"},
-	}, 20*time.Millisecond, log, nil, nil)
+	}, 20*time.Millisecond, log, nil, nil, nil)
 	if ok {
 		t.Fatal("a failed dump released the group")
 	}
@@ -240,7 +240,7 @@ func TestGroupFreeze_AbortsWhenAReleaseIsNotTaken(t *testing.T) {
 	t0 := time.Now()
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s7", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: down.URL, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, nil, nil)
+	}, 20*time.Millisecond, log, nil, nil, nil)
 	if ok {
 		t.Fatal("driver reported the group released though a member never got its release")
 	}
@@ -344,7 +344,7 @@ func TestInstanceHold_CompanionsHeldOnceRanksWait(t *testing.T) {
 	close(saved)
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s8", "", []freezeMember{
 		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions())
+	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions(), nil)
 	if !ok {
 		t.Fatal("driver did not release the group")
 	}
@@ -391,7 +391,7 @@ func TestInstanceHold_FreezePointBeforeTheDriverSeesTheGo(t *testing.T) {
 	// No holdRanks: the driver has not seen the go yet.
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s10", "", []freezeMember{
 		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions())
+	}, 20*time.Millisecond, log, hold.holdCompanions, hold.companions(), nil)
 	if !ok {
 		t.Fatal("driver did not release the group")
 	}
@@ -494,7 +494,7 @@ func TestDriveGroupFreeze_HoldsNotInTimeAbort(t *testing.T) {
 	never := make(chan struct{}) // the companions' hold never lands
 	ok := driveGroupFreeze(ctx, http.DefaultClient, "s12", "", []freezeMember{
 		{Base: b1, Namespace: "ns", Pod: "worker-0"}, {Base: b2, Namespace: "ns", Pod: "etcd-0"},
-	}, 20*time.Millisecond, log, nil, never)
+	}, 20*time.Millisecond, log, nil, never, nil)
 	if ok {
 		t.Fatal("the members were released to dump with the instance's holds still pending")
 	}
@@ -521,9 +521,11 @@ func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 	// The companion's agent: its hold never answers.
 	aEtcd := &Agent{}
 	unblock := make(chan struct{})
+	holdStalls := make(chan struct{}, 1)
 	r := mux.NewRouter()
 	r.HandleFunc("/v1/group-freeze/{session}/{namespace}/{pod}", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Query().Get("phase") == "hold" {
+			holdStalls <- struct{}{}
 			select {
 			case <-req.Context().Done():
 			case <-unblock:
@@ -552,6 +554,13 @@ func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 	driveInstanceFreeze(ctx, http.DefaultClient, "s13", []freezeMember{
 		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
 	}, hold, log)
+	// The companion's hold reached its agent and stalled there, so the
+	// abort below ended a request in flight, not one never sent.
+	select {
+	case <-holdStalls:
+	default:
+		t.Fatal("the companion's hold had not reached its agent when the gate aborted")
+	}
 	for range 2 {
 		if err := <-errs; err == nil {
 			t.Error("a member was released to dump with the companion's hold still pending; want it aborted")
@@ -563,5 +572,76 @@ func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 	case <-waited:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the driver still waits for the stalled hold after the gate aborted the capture")
+	}
+}
+
+// The gate's abort cancels the holds still on their way before it tells
+// the members to stop: an abort that a member's agent is slow to take
+// does not keep a companion's hold coming, to freeze its pod while the
+// capture is being abandoned.
+func TestDriveInstanceFreeze_GateAbortCancelsHoldsBeforeTheAbortIsTaken(t *testing.T) {
+	saved := holdGateWait
+	holdGateWait = 100 * time.Millisecond
+	t.Cleanup(func() { holdGateWait = saved })
+	log := logrus.NewEntry(logrus.New())
+	rec := &holdRecorder{holds: map[string]time.Time{}}
+	aRank, bRank := rec.server(t)
+
+	// The companion's agent: its hold never answers, and it takes the
+	// abort only once the test ends.
+	aEtcd := &Agent{}
+	unblock := make(chan struct{})
+	holdStalls := make(chan struct{}, 1)
+	holdCancelled := make(chan struct{}, 1)
+	r := mux.NewRouter()
+	r.HandleFunc("/v1/group-freeze/{session}/{namespace}/{pod}", func(w http.ResponseWriter, req *http.Request) {
+		q := req.URL.Query()
+		switch {
+		case q.Get("phase") == "hold":
+			holdStalls <- struct{}{}
+			select {
+			case <-req.Context().Done():
+				holdCancelled <- struct{}{}
+			case <-unblock:
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case req.Method == http.MethodPost && q.Get("go") == "false":
+			<-unblock
+		}
+		aEtcd.freezeHandler(w, req)
+	}).Methods("GET", "POST")
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithCancel(context.Background()) // the capture's
+	t.Cleanup(func() { close(unblock); cancel() })          // runs before srv.Close
+	bEtcd := srv.URL
+
+	members := []CheckpointRequest{
+		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
+		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
+	}
+	hold := newInstanceHold(ctx, http.DefaultClient, "s14", members, []string{bRank, bEtcd}, log)
+	hold.steps().onGo() // the vote went
+	go func() { _ = aRank.awaitGroupFreeze(ctx, "s14", "ns", "worker-0", log) }()
+	go func() { _ = aEtcd.awaitGroupFreeze(ctx, "s14", "ns", "etcd-0", log) }()
+	driven := make(chan struct{})
+	go func() {
+		defer close(driven)
+		driveInstanceFreeze(ctx, http.DefaultClient, "s14", []freezeMember{
+			{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
+		}, hold, log)
+	}()
+	select {
+	case <-holdStalls:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the companion's hold never reached its agent")
+	}
+	select {
+	case <-holdCancelled:
+	case <-driven:
+		t.Fatal("the driver returned although the companion's agent has not taken the abort")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the companion's hold still runs while the driver waits for its agent to take the abort")
 	}
 }

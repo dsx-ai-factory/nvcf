@@ -253,8 +253,9 @@ type freezeMember struct {
 
 // driveGroupFreeze releases every member from the freeze point of phase
 // ("" before the dump, "post" after it) once all wait there, or aborts them
-// all when one ends before it, or none of that happens in time.
-func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase string, members []freezeMember, poll time.Duration, log *logrus.Entry, reached func(), gate <-chan struct{}) bool {
+// all when one ends before it, or none of that happens in time. An abort
+// calls aborted, if set, before it tells the members.
+func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase string, members []freezeMember, poll time.Duration, log *logrus.Entry, reached func(), gate <-chan struct{}, aborted func()) bool {
 	wait := groupFreezeWait
 	if phase == "post" {
 		wait = postDumpWait
@@ -287,6 +288,14 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 		wg.Wait()
 		return missed.Load() == 0
 	}
+	// abort tells every member to stop, once aborted has ended what the
+	// capture no longer needs: a member's agent can be slow to take it.
+	abort := func() {
+		if aborted != nil {
+			aborted()
+		}
+		release(false, phase)
+	}
 	for {
 		all := true
 		for _, m := range members {
@@ -299,7 +308,7 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 			}
 			if done || failed {
 				log.WithFields(logrus.Fields{"pod": m.Namespace + "/" + m.Pod, "phase": phaseName(phase)}).Warn("group capture: a member ended before the freeze point; aborting the others")
-				release(false, phase)
+				abort()
 				return false
 			}
 			all = false
@@ -325,7 +334,7 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 				case <-ctx.Done():
 				}
 				if !held {
-					release(false, phase)
+					abort()
 					return false
 				}
 			}
@@ -336,7 +345,7 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 				// post-dump abort is recorded ahead of the members that
 				// already dump, and they stop on reaching the barrier.
 				log.WithField("phase", phaseName(phase)).Warn("group capture: a member was not released; aborting the others")
-				release(false, phase)
+				abort()
 				if phase == "" {
 					release(false, "post")
 				}
@@ -347,7 +356,7 @@ func driveGroupFreeze(ctx context.Context, client *http.Client, session, phase s
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			log.Warn("group capture: not every member reached the freeze point; aborting")
-			release(false, phase)
+			abort()
 			return false
 		}
 		time.Sleep(poll)
@@ -508,17 +517,17 @@ func (h *instanceHold) wait() {
 // driveInstanceFreeze drives a group capture's freeze points, before the
 // dump and after it, with hold's steps at the first. A capture aborted
 // before the dump (a member ended, the holds did not land in time) cancels
-// the holds still on their way: the members' hold releases end any that
-// landed (an agent refuses a hold that comes after its release).
+// the holds still on their way, before it tells the members to stop: the
+// members' hold releases end any that landed (an agent refuses a hold that
+// comes after its release).
 func driveInstanceFreeze(ctx context.Context, client *http.Client, session string, members []freezeMember, hold *instanceHold, log *logrus.Entry) {
 	steps := hold.steps()
-	if !driveGroupFreeze(ctx, client, session, "", members, 200*time.Millisecond, log, steps.atFreezePoint, steps.gate) {
-		hold.cancel()
+	if !driveGroupFreeze(ctx, client, session, "", members, 200*time.Millisecond, log, steps.atFreezePoint, steps.gate, hold.cancel) {
 		return
 	}
 	// Dumped, the members wait stopped until all are: none resumes to
 	// talk to one not dumped yet.
-	driveGroupFreeze(ctx, client, session, "post", members, 100*time.Millisecond, log, nil, nil)
+	driveGroupFreeze(ctx, client, session, "post", members, 100*time.Millisecond, log, nil, nil, nil)
 }
 
 // holdMembers holds the member pods of capture session that are
