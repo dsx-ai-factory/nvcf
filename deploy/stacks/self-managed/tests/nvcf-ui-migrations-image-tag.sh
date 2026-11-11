@@ -62,15 +62,15 @@ assert_tag() {
     fail "expected migrations image tag $expected"
 }
 
-write_env "0.19.6"
+write_env "0.23.2"
 render_values "$work_dir/newer-values.yaml" >/dev/null
-assert_tag "$work_dir/newer-values.yaml" "0.19.6"
+assert_tag "$work_dir/newer-values.yaml" "0.23.2"
 
-write_env "0.19.4"
+write_env "0.23.0"
 render_values "$work_dir/older-values.yaml" >/dev/null
-assert_tag "$work_dir/older-values.yaml" "0.19.5"
+assert_tag "$work_dir/older-values.yaml" "0.23.1"
 
-write_env "0.19.5+build.1"
+write_env "0.23.1+build.1"
 if render_values "$work_dir/invalid-values.yaml" >"$work_dir/invalid.log" 2>&1; then
   fail "accepted a SemVer build-metadata suffix that is invalid in an OCI image tag"
 fi
