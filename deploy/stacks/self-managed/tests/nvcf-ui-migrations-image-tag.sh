@@ -37,6 +37,48 @@ addons:
 YAML
 }
 
+# Shared stack tag only: no component tag set.
+write_shared_env() {
+  local tag="$1"
+
+  cat >"$environment_file" <<YAML
+global:
+  image:
+    registry: nvcr.io
+    repository: test/nvcf
+YAML
+  if test -n "$tag"; then
+    cat >>"$environment_file" <<YAML
+  openbaoMigrations:
+    image:
+      tag: "$tag"
+YAML
+  fi
+  cat >>"$environment_file" <<YAML
+addons:
+  nvcfUi:
+    enabled: true
+YAML
+}
+
+render_openbao_values() {
+  local output_file="$1"
+
+  HELMFILE_ENV="$environment_name" \
+    HELMFILE_CACHE_HOME="$work_dir/helmfile-cache" \
+    helmfile \
+      --file "$test_stack_dir/helmfile.d/01-dependencies.yaml.gotmpl" \
+      --environment default \
+      --state-values-set ingress.gatewayApi.controllerNamespace=envoy-gateway-system \
+      --state-values-set ingress.gatewayApi.gateways.shared.name=shared-gw \
+      --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
+      --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
+      --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system \
+      --selector name=openbao-server \
+      write-values \
+      --output-file-template "$output_file"
+}
+
 render_values() {
   local output_file="$1"
 
@@ -62,15 +104,15 @@ assert_tag() {
     fail "expected migrations image tag $expected"
 }
 
-write_env "0.23.2"
+write_env "0.19.6"
 render_values "$work_dir/newer-values.yaml" >/dev/null
-assert_tag "$work_dir/newer-values.yaml" "0.23.2"
+assert_tag "$work_dir/newer-values.yaml" "0.19.6"
 
-write_env "0.23.0"
+write_env "0.19.4"
 render_values "$work_dir/older-values.yaml" >/dev/null
-assert_tag "$work_dir/older-values.yaml" "0.23.1"
+assert_tag "$work_dir/older-values.yaml" "0.19.5"
 
-write_env "0.23.1+build.1"
+write_env "0.19.5+build.1"
 if render_values "$work_dir/invalid-values.yaml" >"$work_dir/invalid.log" 2>&1; then
   fail "accepted a SemVer build-metadata suffix that is invalid in an OCI image tag"
 fi
@@ -78,5 +120,26 @@ grep -qF 'must be a valid OCI image tag' "$work_dir/invalid.log" || {
   cat "$work_dir/invalid.log" >&2
   fail "invalid OCI image tag did not produce the expected validation error"
 }
+
+# The stack default reaches both OpenBao and the UI hook as one tag.
+write_shared_env ""
+render_values "$work_dir/default-ui.yaml" >/dev/null
+render_openbao_values "$work_dir/default-openbao.yaml" >/dev/null
+assert_tag "$work_dir/default-ui.yaml" "0.23.1"
+yq -e '.openbao.migrations.image.tag == "0.23.1"' "$work_dir/default-openbao.yaml" >/dev/null 2>&1 ||
+  fail "OpenBao migrations tag is not the stack default 0.23.1"
+
+# Changing the shared tag moves both together.
+write_shared_env "0.23.4"
+render_values "$work_dir/shared-ui.yaml" >/dev/null
+render_openbao_values "$work_dir/shared-openbao.yaml" >/dev/null
+assert_tag "$work_dir/shared-ui.yaml" "0.23.4"
+yq -e '.openbao.migrations.image.tag == "0.23.4"' "$work_dir/shared-openbao.yaml" >/dev/null 2>&1 ||
+  fail "OpenBao migrations tag did not follow the shared stack tag"
+
+# A shared tag below the UI floor falls back to the floor for the UI only.
+write_shared_env "0.19.4"
+render_values "$work_dir/low-ui.yaml" >/dev/null
+assert_tag "$work_dir/low-ui.yaml" "0.19.5"
 
 echo "nvcf-ui-migrations-image-tag: ok"

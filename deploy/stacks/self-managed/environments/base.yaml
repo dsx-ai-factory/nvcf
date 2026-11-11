@@ -46,6 +46,14 @@ global:
     registry: nvcr.io
     repository: YOUR_ORG/YOUR_TEAM
 
+  # nvcf-openbao-migrations image tag shared by OpenBao, LLS HMAC rotation and
+  # the NVCF UI. Set openbao.migrations.image.tag,
+  # addons.lls.hmacRotation.image.tag or addons.nvcfUi.openbaoMigrations.image.tag
+  # to pin one component.
+  openbaoMigrations:
+    image:
+      tag: "0.23.1"
+
   # =============================================================================
   # Worker Sidecar Registry Configuration
   # =============================================================================
