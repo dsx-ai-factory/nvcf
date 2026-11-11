@@ -241,7 +241,7 @@ func TestDecisionModelEnabledForOneRouteIsNotFoundOnTheOther(t *testing.T) {
 }
 
 func TestDecisionRoutesLocalErrorsUseNativeShape(t *testing.T) {
-	tooLarge := `{"model":"` + strings.Repeat("a", maxRequestSize) + `"}`
+	tooLarge := `{"model":"` + strings.Repeat("a", defaultMaxRequestSize) + `"}`
 	for _, tc := range []struct {
 		name, body string
 		status     int

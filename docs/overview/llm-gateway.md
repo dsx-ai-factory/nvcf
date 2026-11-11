@@ -430,7 +430,10 @@ direct entry, one without `functionType: LLM`, of a function that serves both
 routes, set `usePexec: false`. A direct `usePexec: true` entry reaches only the
 function's default invocation path. On the decision routes the Vanity Gateway
 returns `415` when a request sets a `Content-Type` other than
-`application/json`, and accepts request bodies up to 25 MB.
+`application/json`, and accepts request bodies up to its configured limit,
+25 MiB by default. In the self-managed stack, set it with
+`addons.vanityGateway.config.maxRequestSizeBytes`. The LLM Gateway itself
+rejects request bodies over 50 MiB by default.
 
 ### Anthropic Messages
 
@@ -634,6 +637,8 @@ The client-facing `model` value must include a routing key and model name:
 ```
 
 The gateway uses `<function-id>` to authorize the request and select the NVCF function deployment. It rewrites the upstream model to `<model-name>` before forwarding the request.
+
+The model server never receives caller credentials. On every route, the gateway removes `Authorization`, `X-Api-Key`, `Proxy-Authorization`, and `Cookie` before forwarding, because they authorize NVCF, not the model server.
 
 The configured `llmConfig.uris` must match the paths served by the container. For example, a model that declares `/v1/responses` must have a container backend that can answer `POST /v1/responses`.
 

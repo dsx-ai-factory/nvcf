@@ -105,6 +105,9 @@ func TestReason(t *testing.T) {
 		"context deadline exceeded":                                                                                     "timeout",
 		"CRIU dump failed (criu-v2): exit status 1":                                                                     "criu",
 		"the restored engine never served":                                                                              "other",
+		"CRIU dump failed (criu-v2): the workload exited during the capture: criu-v2 pid-namespace dump: exit status 1": "workload_exited",
+		"group checkpoint s1: 2 of 2 members failed: ns/p-0: 500 Internal Server Error: checkpoint failed: CRIU dump failed (criu-v2): " +
+			"gpushare: fabric session s1, but no process of this pod runs on the GPU under libnvsnap_gpushare.so": "no_gpu_process",
 	} {
 		if got := Reason(text); got != want {
 			t.Errorf("Reason(%q) = %q, want %q", text, got, want)

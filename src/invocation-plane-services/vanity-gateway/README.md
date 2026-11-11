@@ -53,11 +53,40 @@ Configuration is passed through environment variables.
 | `PRIVATE_MODEL_NAME_REGEX_PATTERN` | No | See below | Regex used to hide private model names from `/v1/models`. |
 | `POD_IP` | No | Empty | Added to trace attributes as `host.ip`. |
 | `AWS_REGION` | No | Empty | Added to trace attributes as `host.dc`. |
+| `MAX_REQUEST_SIZE_BYTES` | No | `26214400` (25 MiB) | Maximum model API request body size in bytes. Explicit values must be positive integers. Invalid values stop startup. |
 | `SHADOW_MAX_CONCURRENT` | No | `256` | Maximum concurrent shadow requests. Non-positive values use the default. |
 
 `PRIVATE_MODEL_NAME_REGEX_PATTERN` defaults to the value compiled into the
 service. Override it when your deployment uses different private model naming
 conventions.
+
+Set `MAX_REQUEST_SIZE_BYTES=67108864` for a 64 MiB limit. The native chart
+exposes the same setting as `vanityGateway.config.maxRequestSizeBytes`:
+
+```yaml
+vanityGateway:
+  config:
+    maxRequestSizeBytes: 67108864
+```
+
+The gateway holds each model API request body in memory while it routes the
+request. LLM Gateway routes and shadow models add more copies. In one
+in-process test, a single 64 MiB request raised gateway heap use by about
+224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
+900 MiB with one shadow model. Treat these numbers as examples, not limits.
+When raising this limit, also raise `vanityGateway.resources.limits.memory`.
+Size it from a load test at your expected concurrency, with headroom. The
+chart's default memory limit is `512Mi`.
+
+Requests for models with `functionType: LLM` are also limited by the LLM
+Gateway, which rejects request bodies over 50 MiB (52428800 bytes) by default.
+
+The limit applies to all model API POST routes, including JSON and multipart
+image requests. Bodies exactly at the limit are accepted. Generic vanity
+pass-through routes and private-model lookup response limits are unchanged.
+Existing logs, spans, and request metrics still record rejected requests.
+Changing the environment setting requires a process restart; mapping reloads
+retain the configured limit.
 
 ## Configuration Sources
 
@@ -128,6 +157,17 @@ for OpenAI-compatible endpoints and `path` for Vanity URL routes.
 When `usePexec` is false or omitted, the gateway forwards to `NVCF_API_ENDPOINT`
 with `function-id` and `function-version-id` headers. When `usePexec` is true,
 the gateway rewrites the upstream path to the pexec endpoint instead.
+
+When a model route or Vanity URL route invokes a function through the
+invocation service, with or without `usePexec`, the gateway removes the
+caller's `X-Api-Key` and `Cookie` headers before forwarding, so these
+credentials never reach the function. `Authorization` is
+forwarded: the invocation service authenticates the request with it and removes
+it before the function sees the request. The invocation service does not read
+`X-Api-Key`, so a Messages request that authenticates only with `x-api-key` is
+rejected there with `401`. Configured `customHeaders` are set after this step.
+Models with `functionType: LLM` keep both headers, see
+[LLM Function Models](#llm-function-models).
 
 ```yaml
 v2config:
@@ -387,7 +427,8 @@ these requests. The LLM Gateway resolves the function from the model, so the
 gateway sets none of them, and a caller-supplied value is removed rather than
 forwarded: the mapping is what decides which function a caller reaches.
 Vanity Gateway passes `Authorization`, `NVCF-POLL-SECONDS`, and the caller's
-other headers to the LLM Gateway.
+other headers, including `X-Api-Key` and `Cookie`, to the LLM Gateway. The LLM
+Gateway accepts the API key in `x-api-key` on Messages requests.
 
 Config validation rejects `functionType: LLM` outside the supported
 sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`
@@ -704,7 +745,7 @@ Requests must use `Content-Type: application/json`. A request without
 a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
 other media type returns `415`. Vendor headers such as
 `TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
-may be up to 25 MB.
+may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default).
 
 ```shell
 source .env

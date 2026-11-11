@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -608,7 +609,7 @@ func TestFailGroup_RecordsOnlyOnItsOwnRecord(t *testing.T) {
 }
 
 // A group's failure, as its record keeps it, names every member with the
-// start of its own error, however long each member's error is: the member
+// start and end of its own error, however long each member's error is: the member
 // that failed on its own is not hidden behind the others' aborts.
 func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	abort := "checkpoint failed: CRIU dump failed (criu-v2): action.sh exited, status=1 " + strings.Repeat("Unseizing 4174664 into 1 | ", 400)
@@ -628,6 +629,56 @@ func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	}
 	if len(reason) > groupReasonMax || len(reason) > 3*(groupMemberErrorMax+16)+64 {
 		t.Errorf("reason of %d bytes, want each member bounded", len(reason))
+	}
+}
+
+// A member's error keeps its end: a tool's own error comes after its
+// command line and its progress, which alone fill the bound.
+func TestMemberFailureKeepsTheEnd(t *testing.T) {
+	err := "500 Internal Server Error: restore failed: gpushare resume: nvsnap-gpu-suspend --hold-gate --fabric-map /w/.fabric-s1 resume " +
+		strings.Repeat("123 ", 60) + ": exit status 1 (output: " + strings.Repeat("pid=883 fabmap /w/out.883: ok 267 fabric handle(s) | ", 12) +
+		"fabric map: 267 handle(s) in /w/out; waiting for /w/in | no /w/in after 600 s)"
+	got := memberFailure("fn/worker-0", err)
+	if !strings.HasPrefix(got, "fn/worker-0: 500 Internal Server Error: restore failed: gpushare resume") {
+		t.Errorf("lost the start: %q", got[:80])
+	}
+	if !strings.HasSuffix(got, "no /w/in after 600 s)") {
+		t.Errorf("lost the cause at the end: %q", got[len(got)-80:])
+	}
+	if n := len(got) - len("fn/worker-0: "); n != groupMemberErrorMax {
+		t.Errorf("member error of %d bytes, want %d", n, groupMemberErrorMax)
+	}
+	if short := memberFailure("p", "boom"); short != "p: boom" {
+		t.Errorf("a short error changed: %q", short)
+	}
+}
+
+// A multibyte rune at either cut is kept whole or left out, never split:
+// the recorded error stays valid UTF-8 within the bound.
+func TestTruncateMiddleRuneBoundaries(t *testing.T) {
+	const n = groupMemberErrorMax
+	head := n / 3
+	tail := n - head - len(" … ")
+	for _, tc := range []struct{ name, s string }{
+		// é (2 bytes) starts one byte before the head cut.
+		{"head cut", strings.Repeat("a", head-1) + "é" + strings.Repeat("b", 2*n)},
+		// 世 (3 bytes) and 🙂 (4 bytes) straddling the head cut.
+		{"head cut, 3-byte rune", strings.Repeat("a", head-2) + "世" + strings.Repeat("b", 2*n)},
+		{"head cut, 4-byte rune", strings.Repeat("a", head-1) + "🙂" + strings.Repeat("b", 2*n)},
+		// The tail cut falls on é's second byte.
+		{"tail cut", strings.Repeat("a", 2*n) + "é" + strings.Repeat("b", tail-1)},
+		{"tail cut, 4-byte rune", strings.Repeat("a", 2*n) + "🙂" + strings.Repeat("b", tail-2)},
+	} {
+		got := truncateMiddle(tc.s, n)
+		if !utf8.ValidString(got) {
+			t.Errorf("%s: invalid UTF-8 around the cuts: %q ... %q", tc.name, got[head-4:head+8], got[len(got)-tail-8:len(got)-tail+4])
+		}
+		if len(got) > n {
+			t.Errorf("%s: %d bytes, want at most %d", tc.name, len(got), n)
+		}
+		if !strings.HasPrefix(got, "aaaa") || !strings.HasSuffix(got, "bbbb") || !strings.Contains(got, " … ") {
+			t.Errorf("%s: lost the start, the end or the gap", tc.name)
+		}
 	}
 }
 

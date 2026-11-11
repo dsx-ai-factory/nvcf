@@ -95,7 +95,9 @@ go_library(
         "rootfs_diff.go",
         "rootfsonly_integration.go",
         "tar_extract.go",
+        "verify_abandoned.go",
         "webhook_integration.go",
+        "workload_exited.go",
     ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/agent",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
@@ -253,6 +255,8 @@ go_test(
         "tail_of_file_test.go",
         "tar_extract_test.go",
         "tar_pipe_test.go",
+        "verify_abandoned_test.go",
+        "workload_exited_test.go",
     ],
     data = glob(["testdata/**"]) + [
         ":go_srcs",

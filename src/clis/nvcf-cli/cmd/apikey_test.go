@@ -20,6 +20,8 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +33,7 @@ import (
 
 	"nvcf-cli/internal/apikeys"
 	"nvcf-cli/internal/client"
+	"nvcf-cli/internal/logging"
 	"nvcf-cli/internal/state"
 
 	"github.com/spf13/viper"
@@ -346,6 +349,83 @@ func TestApikeyList_CoversEventLedgerKeys(t *testing.T) {
 		}
 	}
 	assert.Contains(t, services, "event-ledger")
+}
+
+func TestApikeyRevoke_TriesEachIssuer(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		service  string
+		attempts []string
+	}{
+		{"function", "nvcf-test-service-id", []string{"nvcf-test-service-id"}},
+		{"task", "nvct-test-service-id", []string{"nvcf-test-service-id", "nvct-test-service-id"}},
+		{"event-ledger", "event-ledger-test-service-id", []string{"nvcf-test-service-id", "nvct-test-service-id", "event-ledger-test-service-id"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodDelete, r.Method)
+				assert.Equal(t, "/v1/keys/test-key", r.URL.Path)
+				service := r.Header.Get("Key-Issuer-Id")
+				attempts = append(attempts, service)
+				if service != tc.service {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(srv.Close)
+			configureApikeyTest(t, srv.URL)
+			deleteForce = true
+			jsonOutput = true
+			logging.SetJSONOutput(true)
+			t.Cleanup(func() {
+				deleteForce, jsonOutput = false, false
+				logging.SetJSONOutput(false)
+			})
+			stdout := captureStdout(t, func() {
+				require.NoError(t, runRevokeAPIKey(nil, []string{"test-key"}))
+			})
+			assert.JSONEq(t, `{"status":"revoked","keyId":"test-key"}`, stdout)
+			assert.Equal(t, tc.attempts, attempts)
+		})
+	}
+}
+
+func TestApikeyRevoke_StopsOnNon404(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		for stopAt := 1; stopAt <= 3; stopAt++ {
+			t.Run(fmt.Sprintf("status=%d/issuer=%d", status, stopAt), func(t *testing.T) {
+				var attempts int
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					attempts++
+					if attempts < stopAt {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					w.WriteHeader(status)
+				}))
+				t.Cleanup(srv.Close)
+				configureApikeyTest(t, srv.URL)
+				deleteForce = true
+				t.Cleanup(func() { deleteForce = false })
+				err := runRevokeAPIKey(nil, []string{"test-key"})
+				require.ErrorContains(t, err, fmt.Sprintf("API error %d", status))
+				assert.Equal(t, stopAt, attempts)
+			})
+		}
+	}
+}
+
+func TestApikeyRevoke_NotFoundUnderAllIssuers(t *testing.T) {
+	srv, _ := fakeAPIKeysListServer(t, nil, nil, nil)
+	configureApikeyTest(t, srv.URL)
+	deleteForce = true
+	t.Cleanup(func() { deleteForce = false })
+	err := runRevokeAPIKey(nil, []string{"missing"})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, apikeys.ErrKeyNotFound))
+	assert.Contains(t, err.Error(), "function, task or event-ledger")
 }
 
 func TestApikeyList_EmptyJSONIsArray(t *testing.T) {

@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -1509,9 +1510,32 @@ const (
 	groupReasonMax      = 16 << 10
 )
 
-// memberFailure is one member's part of a group's failure.
+// memberFailure is one member's part of a group's failure: the start of
+// its error (what failed) and its end (why: a tool's error comes last,
+// after its command line and progress). A failed gpushare resume's error
+// was cut after the progress, losing the cause (2026-11-06).
 func memberFailure(name, err string) string {
-	return name + ": " + truncate(err, groupMemberErrorMax)
+	return name + ": " + truncateMiddle(err, groupMemberErrorMax)
+}
+
+// truncateMiddle bounds s to n bytes, keeping its first third and its end,
+// with "…" between them.
+func truncateMiddle(s string, n int) string {
+	const gap = " … "
+	if len(s) <= n || n <= 3*len(gap) {
+		return truncate(s, n)
+	}
+	// Both cuts move inward to rune boundaries, so a multibyte rune at
+	// either is left out whole, never split.
+	head := n / 3
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	from := len(s) - (n - n/3 - len(gap))
+	for from < len(s) && !utf8.RuneStart(s[from]) {
+		from++
+	}
+	return s[:head] + gap + s[from:]
 }
 
 // membersFailed is the failure of a group operation (what, in session)

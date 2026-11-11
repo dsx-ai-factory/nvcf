@@ -309,11 +309,13 @@ releases:
 
   - name: event-ledger
     chart: nvcf/helm-nvcf-event-ledger
-    version: 0.9.0
+    version: 0.10.2
     namespace: nvcf
     condition: addons.eventLedger.enabled
     values:
       - ../global.yaml.gotmpl
+    needs:
+      - api-keys/api-keys
     labels:
       release-group: services
 

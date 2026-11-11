@@ -1637,6 +1637,117 @@ mod tests {
         );
     }
 
+    /// Sampling fields that a backend can fix or limit. Such a backend
+    /// answers 400 when a request sets one of them.
+    const BACKEND_RESTRICTED_FIELDS: [&str; 2] = ["top_p", "temperature"];
+
+    #[tokio::test]
+    async fn canary_passes_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                ..TestServerState::default()
+            })
+            .await;
+
+            send_canary_request(
+                &reqwest::Client::new(),
+                &base_url,
+                &test_generation(),
+                Duration::from_secs(1),
+                7,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("canary failed on a backend that rejects `{rejected_field}`: {error}")
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_completes_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                ..TestServerState::default()
+            })
+            .await;
+
+            let outcome = send_calibration_batch(
+                &reqwest::Client::new(),
+                &base_url,
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: 256,
+                    request_count: 1,
+                    concurrency: 1,
+                },
+                &test_runtime_state(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("calibration failed on a backend that rejects `{rejected_field}`: {error}")
+            });
+
+            assert_eq!(
+                outcome,
+                CalibrationStepOutcome::Completed,
+                "backend rejects `{rejected_field}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_stays_ready_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let canary_requests = Arc::new(AtomicUsize::new(0));
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                canary_requests: Some(canary_requests.clone()),
+                ..TestServerState::default()
+            })
+            .await;
+            let runtime_state = test_runtime_state();
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(run_bringup_task(
+                test_task_config(
+                    base_url.to_string(),
+                    BringupConfig {
+                        active_canary_interval: Duration::from_millis(10),
+                        canary_timeout: Duration::from_secs(1),
+                        ..BringupConfig::default()
+                    },
+                ),
+                runtime_state.clone(),
+                stop.clone(),
+            ));
+
+            // The server counts a canary before Pylon has its result, so the
+            // count alone can miss a demotion. Each poll checks readiness.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    assert_eq!(
+                        runtime_state.model_bringup_ready("test-model"),
+                        Some(true),
+                        "backend rejects `{rejected_field}`"
+                    );
+                    if canary_requests.load(Ordering::SeqCst) >= 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a backend that rejects `{rejected_field}` should accept active canaries")
+            });
+
+            stop.cancel();
+            task.await.unwrap();
+        }
+    }
+
     /// Serves canary responses over HTTP/1.1 keep-alive connections and counts
     /// accepted TCP connections.
     async fn spawn_keep_alive_canary_server()
@@ -1808,6 +1919,7 @@ mod tests {
     struct TestServerState {
         completion_tokens: u32,
         error_body: Option<String>,
+        rejected_field: Option<&'static str>,
         event_stream_content_type: Option<String>,
         prompt_too_long_above: Option<usize>,
         calibration_barrier: Option<Arc<Barrier>>,
@@ -1830,6 +1942,7 @@ mod tests {
             Self {
                 completion_tokens: 1,
                 error_body: None,
+                rejected_field: None,
                 event_stream_content_type: None,
                 prompt_too_long_above: None,
                 calibration_barrier: None,
@@ -1995,6 +2108,18 @@ mod tests {
 
         if let Some(error_body) = state.error_body {
             return (StatusCode::SERVICE_UNAVAILABLE, error_body).into_response();
+        }
+
+        if let Some(rejected_field) = state.rejected_field
+            && request.get(rejected_field).is_some()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {"message": "invalid request parameters"}
+                })),
+            )
+                .into_response();
         }
 
         if prompt == "1+1=" {

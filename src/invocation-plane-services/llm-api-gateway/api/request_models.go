@@ -50,7 +50,7 @@ func requestModelID(req *http.Request) string {
 		return ""
 	}
 
-	mediaType, params, err := mime.ParseMediaType(req.Header.Get(echo.HeaderContentType))
+	mediaType, params, err := mime.ParseMediaType(requestContentType(req))
 	if err != nil {
 		return ""
 	}
@@ -63,6 +63,16 @@ func requestModelID(req *http.Request) string {
 	default:
 		return ""
 	}
+}
+
+// requestContentType returns the request's Content-Type, reading a missing
+// header as JSON. Clients and gateways in front of this service send JSON
+// bodies without the header, and the OpenAI routes accept them.
+func requestContentType(req *http.Request) string {
+	if contentType := req.Header.Get(echo.HeaderContentType); contentType != "" {
+		return contentType
+	}
+	return echo.MIMEApplicationJSON
 }
 
 func requestModelIDFromJSON(body []byte) string {
