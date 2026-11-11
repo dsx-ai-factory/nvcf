@@ -233,13 +233,15 @@ For initial activation, add the selector entry to `fern/docs.yml`:
   ref: docs/versions/X.Y.Z
 ```
 
-Choose default promotion separately from initial activation. For a selectable,
-non-default edition, retain `fern/editions.yml`'s current `default`, keep that
-version's selector first, and add the new selector after it. Record the release
-owner's publication decision, any qualification exclusions, and their follow-up
-issues. Disclose unfinished upgrade procedures in the release notes and guides.
-Promote the new default only through a separate reviewed change after the
-remaining qualification gates are complete.
+Activation requires qualification of the complete selected three-stack
+combination. Choose default promotion separately from initial activation.
+For a selectable, non-default edition, retain `fern/editions.yml`'s current
+`default`, keep that version's selector first, and add the new selector after it.
+Record the release owner's publication decision, upgrade procedure limitations,
+and their follow-up issues. Disclose unfinished upgrade procedures in the
+release notes and guides. Promote the new default only through a separate
+reviewed change after upgrade validation and other default-promotion gates are
+complete.
 
 When promoting the default, set `fern/editions.yml`'s `default` to the new version
 and put its selector first. Retain every old version, all six tabs, Development,
