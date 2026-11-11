@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -1555,9 +1556,17 @@ func truncateMiddle(s string, n int) string {
 	if len(s) <= n || n <= 3*len(gap) {
 		return truncate(s, n)
 	}
+	// Both cuts move inward to rune boundaries, so a multibyte rune at
+	// either is left out whole, never split.
 	head := n / 3
-	tail := n - head - len(gap)
-	return s[:head] + gap + s[len(s)-tail:]
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	from := len(s) - (n - n/3 - len(gap))
+	for from < len(s) && !utf8.RuneStart(s[from]) {
+		from++
+	}
+	return s[:head] + gap + s[from:]
 }
 
 // membersFailed is the failure of a group operation (what, in session)

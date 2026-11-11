@@ -82,12 +82,27 @@ func workloadExitedErr(err error, procBase string, pid int, start uint64) error 
 	return fmt.Errorf("%w: %w", errWorkloadExited, err)
 }
 
+// initialStart reads process pid's start time when its dump begins. gone
+// reports the process already ended (its stat does not exist); any other
+// read error gives start 0 and gone false, which tells nothing.
+func initialStart(procBase string, pid int) (start uint64, gone bool) {
+	start, err := procStartTime(procBase, pid)
+	if err != nil {
+		return 0, errors.Is(err, os.ErrNotExist)
+	}
+	return start, false
+}
+
 // dumpFailure is the error of a dump that failed with err: marked
 // errWorkloadExited when CRIU had not dumped the container (dumped false)
-// and its process, pid (started at start), had ended.
-func dumpFailure(err error, dumped bool, procBase string, pid int, start uint64) error {
+// and its process, pid (started at start), had ended, or was already gone
+// when the dump began (gone).
+func dumpFailure(err error, dumped bool, procBase string, pid int, start uint64, gone bool) error {
 	if dumped {
 		return err
+	}
+	if gone && err != nil && !errors.Is(err, errWorkloadExited) {
+		return fmt.Errorf("%w: %w", errWorkloadExited, err)
 	}
 	return workloadExitedErr(err, procBase, pid, start)
 }
