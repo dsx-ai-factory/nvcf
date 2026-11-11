@@ -71,9 +71,12 @@ storage-specific transition and the restore-side mount to a `Promoter`.
   startup validation and logging.
 
 `PromoteResult` tells the orchestrator how restore consumes the artifact:
-`SharedClaimName` (the one ROX PVC; empty when per-pod), `PerPod` (each pod
-gets its own clone in `MountSpec`; the catalog records the snapshot instead
-of a shared PVC), `ReusedWriterVolume` (no copy; informational).
+`SharedClaimName` (the one ROX PVC; empty when per-pod), `PerPod` (clones are
+made in `MountSpec`; `Put` then publishes the logical `rox-<hash>` name,
+`internal/checkpointstore/percapture_pvc.go`), `ReusedWriterVolume` (no copy;
+informational). Not done: the agent's L2 fetch (`internal/agent/l2_fetch.go`
+`fetchFromL2`) needs `EnsureClaim`, which per-pod clones do not support, so
+for them that fetch treats L2 as unavailable and the cascade moves on.
 
 `Backend.Mount` delegates to `MountSpec`, `Backend.Delete` to `Delete`. `Put`
 keeps the lease, write phase, `waitForRWXDetach` and state machine, and calls
@@ -85,13 +88,17 @@ keeps the lease, write phase, `waitForRWXDetach` and state machine, and calls
    VolumeSnapshotClass). `Promote` takes a `VolumeSnapshot` and waits for
    readyToUse. On a ROX-capable class (`Caps.ReadOnlyMany`) it clones one
    `rox-<hash>` ROX PVC. On an RWO-only class it sets `PerPod`, and
-   `MountSpec` clones a `rox-<hash>-<podUID>` RWO PVC per restore pod: one
-   volume per pod, but it works where ROX is impossible.
+   `MountSpec` clones a `rox-<hash>-<vol.Name>` RWO PVC (`ensurePerPodClone`).
+   Not guaranteed to be one per pod: the suffix is the volume name the caller
+   passes, and the cachedir restore passes a fixed one (`cacheDirVolumeMeta`),
+   so restores of one hash in one namespace share one RWO clone and can fail
+   when scheduled on different nodes.
 2. `SharedVolumePromoter` (NVMesh, RWX filesystems). `Promote` sets the
    writer PV to `Retain` and records its `CSI.VolumeHandle`: no snapshot, no
-   copy. `MountSpec` creates the static secondary PV and its RO PVC as above,
-   the handle rewritten by the profile's `volumeHandleTransform` (`none`
-   reuses it verbatim).
+   copy, then creates the static secondary PV and its RO PVC, the handle
+   rewritten by the profile's `volumeHandleTransform` (`none` reuses it
+   verbatim). `MountSpec` looks the claim up and returns `ErrNotFound` when it
+   is absent; `Backend.Mount` can then mint it with `EnsureClaim`.
 3. `copy-per-pod` (RWO storage without snapshots) is a reserved strategy name,
    not implemented: `NewPromoterFromProfile` refuses it. On such storage L2 is
    not offered and the L3/L4 cascade serves restores.

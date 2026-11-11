@@ -42,7 +42,8 @@ at 1024 bytes.
 
 A configuration's CRIU capture is attempted once per agent bundle version (the record's `agentBundle`). A failure
 is recorded as `state=failed` with every member's first error (2.3). It is retried only when the agent bundle
-version or the configuration (a new configuration key) changes. A stall the code classifies as transient (the
+version or the configuration (a new configuration key) changes, and only while fewer than `criuGroupMaxCaptures` (3)
+captures have been made (`criuGroupRecaptures`). A stall the code classifies as transient (the
 instance not ready, agents settling) does not count as a failure.
 
 ### 2.2 A configuration CRIU cannot serve falls back to the caches
@@ -50,8 +51,8 @@ instance not ready, agents settling) does not count as a failure.
 A configuration falls back when its group record (`nvsnap-criu-group-<key>`, keyed by configuration and tenant) says,
 for the current `agentBundle`, `state=failed` (capture failed), `state=restore-failed` (restore failed) or
 `state=gpushare-failed` (2.6). It falls back only once CRIU will not capture it again under the current bundle
-(`criuGroupRecaptures`): a record of another bundle version is not a fallback, and a failed restore is captured again
-until `criuGroupMaxCaptures` is spent. A fallback pod is never taken for a CRIU capture, since its restore
+(`criuGroupRecaptures`): a failed capture of another bundle version is captured again, and a failed restore under
+any bundle, until `criuGroupMaxCaptures` is spent; once it is, the record falls back whatever its bundle. A fallback pod is never taken for a CRIU capture, since its restore
 placeholder would lack its cachedir. A usable record, or none, changes nothing.
 
 For a GPU pod of a configuration that falls back, the webhook, in place of the CRIU-only decoration:
@@ -60,8 +61,10 @@ For a GPU pod of a configuration that falls back, the webhook, in place of the C
    attempt needs it;
 2. gives the pod the cachedir: an emptyDir at `CacheDir` and the cache environment (`cacheDirCapturePatchesFor`;
    for a pod whose model comes from a model volume, the cache entries only). No `nvsnap.io/capture` label is needed;
-3. annotates the pod `nvsnap.io/capture-method: cachedir`, `nvsnap.io/fallback-reason: <state>`,
-   `nvsnap.io/fallback-cache: <key>` and `nvsnap.io/fallback-cache-ordinal: <n>`;
+3. annotates the pod `nvsnap.io/capture-method: cachedir` and `nvsnap.io/fallback-reason: <state>`, and, when its
+   rank has a complete capture and the checkpoint root is configured, `nvsnap.io/fallback-capture: <capture>`
+   (`internal/webhook/criu_fallback.go` `fallbackPatches`). The configuration and rank come from the pod's identity
+   annotations, `nvsnap.io/cache-uri` and `nvsnap.io/cache-ordinal`;
 4. when the record of 2.7 holds a complete capture of the pod's rank, also restores it (2.7).
 
 ### 2.3 Every member's error, kept in the record
@@ -79,8 +82,9 @@ known, so this section is a requirement, not a design.
 ### 2.5 What the preflight can find, it finds before the freeze
 
 The capture preflight blocks a capture whose processes hold RDMA devices, and one where a process holds an MPTCP
-socket (it reads every socket's protocol through `pidfd_getfd`, on a duplicate it closes), naming the process. The
-instance is never frozen for a capture that cannot succeed. Capturing such processes is tracked in #2926.
+socket (it reads every socket's protocol through `pidfd_getfd`, on a duplicate it closes), naming the process, so
+the instance is not frozen for a capture these would fail. Not guaranteed: when no socket's protocol can be read, the
+preflight only warns (`socketScan.findings`), and an undetected MPTCP socket still fails the dump after the freeze. Capturing such processes is tracked in #2926.
 
 A block every pod of the configuration would hit (today only an MPTCP socket) is recorded as a failed capture of
 the current bundle (`configurationRefusal` in `internal/agent/capture_preflight.go`, `recordRefusal` in
@@ -110,11 +114,14 @@ failure (non-zero exit or a signal) twice and the agent has not seen the pod Rea
 
 ### 2.7 The cachedir capture over the bedrock peer
 
-Capture, per rank, by the agent on the rank's node: a pod annotated `nvsnap.io/fallback-cache` that has been Ready for
+Capture, per rank, by the agent on the rank's node (`considerFallbackCapture`): a pod annotated
+`nvsnap.io/fallback-reason`, and not `nvsnap.io/fallback-capture`, that has been Ready for
 the warm-up (60 s) and whose cachedir has stopped changing is captured once per rank. The agent claims the rank in the
 record `nvsnap-cachedir-<key>` (compare-and-swap, so of two pods of one rank one is captured), copies the cachedir to
 `<checkpoint dir>/cachedir-<key>-<n>/tree`, writes a manifest of files and sizes (directories and symbolic links
-last), registers it in the catalog as a checkpoint held by its node, and records the rank complete. The pod can write
+last), registers it in the catalog as a checkpoint held by its node (only with a catalog URL configured), and records the
+rank complete. A failed registration is logged and the rank is still recorded complete; other nodes then cannot fetch
+the capture, and a pod there waits for it before starting without it (`captureFallbackRank`). The pod can write
 its cachedir during the copy, so the agent reads it through an `os.Root`; links live only in the manifest, never in
 the directory the peers serve.
 

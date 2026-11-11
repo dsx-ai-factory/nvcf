@@ -347,7 +347,10 @@ out and starts cold) and stamped with its hash (`nvsnap.io/hash`). Then:
   atomic, so one admission wins and leads (captured as usual); the others are
   admitted against the claim name `rox-<hash>` behind the scheduling gate
   `nvsnap.io/wait-for-cache`, holding no node and no GPU;
-- any error admits the pod unchanged.
+- any error admits the pod unchanged, and so does a manifest whose claim is
+  not bound yet (a promote pending or failed);
+- a follower starts cold, ungated, when the L2 backend cannot name the claim
+  before the promote or clones per pod.
 
 nvsnap-server ungates the followers when the promote reports `ready`. On
 `failed`, a leader gone, or the Lease deadline (default 60 min), it deletes
@@ -371,17 +374,20 @@ end-to-end test `scripts/test-election-e2e.sh` with the stock chart
 ### Cache-set refresh
 
 Off by default (`agent.cacheVolume.refresh`; `agent.cacheVolume.refreshCooldown`,
-default 6 h) and not used under CRIU. A compile-cache set is collected once,
+default 6 h), needs the model volume (`agent.modelVolume.enabled`) and a working
+`agent.l2`, and is not used under CRIU. A compile-cache set is collected once,
 from the cold run; with refresh on it also learns what warm starts compile.
 The seed init lists the paths it seeded in `<cachedir>/.nvsnap-seeded`; after
-Ready the agent stamps on the pod the files written before Ready that are not
-in that list (`nvsnap.io/cache-rank-delta`). When every rank of the group is
+Ready the agent checks for files written before Ready that are not in that
+list and, when it finds any, marks the pod `nvsnap.io/cache-rank-delta: "true"`
+with their byte count and fingerprint beside it (`scanWarmRank`). When every rank of the group is
 live, the set is complete and the cooldown has passed, one agent wins the
 election for the next generation and collects it from the warm ranks through
 `GET /v1/cache-rank/{key}/{ordinal}`. A set is never written in place: each
 generation is a new volume, `Lookup` serves the newest complete one, and the
-reaper retires a superseded one with no reader bound about an hour after it is
-replaced. A delta fingerprint seen twice marks the set `refresh-stable`, which
+reaper retires a superseded one with no reader bound once an hour has passed
+since its last use (`DefaultSupersededGrace`), which can be at once if it was
+last used more than an hour before it was replaced. A delta fingerprint seen twice marks the set `refresh-stable`, which
 stops further refreshes. Code: `internal/modelvolume/modelvolume.go` `Lookup`,
 `internal/modelvolume/reaper.go`, `internal/agent/modelvolume_controller.go`,
 `internal/webhook/reader_steps.go`. Its one run:
@@ -434,8 +440,9 @@ Starting cold in place (`internal/agent/cold_start.go`, `cmd/nvsnap-idle`):
 a lone placeholder's idle program is given the workload's argv (the pod's
 command and args, or the captured entrypoint, `cold_entrypoint`, with the
 pod's args). The agent checks the pod and container are still the failed
-placeholder's, writes a marker on the restore work volume, marks the pod
-`nvsnap.io/criu-cold-started` and kills the container's init. That ends the
+placeholder's, marks the pod `nvsnap.io/criu-cold-started`, writes a marker on
+the restore work volume and kills the container's init; a failed marker write
+leaves the annotation, and a later event retries. That ends the
 pid namespace, including anything a late-failing restore left running; on
 restart the idle program finds the marker and execs the workload as init, on
 every later restart too. The workload's own readiness probe decides the
@@ -446,7 +453,8 @@ namespace, a pod whose containers are never restarted. The liveness and
 startup probes the placeholder dropped stay dropped. A lone placeholder, and a
 one-pod capture with no companions, runs all of the pod's init containers; a
 rank of a larger group skips the ones that only wait on the instance's peers
-and keeps every one whose output something in the pod reads
+and keeps every native sidecar and every one whose output something in the pod
+reads
 (`internal/webhook/criu_restore.go` `initsToKeep`).
 
 ## 11. Platform integration (NVCF and NVCA)

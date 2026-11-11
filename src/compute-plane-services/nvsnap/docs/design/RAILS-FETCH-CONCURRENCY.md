@@ -48,7 +48,9 @@ to 57 s end to end. The transfers waited for each other, not for the rails. No r
 
 ### 3.1 Small checkpoints: the peer tier, on clusters with no L2
 
-A checkpoint smaller than `rails.minSize` goes to the HTTP peer tier and never starts a rails pod. That tier
+With the rails tier on and a catalog configured, a checkpoint smaller than `rails.minSize` goes to the HTTP peer
+tier and never starts a rails pod: the rails fetch finds a source, returns `errRailsSmall`, and `EnsureLocal` tries
+the peers first. With rails off, `rails.minSize` does not route anything and the usual tier order applies. That tier
 needs no pod, NIC claim or shared storage: the fetching agent reads the files from the agents that hold them,
 authenticated, from several sources at once (`fetchFromPeer`). The size is known from the peer listing. Large
 checkpoints keep the rails, and the peer tier stays the fall-back for both. The default comes from
@@ -57,9 +59,10 @@ measurement (section 4, step 1).
 With no L2, a checkpoint lives only on its capture node and on nodes that restored it since, and a group
 restore needs every member's. Losing the one node that holds a companion would lose the whole group's capture.
 So once a group capture is recorded, every member smaller than `rails.minSize` is copied to the capture nodes
-of the group's other members, through their agents' `ensure-local` endpoint (`checkpoint_spread.go`). Then any
-node holding an engine rank's checkpoint also holds every companion. A failed copy is logged and retried by
-the next restore's own fetch; it never fails the capture.
+of the group's other members, through their agents' `ensure-local` endpoint (`checkpoint_spread.go`
+`spreadSmallCheckpoints`). Best effort: the copies run after the capture is recorded, reach only the other capture
+nodes (not nodes that restore a rank later), and a member of unknown size is not copied. A failed copy is logged and
+retried by the next restore's own fetch; it never fails the capture.
 
 ### 3.2 One rails pod per node, shared by every transfer
 

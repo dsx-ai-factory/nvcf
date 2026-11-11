@@ -79,7 +79,7 @@ created already labelled and the fresh concurrent mint passed.
 ## 3. Election with a Dynamo disaggregated graph, 2026-09-25
 
 NVCF Dynamo sample (vllm-runtime 1.1.1, Qwen3-0.6B, frontend + prefill +
-decode). With the role-neutral hash both workers compose 18313f93: prefill
+decode); nvsnap build not recorded. With the role-neutral hash both workers compose 18313f93: prefill
 elected leader, decode follower, frontend ignored. The gang did not
 schedule: `kai-scheduler` places the podgang `myllm-0` as a unit and the
 follower is unschedulable until `rox-<hash>` exists, so the leader is held

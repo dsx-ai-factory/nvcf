@@ -210,9 +210,10 @@ fabric session:
 
 1. The webhook turns fabric on for a pod whose engine spans pods (a
    multi-node flag, or a group of more than one pod) and sets
-   `NVSNAP_GPUSHARE_FABRIC=1` unless the pod sets it;
-   `nvsnap.io/gpushare-fabric` wins either way
-   (`internal/webhook/gpushare.go` `gpushareMode`).
+   `NVSNAP_GPUSHARE_FABRIC=1` unless the container sets it;
+   `nvsnap.io/gpushare-fabric` overrides the webhook's choice, but a value the
+   container sets itself wins over both (`internal/webhook/gpushare.go`
+   `gpushareMode`).
 2. Ask any agent for a group checkpoint of all the pods:
 
    ```bash
@@ -270,9 +271,12 @@ curl -X POST http://<agent>:8081/v1/gpushare/group-restore \
 3. Every member restores with `criu restore --inet-addr-map <map>
    --keep-network-lock`, so a pod restored early cannot reach a peer that is
    not restored yet.
-4. Once every member is restored, the driver unlocks them all (`criu
-   net-unlock` in each pod's network namespace).
-5. Only then does each member run the GPU resume, with the handle exchange.
+4. Each member then runs the GPU resume, with the handle exchange, its GPU
+   launches held by the hold gate, and reports restored.
+5. Once every member is restored, the driver gives the unlock verdict; each
+   member opens its gate, then releases its network lock (`criu net-unlock`
+   in its network namespace) (`internal/agent/restore_v2.go`, `awaitUnlock`,
+   `openHeldGPUOnUnlock`).
 
 If any member fails, the others abort and the driver deletes every target pod
 (`keepFailedPods: true` keeps them): a pod holds its lock until its network

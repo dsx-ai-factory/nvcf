@@ -88,13 +88,17 @@ Reuse guards: the alias and rules are skipped, the restore continues without the
 `RestoreCapturedAddressTotal` (`internal/metrics/metrics.go`) record why, when the captured IP is the new IP of a member of the restored
 instance, or the IP of any pod in the cluster at restore time.
 
+Not guaranteed: when a guard skips (or applying fails) and the inet address map does not move the captured address,
+the restore falls back to the switch-off behaviour and adds the old unguarded loopback alias, with section 3's
+exposure (`internal/agent/restore_address.go` `restoreSourceAddress`; `TestRestoreSourceAddress`).
+
 Not guaranteed: a pod given the captured IP after the restore cannot reach the restored pod by pod IP directly (its
 packets arrive with a local source). Service traffic is unaffected. Several instances restored from one capture each
 hold the captured address privately, on their own loopback and never advertised, so they do not conflict with each
 other.
 
 With the switch off, the single-pod path keeps its old alias, unguarded (section 3's second exposure); with it on, it
-gets the same guards.
+gets the same guards, except for the fallback above.
 
 ## 6. Verification
 
