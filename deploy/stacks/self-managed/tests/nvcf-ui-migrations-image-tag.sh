@@ -62,6 +62,44 @@ addons:
 YAML
 }
 
+# LLS HMAC rotation: shared stack tag and an optional component tag.
+write_lls_env() {
+  local shared_tag="$1" lls_tag="$2"
+
+  cat >"$environment_file" <<YAML
+global:
+  image:
+    registry: nvcr.io
+    repository: test/nvcf
+YAML
+  if test -n "$shared_tag"; then
+    cat >>"$environment_file" <<YAML
+  openbaoMigrations:
+    image:
+      tag: "$shared_tag"
+YAML
+  fi
+  cat >>"$environment_file" <<YAML
+addons:
+  lls:
+    enabled: true
+YAML
+  if test -n "$lls_tag"; then
+    cat >>"$environment_file" <<YAML
+    hmacRotation:
+      image:
+        tag: "$lls_tag"
+YAML
+  fi
+}
+
+assert_lls_tag() {
+  local values_file="$1" expected="$2"
+
+  yq -e ".sis.lls.hmacRotation.image.tag == \"$expected\"" "$values_file" >/dev/null 2>&1 ||
+    fail "expected LLS HMAC rotation image tag $expected"
+}
+
 render_openbao_values() {
   local output_file="$1"
 
@@ -81,7 +119,7 @@ render_openbao_values() {
 }
 
 render_values() {
-  local output_file="$1"
+  local output_file="$1" release="${2:-nvcf-ui}"
 
   HELMFILE_ENV="$environment_name" \
     HELMFILE_CACHE_HOME="$work_dir/helmfile-cache" \
@@ -93,7 +131,7 @@ render_values() {
       --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
       --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
       --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system \
-      --selector name=nvcf-ui \
+      --selector "name=$release" \
       write-values \
       --output-file-template "$output_file"
 }
@@ -133,5 +171,18 @@ render_openbao_values "$work_dir/shared-openbao.yaml" >/dev/null
 assert_tag "$work_dir/shared-ui.yaml" "0.23.4"
 yq -e '.openbao.migrations.image.tag == "0.23.4"' "$work_dir/shared-openbao.yaml" >/dev/null 2>&1 ||
   fail "OpenBao migrations tag did not follow the shared stack tag"
+
+# The LLS HMAC rotation job gets the shared tag unless it sets its own.
+write_lls_env "" ""
+render_values "$work_dir/default-lls.yaml" sis >/dev/null
+assert_lls_tag "$work_dir/default-lls.yaml" "0.23.1"
+
+write_lls_env "0.23.4" ""
+render_values "$work_dir/shared-lls.yaml" sis >/dev/null
+assert_lls_tag "$work_dir/shared-lls.yaml" "0.23.4"
+
+write_lls_env "0.23.4" "0.23.2"
+render_values "$work_dir/component-lls.yaml" sis >/dev/null
+assert_lls_tag "$work_dir/component-lls.yaml" "0.23.2"
 
 echo "nvcf-ui-migrations-image-tag: ok"
