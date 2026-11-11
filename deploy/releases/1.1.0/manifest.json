@@ -1,7 +1,8 @@
 {
   "schema_version": 2,
   "version": "1.1.0",
-  "change": "initial",
+  "previous_version": "1.0.4",
+  "change": "minor",
   "status": "qualified",
   "qualification": "https://github.com/dsx-ai-factory/nvcf/issues/3182",
   "source_commit": "f7c0cb66968a63a45e341ea808034ba6e2b5288c",

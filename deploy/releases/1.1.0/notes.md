@@ -21,12 +21,26 @@ The recorded toolchain is Helm 3.21.4 and Helmfile 1.1.9.
 
 ## Upgrade from NVCF 1.0.1
 
-Follow the
+The upgrade procedure and its validation are still in progress. Publication
+of this release does not establish a qualified upgrade path. Completion is
+tracked in [the upgrade follow-up](https://github.com/dsx-ai-factory/nvcf/issues/3375).
+
+Review the current
 [1.0.1 to 1.1.0 upgrade guide](https://github.com/dsx-ai-factory/nvcf/blob/1388f73aa9db949a4af67a4f653c6a7b81e86c46/docs/overview/release-notes/1.0.1-to-1.1.0-upgrade.md)
-before deployment. It covers the hostname-policy and high availability
-preparation, the single-member Cassandra
-step, queue draining, and the staged control-plane order. Preserve backups and
+before planning an upgrade. It covers hostname-policy and high availability
+preparation, the single-member Cassandra step, queue draining, and the staged
+control-plane order. Preserve backups and
 follow the documented rollback limits; replacing the archive does not reverse
 database migrations.
 
-The maintained 1.1.0 documentation edition is activated separately.
+The maintained 1.1.0 documentation edition is activated separately as a
+selectable version. Version 1.0.4 remains the default until the upgrade
+procedure and its validation are complete. Reviewed documentation corrections
+can be published under the same 1.1.0 edition without changing release assets.
+
+## Subsequent security patch
+
+Further CVE remediation and eMudhra/emSign security backports are planned for
+a subsequent 1.1.x patch. See [the patch release follow-up](https://github.com/dsx-ai-factory/nvcf/issues/3187)
+for scope and delivery status. These fixes are not included by this release's
+qualification approval.
