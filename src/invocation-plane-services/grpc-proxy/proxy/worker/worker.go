@@ -38,6 +38,7 @@ import (
 )
 
 func NewWorkerConnection(requestId uuid.UUID, functionId, functionVersionId string, onActive, onInactive func()) *WorkerConnection {
+	tunnelCtx, endTunnel := context.WithCancel(context.Background())
 	return &WorkerConnection{
 		RequestId:         requestId,
 		FunctionId:        functionId,
@@ -45,9 +46,16 @@ func NewWorkerConnection(requestId uuid.UUID, functionId, functionVersionId stri
 		AttachmentId:      uuid.New(),
 		CreatedAt:         time.Now(),
 		connPopulated:     make(chan struct{}),
+		tunnelCtx:         tunnelCtx,
+		endTunnel:         endTunnel,
 		onActive:          onActive,
 		onInactive:        onInactive,
 	}
+}
+
+// TunnelContext is done once this tunnel has closed, from either side.
+func (w *WorkerConnection) TunnelContext() context.Context {
+	return w.tunnelCtx
 }
 
 // SetCloseOrigin records why this tunnel is being torn down. First writer
@@ -100,6 +108,11 @@ type WorkerConnection struct {
 	closedAt      atomic.Pointer[time.Time]
 	connSetOnce   sync.Once
 	connPopulated chan struct{}
+	// Ended when the tunnel closes. See TunnelContext.
+	tunnelCtx context.Context
+	endTunnel context.CancelFunc
+	// Set by the first RPC forwarded over this attachment. See ClaimFirstRpc.
+	rpcClaimed atomic.Bool
 	// Set only where a worker actually attaches. See EverConnected.
 	everConnected   atomic.Bool
 	handler         atomic.Pointer[httputil.ReverseProxy]
@@ -186,6 +199,13 @@ func (w *WorkerConnection) MarkEnded() bool {
 	return w.attachment.Swap(attachmentEnded) == attachmentEstablished
 }
 
+// ClaimFirstRpc reports whether the caller is the first RPC forwarded over
+// this attachment. Only that RPC is reported to the event ledger, which keeps
+// the event volume at one pair per attachment.
+func (w *WorkerConnection) ClaimFirstRpc() bool {
+	return w.rpcClaimed.CompareAndSwap(false, true)
+}
+
 func (w *WorkerConnection) WorkerClosed() bool {
 	select {
 	case <-w.connPopulated:
@@ -205,6 +225,7 @@ func (w *WorkerConnection) SetConnection(conn net.Conn) error {
 			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
 			w.SetCloseError(wrapped.FirstError())
 			w.MarkClosed(time.Now())
+			w.endTunnel()
 			w.onInactive()
 		}
 		dialOnce := atomic.Bool{}
@@ -282,6 +303,7 @@ func (w *WorkerConnection) Close() error {
 	w.connSetOnce.Do(func() {
 		close(w.connPopulated)
 	})
+	w.endTunnel()
 	w.handler.Store(nil)
 	var err error
 	if w.closeWorkerConn != nil {

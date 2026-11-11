@@ -252,6 +252,8 @@ func Reason(text string) string {
 		return "no_gpu_process"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
+	case strings.Contains(t, "no nvsnap agent"):
+		return "no_agent"
 	case strings.Contains(t, "rdma") || strings.Contains(t, "infiniband"):
 		return "rdma"
 	case strings.Contains(t, "gpushare"):

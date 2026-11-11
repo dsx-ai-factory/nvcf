@@ -40,8 +40,8 @@ import (
 )
 
 const (
-	maxRequestSize = 25 * 1024 * 1024 // 25 MB
-	healthPath     = "/health"
+	defaultMaxRequestSize = 25 * 1024 * 1024 // 25 MiB
+	healthPath            = "/health"
 	// max nvcf api timeout is one hour
 	requestTimeout = 1*time.Hour + 10*time.Second
 )
@@ -60,6 +60,10 @@ func buildRouter(mappings *config.GatewayConfig, serverConfig Config) (*router.S
 // Callers must ensure mappings have been validated (SetupConfigWithConfigPath
 // handles this via WithPostLoadFunc on both initial load and reload).
 func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux, error) {
+	maxRequestSize, err := serverConfig.requestSizeLimit()
+	if err != nil {
+		return nil, err
+	}
 	// Compile the regex pattern
 	re, err := regexp.Compile(serverConfig.PrivateModelNameRegexPattern)
 	if err != nil {
@@ -137,7 +141,7 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 
 	hostRouter := &middleware.HostRouter{}
 
-	registerModelAPIs(hostRouter, mappings, modelDirector, healthManager, serverTelemetry)
+	registerModelAPIs(hostRouter, mappings, modelDirector, healthManager, serverTelemetry, maxRequestSize)
 	registerVanity(hostRouter, mappings, vanityDirector, healthManager, serverTelemetry)
 
 	r.Use(hostRouter.Handler)
@@ -183,7 +187,7 @@ func registerVanity(hostRouter *middleware.HostRouter, mappings *config.GatewayC
 }
 
 // openai specific domain
-func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, modelDirector *ModelDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler) {
+func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, modelDirector *ModelDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler, maxRequestSize int64) {
 	r := chi.NewRouter()
 	r.Use(serverTelemetry)
 	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))

@@ -26,6 +26,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1140,4 +1142,118 @@ func TestBuildChiMux_ImageEndpoints(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, rec.Code)
 	})
+}
+
+func TestModelAPIRequestSizeLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured *int64
+		limit      int
+	}{
+		{"default", nil, 26214400},
+		{"custom 64 MiB", int64Ptr(67108864), 67108864},
+		{"custom small", int64Ptr(128), 128},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mappings := &config.GatewayConfig{}
+			mappings.OpenAI.Host = "test.host"
+			mux, err := buildChiMux(mappings, Config{NvcfApiEndpoint: "http://upstream.invalid", MaxRequestSizeBytes: tc.configured})
+			require.NoError(t, err)
+			paths := []string{"/v1/chat/completions"}
+			if tc.limit == 128 {
+				paths = append(paths, "/v1/completions", "/v1/embeddings", "/v1/messages", decisionsPath, systemOnePath, "/v1/responses", "/v1/images/generations", "/v1/images/edits", "/v1/images/variations")
+			}
+			for _, path := range paths {
+				for _, extra := range []int{-1, 0, 1} {
+					t.Run(path+"/"+strconv.Itoa(extra), func(t *testing.T) {
+						prefix := `{"model":"missing","padding":"`
+						body := prefix + strings.Repeat("x", tc.limit+extra-len(prefix)-2) + `"}`
+						req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+						req.Host = "test.host"
+						req.Header.Set("Content-Type", "application/json")
+						// Also cover streaming bodies without a known Content-Length.
+						req.ContentLength = -1
+						rec := httptest.NewRecorder()
+						mux.ServeHTTP(rec, req)
+						if extra <= 0 {
+							require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+							return
+						}
+						require.Contains(t, rec.Body.String(), strconv.Itoa(tc.limit)+" bytes")
+						switch path {
+						case messagesPath:
+							require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+							require.Contains(t, rec.Body.String(), `"type":"request_too_large"`)
+						case decisionsPath:
+							payload := requireOpenAIErrorBody(t, rec, http.StatusRequestEntityTooLarge)
+							require.Equal(t, "request_too_large", payload.Error.Code)
+						case systemOnePath:
+							requireSystemOneErrorBody(t, rec, http.StatusRequestEntityTooLarge, "request_too_large")
+						default:
+							var payload OpenAIError
+							require.Equal(t, http.StatusBadRequest, rec.Code)
+							require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+							require.Equal(t, "invalid_request_error", payload.Error.Type)
+							require.Equal(t, "invalid_image_format", payload.Error.Code)
+							require.Nil(t, payload.Error.Param)
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
+func TestVanityPassThroughIgnoresModelAPIRequestSizeLimit(t *testing.T) {
+	body := strings.Repeat("x", 129)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.Equal(t, body, string(got))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(backend.Close)
+	mappings := &config.GatewayConfig{}
+	mappings.Vanity = map[string]config.VanityEntry{
+		"test": {Host: "test.host", Paths: map[string]config.PathFunctionDetails{
+			"echo": {Path: "/echo", FunctionID: "test-function"},
+		}},
+	}
+	mux, err := buildChiMux(mappings, Config{NvcfApiEndpoint: backend.URL, MaxRequestSizeBytes: int64Ptr(128)})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(body))
+	req.Host = "test.host"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+func TestMultipartImageRequestSizeLimit(t *testing.T) {
+	body := &bytes.Buffer{}
+	form := multipart.NewWriter(body)
+	require.NoError(t, form.WriteField("model", "missing"))
+	image, err := form.CreateFormFile("image", "input.png")
+	require.NoError(t, err)
+	_, err = io.WriteString(image, strings.Repeat("x", 256))
+	require.NoError(t, err)
+	require.NoError(t, form.Close())
+	mappings := &config.GatewayConfig{}
+	mappings.OpenAI.Host = "test.host"
+	for _, path := range []string{"/v1/images/edits", "/v1/images/variations"} {
+		for _, extra := range []int{0, 1} {
+			mux, err := buildChiMux(mappings, Config{NvcfApiEndpoint: "http://upstream.invalid", MaxRequestSizeBytes: int64Ptr(int64(body.Len()))})
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body.String()+strings.Repeat(" ", extra)))
+			req.Host = "test.host"
+			req.Header.Set("Content-Type", form.FormDataContentType())
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if extra == 0 {
+				require.Equal(t, http.StatusNotFound, rec.Code, rec.Body.String())
+			} else {
+				require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+				require.Contains(t, rec.Body.String(), strconv.Itoa(body.Len())+" bytes")
+			}
+		}
+	}
 }

@@ -159,6 +159,14 @@ helmfile -e <env> apply
 An invalid mode fails the render fast with a clear error, so a typo cannot
 silently disable HA.
 
+> **Single-member Cassandra:** if your Cassandra runs a single member, do not
+> enable HA by setting the mode and applying. The Cassandra chart raises the
+> `system_auth` replication factor in a hook that runs after the StatefulSet
+> scales, and it does not repair the data, so administrator and service logins can
+> fail while every member shows `UN`. Expand and repair Cassandra first, with the
+> steps in [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
+> then apply.
+
 ## What HA changes, by tier
 
 ### Replica-safe Deployments
@@ -177,7 +185,9 @@ safely.)
 > advertises its own address in the work message: grpc-proxy its Pod IP, and
 > invocation-service `<dashed-pod-ip>.invocation.nvcf.svc.cluster.local`, which
 > cluster DNS resolves to that pod. Workers in the same cluster reach that
-> address directly, so no proxy and no DNS change are needed.
+> address directly, so no proxy and no DNS change are needed. Workers in
+> another cluster cannot reach pod addresses; they need the
+> [Worker Callback Proxy](./worker-callback-proxy.md).
 >
 > The invocation-service name is a CoreDNS endpoint record, which CoreDNS
 > answers by default. It does not resolve if CoreDNS has `endpoint_pod_names`
@@ -193,7 +203,9 @@ safely.)
 > request. When one is set, the affected service stays at **a single replica**
 > under HA with its HPA disabled, keeps hostname anti-affinity and zone spread
 > (no-ops at one replica), and gets **no HA PDB** (a `minAvailable: 1` PDB on a
-> singleton would block node drains).
+> singleton would block node drains). grpc-proxy with HTTP/3 enabled
+> (`grpcproxy.http3.enabled`, or the worker callback proxy) is the exception:
+> each pod puts its own IP in front of the base URL, so it still scales.
 >
 > If you enable the HPA (`invocation.autoscaling.enabled` or
 > `grpcproxy.deployment.autoscaling.enabled`), HA raises its `minReplicas` to 2

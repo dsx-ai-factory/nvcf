@@ -54,7 +54,7 @@ func requireOneRequestID(t *testing.T, header http.Header, messages bool) string
 }
 
 func TestGatewayGeneratedErrorsCarryRequestID(t *testing.T) {
-	tooLarge := `{"model":"` + strings.Repeat("a", maxRequestSize) + `"}`
+	tooLarge := `{"model":"` + strings.Repeat("a", defaultMaxRequestSize) + `"}`
 	tests := []struct {
 		name   string
 		path   string

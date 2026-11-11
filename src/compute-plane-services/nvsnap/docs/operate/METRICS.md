@@ -49,11 +49,13 @@ Labels:
 - `ranks`: the instance's GPU ranks, bucketed `1`, `2-4`, `5-8`, `9-16`,
   `17+`; companions (etcd, NATS) are not ranks.
 - `reason`: the class of a failure or refusal: `mptcp`, `rdma`, `gpushare`,
-  `fetch`, `timeout`, `criu`, `other`, and two that are the workload's own
-  doing, not a fault of nvsnap's: `workload_exited` (the container's process
-  had ended when its dump failed: it is gone, or a later process holds its
-  pid) and `no_gpu_process` (a pod of a multi-node instance had no process on
-  the GPU under the gpushare library to capture).
+  `fetch`, `timeout`, `criu`, `other`; `no_agent` for an instance refused
+  because a companion of it runs on a node no nvsnap agent runs on; and two
+  that are the workload's own doing, not a fault of nvsnap's:
+  `workload_exited` (the container's process had ended when its dump failed:
+  it is gone, or a later process holds its pid) and `no_gpu_process` (a pod of
+  a multi-node instance had no process on the GPU under the gpushare library
+  to capture).
 - `source`: where a checkpoint fetched to a node came from: `rails`, `peer`,
   `fsstore`, `volume` (`unknown` for a fetch that found no source). A
   checkpoint already on the node is no fetch.
