@@ -574,7 +574,7 @@ func TestRenderStackPackageDownloads(t *testing.T) {
 	catalog.Stack.Version = "1.2.3"
 	catalog.SupplementalArtifacts[0].Version = "2.3.4"
 	catalog.SupplementalArtifacts[1].Version = "3.4.5"
-	got, err := Render("stack-package-downloads", catalog)
+	got, err := Render("stack-package-downloads-fail-fast", catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +594,7 @@ func TestRenderStackPackageDownloads(t *testing.T) {
 		}
 	}
 	catalog.PublicationPending = []string{catalog.Stack.Name, computeStackResourceName}
-	got, err = Render("stack-package-downloads", catalog)
+	got, err = Render("stack-package-downloads-fail-fast", catalog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,8 +605,31 @@ func TestRenderStackPackageDownloads(t *testing.T) {
 	}
 }
 
+func TestLegacyStackPackageDownloadsPreserveApprovedBytes(t *testing.T) {
+	catalog := testCatalog()
+	got, err := Render("stack-package-downloads", catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "```bash\n"
+	for _, spec := range []struct{ name, version, directory, label string }{
+		{catalog.Stack.Name, catalog.Stack.Version, "self-managed", "Self-Managed"},
+		{computeStackResourceName, catalog.SupplementalArtifacts[0].Version, "nvcf-compute-plane", "Compute Plane"},
+		{observabilityStackResourceName, catalog.SupplementalArtifacts[1].Version, "observability", "Observability"},
+	} {
+		want += fmt.Sprintf("# %s %s\n", spec.label, spec.version)
+		want += fmt.Sprintf("ngc registry resource download-version %q && \\\n  tar -xzf %q \\\n    -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n",
+			"nvidia/nvcf/"+spec.name+":"+spec.version,
+			fmt.Sprintf("%s_v%s/%s-%s.tar.gz", spec.name, spec.version, spec.name, spec.version), spec.directory)
+	}
+	want += "```\n"
+	if got != want {
+		t.Fatalf("legacy generated commands changed: got %q, want %q", got, want)
+	}
+}
+
 func TestStackPackageDownloadsStopOnFailure(t *testing.T) {
-	block, err := Render("stack-package-downloads", testCatalog())
+	block, err := Render("stack-package-downloads-fail-fast", testCatalog())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +717,7 @@ func testBundledChartDistribution(t *testing.T, repository, sha string) {
 func TestRenderStackPackageDownloadsRequiresSiblingPackages(t *testing.T) {
 	catalog := testCatalog()
 	catalog.SupplementalArtifacts = nil
-	if _, err := renderStackPackageDownloads(catalog); err == nil {
+	if _, err := renderStackPackageDownloads(catalog, true); err == nil {
 		t.Fatal("expected an error for missing sibling packages")
 	}
 }

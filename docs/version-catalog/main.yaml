@@ -1856,7 +1856,7 @@ outputs:
   - path: docs/overview/umbrella-releases.md
     blocks:
       - marker: stack-package-downloads
-        renderer: stack-package-downloads
+        renderer: stack-package-downloads-fail-fast
   - path: docs/overview/image-mirroring.md
     blocks:
       - marker: image-mirroring-cli-snippet
