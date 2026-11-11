@@ -157,11 +157,12 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 			}
 			expected = current.RawValue()
 			if ttl := current.TTL(); ttl > 0 {
-				// Same window: increment in place and keep the remaining TTL.
+				// Same window: increment in place and keep the absolute expiry.
 				// GetResponse.TTL reports the stored expiry as an absolute Unix
-				// millisecond timestamp, so the swap re-arms exactly what is left.
+				// millisecond timestamp; PXAT re-arms it verbatim, where a
+				// remaining-duration round-trip can truncate to zero.
 				newValue = old + 1
-				options = append(options, olric.PX(time.Until(time.UnixMilli(ttl))))
+				options = append(options, olric.PXAT(time.Duration(ttl)*time.Millisecond))
 				expiration = time.UnixMilli(ttl)
 			} else {
 				// No TTL left on the key: restart the window at 1.
