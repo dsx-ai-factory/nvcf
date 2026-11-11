@@ -1284,7 +1284,18 @@ static void do_release(char *reply, size_t n, const char *args)
     for (int i = 0; r == CUDA_SUCCESS && i < n_mcs; i++) {
         if (mcs[i].dead || mcs[i].released) continue;
         int live = mc_live(i);
-        if (!live && !mcs[i].creator) { mcs[i].dead = 1; continue; }
+        if (!live && !mcs[i].creator) {
+            /* The app let go of this importer and no longer maps or binds
+             * it. A handle we re-imported for it (own) is ours to release;
+             * only then is it dead, so a failed release rolls back as is. */
+            if (mcs[i].own) {
+                what = "release multicast";
+                if ((r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h)) != CUDA_SUCCESS) continue;
+                mcs[i].own = 0;
+            }
+            mcs[i].dead = 1;
+            continue;
+        }
         what = "release multicast";
         if (!mcs[i].app_released || mcs[i].own) r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h);
         if (r == CUDA_SUCCESS) mcs[i].released = 1, mcs[i].own = 0;
