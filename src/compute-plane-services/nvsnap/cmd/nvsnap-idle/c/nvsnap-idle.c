@@ -26,6 +26,13 @@
  * included. When the container restarts, this program finds MARKER and execs
  * COMMAND, which becomes the container's init as in a fresh start; so does
  * every later restart.
+ *
+ * While it idles, it blanks COMMAND [ARG...] in its own argument memory, so
+ * /proc/PID/cmdline (its ticking children's too) shows only
+ * "nvsnap-idle --cold-start MARKER --". Tools that find the workload by its
+ * command line (a gang health sidecar looking for "-m dynamo.vllm",
+ * pkill -f) must not take the placeholder for it. The arguments are only
+ * needed by a start that finds MARKER, which execs before this.
  */
 #include <errno.h>
 #include <signal.h>
@@ -37,6 +44,18 @@
 #include <unistd.h>
 
 #define TICK_SECONDS 2
+
+/* hide_args zeroes argv[from..argc-1] where the kernel shows the command
+ * line. The strings are contiguous there; if not, they are left alone. */
+static void hide_args(int argc, char **argv, int from) {
+	if (from >= argc)
+		return;
+	for (int i = from + 1; i < argc; i++)
+		if (argv[i] != argv[i - 1] + strlen(argv[i - 1]) + 1)
+			return;
+	char *end = argv[argc - 1] + strlen(argv[argc - 1]);
+	memset(argv[from], 0, (size_t)(end - argv[from]));
+}
 
 static volatile sig_atomic_t stop;
 
@@ -54,6 +73,7 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "nvsnap-idle: cannot start %s: %s\n", argv[4], strerror(errno));
 			return 127;
 		}
+		hide_args(argc, argv, 4);
 	}
 
 	struct sigaction sa = {0};

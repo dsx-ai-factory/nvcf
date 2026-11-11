@@ -40,7 +40,6 @@ import (
 	"github.com/felixge/httpsnoop"
 	"github.com/go-chi/chi/v5"
 	"github.com/goccy/go-json"
-	"github.com/valyala/bytebufferpool"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
@@ -933,9 +932,10 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 
 	targetModelNames := shadowModelNames(shadows)
 
-	// Clone body only for shadowed requests — avoids allocation on the hot path.
-	rawBody, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close() // releases bytebufferpool buffer
+	// Shadow bodies read from the primary's pooled buffer instead of copying it.
+	// Each holds its own reference, so the buffer returns to the pool only after
+	// the primary proxy and every shadow replay close their bodies.
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		recordShadowDispatchSummary(
 			resolved.request.Context(),
@@ -947,9 +947,7 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 		)
 		return func(error) {}
 	}
-	// Reset primary request body (pool buffer released above).
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rawBody))
-	resolved.request.ContentLength = int64(len(rawBody))
+	modelSpans, modelSpansErr := topLevelModelSpans(body.peek())
 
 	// Replay through the same code path — proxyModelMappedRequest will resolve the
 	// shadow model name from the same mapping and proxy it. The NVCF-Shadow header
@@ -964,7 +962,7 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 	var droppedTargetModels []string
 	finishers := make([]func(error), 0, len(shadows))
 	for _, shadow := range shadows {
-		shadowBody, err := d.rewriteShadowBody(resolved.request, rawBody, shadow.modelName)
+		shadowBody, shadowBodyLength, err := d.newShadowBody(body, modelSpans, modelSpansErr, shadow.modelName)
 		if err != nil {
 			zap.L().Warn("shadow body rewrite failed, dropping target", append(
 				middleware.TraceFields(resolved.request.Context()),
@@ -982,13 +980,14 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 		// Build shadow request with the rewritten body and recursion guard.
 		shadowCtx, finishShadow := shadowContext(resolved.request, shadow.cancelOnClientDisconnect)
 		finishers = append(finishers, finishShadow)
-		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowCtx)
+		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowBodyLength, shadowCtx)
 		handler := newShadowReplayHandler(shadow.modelName, replayHandler)
 
 		// Shadow admission errors are logged by TrafficShadower and summarized below.
 		// They must not affect the primary request.
 		err = d.shadower.Shadow(shadowReq, handler)
 		if err != nil {
+			_ = shadowBody.Close()
 			droppedCount++
 			if reason := shadowDroppedReason(err); reason != "" {
 				droppedReasons = append(droppedReasons, reason)
@@ -1016,17 +1015,29 @@ func (d *ModelDirector) randomShadowBucket() int {
 	return rand.IntN(100)
 }
 
-// rewriteShadowBody points a shadow copy at its target model. Decision routes
-// replace only the model value so the shadow keeps every other byte, as the
-// primary does.
-func (d *ModelDirector) rewriteShadowBody(request *http.Request, body []byte, modelName string) ([]byte, error) {
+// newShadowBody points a shadow copy at its target model. It replaces only
+// the model values found in modelSpans, so the shadow keeps every other byte,
+// as the primary does, and reads them from the primary's pooled buffer.
+func (d *ModelDirector) newShadowBody(body *pooledRequestBody, modelSpans []byteSpan, modelSpansErr error, modelName string) (io.ReadCloser, int64, error) {
 	if d.shadowBodyRewriter != nil {
-		return d.shadowBodyRewriter(body, modelName)
+		rewritten, err := d.shadowBodyRewriter(body.peek(), modelName)
+		if err != nil {
+			return nil, 0, err
+		}
+		return io.NopCloser(bytes.NewReader(rewritten)), int64(len(rewritten)), nil
 	}
-	if isDecisionRoute(request) {
-		return replaceTopLevelModel(body, modelName)
+	if modelSpansErr != nil {
+		return nil, 0, modelSpansErr
 	}
-	return rewriteShadowRequestModel(body, modelName)
+	modelValue, err := encodeModelValue(modelName)
+	if err != nil {
+		return nil, 0, err
+	}
+	shadowBody, err := body.withModel(modelSpans, modelValue)
+	if err != nil {
+		return nil, 0, err
+	}
+	return shadowBody, shadowBody.Len(), nil
 }
 
 func finishShadows(finishers []func(error)) func(error) {
@@ -1045,25 +1056,28 @@ func (d *ModelDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved r
 		return nil
 	}
 
-	body, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close()
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("failed to read request body: %w", err))
 		return nil
 	}
-
-	rewrite := rewriteShadowRequestModel
-	if isDecisionRoute(resolved.request) {
-		rewrite = replaceTopLevelModel
+	// The forwarded body reads the pooled buffer around the new model values and
+	// holds its own buffer reference, so the primary body can close now.
+	rewritten, err := body.withTopLevelModel(resolved.functionInfo.functionId + "/" + resolved.modelName)
+	_ = body.Close()
+	if errors.Is(err, errInvalidJSONBody) {
+		// The model extractor accepts some bodies strict JSON rejects, such as
+		// raw control characters in strings. The caller sent them, so answer 400.
+		writeInvalidJSONBody(writer, resolved.request, err)
+		return nil
 	}
-	rewritten, err := rewrite(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, err)
 		return nil
 	}
 
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rewritten))
-	resolved.request.ContentLength = int64(len(rewritten))
+	resolved.request.Body = rewritten
+	resolved.request.ContentLength = rewritten.Len()
 
 	return d.llmGatewayDirector.ServeProxy(
 		LLMGatewayRequest{
@@ -1112,73 +1126,6 @@ func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolve
 		resolved.request,
 	)
 	return observer.shadowFinalizationError(resolved.request, proxyErr)
-}
-
-func rewriteShadowRequestModel(body []byte, modelName string) ([]byte, error) {
-	if modelName == "" {
-		return body, nil
-	}
-
-	payload := map[string]json.RawMessage{}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("failed to decode shadow request body: %w", err)
-	}
-
-	modelValue, err := json.Marshal(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow model name: %w", err)
-	}
-	payload["model"] = modelValue
-
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow request body: %w", err)
-	}
-	return rewritten, nil
-}
-
-// replaceTopLevelModel replaces the value of every top-level model member in
-// place and keeps every other byte of body. Go decoders match keys without
-// regard to case and differ on which duplicate wins, so every key that equals
-// model in any case is replaced and the LLM Gateway cannot read a value the
-// gateway did not resolve.
-func replaceTopLevelModel(body []byte, modelName string) ([]byte, error) {
-	modelValue, err := stdjson.Marshal(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode model name: %w", err)
-	}
-	decoder := stdjson.NewDecoder(bytes.NewReader(body))
-	if token, err := decoder.Token(); err != nil || token != stdjson.Delim('{') {
-		return nil, fmt.Errorf("request body is not a JSON object")
-	}
-	type span struct{ start, end int64 }
-	var spans []span
-	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read request body key: %w", err)
-		}
-		key, _ := token.(string)
-		var value stdjson.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return nil, fmt.Errorf("failed to read request body value: %w", err)
-		}
-		if strings.EqualFold(key, "model") {
-			end := decoder.InputOffset()
-			spans = append(spans, span{end - int64(len(value)), end})
-		}
-	}
-	if len(spans) == 0 {
-		return nil, fmt.Errorf("request body has no model member")
-	}
-	rewritten := make([]byte, 0, len(body)+len(spans)*len(modelValue))
-	var last int64
-	for _, s := range spans {
-		rewritten = append(rewritten, body[last:s.start]...)
-		rewritten = append(rewritten, modelValue...)
-		last = s.end
-	}
-	return append(rewritten, body[last:]...), nil
 }
 
 // errModelFieldMissing signals that the client sent a valid request body that did
@@ -1348,47 +1295,6 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	return body, nil
 }
 
-type bufferedOpenAIRequestBody struct {
-	*bytes.Reader
-	buffer  *bytebufferpool.ByteBuffer
-	release func()
-}
-
-func readOpenAIRequestBody(request *http.Request, bodyDescription string) (*bufferedOpenAIRequestBody, error) {
-	if request.Body == nil {
-		return nil, fmt.Errorf("expecting %s", bodyDescription)
-	}
-
-	bodyBytes := bytebufferpool.Get()
-	releaseBuffer := sync.OnceFunc(func() {
-		bodyBytes.Reset()
-		bytebufferpool.Put(bodyBytes)
-	})
-	_, err := io.Copy(bodyBytes, request.Body)
-	_ = request.Body.Close()
-	if err != nil {
-		releaseBuffer()
-		return nil, fmt.Errorf("failed to read body: %w", err)
-	}
-
-	bufferedBody := &bufferedOpenAIRequestBody{
-		Reader:  bytes.NewReader(bodyBytes.Bytes()),
-		buffer:  bodyBytes,
-		release: releaseBuffer,
-	}
-	request.Body = bufferedBody
-	return bufferedBody, nil
-}
-
-func (b *bufferedOpenAIRequestBody) peek() []byte {
-	return b.buffer.Bytes()
-}
-
-func (b *bufferedOpenAIRequestBody) Close() error {
-	b.release()
-	return nil
-}
-
 func getFirstValue[K comparable, V any](k K, maps ...map[K]V) (V, bool) {
 	for _, m := range maps {
 		if v, ok := m[k]; ok {
@@ -1423,6 +1329,18 @@ func isDecisionRoute(request *http.Request) bool {
 
 // requestReadFailure maps a failure to read or parse the request body to the
 // status, error code and message of the route's native error.
+// writeInvalidJSONBody answers a request whose body is not valid JSON with 400
+// invalid_json in the route's error shape.
+func writeInvalidJSONBody(writer http.ResponseWriter, request *http.Request, err error) {
+	markGatewayRejected(writer, request)
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+		status, kind, message := requestReadFailure(protocol, err)
+		writeNativeError(writer, request, status, kind, message)
+		return
+	}
+	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
+}
+
 func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
 	status, kind := http.StatusInternalServerError, ""
 	message := "failed to read request"

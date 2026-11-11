@@ -822,7 +822,11 @@ func TestBuildChiMux_CancelsStreamingShadowAfterPrimaryStreamStarts(t *testing.T
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			assert.Contains(t, string(body), `"model":"openai-gateway-shadow"`)
+			var payload struct {
+				Model string `json:"model"`
+			}
+			assert.NoError(t, json.Unmarshal(body, &payload))
+			assert.Equal(t, "openai-gateway-shadow", payload.Model)
 
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)

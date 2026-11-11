@@ -23,3 +23,13 @@ editions:
         revisions:
             - f00ae2290a4b1169ec37ac4dd79726a5b4a21410
             - 59d50ba4c276cfddbfe8e0661e13566c24679aca
+    - version: 1.1.0
+      ref: docs/versions/1.1.0
+      commit: 0f68ca343e884104162e2c73bcb096234cbe3000
+      mode: umbrella
+      umbrella:
+        product_commit: 2120f7aa9186391ad4f45bfaa0f5587364e1a3ff
+        manifest_sha256: sha256:531239f3efca39d936d694e22f0c6fea54ead7c417b9ba8afa0781a9cc64e626
+        revisions:
+            - 3d89c1b74c595711a143a7a5ee92290fa40e5546
+            - 0f68ca343e884104162e2c73bcb096234cbe3000

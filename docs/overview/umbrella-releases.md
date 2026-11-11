@@ -12,7 +12,12 @@ this docs edition's [artifact manifest](manifest.md). Use one selected
 combination. Mixing the latest versions of each stack can select a different
 combination from the one documented here.
 
-For the 1.0.4 selection and changes from docs edition 1.0.2, read the
+For NVCF 1.1.0, read the [release notes](../../fern/changelog/2026-11-10.mdx).
+The [1.0.1 to 1.1.0 upgrade procedure](release-notes/1.0.1-to-1.1.0-upgrade.md)
+is still under validation. The 1.1.0 docs edition is selectable; 1.0.4 remains
+the default until that procedure and its validation are complete.
+
+For the earlier 1.0.4 selection and changes from docs edition 1.0.2, read its
 [release notes](../../fern/changelog/2026-10-26.mdx) and
 [upgrade procedure](release-notes/1.0.2-to-1.0.4-upgrade.md).
 The [compatibility policy](compatibility-matrix.md#compatibility-and-maintenance-policy)
