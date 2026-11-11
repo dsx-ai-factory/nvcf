@@ -120,7 +120,31 @@ func newTestStoreCluster(t *testing.T, size int) []*Store {
 			}
 		}
 		if ready {
-			return stores
+			// Members() reports cluster size, but a partition owner may not
+			// have installed the routing table yet. Prove convergence with a
+			// marker written and read through every node's dmap, so the first
+			// real checks cannot race the partition balancer.
+			marker := "2394-routing-convergence"
+			for {
+				ready := true
+				for _, store := range stores {
+					if err := store.GetDMap().Put(context.Background(), marker, 1); err != nil {
+						ready = false
+						break
+					}
+					if _, err := store.GetDMap().Get(context.Background(), marker); err != nil {
+						ready = false
+						break
+					}
+				}
+				if ready {
+					return stores
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("olric routing tables did not converge across nodes")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("olric cluster did not converge")
@@ -172,9 +196,14 @@ func TestStoreGetConcurrentIncrementsCounted(t *testing.T) {
 
 	// limiter.Context carries the accepted count as Limit-Remaining (it has
 	// no Counter field in ulule/limiter v3).
-	var sum int64
+	// A sum alone would accept duplicates: [1, 1, 4, 4] sums the same as
+	// [1, 2, 3, 4]. Assert the complete 1..calls sequence, each exactly once.
+	seen := make(map[int64]int, calls)
 	for _, lc := range contexts {
-		sum += lc.Limit - lc.Remaining
+		seen[lc.Limit-lc.Remaining]++
+	}
+	for want := int64(1); want <= calls; want++ {
+		require.Equal(t, 1, seen[want], "counter %d must be returned exactly once across nodes", want)
 	}
 
 	resp, err := store.GetDMap().Get(ctx, store.getCacheKey(key))
@@ -227,7 +256,6 @@ func TestStoreGetConcurrentIncrementsAcrossNodes(t *testing.T) {
 	stored, err := resp.Int()
 	require.NoError(t, err)
 	require.Equal(t, calls, stored, "lost or duplicated increments across nodes")
-	require.EqualValues(t, calls*(calls+1)/2, sum, "per-call counters must cover 1..N exactly once across nodes")
 }
 
 // TestStoreGetOverCapContention pushes more concurrent checks through one

@@ -19,6 +19,8 @@ package ratelimiter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -27,8 +29,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-
-	"go.uber.org/zap"
 
 	"github.com/olric-data/olric"
 	"github.com/ulule/limiter/v3"
@@ -165,8 +165,10 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		} else {
 			old, err := current.Int()
 			if err != nil {
-				zap.L().Error("Failed to decode counter value", zap.String("key", fullKey), zap.Error(err))
-				return 0, time.Time{}, fmt.Errorf("decode counter for %q: %w", fullKey, err)
+				// fullKey embeds the raw per-user subject, so only a short hash
+				// prefix may leave the process. The returned error is logged by the
+				// caller - do not log it here as well.
+				return 0, time.Time{}, fmt.Errorf("decode counter for %s: %w", redactKey(fullKey), err)
 			}
 			expected = current.RawValue()
 			// GetResponse.TTL reports the stored expiry as an absolute Unix
@@ -189,8 +191,7 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 
 		swapped, next, err := store.dmap.CompareAndSwap(ctx, fullKey, expected, newValue, options...)
 		if err != nil {
-			zap.L().Error("Failed to update value", zap.String("key", fullKey), zap.Error(err))
-			return 0, time.Time{}, fmt.Errorf("compare-and-swap counter for %q: %w", fullKey, err)
+			return 0, time.Time{}, fmt.Errorf("compare-and-swap counter for %s: %w", redactKey(fullKey), err)
 		}
 		if swapped {
 			return newValue, expiration, nil
@@ -210,9 +211,9 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		}
 	}
 
-	zap.L().Warn("Compare-and-swap attempts exhausted; failing the check closed",
-		zap.String("key", fullKey), zap.Int("attempts", maxCompareAndSwapAttempts))
-	return 0, time.Time{}, fmt.Errorf("counter for %q did not stabilize after %d compare-and-swap attempts", fullKey, maxCompareAndSwapAttempts)
+	// Attempts exhausted: no log here - the returned error is the single
+	// report, with the key redacted so the raw subject never reaches logs.
+	return 0, time.Time{}, fmt.Errorf("counter %s did not stabilize after %d compare-and-swap attempts", redactKey(fullKey), maxCompareAndSwapAttempts)
 }
 
 // Peek returns the limit for the given identifier, without modification on current values.
@@ -233,6 +234,14 @@ func (store *Store) Reset(ctx context.Context, key string, rate limiter.Rate) (l
 	expiration := now.Add(rate.Period)
 
 	return common.GetContextFromState(now, rate, expiration, 0), nil
+}
+
+// redactKey keeps error messages correlatable without exposing the per-user
+// subject: fullKey embeds the raw ClientAuthSubject, so only a short hash
+// prefix leaves the process.
+func redactKey(fullKey string) string {
+	sum := sha256.Sum256([]byte(fullKey))
+	return hex.EncodeToString(sum[:6])
 }
 
 // getCacheKey returns the full path for an identifier.
