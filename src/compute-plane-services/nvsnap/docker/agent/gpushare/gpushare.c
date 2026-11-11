@@ -324,6 +324,10 @@ struct imp {
      * again at "quiesce" by the fabric handle or a dup of the fd. */
     CUmemFabricHandle fh;
     int ufd;                             /* 0 = none */
+    /* The exporter, found at "quiesce", says this is a multicast object:
+     * not restorable as an import (see do_quiesce). Kept so that every
+     * later "quiesce" refuses too, not only the one that found it. */
+    int mc;
 };
 
 /* A mapping of an imported allocation. */
@@ -962,7 +966,7 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
 /* Look up the exporter of an import made before the exporter registered it
  * (mu held: the peers' replies do not need it, and the tool asks one
  * process at a time). */
-static void resolve_import(struct imp *im, int *mc_out)
+static void resolve_import(struct imp *im)
 {
     unsigned long long key = 0;
     int mc = 0;
@@ -977,7 +981,7 @@ static void resolve_import(struct imp *im, int *mc_out)
     im->key = key;
     if (im->ufd) close(im->ufd);
     im->ufd = 0;
-    *mc_out = mc;
+    im->mc = mc;
 }
 
 /* The same for a multicast object imported before its creator registered
@@ -1131,12 +1135,11 @@ static void do_quiesce(char *reply, size_t n)
     }
     reply[0] = 0;
     for (int i = 0; i < n_imps; i++) {
-        int mc = 0;
-        if (!imps[i].peer && !imps[i].released && imp_live(i)) resolve_import(&imps[i], &mc);
+        if (!imps[i].peer && !imps[i].released && imp_live(i)) resolve_import(&imps[i]);
         /* A multicast object the app joins is tracked as one (imp_to_mc):
          * remapped as an import, its mapping would wait for every device
          * of the group, this one included, and never return. */
-        if (mc && !reply[0])
+        if (imps[i].mc && !imps[i].released && imp_live(i) && !reply[0])
             snprintf(reply, n, "err import of handle %llu is multicast object %llu of pid %d, which this process "
                      "never joined", (unsigned long long)imps[i].app_h, imps[i].key, imps[i].peer);
     }
