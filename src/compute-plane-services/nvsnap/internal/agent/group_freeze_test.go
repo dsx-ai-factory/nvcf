@@ -512,7 +512,9 @@ func TestDriveGroupFreeze_HoldsNotInTimeAbort(t *testing.T) {
 // deadline (an hour).
 func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 	saved := holdGateWait
-	holdGateWait = 100 * time.Millisecond
+	// The gate's wait starts when the members reach the freeze point; the
+	// companion's hold, sent then to a local server, must reach it first.
+	holdGateWait = 500 * time.Millisecond
 	t.Cleanup(func() { holdGateWait = saved })
 	log := logrus.NewEntry(logrus.New())
 	rec := &holdRecorder{holds: map[string]time.Time{}}
@@ -548,6 +550,11 @@ func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 	}
 	hold := newInstanceHold(ctx, http.DefaultClient, "s13", members, []string{bRank, bEtcd}, log)
 	hold.steps().onGo() // the vote went
+	select {            // landed, so the companions' hold is sent at the freeze point
+	case <-hold.ranksDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the GPU rank's hold did not land")
+	}
 	errs := make(chan error, 2)
 	go func() { errs <- aRank.awaitGroupFreeze(ctx, "s13", "ns", "worker-0", log) }()
 	go func() { errs <- aEtcd.awaitGroupFreeze(ctx, "s13", "ns", "etcd-0", log) }()
@@ -581,7 +588,9 @@ func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
 // capture is being abandoned.
 func TestDriveInstanceFreeze_GateAbortCancelsHoldsBeforeTheAbortIsTaken(t *testing.T) {
 	saved := holdGateWait
-	holdGateWait = 100 * time.Millisecond
+	// The gate's wait starts when the members reach the freeze point; the
+	// companion's hold, sent then to a local server, must reach it first.
+	holdGateWait = 500 * time.Millisecond
 	t.Cleanup(func() { holdGateWait = saved })
 	log := logrus.NewEntry(logrus.New())
 	rec := &holdRecorder{holds: map[string]time.Time{}}
@@ -623,6 +632,11 @@ func TestDriveInstanceFreeze_GateAbortCancelsHoldsBeforeTheAbortIsTaken(t *testi
 	}
 	hold := newInstanceHold(ctx, http.DefaultClient, "s14", members, []string{bRank, bEtcd}, log)
 	hold.steps().onGo() // the vote went
+	select {            // landed, so the companions' hold is sent at the freeze point
+	case <-hold.ranksDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the GPU rank's hold did not land")
+	}
 	go func() { _ = aRank.awaitGroupFreeze(ctx, "s14", "ns", "worker-0", log) }()
 	go func() { _ = aEtcd.awaitGroupFreeze(ctx, "s14", "ns", "etcd-0", log) }()
 	driven := make(chan struct{})
