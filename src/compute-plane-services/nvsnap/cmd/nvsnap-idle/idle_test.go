@@ -243,8 +243,9 @@ func TestIdleUsage(t *testing.T) {
 
 // startWorkload starts a stand-in for a restored workload beside the
 // placeholder (not its child): on SIGTERM it notes the signal, takes a
-// moment to shut down, and notes that it is done.
-func startWorkload(t *testing.T, dir string) *exec.Cmd {
+// moment to shut down, and notes that it is done. The channel is closed
+// once it has exited (and been reaped: a zombie still answers signal 0).
+func startWorkload(t *testing.T, dir string) (*exec.Cmd, <-chan struct{}) {
 	t.Helper()
 	got, done := filepath.Join(dir, "got-term"), filepath.Join(dir, "done")
 	w := exec.CommandContext(t.Context(), "/bin/sh", "-c", //nolint:gosec // a test fixture
@@ -252,8 +253,10 @@ func startWorkload(t *testing.T, dir string) *exec.Cmd {
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = w.Process.Kill(); _ = w.Wait() })
-	return w
+	exited := make(chan struct{})
+	go func() { _ = w.Wait(); close(exited) }()
+	t.Cleanup(func() { _ = w.Process.Kill(); <-exited })
+	return w, exited
 }
 
 // On SIGTERM the placeholder passes the signal to the rest of its container
@@ -262,9 +265,7 @@ func startWorkload(t *testing.T, dir string) *exec.Cmd {
 func TestIdleForwardsTermToTheContainer(t *testing.T) {
 	bin := buildIdle(t)
 	dir := t.TempDir()
-	w := startWorkload(t, dir)
-	waited := make(chan struct{})
-	go func() { _ = w.Wait(); close(waited) }() // reaps the workload as its parent
+	w, waited := startWorkload(t, dir)
 	procs := filepath.Join(dir, "cgroup.procs")
 	if err := os.WriteFile(procs, []byte(strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -302,7 +303,7 @@ func TestIdleForwardsTermToTheContainer(t *testing.T) {
 func TestIdleForwardsNothingOutsideAPod(t *testing.T) {
 	bin := buildIdle(t)
 	dir := t.TempDir()
-	w := startWorkload(t, dir)
+	_, exited := startWorkload(t, dir)
 	idle := exec.CommandContext(t.Context(), bin) //nolint:gosec // runs the program under test
 	env := make([]string, 0, len(os.Environ()))
 	for _, e := range os.Environ() {
@@ -323,7 +324,9 @@ func TestIdleForwardsNothingOutsideAPod(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "got-term")); err == nil {
 		t.Error("a process outside a pod's container got SIGTERM")
 	}
-	if w.ProcessState != nil {
+	select {
+	case <-exited:
 		t.Error("the unrelated process exited")
+	default:
 	}
 }
