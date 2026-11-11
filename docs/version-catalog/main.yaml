@@ -666,8 +666,8 @@ manifest:
     - artifact_id: nvcf-openbao-migrations-image-0.19.10
       plane: control
       kind: service-image
-      requirement: required
-      description: Applies the OpenBao configuration required by NVCF.
+      requirement: optional
+      description: Applies the OpenBao configuration for the optional NVCF UI add-on.
       github_url: https://github.com/NVIDIA/nvcf/tree/main/migrations/openbao
     - artifact_id: nvcf-openbao-migrations-image-0.23.1
       plane: control
