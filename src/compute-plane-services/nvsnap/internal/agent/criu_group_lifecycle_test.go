@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -649,6 +650,35 @@ func TestMemberFailureKeepsTheEnd(t *testing.T) {
 	}
 	if short := memberFailure("p", "boom"); short != "p: boom" {
 		t.Errorf("a short error changed: %q", short)
+	}
+}
+
+// A multibyte rune at either cut is kept whole or left out, never split:
+// the recorded error stays valid UTF-8 within the bound.
+func TestTruncateMiddleRuneBoundaries(t *testing.T) {
+	const n = groupMemberErrorMax
+	head := n / 3
+	tail := n - head - len(" … ")
+	for _, tc := range []struct{ name, s string }{
+		// é (2 bytes) starts one byte before the head cut.
+		{"head cut", strings.Repeat("a", head-1) + "é" + strings.Repeat("b", 2*n)},
+		// 世 (3 bytes) and 🙂 (4 bytes) straddling the head cut.
+		{"head cut, 3-byte rune", strings.Repeat("a", head-2) + "世" + strings.Repeat("b", 2*n)},
+		{"head cut, 4-byte rune", strings.Repeat("a", head-1) + "🙂" + strings.Repeat("b", 2*n)},
+		// The tail cut falls on é's second byte.
+		{"tail cut", strings.Repeat("a", 2*n) + "é" + strings.Repeat("b", tail-1)},
+		{"tail cut, 4-byte rune", strings.Repeat("a", 2*n) + "🙂" + strings.Repeat("b", tail-2)},
+	} {
+		got := truncateMiddle(tc.s, n)
+		if !utf8.ValidString(got) {
+			t.Errorf("%s: invalid UTF-8 around the cuts: %q ... %q", tc.name, got[head-4:head+8], got[len(got)-tail-8:len(got)-tail+4])
+		}
+		if len(got) > n {
+			t.Errorf("%s: %d bytes, want at most %d", tc.name, len(got), n)
+		}
+		if !strings.HasPrefix(got, "aaaa") || !strings.HasSuffix(got, "bbbb") || !strings.Contains(got, " … ") {
+			t.Errorf("%s: lost the start, the end or the gap", tc.name)
+		}
 	}
 }
 

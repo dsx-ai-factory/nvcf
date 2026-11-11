@@ -120,13 +120,72 @@ func TestProcStartTime_Self(t *testing.T) {
 func TestDumpFailure_AfterTheDump(t *testing.T) {
 	proc := t.TempDir() // pid 9 is gone
 	err := errors.New("dump snapshot: not taken")
-	if got := dumpFailure(err, true, proc, 9, 100); errors.Is(got, errWorkloadExited) || got.Error() != err.Error() {
+	if got := dumpFailure(err, true, proc, 9, 100, false); errors.Is(got, errWorkloadExited) || got.Error() != err.Error() {
 		t.Errorf("after the dump: %v, want the error as it is", got)
 	}
-	if got := dumpFailure(err, false, proc, 9, 100); !errors.Is(got, errWorkloadExited) {
+	if got := dumpFailure(err, false, proc, 9, 100, false); !errors.Is(got, errWorkloadExited) {
 		t.Errorf("before the dump, the process gone: %v, want it marked", got)
 	}
-	if dumpFailure(nil, false, proc, 9, 100) != nil {
+	if dumpFailure(nil, false, proc, 9, 100, false) != nil {
 		t.Error("a dump that succeeded failed")
+	}
+}
+
+// A workload already gone when its dump starts is told apart from a start
+// time that could not be read: the first is the workload's exit, the
+// second tells nothing.
+func TestDumpFailure_GoneBeforeTheDump(t *testing.T) {
+	proc := t.TempDir() // pid 9 is gone
+	start, gone := initialStart(proc, 9)
+	if start != 0 || !gone {
+		t.Fatalf("a missing process: start %d, gone %v; want 0, true", start, gone)
+	}
+	err := errors.New("bundle tools: no such process")
+	if got := dumpFailure(err, false, proc, 9, start, gone); !errors.Is(got, errWorkloadExited) {
+		t.Errorf("gone before the dump: %v, want it marked", got)
+	}
+	if got := dumpFailure(err, true, proc, 9, start, gone); errors.Is(got, errWorkloadExited) {
+		t.Errorf("gone, but CRIU dumped it: %v, want the error as it is", got)
+	}
+
+	// Another read error (a stat without a start time) tells nothing.
+	writeStat(t, proc, 10, "server", 100)
+	if err := os.WriteFile(filepath.Join(proc, "10", "stat"), []byte("10 (short) S 1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start, gone = initialStart(proc, 10)
+	if start != 0 || gone {
+		t.Fatalf("an unreadable start: start %d, gone %v; want 0, false", start, gone)
+	}
+	if got := dumpFailure(err, false, proc, 10, start, gone); errors.Is(got, errWorkloadExited) {
+		t.Errorf("an unreadable start: %v, want the error as it is", got)
+	}
+
+	// A process read at the start keeps the existing check.
+	writeStat(t, proc, 11, "server", 100)
+	start, gone = initialStart(proc, 11)
+	if start != 100 || gone {
+		t.Fatalf("a running process: start %d, gone %v; want 100, false", start, gone)
+	}
+}
+
+// CRIU completed, but the marker could not be written: the dump is
+// reported done, so its failure is nvsnap's, never the workload's, even
+// with the process gone since.
+func TestPIDNSDumpDone_MarkerFails(t *testing.T) {
+	proc := t.TempDir() // pid 9 is gone (the dump stopped it)
+	dumped, err := pidNSDumpDone(filepath.Join(t.TempDir(), "missing", "dir"), pidNSCapture{})
+	if !dumped || err == nil {
+		t.Fatalf("marker write into a missing directory: dumped %v, err %v; want true and an error", dumped, err)
+	}
+	if got := dumpFailure(err, dumped, proc, 9, 100, false); errors.Is(got, errWorkloadExited) {
+		t.Errorf("a marker failure after CRIU dumped: %v, want it not marked workload_exited", got)
+	}
+	dir := t.TempDir()
+	if dumped, err := pidNSDumpDone(dir, pidNSCapture{Subtree: true}); !dumped || err != nil {
+		t.Fatalf("marker write: dumped %v, err %v", dumped, err)
+	}
+	if c, ok, err := readPIDNSMarker(dir); err != nil || !ok || !c.Subtree {
+		t.Errorf("marker read back: %+v %v %v", c, ok, err)
 	}
 }

@@ -723,31 +723,31 @@ type pidnsDumpHooks struct {
 	FreezeCgroup func() string
 }
 
-func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID int, checkpointDir string, deviceExternals []string, final dumpFinal, gpushare bool, hooks pidnsDumpHooks, log *logrus.Entry) error {
+func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID int, checkpointDir string, deviceExternals []string, final dumpFinal, gpushare bool, hooks pidnsDumpHooks, log *logrus.Entry) (bool, error) {
 	if err := awaitSettledZombies(procBase, hostPID, 15*time.Second); err != nil {
-		return fmt.Errorf("pid-namespace dump: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: %w", err)
 	}
 	entries, mounts, gpuMounts, err := pidNSMounts(procBase, hostPID)
 	if err != nil {
-		return fmt.Errorf("pid-namespace dump: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: %w", err)
 	}
 	if mp := deletedMount(entriesAt(entries, mounts)); mp != "" {
 		// Its restore cannot rebuild it; refuse rather than record a
 		// capture that will never restore.
-		return fmt.Errorf("pid-namespace dump: %s is bound from a deleted directory on the node; restart the pod to capture it", mp)
+		return false, fmt.Errorf("pid-namespace dump: %s is bound from a deleted directory on the node; restart the pod to capture it", mp)
 	}
 	listeners, err := listeningUnixSockets(procBase, hostPID)
 	if err != nil {
-		return fmt.Errorf("pid-namespace dump: listening unix sockets: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: listening unix sockets: %w", err)
 	}
 	var st, hostNet syscall.Stat_t
 	if err := syscall.Stat(filepath.Join(procBase, strconv.Itoa(hostPID), "ns", "net"), &st); err != nil {
-		return fmt.Errorf("pid-namespace dump: network namespace: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: network namespace: %w", err)
 	}
 	if err := syscall.Stat(filepath.Join(procBase, "1", "ns", "net"), &hostNet); err == nil && hostNet.Ino == st.Ino {
 		// The dump locks the network of the namespace it runs in: here,
 		// the node's.
-		return errors.New("pid-namespace dump: the pod runs on the node's network; it cannot be captured")
+		return false, errors.New("pid-namespace dump: the pod runs on the node's network; it cannot be captured")
 	}
 	// The source's stdout and stderr, read while the tree still holds them:
 	// a dump that stops the tree closes them.
@@ -756,14 +756,14 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 	// process tree, from inside that namespace (pidns_subtree.go).
 	nsPID, err := nsPidOf(procBase, hostPID)
 	if err != nil {
-		return fmt.Errorf("pid-namespace dump: the container's pid: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: the container's pid: %w", err)
 	}
 	subtree, target := nsPID != 1, hostPID
 	if subtree {
 		if procBase == "/proc" {
 			// The helper mounts the pod's procfs at /proc: the container's
 			// root must be reachable through the node's, elsewhere.
-			return errors.New("pid-namespace dump: the container shares its pod's pid namespace, and the agent has no node /proc at /host/proc to dump it from")
+			return false, errors.New("pid-namespace dump: the container shares its pod's pid namespace, and the agent has no node /proc at /host/proc to dump it from")
 		}
 		target = nsPID
 	}
@@ -776,7 +776,7 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 	}
 	if hooks.Before != nil {
 		if err := hooks.Before(); err != nil {
-			return err
+			return false, err
 		}
 	}
 	cg := ""
@@ -788,26 +788,26 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 		// dump has seized it (exec_sessions.go).
 		rel, err := processCgroup(procBase, hostPID)
 		if err != nil {
-			return fmt.Errorf("pid-namespace dump: %w", err)
+			return false, fmt.Errorf("pid-namespace dump: %w", err)
 		}
 		cg = filepath.Join(cgroupRoot(), rel)
 		// Recorded like a pod hold (pod_hold.go), so the next run of an
 		// agent that stops mid-dump thaws it.
 		record := a.holdRecordPath(fmt.Sprintf("pidns-dump-%d", hostPID))
 		if err := writeHoldRecord(record, []string{cg}); err != nil {
-			return fmt.Errorf("pid-namespace dump: record the freeze: %w", err)
+			return false, fmt.Errorf("pid-namespace dump: record the freeze: %w", err)
 		}
 		if err := setFrozen(cg, true); err != nil {
 			_ = setFrozen(cg, false)
 			_ = os.Remove(record)
-			return fmt.Errorf("pid-namespace dump: stop the container: %w", err)
+			return false, fmt.Errorf("pid-namespace dump: stop the container: %w", err)
 		}
 		// criu leaves the cgroup as it found it, frozen.
 		defer thawAfterDump(cg, record, log)
 	}
 	ended, err := endExecSessions(procBase, hostPID, killPID)
 	if err != nil {
-		return fmt.Errorf("pid-namespace dump: %w", err)
+		return false, fmt.Errorf("pid-namespace dump: %w", err)
 	}
 	if len(ended) > 0 {
 		log.WithField("pids", ended).Info("criu-v2: ended the runtime's exec sessions in the container (a probe's or a kubectl exec's); they cannot be dumped")
@@ -826,11 +826,19 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 		out, err = runDump(ctx, pidNSDumpDeadline, env, "nsenter", append([]string{"-t", strconv.Itoa(hostPID), "-n", "--", a.config.CRIUPath}, args...)...)
 	}
 	if err != nil {
-		return fmt.Errorf("criu-v2 pid-namespace dump: %w (output: %s; dump.log tail: %s)", err,
+		return false, fmt.Errorf("criu-v2 pid-namespace dump: %w (output: %s; dump.log tail: %s)", err,
 			strings.TrimSpace(string(out)), tailOfFile(filepath.Join(checkpointDir, "dump.log"), 6))
 	}
-	return writePIDNSMarker(checkpointDir, pidNSCapture{Mounts: mounts, GPUMounts: gpuMounts, UnixListeners: listeners,
+	return pidNSDumpDone(checkpointDir, pidNSCapture{Mounts: mounts, GPUMounts: gpuMounts, UnixListeners: listeners,
 		StdoutPipe: stdout, StderrPipe: stderr, Subtree: subtree, RootNSPID: rootNSPIDOf(subtree, nsPID)})
+}
+
+// pidNSDumpDone records the marker of a pid-namespace dump CRIU completed.
+// dumped is true whatever the write's outcome: CRIU stopped the container,
+// so a marker that cannot be written is the agent's failure, never the
+// workload's (dumpFailure).
+func pidNSDumpDone(checkpointDir string, c pidNSCapture) (dumped bool, err error) {
+	return true, writePIDNSMarker(checkpointDir, c)
 }
 
 // pidNSDumpDeadline bounds a pid-namespace dump; CRIU's own --timeout

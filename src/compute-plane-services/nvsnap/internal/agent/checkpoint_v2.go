@@ -252,9 +252,10 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// container's process ended, failed because the workload exited
 	// (workload_exited.go). Once CRIU has dumped it, the dump itself
 	// stopped the process, and a later failure is nvsnap's.
-	initStart, _ := procStartTime(procBase, hostPID)
+	// A process already gone here is the workload's exit too.
+	initStart, initGone := initialStart(procBase, hostPID)
 	dumped := false
-	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart) }()
+	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart, initGone) }()
 
 	// 1. The tools run from the node bundle mounted read-only in the
 	// container (bundle_tools.go), never from a copy in its filesystem. A
@@ -419,8 +420,9 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	}
 	// The container's pid namespace, from its init, dumped from outside
 	// with the agent's own CRIU (pidns_capture.go).
-	err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
-	dumped = err == nil
+	// dumped is CRIU's completion, not the error: a marker that cannot be
+	// written after CRIU dumped the container is nvsnap's failure.
+	dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}
