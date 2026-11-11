@@ -330,3 +330,150 @@ func TestIdleForwardsNothingOutsideAPod(t *testing.T) {
 	default:
 	}
 }
+
+// fakeSelf writes stand-ins for /proc/self/cgroup and /proc/self/mountinfo
+// (NVSNAP_IDLE_SELF) naming this container's cgroup as cg, with a cgroup2
+// mount of root at a directory of the test; it returns that directory.
+func fakeSelf(t *testing.T, dir, cg, root string) string {
+	t.Helper()
+	mnt := filepath.Join(dir, "cgroup")
+	if err := os.MkdirAll(mnt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	self := filepath.Join(dir, "self")
+	if err := os.MkdirAll(self, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mountinfo := "25 1 0:22 / / rw - ext4 /dev/root rw\n" +
+		"30 25 0:26 " + root + " " + mnt + " rw,nosuid - cgroup2 cgroup2 rw\n"
+	for name, body := range map[string]string{"cgroup": "0::" + cg + "\n", "mountinfo": mountinfo} {
+		if err := os.WriteFile(filepath.Join(self, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return mnt
+}
+
+// runIdleInPod starts the placeholder as in a pod (KUBERNETES_SERVICE_HOST
+// set, no NVSNAP_IDLE_PROCS), with NVSNAP_IDLE_SELF at dir/self, sends it
+// SIGTERM and returns its stderr once it has exited.
+func runIdleInPod(t *testing.T, bin, dir string) string {
+	t.Helper()
+	idle := exec.CommandContext(t.Context(), bin) //nolint:gosec // runs the program under test
+	env := []string{"KUBERNETES_SERVICE_HOST=10.0.0.1", "NVSNAP_IDLE_SELF=" + filepath.Join(dir, "self")}
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "KUBERNETES_SERVICE_HOST=") && !strings.HasPrefix(e, "NVSNAP_IDLE_") {
+			env = append(env, e)
+		}
+	}
+	idle.Env = env
+	var stderr strings.Builder
+	idle.Stderr = &stderr
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_ = idle.Process.Signal(syscall.SIGTERM)
+	exited := make(chan error, 1)
+	go func() { exited <- idle.Wait() }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("placeholder: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = idle.Process.Kill()
+		t.Fatal("the placeholder did not exit")
+	}
+	return stderr.String()
+}
+
+// The container's cgroup is found through the cgroup2 mount that shows it:
+// a mount rooted at the container's own cgroup (as a runtime mounts it)
+// lists the container's processes at its top, whatever the cgroup's path.
+func TestIdleFindsTheContainerThroughItsCgroupMount(t *testing.T) {
+	bin := buildIdle(t)
+	dir := t.TempDir()
+	w, waited := startWorkload(t, dir)
+	cg := "/kubepods.slice/kubepods-pod1.slice/cri-containerd-c1.scope"
+	mnt := fakeSelf(t, dir, cg, cg)
+	if err := os.WriteFile(filepath.Join(mnt, "cgroup.procs"), []byte(strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIdleInPod(t, bin, dir)
+	if _, err := os.Stat(filepath.Join(dir, "got-term")); err != nil {
+		t.Fatal("the workload never got SIGTERM")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "done")); err != nil {
+		t.Error("the placeholder exited before the workload finished shutting down")
+	}
+	<-waited
+}
+
+// A cgroup namespace's "/" is the container's cgroup only if the cgroup2
+// mount shows that namespace's root. A mount of a cgroup above it (the
+// host's root bind-mounted into the container) lists other processes:
+// nothing is passed the signal.
+func TestIdleRefusesACgroupMountAboveTheContainer(t *testing.T) {
+	bin := buildIdle(t)
+	dir := t.TempDir()
+	w, exited := startWorkload(t, dir)
+	mnt := fakeSelf(t, dir, "/", "/../../..")
+	if err := os.WriteFile(filepath.Join(mnt, "cgroup.procs"), []byte(strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runIdleInPod(t, bin, dir)
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(dir, "got-term")); err == nil {
+		t.Error("a process listed by a cgroup mount above the container got SIGTERM")
+	}
+	select {
+	case <-exited:
+		t.Error("the unrelated process exited")
+	default:
+	}
+}
+
+// A process of the container the placeholder may not signal (EPERM) is
+// reported, and not waited for: it would only end at the kubelet's SIGKILL.
+// The others are still passed SIGTERM and waited for.
+func TestIdleReportsAProcessItCannotSignal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may signal every process")
+	}
+	bin := buildIdle(t)
+	dir := t.TempDir()
+	w, waited := startWorkload(t, dir)
+	procs := filepath.Join(dir, "cgroup.procs")
+	// pid 1 belongs to root: this test's user cannot signal it.
+	if err := os.WriteFile(procs, []byte("1\n"+strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idle := exec.CommandContext(t.Context(), bin) //nolint:gosec // runs the program under test
+	idle.Env = append(os.Environ(), "NVSNAP_IDLE_PROCS="+procs)
+	var stderr strings.Builder
+	idle.Stderr = &stderr
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_ = idle.Process.Signal(syscall.SIGTERM)
+	exited := make(chan error, 1)
+	go func() { exited <- idle.Wait() }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("placeholder: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = idle.Process.Kill()
+		t.Fatal("the placeholder waited for a process it could not signal")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "done")); err != nil {
+		t.Error("the placeholder exited before the workload it could signal finished shutting down")
+	}
+	if !strings.Contains(stderr.String(), "cannot pass SIGTERM to pid 1") {
+		t.Errorf("the failed send was not reported; stderr: %q", stderr.String())
+	}
+	<-waited
+}
