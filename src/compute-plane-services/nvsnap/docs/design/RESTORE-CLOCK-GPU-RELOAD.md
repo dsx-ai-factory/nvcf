@@ -83,9 +83,9 @@ leaves the overrun counted, as CRIU's budget does today. The recorded span makes
 their clocks reach the dump, so a rank's budget decides when it resumes. The recorded span is per node and
 per checkpoint, and an instance's ranks are not always placed on the nodes that restored them before. With
 budgets of their own, a rank new to its node waits out the estimate while the others resume on their last
-span. The others then run with their network locked until the last rank restores. On a 4-node Kimi-K3
-instance one rank took the 1m52s estimate and the others about 50 s. They waited 61 s locked, and the
-leader's workload exited before the unlock, which failed the restore.
+span. The others then run with their network locked until the last rank restores. In a 4-node Kimi-K3
+restore, one rank took the estimate, much longer than the others' last span. The others waited locked
+until it resumed, and the leader's workload exited before the unlock, which failed the restore.
 
 So the driver reads each rank's recorded span from its node's agent (`restore-span-ms`, through the
 checkpoint file endpoint) and hands every rank the same one in the restore request (`groupRestoreSpanMs`):
