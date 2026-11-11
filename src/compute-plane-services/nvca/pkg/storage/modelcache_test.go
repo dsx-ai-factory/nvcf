@@ -103,6 +103,10 @@ func TestHandleLease_CreatesModelCacheInitNamespace(t *testing.T) {
 		Namespace: ModelCacheInitNamespace,
 		Name:      buildInitLeaseName(cacheHandle),
 	}, &coordv1.Lease{}))
+
+	// Every reconcile re-ensures the namespace, so an existing one must not be
+	// reported as a failure.
+	require.NoError(t, r.ensureModelCacheInitNamespace(ctx))
 }
 
 func TestReconcile_ModelCache(t *testing.T) {
