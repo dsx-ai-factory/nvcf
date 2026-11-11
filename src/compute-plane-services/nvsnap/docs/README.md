@@ -75,16 +75,13 @@ the column below is that status, corrected where the code disagrees.
 | [CRIU-CAPTURE-FALLBACK.md](design/CRIU-CAPTURE-FALLBACK.md) | What happens when a CRIU capture fails: one attempt per agent release, every member's error kept, MPTCP refused before the freeze | Partly built (§3 of the note) |
 | [RAILS-FETCH-CONCURRENCY.md](design/RAILS-FETCH-CONCURRENCY.md) | How rails transfers run concurrently: one rails pod per node that serves and fetches, source ranking, small checkpoints over HTTP | Built (`internal/agent/rails_fetch.go`, `rails_serve.go`, `rails_jobs.go`) |
 | [RESTORE-POD-ADDRESS.md](design/RESTORE-POD-ADDRESS.md) | How a restored pod keeps its captured address, and the guards against an address another pod holds | Built, behind `agent.restoreCapturedAddress` (`internal/agent/restore_address.go`) |
-| [RESTORE-CLOCK-GPU-RELOAD.md](design/RESTORE-CLOCK-GPU-RELOAD.md) | How a restored process's clocks are kept consistent across the GPU reload | In use; §6 proposed |
-| [RESTORE-FETCH-LOAD-OVERLAP.md](design/RESTORE-FETCH-LOAD-OVERLAP.md) | How fetching a checkpoint could overlap with loading it during a restore | Proposed |
+| [RESTORE-CLOCK-GPU-RELOAD.md](design/RESTORE-CLOCK-GPU-RELOAD.md) | How a restored process's clocks are kept consistent across the GPU reload | In use |
 | [FUNCTION-CACHE-STATUS.md](design/FUNCTION-CACHE-STATUS.md) | Which functions are cached: the records name their function version, nvsnap-server keeps one `NvsnapFunction` per version, readable with `view` | Built (`internal/fnstatus`, `internal/server/function_status.go`) |
 | [GPU-FAULT-PROBE.md](design/GPU-FAULT-PROBE.md) | Why a pod's failure on a faulty GPU is not counted against nvsnap: the probe, what it decides, what it cannot tell | Built (`internal/agent/gpu_probe.go`) |
+| [TOOLS-OUTSIDE-THE-WORKLOAD.md](design/TOOLS-OUTSIDE-THE-WORKLOAD.md) | Why CRIU, the replays and namespace entry run from the agent's filesystem, not the workload's | Built, except running the GPU tool as the workload's user |
 | [VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md) | How the node bundle (CRIU, gpushare, helper) is versioned so upgrades do not break running pods | Built (`internal/webhook/bundle_mount.go` `BundleVersionsDir`) |
 | [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model per cluster, and the cache set | Built and verified (as the doc states) |
-| [helm-chart-cache-election.md](design/helm-chart-cache-election.md) | One downloader per hash when a chart starts many workers | Built and verified (as the doc states) |
-| [helm-chart-cache-refresh.md](design/helm-chart-cache-refresh.md) | Cache sets that learn what warm starts compile | Built, off by default (as the doc states) |
 | [cross-cluster-replication.md](design/cross-cluster-replication.md) | Replicating checkpoints across clusters | Partly built, cachedir captures and GCS only (as the doc states) |
-| [dynamo-cr-validation.md](design/dynamo-cr-validation.md) | How a Dynamo workload's checkpoint/restore is validated | Proposal (as the doc states) |
 | [STORAGE-AGNOSTIC-L2-PROMOTION.md](design/STORAGE-AGNOSTIC-L2-PROMOTION.md) | Promoting the L2 volume on any storage | Built (as the doc states) |
 | [THIRD-PARTY-FORKS.md](design/THIRD-PARTY-FORKS.md) | What the CRIU fork carries and why | Current, 2026-10-21 (pin and check in `scripts/versions.sh`, `scripts/build-agent.sh`) |
 
@@ -95,6 +92,7 @@ the column below is that status, corrected where the code disagrees.
 | [BENCHMARK.md](results/BENCHMARK.md) | Measured restore times with phase breakdowns: single-GPU CRIU (July 2026), cachedir (June 2026), page-cache prewarm (September 2026) | Record |
 | [PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows | Empty until the next run |
 | [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | How long a Kimi-K3 group restore over 2 GB300 nodes took, step by step: fetch over rails, CRIU, GPU load, clock wait | Record |
+| [HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | The election (one downloader per hash) on H100 with NVMesh, and the cache-set refresh's one run on GB300 | Record |
 
 ## Using the API
 

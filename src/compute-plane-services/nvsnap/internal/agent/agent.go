@@ -231,7 +231,7 @@ type ObjectStoreConfig struct {
 }
 
 // ElectionConfig configures the admission election
-// (docs/design/helm-chart-cache-election.md).
+// (docs/ARCHITECTURE.md, section 7).
 type ElectionConfig struct {
 	// Enabled turns the election on. Default off until qualified.
 	Enabled bool
@@ -255,7 +255,7 @@ type ModelVolumeConfig struct {
 	HostRoot string
 	// RefreshDisabled turns cache set refresh off; RefreshCooldown is the
 	// least time between generations of one set (zero: 6 hours).
-	// docs/design/helm-chart-cache-refresh.md.
+	// docs/ARCHITECTURE.md, section 7.
 	RefreshDisabled bool
 	RefreshCooldown time.Duration
 	// ReapInterval is how often the reaper removes read-only model PVs

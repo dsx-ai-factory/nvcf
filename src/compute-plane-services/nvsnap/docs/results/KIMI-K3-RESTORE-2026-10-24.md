@@ -5,8 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 # Kimi-K3 group restores, 2026-10-24
 
 The record behind the measurements in
-[design/RESTORE-CLOCK-GPU-RELOAD.md](../design/RESTORE-CLOCK-GPU-RELOAD.md) and
-[design/RESTORE-FETCH-LOAD-OVERLAP.md](../design/RESTORE-FETCH-LOAD-OVERLAP.md). Every figure below is
+[design/RESTORE-CLOCK-GPU-RELOAD.md](../design/RESTORE-CLOCK-GPU-RELOAD.md). Every figure below is
 read from the nvsnap agent logs of the two nodes that ran each restore. Times are UTC, to the second the
 log gives.
 

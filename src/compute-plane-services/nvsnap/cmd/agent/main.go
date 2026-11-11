@@ -178,7 +178,7 @@ func main() {
 	// once the rox PVC binds; kubelet may stall in
 	// ContainerCreating in the meantime).
 	// One-downloader-per-hash admission election for chart-shaped model
-	// workloads (docs/design/helm-chart-cache-election.md). Needs L2.
+	// workloads (docs/ARCHITECTURE.md, section 7). Needs L2.
 	flag.BoolVar(&config.Election.Enabled, "election", false,
 		"Elect one capture leader per cache hash at admission and gate the other model workers until the capture is promoted (needs L2)")
 	flag.DurationVar(&config.Election.Deadline, "election-deadline", 0,

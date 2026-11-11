@@ -152,7 +152,7 @@ func seedStep(name string, main *corev1.Container, src volumeAt, srcSubdir strin
 		Name:  name,
 		Image: main.Image,
 		// The index of seeded paths lets the agent tell what the engine
-		// adds later (docs/design/helm-chart-cache-refresh.md).
+		// adds later (docs/ARCHITECTURE.md, section 7).
 		Command: []string{HelperBin, "seed", "--from", from, "--to", to, "--label", label, "--index", SeedIndexFile},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: src.Volume, MountPath: src.Path, ReadOnly: true},

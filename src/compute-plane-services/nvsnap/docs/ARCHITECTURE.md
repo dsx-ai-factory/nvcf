@@ -35,6 +35,8 @@ about the current build. Checked against the code of branch
   - [Group restore](#group-restore)
 - [6. Where bytes live and how they move](#6-where-bytes-live-and-how-they-move)
 - [7. Model volumes and the election](#7-model-volumes-and-the-election)
+  - [The election: one downloader per hash](#the-election-one-downloader-per-hash)
+  - [Cache-set refresh](#cache-set-refresh)
 - [8. Catalog and lifecycle](#8-catalog-and-lifecycle)
 - [9. Security model](#9-security-model)
 - [10. Failure modes and recovery](#10-failure-modes-and-recovery)
@@ -59,14 +61,15 @@ built. Anything not listed here is not claimed.
 | In-place suspend and resume of a two-node instance under gpushare | Measured | [design/GPUSHARE.md](design/GPUSHARE.md#validation) (2 nodes x 4 GB300) |
 | Group capture and restore of a multi-pod instance, with companions | Exercised | `internal/agent/criu_group_test.go`, `gpushare_group_restore_test.go`, `group_freeze_test.go`; no recorded end-to-end run on hardware |
 | Model volume, one download per model per cluster | Measured | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) results (H100, NVMesh, 2026-09-26) |
-| Election, one downloader per hash | Measured | [design/helm-chart-cache-election.md](design/helm-chart-cache-election.md) results (H100, NVMesh, 2026-09-25) |
+| Election, one downloader per hash | Measured | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (H100, NVMesh, 2026-09-25) |
+| Cache-set refresh | Measured once | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (GB300, 2026-10-01; off by default) |
 | L2 volume pair and promotion | Exercised | `internal/checkpointstore/*_test.go` (`TestPerCapturePVCBackend_*`) |
 | L3 peer fetch | Exercised | `internal/agent/cascade_fetch_test.go` (`TestEnsureLocal_*`) |
 | L4 cross-cluster replication | Exercised | `internal/agent/replication_test.go` (`TestReplicateFromObjectStore_RoundTrip`) |
 | Tenant scope on restore | Exercised | `TestCRIURestore_SameScopeInAnotherNamespace`, `TestRecordCRIUCapture_RecordsTheTenantScope`, `TestCRIUGroupKey_ScopedByTenant` |
 | Agent API authentication | Exercised | `internal/agent/auth_test.go` (`TestTokenGuard*`) |
 | Fetched node-bundle verification | Exercised | `internal/agent/bundle_digest_test.go` (`TestFetchedBundleIsVerified`) |
-| Checkpoint transfer over RDMA (rails tier) | Exercised | `internal/agent/rails_fetch_test.go`, `rails_serve_test.go`, `rails_jobs_test.go`; restores through the agent have run in a GB300 cluster's conformance gate, with no timing recorded under `results/`. A manual bedrock-peer copy of a 1.06 TB checkpoint between GB300 nodes ran at 13.2 GiB/s, 97 % of the destination disk's write rate (GB300, 2026-10-21; no nvsnap build, as bedrock-peer ran by hand; not recorded under `results/`) |
+| Checkpoint transfer over RDMA (rails tier) | Exercised | `internal/agent/rails_fetch_test.go`, `rails_serve_test.go`, `rails_jobs_test.go`; restores through the agent have run on GB300 nodes, with no timing recorded under `results/` |
 
 ## 1. What nvsnap is and what a deployment runs
 
@@ -151,20 +154,20 @@ captured (`criu_group.go` `gpushareEnabledFor`), and only one with a controller
 The agent finds the pod's container through the node's container runtime
 (containerd or CRI-O, detected at start; `internal/runtime`) and its GPU
 processes from `/proc` (`internal/cuda` `FindAllGPUPIDsForContainer`). CRIU
-runs inside the container's namespaces, from a bundle the agent stages into
-the container at `/criu-bundle` (`internal/agent/checkpoint_v2.go`
-`stageV2Bundle`). Under gpushare the dump omits CRIU's CUDA plugin, because
-`nvsnap-gpu-suspend` has already checkpointed the GPU state; without gpushare
-the plugin runs the staged `cuda-checkpoint` (`dumpV2Args`).
+and the replays run from the agent's own filesystem, never from the
+workload's ([design/TOOLS-OUTSIDE-THE-WORKLOAD.md](design/TOOLS-OUTSIDE-THE-WORKLOAD.md)).
+Under gpushare the dump omits CRIU's CUDA plugin, because
+`nvsnap-gpu-suspend` has already checkpointed the GPU state.
 
 When the pod is Ready, the agent on its node:
 
 1. suspends the GPU processes through gpushare, which saves their GPU memory
    to the chunk store (`internal/agent/gpushare.go`);
-2. dumps the process tree with CRIU (`internal/agent/checkpoint_v2.go`
-   `dumpV2`); a container whose workload is pid 1 is dumped from outside its
-   pid namespace with its mounts declared external
-   (`internal/agent/pidns_capture.go`);
+2. dumps the container's pid namespace with CRIU from outside it, its mounts
+   declared external (`internal/agent/checkpoint_v2.go` `dumpV2`,
+   `internal/agent/pidns_capture.go` `dumpPIDNamespace`); in a pod that shares
+   one pid namespace, the container's own process tree
+   (`internal/agent/pidns_subtree.go`);
 3. from CRIU's post-dump hook, with the tree still stopped and before CRIU
    kills it, saves the contents of the container's in-memory mounts that are
    on the allowlist (`internal/agent/replay_mounts.go`
@@ -325,15 +328,64 @@ owns the volume; `internal/webhook/model_volume.go` lands it).
 
 ![Model volumes: one download per model, a read-only view in every reader's namespace](figures/nvsnap-model-volume.svg)
 
-Under cachedir, the election chooses one pod per hash to download and capture
-when a chart starts many workers at once: a Lease create, which only one
-admission can win (`internal/election`). The winner leads; the followers wait
-behind a scheduling gate and restore from its capture. The election does not
-run under CRIU.
-
 The design and its measured results are in
-[design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) and
-[design/helm-chart-cache-election.md](design/helm-chart-cache-election.md).
+[design/helm-shared-model-volume.md](design/helm-shared-model-volume.md).
+
+### The election: one downloader per hash
+
+Off by default (`agent.election.enabled`, `agent.election.deadline`), needs
+`agent.l2`, and does not run under CRIU. When a chart starts many workers at
+once, the webhook picks one per cache hash to download and be captured; the
+rest start from its capture. At admission a pod that requests
+`nvidia.com/gpu` and names a model (`--model`, `--model-path`,
+`HF_MODEL_ID`, `MODEL_ID`, `NIM_MODEL_NAME` or a NIM image) is pinned to the
+one compute capability its node selection admits (several, or none: it stays
+out and starts cold) and stamped with its hash (`nvsnap.io/hash`). Then:
+
+- a promoted capture with a bound `rox-<hash>` exists: the pod restores;
+- otherwise the webhook creates Lease `nvsnap-capture-<hash>`. Create is
+  atomic, so one admission wins and leads (captured as usual); the others are
+  admitted against the claim name `rox-<hash>` behind the scheduling gate
+  `nvsnap.io/wait-for-cache`, holding no node and no GPU;
+- any error admits the pod unchanged.
+
+nvsnap-server ungates the followers when the promote reports `ready`. On
+`failed`, a leader gone, or the Lease deadline (default 60 min), it deletes
+the Lease and the gated followers that have a controller, so they are
+re-admitted and a new leader is elected; a follower with no owner is left and
+logged. A pod has no name or UID at admission, so the Lease holder is an id
+the webhook mints (`nvsnap.io/election-id`), and the watcher honours a
+stamped hash only when the Lease vouches for it (`internal/rootfsonly/watcher.go`
+`StampVerifier`). Prefill and decode workers of a disaggregated graph share one
+hash (`internal/rootfsonly/composer.go` `stripRoleFlags`). Followers need
+ReadOnlyMany storage; a restore namespace gets its own `rox-<hash>` claim
+minted from the promoted volume (`EnsureClaim`). Under Grove gang scheduling,
+Grove rewrites the gate away and followers wait on volume binding instead.
+In a restore namespace with no other egress allows, the restore-pod
+NetworkPolicy also blocks DNS. Code: `internal/election`,
+`internal/webhook/election.go`, `internal/server/election_release.go`;
+end-to-end test `scripts/test-election-e2e.sh` with the stock chart
+`deploy/k8s/charts/vllm-workers`. Results:
+[results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md).
+
+### Cache-set refresh
+
+Off by default (`agent.cacheVolume.refresh`; `agent.cacheVolume.refreshCooldown`,
+default 6 h) and not used under CRIU. A compile-cache set is collected once,
+from the cold run; with refresh on it also learns what warm starts compile.
+The seed init lists the paths it seeded in `<cachedir>/.nvsnap-seeded`; after
+Ready the agent stamps on the pod the files written before Ready that are not
+in that list (`nvsnap.io/cache-rank-delta`). When every rank of the group is
+live, the set is complete and the cooldown has passed, one agent wins the
+election for the next generation and collects it from the warm ranks through
+`GET /v1/cache-rank/{key}/{ordinal}`. A set is never written in place: each
+generation is a new volume, `Lookup` serves the newest complete one, and the
+reaper retires a superseded one with no reader bound about an hour after it is
+replaced. A delta fingerprint seen twice marks the set `refresh-stable`, which
+stops further refreshes. Code: `internal/modelvolume/modelvolume.go` `Lookup`,
+`internal/modelvolume/reaper.go`, `internal/agent/modelvolume_controller.go`,
+`internal/webhook/reader_steps.go`. Its one run:
+[results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md).
 
 ## 8. Catalog and lifecycle
 
@@ -378,29 +430,24 @@ keys and request data.
 | The captured pod's model volume is missing at restore | The instance starts cold | `internal/webhook/model_volume.go` `placeholderModelPatches` |
 | An agent rollout during a capture | Captures do not start until every agent runs one revision; an agent that restarts mid-capture fails it (section 8) | `criu_group_guard.go` `agentsSettled`; `criu_group_recover.go` `recoverInterruptedCaptures` |
 
-A lone placeholder's idle program is given the workload's argv: the pod's
-own command and args, or, for an image that names its entrypoint, the
-entrypoint the runtime started the captured container with (recorded on the
-capture as `cold_entrypoint`) and the pod's own args, which the kubelet
-expands for this pod. To start cold in place the agent checks the pod and
-container are still the failed placeholder's, writes a marker on the pod's
-restore work volume, marks the pod `nvsnap.io/criu-cold-started`, and kills
-the container's init. That ends the container's pid namespace, including any
-processes a restore that failed late left running; the container restarts,
-and the idle program, finding the marker, execs the workload as its init, on
-this and every later restart. The restored condition is set so the
-workload's own readiness probe decides. Each step can be repeated, so an
-agent that stops half way is finished by the next. A placeholder admitted
-without the argv (an older webhook), a pod whose containers share one pid
-namespace, and a pod whose containers are never restarted cannot, and are
-deleted as before. The liveness and startup probes the placeholder dropped
-stay dropped for that pod (`internal/agent/cold_start.go`,
-`cmd/nvsnap-idle`). A lone placeholder, and a one-pod capture with no
-companions, runs all of the pod's init containers, so a cold start in place
-has what they set up. A rank of a larger group skips the init containers
-that would only wait on the instance's peers, and keeps every one whose
-output something running in the pod reads, directly or through another kept
-init (`internal/webhook/criu_restore.go` `initsToKeep`).
+Starting cold in place (`internal/agent/cold_start.go`, `cmd/nvsnap-idle`):
+a lone placeholder's idle program is given the workload's argv (the pod's
+command and args, or the captured entrypoint, `cold_entrypoint`, with the
+pod's args). The agent checks the pod and container are still the failed
+placeholder's, writes a marker on the restore work volume, marks the pod
+`nvsnap.io/criu-cold-started` and kills the container's init. That ends the
+pid namespace, including anything a late-failing restore left running; on
+restart the idle program finds the marker and execs the workload as init, on
+every later restart too. The workload's own readiness probe decides the
+restored condition. Each step is repeatable, so a restarted agent finishes
+the job. Not possible, so the pod is deleted as before: a placeholder admitted
+without the argv (older webhook), a pod whose containers share one pid
+namespace, a pod whose containers are never restarted. The liveness and
+startup probes the placeholder dropped stay dropped. A lone placeholder, and a
+one-pod capture with no companions, runs all of the pod's init containers; a
+rank of a larger group skips the ones that only wait on the instance's peers
+and keeps every one whose output something in the pod reads
+(`internal/webhook/criu_restore.go` `initsToKeep`).
 
 ## 11. Platform integration (NVCF and NVCA)
 
@@ -429,8 +476,9 @@ In the order they matter for multi-node instances:
 
 1. **End-to-end group restore on hardware has no recorded result.** The
    mechanism is covered by unit tests only (section 0).
-2. **Checkpoint transfer is bound by cluster storage.** L2 and L3 move bytes
-   over the storage network and HTTP; there is no RDMA path.
+2. **Checkpoint transfer is bound by cluster storage unless the rails tier is
+   on.** L2 and L3 move bytes over the storage network and HTTP; only the
+   opt-in rails tier (`agent.rails`) uses the RDMA NICs.
 3. **Agent API authentication is off by default** (`agent.auth.enabled:
    false`); deployments must turn it on.
 4. **Design notes that disagree with the code** are listed below until they

@@ -98,4 +98,4 @@ Time to ready, cold and restored. nvsnap build: not recorded.
 | [results/KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | Kimi-K3 group restores on 2 nodes with 4x GB300 each (2026-10-24): clock budgets and waits, fetch, CRIU and GPU-load times, remap times |
 | [design/GPUSHARE.md](design/GPUSHARE.md#validation) | gpushare validation |
 | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) | Model volume results (H100, NVMesh, September 2026) |
-| [design/helm-chart-cache-election.md](design/helm-chart-cache-election.md) | Election results (H100, NVMesh, 2026-09-25) |
+| [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | Election results (H100, NVMesh, 2026-09-25); cache-set refresh run (GB300, 2026-10-01) |
