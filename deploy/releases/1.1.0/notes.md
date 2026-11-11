@@ -25,6 +25,10 @@ The upgrade procedure and its validation are still in progress. Publication
 of this release does not establish a qualified upgrade path. Completion is
 tracked in [the upgrade follow-up](https://github.com/dsx-ai-factory/nvcf/issues/3375).
 
+If you run NVCF 1.0.4, do not upgrade to 1.1.0 yet. The guide below covers
+only a planned upgrade from 1.0.1; do not apply its procedure to a 1.0.4
+deployment. The product's predecessor field does not qualify that upgrade path.
+
 Review the current
 [1.0.1 to 1.1.0 upgrade guide](https://github.com/dsx-ai-factory/nvcf/blob/1388f73aa9db949a4af67a4f653c6a7b81e86c46/docs/overview/release-notes/1.0.1-to-1.1.0-upgrade.md)
 before planning an upgrade. It covers hostname-policy and high availability
