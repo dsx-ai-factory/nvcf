@@ -56,6 +56,7 @@ test:
 	@tests/nonroot-ui-migrations.sh
 	@tests/ha-value-wiring.sh
 	@tests/ha-chart-render.sh
+	@tests/control-tolerations-wiring.sh
 	@tests/worker-callback-proxy-wiring.sh
 
 test-published-charts:
