@@ -438,14 +438,15 @@ func TestIdleRefusesACgroupMountAboveTheContainer(t *testing.T) {
 // reported, and not waited for: it would only end at the kubelet's SIGKILL.
 // The others are still passed SIGTERM and waited for.
 func TestIdleReportsAProcessItCannotSignal(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root may signal every process")
+	// pid 1 is the stand-in only if this test may not signal it: under the
+	// same user (a container's init) SIGTERM would reach it.
+	if err := syscall.Kill(1, 0); !errors.Is(err, syscall.EPERM) {
+		t.Skipf("pid 1 can be signaled here (%v)", err)
 	}
 	bin := buildIdle(t)
 	dir := t.TempDir()
 	w, waited := startWorkload(t, dir)
 	procs := filepath.Join(dir, "cgroup.procs")
-	// pid 1 belongs to root: this test's user cannot signal it.
 	if err := os.WriteFile(procs, []byte("1\n"+strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

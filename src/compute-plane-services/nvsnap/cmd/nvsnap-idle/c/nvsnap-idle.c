@@ -164,13 +164,29 @@ static int procs_path(char *buf, size_t n) {
 	return ok;
 }
 
-/* The pids SIGTERM could not reach (EPERM): reported once, not waited for. */
-#define MAX_UNSIGNALED 256
-static pid_t unsignaled[MAX_UNSIGNALED];
-static int n_unsignaled;
+/* The pids SIGTERM could not reach (EPERM): reported once, not waited for.
+ * Should the list not grow, every EPERM counts as gone in the wait, as if
+ * none had been signaled: the wait never outlasts what it sent SIGTERM to. */
+static pid_t *unsignaled;
+static size_t n_unsignaled, cap_unsignaled;
+static int unsignaled_full;
+
+static void add_unsignaled(pid_t pid) {
+	if (n_unsignaled == cap_unsignaled) {
+		size_t cap = cap_unsignaled ? cap_unsignaled * 2 : 64;
+		pid_t *grown = realloc(unsignaled, cap * sizeof *grown);
+		if (!grown) {
+			unsignaled_full = 1;
+			return;
+		}
+		unsignaled = grown;
+		cap_unsignaled = cap;
+	}
+	unsignaled[n_unsignaled++] = pid;
+}
 
 static int is_unsignaled(pid_t pid) {
-	for (int i = 0; i < n_unsignaled; i++)
+	for (size_t i = 0; i < n_unsignaled; i++)
 		if (unsignaled[i] == pid)
 			return 1;
 	return 0;
@@ -193,13 +209,12 @@ static int signal_others(const char *procs, int sig) {
 				continue;
 			/* EPERM: alive, but no longer ours to signal (it changed its
 			 * credentials after the SIGTERM); still wait for it. */
-			if (kill((pid_t)pid, 0) != 0 && errno == ESRCH)
+			if (kill((pid_t)pid, 0) != 0 && (errno == ESRCH || (errno == EPERM && unsignaled_full)))
 				continue; /* gone, or listed in a file only a test keeps */
 		} else if (kill((pid_t)pid, sig) != 0) {
 			if (errno == EPERM && !is_unsignaled((pid_t)pid)) {
 				fprintf(stderr, "nvsnap-idle: cannot pass SIGTERM to pid %ld: %s\n", pid, strerror(errno));
-				if (n_unsignaled < MAX_UNSIGNALED)
-					unsignaled[n_unsignaled++] = (pid_t)pid;
+				add_unsignaled((pid_t)pid);
 			}
 			continue;
 		}
