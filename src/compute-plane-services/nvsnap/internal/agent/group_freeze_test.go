@@ -504,3 +504,64 @@ func TestDriveGroupFreeze_HoldsNotInTimeAbort(t *testing.T) {
 		}
 	}
 }
+
+// A companion's hold that stalls (its agent accepts the request and never
+// answers) makes the gate's wait abort the capture; the abort also ends
+// the stalled request, so the driver's wait for the holds, and with it
+// the capture's failure handling, does not last until the capture's own
+// deadline (an hour).
+func TestDriveInstanceFreeze_GateAbortEndsStalledHolds(t *testing.T) {
+	saved := holdGateWait
+	holdGateWait = 100 * time.Millisecond
+	t.Cleanup(func() { holdGateWait = saved })
+	log := logrus.NewEntry(logrus.New())
+	rec := &holdRecorder{holds: map[string]time.Time{}}
+	aRank, bRank := rec.server(t)
+
+	// The companion's agent: its hold never answers.
+	aEtcd := &Agent{}
+	unblock := make(chan struct{})
+	r := mux.NewRouter()
+	r.HandleFunc("/v1/group-freeze/{session}/{namespace}/{pod}", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get("phase") == "hold" {
+			select {
+			case <-req.Context().Done():
+			case <-unblock:
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		aEtcd.freezeHandler(w, req)
+	}).Methods("GET", "POST")
+	srv := httptest.NewServer(r)
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(unblock) }) // runs before srv.Close
+	bEtcd := srv.URL
+
+	ctx, cancel := context.WithCancel(context.Background()) // the capture's: ends long after the test
+	t.Cleanup(cancel)
+	members := []CheckpointRequest{
+		{Namespace: "ns", PodName: "worker-0", ContainerName: "main"},
+		{Namespace: "ns", PodName: "etcd-0", ContainerName: "etcd", Companion: true},
+	}
+	hold := newInstanceHold(ctx, http.DefaultClient, "s13", members, []string{bRank, bEtcd}, log)
+	hold.steps().onGo() // the vote went
+	errs := make(chan error, 2)
+	go func() { errs <- aRank.awaitGroupFreeze(ctx, "s13", "ns", "worker-0", log) }()
+	go func() { errs <- aEtcd.awaitGroupFreeze(ctx, "s13", "ns", "etcd-0", log) }()
+	driveInstanceFreeze(ctx, http.DefaultClient, "s13", []freezeMember{
+		{Base: bRank, Namespace: "ns", Pod: "worker-0"}, {Base: bEtcd, Namespace: "ns", Pod: "etcd-0"},
+	}, hold, log)
+	for range 2 {
+		if err := <-errs; err == nil {
+			t.Error("a member was released to dump with the companion's hold still pending; want it aborted")
+		}
+	}
+	waited := make(chan struct{})
+	go func() { hold.wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the driver still waits for the stalled hold after the gate aborted the capture")
+	}
+}

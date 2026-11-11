@@ -423,9 +423,12 @@ var holdGateWait = 30 * time.Second
 //     saved it shutting down, and its restore finished the shutdown.
 //
 // Each step runs at most once; wait returns when the steps begun have
-// landed.
+// landed, or failed. cancel ends the holds still on their way: a capture
+// that aborts has no use for them, and its driver must not wait for a
+// stalled one until the capture's own deadline.
 type instanceHold struct {
 	ctx     context.Context
+	cancel  context.CancelFunc
 	client  *http.Client
 	session string
 	members []CheckpointRequest
@@ -438,7 +441,8 @@ type instanceHold struct {
 }
 
 func newInstanceHold(ctx context.Context, client *http.Client, session string, members []CheckpointRequest, bases []string, log *logrus.Entry) *instanceHold {
-	return &instanceHold{ctx: ctx, client: client, session: session, members: members, bases: bases, log: log,
+	ctx, cancel := context.WithCancel(ctx)
+	return &instanceHold{ctx: ctx, cancel: cancel, client: client, session: session, members: members, bases: bases, log: log,
 		ranksDone: make(chan struct{}), companionsDone: make(chan struct{})}
 }
 
@@ -499,6 +503,22 @@ func (h *instanceHold) wait() {
 	if h.companionsBegun.Load() {
 		<-h.companionsDone
 	}
+}
+
+// driveInstanceFreeze drives a group capture's freeze points, before the
+// dump and after it, with hold's steps at the first. A capture aborted
+// before the dump (a member ended, the holds did not land in time) cancels
+// the holds still on their way: the members' hold releases end any that
+// landed (an agent refuses a hold that comes after its release).
+func driveInstanceFreeze(ctx context.Context, client *http.Client, session string, members []freezeMember, hold *instanceHold, log *logrus.Entry) {
+	steps := hold.steps()
+	if !driveGroupFreeze(ctx, client, session, "", members, 200*time.Millisecond, log, steps.atFreezePoint, steps.gate) {
+		hold.cancel()
+		return
+	}
+	// Dumped, the members wait stopped until all are: none resumes to
+	// talk to one not dumped yet.
+	driveGroupFreeze(ctx, client, session, "post", members, 100*time.Millisecond, log, nil, nil)
 }
 
 // holdMembers holds the member pods of capture session that are

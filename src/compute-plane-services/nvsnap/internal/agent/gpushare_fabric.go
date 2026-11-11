@@ -901,17 +901,13 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	hold := newInstanceHold(ctx, fabricHTTPClient, session, req.Members, bases, log)
 	defer func() {
 		hold.wait()
+		hold.cancel()
 		releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
 	}()
 	freezeDone := make(chan struct{})
 	go func() {
 		defer close(freezeDone)
-		steps := hold.steps()
-		if driveGroupFreeze(ctx, fabricHTTPClient, session, "", freezeMembers, 200*time.Millisecond, log, steps.atFreezePoint, steps.gate) {
-			// Dumped, the members wait stopped until all are: none
-			// resumes to talk to one not dumped yet.
-			driveGroupFreeze(ctx, fabricHTTPClient, session, "post", freezeMembers, 100*time.Millisecond, log, nil, nil)
-		}
+		driveInstanceFreeze(ctx, fabricHTTPClient, session, freezeMembers, hold, log)
 	}()
 	// A companion that ends before the vote passed loses the capture: the
 	// GPU ranks must not suspend for it.
