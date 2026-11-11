@@ -85,7 +85,8 @@ func (store *Store) Increment(ctx context.Context, key string, count int64, rate
 // means another check incremented the same key between the read and the swap;
 // each retry reuses the authoritative current value returned by the failed
 // swap, so the loop converges within a few attempts. Exhausting the cap fails
-// the check instead of writing an unvalidated value.
+// the check instead of writing an unvalidated value: Store.Get returns an
+// error and the caller denies the request (fail closed).
 const maxCompareAndSwapAttempts = 100
 
 // Get returns the limit for the given identifier.
@@ -125,6 +126,11 @@ func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (lim
 // arming are therefore a single atomic write. dmap.Incr cannot do this: it
 // has no TTL option, and arming the TTL in a follow-up call would leave the
 // counter without a window whenever that call fails.
+//
+// A read whose window ends before the swap takes the restart branch instead
+// of re-arming a stale expiry: the swap still compares against the old bytes,
+// so the write stays atomic, and the partition owner reports an expired key
+// as absent, so the next attempt inserts a fresh window.
 func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.Rate) (int, time.Time, error) {
 	// current is the value the next swap compares against. nil means the key
 	// does not exist and the next swap must insert it.
@@ -141,14 +147,21 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 			expiration time.Time
 		)
 
-		if current == nil {
-			// Insert-if-absent: the first check in a window creates the
-			// counter at 1 and arms the window TTL in the same atomic write.
+		// startWindow restarts the counter at 1 and arms the window TTL in
+		// the same atomic write.
+		startWindow := func() {
 			newValue = 1
 			if rate.Period.Milliseconds() > 0 {
 				options = append(options, olric.PX(rate.Period))
 			}
 			expiration = time.Now().Add(rate.Period)
+		}
+
+		if current == nil {
+			// Insert-if-absent: expected stays nil, so the swap only succeeds
+			// when the key does not exist. Counter creation and window TTL
+			// arming are a single atomic write.
+			startWindow()
 		} else {
 			old, err := current.Int()
 			if err != nil {
@@ -156,21 +169,21 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 				return 0, time.Time{}, fmt.Errorf("decode counter for %q: %w", fullKey, err)
 			}
 			expected = current.RawValue()
-			if ttl := current.TTL(); ttl > 0 {
+			// GetResponse.TTL reports the stored expiry as an absolute Unix
+			// millisecond timestamp.
+			ttl := current.TTL()
+			if remaining := time.Until(time.UnixMilli(ttl)); ttl > 0 && remaining > 0 {
 				// Same window: increment in place and keep the absolute expiry.
-				// GetResponse.TTL reports the stored expiry as an absolute Unix
-				// millisecond timestamp; PXAT re-arms it verbatim, where a
-				// remaining-duration round-trip can truncate to zero.
+				// PXAT re-arms it verbatim, where a remaining-duration
+				// round-trip can truncate to zero near the window edge.
 				newValue = old + 1
 				options = append(options, olric.PXAT(time.Duration(ttl)*time.Millisecond))
 				expiration = time.UnixMilli(ttl)
 			} else {
-				// No TTL left on the key: restart the window at 1.
-				newValue = 1
-				if rate.Period.Milliseconds() > 0 {
-					options = append(options, olric.PX(rate.Period))
-				}
-				expiration = time.Now().Add(rate.Period)
+				// The window ended between the read and the swap, or the key
+				// has no TTL left: restart the window at 1. The swap still
+				// compares against the old bytes, so it stays atomic.
+				startWindow()
 			}
 		}
 
@@ -197,6 +210,8 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		}
 	}
 
+	zap.L().Warn("Compare-and-swap attempts exhausted; failing the check closed",
+		zap.String("key", fullKey), zap.Int("attempts", maxCompareAndSwapAttempts))
 	return 0, time.Time{}, fmt.Errorf("counter for %q did not stabilize after %d compare-and-swap attempts", fullKey, maxCompareAndSwapAttempts)
 }
 
