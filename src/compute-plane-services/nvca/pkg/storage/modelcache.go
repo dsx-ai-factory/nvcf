@@ -1362,6 +1362,15 @@ func (r *Reconciler) handleLease(ctx context.Context,
 	case apierrors.IsNotFound(err):
 		// The lease can be acquired.
 		log.Info("Creating lease, starting model cache initialization")
+		// The init namespace holds every cross-namespace model cache object and
+		// nothing else provisions it on the cluster, so create it before the
+		// lease rather than failing forever with
+		// `namespaces "nvca-modelcache-init" not found`.
+		if err := r.Client.Create(ctx, NewModelCacheInitNamespace()); err != nil &&
+			!apierrors.IsAlreadyExists(err) {
+			log.Error(err, "Failed to ensure model cache init namespace")
+			return reconcile.Result{}, false, err
+		}
 		lease.Spec.RenewTime = &metav1.MicroTime{Time: now}
 		lease.Spec.AcquireTime = &metav1.MicroTime{Time: now}
 		if err := r.Client.Create(ctx, lease); err != nil {
