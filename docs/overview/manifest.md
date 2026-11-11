@@ -285,7 +285,9 @@ existing mounts have migrated. Follow the
 [upgrade procedure](release-notes/1.0.2-to-1.0.4-upgrade.md) before changing
 mount selections or removing legacy binaries.
 
-The following tables list the complete artifact inventory.
+The following tables list the artifacts that the stack inventories declare.
+Seven upstream images that operators create at runtime are not in those
+inventories. See [Runtime images created by operators](#runtime-images-created-by-operators).
 
 {/*docs-version-sync:BEGIN manifest-artifact-registry-paths*/}
 
@@ -443,3 +445,39 @@ The following tables list the complete artifact inventory.
 | `nvcf-self-managed-stack` | `1.0.10` | `self-managed` | Provides the Helmfile bundle for control-plane deployment. | `nvcr.io/nvidia/nvcf/nvcf-self-managed-stack:1.0.10` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/self-managed) |
 
 {/*docs-version-sync:END manifest-artifact-registry-paths*/}
+
+### Runtime images created by operators
+
+The selected stack inventories omit these seven images used by pods that the
+OpenTelemetry and KAI Scheduler operators create at runtime. Add them to your
+registry mirror or allowlist when you enable the matching component. These
+third-party images are available from `ghcr.io`; NVIDIA does not republish them
+under `nvidia/nvcf`.
+
+This list applies to the 1.0.4 edition's Self-Managed `1.0.10`, Compute Plane
+`1.0.5`, and Observability `1.0.0` selection. Observability pins OpenTelemetry
+operator chart `0.122.0`, which uses operator `0.158.0`. Compute Plane pins KAI
+Scheduler `v0.17.1`. If you override the operator version or use an existing
+operator, verify its runtime image references and tags.
+
+The target allocator is enabled by default for `observability.profile` values
+`control`, `compute`, and `all`. The stack enables it when
+`observability.components.targetAllocator.mode` is `install`, which also
+requires `observability.components.collector.mode` to be `install`. Both modes
+default to `install` for these profiles. With target allocator mode `existing`,
+the collector and target allocator are managed outside the stack; with
+`disabled`, the stack does not enable the target allocator.
+
+All six KAI images below are used when `addons.kaiScheduler.enabled` is `true`
+with the selected chart's default components. KAI Scheduler is disabled by
+default and is required when enabling the Grove or Dynamo add-ons.
+
+| Artifact | Version | Stack | Required | Description | Distribution | Source code |
+| --- | --- | --- | --- | --- | --- | --- |
+| `target-allocator` | `0.158.0` | `observability` | When target allocator is enabled | Distributes scrape targets to the OpenTelemetry Collector. | `ghcr.io/open-telemetry/opentelemetry-operator/target-allocator:0.158.0` | [Upstream](https://github.com/open-telemetry/opentelemetry-operator) |
+| `admission` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Handles admission of KAI Scheduler workloads. | `ghcr.io/kai-scheduler/kai-scheduler/admission:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `binder` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Binds pods to nodes for KAI Scheduler. | `ghcr.io/kai-scheduler/kai-scheduler/binder:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `podgrouper` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Groups workload pods into pod groups for KAI Scheduler. | `ghcr.io/kai-scheduler/kai-scheduler/podgrouper:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `podgroupcontroller` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Reconciles pod groups for KAI Scheduler. | `ghcr.io/kai-scheduler/kai-scheduler/podgroupcontroller:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `queuecontroller` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Reconciles scheduling queues for KAI Scheduler. | `ghcr.io/kai-scheduler/kai-scheduler/queuecontroller:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
+| `scheduler` | `v0.17.1` | `compute-plane` | When KAI Scheduler is enabled | Schedules workloads for KAI Scheduler. | `ghcr.io/kai-scheduler/kai-scheduler/scheduler:v0.17.1` | [Upstream](https://github.com/NVIDIA/KAI-Scheduler) |
