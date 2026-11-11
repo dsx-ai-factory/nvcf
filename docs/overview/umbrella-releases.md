@@ -88,20 +88,20 @@ download command in this catalog.
 {/*docs-version-sync:BEGIN stack-package-downloads*/}
 
 ```bash
-# Self-Managed 1.0.10
-ngc registry resource download-version "nvidia/nvcf/nvcf-self-managed-stack:1.0.10" && \
-  tar -xzf "nvcf-self-managed-stack_v1.0.10/nvcf-self-managed-stack-1.0.10.tar.gz" \
-    -C "$BUNDLE_DIR/deploy/stacks/self-managed"
+# Self-Managed 1.1.5
+ngc registry resource download-version "nvidia/nvcf/nvcf-self-managed-stack:1.1.5"
+tar -xzf "nvcf-self-managed-stack_v1.1.5/nvcf-self-managed-stack-1.1.5.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/self-managed"
 
-# Compute Plane 1.0.5
-ngc registry resource download-version "nvidia/nvcf/nvcf-compute-plane-stack:1.0.5" && \
-  tar -xzf "nvcf-compute-plane-stack_v1.0.5/nvcf-compute-plane-stack-1.0.5.tar.gz" \
-    -C "$BUNDLE_DIR/deploy/stacks/nvcf-compute-plane"
+# Compute Plane 1.1.0
+ngc registry resource download-version "nvidia/nvcf/nvcf-compute-plane-stack:1.1.0"
+tar -xzf "nvcf-compute-plane-stack_v1.1.0/nvcf-compute-plane-stack-1.1.0.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/nvcf-compute-plane"
 
-# Observability 1.0.0
-ngc registry resource download-version "nvidia/nvcf/nvcf-observability-stack:1.0.0" && \
-  tar -xzf "nvcf-observability-stack_v1.0.0/nvcf-observability-stack-1.0.0.tar.gz" \
-    -C "$BUNDLE_DIR/deploy/stacks/observability"
+# Observability 1.1.0
+ngc registry resource download-version "nvidia/nvcf/nvcf-observability-stack:1.1.0"
+tar -xzf "nvcf-observability-stack_v1.1.0/nvcf-observability-stack-1.1.0.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/observability"
 
 ```
 

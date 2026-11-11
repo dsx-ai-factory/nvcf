@@ -3,6 +3,7 @@ include Makefile.dist
 
 .PHONY: test test-published-charts
 test:
+	@tests/vanity-request-size.sh
 	@tests/custom-observability-environment.sh
 	@tests/llm-gateway-auth-transport.sh
 	@tests/llm-router-worker-address.sh
@@ -15,6 +16,7 @@ test:
 	@tests/gateway-routes-default-ownership.sh
 	@tests/grpc-proxy-nats-endpoint.sh
 	@tests/grpc-proxy-event-ledger-addr.sh
+	@tests/event-ledger-dependencies.sh
 	@tests/nats-image-overrides.sh
 	@tests/cert-manager-image-overrides.sh
 	@tests/llm-pki-openbao-migration.sh
@@ -54,6 +56,7 @@ test:
 	@tests/nonroot-ui-migrations.sh
 	@tests/ha-value-wiring.sh
 	@tests/ha-chart-render.sh
+	@tests/worker-callback-proxy-wiring.sh
 
 test-published-charts:
 	@: "$${NVCF_PUBLISHED_CHART_REGISTRY:?NVCF_PUBLISHED_CHART_REGISTRY is required}"

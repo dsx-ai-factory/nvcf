@@ -348,9 +348,6 @@ func (p *StargateProvider) newOutboundRequest(
 	if reqCtx.Priority != nil {
 		req.Header.Set(headerPriority, strconv.FormatUint(uint64(*reqCtx.Priority), 10))
 	}
-	if bearerToken := reqCtx.BearerToken; bearerToken != "" {
-		req.Header.Set(headerAuthorization, "Bearer "+bearerToken)
-	}
 
 	model := effectiveModel(reqCtx, request)
 	if model != "" {
@@ -455,17 +452,12 @@ func (p *StargateProvider) Proxy(
 		if reqCtx.Model != "" {
 			outbound.Header.Set(headerModel, reqCtx.Model)
 		}
-		if bearerToken := reqCtx.BearerToken; bearerToken != "" {
-			outbound.Header.Set(headerAuthorization, "Bearer "+bearerToken)
-		}
 	}
-	// Caller credentials authorize NVCF, never the Messages or decision model
-	// server. Enforce this before Stargate so Pylon workers that forward
-	// Authorization cannot leak them.
-	if stripsCallerCredentials(request.Path) {
-		for _, name := range callerCredentialHeaders {
-			outbound.Header.Del(name)
-		}
+	// Caller credentials authorize NVCF, never the model server. Remove them on
+	// every route before Stargate, because Pylon forwards request headers to
+	// the model server.
+	for _, name := range callerCredentialHeaders {
+		outbound.Header.Del(name)
 	}
 
 	if decisionRoute {
@@ -511,12 +503,6 @@ var stargateControlHeaders = []string{
 // every client header and body member.
 func isDecisionPath(path string) bool {
 	return path == "/v1/decisions" || path == "/v1/systemone"
-}
-
-// stripsCallerCredentials reports whether path is a route whose model server
-// must never see the caller's credentials.
-func stripsCallerCredentials(path string) bool {
-	return path == "/v1/messages" || isDecisionPath(path)
 }
 
 type proxyResponseBody struct {

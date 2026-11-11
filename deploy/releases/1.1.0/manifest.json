@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "version": "1.1.0",
+  "previous_version": "1.0.4",
+  "change": "minor",
+  "status": "qualified",
+  "qualification": "https://github.com/dsx-ai-factory/nvcf/issues/3182",
+  "source_commit": "f7c0cb66968a63a45e341ea808034ba6e2b5288c",
+  "toolchain": {
+    "helm": "3.21.4",
+    "helmfile": "1.1.9"
+  },
+  "stacks": {
+    "compute-plane": {
+      "version": "1.1.0",
+      "source_tag": "deploy/stacks/nvcf-compute-plane/v1.1.0",
+      "source_commit": "507d8e2ece81d04b8e63f6be31a0ea2d83561b4b",
+      "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
+      "inventory_sha256": "sha256:ee76f728cfdf8d23ded4e5e63cba0e96bb3a53b7055e5ebb966204d33f27c9d1",
+      "compatible_with": {
+        "control-plane": "1.1.5",
+        "observability": "1.1.0"
+      }
+    },
+    "control-plane": {
+      "version": "1.1.5",
+      "source_tag": "deploy/stacks/self-managed/v1.1.5",
+      "source_commit": "e11b44050c3770d650d5fd4bf0b8e8bebca6786c",
+      "inventory_asset": "nvcf-self-managed-stack-inventory.json",
+      "inventory_sha256": "sha256:2e4ce14b997e2ceda8dbdd54419193ccdc65a1cffe65734d7d3bada3c4f2543f",
+      "compatible_with": {
+        "compute-plane": "1.1.0",
+        "observability": "1.1.0"
+      }
+    },
+    "observability": {
+      "version": "1.1.0",
+      "source_tag": "deploy/stacks/observability/v1.1.0",
+      "source_commit": "d1918a811df7e7bc6be7d6cc625844b6f5e30b42",
+      "inventory_asset": "nvcf-observability-stack-inventory.json",
+      "inventory_sha256": "sha256:3833771ad85f14af832fcd60b9de95a48dd05af2f5e666c5a5d6324a5af91c82",
+      "compatible_with": {
+        "compute-plane": "1.1.0",
+        "control-plane": "1.1.5"
+      }
+    }
+  }
+}

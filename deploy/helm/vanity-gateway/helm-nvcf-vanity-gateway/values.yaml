@@ -58,6 +58,8 @@ vanityGateway:
     privateModelNameRegexPattern: ""
     awsRegion: ""
     shadowMaxConcurrent: 256
+    # Maximum model API request body size in bytes (25 MiB). Must be positive.
+    maxRequestSizeBytes: 26214400
 
   mappingConfig:
     v2config:

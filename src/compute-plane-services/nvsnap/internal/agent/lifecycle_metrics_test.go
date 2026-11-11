@@ -145,6 +145,16 @@ func TestPodStartMethod(t *testing.T) {
 			t.Errorf("method of %v = %s, want %s", ann, got, want)
 		}
 	}
+	// A pod made Ready by its restored condition before its annotation was
+	// written is a restore; one started cold in place after a failed
+	// restore is not.
+	for reason, want := range map[string]string{restoredConditionReason: metrics.MethodCRIU, "ColdStarted": metrics.MethodCold} {
+		pod := &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+			{Type: webhook.CRIURestoredCondition, Status: corev1.ConditionTrue, Reason: reason}}}}
+		if got := podStartMethod(pod); got != want {
+			t.Errorf("method of a pod whose restored condition's reason is %s = %s, want %s", reason, got, want)
+		}
+	}
 }
 
 // A GPU pod's start is recorded once, by how it started, with an event.

@@ -416,79 +416,25 @@ func (c *Client) DeleteAPIKey(ctx context.Context, keyID string) error {
 		return fmt.Errorf("%w: %s", ErrKeyNotFound, string(body))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		message := string(body)
+		var problem struct {
+			Title  string `json:"title"`
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(body, &problem); err == nil {
+			switch {
+			case problem.Title != "" && problem.Detail != "":
+				message = problem.Title + " - " + problem.Detail
+			case problem.Title != "":
+				message = problem.Title
+			case problem.Detail != "":
+				message = problem.Detail
+			}
+		}
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, message)
 	}
 
 	logging.Debug("Successfully deleted API key %s", keyID)
-	return nil
-}
-
-// RevokeAPIKey revokes an API key via direct HTTP call
-func (c *Client) RevokeAPIKey(ctx context.Context, keyID string) error {
-	if c.config.Debug {
-		logging.Debug("Revoking API key %s via direct HTTPS call to: %s", keyID, c.config.ServiceURL)
-	}
-
-	// Create HTTP request - using DELETE for revoke
-	req, err := http.NewRequestWithContext(ctx, "DELETE", c.config.ServiceURL+"/v1/keys/"+keyID, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Key-Issuer-Service", c.config.IssuerService)
-	req.Header.Set("Key-Issuer-Id", c.config.ServiceID)
-	req.Header.Set("Key-Owner-Id", c.config.OwnerID)
-
-	if c.config.Debug {
-		logging.Debug("Request headers:")
-		for name, values := range req.Header {
-			for _, v := range values {
-				if name == "Authorization" {
-					logging.Debug("  %s: %s", name, redactBearerToken(v))
-				} else {
-					logging.Debug("  %s: %s", name, v)
-				}
-			}
-		}
-	}
-
-	// Make the request
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to revoke API key: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if c.config.Debug {
-		logging.Debug("Revoke API key response status: %d", resp.StatusCode)
-		logging.Debug("Revoke API key response: %s", string(body))
-	}
-
-	// Check status code - allow both 200 and 204
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		// Try to parse as error response
-		var errorResponse map[string]interface{}
-		if err := json.Unmarshal(body, &errorResponse); err == nil {
-			if status, ok := errorResponse["status"].(float64); ok && status >= 400 {
-				title, _ := errorResponse["title"].(string)
-				detail, _ := errorResponse["detail"].(string)
-				return fmt.Errorf("API error %d: %s - %s", int(status), title, detail)
-			}
-			if detail, ok := errorResponse["detail"].(string); ok {
-				return fmt.Errorf("API error: %s", detail)
-			}
-		}
-		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-
-	logging.Debug("Successfully revoked API key %s", keyID)
 	return nil
 }
 

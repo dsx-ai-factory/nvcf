@@ -43,7 +43,9 @@ func Render(renderer string, catalog *Catalog) (string, error) {
 	case "image-mirroring-cli-snippet":
 		return renderImageMirroringCLISnippet(catalog)
 	case "stack-package-downloads":
-		return renderStackPackageDownloads(catalog)
+		return renderStackPackageDownloads(catalog, false)
+	case "stack-package-downloads-fail-fast":
+		return renderStackPackageDownloads(catalog, true)
 	case "compatibility-matrix":
 		return renderCompatibilityMatrix(catalog)
 	case "release-selection":
@@ -55,7 +57,7 @@ func Render(renderer string, catalog *Catalog) (string, error) {
 	}
 }
 
-func renderStackPackageDownloads(catalog *Catalog) (string, error) {
+func renderStackPackageDownloads(catalog *Catalog, failFast bool) (string, error) {
 	var b strings.Builder
 	b.WriteString("```bash\n")
 	for _, spec := range []struct{ name, directory, label string }{
@@ -80,7 +82,12 @@ func renderStackPackageDownloads(catalog *Catalog) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(&b, "ngc registry resource download-version %q && \\\n  tar -xzf %q \\\n    -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n", ref,
+		// Retain the original renderer's bytes for approved historical editions.
+		format := "ngc registry resource download-version %q && \\\n  tar -xzf %q \\\n    -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n"
+		if failFast {
+			format = "ngc registry resource download-version %q\ntar -xzf %q \\\n  -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n"
+		}
+		fmt.Fprintf(&b, format, ref,
 			fmt.Sprintf("%s_v%s/%s-%s.tar.gz", artifact.Name, artifact.Version, artifact.Name, artifact.Version), spec.directory)
 	}
 	b.WriteString("```\n")

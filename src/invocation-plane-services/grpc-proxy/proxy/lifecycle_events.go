@@ -35,6 +35,8 @@ const (
 	eventTypeAttachmentEstablished = "GrpcProxy.Attachment.Established"
 	eventTypeAttachmentSetupFailed = "GrpcProxy.Attachment.Setup_failed"
 	eventTypeAttachmentClosed      = "GrpcProxy.Attachment.Closed"
+	eventTypeRpcStarted            = "GrpcProxy.Rpc.Started"
+	eventTypeRpcFinished           = "GrpcProxy.Rpc.Finished"
 
 	// Auth, rate limit and rejoin lookup failures are not published: their
 	// callers are unverified or rejected, and every attempt would add a row.
@@ -44,7 +46,7 @@ const (
 
 // Pre-initialized so the series exist at zero before the first publish.
 func init() {
-	for _, eventType := range []string{eventTypeWorkDispatched, eventTypeAttachmentEstablished, eventTypeAttachmentSetupFailed, eventTypeAttachmentClosed} {
+	for _, eventType := range []string{eventTypeWorkDispatched, eventTypeAttachmentEstablished, eventTypeAttachmentSetupFailed, eventTypeAttachmentClosed, eventTypeRpcStarted, eventTypeRpcFinished} {
 		for _, result := range []string{"sent", "failed", "dropped"} {
 			metrics.EventLedgerPublishCounter.WithLabelValues(eventType, result)
 		}
@@ -144,4 +146,66 @@ func attachmentEndEvent(wc *worker.WorkerConnection, cause string, closedAt time
 			attachmentSetupFailedData{eventHeader: header(wc.RequestId), Phase: setupPhaseWorkerWait, AttachmentId: wc.AttachmentId.String()}), true
 	}
 	return cloudevents.Event{}, false
+}
+
+// rpcData identifies the RPC an attachment reports. Only the first RPC
+// forwarded over each attachment is reported.
+type rpcData struct {
+	eventHeader
+	AttachmentId string `json:"attachment_id"`
+	RpcId        string `json:"rpc_id"`
+	Method       string `json:"method"`
+	Protocol     string `json:"protocol"`
+}
+
+type rpcFinishedData struct {
+	rpcData
+	// The gRPC status for a gRPC call, otherwise the HTTP status. Absent when
+	// a gRPC call ended without one.
+	StatusCode            *int   `json:"status_code,omitempty"`
+	DurationMs            int64  `json:"duration_ms"`
+	TimeToFirstResponseMs *int64 `json:"time_to_first_response_ms,omitempty"`
+	// Absent for an upgraded connection, whose traffic is not counted.
+	BytesIn  *int64 `json:"bytes_in,omitempty"`
+	BytesOut *int64 `json:"bytes_out,omitempty"`
+	// Forwarding was cut short, or a gRPC call ended without a status.
+	Incomplete bool `json:"incomplete"`
+}
+
+func newRpcData(wc *worker.WorkerConnection, rpc *rpcObserver) rpcData {
+	return rpcData{
+		eventHeader:  header(wc.RequestId),
+		AttachmentId: wc.AttachmentId.String(),
+		RpcId:        rpc.id.String(),
+		Method:       rpc.method,
+		Protocol:     rpc.protocol,
+	}
+}
+
+func newRpcStarted(wc *worker.WorkerConnection, rpc *rpcObserver) cloudevents.Event {
+	return newLedgerEvent(eventTypeRpcStarted, rpc.startedAt, wc.RequestId, wc.FunctionId, wc.FunctionVersionId, wc.CallerNcaId,
+		newRpcData(wc, rpc))
+}
+
+// newRpcFinished describes how rpc ended at at. aborted is set when
+// forwarding did not return normally.
+func newRpcFinished(wc *worker.WorkerConnection, rpc *rpcObserver, aborted bool, at time.Time) cloudevents.Event {
+	data := rpcFinishedData{rpcData: newRpcData(wc, rpc), DurationMs: at.Sub(rpc.startedAt).Milliseconds()}
+	if code, ok := rpc.statusCode(); ok {
+		data.StatusCode = &code
+	}
+	if !rpc.firstResponse.IsZero() {
+		ttfb := rpc.firstResponse.Sub(rpc.startedAt).Milliseconds()
+		data.TimeToFirstResponseMs = &ttfb
+	}
+	if !rpc.hijacked {
+		var in int64
+		if rpc.body != nil {
+			in = rpc.body.n.Load()
+		}
+		out := rpc.bytesOut
+		data.BytesIn, data.BytesOut = &in, &out
+	}
+	data.Incomplete = aborted || (rpc.protocol == rpcProtocolGRPC && data.StatusCode == nil)
+	return newLedgerEvent(eventTypeRpcFinished, at, wc.RequestId, wc.FunctionId, wc.FunctionVersionId, wc.CallerNcaId, data)
 }

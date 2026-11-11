@@ -51,6 +51,17 @@ type Config struct {
 	PodIP                        string        `mapstructure:"POD_IP"`
 	AWSRegion                    string        `mapstructure:"AWS_REGION"`
 	ShadowMaxConcurrent          int           `mapstructure:"SHADOW_MAX_CONCURRENT"`
+	MaxRequestSizeBytes          *int64        `mapstructure:"MAX_REQUEST_SIZE_BYTES"`
+}
+
+func (c Config) requestSizeLimit() (int64, error) {
+	if c.MaxRequestSizeBytes == nil {
+		return defaultMaxRequestSize, nil
+	}
+	if *c.MaxRequestSizeBytes <= 0 {
+		return 0, fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+	}
+	return *c.MaxRequestSizeBytes, nil
 }
 
 type NVCFGateway struct {
@@ -80,6 +91,9 @@ func swapRouterWhenNotified(ctx context.Context, mappings reloadableconfig.Reloa
 }
 
 func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error) {
+	if _, err := config.requestSizeLimit(); err != nil {
+		return nil, err
+	}
 	if config.SecretsPath == "" {
 		config.SecretsPath = "vault/secrets.json"
 	}

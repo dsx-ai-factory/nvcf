@@ -833,7 +833,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 			errorMessage := OpenAIError{
 				Error: CustomOpenAIError{
 					Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-						"If larger assets are required please refer to our Assets API.", maxRequestSize),
+						"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
 					Type: "invalid_request_error",
 					Code: "invalid_image_format",
 				},
@@ -1440,7 +1440,7 @@ func requestReadFailure(protocol nativeProtocol, err error) (int, string, string
 	}
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		status, kind, message = http.StatusRequestEntityTooLarge, "", "request body is too large"
+		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
 	}
 	if errors.Is(err, errModelFieldMissing) {
 		kind, message = errKindInvalidRequest, "model field is required"

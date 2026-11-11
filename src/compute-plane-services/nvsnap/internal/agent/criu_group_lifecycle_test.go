@@ -4,6 +4,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,6 +21,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -606,7 +608,7 @@ func TestFailGroup_RecordsOnlyOnItsOwnRecord(t *testing.T) {
 }
 
 // A group's failure, as its record keeps it, names every member with the
-// start of its own error, however long each member's error is: the member
+// start and end of its own error, however long each member's error is: the member
 // that failed on its own is not hidden behind the others' aborts.
 func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	abort := "checkpoint failed: CRIU dump failed (criu-v2): action.sh exited, status=1 " + strings.Repeat("Unseizing 4174664 into 1 | ", 400)
@@ -626,6 +628,27 @@ func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	}
 	if len(reason) > groupReasonMax || len(reason) > 3*(groupMemberErrorMax+16)+64 {
 		t.Errorf("reason of %d bytes, want each member bounded", len(reason))
+	}
+}
+
+// A member's error keeps its end: a tool's own error comes after its
+// command line and its progress, which alone fill the bound.
+func TestMemberFailureKeepsTheEnd(t *testing.T) {
+	err := "500 Internal Server Error: restore failed: gpushare resume: nvsnap-gpu-suspend --hold-gate --fabric-map /w/.fabric-s1 resume " +
+		strings.Repeat("123 ", 60) + ": exit status 1 (output: " + strings.Repeat("pid=883 fabmap /w/out.883: ok 267 fabric handle(s) | ", 12) +
+		"fabric map: 267 handle(s) in /w/out; waiting for /w/in | no /w/in after 600 s)"
+	got := memberFailure("fn/worker-0", err)
+	if !strings.HasPrefix(got, "fn/worker-0: 500 Internal Server Error: restore failed: gpushare resume") {
+		t.Errorf("lost the start: %q", got[:80])
+	}
+	if !strings.HasSuffix(got, "no /w/in after 600 s)") {
+		t.Errorf("lost the cause at the end: %q", got[len(got)-80:])
+	}
+	if n := len(got) - len("fn/worker-0: "); n != groupMemberErrorMax {
+		t.Errorf("member error of %d bytes, want %d", n, groupMemberErrorMax)
+	}
+	if short := memberFailure("p", "boom"); short != "p: boom" {
+		t.Errorf("a short error changed: %q", short)
 	}
 }
 
@@ -694,5 +717,82 @@ func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
 	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn"})
 	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
 		t.Errorf("claim = %v, %v; a record still verified in its namespace is not taken over", again, err)
+	}
+}
+
+// A placeholder scheduled to a node no agent will run on (a pod without
+// GPUs on a CPU node) is never restored: the restore does not run, the
+// checkpoints stay usable, and the instance starts cold at once rather than
+// after the placeholder wait. A node an agent is on its way to is waited for.
+func TestRestoreGroup_PlaceholderWithoutAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		gpuNode  bool
+		wantCold bool
+	}{
+		{"on a CPU node", false, true},
+		{"on a GPU node whose agent is not running yet", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, kc, leader := groupFixture(t)
+			var logs bytes.Buffer
+			c.a.log.SetOutput(&logs)
+			ctx := context.Background()
+			for _, name := range []string{"node-kimi-0", "node-kimi-1"} {
+				n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+				if name == "node-kimi-0" || tc.gpuNode {
+					n.Status.Allocatable = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}
+				}
+				if _, err := kc.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			agent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nvsnap-agent-0", Namespace: c.a.criuFailedNamespace(), Labels: map[string]string{"app": "nvsnap-agent"}},
+				Spec: corev1.PodSpec{NodeName: "node-kimi-0"}}
+			if _, err := kc.CoreV1().Pods(agent.Namespace).Create(ctx, agent, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"kimi-0", "kimi-1"} {
+				p, err := kc.CoreV1().Pods("fn").Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				p.Annotations[webhook.CRIURestoreContainerAnnotation] = "engine"
+				p.Annotations[webhook.CRIUGroupOrdinalAnnotation] = name[len(name)-1:]
+				p.Annotations[webhook.CRIUGroupSizeAnnotation] = "2"
+				p.Spec.NodeName = "node-" + name
+				if name == "kimi-0" {
+					p.Status.Phase = corev1.PodRunning
+					p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "engine", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+				} else {
+					// Its mounts keep it in ContainerCreating there.
+					p.Status.Phase = corev1.PodPending
+				}
+				if _, err := kc.CoreV1().Pods("fn").Update(ctx, p, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if name == "kimi-0" {
+					leader = p
+				}
+			}
+			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			t0 := time.Now()
+			c.restoreGroup(rctx, leader, "k1", 2)
+			cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+			if c.Blocked(ctx, "c0") || c.Blocked(ctx, "c1") {
+				t.Error("a restore that never ran blocked its checkpoints")
+			}
+			if tc.wantCold {
+				if time.Since(t0) > time.Second || cm.Data["stalls"] != "1" {
+					t.Errorf("after %s record = %v; want the restore ended at once as not run (one stall)\n%s", time.Since(t0), cm.Data, logs.String())
+				}
+				if got := remainingPods(t, kc); len(got) != 1 || got[0] != "other-0" {
+					t.Errorf("pods left = %v, want only the other instance", got)
+				}
+			} else if cm.Data["stalls"] != "" {
+				t.Errorf("record = %v; a node an agent is on its way to must be waited for\n%s", cm.Data, logs.String())
+			}
+		})
 	}
 }

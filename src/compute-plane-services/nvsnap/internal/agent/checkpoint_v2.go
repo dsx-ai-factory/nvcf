@@ -248,8 +248,20 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	}
 	root := filepath.Join(procBase, strconv.Itoa(hostPID), "root")
 
+	// A dump that fails before CRIU has dumped the container, with the
+	// container's process ended, failed because the workload exited
+	// (workload_exited.go). Once CRIU has dumped it, the dump itself
+	// stopped the process, and a later failure is nvsnap's.
+	initStart, _ := procStartTime(procBase, hostPID)
+	dumped := false
+	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart) }()
+
 	// 1. The tools run from the node bundle mounted read-only in the
-	// container (bundle_tools.go), never from a copy in its filesystem.
+	// container (bundle_tools.go), never from a copy in its filesystem. A
+	// companion lacking them has them mounted into it (companion_tools.go).
+	if err := a.ensureCompanionToolsIn(procBase, hostPID); err != nil {
+		log.WithError(err).Warn("node bundle: cannot mount the tools into a pod without GPUs")
+	}
 	tools, err := bundleToolsOf(procBase, hostPID, a.bundleVersionsDir())
 	if err != nil {
 		return nil, fmt.Errorf("criu-v2: %w", err)
@@ -303,7 +315,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	var gpuMap string
 	var guard suspendGuard
 	if fabricSession != "" && !gsOn {
-		return nil, fmt.Errorf("gpushare: fabric session %s, but no process of this pod runs on the GPU under %s", fabricSession, gpushareLibName)
+		return nil, errNoGPUProcess(fabricSession)
 	}
 	// A multi-node session's directory lives in the pod's store and must be
 	// gone before the store is collected into the checkpoint.
@@ -408,6 +420,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// The container's pid namespace, from its init, dumped from outside
 	// with the agent's own CRIU (pidns_capture.go).
 	err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+	dumped = err == nil
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}

@@ -22,6 +22,10 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | global.imagePullSecrets[0].name               | nvcr-pull-secret                                                   |
         | global.helm.sources.repository                | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}                               |
         | global.image.repository                       | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}                               |
+      And I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "addons.vanityGateway.config.maxRequestSizeBytes" to:
+        """
+        67108864
+        """
       And I prepare Helmfile environment "local-bdd" for stack "nvcf-compute-plane" from fixture "tests/bdd/fixtures/nvcf-compute-plane-local-bdd.yaml" with values:
         | global.imagePullSecrets[0].name | nvcr-pull-secret                     |
         | global.helm.sources.repository  | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM} |
@@ -101,6 +105,11 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       When I run command "kubectl --context k3d-ncp-local get configmap/llm-api-gateway -n nvcf -o jsonpath={.data.NVCF_GRPC_INSECURE}"
       Then the command exit code should be 0
       And the command output should contain "true"
+
+      # Confirm the operator's 64 MiB override reaches the gateway environment.
+      When I run command "kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}"
+      Then the command exit code should be 0
+      And the command output should contain "67108864"
 
       When I run command "helm get manifest llm-api-gateway --namespace nvcf --kube-context k3d-ncp-local"
       Then the command exit code should be 0
