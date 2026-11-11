@@ -80,7 +80,7 @@ func renderStackPackageDownloads(catalog *Catalog) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(&b, "ngc registry resource download-version %q && \\\n  tar -xzf %q \\\n    -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n", ref,
+		fmt.Fprintf(&b, "ngc registry resource download-version %q\ntar -xzf %q \\\n  -C \"$BUNDLE_DIR/deploy/stacks/%s\"\n\n", ref,
 			fmt.Sprintf("%s_v%s/%s-%s.tar.gz", artifact.Name, artifact.Version, artifact.Name, artifact.Version), spec.directory)
 	}
 	b.WriteString("```\n")
