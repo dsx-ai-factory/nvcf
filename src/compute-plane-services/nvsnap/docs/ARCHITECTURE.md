@@ -347,8 +347,9 @@ out and starts cold) and stamped with its hash (`nvsnap.io/hash`). Then:
   atomic, so one admission wins and leads (captured as usual); the others are
   admitted against the claim name `rox-<hash>` behind the scheduling gate
   `nvsnap.io/wait-for-cache`, holding no node and no GPU;
-- any error admits the pod unchanged, and so does a manifest whose claim is
-  not bound yet (a promote pending or failed);
+- an election error, or a manifest whose claim is not bound yet (a promote
+  pending or failed), adds no election patch: the pod gets no gate and no
+  claim, and the rest of admission still applies (`internal/webhook/mutate.go`);
 - a follower starts cold, ungated, when the L2 backend cannot name the claim
   before the promote or clones per pod.
 

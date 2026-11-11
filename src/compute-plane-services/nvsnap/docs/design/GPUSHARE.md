@@ -210,10 +210,12 @@ fabric session:
 
 1. The webhook turns fabric on for a pod whose engine spans pods (a
    multi-node flag, or a group of more than one pod) and sets
-   `NVSNAP_GPUSHARE_FABRIC=1` unless the container sets it;
-   `nvsnap.io/gpushare-fabric` overrides the webhook's choice, but a value the
-   container sets itself wins over both (`internal/webhook/gpushare.go`
-   `gpushareMode`).
+   `NVSNAP_GPUSHARE_FABRIC=1` unless the container's `env` list names it;
+   `nvsnap.io/gpushare-fabric` overrides the webhook's choice, and a value in
+   the container's `env` list wins over both. The webhook does not read
+   `envFrom` or the image: a value set only there is overridden by the
+   injected `1` (`internal/webhook/gpushare.go` `gpushareMode`,
+   `gpusharePatches`).
 2. Ask any agent for a group checkpoint of all the pods:
 
    ```bash
