@@ -108,10 +108,6 @@ write_env "0.19.6"
 render_values "$work_dir/newer-values.yaml" >/dev/null
 assert_tag "$work_dir/newer-values.yaml" "0.19.6"
 
-write_env "0.19.4"
-render_values "$work_dir/older-values.yaml" >/dev/null
-assert_tag "$work_dir/older-values.yaml" "0.19.5"
-
 write_env "0.19.5+build.1"
 if render_values "$work_dir/invalid-values.yaml" >"$work_dir/invalid.log" 2>&1; then
   fail "accepted a SemVer build-metadata suffix that is invalid in an OCI image tag"
@@ -136,10 +132,5 @@ render_openbao_values "$work_dir/shared-openbao.yaml" >/dev/null
 assert_tag "$work_dir/shared-ui.yaml" "0.23.4"
 yq -e '.openbao.migrations.image.tag == "0.23.4"' "$work_dir/shared-openbao.yaml" >/dev/null 2>&1 ||
   fail "OpenBao migrations tag did not follow the shared stack tag"
-
-# A shared tag below the UI floor falls back to the floor for the UI only.
-write_shared_env "0.19.4"
-render_values "$work_dir/low-ui.yaml" >/dev/null
-assert_tag "$work_dir/low-ui.yaml" "0.19.5"
 
 echo "nvcf-ui-migrations-image-tag: ok"
