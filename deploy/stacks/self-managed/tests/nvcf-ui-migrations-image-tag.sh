@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Test that the NVCF UI OpenBao migrations image tag is a supported SemVer and
-# a valid OCI image tag before the stack passes it to the chart.
+# Test that the NVCF UI OpenBao migrations image tag follows the shared stack
+# tag unless the add-on sets its own, and is a valid OCI image tag before the
+# stack passes it to the chart.
 set -euo pipefail
 
 stack_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

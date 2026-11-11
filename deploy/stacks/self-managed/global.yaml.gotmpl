@@ -2451,15 +2451,10 @@ vanityGateway:
 {{- $essBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "ess" "backend" dict .Values)) (dict "name" "ess-api" "namespace" "ess" "port" 8080) }}
 {{- $apiKeysBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "apiKeys" "backend" dict .Values)) (dict "name" "api-keys" "namespace" "api-keys" "port" 8080) }}
 {{/* openbao-migrations image tag: the component tag, else the shared stack tag
-     (global.openbaoMigrations.image.tag). 0.19.5 is the floor: the migrations
-     job needs >= 0.19.5, so an older tag is replaced by the floor. */}}
-{{- $nvcfUiOpenbaoMigrationsTag := "0.19.5" }}
-{{- $nvcfUiMigrationsCandidate := coalesce (dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values) $migrationsTag }}
-{{- if and $nvcfUiMigrationsCandidate (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiMigrationsCandidate)) }}
+     (global.openbaoMigrations.image.tag). */}}
+{{- $nvcfUiOpenbaoMigrationsTag := coalesce (dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values) $migrationsTag }}
+{{- if and $nvcfUiOpenbaoMigrationsTag (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiOpenbaoMigrationsTag)) }}
 {{- fail "addons.nvcfUi.openbaoMigrations.image.tag must be a valid OCI image tag" }}
-{{- end }}
-{{- if and $nvcfUiMigrationsCandidate (semverCompare ">=0.19.5" $nvcfUiMigrationsCandidate) }}
-{{- $nvcfUiOpenbaoMigrationsTag = $nvcfUiMigrationsCandidate }}
 {{- end }}
 nvcfUi:
   fullnameOverride: nvcf-ui
