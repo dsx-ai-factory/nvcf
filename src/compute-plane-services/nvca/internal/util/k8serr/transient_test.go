@@ -28,6 +28,51 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+// TestIsTransientCSIMountPathErrors pins the NVMesh first-provision CSI mount
+// failures reported in nvbugs#6471949: kubelet surfaces them as plain strings
+// while mkfs.xfs runs on a freshly provisioned container-cache volume, they
+// clear on retry once the filesystem exists, and so must be requeued quietly
+// rather than escalated as hard reconcile failures. Permanent CSI rejections
+// must stay non-transient.
+func TestIsTransientCSIMountPathErrors(t *testing.T) {
+	const vol = "pvc-cc401d5b-7bb2-400b-9e10-8f15c5c50efd"
+
+	deadline := fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+		"rpc error: code = DeadlineExceeded desc = context deadline exceeded", vol)
+	busy := fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+		"rpc error: code = Internal desc = mkfs failed 1  mkfs.xfs: cannot open "+
+		"/dev/nvmesh/csi-cc401d5b-7bb2-400b: Device or resource busy", vol)
+
+	tests := []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{name: "mount device deadline exceeded", err: deadline, transient: true},
+		{name: "wrapped mount device deadline exceeded", err: fmt.Errorf("mounting cache volume: %w", deadline), transient: true},
+		{name: "mkfs device or resource busy", err: busy, transient: true},
+		{name: "wrapped mkfs device or resource busy", err: fmt.Errorf("mounting cache volume: %w", busy), transient: true},
+		{
+			name: "invalid argument",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = InvalidArgument desc = volume capability not supported", vol),
+			transient: false,
+		},
+		{
+			name: "permission denied",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = PermissionDenied desc = not authorized", vol),
+			transient: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.transient, IsTransient(tt.err))
+		})
+	}
+}
+
 func TestIsTransient(t *testing.T) {
 	gr := schema.GroupResource{Group: "test", Resource: "things"}
 
