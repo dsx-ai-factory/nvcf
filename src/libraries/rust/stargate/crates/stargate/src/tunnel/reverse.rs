@@ -149,7 +149,11 @@ impl QuicHttpProxy {
             .map_or(&self.config.server_tls_identity, |reloader| {
                 reloader.current_identity()
             });
-        let server_config = build_server_config(initial_identity, self.config.tunnel_protocol)?;
+        let server_config = build_server_config(
+            initial_identity,
+            self.config.tunnel_protocol,
+            self.config.reverse_tunnel_liveness,
+        )?;
         socket
             .set_nonblocking(true)
             .context("set reverse listener socket to non-blocking")?;
@@ -181,12 +185,13 @@ impl QuicHttpProxy {
             status.set_validity(reloader.current_validity());
             metrics.refresh_tls_certificate_expiry();
             let tunnel_protocol = self.config.tunnel_protocol;
+            let liveness = self.config.reverse_tunnel_liveness;
             let reload = stargate_tls::ServerIdentityReloadTask {
                 component: "stargate-reverse-listener",
                 reloader,
                 endpoint: endpoint.clone(),
                 build_server_config: Box::new(move |identity| {
-                    build_server_config(identity, tunnel_protocol)
+                    build_server_config(identity, tunnel_protocol, liveness)
                 }),
                 poll_interval: self.config.tls_reload_interval,
                 status,

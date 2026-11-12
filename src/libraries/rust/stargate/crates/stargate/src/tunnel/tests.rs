@@ -97,6 +97,7 @@ fn test_server_endpoint(
     let mut config = build_server_config(
         &stargate_tls::ServerTlsIdentity::SelfSigned,
         tunnel_protocol,
+        super::ReverseTunnelLiveness::default(),
     )
     .expect("test server config should build");
     configure(&mut config);
@@ -178,6 +179,7 @@ fn test_quic_proxy_with(
         tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
         quic_insecure: true,
         tunnel_protocol,
+        reverse_tunnel_liveness: Default::default(),
     };
     configure(&mut config);
     Arc::new(
@@ -468,6 +470,92 @@ async fn reverse_listener_shutdown_waits_for_stalled_dispatch_task() {
     client_endpoint.close(0u32.into(), b"test complete");
 }
 
+/// Forwards UDP datagrams between one client and `server_addr` until `cut` is
+/// cancelled, then drops everything, like a host that vanished from the network.
+async fn spawn_cuttable_udp_relay(
+    server_addr: SocketAddr,
+    cut: tokio_util::sync::CancellationToken,
+) -> SocketAddr {
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut client_addr = None;
+        let mut buf = vec![0_u8; 65_535];
+        loop {
+            let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            if cut.is_cancelled() {
+                continue;
+            }
+            let to = if from == server_addr {
+                let Some(client) = client_addr else { continue };
+                client
+            } else {
+                client_addr = Some(from);
+                server_addr
+            };
+            let _ = socket.send_to(&buf[..len], to).await;
+        }
+    });
+    relay_addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverse_tunnel_liveness_keeps_quiet_tunnel_and_detects_vanished_peer() {
+    install_crypto_provider();
+    let liveness = super::ReverseTunnelLiveness {
+        keep_alive_interval: Duration::from_millis(100),
+        max_idle_timeout: Duration::from_millis(500),
+    };
+    let server = server_endpoint(
+        build_server_config(
+            &stargate_tls::ServerTlsIdentity::SelfSigned,
+            TunnelTransportProtocol::RawQuic,
+            liveness,
+        )
+        .expect("server config"),
+    );
+    let cut = tokio_util::sync::CancellationToken::new();
+    let relay_addr = spawn_cuttable_udp_relay(server.local_addr().unwrap(), cut.clone()).await;
+
+    // The client keeps the quinn defaults, like a Pylon without its own settings.
+    let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(
+        build_client_config(None, true, TunnelTransportProtocol::RawQuic).expect("client config"),
+    );
+    let client_connection = client
+        .connect(relay_addr, "stargate")
+        .unwrap()
+        .await
+        .expect("client should connect through the relay");
+    let server_connection = server
+        .accept()
+        .await
+        .expect("server should accept")
+        .await
+        .expect("server connection should complete");
+
+    // A quiet but healthy tunnel outlives several idle timeouts.
+    tokio::time::sleep(liveness.max_idle_timeout * 3).await;
+    assert!(
+        server_connection.close_reason().is_none(),
+        "keep-alive should hold a quiet tunnel open: {:?}",
+        server_connection.close_reason()
+    );
+
+    cut.cancel();
+    let reason = tokio::time::timeout(Duration::from_secs(3), server_connection.closed())
+        .await
+        .expect("Stargate should notice the vanished peer within the idle timeout");
+    assert!(
+        matches!(reason, quinn::ConnectionError::TimedOut),
+        "tunnel should close on idle timeout, got {reason:?}"
+    );
+    drop(client_connection);
+    client.close(0u32.into(), b"test complete");
+}
+
 async fn negotiate_alpn(
     client_config: ClientConfig,
     server_config: quinn::ServerConfig,
@@ -502,6 +590,7 @@ async fn assert_tunnel_alpn(tunnel_protocol: TunnelTransportProtocol, expected: 
     let server_config = build_server_config(
         &stargate_tls::ServerTlsIdentity::SelfSigned,
         tunnel_protocol,
+        super::ReverseTunnelLiveness::default(),
     )
     .expect("server config");
     assert_eq!(negotiate_alpn(client_config, server_config).await, expected);
