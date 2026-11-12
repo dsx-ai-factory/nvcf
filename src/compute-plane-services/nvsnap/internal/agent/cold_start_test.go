@@ -62,6 +62,9 @@ func TestIdleColdStartMarker(t *testing.T) {
 		want    bool
 	}{
 		{nul(webhook.IdleBin, "--cold-start", webhook.ColdStartMarker, "--", "vllm"), true},
+		// A program that blanks the workload's argv while it idles (cmd/nvsnap-idle).
+		{append(nul(webhook.IdleBin, "--cold-start", webhook.ColdStartMarker, "--"), make([]byte, 24)...), true},
+		{nul(webhook.IdleBin, "--cold-start", webhook.ColdStartMarker), false}, // no "--": no workload given
 		{nul(webhook.IdleBin), false},                                                    // an older webhook: no argv
 		{nul("vllm", "--cold-start", webhook.ColdStartMarker, "--", "x"), false},         // the workload itself
 		{nul(webhook.IdleBin, "--cold-start", webhook.ColdStartMarker, "x", "y"), false}, // malformed

@@ -155,6 +155,13 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod) (bool, str
 	if err != nil {
 		return false, fmt.Sprintf("cannot list the instance's pods: %v", err)
 	}
+	// Admission is decided once, so an unreadable count fails closed: the
+	// pod starts cold (grove_replicas.go).
+	if why, err := a.sharedCompanionsReason(ctx, pod, pods.Items); err != nil {
+		return false, err.Error()
+	} else if why != "" {
+		return false, why
+	}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) {

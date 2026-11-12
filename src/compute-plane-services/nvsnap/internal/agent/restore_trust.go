@@ -346,6 +346,7 @@ func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.forgetFallback(pod.UID)
 	c.readyObserved.Delete(pod.UID)
 	c.captureDecided.Delete(pod.UID)
+	c.companionFailures.Delete(pod.UID)
 	c.bundleWaitSince.Delete(pod.UID)
 	c.agentWaitSince.Delete(pod.UID)
 	c.attempted.Delete("capture/" + string(pod.UID))

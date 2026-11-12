@@ -270,6 +270,9 @@ topologySpreadConstraints:
 {{- fail (printf "highAvailability.mode must be none, preferred, or enforced, got %q" $haMode) }}
 {{- end }}
 {{- $haEnabled := or (eq $haMode "preferred") (eq $haMode "enforced") }}
+{{- /* One tag for every nvcf-openbao-migrations consumer (OpenBao, LLS HMAC
+       rotation, NVCF UI). A component tag set by the operator wins. */}}
+{{- $migrationsTag := dig "global" "openbaoMigrations" "image" "tag" "" .Values }}
 {{- $natsWorkerAuth := dig "nats" "workerAuth" "nkey" .Values | toString }}
 {{- if not (has $natsWorkerAuth (list "nkey" "token")) }}
 {{- fail (printf "nats.workerAuth must be nkey or token, got %q" $natsWorkerAuth) }}
@@ -433,8 +436,8 @@ openbao:
     image:
       registry: {{ .Values.global.image.registry }}
       repository: {{ .Values.global.image.repository }}/nvcf-openbao-migrations
-      {{- if dig "openbao" "migrations" "image" "tag" "" .Values }}
-      tag: {{ dig "openbao" "migrations" "image" "tag" "" .Values }}
+      {{- with coalesce (dig "openbao" "migrations" "image" "tag" "" .Values) $migrationsTag }}
+      tag: {{ . | quote }}
       {{- end }}
 
     # No env here. openbao-migrations-env.yaml.gotmpl is applied after this file
@@ -1795,8 +1798,8 @@ sis:
       image:
         registry: {{ .Values.global.image.registry }}
         repository: {{ .Values.global.image.repository }}/nvcf-openbao-migrations
-        {{- if dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values }}
-        tag: {{ dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values }}
+        {{- with coalesce (dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values) $migrationsTag }}
+        tag: {{ . | quote }}
         {{- end }}
 
   env:
@@ -2447,16 +2450,11 @@ vanityGateway:
 {{- $vanityBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "vanityGateway" "backend" dict .Values)) (dict "name" "vanity-gateway" "namespace" "nvcf" "port" 8080) }}
 {{- $essBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "ess" "backend" dict .Values)) (dict "name" "ess-api" "namespace" "ess" "port" 8080) }}
 {{- $apiKeysBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "apiKeys" "backend" dict .Values)) (dict "name" "api-keys" "namespace" "api-keys" "port" 8080) }}
-{{/* openbao-migrations image tag: 0.19.5 is the floor. An operator may pin a
-     newer tag via addons.nvcfUi.openbaoMigrations.image.tag, but anything older
-     than the floor is ignored (the migrations job needs >= 0.19.5). */}}
-{{- $nvcfUiOpenbaoMigrationsTag := "0.19.5" }}
-{{- $nvcfUiMigrationsTagOverride := dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values }}
-{{- if and $nvcfUiMigrationsTagOverride (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiMigrationsTagOverride)) }}
+{{/* openbao-migrations image tag: the component tag, else the shared stack tag
+     (global.openbaoMigrations.image.tag). */}}
+{{- $nvcfUiOpenbaoMigrationsTag := coalesce (dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values) $migrationsTag }}
+{{- if and $nvcfUiOpenbaoMigrationsTag (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiOpenbaoMigrationsTag)) }}
 {{- fail "addons.nvcfUi.openbaoMigrations.image.tag must be a valid OCI image tag" }}
-{{- end }}
-{{- if and $nvcfUiMigrationsTagOverride (semverCompare ">=0.19.5" $nvcfUiMigrationsTagOverride) }}
-{{- $nvcfUiOpenbaoMigrationsTag = $nvcfUiMigrationsTagOverride }}
 {{- end }}
 nvcfUi:
   fullnameOverride: nvcf-ui

@@ -58,6 +58,7 @@ where the files column says.
 | `nvsnap.io/cold-start` | `ColdStartAnnotation` (internal/election/election.go) | Is stamped on a follower whose leader failed; the pod is recreated by its controller and re-admitted. |
 | `nvsnap.io/criu-capture` | `criuCaptureAnnotation` (internal/agent/criu_group.go) | Opts a multi-pod instance into the capture. |
 | `nvsnap.io/criu-cold-started` | `ColdStartedAnnotation` (internal/webhook/criu_restore.go) | Marks a placeholder whose restore failed and that the agent started cold in place, with the time it did. |
+| `nvsnap.io/criu-companion-claimed-by` | `companionClaimAnnotation` (internal/agent/grove_replicas.go) | Names the leader (by pod UID) of the group restore that restores a companion placeholder. |
 | `nvsnap.io/criu-group` | `CRIUGroupAnnotation` (internal/webhook/criu_group.go) | Names the group record a placeholder restores from; CRIUGroupOrdinalAnnotation and CRIUGroupSizeAnnotation place it in the instance. |
 | `nvsnap.io/criu-group-companion` | `CRIUGroupCompanionAnnotation` (internal/webhook/criu_group.go) | Marks a placeholder that restores a companion of the instance: a pod without GPUs that its GPU ranks were connected to (an etcd, a NATS), captured and restored with them. |
 | `nvsnap.io/criu-group-ordinal` | `CRIUGroupOrdinalAnnotation` (internal/webhook/criu_group.go) |  |

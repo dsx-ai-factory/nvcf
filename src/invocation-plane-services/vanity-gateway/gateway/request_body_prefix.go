@@ -188,7 +188,7 @@ func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, conten
 // finishBufferedRequestBody reads the rest of the body after prefix and
 // applies the complete-body decoder, so buffered requests keep the existing
 // validation, field semantics and error precedence.
-func finishBufferedRequestBody(request *http.Request, prefix *bytebufferpool.ByteBuffer, decode func(*bufferedOpenAIRequestBody) (openAIRequestBody, error), reason string) (openAIRequestBody, requestBodyMode, error) {
+func finishBufferedRequestBody(request *http.Request, prefix *bytebufferpool.ByteBuffer, decode func(*pooledRequestBody) (openAIRequestBody, error), reason string) (openAIRequestBody, requestBodyMode, error) {
 	bodyBytes, err := bufferRemainingRequestBody(request, prefix)
 	if err != nil {
 		return openAIRequestBody{}, requestBodyMode{}, err
@@ -262,7 +262,7 @@ func (s *requestPrefixScan) scan(buf []byte) string {
 		if buf[i] != '"' {
 			return requestBodyReasonInvalidPrefix
 		}
-		keyEnd, keyEscaped, complete := jsonStringEnd(buf, i)
+		keyEnd, keyEscaped, complete := prefixStringEnd(buf, i)
 		if !complete {
 			return requestBodyReasonLateFields
 		}
@@ -275,7 +275,7 @@ func (s *requestPrefixScan) scan(buf []byte) string {
 			return requestBodyReasonInvalidPrefix
 		}
 		valueStart := skipJSONSpace(buf, i+1)
-		valueEnd, valueDepth, complete := jsonValueEnd(buf, valueStart)
+		valueEnd, valueDepth, complete := prefixValueEnd(buf, valueStart)
 		if !complete {
 			return requestBodyReasonLateFields
 		}
@@ -391,21 +391,9 @@ func isASCII(b []byte) bool {
 	return true
 }
 
-func skipJSONSpace(buf []byte, i int) int {
-	for i < len(buf) {
-		switch buf[i] {
-		case ' ', '\t', '\n', '\r':
-			i++
-		default:
-			return i
-		}
-	}
-	return i
-}
-
-// jsonStringEnd returns the offset after the closing quote of the string that
+// prefixStringEnd returns the offset after the closing quote of the string that
 // starts at buf[start], and whether it contains an escape.
-func jsonStringEnd(buf []byte, start int) (int, bool, bool) {
+func prefixStringEnd(buf []byte, start int) (int, bool, bool) {
 	escaped := false
 	for i := start + 1; i < len(buf); i++ {
 		switch buf[i] {
@@ -425,23 +413,23 @@ func jsonStringEnd(buf []byte, start int) (int, bool, bool) {
 // document too deep to decode.
 const jsonMaxDepth = 10000
 
-// jsonValueEnd returns the offset after the value that starts at buf[start]
+// prefixValueEnd returns the offset after the value that starts at buf[start]
 // and how many levels it nests. It only locates the end; stdjson.Valid checks
 // the syntax afterwards.
-func jsonValueEnd(buf []byte, start int) (int, int, bool) {
+func prefixValueEnd(buf []byte, start int) (int, int, bool) {
 	if start >= len(buf) {
 		return 0, 0, false
 	}
 	switch buf[start] {
 	case '"':
-		end, _, complete := jsonStringEnd(buf, start)
+		end, _, complete := prefixStringEnd(buf, start)
 		return end, 0, complete
 	case '{', '[':
 		depth, maxDepth := 0, 0
 		for i := start; i < len(buf); i++ {
 			switch buf[i] {
 			case '"':
-				end, _, complete := jsonStringEnd(buf, i)
+				end, _, complete := prefixStringEnd(buf, i)
 				if !complete {
 					return 0, 0, false
 				}

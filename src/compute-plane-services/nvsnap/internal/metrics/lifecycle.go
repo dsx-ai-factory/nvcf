@@ -31,6 +31,7 @@ const (
 	CaptureFailed         = "failed"          // the capture itself failed
 	CaptureRefused        = "refused"         // the preflight refused the configuration
 	CaptureGPUShareFailed = "gpushare-failed" // the pod never started under the library
+	CaptureAbandoned      = "abandoned"       // its namespace went before a restore of it served
 )
 
 // Restore outcomes.
@@ -225,12 +226,30 @@ func GPU(product string) string {
 	return product
 }
 
+// The texts Reason classes as the workload's own doing, as the agent
+// writes them into a capture's error (lower case: Reason matches them in
+// the lowered text).
+const (
+	// WorkloadExitedText: the container's process was gone when its dump
+	// failed.
+	WorkloadExitedText = "the workload exited during the capture"
+	// NoGPUProcessText: a multi-node instance's pod had no process on the
+	// GPU under the gpushare library to capture.
+	NoGPUProcessText = "no process of this pod runs on the gpu"
+)
+
 // Reason classes a failure's text into a bounded label value.
 func Reason(text string) string {
 	t := strings.ToLower(text)
 	switch {
 	case t == "":
 		return ""
+	// The workload's own doing, checked first: the rest of the text is
+	// what the capture ran into because of it.
+	case strings.Contains(t, WorkloadExitedText):
+		return "workload_exited"
+	case strings.Contains(t, NoGPUProcessText):
+		return "no_gpu_process"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):

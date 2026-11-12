@@ -450,9 +450,9 @@ inventories. See [Runtime images created by operators](#runtime-images-created-b
 | Artifact | Version | Stack | Description | Distribution | Source code |
 | --- | --- | --- | --- | --- | --- |
 | `nvcf-cli` | `1.16.8` | Independent | Manages functions, deployments, and clusters from the command line. | `nvcr.io/nvidia/nvcf/nvcf-cli:1.16.8` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/src/clis/nvcf-cli) |
-| `nvcf-compute-plane-stack` | `1.1.0` | `compute-plane` | Provides the Helmfile bundle for compute-plane deployment. | `Publication pending` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/nvcf-compute-plane) |
-| `nvcf-observability-stack` | `1.1.0` | `observability` | Provides the Helmfile bundle for standalone observability deployment. | `Publication pending` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/observability) |
-| `nvcf-self-managed-stack` | `1.1.5` | `self-managed` | Provides the Helmfile bundle for control-plane deployment. | `Publication pending` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/self-managed) |
+| `nvcf-compute-plane-stack` | `1.1.0` | `compute-plane` | Provides the Helmfile bundle for compute-plane deployment. | `nvcr.io/nvidia/nvcf/nvcf-compute-plane-stack:1.1.0` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/nvcf-compute-plane) |
+| `nvcf-observability-stack` | `1.1.0` | `observability` | Provides the Helmfile bundle for standalone observability deployment. | `nvcr.io/nvidia/nvcf/nvcf-observability-stack:1.1.0` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/observability) |
+| `nvcf-self-managed-stack` | `1.1.5` | `self-managed` | Provides the Helmfile bundle for control-plane deployment. | `nvcr.io/nvidia/nvcf/nvcf-self-managed-stack:1.1.5` | [GitHub](https://github.com/NVIDIA/nvcf/tree/main/deploy/stacks/self-managed) |
 
 {/*docs-version-sync:END manifest-artifact-registry-paths*/}
 

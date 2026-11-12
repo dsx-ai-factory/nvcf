@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -434,6 +435,23 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 	return true
 }
 
+// sharedCompanionsBlockCapture reports whether leader's instance must not
+// be captured now because its namespace's Grove instances share their
+// companions (skip), and whether to try again later (again): when their
+// count cannot be read yet.
+func (c *criuAutoRestorer) sharedCompanionsBlockCapture(ctx context.Context, leader *corev1.Pod, pods []corev1.Pod, log *logrus.Entry) (again, skip bool) {
+	why, err := c.a.sharedCompanionsReason(ctx, leader, pods)
+	if err != nil {
+		log.WithError(err).Info("CRIU group capture: waiting to read the namespace's scaling groups")
+		return true, true
+	}
+	if why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false, true
+	}
+	return false, false
+}
+
 // captureGroup captures leader's instance. retry is true when the
 // instance was not ready for it yet.
 func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod, scope string, size int) (retry bool) {
@@ -449,6 +467,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods")
 		return true
+	}
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
+		return again
 	}
 	// A rank the webhook never mutated is never one of the instance's ranks
 	// below: say so once, rather than wait for it as "not ready"
@@ -502,9 +523,11 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		return false
 	}
 	if err != nil {
-		log.WithError(err).Warn("CRIU group capture: skipped; a companion of the instance cannot be captured")
-		return false
+		// Labelled by the ranks' configuration: the instance's own key
+		// takes its companions too.
+		return c.companionsUnknown(ctx, criuGroupKey(instanceConfigURI(ranks), scope), leader, len(ranks), err, log)
 	}
+	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
 		if webhook.DynamoComponent(r) && len(companions) == 0 {
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
@@ -584,6 +607,11 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			c.recordRefusal(ctx, key, scope, uris, len(ranks), leader, why, log)
 		}
 		return false
+	}
+	// Again just before the instance is held: the namespace's scaling
+	// groups may have grown while the instance warmed up.
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
+		return again
 	}
 	// Held for the capture before it is claimed: a member already
 	// released into service (its hold expired) is not stopped for it.
@@ -700,6 +728,35 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		// record).
 		c.deleteInstance(context.WithoutCancel(ctx), members, log)
 	}
+	return false
+}
+
+// companionMaxFailures bounds the attempts to tell an instance's
+// companions: each follows the last by a pod event and criuGroupWarmup.
+const companionMaxFailures = 5
+
+// companionsUnknown handles an instance whose companions could not be
+// told (err): a node's agent that did not answer, a pod that was
+// restarting. Such a failure passes, so the capture is tried again on a
+// later event of the leader (again true); one that keeps failing is
+// counted as a refusal, with its reason, in the metric, the summary line
+// and an event on the pod, rather than leave the instance uncaptured with
+// nothing but a log line to say so. No record is written: without its
+// companions the instance's configuration, its record's key, is not known.
+func (c *criuAutoRestorer) companionsUnknown(ctx context.Context, key string, leader *corev1.Pod, ranks int, err error, log *logrus.Entry) (again bool) {
+	n := 1
+	if v, ok := c.companionFailures.Load(leader.UID); ok {
+		n = v.(int) + 1
+	}
+	c.companionFailures.Store(leader.UID, n)
+	if n < companionMaxFailures {
+		log.WithError(err).WithField("attempt", n).Warn("CRIU group capture: the instance's companions cannot be told yet; trying again")
+		return true
+	}
+	c.companionFailures.Delete(leader.UID)
+	why := fmt.Sprintf("a companion of the instance cannot be captured (%d attempts): %v", n, err)
+	log.WithError(err).Warn("CRIU group capture: skipped; " + why)
+	c.observeRefusal(ctx, key, leader, ranks, why, log)
 	return false
 }
 
@@ -1070,6 +1127,9 @@ func isGroupPlaceholder(pod *corev1.Pod) bool {
 }
 
 func (c *criuAutoRestorer) considerGroupRestore(ctx context.Context, pod *corev1.Pod) {
+	if pod.DeletionTimestamp != nil {
+		return // a leader on its way out restores nothing, and ends nothing
+	}
 	key, size, ok := criuGroupRestoreLeader(pod)
 	if !ok {
 		return
@@ -1080,9 +1140,31 @@ func (c *criuAutoRestorer) considerGroupRestore(ctx context.Context, pod *corev1
 	go c.restoreGroup(ctx, pod, key, size)
 }
 
+// mayRestoreShared reports whether leader's group restore may go on as
+// far as shared companions go (grove_replicas.go). When the namespace runs
+// several Grove instances, the restore ends as not run, so its ranks start
+// cold rather than hold their GPUs waiting. When their count cannot be
+// read yet, it is tried again on the leader's next event.
+func (c *criuAutoRestorer) mayRestoreShared(ctx context.Context, leader *corev1.Pod, key string, log *logrus.Entry) bool {
+	why, err := c.a.sharedCompanionsReason(ctx, leader, nil)
+	if err != nil {
+		log.WithError(err).Warn("CRIU group restore: trying again on the leader's next event")
+		c.attempted.Delete("restore/" + string(leader.UID))
+		return false
+	}
+	if why != "" {
+		c.failGroup(ctx, leader, key, false, errors.New(why), log)
+		return false
+	}
+	return true
+}
+
 func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod, key string, size int) {
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"criuGroup": key, "pod": leader.Namespace + "/" + leader.Name, "size": size})
+	if !c.mayRestoreShared(ctx, leader, key, log) {
+		return
+	}
 	t0 := time.Now()
 	var ranks []*corev1.Pod
 	var waitErr error
@@ -1150,6 +1232,26 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			PlaceholderContainerName: p.Annotations[webhook.CRIURestoreContainerAnnotation],
 			ReservePIDs:              true,
 		}
+	}
+	// Placeholders an earlier agent admitted for a scaling group of
+	// several replicas start cold instead: each replica's restore would
+	// restore the companions they share (grove_replicas.go).
+	if !c.mayRestoreShared(ctx, leader, key, log) {
+		return
+	}
+	// A companion is restored by one group restore only. Losing it to
+	// another live leader ends this leader's restore as not run: its ranks
+	// start again, and the claimed companions are spared
+	// (groupPlaceholders).
+	if err := claimCompanions(ctx, a.kubeClient, ranks, leader); err != nil {
+		var claimed errCompanionClaimed
+		if errors.As(err, &claimed) {
+			c.failGroup(ctx, leader, key, false, err, log)
+			return
+		}
+		log.WithError(err).Warn("CRIU group restore: cannot claim the companions yet; trying again on the leader's next event")
+		c.attempted.Delete("restore/" + string(leader.UID))
+		return
 	}
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
@@ -1389,8 +1491,16 @@ func (c *criuAutoRestorer) endGroup(ctx context.Context, leader *corev1.Pod, key
 		log.WithError(cause).Error("CRIU group restore failed; its capture was verified, so it is kept and the replacements restore from it again")
 	}
 	for _, p := range members {
-		if err := c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID); err != nil {
-			log.WithError(err).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
+		var del error
+		if isCompanion(p) {
+			// Another leader may claim it between the list above and the
+			// delete (grove_replicas.go).
+			del = deleteCompanionUnlessClaimed(ctx, c.a.kubeClient, p, leader, log)
+		} else {
+			del = c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID)
+		}
+		if del != nil {
+			log.WithError(del).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
 		}
 	}
 }
@@ -1492,7 +1602,8 @@ func groupPlaceholders(pods []corev1.Pod, leader *corev1.Pod, key string, includ
 	for i := range pods {
 		p := &pods[i]
 		if p.DeletionTimestamp == nil && p.Annotations[webhook.CRIUGroupAnnotation] == key &&
-			(includeRestored || p.Annotations[webhook.CRIURestoredAnnotation] == "") && groupMember(leader, p) {
+			(includeRestored || p.Annotations[webhook.CRIURestoredAnnotation] == "") && groupMember(leader, p) &&
+			!claimedByAnother(p, leader, pods) {
 			out = append(out, p)
 		}
 	}
@@ -1509,9 +1620,32 @@ const (
 	groupReasonMax      = 16 << 10
 )
 
-// memberFailure is one member's part of a group's failure.
+// memberFailure is one member's part of a group's failure: the start of
+// its error (what failed) and its end (why: a tool's error comes last,
+// after its command line and progress). A failed gpushare resume's error
+// was cut after the progress, losing the cause (2026-11-06).
 func memberFailure(name, err string) string {
-	return name + ": " + truncate(err, groupMemberErrorMax)
+	return name + ": " + truncateMiddle(err, groupMemberErrorMax)
+}
+
+// truncateMiddle bounds s to n bytes, keeping its first third and its end,
+// with "…" between them.
+func truncateMiddle(s string, n int) string {
+	const gap = " … "
+	if len(s) <= n || n <= 3*len(gap) {
+		return truncate(s, n)
+	}
+	// Both cuts move inward to rune boundaries, so a multibyte rune at
+	// either is left out whole, never split.
+	head := n / 3
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	from := len(s) - (n - n/3 - len(gap))
+	for from < len(s) && !utf8.RuneStart(s[from]) {
+		from++
+	}
+	return s[:head] + gap + s[from:]
 }
 
 // membersFailed is the failure of a group operation (what, in session)
