@@ -799,10 +799,10 @@ func TestFallbackPathsStillReceiveCompleteBodies(t *testing.T) {
 	})
 }
 
-// TestShadowReplayLongerThanRouteLimitReachesTarget sends a primary request
-// within the route limit whose shadow copy grows past it when its model is
-// rewritten, because the rewrite escapes HTML characters. Shadow replays never
-// pass through the route limit, so the copy must still reach its target.
+// TestShadowReplayLongerThanRouteLimitReachesTarget sends a primary request at
+// the route limit whose shadow copy grows past it when its model is rewritten
+// to a longer name. Shadow replays never pass through the route limit, so the
+// copy must still reach its target.
 func TestShadowReplayLongerThanRouteLimitReachesTarget(t *testing.T) {
 	const limit = 4 * requestPrefixLimit
 	type received struct {
