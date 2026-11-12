@@ -49,8 +49,19 @@
  * stderr and not waited for: only the kubelet's SIGKILL would end it.
  * NVSNAP_IDLE_PROCS, for tests, names a file to read the pids from instead;
  * NVSNAP_IDLE_SELF, for tests, a directory standing in for /proc/self.
+ *
+ * Group teardown: a rank of a restored multi-node group holds fabric memory
+ * the other ranks imported, through their nodes' IMEX daemons, which go
+ * when their pods do. When the agent has put a hold on the work volume
+ * (teardown-hold), this program, once its own workload is gone, says so
+ * (teardown-exited) and stays until the agent lifts the hold: once every
+ * rank of the group has exited. The kubelet's SIGKILL at the end of the
+ * grace period still ends it. Without a hold it exits as before.
+ * NVSNAP_IDLE_TEARDOWN, for tests, names the directory instead of the work
+ * volume.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -224,25 +235,78 @@ static int signal_others(const char *procs, int sig) {
 	return n;
 }
 
+/* unsignaled_left reports whether a process SIGTERM could not reach is
+ * still listed in procs and alive (or, the list being full, might be). */
+static int unsignaled_left(const char *procs) {
+	if (unsignaled_full)
+		return 1;
+	if (n_unsignaled == 0)
+		return 0;
+	FILE *f = fopen(procs, "r");
+	if (!f)
+		return 1;
+	int left = 0;
+	long pid;
+	while (!left && fscanf(f, "%ld", &pid) == 1)
+		if (pid > 0 && is_unsignaled((pid_t)pid) && (kill((pid_t)pid, 0) == 0 || errno == EPERM))
+			left = 1;
+	fclose(f);
+	return left;
+}
+
 /* forward_term passes SIGTERM to the rest of the container and waits,
- * reaping what is this program's, until none of it is left. */
-static void forward_term(void) {
+ * reaping what is this program's, until none of what it signaled is left.
+ * Returns 1 once the whole rest of the container is gone, else 0: it cannot
+ * tell what the container holds (outside a pod, or its process list
+ * unreadable), or a process it could not signal still runs. */
+static int forward_term(void) {
 	char procs[4200];
 	if (!procs_path(procs, sizeof procs))
-		return;
-	if (signal_others(procs, SIGTERM) <= 0)
-		return;
+		return 0;
+	int n = signal_others(procs, SIGTERM);
+	if (n < 0)
+		return 0;
+	if (n == 0)
+		return !unsignaled_left(procs);
 	for (;;) {
 		while (waitpid(-1, NULL, WNOHANG) > 0) {
 		}
-		if (signal_others(procs, 0) <= 0)
-			return;
+		n = signal_others(procs, 0);
+		if (n < 0)
+			return 0;
+		if (n == 0)
+			return !unsignaled_left(procs);
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}
 }
 
 static void on_term(int sig) { (void)sig; stop = 1; }
+
+/* hold_teardown waits, after the workload is gone, while the agent's hold
+ * is on the work volume, having said the workload is gone. */
+static void hold_teardown(void) {
+	const char *dir = getenv("NVSNAP_IDLE_TEARDOWN");
+	if (!dir || !dir[0])
+		dir = "/nvsnap-restore-work";
+	char hold[4200], done[4200];
+	snprintf(hold, sizeof hold, "%s/teardown-hold", dir);
+	snprintf(done, sizeof done, "%s/teardown-exited", dir);
+	if (access(hold, F_OK) != 0)
+		return;
+	int fd = open(done, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+	if (fd < 0)
+		fprintf(stderr, "nvsnap-idle: cannot report the workload gone (%s): %s\n", done, strerror(errno));
+	else
+		close(fd);
+	fprintf(stderr, "nvsnap-idle: workload gone; holding the pod until the group's ranks have exited\n");
+	while (access(hold, F_OK) == 0) {
+		while (waitpid(-1, NULL, WNOHANG) > 0) {
+		}
+		struct timespec ts = {0, 200 * 1000 * 1000};
+		nanosleep(&ts, NULL);
+	}
+}
 
 int main(int argc, char **argv) {
 	if (argc > 1) {
@@ -294,6 +358,9 @@ int main(int argc, char **argv) {
 			}
 		}
 	}
-	forward_term();
+	/* Held only when the workload is known gone: a placeholder that cannot
+	 * see its container would report it gone while it runs. */
+	if (forward_term())
+		hold_teardown();
 	return 0;
 }

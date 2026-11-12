@@ -293,6 +293,13 @@ is a group record: a ConfigMap naming every member's checkpoint
    `groupRestore`).
 3. A member whose new address collides with an old one is replaced
    (`criu_group.go` `replaceColliding`).
+4. A restored GPU rank of a group of more than one pod is held at teardown:
+   its placeholder, once its own workload has exited, stays until every rank
+   of the same restore has exited too, so no node's IMEX daemon leaves while a
+   peer still holds fabric memory imported from it. The pod's grace period
+   bounds the hold (`considerTeardown` and `driveTeardown` in `internal/agent/teardown_barrier.go`,
+   `hold_teardown` in `cmd/nvsnap-idle/c/nvsnap-idle.c`;
+   [design/GROUP-TEARDOWN.md](design/GROUP-TEARDOWN.md)).
 
 ## 6. Where bytes live and how they move
 

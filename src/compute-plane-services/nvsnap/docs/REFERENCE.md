@@ -66,6 +66,7 @@ where the files column says.
 | `nvsnap.io/criu-restore` | `CRIURestoreAnnotation` (internal/webhook/criu_restore.go)<br>`criuRestoreAnnotation` (internal/rootfsonly/watcher.go) | Marks a CRIU restore placeholder (webhook.CRIURestoreAnnotation; that package imports this one). |
 | `nvsnap.io/criu-restore-container` | `CRIURestoreContainerAnnotation` (internal/webhook/criu_restore.go) |  |
 | `nvsnap.io/criu-restored` | `CRIURestoredAnnotation` (internal/webhook/criu_group.go) | Marks a placeholder the agent restored into, so an agent that restarts does not restore into it again. |
+| `nvsnap.io/criu-teardown-exited` | `TeardownExitedAnnotation` (internal/webhook/criu_restore.go) | Marks a terminating restored rank whose workload has exited, for the other ranks' agents. |
 | `nvsnap.io/deadline` | `DeadlineAnnotation` (internal/election/election.go) | Is the RFC3339 time after which the reconciler treats the leader as failed even if its pod is still around. |
 | `nvsnap.io/demo-name` | `annDemoName` (internal/server/manifests.go) |  |
 | `nvsnap.io/desc` | `annDesc` (internal/server/manifests.go) |  |
