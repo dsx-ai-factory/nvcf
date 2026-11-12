@@ -20,6 +20,7 @@ USE nvcf_api_keys;
 CREATE TABLE IF NOT EXISTS keys
 (
     api_key_hash TEXT,
+    nca_id       TEXT,
     status       TEXT,
     expires_at   TIMESTAMP,
     deletes_at   TIMESTAMP,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS keys_by_owner_and_service
     owner_id                TEXT,
     issuer_service_id       TEXT,
     key_id                  TEXT,
+    nca_id                  TEXT,
     owner_status            TEXT STATIC,
     owner_status_updated_at TIMESTAMP STATIC,
     expires_at              TIMESTAMP,
@@ -40,6 +42,30 @@ CREATE TABLE IF NOT EXISTS keys_by_owner_and_service
     key_status              TEXT,
     key_details             TEXT,
     PRIMARY KEY ((owner_type, owner_id), issuer_service_id, key_id)
+);
+
+CREATE TABLE IF NOT EXISTS keys_by_owner_and_account_and_service
+(
+    nca_id            TEXT,
+    owner_type        TEXT,
+    owner_id          TEXT,
+    issuer_service_id TEXT,
+    key_id            TEXT,
+    key_status        TEXT,
+    created_at        TIMESTAMP,
+    expires_at        TIMESTAMP,
+    deletes_at        TIMESTAMP,
+    key_details       TEXT,
+    PRIMARY KEY ((nca_id, owner_type, owner_id), issuer_service_id, key_id)
+);
+
+CREATE TABLE IF NOT EXISTS lock
+(
+    name      TEXT,
+    lockuntil TIMESTAMP,
+    lockedat  TIMESTAMP,
+    lockedby  TEXT,
+    PRIMARY KEY ((name))
 );
 
 --

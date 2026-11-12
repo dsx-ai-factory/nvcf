@@ -308,4 +308,25 @@ if ! grep -F -q 'ALTER TABLE nvct_api.tasks_v2 ADD IF NOT EXISTS health TEXT;' \
   fail "NVCT upgrade migration does not add tasks_v2.health idempotently"
 fi
 
+api_keys_dir="${keyspaces}/api_keys_api"
+api_keys_migration="${api_keys_dir}/04_add_nca_id_and_keys_by_account.up.sql"
+for table in keys keys_by_owner_and_service; do
+  if ! grep -F -q "ALTER TABLE api_keys_api.${table} ADD IF NOT EXISTS nca_id TEXT;" \
+    "${api_keys_migration}"; then
+    fail "API Keys upgrade migration does not add ${table}.nca_id idempotently"
+  fi
+done
+for table in keys_by_owner_and_account_and_service lock; do
+  if ! grep -F -q "CREATE TABLE IF NOT EXISTS api_keys_api.${table}" "${api_keys_migration}"; then
+    fail "API Keys upgrade migration does not create ${table} idempotently"
+  fi
+  if ! grep -F -q "CREATE TABLE IF NOT EXISTS api_keys_api.${table}" \
+    "${api_keys_dir}/03_init_tables.up.sql"; then
+    fail "API Keys fresh schema is missing ${table}"
+  fi
+done
+if [ "$(grep -c 'nca_id' "${api_keys_dir}/03_init_tables.up.sql")" -lt 3 ]; then
+  fail "API Keys fresh schema is missing nca_id columns"
+fi
+
 exit "${status}"

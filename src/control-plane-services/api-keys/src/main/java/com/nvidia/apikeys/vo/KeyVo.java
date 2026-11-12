@@ -33,6 +33,8 @@ import lombok.NoArgsConstructor;
 @ValueObject(model = KeyModel.class)
 public class KeyVo {
 
+    private String ncaId;
+    private String ncaIdInDetails;
     private KeyStatus keyStatus;
     private KeyOwnerType ownerType;
     private String ownerId;

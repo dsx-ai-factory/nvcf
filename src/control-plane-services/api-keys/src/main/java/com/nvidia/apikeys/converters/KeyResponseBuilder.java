@@ -25,6 +25,7 @@ import com.nvidia.apikeys.dto.keys.KeyDto;
 import com.nvidia.apikeys.dto.keys.ListKeysResponse;
 import com.nvidia.apikeys.vo.GeneratedKeyVo;
 import com.nvidia.apikeys.vo.KeyByOwnerAndServiceVo;
+import com.nvidia.apikeys.services.KeyNcaIdResolver;
 import com.nvidia.apikeys.vo.KeyVo;
 import com.nvidia.boot.exceptions.UnprocessableEntityException;
 import java.util.List;
@@ -37,6 +38,7 @@ import org.springframework.stereotype.Service;
 public class KeyResponseBuilder {
 
     private final JsonMapper jsonMapper;
+    private final KeyNcaIdResolver ncaIdResolver;
 
     public KeyDto toDto(KeyVo key, GeneratedKeyVo generatedKeyVo) {
         return fillMandatoryFields(key).toBuilder()
@@ -72,6 +74,7 @@ public class KeyResponseBuilder {
 
     public IntrospectionResponse toIntrospectionResponse(KeyVo key) {
         return IntrospectionResponse.builder()
+                .ncaId(ncaIdResolver.resolve(key))
                 .ownerId(key.getOwnerId())
                 .ownerType(key.getOwnerType())
                 .keyId(key.getKeyId())

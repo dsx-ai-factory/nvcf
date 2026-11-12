@@ -31,6 +31,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import tools.jackson.databind.json.JsonMapper;
 import com.nvidia.apikeys.TestData;
 import com.nvidia.apikeys.utils.JsonUtils;
+import com.nvidia.apikeys.config.NakProperties;
+import com.nvidia.apikeys.services.KeyNcaIdResolver;
 import com.nvidia.apikeys.vo.KeyVo;
 import com.nvidia.boot.exceptions.UnprocessableEntityException;
 import java.util.List;
@@ -42,7 +44,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class KeyResponseBuilderTest {
 
     private final JsonMapper jsonMapper = JsonUtils.getRequestResponseJsonMapper();
-    private final KeyResponseBuilder keyResponseBuilder = new KeyResponseBuilder(jsonMapper);
+    private final KeyResponseBuilder keyResponseBuilder = new KeyResponseBuilder(
+            jsonMapper,
+            new KeyNcaIdResolver(NakProperties.builder().ncaId("test-nca-id").build()));
 
 
     @Test

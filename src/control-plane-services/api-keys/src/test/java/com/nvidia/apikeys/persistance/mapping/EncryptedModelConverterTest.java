@@ -235,6 +235,106 @@ class EncryptedModelConverterTest extends BaseIntegrationTest {
         assertThat(expectedVo).isEqualTo(voTranslated);
     }
 
+    private static final String LEGACY_SERVICE_ID = "nvidia-cloud-functions-ncp-service-id-aketm";
+
+    private static Map<String, Object> legacyKeyDetails() {
+        return new java.util.HashMap<>(Map.of(
+                "keyStatus", "ACTIVE",
+                "ownerType", "USER",
+                "ownerId", "owner id",
+                "issuerServiceId", LEGACY_SERVICE_ID,
+                "audienceServiceIds", Set.of(LEGACY_SERVICE_ID),
+                "keyId", "key id",
+                "keyHash", "a hash",
+                "apiKeySuffix", "a suffix",
+                "authorizations", "some auth",
+                "description", "a description"));
+    }
+
+    @Test
+    void legacyKeyRowReadsWithNoNcaId() throws JacksonException {
+        var model = KeyModel.builder()
+                .keyHash("a hash")
+                .keyStatus(KeyStatus.ACTIVE)
+                .keyDetails(encryptPayload(legacyKeyDetails()))
+                .build();
+
+        var vo = keyEncryptedModelConverter.modelToVo(model);
+
+        assertThat(vo.getNcaId()).isNull();
+        assertThat(vo.getNcaIdInDetails()).isNull();
+        assertThat(vo.getIssuerServiceId()).isEqualTo(LEGACY_SERVICE_ID);
+        assertThat(vo.getAudienceServiceIds()).isEqualTo(Set.of(LEGACY_SERVICE_ID));
+        assertThat(vo.getKeyId()).isEqualTo("key id");
+    }
+
+    @Test
+    void legacyKeyByOwnerAndServiceRowReadsWithNoNcaId() throws JacksonException {
+        var details = legacyKeyDetails();
+        details.remove("keyStatus");
+        var model = KeyByOwnerAndServiceModel.builder()
+                .ownerType(KeyOwnerType.USER)
+                .ownerId("owner id")
+                .issuerServiceId(LEGACY_SERVICE_ID)
+                .keyId("key id")
+                .keyStatus(KeyStatus.ACTIVE)
+                .keyDetails(encryptPayload(details))
+                .build();
+
+        var vo = (KeyByOwnerAndServiceVo) encryptedModelConverter.modelToVo(model);
+
+        assertThat(vo.getNcaId()).isNull();
+        assertThat(vo.getNcaIdInDetails()).isNull();
+        assertThat(vo.getKeyHash()).isEqualTo("a hash");
+    }
+
+    @Test
+    void columnAndDetailsNcaIdsAreKeptApart() throws JacksonException {
+        var details = legacyKeyDetails();
+        details.put("ncaIdInDetails", "details-nca");
+        var model = KeyModel.builder()
+                .keyHash("a hash")
+                .ncaId("column-nca")
+                .keyStatus(KeyStatus.ACTIVE)
+                .keyDetails(encryptPayload(details))
+                .build();
+
+        var vo = keyEncryptedModelConverter.modelToVo(model);
+
+        assertThat(vo.getNcaId()).isEqualTo("column-nca");
+        assertThat(vo.getNcaIdInDetails()).isEqualTo("details-nca");
+    }
+
+    @Test
+    void ncaIdIsWrittenToColumnAndDetailsValueIsEncrypted() throws JacksonException {
+        var vo = KeyVo.builder()
+                .keyStatus(KeyStatus.ACTIVE)
+                .keyHash("a hash")
+                .ncaId("column-nca")
+                .ncaIdInDetails("details-nca")
+                .build();
+
+        var model = keyEncryptedModelConverter.voToModel(vo);
+
+        assertThat(model.getNcaId()).isEqualTo("column-nca");
+        var decrypted = JSON_MAPPER.readTree(jwtService.decrypt(model.getKeyDetails()));
+        assertThat(decrypted.has("ncaId")).isFalse();
+        assertThat(decrypted.get("ncaIdInDetails").asString()).isEqualTo("details-nca");
+    }
+
+    @Test
+    void unknownKeyDetailsPropertiesAreIgnored() throws JacksonException {
+        var details = legacyKeyDetails();
+        details.put("someFuturePropertyFromANewerPod", "value");
+        var model = KeyModel.builder()
+                .keyHash("a hash")
+                .keyStatus(KeyStatus.ACTIVE)
+                .keyDetails(encryptPayload(details))
+                .build();
+
+        assertThat(keyEncryptedModelConverter.modelToVo(model).getKeyId()).isEqualTo("key id");
+    }
+
     private String encryptPayload(Map<String, ?> voFields)
             throws JacksonException {
         return jwtService.encryptWithKeysetName("payload_jwe_kid",

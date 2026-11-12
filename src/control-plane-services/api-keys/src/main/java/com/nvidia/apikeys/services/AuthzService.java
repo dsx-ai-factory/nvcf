@@ -39,9 +39,11 @@ public class AuthzService {
     public AuthzResponse.Result evaluatePolicy(
             String audienceServiceId, IntrospectionResponse introspectionResponse, String ruleName) {
 
+        String ncaId = Optional.ofNullable(introspectionResponse.getNcaId())
+                .orElseGet(nakProperties::getNcaId);
         var builder = AuthzResponse.Result.builder()
-                .ncaId(nakProperties.getNcaId())
-                .ownerNcaId(nakProperties.getNcaId())
+                .ncaId(ncaId)
+                .ownerNcaId(ncaId)
                 .ownerId(introspectionResponse.getOwnerId())
                 .allowed(true)
                 .policy(getPolicyByAudience(audienceServiceId, introspectionResponse));

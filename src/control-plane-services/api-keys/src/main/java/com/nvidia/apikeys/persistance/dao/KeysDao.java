@@ -120,7 +120,9 @@ public class KeysDao {
     }
 
     public Optional<KeyVo> getKeyByHash(String hash) {
+        // a row holding only nca_id is not a key
         return keyRepository.findByKeyHash(hash)
+                .filter(model -> model.getKeyStatus() != null && model.getKeyDetails() != null)
                 .map(this::modelToValidatedVo);
     }
 

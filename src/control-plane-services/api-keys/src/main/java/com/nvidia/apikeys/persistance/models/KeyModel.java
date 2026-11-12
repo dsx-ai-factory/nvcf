@@ -42,6 +42,7 @@ public class KeyModel {
 
     public static final String TABLE_NAME = "keys";
     public static final String COLUMN_API_KEY_HASH = "api_key_hash";
+    public static final String COLUMN_NCA_ID = "nca_id";
     public static final String COLUMN_STATUS = "status";
     public static final String COLUMN_EXPIRES_AT = "expires_at";
     public static final String COLUMN_DELETES_AT = "deletes_at";
@@ -52,7 +53,9 @@ public class KeyModel {
     @PrimaryKeyColumn(name = COLUMN_API_KEY_HASH, ordinal = 0, type = PrimaryKeyType.PARTITIONED)
     private String keyHash;
 
-    @NonNull
+    @Column(COLUMN_NCA_ID)
+    private String ncaId;
+
     @Column(COLUMN_STATUS)
     private KeyStatus keyStatus;
 

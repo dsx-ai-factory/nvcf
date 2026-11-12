@@ -33,6 +33,8 @@ import lombok.NoArgsConstructor;
 @ValueObject(model = KeyByOwnerAndServiceModel.class)
 public class KeyByOwnerAndServiceVo {
 
+    private String ncaId;
+    private String ncaIdInDetails;
     private KeyOwnerStatus ownerStatus;
     private Instant ownerStatusUpdatedAt;
     private KeyOwnerType ownerType;
@@ -51,6 +53,8 @@ public class KeyByOwnerAndServiceVo {
     private Set<String> audienceServiceIds;
 
     public KeyByOwnerAndServiceVo(KeyVo key, KeyOwnerVo owner) {
+        this.ncaId = key.getNcaId();
+        this.ncaIdInDetails = key.getNcaIdInDetails();
         this.ownerStatus = owner.getOwnerStatus();
         this.ownerStatusUpdatedAt = owner.getOwnerStatusUpdatedAt();
         this.ownerType = owner.getOwnerType();

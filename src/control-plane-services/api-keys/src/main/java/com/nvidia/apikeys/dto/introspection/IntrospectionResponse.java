@@ -32,6 +32,7 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 @JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
 public class IntrospectionResponse {
+    private String ncaId;
     private KeyOwnerType ownerType;
     private String ownerId;
     private String keyId;

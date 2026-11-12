@@ -323,6 +323,7 @@ public class TestData {
 
     public static final IntrospectionResponse INTROSPECTION_RESPONSE_1 =
             IntrospectionResponse.builder()
+                    .ncaId("test-nca-id")
                     .authorizations(AUTHORIZATION_JSON_NODES_1)
                     .issuerServiceId(SERVICE_ID_1)
                     .ownerType(KeyOwnerType.USER)

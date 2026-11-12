@@ -167,6 +167,8 @@ class KeysDaoTest {
     @Test
     void getKeyByHash() {
         when(keyRepositoryMock.findByKeyHash(API_KEY_HASH_1)).thenReturn(Optional.of(modelMock));
+        when(modelMock.getKeyStatus()).thenReturn(ACTIVE);
+        when(modelMock.getKeyDetails()).thenReturn("details");
         when(converterMock.modelToVo(modelMock)).thenReturn(KEY_VO_1);
 
         assertThat(dao.getKeyByHash(API_KEY_HASH_1)).isEqualTo(Optional.of(KEY_VO_1));
@@ -255,6 +257,8 @@ class KeysDaoTest {
 
     private void mockReadBack() {
         when(keyRepositoryMock.findByKeyHash(API_KEY_HASH_1)).thenReturn(Optional.of(modelMock));
+        when(modelMock.getKeyStatus()).thenReturn(ACTIVE);
+        when(modelMock.getKeyDetails()).thenReturn("details");
         when(converterMock.modelToVo(modelMock)).thenReturn(KEY_VO_1);
         when(keyByOwnerAndServiceRepositoryMock.findByOwnerTypeAndOwnerIdAndIssuerServiceIdAndKeyId(
                 USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1, KEY_ID_1))

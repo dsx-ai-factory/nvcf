@@ -141,7 +141,7 @@ public class UserOwnedKeysControllerTest extends BaseIntegrationTest {
                 new HttpEntity<>(introspectionRequest, headerForIntrospection), String.class);
         assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertJsonBodyEquals(
-                "{\"owner_type\":\"USER\","
+                "{\"nca_id\":\"test-nca-id\",\"owner_type\":\"USER\","
                 + "\"owner_id\":\"yreDV0J-umh_ZWUVuJ2aBgtFCfvZeRjMw9hF6dvurUs\","
                 + "\"key_id\":\"" + keyDto.getId() + "\","
                 + "\"issuer_service_id\":\"nvidia-cloud-functions-ncp-service-id-aketm\","
@@ -198,7 +198,7 @@ public class UserOwnedKeysControllerTest extends BaseIntegrationTest {
                 new HttpEntity<>(introspectionRequest, headerForIntrospection), String.class);
         assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertJsonBodyEquals(
-                "{\"owner_type\":\"USER\","
+                "{\"nca_id\":\"test-nca-id\",\"owner_type\":\"USER\","
                 + "\"owner_id\":\"yreDV0J-umh_ZWUVuJ2aBgtFCfvZeRjMw9hF6dvurUs\","
                 + "\"key_id\":\"" + keyDto.getId() + "\","
                 + "\"issuer_service_id\":\"nvidia-cloud-functions-ncp-service-id-aketm\","

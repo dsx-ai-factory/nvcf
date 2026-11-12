@@ -46,6 +46,7 @@ public class KeyByOwnerAndServiceModel {
     public static final String COLUMN_OWNER_ID = "owner_id";
     public static final String COLUMN_ISSUER_SERVICE_ID = "issuer_service_id";
     public static final String COLUMN_KEY_ID = "key_id";
+    public static final String COLUMN_NCA_ID = "nca_id";
     public static final String COLUMN_OWNER_STATUS = "owner_status";
     public static final String COLUMN_OWNER_STATUS_UPDATED_AT = "owner_status_updated_at";
     public static final String COLUMN_EXPIRES_AT = "expires_at";
@@ -66,6 +67,9 @@ public class KeyByOwnerAndServiceModel {
 
     @PrimaryKeyColumn(name = COLUMN_KEY_ID, ordinal = 4, type = PrimaryKeyType.CLUSTERED)
     private String keyId;
+
+    @Column(COLUMN_NCA_ID)
+    private String ncaId;
 
     @Column(COLUMN_OWNER_STATUS)
     private KeyOwnerStatus ownerStatus;
