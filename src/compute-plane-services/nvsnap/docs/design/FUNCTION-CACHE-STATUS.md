@@ -150,6 +150,7 @@ Status: built (`internal/fnstatus/history.go`,
 
 **Problem.** A read-only user can see what is cached and the last restore's
 time, but not how restores have gone over time.
+
 - The record keeps its last 10 restores, and loses them when the
   configuration is captured again.
 - Scale-up (scheduled to Ready) and teardown times are kept nowhere a
@@ -230,6 +231,7 @@ An entry, about 150 bytes, so about 8 KB per object:
 ```
 
 **Limits.**
+
 - Pods admitted before the label existed are not watched.
 - A rank replaced more than two minutes into its restore starts an entry
   of its own.
