@@ -16,13 +16,126 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+func captureRequestLogs(t *testing.T, enabled bool) *bytes.Buffer {
+	t.Helper()
+	previousEnabled, previousOutput := logRequests, log.Writer()
+	t.Cleanup(func() {
+		logRequests = previousEnabled
+		log.SetOutput(previousOutput)
+	})
+	logRequests = enabled
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	return &output
+}
+
+func TestDecisionRequestAccessLogs(t *testing.T) {
+	t.Setenv("NVCF_INSTANCE_ID", "test-pod")
+	t.Setenv("NVCF_FUNCTION_ID", "test-function")
+	t.Setenv("NVCF_FUNCTION_VERSION_ID", "test-version")
+	for _, route := range []struct{ path, body string }{
+		{decisionRoute, decisionsBody},
+		{systemOneRoute, systemOneBody},
+	} {
+		for _, test := range []struct {
+			name, method, query, body string
+			status                    int
+		}{
+			{"success", http.MethodPost, "", route.body, http.StatusOK},
+			{"echo", http.MethodPost, "", strings.TrimSuffix(route.body, "}") + `,"x_load_tester_echo":true,"image":"private-image-data"}`, http.StatusOK},
+			{"invalid JSON", http.MethodPost, "", `{"private-body":`, http.StatusBadRequest},
+			{"wrong method", http.MethodGet, "", "private-body", http.StatusMethodNotAllowed},
+			{"mock error", http.MethodPost, "?mock_error=429&secret=private-query", route.body, http.StatusTooManyRequests},
+		} {
+			t.Run(route.path+"/"+test.name, func(t *testing.T) {
+				var baselineBody string
+				var baselineHeaders http.Header
+				for _, enabled := range []bool{false, true} {
+					t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+						output := captureRequestLogs(t, enabled)
+						request := httptest.NewRequest(test.method, route.path+test.query, strings.NewReader(test.body))
+						request.Header.Set("X-Request-Id", "caller-request-id")
+						for _, name := range []string{"Authorization", "Proxy-Authorization", "X-Api-Key", "Cookie", "X-Other"} {
+							request.Header.Set(name, "private-"+name)
+						}
+						recorder := httptest.NewRecorder()
+						newRouter().ServeHTTP(recorder, request)
+						if recorder.Code != test.status {
+							t.Fatalf("status = %d, want %d: %s", recorder.Code, test.status, recorder.Body.String())
+						}
+						if !enabled {
+							baselineBody, baselineHeaders = recorder.Body.String(), recorder.Header().Clone()
+							if output.Len() != 0 {
+								t.Fatalf("log while disabled: %s", output)
+							}
+							return
+						}
+						if recorder.Body.String() != baselineBody || !reflect.DeepEqual(recorder.Header(), baselineHeaders) {
+							t.Fatal("logging changed response body or headers")
+						}
+						line := output.String()
+						if strings.Count(line, "\n") != 1 {
+							t.Fatalf("want one log line, got %q", line)
+						}
+						for _, field := range []string{`id="caller-request-id"`, `replica="test-pod"`, `method=` + strconv.Quote(test.method), `path=` + strconv.Quote(route.path), `function_id="test-function"`, `function_version_id="test-version"`} {
+							if !strings.Contains(line, field) {
+								t.Errorf("log missing %s: %s", field, line)
+							}
+						}
+						if strings.Contains(line, "private-") || strings.Contains(line, "questions") {
+							t.Fatalf("log leaked request data: %s", line)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
+func TestDecisionRequestLogEscapesFields(t *testing.T) {
+	output := captureRequestLogs(t, true)
+	request := httptest.NewRequest(http.MethodPost, decisionRoute, strings.NewReader(decisionsBody))
+	request.Header.Set("X-Request-Id", "caller\nforged-log")
+	newRouter().ServeHTTP(httptest.NewRecorder(), request)
+	if line := output.String(); strings.Count(line, "\n") != 1 || !strings.Contains(line, `id="caller\nforged-log"`) {
+		t.Fatalf("request id was not escaped: %q", line)
+	}
+}
+
+func TestMessagesRequestLogUnchanged(t *testing.T) {
+	t.Setenv("NVCF_INSTANCE_ID", "test-pod")
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			output := captureRequestLogs(t, enabled)
+			recorder := postJSONWithHeaders(t, "/v1/messages", messagesBody+`}`, map[string]string{"X-Test": "private-value"})
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d", recorder.Code)
+			}
+			if !enabled {
+				if output.Len() != 0 {
+					t.Fatalf("log while disabled: %s", output)
+				}
+				return
+			}
+			want := "messages request id=" + recorder.Header().Get("request-id") + " replica=test-pod method=POST path=/v1/messages headers=content-type,x-test\n"
+			if line := output.String(); !strings.HasSuffix(line, want) || strings.Count(line, "\n") != 1 {
+				t.Fatalf("Messages log = %q, want suffix %q", line, want)
+			}
+		})
+	}
+}
 
 func TestMessagesDiagnosticsOffByDefault(t *testing.T) {
 	recorder := postJSONWithHeaders(t, "/v1/messages", messagesBody+`}`, nil)

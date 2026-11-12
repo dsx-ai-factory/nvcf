@@ -39,8 +39,7 @@ const (
 	redactedValue         = "<redacted>"
 )
 
-// logRequests logs one line per Messages request (method, path, request id,
-// replica and received header names; never header values) when LOG_REQUESTS=true.
+// logRequests enables access logs for Messages, Decisions and System One.
 var logRequests = os.Getenv(logRequestsEnv) == "true"
 
 type backendDiagnostics struct {
@@ -110,4 +109,10 @@ func logMessagesRequest(r *http.Request, requestID string) {
 	sort.Strings(names)
 	log.Printf("messages request id=%s replica=%s method=%s path=%s headers=%s",
 		requestID, replicaID(), r.Method, r.URL.Path, strings.Join(names, ","))
+}
+
+func logDecisionRequest(r *http.Request) {
+	log.Printf("decision request id=%q replica=%q method=%q path=%q function_id=%q function_version_id=%q",
+		r.Header.Get("X-Request-Id"), replicaID(), r.Method, r.URL.Path,
+		os.Getenv("NVCF_FUNCTION_ID"), os.Getenv("NVCF_FUNCTION_VERSION_ID"))
 }

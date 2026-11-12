@@ -330,18 +330,42 @@ print(message.model_extra["x_backend"]["received_headers"])
 
 ### Request log
 
-Set `LOG_REQUESTS=true` in the container environment to log one line for each
-Messages request, whether or not the request asks for diagnostics:
+Set `LOG_REQUESTS=true` in the container environment to log one line at handler
+entry for each Messages, Decisions, or System One request, including requests
+that later return errors. The server reads the variable once at startup.
+Logs go to stderr and are available through `kubectl logs`.
+
+Messages logs are unchanged and do not require the diagnostics control:
 
 ```text
 messages request id=req_7 replica=0-sr-1a2b3c method=POST path=/v1/messages headers=content-length,content-type,x-test-header
 ```
 
-The log has the request id, replica, method, path, and the sorted header names.
-It never logs header values. The server reads the variable once at startup. Use
-it with `kubectl logs` to see what reached a replica when the client cannot
-send the diagnostics field. The request id matches the `request-id` response
-header.
+The Messages log has the generated request id, replica, method, path, and sorted
+header names. Its id matches the `request-id` response header.
+
+Decisions and System One log the received `X-Request-Id`, method, path, replica,
+and function and version ids from the environment (empty when unavailable):
+
+```text
+decision request id="caller-request-id" replica="sample-pod" method="POST" path="/v1/decisions" function_id="function-id" function_version_id="version-id"
+```
+
+Fields are quoted and escaped to keep each request on one line. These access
+logs exclude credentials, cookies, request bodies, image data, query parameters,
+and other header values. Responses and echo behavior are unchanged.
+
+To check gateway rejection, send distinct `X-Request-Id` values for an owner
+request and a request from an account without access to a private function.
+Confirm the owner receives 200 and its id appears in the backend logs. Confirm
+the other account receives 404 and its id is absent across all backend replicas
+in the same time window. A missing id alone is insufficient evidence; keep the
+owner log as a positive control and allow for log collection delay.
+
+```bash
+kubectl logs -l '<backend-selector>' --all-containers=true --prefix=true \
+  --since=10m --tail=-1 | grep -F 'id="caller-request-id"'
+```
 
 | Environment variable | Accepted values | Default |
 |----------------------|-----------------|---------|
