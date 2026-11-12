@@ -74,8 +74,9 @@ const (
 	// failed to process them, so nothing was committed.
 	ReasonProcessingFailed Reason = "processing_failed"
 	// ReasonUploadUnconfirmed means the destination could not confirm that
-	// the upload completed. The data may still land, so the job is sent
-	// again only once, counted as a possible duplicate.
+	// the upload completed. The data may still land, so the work is sent
+	// again only a bounded number of times, each counted as a possible
+	// duplicate.
 	ReasonUploadUnconfirmed Reason = "upload_unconfirmed"
 	// ReasonBadResponse means the destination's answer could not be read.
 	ReasonBadResponse Reason = "bad_response"
