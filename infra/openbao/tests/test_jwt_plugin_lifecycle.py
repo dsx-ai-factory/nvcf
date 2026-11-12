@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import copy
 import hashlib
 import json
 import os
@@ -25,6 +26,9 @@ from pathlib import Path
 path = Path(os.environ["FAKE_BAO_STATE"])
 state = json.loads(path.read_text())
 args = sys.argv[1:]
+if state.get("fail_operation") == " ".join(args[:2]):
+    print(state.get("read_error", "Injected read failure"), file=sys.stderr)
+    sys.exit(2)
 if state.get("fail_reads"):
     sys.exit(2)
 if args[:2] == ["plugin", "list"] and state.get("catalog_list_failures", 0):
@@ -38,10 +42,13 @@ if args[:2] == ["plugin", "info"] and state.get("not_ready_reads", 0):
 if args[:1] == ["status"]:
     print(json.dumps(state.get("health", {"initialized": True, "sealed": False, "ha_enabled": False})))
 elif args[:2] == ["plugin", "list"]:
-    print(json.dumps(state.get("catalog_response", {"details": [
-        {"name": "vault-plugin-secrets-jwt", **entry} for entry in state["catalog"].values()]})))
+    if "raw_catalog_response" in state:
+        print(state["raw_catalog_response"])
+    else:
+        print(json.dumps(state.get("catalog_response", {"details": [
+            {"name": "vault-plugin-secrets-jwt", **entry} for entry in state["catalog"].values()]})))
 elif args[:2] == ["secrets", "list"]:
-    print(json.dumps(state["mounts"]))
+    print(state["raw_mount_response"] if "raw_mount_response" in state else json.dumps(state["mounts"]))
 elif args[:2] == ["plugin", "info"]:
     version = next((x.split("=", 1)[1] for x in args if x.startswith("-version=")), "")
     if version not in state["catalog"]:
@@ -384,6 +391,113 @@ class LifecycleTest(unittest.TestCase):
         result = self.run_driver("deployment-preflight", success=False)
         self.assertIn("Required upgrade stop: bridge.example/release@sha256:", result.stderr)
         self.assertIn("openbao-jwt-plugin-upgrade.md", result.stderr)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_legacy_only_catalog_identifies_bridge_before_target_registration(self):
+        self.target_only()
+        initial_catalog = copy.deepcopy(self.state["catalog"])
+        for version in ("", OLD):
+            for omit_version in (False, True) if version == "" else (False,):
+                with self.subTest(version=version, omit_version=omit_version):
+                    entry = copy.deepcopy(initial_catalog[version])
+                    if omit_version:
+                        entry.pop("version")
+                    self.state["catalog"] = {version: entry}
+                    self.mount().update(plugin_version=version, running_plugin_version=version)
+                    result = self.run_driver("deployment-preflight", success=False)
+                    self.assertIn("Required upgrade stop:", result.stderr)
+                    self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_read_failures_preserve_cause_without_bridge_hint(self):
+        self.mount()["plugin_version"] = TARGET
+        self.reload()
+        self.target_only()
+        for operation in ("plugin list", "secrets list", "plugin info"):
+            for error in ("permission denied", "connection refused", "context deadline exceeded"):
+                with self.subTest(operation=operation, error=error):
+                    cause = f"Injected {operation}: {error}"
+                    self.state.update(fail_operation=operation, read_error=cause)
+                    result = self.run_driver("deployment-preflight", success=False)
+                    self.assertIn(cause, result.stderr)
+                    self.assertNotIn("Required upgrade stop:", result.stderr)
+                    if operation != "plugin info":
+                        self.assertEqual(result.returncode, 2)
+                    self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_image_config_failure_does_not_prescribe_bridge(self):
+        self.target_only()
+        (self.output / "plugin-config/jwt.hcl").unlink()
+        result = self.run_driver("deployment-preflight", success=False)
+        self.assertIn("missing declarative plugin config", result.stderr)
+        self.assertNotIn("Required upgrade stop:", result.stderr)
+        self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_invalid_inventory_and_catalog_do_not_prescribe_bridge(self):
+        self.target_only()
+        baseline = copy.deepcopy(self.state)
+        cases = [
+            {"raw_catalog_response": "{invalid"},
+            {"catalog_response": {"details": None}},
+            {"raw_mount_response": "{invalid"},
+            {"catalog_response": {"details": [{"name": PLUGIN, "builtin": False, "version": "v99.0.0"}]}},
+        ]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                self.state = {**copy.deepcopy(baseline), **changes}
+                result = self.run_driver("deployment-preflight", success=False)
+                self.assertNotIn("Required upgrade stop:", result.stderr)
+                self.assertEqual(self.state["writes"], [])
+
+    def test_unverified_mount_takes_precedence_over_another_legacy_mount(self):
+        self.target_only()
+        valid = {"type": PLUGIN, "plugin_version": TARGET,
+                 "running_plugin_version": TARGET, "running_sha256": self.target_sha}
+        cases = [{key: value for key, value in valid.items() if key != missing}
+                 for missing in ("plugin_version", "running_plugin_version", "running_sha256")]
+        cases += [{**valid, "plugin_version": "v99.0.0"},
+                  {**valid, "running_sha256": "invalid"},
+                  {**valid, "running_sha256": self.old_sha}]
+        for mount in cases:
+            with self.subTest(mount=mount):
+                self.state["mounts"]["broken/jwt/"] = mount
+                result = self.run_driver("deployment-preflight", success=False)
+                self.assertNotIn("Required upgrade stop:", result.stderr)
+                self.assertEqual(self.state["writes"], [])
+
+    def test_target_only_digest_drift_does_not_prescribe_bridge(self):
+        self.target_only()
+        baseline = copy.deepcopy(self.state)
+        for version, include_target_mount in (("", False), (TARGET, False), (TARGET, True)):
+            with self.subTest(version=version, include_target_mount=include_target_mount):
+                self.state = copy.deepcopy(baseline)
+                self.state["catalog"][version]["sha256"] = "0" * 64
+                if include_target_mount:
+                    self.state["mounts"]["target/jwt/"] = {
+                        "type": PLUGIN, "plugin_version": TARGET,
+                        "running_plugin_version": TARGET, "running_sha256": self.target_sha}
+                result = self.run_driver("deployment-preflight", success=False)
+                self.assertIn("does not match the catalog", result.stderr)
+                self.assertNotIn("Required upgrade stop:", result.stderr)
+                self.assertEqual(self.state["writes"], [])
+
+    def test_target_configured_old_running_requires_rotation_without_bridge_hint(self):
+        self.target_only()
+        for running in ("", OLD):
+            with self.subTest(running=running):
+                self.mount().update(plugin_version=TARGET, running_plugin_version=running)
+                result = self.run_driver("deployment-preflight", success=False)
+                self.assertIn("complete the checked rotation", result.stderr)
+                self.assertNotIn("Required upgrade stop:", result.stderr)
+                self.assertEqual(self.state["writes"], [])
+
+    def test_target_selection_with_missing_target_catalog_is_not_legacy(self):
+        self.mount()["plugin_version"] = TARGET
+        self.reload()
+        self.target_only()
+        self.state["catalog"].pop(TARGET)
+        result = self.run_driver("deployment-preflight", success=False)
+        self.assertIn("invalid or missing JWT catalog entry", result.stderr)
+        self.assertNotIn("Required upgrade stop:", result.stderr)
         self.assertEqual(self.state["writes"], [])
 
     def test_image_check_rejects_changed_command_with_unchanged_hash(self):

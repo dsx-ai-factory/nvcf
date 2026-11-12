@@ -32,6 +32,9 @@ func TestOpenBaoJWTPluginLifecycleFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("OPENBAO_JWT_RECOVERY_CONTAINER", "jwt-recovery-wiring")
 	runner := newFakeRunner(nil)
 	runner.respond = func(command string) (harness.Result, bool) {
+		if strings.Contains(command, "BAO_TOKEN=invalid-preflight-test-token") {
+			return harness.Result{ExitCode: 2, Stderr: "Error listing available plugins: data from server response is empty"}, true
+		}
 		if strings.Contains(command, "JWT_PLUGIN_DIR=/tmp/nvcf-jwt-runtime/target-only/plugins") {
 			return harness.Result{ExitCode: 1, Stderr: "Required upgrade stop: qualified bridge"}, true
 		}

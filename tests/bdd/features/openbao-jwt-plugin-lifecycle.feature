@@ -64,6 +64,19 @@ Feature: OpenBao JWT plugin versions preserve signing through upgrade and rollba
         jwt-plugin-lifecycle bridge-preflight
       '
       """
+    # An authentication failure cannot establish that a bridge migration is needed.
+    When I run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        JWT_PLUGIN_DIR=/tmp/nvcf-jwt-runtime/target-only/plugins
+        JWT_PLUGIN_CONFIG_DIR=/tmp/nvcf-jwt-runtime/target-only/plugin-config
+        export JWT_PLUGIN_DIR JWT_PLUGIN_CONFIG_DIR
+        BAO_TOKEN=invalid-preflight-test-token jwt-plugin-lifecycle deployment-preflight
+      '
+      """
+    Then the command exit code should be 2
+    And the command output should contain "Error listing available plugins:"
+    And the command output should not contain "Required upgrade stop:"
     # A candidate target-only package must reject stored legacy state before rollout.
     When I run command:
       """

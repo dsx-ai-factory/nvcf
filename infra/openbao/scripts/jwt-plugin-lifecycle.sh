@@ -39,10 +39,11 @@ if [[ -x $plugin_dir/${plugin}-${old} ]]; then
 fi
 
 catalog_sha() {
-    local version=$1 info
+    local version=$1 info command=$plugin
+    [[ -z $version ]] || command+="-${version}"
     info=$(bao plugin info -format=json -version="$version" secret "$plugin") || return 1
-    jq -er --arg command "${plugin}-${version}" --arg version "$version" '
-      select(.command == $command and .version == $version and .builtin == false) |
+    jq -er --arg command "$command" --arg version "$version" '
+      select(.command == $command and (.version // "") == $version and .builtin == false) |
       .sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' <<< "$info"
 }
 
@@ -89,14 +90,6 @@ if [[ $action == image-check ]]; then
     exit 0
 fi
 
-if [[ $action == deployment-preflight && -z $local_old_sha ]]; then
-    deployment_exit() {
-        local result=$?
-        if ((result != 0)); then upgrade_stop; fi
-        exit "$result"
-    }
-    trap deployment_exit EXIT
-fi
 case "$action" in deployment-preflight|check-cleanup|cleanup) image_check ;; esac
 
 # Enumerate all versions, including unused entries. Never silently discard an
@@ -109,7 +102,7 @@ read_catalog() {
         (.builtin | type == "boolean")) and
       all(.details[] | select(.name == $plugin);
         .builtin == false and ((.version // "") == "" or .version == $old or .version == $target))' \
-      <<< "$catalog" >/dev/null || fail 'unavailable or unknown JWT catalog versions; inventory the deployed artifacts and use a compatible bridge'
+      <<< "$catalog" >/dev/null || fail 'unavailable or unknown JWT catalog versions; resolve the catalog inventory before retrying'
 }
 
 if [[ $action == wait-ready ]]; then
@@ -179,6 +172,47 @@ if [[ $action == bridge-preflight ]]; then
     done
     echo 'Bridge is compatible with existing JWT mounts'
     exit 0
+fi
+
+check_target_only_mounts() {
+    local version sha
+    jq -e --arg old "$old" --arg target "$target" '
+      all(.[]; .value |
+        (.plugin_version | type == "string") and
+        (.running_plugin_version | type == "string") and
+        (.plugin_version == "" or .plugin_version == $old or .plugin_version == $target) and
+        (.running_plugin_version == "" or .running_plugin_version == $old or .running_plugin_version == $target) and
+        (.running_sha256 | type == "string" and test("^[0-9a-f]{64}$")))' \
+        <<< "$mounts" >/dev/null || fail 'unverifiable JWT mount version or running SHA; inspect the mount inventory before retrying'
+
+    # Validate the entire inventory before prescribing a migration path. A
+    # legacy selection alone does not explain another mount's corrupt metadata.
+    for version in "" "$old" "$target"; do
+        if jq -e --arg version "$version" --arg target "$target" --arg plugin "$plugin" --argjson catalog "$catalog" '
+          any(.[]; .value.plugin_version == $version or .value.running_plugin_version == $version) or
+          ($version == $target and any($catalog.details[]; .name == $plugin and .version == $target))' \
+          <<< "$mounts" >/dev/null; then
+            sha=$(catalog_sha "$version") || fail "invalid or missing JWT catalog entry: ${version:-unversioned}"
+            if [[ $version == "$target" && $sha != "$local_target_sha" ]]; then
+                fail 'target binary does not match the catalog'
+            fi
+            jq -e --arg version "$version" --arg sha "$sha" '
+              all(.[] | select(.value.running_plugin_version == $version);
+                .value.running_sha256 == $sha)' <<< "$mounts" >/dev/null ||
+                fail "running JWT SHA does not match the catalog: ${version:-unversioned}"
+        fi
+    done
+
+    if jq -e --arg target "$target" 'any(.[]; .value.plugin_version != $target)' <<< "$mounts" >/dev/null; then
+        upgrade_stop
+        fail 'JWT mounts still select a legacy plugin version; complete migration before target-only deployment'
+    fi
+    jq -e --arg target "$target" 'all(.[]; .value.running_plugin_version == $target)' <<< "$mounts" >/dev/null ||
+        fail 'JWT mounts select the target but still run an older version; confirm every member has the qualified bridge and complete the checked rotation before retrying'
+}
+
+if [[ $action == deployment-preflight && -z $local_old_sha ]]; then
+    check_target_only_mounts
 fi
 
 target_sha=$(catalog_sha "$target") || fail "invalid or missing target catalog entry: $target"
