@@ -1165,10 +1165,10 @@ func (c *ModelVolumeController) collectSet(ctx context.Context, uri, sysNS, clai
 	// published until the volume is detached.
 	detached, derr := c.Cache.Detached(ctx, pvName)
 	if derr != nil {
-		return derr
+		return fmt.Errorf("detach check for set volume %s: %w", pvName, derr)
 	}
 	if !detached {
-		return fmt.Errorf("set volume %s still attached after the collect holder left", pvName)
+		return fmt.Errorf("set volume %s (claim %s/%s) still attached after the collect holder left; its ReadOnlyMany reader views would be refused", pvName, sysNS, claim)
 	}
 	// Both copies above keep the engine's owners and modes.
 	stamp := map[string]string{modelvolume.CacheOwnersAnnotation: modelvolume.CacheOwnersKept}

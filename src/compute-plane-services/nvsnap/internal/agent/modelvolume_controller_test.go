@@ -1422,6 +1422,13 @@ func TestModelVolumeController_CacheSetNotPublishedWhileCollectorVolumeHeld(t *t
 	if st, _ := cache.Lookup(ctx, "cache://abc123"); st.Complete {
 		t.Fatal("the set was published while its volume was still attached read-write; its read-only views are what NVMesh refuses")
 	}
+	// The refused publication releases the set claim, so a later attempt
+	// (once the driver has let go of the volume) collects afresh instead of
+	// inheriting a half-published one.
+	waitUntil(t, "set claim released after the refused publication", func() bool {
+		_, cerr := kc.CoreV1().PersistentVolumeClaims("nvsnap-system").Get(ctx, cache.Cfg.ClaimName("cache://abc123"), metav1.GetOptions{})
+		return cerr != nil
+	})
 	pv, err := kc.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get the set volume: %v", err)
