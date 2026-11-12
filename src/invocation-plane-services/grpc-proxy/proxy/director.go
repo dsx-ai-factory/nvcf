@@ -124,15 +124,23 @@ type StreamDirector struct {
 	// watchSessionEnd.
 	sessionWatches sync.Map
 	sessionEndPoll time.Duration
-	watchCtx       context.Context
-	stopWatches    context.CancelFunc
+	// How long a registration may be absent, before it was ever seen, without
+	// the session being treated as ended.
+	sessionRegistrationGrace time.Duration
+	sessionEndWatchLimit     time.Duration
+	watchCtx                 context.Context
+	stopWatches              context.CancelFunc
 }
 
 // How often a disconnected session is checked for whether it can still be
 // rejoined, and how long it is watched at most.
 const (
-	defaultSessionEndPoll = 10 * time.Second
-	sessionEndWatchLimit  = 9 * time.Hour
+	defaultSessionEndPoll       = 10 * time.Second
+	defaultSessionEndWatchLimit = 9 * time.Hour
+	// The worker may attach before it has published the session registration.
+	// An absent registration is only an ended session once it has been seen,
+	// or once this long has passed without it appearing.
+	defaultSessionRegistrationGrace = 2 * time.Minute
 )
 
 var errShuttingDown = errors.New("proxy is shutting down")
@@ -371,6 +379,8 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 		cors:            cors.New(middleware.DefaultCorsOptions),
 	}
 	director.sessionEndPoll = defaultSessionEndPoll
+	director.sessionRegistrationGrace = defaultSessionRegistrationGrace
+	director.sessionEndWatchLimit = defaultSessionEndWatchLimit
 	director.watchCtx, director.stopWatches = context.WithCancel(context.Background())
 	// Closed over by the eviction handler above, which runs before this
 	// returns only if an entry is evicted during construction, which cannot
@@ -957,36 +967,106 @@ type sessionResumer interface {
 	SessionResumable(ctx context.Context, requestId uuid.UUID) (bool, error)
 }
 
+// sessionWatch lets a later departure of the same session extend a running
+// watch instead of starting a second one.
+type sessionWatch struct {
+	renew chan struct{}
+}
+
 // watchSessionEnd reports Session.Ended once the session wc belonged to can no
 // longer be rejoined. A client that left may still come back, so the proxy
 // asks the session registration, which the worker removes when it stops
-// waiting for the client.
+// waiting for the client. Only one watcher runs per request ID. A client that
+// rejoins and leaves again renews that watcher's deadline.
 func (s *StreamDirector) watchSessionEnd(wc *worker.WorkerConnection) {
 	resumer, ok := s.functionInvoker.(sessionResumer)
 	if !ok || s.eventLedger == nil {
 		return
 	}
-	if _, watching := s.sessionWatches.LoadOrStore(wc.RequestId, struct{}{}); watching {
+	watch := &sessionWatch{renew: make(chan struct{}, 1)}
+	if running, watching := s.sessionWatches.LoadOrStore(wc.RequestId, watch); watching {
+		select {
+		case running.(*sessionWatch).renew <- struct{}{}:
+		default: // a renewal is already pending
+		}
 		return
 	}
 	go func() {
 		defer s.sessionWatches.Delete(wc.RequestId)
-		ctx, cancel := context.WithTimeout(s.watchCtx, sessionEndWatchLimit)
+		ctx, cancel := context.WithCancel(s.watchCtx)
 		defer cancel()
+		deadline := time.NewTimer(s.sessionEndWatchLimit)
+		defer deadline.Stop()
 		ticker := time.NewTicker(s.sessionEndPoll)
 		defer ticker.Stop()
+		started := time.Now()
+		registrationSeen := false
+		lookupFailing := false
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-deadline.C:
+				return
+			case <-watch.renew:
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				deadline.Reset(s.sessionEndWatchLimit)
+				continue
 			case <-ticker.C:
 			}
-			resumable, err := resumer.SessionResumable(ctx, wc.RequestId)
-			if err != nil || resumable {
+			resumable, err := s.lookupSessionResumable(ctx, resumer, wc)
+			if err != nil {
+				if !lookupFailing {
+					zap.L().Warn("session registration lookup failed, will keep polling",
+						zap.Error(err),
+						zap.Stringer("request_id", wc.RequestId),
+						zap.String("function_id", wc.FunctionId),
+						zap.String("function_version_id", wc.FunctionVersionId),
+						zap.String("caller_nca_id", wc.CallerNcaId))
+				}
+				lookupFailing = true
+				continue
+			}
+			lookupFailing = false
+			if resumable {
+				registrationSeen = true
+				continue
+			}
+			if !registrationSeen && time.Since(started) < s.sessionRegistrationGrace {
 				continue
 			}
 			s.eventLedger.Publish(ctx, newSessionEnded(wc, time.Now()))
 			return
 		}
 	}()
+}
+
+func (s *StreamDirector) lookupSessionResumable(ctx context.Context, resumer sessionResumer, wc *worker.WorkerConnection) (bool, error) {
+	ctx, span := otel.GetTracerProvider().Tracer("proxy-tracer").Start(ctx, "grpc-proxy.session_registration_lookup",
+		trace.WithAttributes(
+			attribute.Stringer("request_id", wc.RequestId),
+			attribute.String("nvcf.function.id", wc.FunctionId),
+			attribute.String("nvcf.org.id", wc.CallerNcaId),
+		))
+	defer span.End()
+
+	began := time.Now()
+	resumable, err := resumer.SessionResumable(ctx, wc.RequestId)
+	metrics.SessionEndLookupDurationSeconds.Observe(time.Since(began).Seconds())
+	switch {
+	case err != nil:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupError).Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	case resumable:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupResumable).Inc()
+	default:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupEnded).Inc()
+	}
+	return resumable, err
 }

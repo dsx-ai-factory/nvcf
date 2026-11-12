@@ -458,3 +458,61 @@ func TestSessionEndWatchStopsOnClose(t *testing.T) {
 	publisher.Close()
 	assert.Empty(t, ofType(received(), eventTypeSessionEnded))
 }
+
+func TestSessionEndNotReportedWhileRegistrationNotYetPublished(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionRegistrationGrace = time.Hour
+	invoker.resumable.Store(false)
+	attachThenLeave(t, director)
+
+	require.Eventually(t, func() bool { return invoker.lookups.Load() >= 5 }, 5*time.Second, time.Millisecond)
+	assert.Empty(t, ofType(received(), eventTypeSessionEnded), "an unpublished registration is not an ended session")
+
+	// Once seen, its removal does end the session.
+	invoker.resumable.Store(true)
+	lookups := invoker.lookups.Load()
+	require.Eventually(t, func() bool { return invoker.lookups.Load() > lookups+1 }, 5*time.Second, time.Millisecond)
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+}
+
+func TestSessionEndReportedWhenRegistrationNeverAppears(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionRegistrationGrace = 30 * time.Millisecond
+	invoker.resumable.Store(false)
+	attachThenLeave(t, director)
+
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+}
+
+func TestSessionEndWatchRenewedByLaterDeparture(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionEndWatchLimit = 150 * time.Millisecond
+	wc := attachThenLeave(t, director)
+
+	// The client keeps rejoining and leaving, each departure renewing the one
+	// watcher, so it outlives the original deadline.
+	for range 8 {
+		time.Sleep(50 * time.Millisecond)
+		director.watchSessionEnd(wc)
+	}
+	_, running := director.sessionWatches.Load(wc.RequestId)
+	assert.True(t, running, "watch expired despite later departures")
+
+	// The session then ends while that watcher is still the one watching.
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+	assert.Len(t, ofType(received(), eventTypeSessionEnded), 1, "one watcher per request id")
+}

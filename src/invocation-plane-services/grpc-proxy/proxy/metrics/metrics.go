@@ -204,6 +204,23 @@ var (
 			Help:      "total worker tunnel connections closed, by transport close code",
 		}, []string{"code"})
 
+	// Outcomes of the registration lookups that decide whether a left session
+	// has ended. Without the error outcome a failing lookup is invisible: the
+	// watcher keeps polling and Session.Ended is silently withheld.
+	SessionEndLookupTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: RootNamespace,
+			Name:      "session_end_lookup_total",
+			Help:      "total session registration lookups made while watching left sessions, by outcome",
+		}, []string{"outcome"})
+
+	SessionEndLookupDurationSeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: RootNamespace,
+			Name:      "session_end_lookup_duration_seconds",
+			Help:      "how long a session registration lookup took",
+		})
+
 	// Buckets deliberately straddle the two timers that can close a tunnel:
 	// the worker-side QUIC idle timeout (8s) and this service's worker
 	// connection cache TTL (consts.Timeout, 30s). A hard cliff at either
@@ -217,6 +234,19 @@ var (
 			Buckets:   []float64{1, 5, 8, 10, 15, 30, 45, 60, 120, 300, 600, 1800, 3600},
 		})
 )
+
+// Outcomes of a session registration lookup made while watching a left session.
+const (
+	SessionLookupResumable = "resumable"
+	SessionLookupEnded     = "ended"
+	SessionLookupError     = "error"
+)
+
+var SessionLookupOutcomes = []string{
+	SessionLookupResumable,
+	SessionLookupEnded,
+	SessionLookupError,
+}
 
 // Outcomes of the shutdown purge of queued stateful work requests.
 const (
@@ -535,6 +565,9 @@ func init() {
 	}
 	for _, reason := range PurgeSkipReasons {
 		PendingWorkPurgeSkippedTotal.WithLabelValues(reason)
+	}
+	for _, outcome := range SessionLookupOutcomes {
+		SessionEndLookupTotal.WithLabelValues(outcome)
 	}
 }
 
