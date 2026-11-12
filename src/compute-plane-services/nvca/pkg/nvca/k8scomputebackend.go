@@ -305,7 +305,7 @@ func (c K8sComputeBackend) translateFunctionLaunchSpecification(
 		},
 		DefaultStargateAddress: c.bk8s.cfg.Workload.DefaultStargateAddress,
 		StargateQUICInsecure:   c.bk8s.cfg.Workload.StargateQUICInsecure,
-		LLMInferenceStopPause:  c.bk8s.cfg.Workload.LLMInferenceStopPause,
+		LLMInferenceStopPause:  metav1.Duration{Duration: c.bk8s.cfg.Workload.LLMInferenceStopPause},
 	}
 
 	if reqType == ftContainer {

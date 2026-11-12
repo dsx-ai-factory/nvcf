@@ -18,14 +18,17 @@ limitations under the License.
 package function
 
 import (
+	"encoding/json"
 	"math"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 )
@@ -52,6 +55,15 @@ func llmContainerFunctionEnv() map[string]string {
 func translateLLMContainerPod(t *testing.T, extraEnv map[string]string, pause time.Duration) *corev1.Pod {
 	t.Helper()
 
+	tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil), LLMInferenceStopPause: metav1.Duration{Duration: pause}}
+	return translateLLMContainerPodWithConfig(t, extraEnv, tcfg)
+}
+
+// translateLLMContainerPodWithConfig translates an LLM container function with
+// extra launch environment and the given translate config.
+func translateLLMContainerPodWithConfig(t *testing.T, extraEnv map[string]string, tcfg TranslateConfig) *corev1.Pod {
+	t.Helper()
+
 	env := llmContainerFunctionEnv()
 	for k, v := range extraEnv {
 		env[k] = v
@@ -61,10 +73,39 @@ func translateLLMContainerPod(t *testing.T, extraEnv map[string]string, pause ti
 	msg.Details.FunctionType = FunctionTypeLLM
 	msg.LaunchSpecification.EnvironmentB64 = encodeTextEnv(env)
 
-	tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil), LLMInferenceStopPause: pause}
 	objs, err := Translate(msg, tcfg)
 	require.NoError(t, err)
 	return findPodByName(t, objs, "0-request")
+}
+
+// The icms-translate CLI decodes its config file with encoding/json and
+// unknown fields disallowed; the pause must read as a duration string there.
+func TestTranslateConfigJSONStopPause(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		json      string
+		wantPause time.Duration
+		wantErr   bool
+	}{
+		{name: "duration string", json: `{"llmInferenceStopPause":"90s"}`, wantPause: 90 * time.Second},
+		{name: "absent keeps the default", json: `{}`, wantPause: 60 * time.Second},
+		{name: "unitless number is rejected", json: `{"llmInferenceStopPause":90}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil)}
+			dec := json.NewDecoder(strings.NewReader(tc.json))
+			dec.DisallowUnknownFields()
+			err := dec.Decode(&tcfg)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			pod := translateLLMContainerPodWithConfig(t, nil, tcfg)
+			assert.Equal(t, tc.wantPause, preStopSleep(t, findContainerByName(t, pod.Spec.Containers, inferenceContainerName)))
+		})
+	}
 }
 
 // preStopSleep returns how long the container's preStop hook pauses, or fails
@@ -171,7 +212,7 @@ func TestTranslateContainerNonLLMKeepsDefaultShutdown(t *testing.T) {
 		common.UtilsImageEnv:             "nvcr.io/nvidia/utils:latest",
 		common.InitImageEnv:              "nvcr.io/nvidia/init:latest",
 	})
-	tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil), LLMInferenceStopPause: 5 * time.Minute}
+	tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil), LLMInferenceStopPause: metav1.Duration{Duration: 5 * time.Minute}}
 
 	objs, err := Translate(msg, tcfg)
 	require.NoError(t, err)

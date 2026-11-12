@@ -383,7 +383,7 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			VolumeMounts:    inferenceContainerVolumeMounts,
 		}
 		if isLLM {
-			shutdown := newLLMShutdown(tcfg.LLMInferenceStopPause)
+			shutdown := newLLMShutdown(tcfg.LLMInferenceStopPause.Duration)
 			inferenceContainer.Lifecycle = shutdown.inferenceLifecycle()
 			if grace := shutdown.minGraceSeconds(); grace > *pod.Spec.TerminationGracePeriodSeconds {
 				*pod.Spec.TerminationGracePeriodSeconds = grace

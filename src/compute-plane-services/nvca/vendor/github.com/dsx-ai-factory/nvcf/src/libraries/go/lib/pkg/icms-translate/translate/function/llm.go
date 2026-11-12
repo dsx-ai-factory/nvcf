@@ -171,7 +171,7 @@ func newLLMRouterClientContainer(
 	// functions run Pylon in a separate pod with no pause, so they keep
 	// Pylon's default drain behavior.
 	if !isHelm {
-		drain := newLLMShutdown(tcfg.LLMInferenceStopPause).drain
+		drain := newLLMShutdown(tcfg.LLMInferenceStopPause.Duration).drain
 		llmEnvSet[llmWorkerDrainTimeoutEnv] = strconv.FormatInt(drain.Milliseconds(), 10)
 	}
 

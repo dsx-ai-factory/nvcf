@@ -85,7 +85,7 @@ func (r *Reconciler) translateFunctionWorkload(
 		TranslateConfig:        cmnTCfg,
 		DefaultStargateAddress: r.cfg.Workload.DefaultStargateAddress,
 		StargateQUICInsecure:   r.cfg.Workload.StargateQUICInsecure,
-		LLMInferenceStopPause:  r.cfg.Workload.LLMInferenceStopPause,
+		LLMInferenceStopPause:  metav1.Duration{Duration: r.cfg.Workload.LLMInferenceStopPause},
 	}
 
 	msg := function.CreationQueueMessage{

@@ -53,9 +53,9 @@ sidecar gets `PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS` set to the pause minus 5
 seconds; a `pylon` version that reads this variable uses it as its drain
 deadline. A removed pod therefore releases its GPU up to one pause later. To
 change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
-chart values, for example `90s`, between `10s` and `1h`. The pause runs
-`sleep` in the function container; an image without `sleep` stops at once, as
-before.
+chart values, for example `90s`, between `10s` and `1h`; it applies to worker
+pods created after NVCA picks up the new value. The pause runs `sleep` in the
+function container; an image without `sleep` stops at once, as before.
 
 ## Enable on an Existing Installation
 
