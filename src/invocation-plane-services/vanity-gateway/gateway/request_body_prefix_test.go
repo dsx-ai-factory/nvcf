@@ -886,6 +886,62 @@ func TestPrefixReplayBodyReleasesPrefixAfterReplay(t *testing.T) {
 	assert.Equal(t, "tail", string(rest))
 }
 
+// TestReleasedPrefixBufferIsPoisoned checks that every path returning the
+// scanned prefix to the pool poisons it in tests, so a read of the prefix
+// after release fails like a read of any other released body buffer.
+func TestReleasedPrefixBufferIsPoisoned(t *testing.T) {
+	newPrefix := func() (*bytebufferpool.ByteBuffer, []byte) {
+		prefix := bytebufferpool.Get()
+		_, _ = prefix.WriteString(`{"model":"` + prefixTestModel + `"`)
+		return prefix, prefix.B
+	}
+	tests := []struct {
+		name    string
+		release func(t *testing.T) []byte
+	}{
+		{"replayed", func(t *testing.T) []byte {
+			prefix, released := newPrefix()
+			_, err := io.ReadAll(newPrefixReplayBody(prefix, io.NopCloser(strings.NewReader("}"))))
+			require.NoError(t, err)
+			return released
+		}},
+		{"closed before replay", func(t *testing.T) []byte {
+			prefix, released := newPrefix()
+			require.NoError(t, newPrefixReplayBody(prefix, io.NopCloser(strings.NewReader("}"))).Close())
+			return released
+		}},
+		{"prefix read fails", func(t *testing.T) []byte {
+			director, _ := newPrefixTestDirector(t, 25<<20, http.DefaultTransport)
+			upload := &truncatedUpload{content: `{"model":"` + prefixTestModel + `"`}
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", upload)
+			_, _, err := director.readModelRequestBody(req, director.chatCompletions.modelNameToNVCFUrl)
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			return upload.written
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			released := tt.release(t)
+			require.NotEmpty(t, released)
+			assert.Equal(t, strings.Repeat("X", len(released)), string(released))
+		})
+	}
+}
+
+// truncatedUpload writes content into the caller's buffer, keeps that buffer
+// so a test can inspect it after release, and then fails like an upload that
+// ended early.
+type truncatedUpload struct {
+	content string
+	written []byte
+}
+
+func (u *truncatedUpload) Read(p []byte) (int, error) {
+	n := copy(p, u.content)
+	u.written = p[:n]
+	return n, io.ErrUnexpectedEOF
+}
+
 func TestRequestBodyReadsMetricInitializesAndCountsPrimaryRequests(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

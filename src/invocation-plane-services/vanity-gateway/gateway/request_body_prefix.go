@@ -138,7 +138,7 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 	complete, err := readRequestPrefix(prefix, request.Body, request.ContentLength)
 	if err != nil {
 		_ = request.Body.Close()
-		bytebufferpool.Put(prefix)
+		releaseRequestBodyBuffer(prefix)
 		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", err)
 	}
 	if complete {
@@ -606,8 +606,7 @@ func (b *prefixReplayBody) releasePrefixLocked() {
 	if b.prefix == nil {
 		return
 	}
-	// Put resets the buffer after recording its length for pool calibration.
-	bytebufferpool.Put(b.prefix)
+	releaseRequestBodyBuffer(b.prefix)
 	b.prefix = nil
 }
 
