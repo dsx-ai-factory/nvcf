@@ -39,18 +39,18 @@ openbao:
   migrations:
     image:
       registry: nvcr.io
-      repository: 0651155215864979/ncp-dev/nvcf-openbao-migrations
+      repository: <your-org>/nvcf-openbao-migrations
   server:
     image:
       registry: nvcr.io
-      repository: 0651155215864979/ncp-dev/nvcf-openbao
+      repository: <your-org>/nvcf-openbao
   injector:
     image:
       registry: nvcr.io
-      repository: 0651155215864979/ncp-dev/oss-vault-k8s
+      repository: <your-org>/oss-vault-k8s
     agentImage:
       registry: nvcr.io
-      repository: 0651155215864979/ncp-dev/nvcf-openbao
+      repository: <your-org>/nvcf-openbao
 ```
 
 ## Installation
@@ -63,7 +63,7 @@ This chart is intended to be installed by invoking Helm directly from source.
 helm dependency build helm
 ```
 
-2. Install the chart:
+1. Install the chart:
 
 ```bash
 helm install openbao-server helm \
@@ -94,6 +94,19 @@ Important note on Helm list merging:
 When overriding list values such as `extraContainers`, Helm replaces the
 original list instead of merging it. Override the full list item to preserve
 required fields from the base values file.
+
+### Migration kubectl client
+
+`openbao.migrations.kubectlMinor` controls both the initialization and migration
+Jobs. Leave it empty to use the image default, or set `"1.36"` for Kubernetes
+1.35 servers. The migrations 0.23.1 image provides kubectl 1.37.2 by default
+and the patched 1.36.6 client through `NVCF_KUBECTL_MINOR="1.36"`. An explicit
+`"1.37"` is also supported; other selections fail rendering.
+
+Use an image that implements `NVCF_KUBECTL_MINOR` when setting this value.
+Configure the selector here rather than also setting it in
+`openbao.migrations.env`; specifying both fails rendering. Existing env-only
+configuration still applies to the migration Job when `kubectlMinor` is empty.
 
 ## Uninstallation
 
