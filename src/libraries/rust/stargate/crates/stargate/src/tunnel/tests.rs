@@ -2029,7 +2029,8 @@ async fn reverse_tunnel_through_relay_carries_more_requests_than_default_stream_
             })
         })
         .collect();
-    let all_arrived = tokio::time::timeout(Duration::from_secs(5), async {
+    // Well under the fixture's 5 s request timeout, which would free held streams.
+    let all_arrived = tokio::time::timeout(Duration::from_secs(2), async {
         while arrived.load(Ordering::SeqCst) < HELD_REQUESTS {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
