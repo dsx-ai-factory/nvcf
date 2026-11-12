@@ -19,6 +19,7 @@ package function
 
 import (
 	"fmt"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +47,10 @@ type TranslateConfig struct {
 	// Whether to use QUIC insecure mode for stargate connections
 	// If not set, "--quick-insecure" is omitted
 	StargateQUICInsecure bool `json:"stargateQUICInsecure,omitempty"`
+	// LLMInferenceStopPause is how long an LLM container function's inference
+	// container keeps running after its pod is deleted. Zero uses the default.
+	// Pylon's drain timeout and the pod's grace period are derived from it.
+	LLMInferenceStopPause time.Duration `json:"llmInferenceStopPause,omitempty"`
 }
 
 func Translate(t CreationQueueMessage, tcfg TranslateConfig) (objs []metav1.Object, err error) {

@@ -595,6 +595,11 @@
                             ]
                         }
                     }
+                },
+                "llmInferenceStopPause": {
+                    "type": "string",
+                    "default": "",
+                    "description": "How long an LLM container function's inference container keeps serving after pod deletion while Pylon drains, as a Go duration between 10s and 1h (NVCA rejects other values). Empty keeps the agent's default (60s)."
                 }
             }
         },

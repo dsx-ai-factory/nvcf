@@ -114,6 +114,15 @@ assert_equal "16777216" "$(agent_config_value "${default_manifest}" '.workload.w
 render "${tmp_dir}/zero-download-manifest.yaml" --set worker.download.concurrentDownloads=0 --set worker.download.concurrentChunks=0 --set worker.download.chunkSizeBytes=0
 assert_absent "${tmp_dir}/zero-download-manifest.yaml" '.workload' "all-zero worker.download must emit no workload section"
 
+# worker.llmInferenceStopPause renders under workload.llmInferenceStopPause;
+# empty leaves NVCA's built-in default.
+assert_absent "${default_manifest}" '.workload.llmInferenceStopPause' "llmInferenceStopPause should be unset by default"
+render "${tmp_dir}/stop-pause-manifest.yaml" --set-string worker.llmInferenceStopPause=90s
+assert_equal "90s" "$(agent_config_value "${tmp_dir}/stop-pause-manifest.yaml" '.workload.llmInferenceStopPause')" "worker.llmInferenceStopPause must render under workload"
+assert_equal "5" "$(agent_config_value "${tmp_dir}/stop-pause-manifest.yaml" '.workload.workerInitDownload.concurrentDownloads')" "worker.llmInferenceStopPause must keep worker.download"
+render "${tmp_dir}/stop-pause-only-manifest.yaml" --set-string worker.llmInferenceStopPause=90s --set worker.download.concurrentDownloads=0 --set worker.download.concurrentChunks=0 --set worker.download.chunkSizeBytes=0
+assert_equal "90s" "$(agent_config_value "${tmp_dir}/stop-pause-only-manifest.yaml" '.workload.llmInferenceStopPause')" "worker.llmInferenceStopPause must render without worker.download"
+
 cat > "${explicit_values}" <<'EOF'
 storage:
   sharedStorage:

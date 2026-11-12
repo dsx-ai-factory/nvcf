@@ -156,6 +156,12 @@ spec:
           fieldPath: metadata.annotations['nvcf.nvidia.io/region']
     image: nvcr.io/myorg/custom-dynamo-container:1.0.0
     imagePullPolicy: IfNotPresent
+    lifecycle:
+      preStop:
+        exec:
+          command:
+          - sleep
+          - "60"
     name: inference
     resources:
       limits:
@@ -256,6 +262,8 @@ spec:
       value: nvcr.io/nvcf-core/opentelemetry-collector:0.74.0
     - name: OTEL_EXPORTER_OTLP_ENDPOINT
       value: https://prod.otel.example.com:8282
+    - name: PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS
+      value: "55000"
     - name: SHARED_CONFIG_DIR
       value: /config/shared
     - name: SIDECAR_REGISTRY_CREDENTIAL

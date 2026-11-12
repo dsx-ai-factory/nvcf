@@ -44,6 +44,7 @@ go_test(
         "config_test.go",
         "deepcopy_test.go",
         "keys_test.go",
+        "llm_inference_stop_pause_test.go",
         "transport_tls_installer_image_test.go",
         "types_additional_test.go",
         "types_test.go",

@@ -382,6 +382,13 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			SecurityContext: common.NewWorkloadContainerSecurityContext(),
 			VolumeMounts:    inferenceContainerVolumeMounts,
 		}
+		if isLLM {
+			shutdown := newLLMShutdown(tcfg.LLMInferenceStopPause)
+			inferenceContainer.Lifecycle = shutdown.inferenceLifecycle()
+			if grace := shutdown.minGraceSeconds(); grace > *pod.Spec.TerminationGracePeriodSeconds {
+				*pod.Spec.TerminationGracePeriodSeconds = grace
+			}
+		}
 
 		pod.Spec.Containers = append(pod.Spec.Containers, inferenceContainer)
 
