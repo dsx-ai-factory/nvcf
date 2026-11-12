@@ -954,7 +954,7 @@ class InstanceControllerTest extends IntegrationTest {
 
         SpotInstanceRequestSchema instanceRequestSchema = createDefaultInstanceRequestSchema();
         instanceRequestSchema.setFunctionType(FunctionType.LLM);
-        instanceRequestSchema.setFunctionTerminationGracePeriodDuration(Duration.ofMinutes(10));
+        instanceRequestSchema.setTerminationGracePeriodDurationForFunction(Duration.ofMinutes(10));
 
         doReturn(createResponse).when(instanceService).requestInstances(eq(DUMMY_CUSTOMER_1),
                                                                         eq(instanceRequestSchema),
