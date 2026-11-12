@@ -44,7 +44,7 @@ global:
         imageTag: "1.0.9"
       nvcaVersion: "3.10.4"
       imageCredHelper:
-        imageTag: "0.11.3"
+        imageTag: "0.11.4"
       otelCollector:
         # Self-hosted registries do not always mirror this optional image.
         # Enable it only after publishing the collector in global.image.
