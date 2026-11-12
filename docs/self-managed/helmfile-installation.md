@@ -65,16 +65,22 @@ namespace and each observability release uses its configured namespace.
 The following tools must be installed on your deployment machine:
 
 - `kubectl`
-- `helm` >= 3.12
-- `helmfile` >= 1.1.0 (recommended: `1.1.x`)
+- `helm` >= 3.12, < 4 (Helm 4 is not supported)
+- `helmfile` >= 1.1.0, < 1.2 (`1.1.x`)
 - `helm-diff` plugin >=3.11
+
+The stack's `make` targets run a `check-versions` step that enforces these
+ranges: it fails on any Helm major version other than 3, and it warns and asks
+for confirmation on Helmfile `1.2.0` or later. Package managers such as
+Homebrew may install newer releases than these ranges, so pin the versions
+explicitly.
 
 <Warning>
 Avoid Helmfile 1.2.x. Helmfile 1.2.0 removed sequential execution mode, which
 the NVCF stack requires for ordered deployments. Use version `1.1.x` for
 compatibility with the commands in this guide.
 
-Helmfile `1.3.0+` re-introduced sequential execution via the `--sequential-helmfiles` flag, but the command syntax differs from the `1.1.x` examples shown here. If you choose to use `1.3.0+`, add `--sequential-helmfiles` to every `helmfile apply` and `helmfile sync` command.
+Helmfile `1.3.0+` re-introduced sequential execution via the `--sequential-helmfiles` flag, but the command syntax differs from the `1.1.x` examples shown here. If you choose to use `1.3.0+`, add `--sequential-helmfiles` to every `helmfile apply` and `helmfile sync` command. The `make` targets do not add this flag, and `check-versions` still asks for confirmation on `1.3.0+`.
 
 </Warning>
 
