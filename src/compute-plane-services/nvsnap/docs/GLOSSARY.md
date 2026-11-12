@@ -48,6 +48,8 @@ are listed in the generated [reference](REFERENCE.md).
 | companion | A member without GPUs that the ranks talk to (an etcd, a NATS, a frontend), captured and restored with them. |
 | group capture | Capturing every member of an instance together, opted in per instance. |
 | group freeze | The point where every member of a group capture stops at once, so no member sees another stop before it. |
+| group teardown hold | A restored rank's pod kept, once its own workload has exited, until every rank of the same restore has exited, so no node's IMEX daemon leaves while a peer still holds fabric memory imported from it ([design/GROUP-TEARDOWN.md](design/GROUP-TEARDOWN.md)). |
+| IMEX daemon | NVIDIA's per-node service that lets a process import GPU memory another node's process exported (fabric memory); on Kubernetes the DRA driver's ComputeDomain runs it for the workload, on the nodes its pods run on. |
 
 ## Where bytes live: the tiers
 
