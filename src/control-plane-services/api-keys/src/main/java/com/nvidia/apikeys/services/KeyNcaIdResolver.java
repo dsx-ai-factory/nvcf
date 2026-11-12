@@ -34,8 +34,8 @@ public class KeyNcaIdResolver {
      * before the nca_id column existed carry neither.
      */
     public String resolve(KeyVo key) {
-        String column = StringUtils.trimToNull(key.getNcaId());
-        String details = StringUtils.trimToNull(key.getNcaIdInDetails());
+        var column = StringUtils.trimToNull(key.getNcaId());
+        var details = StringUtils.trimToNull(key.getNcaIdInDetails());
         if (column != null && details != null && !column.equals(details)) {
             throw new IllegalStateException("Key NCA ID does not match its stored details");
         }
