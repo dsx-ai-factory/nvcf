@@ -13,9 +13,14 @@ import (
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
@@ -357,5 +362,45 @@ func TestDriveTeardownDoesNotMarkAPodOfTheSameName(t *testing.T) {
 	}
 	if got.Annotations[webhook.TeardownExitedAnnotation] != "" {
 		t.Error("the exit report marked a different pod of the same name")
+	}
+}
+
+// A rank whose exit report the API server refuses (here, as invalid, with the
+// pod still the same) keeps its hold and tries again: its peers cannot see it
+// exited, so it must not leave before them.
+func TestDriveTeardownHoldsUntilTheExitIsReported(t *testing.T) {
+	root := t.TempDir()
+	old, oldPoll := cachedirPodsRoot, teardownPoll
+	cachedirPodsRoot, teardownPoll = root, 20*time.Millisecond
+	t.Cleanup(func() { cachedirPodsRoot, teardownPoll = old, oldPoll })
+
+	self := terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
+	peer := exitedRank(terminating(restoredRank(1, 2), time.Now().Add(time.Minute)))
+	kc := fake.NewSimpleClientset(self, peer)
+	patches := 0
+	kc.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		patches++
+		return true, nil, apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, self.Name,
+			field.ErrorList{field.TooLong(field.NewPath("metadata", "annotations"), "", 262144)})
+	})
+	c := &criuAutoRestorer{a: &Agent{kubeClient: kc, log: logrus.New()}}
+	dir := teardownWorkDir(self.UID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := armTeardownHold(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, webhook.TeardownExitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	c.driveTeardown(ctx, self, logrus.NewEntry(logrus.New()))
+	if !teardownHeld(dir) {
+		t.Error("the hold was lifted while the rank's exit was not reported")
+	}
+	if patches < 2 {
+		t.Errorf("the refused report was not tried again (%d tries)", patches)
 	}
 }

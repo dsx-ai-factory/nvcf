@@ -64,10 +64,11 @@ never makes teardown longer than the grace period allows.
 |------|---------|
 | A rank's agent is down, or never sees its rank exit | Its rank is never recorded; the other ranks are held to the end of their grace period, then killed, as without the hold |
 | An agent restarts during the teardown | The terminating pod is listed again and its release driven again; nothing is kept in memory |
+| A rank's agent is down from before its delete until its workload has exited | Accepted limit. The placeholder finds no hold and exits as without the barrier (`TestIdleWithoutAHoldExitsWithItsWorkload`); a hold armed later only waits for the pod to go. Holds are armed while ranks run, so this needs the agent down for the whole of a restored rank's life before its delete |
 | One rank is deleted, the others run on | It is held until they exit or its grace period ends |
 | The placeholder cannot see its container's processes | It neither reports its workload gone nor holds (`nvsnap-idle` exits as before) |
 | A process of the container could not be signaled and still runs | Not reported gone: the other ranks wait for this one, at worst to the end of their grace period |
-| The workload writes the files itself | It can only release its own pod early. The agent creates the hold without following a link, and only reads the report |
+| The workload writes the files itself | It can release its own pod early, and, by writing `teardown-exited` before it has exited, its peers too: only its own instance's ranks, which then tear down as without the hold. The agent creates the hold without following a link, and only reads the report |
 | An older placeholder, or an older agent | No hold is made or none is honoured: teardown is as before |
 
 The work volume is the pod's own, so a hold never outlives its pod or applies to another.

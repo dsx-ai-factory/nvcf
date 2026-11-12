@@ -143,6 +143,15 @@ func liftTeardownHold(dir string) error {
 	return nil
 }
 
+// podReplaced reports whether pod's name is gone or now names another pod.
+func (c *criuAutoRestorer) podReplaced(ctx context.Context, pod *corev1.Pod) bool {
+	cur, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return true
+	}
+	return err == nil && cur.UID != pod.UID
+}
+
 // considerTeardown holds a restored rank of this node: it arms the hold
 // the first time it sees the rank restored, and drives its release once it
 // terminates. A rank first seen already terminating (the agent started or
@@ -194,14 +203,17 @@ func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, l
 				pod.UID, annotationPath, time.Now().UTC().Format(time.RFC3339))
 			_, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
 			// Not found, or found under another UID (the test fails, 422): this
-			// rank's pod is gone, which its peers count as exited.
-			gone := apierrors.IsNotFound(err) || apierrors.IsInvalid(err)
+			// rank's pod is gone, which its peers count as exited. Any other
+			// invalid patch is retried.
+			gone := apierrors.IsNotFound(err) || (apierrors.IsInvalid(err) && c.podReplaced(ctx, pod))
 			reported = err == nil || gone
 			if err != nil && !gone {
 				log.WithError(err).Warn("group teardown: cannot report the rank's workload gone; trying again")
 			}
 		}
-		if exited {
+		// Lift only once the peers can see this rank exited: a failed report
+		// is tried again next tick, and holds the pod at worst to its deadline.
+		if exited && reported {
 			pods, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
 			if err == nil && teardownReleased(pod, pods.Items, true) {
 				if err := liftTeardownHold(dir); err != nil {
