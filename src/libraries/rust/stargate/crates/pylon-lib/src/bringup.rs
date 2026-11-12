@@ -1230,9 +1230,12 @@ mod tests {
             ..TestServerState::default()
         })
         .await;
-        let runtime_state = PylonRuntimeState::new(
+        let metrics = crate::PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, _observations) = PylonRuntimeState::observed(
             InferenceServerStatus::Active,
-            &["test-model".into(), "busy-model".into()],
+            &["test-model".to_string(), "busy-model".to_string()],
+            4096,
+            Some(metrics.clone()),
         );
         let stop = CancellationToken::new();
         let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
@@ -1266,6 +1269,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        let body = metrics.gather_text().expect("metrics should render");
+        assert!(
+            body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="timed_out_upstream_busy"} 0"#
+            ) && !body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="failed"} 0"#
+            ),
+            "a held demotion should record its timed-out recovery canary as failed"
+        );
 
         // The next recovery canary answers normally and restores the model.
         tokio::time::timeout(Duration::from_secs(3), async {
