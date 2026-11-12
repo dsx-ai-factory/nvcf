@@ -40,6 +40,12 @@ QUIC listener. Use `reverse` where pylon must dial a Stargate reverse listener.
 - Reverse-tunnel backends advertise upstream HTTP URL and set
   `reverse_tunnel=true`.
 - Stargate opens one fresh request stream per proxied request.
+- Each request holds its stream on every tunnel hop until it finishes. pylon's
+  reverse-tunnel connection and the router's upstream connection to Stargate
+  allow 16,384 concurrent streams; listeners keep the QUIC default of 100.
+- Upgrade pylon before `stargate-k8s-router` when either limit changes. A
+  router that accepts more streams than pylon holds requests at the router,
+  where routing no longer counts them.
 - `--direct-quic-connections` controls direct backend connection-set size and
   defaults to `1`.
 

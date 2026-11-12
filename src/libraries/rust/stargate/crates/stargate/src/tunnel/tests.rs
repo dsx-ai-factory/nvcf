@@ -575,14 +575,16 @@ fn start_tunnel_relay(
             let relay_endpoints = Arc::clone(&relay_endpoints);
             let peer = Arc::clone(&peer);
             tokio::spawn(async move {
+                // A failed handshake or relay surfaces as a failed request in the test.
                 let Ok(connection) = incoming.await else {
                     return;
                 };
-                let _ = stargate_forwarding::forward_quic_connection(
+                let _ = stargate_forwarding::forward_quic_connection_until_shutdown(
                     connection,
                     &peer,
                     &relay_endpoints,
                     Duration::from_secs(2),
+                    std::future::pending(),
                 )
                 .await;
             });

@@ -630,13 +630,9 @@ pub fn build_quic_server_config_from_pem(
 }
 
 fn quic_client_config(tls: rustls::ClientConfig) -> Result<ClientConfig> {
-    let mut config = ClientConfig::new(Arc::new(
+    Ok(ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    ));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_TUNNEL_STREAMS.into());
-    config.transport_config(Arc::new(transport));
-    Ok(config)
+    )))
 }
 
 #[derive(Debug)]
