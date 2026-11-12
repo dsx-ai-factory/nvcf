@@ -39,7 +39,10 @@ forwards each one to the pod that holds the request.
   8443 worker TLS listener (`invocation.workerTls`) when the proxy is enabled,
   unless `workerCallbackProxy.invocation.upstreamTls.enabled` is false.
 - Function workers that send `http://` callback targets as forward-proxy
-  requests (worker-utils 1.3.2 or later).
+  requests (worker-utils 1.3.2 or later). When Envoy's frontend certificate is
+  issued by the stack CA, HTTP callbacks also need worker-utils 1.4.0 or later,
+  the first release that trusts `NVCF_PROXY_CA_PEM` on that path. The stack's
+  `api` chart selects the worker-utils version.
 - No split-plane worker URLs: leave
   `global.workerEndpoints.invocationServiceURL`,
   `global.workerEndpoints.grpcProxyWorkerConnectURL`,
