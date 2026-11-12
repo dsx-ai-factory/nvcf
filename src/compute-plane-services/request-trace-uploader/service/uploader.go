@@ -72,8 +72,8 @@ type Options struct {
 	// HeaderCheckRecords overrides DefaultHeaderCheckRecords.
 	HeaderCheckRecords int
 	// Faults replaces the whole fault handling config, including the
-	// quarantine breaker settings from config.Config. Nil uses
-	// retry.DefaultConfig with those settings. Tests shorten its waits.
+	// fault settings from config.Config. Nil uses retry.DefaultConfig with
+	// those settings. Tests shorten its waits.
 	Faults *retry.Config
 	// Listener serves health instead of a listener on the configured
 	// address. Tests pass one bound to a free port.
@@ -118,6 +118,11 @@ type Uploader struct {
 	holder     string
 	point      func(string)
 	now        func() time.Time
+
+	// batchConfig is the batch config after the backend's limits, and
+	// batchLimits those limits.
+	batchConfig batch.Config
+	batchLimits batch.Limits
 
 	startOnce sync.Once
 	startErr  error
@@ -184,13 +189,12 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if cfg.ScanInterval < 0 || cfg.MaxJobAge < 0 {
 		return nil, errors.New("scan interval and max job age must not be negative")
 	}
-	faults := retry.DefaultConfig()
-	if cfg.QuarantineTrip != 0 {
-		faults.QuarantineTrip = cfg.QuarantineTrip
+	caps := client.Capabilities()
+	batchConfig, batchLimits, err := batchSettings(cfg, caps)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.QuarantineResume != 0 {
-		faults.QuarantineResume = cfg.QuarantineResume
-	}
+	faults := faultConfig(cfg)
 	if opts.Faults != nil {
 		faults = *opts.Faults
 	}
@@ -230,7 +234,9 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	return &Uploader{
 		cfg:          cfg,
 		client:       client,
-		caps:         client.Capabilities(),
+		caps:         caps,
+		batchConfig:  batchConfig,
+		batchLimits:  batchLimits,
 		name:         string(cfg.Backend),
 		preparer:     preparer,
 		factory:      factory,
@@ -437,20 +443,14 @@ func (u *Uploader) open(ctx context.Context) error {
 		return fmt.Errorf("discard transports prepared under another policy: %w", err)
 	}
 	u.cleaner = cleanup.New(cleanupJournal{store: store, point: u.point}, spoolIndex{dir: u.cfg.SourceDir}, cleanup.Options{Counter: counterFor(u.metrics)})
-	limits := batch.Limits{
-		Batching: u.caps.BatchFiles() > 1,
-		MaxBytes: u.caps.MaxBatchBytes,
-		MaxFiles: u.caps.BatchFiles(),
-	}
-	// The batch settings are defaults no operator sets, so lowering them to
-	// the backend's limits is expected and not worth a warning.
-	batchConfig, _ := batch.Resolve(batch.DefaultConfig(), limits)
-	u.batcher, err = batch.New(batchConfig, limits, batch.Options{Metrics: batchMetrics{u.metrics}})
+	u.batcher, err = batch.New(u.batchConfig, u.batchLimits, batch.Options{Metrics: batchMetrics{u.metrics}})
 	if err != nil {
 		return err
 	}
-	// Prepare-ahead must let a full batch form; the default already does.
-	guardConfig, _ := diskguard.DefaultConfig().Resolve(batchConfig.MaxSegments)
+	// Prepare-ahead must let a full batch form. It is raised to a batch
+	// size set above the default, which is expected and not worth a
+	// warning.
+	guardConfig, _ := diskguard.DefaultConfig().Resolve(u.batchConfig.MaxSegments)
 	volume := u.volume
 	if volume == nil {
 		volume = diskguard.StatVolume(u.cfg.SourceDir)
