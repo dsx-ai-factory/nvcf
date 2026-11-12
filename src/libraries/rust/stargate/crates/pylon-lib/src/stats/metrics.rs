@@ -638,11 +638,16 @@ pub(crate) enum CanaryPhase {
 impl CanaryPhase {
     const ALL: [Self; 2] = [Self::Active, Self::Recovery];
 
-    /// Results each phase can record; recovery canaries never skip and must pass.
+    /// Results each phase can record; recovery canaries never skip.
     fn results(self) -> &'static [CanaryResult] {
         match self {
             Self::Active => &CanaryResult::ALL,
-            Self::Recovery => &[CanaryResult::Passed, CanaryResult::Failed],
+            Self::Recovery => &[
+                CanaryResult::Passed,
+                CanaryResult::TimedOutUpstreamBusy,
+                CanaryResult::RejectedUpstreamBusy,
+                CanaryResult::Failed,
+            ],
         }
     }
 
@@ -662,15 +667,19 @@ pub(crate) enum CanaryResult {
     SkippedRecentProgress,
     /// The canary timed out while the upstream made progress on other requests.
     TimedOutUpstreamBusy,
+    /// The upstream rejected the canary as overloaded while it made progress
+    /// on other requests.
+    RejectedUpstreamBusy,
     /// The canary failed and counted against the model.
     Failed,
 }
 
 impl CanaryResult {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Passed,
         Self::SkippedRecentProgress,
         Self::TimedOutUpstreamBusy,
+        Self::RejectedUpstreamBusy,
         Self::Failed,
     ];
 
@@ -679,6 +688,7 @@ impl CanaryResult {
             Self::Passed => "passed",
             Self::SkippedRecentProgress => "skipped_recent_progress",
             Self::TimedOutUpstreamBusy => "timed_out_upstream_busy",
+            Self::RejectedUpstreamBusy => "rejected_upstream_busy",
             Self::Failed => "failed",
         }
     }
@@ -1194,14 +1204,16 @@ mod tests {
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="passed"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="skipped_recent_progress"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="timed_out_upstream_busy"} 1"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="active",result="rejected_upstream_busy"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="failed"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="passed"} 0"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="timed_out_upstream_busy"} 0"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="rejected_upstream_busy"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="failed"} 0"#,
             ],
         );
         assert!(
-            !body.contains(r#"phase="recovery",result="skipped_recent_progress""#)
-                && !body.contains(r#"phase="recovery",result="timed_out_upstream_busy""#),
+            !body.contains(r#"phase="recovery",result="skipped_recent_progress""#),
             "unreachable recovery results should not be pre-initialized"
         );
 
