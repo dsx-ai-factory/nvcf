@@ -1291,9 +1291,12 @@ mod tests {
             ..TestServerState::default()
         })
         .await;
-        let runtime_state = PylonRuntimeState::new(
+        let metrics = crate::PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, _observations) = PylonRuntimeState::observed(
             InferenceServerStatus::Active,
-            &["test-model".into(), "busy-model".into()],
+            &["test-model".to_string(), "busy-model".to_string()],
+            4096,
+            Some(metrics.clone()),
         );
         let stop = CancellationToken::new();
         let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
@@ -1313,7 +1316,7 @@ mod tests {
         wait_for_bringup_ready(&runtime_state, false).await;
 
         // Overload replies while another model serves must not restore a
-        // model demoted for a real failure.
+        // model demoted for a real failure, and they count as failures.
         canary_status.store(529, Ordering::SeqCst);
         let overloaded_from = canary_requests.load(Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1329,6 +1332,13 @@ mod tests {
         .await
         .expect("recovery canaries should keep running");
         assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(false));
+        let body = metrics.gather_text().expect("metrics should render");
+        assert!(
+            body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="rejected_upstream_busy"} 0"#
+            ),
+            "a held demotion should not record busy recovery results"
+        );
 
         canary_status.store(0, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(3), async {

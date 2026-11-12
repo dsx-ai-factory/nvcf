@@ -33,8 +33,8 @@ struct CanaryProbe<'a> {
     runtime_state: &'a PylonRuntimeState,
 }
 
-/// Names on one Pylon share its upstream, so output from other names' requests
-/// shows that a slow or rejected canary queued behind real work.
+/// Assumes the names on one Pylon share workers, as aliases of one model do, so
+/// output from any name shows that a slow or rejected canary queued behind real work.
 enum CanaryOutcome {
     Passed,
     /// The canary timed out while the upstream produced output for other
@@ -49,8 +49,9 @@ enum CanaryOutcome {
 }
 
 impl CanaryProbe<'_> {
-    /// Sends one canary and records its result.
-    async fn send(&self, phase: CanaryPhase) -> CanaryOutcome {
+    /// Sends one canary and records its result. Without `accept_busy`, a busy
+    /// timeout or overload is a failure.
+    async fn send(&self, phase: CanaryPhase, accept_busy: bool) -> CanaryOutcome {
         let started_at = Instant::now();
         let outcome = match send_canary_request(
             &self.http_client,
@@ -63,14 +64,17 @@ impl CanaryProbe<'_> {
         {
             Ok(()) => CanaryOutcome::Passed,
             Err(error)
-                if error.is_timeout()
+                if accept_busy
+                    && error.is_timeout()
                     && self.runtime_state.upstream_progressed_since(started_at) =>
             {
                 CanaryOutcome::TimedOutUpstreamBusy(error)
             }
             // An overload reply arrives at once, so look back one canary
             // timeout for output instead of only the time the canary took.
-            Err(error) if error.is_overloaded() && self.upstream_recently_progressed() => {
+            Err(error)
+                if accept_busy && error.is_overloaded() && self.upstream_recently_progressed() =>
+            {
                 CanaryOutcome::RejectedUpstreamBusy(error)
             }
             Err(error) => CanaryOutcome::Failed(error),
@@ -182,7 +186,7 @@ pub(crate) async fn run_bringup_task(
             }
 
             let Some(canary_outcome) = stop
-                .run_until_cancelled(probe.send(CanaryPhase::Recovery))
+                .run_until_cancelled(probe.send(CanaryPhase::Recovery, demoted_for_stall))
                 .await
             else {
                 return;
@@ -190,18 +194,14 @@ pub(crate) async fn run_bringup_task(
             match canary_outcome {
                 CanaryOutcome::Passed => {}
                 CanaryOutcome::TimedOutUpstreamBusy(error)
-                | CanaryOutcome::RejectedUpstreamBusy(error)
-                    if demoted_for_stall =>
-                {
+                | CanaryOutcome::RejectedUpstreamBusy(error) => {
                     tracing::info!(
                         model_id = generation.model_id(),
                         error = %error,
                         "bringup recovery canary found the upstream serving other requests; restoring model"
                     );
                 }
-                CanaryOutcome::TimedOutUpstreamBusy(error)
-                | CanaryOutcome::RejectedUpstreamBusy(error)
-                | CanaryOutcome::Failed(error) => {
+                CanaryOutcome::Failed(error) => {
                     tracing::warn!(
                         model_id = generation.model_id(),
                         error = %error,
@@ -246,7 +246,7 @@ async fn wait_for_active_canary_failure(
                     continue;
                 }
                 let canary_outcome = stop
-                    .run_until_cancelled(probe.send(CanaryPhase::Active))
+                    .run_until_cancelled(probe.send(CanaryPhase::Active, true))
                     .await?;
                 match canary_outcome {
                     CanaryOutcome::Passed => {}
