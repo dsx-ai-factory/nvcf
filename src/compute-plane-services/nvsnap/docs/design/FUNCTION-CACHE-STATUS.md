@@ -12,6 +12,7 @@ Status: built (`internal/fnstatus`, `internal/agent/record_identity.go`,
   - [2. The view](#2-the-view)
   - [3. Read access](#3-read-access)
   - [4. Before a deploy](#4-before-a-deploy)
+  - [5. History](#5-history)
 - [Why not](#why-not)
 - [Limits](#limits)
 - [Tests](#tests)
@@ -141,6 +142,102 @@ kept on uninstall (`helm.sh/resource-policy: keep`).
 An object answers for a version nvsnap has seen. A new version of a
 function has a new scope, so it starts cold and is captured on its own;
 until then it is not listed.
+
+### 5. History
+
+Status: built (`internal/fnstatus/history.go`,
+`internal/server/restore_history.go`, the webhook's `CRIUGroupLabel`).
+
+**Problem.** A read-only user can see what is cached and the last restore's
+time, but not how restores have gone over time.
+- The record keeps its last 10 restores, and loses them when the
+  configuration is captured again.
+- Scale-up (scheduled to Ready) and teardown times are kept nowhere a
+  `view` user can read:
+  - events expire within about an hour;
+  - the agents' summary lines go with each agent pod;
+  - the metrics need Prometheus access.
+
+**Design.** Each object keeps the version's last 50 restores in
+`status.history`, newest last, with running counts. nvsnap-server writes
+them; nothing new is written on the admission, capture or restore path.
+
+1. **The webhook labels group pods.** Every pod it admits into a CRIU group
+   gets the label `nvsnap.io/criu-group=<key>`, next to the annotation of
+   the same name. Restored pods already carry everything else on the pod:
+   - `nvsnap.io/criu-restored`: when the rank was restored;
+   - the `PodScheduled` and `Ready` conditions;
+   - `nvsnap.io/criu-teardown-exited`: when the rank's workload exited.
+2. **The server watches those pods.** A pod informer selects on the label,
+   so the server holds only group pods, not the cluster's. It follows the
+   GPU ranks that restore (`nvsnap.io/criu-restore`); companions are not
+   ranks. A restore is one instance's: the instances of a namespace are
+   told apart as the agent tells them (the Grove scaling group replica,
+   else the LeaderWorkerSet group, else the controller). Its ranks' pods
+   are created within two minutes of each other, unless every pod of the
+   earlier restore had gone first; it is dated by its first pod's
+   creation. A rank replaced during the restore counts once, as its newest
+   pod. An entry is updated as its pods change:
+   - **every rank is Ready**: it records `scaleUpSeconds`, the last rank's
+     Ready less the first rank's PodScheduled;
+   - **every rank is deleted before that** (it failed and was replaced, or
+     was scaled down), or its pods are all gone: the outcome is `gone`;
+   - **a rank's restore failed and it started cold in place**: the outcome
+     is `cold-started`, with no times;
+   - **a restored instance of more than one rank is deleted**: once every
+     rank's workload has exited, `teardown` is `released` with
+     `teardownSeconds`, the last exit less the first delete request; a
+     rank whose pod went without its exit recorded makes it `killed`,
+     untimed. A pod whose delete the watch saw only as its last known
+     state gives no verdict. A lone rank has no teardown barrier and
+     records no exit, so it has no teardown.
+3. **The server merges into the object.** On each pass it reads the
+   object's current `history` and adds the entries it finished. Each entry
+   is the same restore as one kept of the same namespace, key and instance
+   dated within two minutes of it, so a server restart that no longer sees
+   a restore's first pod does not add it again. Once 50 are kept, a
+   restore older than the oldest is not added. The record's restore time
+   (`restoreSeconds`: of the record's stamps, the one closest to the last
+   rank's restore, within two minutes; every instance of a configuration
+   shares the record) and the bundle that took the capture
+   (`capturedBy`) are copied from the record. A restore is forgotten once
+   its pods are gone and its object has been written with it; nothing is
+   merged before the watch has listed the pods.
+   History survives a recapture, because the object is per version. It is
+   dropped when the object is deleted, with the version's last record.
+4. **Running counts and new columns.** `status.restoreCount`,
+   `status.goneCount` and `status.killedTeardowns` count every restore the
+   history has had. `status.p50RestoreSeconds`, `p50ScaleUpSeconds` and
+   `p50TeardownSeconds` are over the kept ones. `kubectl get
+   nvsnapfunctions` gains `RESTORES`, `GONE`, `P50-SCALEUP-S` and
+   `P50-TEARDOWN-S` (and `KILLED` with `-o wide`).
+
+An entry, about 150 bytes, so about 8 KB per object:
+
+```yaml
+- at: "2026-11-12T17:54:00Z"   # its first pod's creation
+  namespace: <ns>
+  key: a580456be494755f
+  instance: nvsnap-repro-0-vllmworker/0
+  ranks: 4
+  outcome: restored        # restoring, restored, gone, cold-started
+  restoredAt: "2026-11-12T17:57:29Z"
+  restoreSeconds: 144
+  scaleUpSeconds: 168
+  teardownSeconds: 105     # once the instance is deleted
+  teardown: released       # released, killed
+  capturedBy: v0.2.91-rc9
+```
+
+**Limits.**
+- Pods admitted before the label existed are not watched.
+- A rank replaced more than two minutes into its restore starts an entry
+  of its own.
+- A restore that starts and ends while the server is down, or whose pods
+  are all deleted then, is missed or left `restoring`.
+- History is per cluster.
+- The metrics stay the source for fleet-wide trends and alerts. History
+  is for one function version, read with kubectl.
 
 ## Why not
 

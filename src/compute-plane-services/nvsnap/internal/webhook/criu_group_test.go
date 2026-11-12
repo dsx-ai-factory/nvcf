@@ -59,6 +59,11 @@ func TestCRIUGroupRestore_EachRankRestoresItsCheckpoint(t *testing.T) {
 		if a[CRIURestoreAnnotation] != want || a[CRIUGroupOrdinalAnnotation] != []string{"0", "1"}[i] || a[CRIUGroupSizeAnnotation] != "2" || a[CRIUGroupAnnotation] != *asked {
 			t.Fatalf("rank %d annotations: %v", i, a)
 		}
+		// Labelled too, for nvsnap-server's watch of a restore's pods; the
+		// pod's own labels are kept.
+		if got.Labels[CRIUGroupLabel] != *asked || len(got.Labels) != len(pod.Labels)+1 {
+			t.Fatalf("rank %d labels: %v (pod's own: %v)", i, got.Labels, pod.Labels)
+		}
 		if c := got.Spec.Containers[0]; !reflect.DeepEqual(c.Command, []string{IdleBin}) || (len(c.Args) > 0 && c.Args[0] != "--cold-start") {
 			t.Errorf("rank %d engine not idled: %v %v", i, c.Command, c.Args)
 		}

@@ -72,7 +72,15 @@ Everything below takes `kubectl` alone.
    agents. A rank's teardown logs `group teardown:` lines with
    `teardownSeconds`.
 
-5. **Where the time went, across many.** The dashboard
+5. **The function version's history.** Its last 50 restores, with their
+   restore, scale-up and teardown times, outlive the pods:
+
+   ```bash
+   kubectl get nvsnapfunctions                               # RESTORES, GONE, P50-SCALEUP-S, P50-TEARDOWN-S
+   kubectl get nvsnapfunction <function-version-id> -o jsonpath='{range .status.history[*]}{.at} {.outcome} restore={.restoreSeconds} scaleup={.scaleUpSeconds} teardown={.teardown}/{.teardownSeconds}{"\n"}{end}'
+   ```
+
+6. **Where the time went, across many.** The dashboard
    (`deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`) has
    scale-up, restore phases, teardown and the cached captures per cluster.
 

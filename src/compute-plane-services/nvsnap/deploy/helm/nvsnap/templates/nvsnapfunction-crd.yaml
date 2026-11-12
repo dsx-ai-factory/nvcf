@@ -62,6 +62,25 @@ spec:
         - name: Last-Restore-S
           type: number
           jsonPath: .status.lastRestoreSeconds
+        # The restore history (status.history, the last 50 restores) and
+        # its counts: restores followed, and those that went before every
+        # rank was Ready.
+        - name: Restores
+          type: integer
+          jsonPath: .status.restoreCount
+        - name: Gone
+          type: integer
+          jsonPath: .status.goneCount
+        - name: P50-ScaleUp-S
+          type: number
+          jsonPath: .status.p50ScaleUpSeconds
+        - name: P50-Teardown-S
+          type: number
+          jsonPath: .status.p50TeardownSeconds
+        - name: Killed
+          type: integer
+          jsonPath: .status.killedTeardowns
+          priority: 1
         - name: Reason
           type: string
           jsonPath: .status.reason

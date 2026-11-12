@@ -239,6 +239,15 @@ kubectl get nvsnapfunctions -l nvsnap.io/function-id=<id>
 kubectl get nvsnapfunction <function-version-id> -o yaml   # every configuration, its nodes and restores
 ```
 
+`kubectl get nvsnapfunctions` also shows each version's restore history
+([design](../design/FUNCTION-CACHE-STATUS.md#5-history)), kept by
+nvsnap-server from the restores' pods: `RESTORES` and `GONE` (deleted
+before every rank was Ready) counted over the version's life,
+`P50-SCALEUP-S` (first rank scheduled to last Ready) and `P50-TEARDOWN-S`
+over its last 50 restores, each in `status.history` with its restore,
+scale-up and teardown times. It is readable with `view`, and outlives
+the pods, the events and the agents' logs.
+
 `METHOD` is how the version's next pod starts: `criu` (restored), `cachedir`
 (seeded caches after CRIU failed), or empty (cold). A version that is not
 listed starts cold.
