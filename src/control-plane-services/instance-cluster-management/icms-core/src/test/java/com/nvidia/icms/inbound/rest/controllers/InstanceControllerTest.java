@@ -82,6 +82,7 @@ import com.nvidia.icms.service.InstanceService;
 import com.nvidia.icms.uec.IcmsHttpUnifiedErrorException;
 import com.nvidia.icms.util.JwtKeyUtils;
 import com.nvidia.icms.util.TestUtil;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -941,6 +942,45 @@ class InstanceControllerTest extends IntegrationTest {
                 .andExpect(status().isAccepted()).andReturn().getResponse();
         String jsonString = objectMapper.writeValueAsString(createResponse);
         assertThat(jsonString).isEqualTo(response.getContentAsString());
+    }
+
+    @Test
+    void requestInstances_withFunctionTerminationGracePeriod_passesItToTheService()
+            throws Exception {
+
+        UUID requestId = UUID.randomUUID();
+        HttpHeaders httpHeaders = generateAuthorizationHeader();
+        var createResponse = new CreateSpotInstancesResponse(requestId);
+
+        SpotInstanceRequestSchema instanceRequestSchema = createDefaultInstanceRequestSchema();
+        instanceRequestSchema.setFunctionType(FunctionType.LLM);
+        instanceRequestSchema.setFunctionTerminationGracePeriodDuration(Duration.ofMinutes(10));
+
+        doReturn(createResponse).when(instanceService).requestInstances(eq(DUMMY_CUSTOMER_1),
+                                                                        eq(instanceRequestSchema),
+                                                                        Mockito.any());
+        mockMvc.perform(
+                        MockMvcRequestBuilders.post(PUBLIC_SIS_ENDPOINT)
+                                .headers(httpHeaders)
+                                .param(ACTION, REQUEST_SPOT_INSTANCES.getRequestAction())
+                                .param(INSTANCE_COUNT_KEY, "1")
+                                .param(LAUNCH_SPECIFICATION_INSTANCE_TYPE_KEY, DUMMY_NON_BYOC_INSTANCE_TYPE)
+                                .param(LAUNCH_SPECIFICATION_CONTAINER_IMAGE_KEY, DUMMY_CONTAINER_IMAGE)
+                                .param("LaunchSpecification.Environment", DUMMY_ENVIRONMENT_VALUE)
+                                .param("LaunchSpecification.Placement.AvailabilityZone", "availabilityZone")
+                                .param("LaunchSpecification.Backend", "backend")
+                                .param("LaunchSpecification.Gpu", "gpu")
+                                .param("LaunchSpecification.NcaId", "ncaId")
+                                .param("LaunchSpecification.CacheArtifacts", "true")
+                                .param("LaunchSpecification.CacheHandle", "cachingHandle")
+                                .param("FunctionDetails.FunctionName", "functionName")
+                                .param("FunctionDetails.FunctionType", FunctionType.LLM.name())
+                                .param("FunctionDetails.TerminationGracePeriodDuration", "PT10M"))
+                .andExpect(status().isAccepted());
+
+        verify(instanceService).requestInstances(eq(DUMMY_CUSTOMER_1),
+                                                 eq(instanceRequestSchema),
+                                                 Mockito.any());
     }
 
     //**************************************************
