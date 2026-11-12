@@ -66,10 +66,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(nvsnap_restore_outcomes_total, gpu)",
+          "query": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, gpu)",
           "refId": "gpu"
         },
-        "definition": "label_values(nvsnap_restore_outcomes_total, gpu)",
+        "definition": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, gpu)",
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
@@ -95,10 +95,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(nvsnap_restore_outcomes_total, ranks)",
+          "query": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, ranks)",
           "refId": "ranks"
         },
-        "definition": "label_values(nvsnap_restore_outcomes_total, ranks)",
+        "definition": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, ranks)",
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
@@ -806,6 +806,7 @@
         },
         "overrides": []
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",
@@ -872,6 +873,7 @@
         },
         "overrides": []
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",
@@ -995,7 +997,7 @@
     {
       "type": "timeseries",
       "title": "Checkpoint fetch to a node",
-      "description": "p50 time by where the bytes came from, and failed fetches. A checkpoint already on the node is no fetch.",
+      "description": "p50 time by where the bytes came from (left axis), and failed fetches (bars, right axis). A checkpoint already on the node is no fetch.",
       "id": 19,
       "datasource": {
         "type": "prometheus",
@@ -1011,8 +1013,42 @@
         "defaults": {
           "unit": "s"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "failed fetches"
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "bars"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 60
+              }
+            ]
+          }
+        ]
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",
@@ -1144,6 +1180,7 @@
         },
         "overrides": []
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",
@@ -1210,6 +1247,7 @@
         },
         "overrides": []
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",
@@ -1870,6 +1908,7 @@
         },
         "overrides": []
       },
+      "interval": "2m",
       "options": {
         "legend": {
           "displayMode": "table",

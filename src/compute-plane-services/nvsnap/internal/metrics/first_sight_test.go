@@ -4,6 +4,8 @@
 package metrics
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strconv"
@@ -141,5 +143,123 @@ func TestObservePodStartAndTeardown(t *testing.T) {
 	}
 	if got := timed() - t0; got != 1 {
 		t.Fatalf("teardown times +%d, want only the released one's", got)
+	}
+}
+
+// A held series is released once every regular scraper has scraped since
+// it was created: about one scrape interval, not the whole hold.
+func TestFirstSightReleasesOnceEveryScraperReadTheZero(t *testing.T) {
+	s := newFakeSight(2 * time.Minute)
+	c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total"}, []string{"outcome"})
+	inc := func() {
+		s.observe("c", []string{"failed"}, func() { c.WithLabelValues("failed") }, func() { c.WithLabelValues("failed").Inc() })
+	}
+	scrape := func(from string) { s.scraped(from, s.clock) }
+	// Two Prometheus replicas scraping every 30 s, and a person's curl once.
+	scrape("10.0.0.1")
+	scrape("10.0.0.2")
+	s.advance(30 * time.Second)
+	scrape("10.0.0.1")
+	scrape("10.0.0.2")
+	scrape("127.0.0.1")
+
+	s.advance(time.Second)
+	inc()
+	// A scrape that began before the series existed did not read its zero.
+	s.scraped("10.0.0.1", s.clock.Add(-time.Second))
+	s.scraped("10.0.0.2", s.clock.Add(-time.Second))
+	if v := value(t, c, "failed"); v != 0 {
+		t.Fatalf("released by scrapes that began before the series was created (%v)", v)
+	}
+	s.advance(10 * time.Second)
+	scrape("10.0.0.1")
+	inc()
+	if v := value(t, c, "failed"); v != 0 {
+		t.Fatalf("released before the second replica read the zero (%v)", v)
+	}
+	s.advance(10 * time.Second)
+	scrape("10.0.0.2")
+	if v := value(t, c, "failed"); v != 2 {
+		t.Fatalf("after every replica read the zero the series is %v, want both observations (2)", v)
+	}
+	inc()
+	if v := value(t, c, "failed"); v != 3 {
+		t.Fatalf("an observation after the release is %v, want it applied at once (3)", v)
+	}
+	// The hold's timer, firing later, applies nothing twice.
+	s.advance(3 * time.Minute)
+	if v := value(t, c, "failed"); v != 3 {
+		t.Fatalf("the hold's end re-applied observations (%v)", v)
+	}
+}
+
+// A one-off read releases nothing; with no regular scraper the hold's end
+// releases the series; a scraper that went away stops counting.
+func TestFirstSightIgnoresOneOffAndGoneScrapers(t *testing.T) {
+	s := newFakeSight(2 * time.Minute)
+	c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total"}, []string{"outcome"})
+	inc := func(o string) {
+		s.observe("c", []string{o}, func() { c.WithLabelValues(o) }, func() { c.WithLabelValues(o).Inc() })
+	}
+	inc("a")
+	s.advance(time.Second)
+	s.scraped("127.0.0.1", s.clock)
+	if v := value(t, c, "a"); v != 0 {
+		t.Fatalf("a one-off read released the series (%v)", v)
+	}
+	s.advance(2 * time.Minute)
+	if v := value(t, c, "a"); v != 1 {
+		t.Fatalf("with no regular scraper the hold's end left the series at %v, want 1", v)
+	}
+
+	// A regular scraper that stops: once its last scrape is older than the
+	// hold, the remaining one alone releases.
+	s.scraped("10.0.0.1", s.clock)
+	s.scraped("10.0.0.2", s.clock)
+	s.advance(30 * time.Second)
+	s.scraped("10.0.0.1", s.clock)
+	s.scraped("10.0.0.2", s.clock)
+	for range 4 {
+		s.advance(30 * time.Second)
+		s.scraped("10.0.0.1", s.clock)
+	}
+	s.advance(time.Second)
+	inc("b")
+	s.advance(time.Second)
+	s.scraped("10.0.0.1", s.clock)
+	if v := value(t, c, "b"); v != 1 {
+		t.Fatalf("a scraper gone for more than the hold still held the series (%v)", v)
+	}
+}
+
+// The /metrics handler counts a scrape served whole, by client address.
+func TestScrapedCountsServedScrapes(t *testing.T) {
+	s := newFakeSight(2 * time.Minute)
+	old := sight
+	sight = s.firstSight
+	t.Cleanup(func() { sight = old })
+	c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total"}, []string{"outcome"})
+	status := http.StatusOK
+	h := Scraped(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+	get := func(from string) {
+		r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		r.RemoteAddr = from
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+	get("10.0.0.1:41000")
+	s.advance(30 * time.Second)
+	get("10.0.0.1:41002") // another port, the same scraper
+	s.advance(time.Second)
+	s.observe("c", []string{"x"}, func() { c.WithLabelValues("x") }, func() { c.WithLabelValues("x").Inc() })
+	s.advance(time.Second)
+	status = http.StatusInternalServerError
+	get("10.0.0.1:41004")
+	if v := value(t, c, "x"); v != 0 {
+		t.Fatalf("a failed scrape released the series (%v)", v)
+	}
+	status = http.StatusOK
+	get("10.0.0.1:41006")
+	if v := value(t, c, "x"); v != 1 {
+		t.Fatalf("a served scrape after creation left the series at %v, want 1", v)
 	}
 }

@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,6 +186,32 @@ func TestDriveTeardownRecordsItsOutcome(t *testing.T) {
 		t.Fatalf("a rank first driven past its deadline was counted (+%v, want +2)", got)
 	}
 
+	// A lift that fails is tried again: once it succeeds, released, and
+	// not a deadline, though the grace period has not run out.
+	self = terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
+	self.UID = "lift-retried-0"
+	peer = exitedRank(terminating(restoredRank(1, 2), time.Now().Add(time.Minute)))
+	c = &criuAutoRestorer{a: &Agent{kubeClient: fake.NewSimpleClientset(self, peer), log: logrus.New()}}
+	dir = arm(self, true)
+	fails := 2
+	liftHold = func(d string) error {
+		if fails > 0 {
+			fails--
+			return errors.New("injected: cannot remove the hold")
+		}
+		return liftTeardownHold(d)
+	}
+	t.Cleanup(func() { liftHold = liftTeardownHold })
+	c.driveTeardown(t.Context(), self, logrus.NewEntry(quietLog()))
+	liftHold = liftTeardownHold
+	if fails != 0 || teardownHeld(dir) {
+		t.Fatalf("the lift was not tried again until it succeeded (%d failures left, held %v)", fails, teardownHeld(dir))
+	}
+	if outcome(metrics.TeardownReleased)-released != 2 || outcome(metrics.TeardownDeadline)-deadline != 2 {
+		t.Fatalf("a lift that failed then succeeded: released +%v (want +2), deadline +%v (want +2)",
+			outcome(metrics.TeardownReleased)-released, outcome(metrics.TeardownDeadline)-deadline)
+	}
+
 	// The agent stopping is neither.
 	self = terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
 	self.UID = "stopped-0"
@@ -193,7 +220,7 @@ func TestDriveTeardownRecordsItsOutcome(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	c.driveTeardown(ctx, self, logrus.NewEntry(quietLog()))
-	if outcome(metrics.TeardownReleased)-released != 1 || outcome(metrics.TeardownDeadline)-deadline != 2 {
+	if outcome(metrics.TeardownReleased)-released != 2 || outcome(metrics.TeardownDeadline)-deadline != 2 {
 		t.Fatal("a teardown the agent stopped driving was counted")
 	}
 }

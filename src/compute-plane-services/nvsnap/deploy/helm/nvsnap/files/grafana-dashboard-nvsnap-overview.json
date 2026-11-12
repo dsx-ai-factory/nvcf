@@ -205,7 +205,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "NvSnap operations in flight",
-      "description": "Checkpoint and restore operations the agents are running now (nvsnap_active_operations).",
+      "description": "Checkpoint and restore operations the agents are running now (nvsnap_active_operations): API calls, the instance captures each agent leads (one per instance, not one per rank), rank fallback captures, and automatic restores (one per pod).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "targets": [

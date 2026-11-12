@@ -78,11 +78,17 @@ created it: a counter first scraped at 1 has no 0 before it. On a cluster
 where a node captures or restores a few times a day, that would be most
 events, each node's first failure among them. So the agent creates a
 series at zero on its first observation and holds that observation, and any
-other made meanwhile, for two minutes, until Prometheus has scraped the zero
-(`internal/metrics/first_sight.go`). A series appears up to two minutes
-after its first event; an agent that stops within those two minutes loses
-the held observations. The chart refuses a scrape interval over 40 seconds,
-which the hold could not cover.
+other made meanwhile, until Prometheus has scraped the zero
+(`firstSight.observe` in `internal/metrics/first_sight.go`). The agent's
+`/metrics` handler (`metrics.Scraped`) tells it when: the held
+observations apply once every scraper seen scraping regularly (twice, the
+last within two minutes) has scraped since the series was created, about
+one scrape interval (`firstSight.scraped`). A one-off read, such as a
+`curl`, does not count. With no regular scraper, the hold ends after two
+minutes (`FirstSightHold`). An agent that stops while observations are held
+loses them, as it loses any increase no scrape has read yet. The chart
+refuses a scrape interval over 40 seconds, which the two minutes could not
+cover (`templates/agent-servicemonitor.yaml`).
 
 What is measured:
 
@@ -133,7 +139,10 @@ What is measured:
 - **Cached captures**: one agent of the cluster, the holder of the
   `nvsnap-capture-inventory` Lease in the records' namespace
   (`nvsnap_inventory_leader` 1), scans the capture records every minute
-  (`internal/agent/capture_inventory.go`). `capture_records` counts them by
+  (`internal/agent/capture_inventory.go`: `startCaptureInventory` runs the
+  Lease election, `scanCaptureRecords` and `tallyCaptureRecords` the scan,
+  `captureInventory.export` the series; a leader that loses the Lease
+  clears them, `captureInventory.clear`). `capture_records` counts them by
   `state` and the agent `bundle` that captured them: `complete` (verified;
   restores use it), `verifying`, `abandoned` (still `verifying` in the
   record, but its namespace went first), `failed`, `gpushare-failed`,

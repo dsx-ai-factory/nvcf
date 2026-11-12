@@ -94,8 +94,16 @@ fire.
   `kubectl get servicemonitor -A | grep nvsnap-agent`, then compare its
   namespace and labels with the Prometheus's `serviceMonitorSelector` and
   `serviceMonitorNamespaceSelector` ([METRICS.md](METRICS.md#install)).
-- Can Prometheus reach an agent? Its `/metrics` is on port 8081:
-  `kubectl -n nvsnap-system port-forward <agent> 8081 & curl -s localhost:8081/metrics | grep nvsnap_build_info`
+- Can Prometheus reach an agent? Its targets page (`/targets`, or
+  `/api/v1/targets?state=active` filtered on `job="nvsnap-agent"`) shows
+  each agent target's last scrape and its error. A target with an error
+  but an agent that serves metrics is a network path or a NetworkPolicy
+  between Prometheus and the agents.
+- Does an agent serve metrics? Its `/metrics` is on port 8081. This goes
+  through the API server, so it does not show that Prometheus can reach it:
+  `kubectl -n nvsnap-system port-forward <agent> 8081`, and once it prints
+  `Forwarding from`, in another shell
+  `curl -s localhost:8081/metrics | grep nvsnap_build_info`.
 
 ## NvsnapAgentDown
 
@@ -198,7 +206,8 @@ failed for 10 minutes. Only the cached-capture panels are affected.
   `kubectl -n nvsnap-system logs <agent> | grep 'capture inventory'`.
 - No Lease, or one held by a node with no agent: the agents' RBAC must let
   them get, create and update Leases in the capture records' namespace
-  (`nvsnap-system` by default).
+  (`nvsnap-system` by default; `templates/agent-rbac.yaml`, checked by
+  `TestAgentRBACCoversTheInventoryLease`).
 
 ## NvsnapCaptureStuckVerifying
 

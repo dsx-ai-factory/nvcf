@@ -1040,6 +1040,7 @@ func recordOf(d map[string]string, id string) bool {
 // are replaced by a restore instead (captureGroup). stopped reports that
 // a failed capture got as far as stopping the instance.
 func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, companions []*corev1.Pod, companionContainers map[string]string, log *logrus.Entry) (results []*CheckpointResult, stopped bool, err error) {
+	defer metrics.Active("checkpoint")()
 	capture := time.Now().UTC().Format("20060102T150405.000000000")
 	reqs := make([]CheckpointRequest, 0, len(ranks)+len(companions))
 	for _, p := range ranks {

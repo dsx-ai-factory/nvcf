@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/rootfsonly"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -536,6 +537,7 @@ func (c *criuAutoRestorer) considerFallbackCapture(ctx context.Context, pod *cor
 // captureFallbackRank captures the pod's rank. again reports a capture
 // that may succeed on a later event (the tree was still changing).
 func (c *criuAutoRestorer) captureFallbackRank(ctx context.Context, pod *corev1.Pod) (again bool, err error) {
+	defer metrics.Active("checkpoint")()
 	key, ordinal, err := c.a.podFallbackKey(ctx, pod)
 	if err != nil {
 		return false, err

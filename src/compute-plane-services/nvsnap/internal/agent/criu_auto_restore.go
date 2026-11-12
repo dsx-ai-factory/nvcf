@@ -254,6 +254,7 @@ func (c *criuAutoRestorer) prefetch(ctx context.Context, pod *corev1.Pod) {
 }
 
 func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid types.UID, id, container, groupKey string) {
+	defer metrics.Active("restore")()
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": ns + "/" + pod, "checkpoint": id, "container": container})
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)

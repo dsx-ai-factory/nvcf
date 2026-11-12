@@ -28,7 +28,14 @@ def tgt(expr, legend, ref="A", instant=False):
         t["instant"] = True
     return t
 
-def ts(title, desc, targets, x, w=12, h=8, unit=None, stack=False, bars=False):
+# Count panels draw one bar per step: increase() over $__interval, so the
+# bars add up to the events. MIN_STEP keeps each window at least four 30 s
+# scrapes wide, where $__interval would otherwise shrink below two and
+# return nothing; $__rate_interval would overlap the windows and count an
+# event in more than one bar.
+MIN_STEP = "2m"
+
+def ts(title, desc, targets, x, w=12, h=8, unit=None, stack=False, bars=False, overrides=None, min_step=False):
     d = {"unit": unit} if unit else {}
     custom = {}
     if stack:
@@ -39,7 +46,8 @@ def ts(title, desc, targets, x, w=12, h=8, unit=None, stack=False, bars=False):
         d["custom"] = custom
     panels.append({"type": "timeseries", "title": title, "description": desc, "id": nid(), "datasource": DS,
                    "gridPos": {"h": h, "w": w, "x": x, "y": y[0]},
-                   "fieldConfig": {"defaults": d, "overrides": []},
+                   "fieldConfig": {"defaults": d, "overrides": overrides or []},
+                   **({"interval": MIN_STEP} if bars or min_step else {}),
                    "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max", "lastNotNull"]},
                                "tooltip": {"mode": "multi"}},
                    "targets": targets})
@@ -85,9 +93,13 @@ ts("Restore outcomes", "restored; failed (ran and failed); not-run (could not ru
 ts("Restore phases, p50", "criu: process restore; gpu: GPU state reload and resume; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.", [tgt(q(0.5, "nvsnap_restore_phase_seconds", "phase", 'method="criu", ' + G), "{{phase}}")], 12, unit="s")
 y[0] += 8
 ts("Restore phases, p95", "As p50, the slowest 5%.", [tgt(q(0.95, "nvsnap_restore_phase_seconds", "phase", 'method="criu", ' + G), "{{phase}}")], 0, unit="s")
-ts("Checkpoint fetch to a node", "p50 time by where the bytes came from, and failed fetches. A checkpoint already on the node is no fetch.",
+ts("Checkpoint fetch to a node", "p50 time by where the bytes came from (left axis), and failed fetches (bars, right axis). A checkpoint already on the node is no fetch.",
    [tgt(q(0.5, "nvsnap_restore_fetch_seconds", "source", C), "p50 {{source}}"),
-    tgt(f'sum by (source) (increase(nvsnap_restore_fetches_total{{result="failed", {C}}}[$__interval]))', "failed {{source}}", "B")], 12, unit="s")
+    tgt(f'sum by (source) (increase(nvsnap_restore_fetches_total{{result="failed", {C}}}[$__interval]))', "failed {{source}}", "B")], 12, unit="s",
+   overrides=[{"matcher": {"id": "byFrameRefID", "options": "B"},
+               "properties": [{"id": "unit", "value": "short"}, {"id": "decimals", "value": 0},
+                              {"id": "custom.axisPlacement", "value": "right"}, {"id": "custom.axisLabel", "value": "failed fetches"},
+                              {"id": "custom.drawStyle", "value": "bars"}, {"id": "custom.fillOpacity", "value": 60}]}], min_step=True)
 y[0] += 8
 
 row("Teardown of restored instances")
@@ -136,8 +148,11 @@ dash = {
     "templating": {"list": [
         {"type": "datasource", "name": "datasource", "label": "Prometheus", "query": "prometheus", "current": {}, "hide": 0},
         var("cluster", "Cluster", 'label_values(nvsnap_build_info, cluster)'),
-        var("gpu", "GPU", 'label_values(nvsnap_restore_outcomes_total, gpu)'),
-        var("ranks", "Ranks", 'label_values(nvsnap_restore_outcomes_total, ranks)'),
+        # Every lifecycle series a GPU product or rank count occurs in: a
+        # series exists only once its event has, so restores alone would
+        # leave out a product that has only captured or cold-started.
+        var("gpu", "GPU", 'label_values({__name__=~"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count"}, gpu)'),
+        var("ranks", "Ranks", 'label_values({__name__=~"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count"}, ranks)'),
     ]},
     "panels": panels,
 }
