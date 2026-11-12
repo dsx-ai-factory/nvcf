@@ -19,6 +19,7 @@ package worker
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"nvcf-grpc-proxy/proxy/metrics"
 	"nvcf-grpc-proxy/proxy/pool"
 	"nvcf-grpc-proxy/proxy/rp"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -232,6 +234,10 @@ func (w *WorkerConnection) SetConnection(conn net.Conn) error {
 		// worker goes, which would record client_closed. Record the worker as
 		// the cause first, when a read or write shows it is gone.
 		wrapped.onPeerGone = func() {
+			// Copy the error before signalling the tunnel: client cleanup can
+			// evict this connection before onClose runs, and the eviction log
+			// would otherwise report no close error.
+			w.SetCloseError(wrapped.FirstError())
 			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
 			w.MarkClosed(time.Now())
 			w.endTunnel()
@@ -364,6 +370,13 @@ func (c *CloseFuncConn) Read(b []byte) (int, error) {
 
 func (c *CloseFuncConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
+	// A write deadline hit after partial progress is not worker loss: the
+	// HTTP/2 transport (writeWithByteTimeout) keeps writing the remainder with
+	// a fresh deadline. Only a timeout with no progress, or any other error,
+	// is terminal.
+	if n > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+		return n, err
+	}
 	c.recordErr(err)
 	return n, err
 }

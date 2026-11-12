@@ -231,6 +231,8 @@ type stubConn struct {
 	writeErrs []error
 	n         int
 	w         int
+	// writeN is the byte count reported alongside each scripted write error.
+	writeN int
 }
 
 func (s *stubConn) Read([]byte) (int, error) {
@@ -246,7 +248,7 @@ func (s *stubConn) Write(b []byte) (int, error) {
 	if s.w < len(s.writeErrs) {
 		err := s.writeErrs[s.w]
 		s.w++
-		return 0, err
+		return s.writeN, err
 	}
 	return len(b), nil
 }
@@ -441,5 +443,42 @@ func TestDetailOmitsEmptyPeerFields(t *testing.T) {
 				t.Errorf("detail = %q, want it to omit %q", got, tc.wantAbsent)
 			}
 		})
+	}
+}
+
+// A write deadline hit after partial progress is retried by the HTTP/2
+// transport, so it must not be reported as the worker being gone.
+func TestCloseFuncConnPartialWriteTimeoutIsNotWorkerLoss(t *testing.T) {
+	gone := 0
+	fc := &CloseFuncConn{
+		Conn:       &stubConn{writeErrs: []error{os.ErrDeadlineExceeded}, writeN: 3},
+		onClose:    func() {},
+		onPeerGone: func() { gone++ },
+	}
+
+	if n, err := fc.Write([]byte("abcdef")); n != 3 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write() = (%d, %v), want (3, deadline exceeded) passed through", n, err)
+	}
+	if gone != 0 {
+		t.Errorf("onPeerGone ran %d times for a retryable partial write", gone)
+	}
+	if fc.FirstError() != nil {
+		t.Errorf("FirstError() = %v, want nil for a retryable partial write", fc.FirstError())
+	}
+}
+
+// A deadline hit with no progress is terminal: that is the worker not answering.
+func TestCloseFuncConnZeroProgressWriteTimeoutIsWorkerLoss(t *testing.T) {
+	gone := 0
+	fc := &CloseFuncConn{
+		Conn:       &stubConn{writeErrs: []error{os.ErrDeadlineExceeded}},
+		onClose:    func() {},
+		onPeerGone: func() { gone++ },
+	}
+
+	_, _ = fc.Write([]byte("abcdef"))
+
+	if gone != 1 {
+		t.Errorf("onPeerGone ran %d times, want 1 for a write that made no progress", gone)
 	}
 }
