@@ -21,7 +21,9 @@ use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
-use stargate_forwarding::{HostnameMatcher, RelayEndpointConfig, build_relay_transport_config};
+use stargate_forwarding::{
+    HostnameMatcher, RelayEndpointConfig, build_relay_client_transport_config,
+};
 use stargate_protocol::TunnelTransportProtocol;
 use stargate_protocol::tunnel_contract::WEBTRANSPORT_TUNNEL_PATH;
 use stargate_tls::ServerTlsIdentity;
@@ -97,7 +99,7 @@ impl WebTransportRouterRuntime {
             config.upstream_tls_cert_pem.as_deref(),
             config.quic_insecure,
         )?;
-        upstream_client_config.transport_config(build_relay_transport_config(relay_config)?);
+        upstream_client_config.transport_config(build_relay_client_transport_config(relay_config)?);
         let server_config = build_webtransport_server_config(&identity, relay_config)?;
         let endpoint = Endpoint::server(server_config, config.listen_addr)
             .context("bind WebTransport router QUIC listener")?;

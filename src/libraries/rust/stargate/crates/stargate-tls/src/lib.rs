@@ -43,6 +43,11 @@ pub const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 /// reload lands and adds a second value.
 pub const SERVER_IDENTITY_MATERIAL: &str = "server_identity";
 
+/// Request streams a tunnel client lets its peer open on one connection. Each
+/// proxied request holds a stream until it finishes, so quinn's default of 100
+/// would cap a backend far below its advertised concurrency.
+pub const MAX_CONCURRENT_TUNNEL_STREAMS: u32 = 16_384;
+
 /// Result of attempting to activate changed TLS material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsReloadOutcome {
@@ -625,9 +630,13 @@ pub fn build_quic_server_config_from_pem(
 }
 
 fn quic_client_config(tls: rustls::ClientConfig) -> Result<ClientConfig> {
-    Ok(ClientConfig::new(Arc::new(
+    let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
-    )))
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_TUNNEL_STREAMS.into());
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 #[derive(Debug)]

@@ -544,27 +544,93 @@ fn reverse_tunnel_config(
     )
 }
 
+/// Stands in for stargate-k8s-router: accepts pylon's reverse tunnel and relays
+/// each stream to the Stargate reverse listener over the production relay transport.
+fn start_tunnel_relay(
+    stargate_addr: SocketAddr,
+    tunnel_protocol: TunnelTransportProtocol,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    install_crypto_provider();
+    let server_config = build_server_config(
+        &stargate_tls::ServerTlsIdentity::SelfSigned,
+        tunnel_protocol,
+    )
+    .expect("relay server config");
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+        .expect("relay endpoint should bind");
+    let relay_addr = endpoint.local_addr().expect("relay local addr");
+    let relay_endpoints = Arc::new(
+        stargate_forwarding::build_relay_endpoints(
+            stargate_forwarding::RelayEndpointConfig::default(),
+            build_client_config(None, true, tunnel_protocol).expect("relay client config"),
+        )
+        .expect("relay endpoints"),
+    );
+    let peer = Arc::new(stargate_forwarding::PeerTarget {
+        dial_addr: stargate_addr.to_string(),
+        server_name: "localhost".to_string(),
+    });
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let relay_endpoints = Arc::clone(&relay_endpoints);
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move {
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let _ = stargate_forwarding::forward_quic_connection(
+                    connection,
+                    &peer,
+                    &relay_endpoints,
+                    Duration::from_secs(2),
+                )
+                .await;
+            });
+        }
+    });
+    (relay_addr, task)
+}
+
 struct ReverseTunnelFixture {
     proxy: Arc<QuicHttpProxy>,
     generation: Arc<RegistrationGeneration>,
     addr: SocketAddr,
     handle: pylon_lib::ReverseQuicTunnelHandle,
     runtime: CriticalTaskGroup,
+    relay: Option<tokio::task::JoinHandle<()>>,
     _owner: RegistrationTunnel,
 }
 
 impl ReverseTunnelFixture {
     async fn start(app: Router, tunnel_protocol: TunnelTransportProtocol) -> Self {
+        Self::start_with_relay(app, tunnel_protocol, false).await
+    }
+
+    async fn start_through_relay(app: Router, tunnel_protocol: TunnelTransportProtocol) -> Self {
+        Self::start_with_relay(app, tunnel_protocol, true).await
+    }
+
+    async fn start_with_relay(
+        app: Router,
+        tunnel_protocol: TunnelTransportProtocol,
+        through_relay: bool,
+    ) -> Self {
         let backend_url = spawn_mock_backend(app).await;
         let state = Arc::new(StargateState::new());
         let registration = register_backend(&state, INFERENCE_SERVER_ID, true);
         let generation = registration.generation();
         let (proxy, addr, runtime) = start_tunnel_server(state, tunnel_protocol).await;
         let owner = own_reverse_registration(proxy.clone(), &registration);
+        let (dial_addr, relay) = if through_relay {
+            let (relay_addr, relay) = start_tunnel_relay(addr, tunnel_protocol);
+            (relay_addr, Some(relay))
+        } else {
+            (addr, None)
+        };
         let handle = tokio::time::timeout(
             Duration::from_secs(3),
             connect_reverse_tunnel_insecure_with_protocol(
-                addr,
+                dial_addr,
                 &backend_url,
                 INFERENCE_SERVER_ID,
                 tunnel_protocol,
@@ -583,12 +649,16 @@ impl ReverseTunnelFixture {
             addr,
             handle,
             runtime,
+            relay,
             _owner: owner,
         }
     }
 
     async fn shutdown(self) {
         self.handle.shutdown().await;
+        if let Some(relay) = self.relay {
+            relay.abort();
+        }
         self.runtime.begin_shutdown();
     }
 }
@@ -1906,4 +1976,82 @@ async fn reverse_tunnel_secure_client_rejects_unknown_server_cert() {
     );
 
     runtime.begin_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_tunnel_through_relay_carries_more_requests_than_default_stream_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Above quinn's default of 100 concurrent streams per connection; each
+    // request holds one stream on both relay hops until it finishes.
+    const HELD_REQUESTS: usize = 150;
+    const STREAMING_CHAT_BODY: &str =
+        r#"{"model":"model","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = {
+        let arrived = Arc::clone(&arrived);
+        let release = Arc::clone(&release);
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let arrived = Arc::clone(&arrived);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let released = release.notified();
+                        arrived.fetch_add(1, Ordering::SeqCst);
+                        released.await;
+                        "done"
+                    }
+                }),
+            )
+    };
+    let fixture =
+        ReverseTunnelFixture::start_through_relay(app, TunnelTransportProtocol::RawQuic).await;
+
+    let requests: Vec<_> = (0..HELD_REQUESTS)
+        .map(|index| {
+            let proxy = Arc::clone(&fixture.proxy);
+            let generation = Arc::clone(&fixture.generation);
+            tokio::spawn(async move {
+                let headers = test_request_headers(&format!("req-held-{index}"), "model", "1");
+                post_chat(
+                    &proxy,
+                    &generation,
+                    headers,
+                    Body::from(STREAMING_CHAT_BODY),
+                )
+                .await
+            })
+        })
+        .collect();
+    let all_arrived = tokio::time::timeout(Duration::from_secs(5), async {
+        while arrived.load(Ordering::SeqCst) < HELD_REQUESTS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let reached = arrived.load(Ordering::SeqCst);
+    let health = fixture
+        .proxy
+        .health_check_rtt_within(&fixture.generation, Duration::from_secs(2))
+        .await;
+
+    release.notify_waiters();
+    for request in requests {
+        request.abort();
+    }
+    fixture.shutdown().await;
+
+    assert!(
+        all_arrived,
+        "only {reached} of {HELD_REQUESTS} dispatched requests reached the backend"
+    );
+    assert!(
+        health.is_ok(),
+        "health probe should get a stream while requests are held: {health:?}"
+    );
 }
