@@ -52,6 +52,11 @@ const (
 	ReasonUploaded = "uploaded"
 	ReasonEmpty    = "empty"
 	ReasonEvicted  = "evicted"
+	// ReasonNotExported finishes a segment that a backend that does not
+	// export, such as a dry run or a diagnostic read, confirmed or found
+	// empty. Its source is kept, and a backend that exports prepares it
+	// again.
+	ReasonNotExported = "not_exported"
 )
 
 var (
@@ -100,6 +105,10 @@ type Transport struct {
 	SHA256 string `json:"sha256"`
 	Rows   int64  `json:"rows"`
 	Bytes  int64  `json:"bytes"`
+	// Policy fingerprints the record handling the transport was written
+	// under: suppression, redaction and format. It is a hash, never the
+	// configured values.
+	Policy string `json:"policy,omitempty"`
 }
 
 // Destination is one segment's progress toward one backend destination, for
@@ -109,6 +118,9 @@ type Destination struct {
 	Transport   Transport `json:"transport"`
 	BatchID     string    `json:"batch_id,omitempty"`
 	ConfirmedAt time.Time `json:"confirmed_at,omitzero"`
+	// Exported is copied from the confirmed batch's receipt. The source is
+	// deleted only when every destination was exported.
+	Exported bool `json:"exported,omitempty"`
 }
 
 // Segment is the journal record for one source segment.
@@ -127,6 +139,10 @@ type Segment struct {
 	Backend      string                  `json:"backend,omitempty"`
 	Destinations map[string]*Destination `json:"destinations,omitempty"`
 	Reason       string                  `json:"reason,omitempty"`
+	// UnconfirmedResends counts the times this segment was sent again after
+	// a job that may still have landed. It is at most one, and preparing the
+	// segment again keeps it.
+	UnconfirmedResends int `json:"unconfirmed_resends,omitempty"`
 
 	DiscoveredAt     time.Time `json:"discovered_at,omitzero"`
 	PrepareStartedAt time.Time `json:"prepare_started_at,omitzero"`
@@ -145,6 +161,11 @@ type Receipt struct {
 	Backend string    `json:"backend"`
 	ID      string    `json:"id"`
 	At      time.Time `json:"at,omitzero"`
+	// Exported reports whether the submit that produced the receipt was a
+	// real export. A dry run or a diagnostic read records false, so its
+	// receipt never authorizes deleting a source, also after a restart
+	// under a backend that exports.
+	Exported bool `json:"exported,omitempty"`
 }
 
 // Member is one segment's transport inside a batch.
@@ -168,6 +189,10 @@ type Batch struct {
 	Receipt     *Receipt  `json:"receipt,omitempty"`
 	Attempts    int       `json:"attempts"`
 	NextRetryAt time.Time `json:"next_retry_at,omitzero"`
+	// MayHaveLanded records that a submit of this batch may have committed
+	// without a job id. A batch without it was only ever refused, so its
+	// members can be released and prepared again.
+	MayHaveLanded bool `json:"may_have_landed,omitempty"`
 	// LastErrorClass is a bounded error class, never error text.
 	LastErrorClass string    `json:"last_error_class,omitempty"`
 	CreatedAt      time.Time `json:"created_at,omitzero"`
@@ -191,8 +216,9 @@ func SegmentID(prefix string, index int, size int64, contentSHA256 string) strin
 
 // segmentTransitions is the segment state machine. Upload progress between
 // Submitting and Confirmed is held by the batch record, so a segment only
-// records that it is in flight. Eviction is the one loss path outside this
-// table; the store applies it explicitly.
+// records that it is in flight. Two moves are outside this table, and the
+// store applies them explicitly: eviction, the one loss path, and reopening
+// a segment finished without an export.
 var segmentTransitions = map[State][]State{
 	StateDiscovered: {StatePreparing},
 	StatePreparing:  {StatePrepared, StateEmpty, StateQuarantined, StateDiscovered},
@@ -210,7 +236,9 @@ var batchTransitions = map[State][]State{
 	StateSubmitting: {StateSubmitted, StateRetryWait, StateAmbiguous, StateReleased},
 	StateRetryWait:  {StateSubmitting, StateReleased},
 	// An ambiguous batch with a receipt is polled, so it can still succeed.
-	StateAmbiguous: {StateSubmitting, StateReleased, StateConfirmed},
+	// One without a receipt waits in RetryWait when it is retained.
+	// One with a receipt is aged like a submitted job, so it can be stranded.
+	StateAmbiguous: {StateSubmitting, StateReleased, StateConfirmed, StateRetryWait, StateStranded},
 	StateSubmitted: {StateConfirmed, StateAmbiguous, StateStranded, StateReleased},
 	StateStranded:  {StateConfirmed},
 }

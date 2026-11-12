@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/suppress"
 )
 
 // runMainEnv makes the test binary run main instead of the tests, so a test
@@ -31,33 +30,13 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func mapLookup(env map[string]string) config.LookupFunc {
-	return func(name string) (string, bool) {
-		value, ok := env[name]
-		return value, ok
-	}
-}
-
-func TestLoadConfigReadsTheSuppressedNCAIDs(t *testing.T) {
-	cfg, _, err := loadConfig(mapLookup(map[string]string{
-		config.EnvSourceDir:      "/records",
-		config.EnvBackend:        string(config.BackendDebug),
-		config.EnvSuppressNCAIDs: "nca-acme-nca",
-	}))
-	if err != nil {
-		t.Fatalf("loadConfig() error = %v", err)
-	}
-	if rules := cfg.Suppression.Rules; len(rules) != 1 || len(rules[0].Values) != 1 || suppress.NormalizeID(rules[0].Values[0]) != "acme" {
-		t.Fatalf("Suppression = %+v, want the NCA id list as one rule", cfg.Suppression)
-	}
-}
-
 func TestMainExitsNonZeroOnInvalidSuppression(t *testing.T) {
 	tests := map[string]map[string]string{
 		"unparseable rules":         {config.EnvSuppressionRules: `[{"name":`},
 		"unknown action":            {config.EnvSuppressionRules: `[{"name":"a","headers":["x-tenant"],"values":["t1"],"action":"hide"}]`},
 		"empty value list":          {config.EnvSuppressionRules: `[{"name":"a","headers":["x-tenant"],"values":[],"action":"dropRecord"}]`},
 		"unknown headerless policy": {config.EnvSuppressHeaderless: "keep"},
+		"nca ids without headers":   {config.EnvSuppressNCAIDs: "acme"},
 	}
 	for name, extra := range tests {
 		t.Run(name, func(t *testing.T) {

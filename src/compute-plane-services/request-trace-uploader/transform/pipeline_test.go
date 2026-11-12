@@ -8,8 +8,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
-	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,19 +18,31 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/suppress"
 )
 
+// rowWriter is a format writer that keeps each closed transport's rows in
+// memory, one payload per row.
+type rowWriter struct {
+	rows   []string
+	closed func([]string)
+}
+
+func (w *rowWriter) Write(r transform.Record) error {
+	w.rows = append(w.rows, string(r.Payload))
+	return nil
+}
+
+func (w *rowWriter) Close() error { w.closed(w.rows); return nil }
+func (w *rowWriter) Abort() error { return nil }
+
 // prepareSink is the hand-off from intake to prepare: each closed segment
-// is prepared into a gzip JSON-lines transport next to the spool.
+// is prepared into a transport, kept here by segment index.
 type prepareSink struct {
-	preparer  *transform.Preparer
-	transport string
-	results   map[int]transform.Result
+	preparer   *transform.Preparer
+	results    map[int]transform.Result
+	transports map[int][]string
 }
 
 func (s *prepareSink) Accept(ctx context.Context, item segment.Segment) error {
-	writer, err := transform.CreateJSONLFile(filepath.Join(s.transport, fmt.Sprintf("%d.jsonl.gz", item.Index)))
-	if err != nil {
-		return err
-	}
+	writer := &rowWriter{closed: func(rows []string) { s.transports[item.Index] = rows }}
 	result, err := s.preparer.Prepare(ctx, item.Path, writer, nil)
 	if err != nil {
 		return err
@@ -63,27 +73,8 @@ func writeSegment(t *testing.T, path string, lines ...string) {
 	}
 }
 
-func readTransport(t *testing.T, path string) []string {
-	t.Helper()
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	gz, err := gzip.NewReader(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := io.ReadAll(gz)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-}
-
 func TestSpoolToTransport(t *testing.T) {
 	spool := t.TempDir()
-	transport := t.TempDir()
 	png := "data:image/png;base64," + base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{1, 2, 3}, 100)...))
 	payload := func(nca string) string {
 		return `{"timestamp":9,"event":{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1777312801000,` +
@@ -96,12 +87,12 @@ func TestSpoolToTransport(t *testing.T) {
 	writeSegment(t, filepath.Join(spool, "request-trace.1000001.jsonl.gz"), end)
 
 	cfg := transform.DefaultConfig()
-	cfg.Suppression = suppress.FromIDs([]string{"blocked"})
+	cfg.Suppression = suppress.FromIDs([]string{"blocked"}, "nvcf-ncaid", "nvcf-nca-id")
 	preparer, err := transform.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &prepareSink{preparer: preparer, transport: transport, results: map[int]transform.Result{}}
+	sink := &prepareSink{preparer: preparer, results: map[int]transform.Result{}, transports: map[int][]string{}}
 	intake, err := segment.NewIntake(spool, segment.DefaultConfig("request-trace"), sink, openGate{})
 	if err != nil {
 		t.Fatal(err)
@@ -114,15 +105,15 @@ func TestSpoolToTransport(t *testing.T) {
 	if pass.Handed != 2 || len(pass.Scan.Active) != 1 || pass.Scan.Active[0].Index != 1000001 {
 		t.Fatalf("pass = %+v, want two closed segments handed and the newest left active", pass)
 	}
-	if _, err := os.Stat(filepath.Join(transport, "1000001.jsonl.gz")); !os.IsNotExist(err) {
-		t.Fatalf("active segment was prepared: %v", err)
+	if _, ok := sink.transports[1000001]; ok {
+		t.Fatal("active segment was prepared")
 	}
 
 	first := sink.results[999999]
 	if first.Written != 2 || first.RedactedParts != 1 || first.Suppressed != 0 || first.Quarantine != "" {
 		t.Fatalf("first segment = %+v", first)
 	}
-	rows := readTransport(t, filepath.Join(transport, "999999.jsonl.gz"))
+	rows := sink.transports[999999]
 	if len(rows) != 2 || strings.Contains(rows[0], "iVBOR") || !strings.Contains(rows[0], `"redacted":"multimodal"`) || rows[1] != end {
 		t.Fatalf("first transport = %q", rows)
 	}
@@ -131,7 +122,7 @@ func TestSpoolToTransport(t *testing.T) {
 	if second.Written != 2 || second.Suppressed != 1 || second.Unparseable != 1 || second.RedactedParts != 0 {
 		t.Fatalf("second segment = %+v", second)
 	}
-	rows = readTransport(t, filepath.Join(transport, "1000000.jsonl.gz"))
+	rows = sink.transports[1000000]
 	if !strings.Contains(rows[0], `"payload_suppressed":true`) || strings.Contains(rows[0], "messages") {
 		t.Fatalf("second transport stub = %s", rows[0])
 	}

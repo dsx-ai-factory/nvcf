@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "atomicfile",
+    srcs = ["atomicfile.go"],
+    importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile",
+    visibility = ["//src/compute-plane-services/request-trace-uploader:__subpackages__"],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":atomicfile",
+    visibility = ["//src/compute-plane-services/request-trace-uploader:__subpackages__"],
+)
+
+go_test(
+    name = "atomicfile_test",
+    srcs = ["atomicfile_test.go"],
+    embed = [":atomicfile"],
+)

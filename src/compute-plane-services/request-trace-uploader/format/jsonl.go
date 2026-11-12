@@ -11,11 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"io/fs"
-	"os"
 	"path/filepath"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 )
 
@@ -45,9 +44,9 @@ func (GzipJSONL) NewWriter(target Target) (Writer, error) {
 	}
 	destination := target.Destinations[0]
 	path := target.Path(destination, jsonlExt)
-	file, err := os.CreateTemp(target.Dir, filepath.Base(path)+".*.tmp")
+	file, err := atomicfile.Create(target.Dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return nil, fmt.Errorf("create transport: %w", pathless(err))
+		return nil, fmt.Errorf("create transport: %w", err)
 	}
 	out := &hashingFile{file: file, hash: sha256.New()}
 	return &jsonlWriter{
@@ -61,7 +60,7 @@ func (GzipJSONL) NewWriter(target Target) (Writer, error) {
 // hashingFile hashes and counts the bytes that reach the file, so Close can
 // describe the transport without reading it back.
 type hashingFile struct {
-	file  *os.File
+	file  *atomicfile.File
 	hash  hash.Hash
 	bytes int64
 }
@@ -70,7 +69,7 @@ func (h *hashingFile) Write(p []byte) (int, error) {
 	n, err := h.file.Write(p)
 	h.hash.Write(p[:n])
 	h.bytes += int64(n)
-	return n, pathless(err)
+	return n, err
 }
 
 type jsonlWriter struct {
@@ -117,7 +116,7 @@ func (w *jsonlWriter) Close() error {
 	}
 	w.done = true
 	if err := w.publish(); err != nil {
-		return errors.Join(fmt.Errorf("publish transport: %w", err), w.discard(), pathless(removeIfPresent(w.path)))
+		return errors.Join(fmt.Errorf("publish transport: %w", err), w.discard())
 	}
 	w.published = true
 	w.outputs = []Output{{
@@ -130,21 +129,13 @@ func (w *jsonlWriter) Close() error {
 	return nil
 }
 
+// publish finishes the gzip stream and publishes the file; a failure
+// leaves neither the temporary nor the final name.
 func (w *jsonlWriter) publish() error {
-	err := w.gz.Close()
-	if err == nil {
-		err = w.out.file.Sync()
+	if err := w.gz.Close(); err != nil {
+		return err
 	}
-	if closeErr := w.out.file.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(w.out.file.Name(), w.path)
-	}
-	if err == nil {
-		err = syncDir(filepath.Dir(w.path))
-	}
-	return pathless(err)
+	return w.out.file.Publish(w.path)
 }
 
 // Abort removes the unfinished file. It is safe to call more than once and
@@ -163,54 +154,10 @@ func (w *jsonlWriter) Abort() error {
 }
 
 func (w *jsonlWriter) discard() error {
-	closeErr := w.out.file.Close()
-	if errors.Is(closeErr, os.ErrClosed) {
-		closeErr = nil
-	}
-	return pathless(errors.Join(closeErr, removeIfPresent(w.out.file.Name())))
+	return w.out.file.Discard()
 }
 
 // Outputs lists the published file after a Close that wrote records.
 func (w *jsonlWriter) Outputs() []Output {
 	return append([]Output(nil), w.outputs...)
-}
-
-func syncDir(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(handle.Sync(), handle.Close())
-}
-
-// pathless drops the path from a file system error, keeping the operation
-// and the cause, so the error can be logged. Joined errors are rewritten one
-// by one.
-func pathless(err error) error {
-	if err == nil {
-		return nil
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		parts := make([]error, 0, len(joined.Unwrap()))
-		for _, part := range joined.Unwrap() {
-			parts = append(parts, pathless(part))
-		}
-		return errors.Join(parts...)
-	}
-	var pathErr *fs.PathError
-	if errors.As(err, &pathErr) {
-		return fmt.Errorf("%s: %w", pathErr.Op, pathErr.Err)
-	}
-	var linkErr *os.LinkError
-	if errors.As(err, &linkErr) {
-		return fmt.Errorf("%s: %w", linkErr.Op, linkErr.Err)
-	}
-	return err
-}
-
-func removeIfPresent(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
 }

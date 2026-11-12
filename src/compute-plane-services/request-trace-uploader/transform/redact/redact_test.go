@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 )
 
 // golden holds what the earlier Python uploader produced: the redacted
@@ -61,6 +61,9 @@ var divergentRecords = map[string]string{"audio format final sigma": "audio/wav"
 
 var markerMIME = regexp.MustCompile(`"mime":(null|"(?:[^"\\]|\\.)*")`)
 
+// TestRecordMatchesPythonUploader checks that redaction finds the same media
+// and writes the same markers as the earlier Python uploader. The record is
+// compared by keys, key order and values; its bytes are plain JSON.
 func TestRecordMatchesPythonUploader(t *testing.T) {
 	found := 0
 	for _, tc := range loadGolden(t).Records {
@@ -68,34 +71,41 @@ func TestRecordMatchesPythonUploader(t *testing.T) {
 			found++
 		}
 		t.Run(tc.Name, func(t *testing.T) {
-			record, err := compat.Decode([]byte(tc.In))
+			record, err := jsonvalue.Decode([]byte(tc.In))
+			if strings.Contains(tc.In, "NaN") {
+				if err == nil {
+					t.Fatal("Decode() accepted NaN, which is not JSON")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			before := string(compat.Encode(record))
+			before := string(jsonvalue.Encode(record))
 			got, count := Record(record)
 			if count != tc.Count {
 				t.Fatalf("count = %d, want %d", count, tc.Count)
 			}
-			encoded := string(compat.Encode(got))
+			encoded := string(jsonvalue.Encode(got))
 			if tc.Out == nil {
 				if encoded != before {
 					t.Fatalf("record changed with nothing redacted:\n%s", encoded)
 				}
 				return
 			}
+			expected := *tc.Out
 			if mime, ok := divergentRecords[tc.Name]; ok {
-				want := markerMIME.ReplaceAllLiteralString(*tc.Out, `"mime":"`+mime+`"`)
-				if want == *tc.Out {
+				expected = markerMIME.ReplaceAllLiteralString(*tc.Out, `"mime":"`+mime+`"`)
+				if expected == *tc.Out {
 					t.Fatal("expected output equals the earlier uploader's; remove it from divergentRecords")
 				}
-				if encoded != want {
-					t.Errorf("redacted =\n%s\nwant\n%s", encoded, want)
-				}
-				return
 			}
-			if encoded != *tc.Out {
-				t.Errorf("redacted =\n%s\nwant\n%s", encoded, *tc.Out)
+			want, err := jsonvalue.Decode([]byte(expected))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !jsonvalue.Equal(got, want) {
+				t.Errorf("redacted =\n%s\nwant\n%s", encoded, expected)
 			}
 		})
 	}
@@ -177,7 +187,7 @@ func TestLargeRecordIsRedactedQuickly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := compat.Decode(line)
+	record, err := jsonvalue.Decode(line)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +199,7 @@ func TestLargeRecordIsRedactedQuickly(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("count = %d, want 2", count)
 	}
-	if size := len(compat.Encode(got)); size > 4096 {
+	if size := len(jsonvalue.Encode(got)); size > 4096 {
 		t.Errorf("redacted record is %d bytes, want the media replaced", size)
 	}
 	if elapsed > 10*time.Second {
@@ -246,17 +256,47 @@ func TestDataURLScanIsLinear(t *testing.T) {
 	}
 }
 
+func TestRedactedRecordIsPlainJSON(t *testing.T) {
+	png := "data:image/png;base64," + base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...))
+	record, err := jsonvalue.Decode([]byte("{\"score\":1.50,\"content\":\"caf\u00e9 " + png + "\"}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, count := Record(record)
+	encoded := string(jsonvalue.Encode(got))
+	if count != 1 || !strings.HasPrefix(encoded, "{\"score\":1.50,\"content\":\"caf\u00e9 [redacted:multimodal kind=data_url mime=image/png bytes=") {
+		t.Fatalf("redacted = %s, want UTF-8 text, the source number and an inline token", encoded)
+	}
+}
+
+// TestPyStripMatchesPython uses expected values from Python's str.strip().
+func TestPyStripMatchesPython(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{in: " a ", want: "a"},
+		{in: "\t\n x \r\u000b\f", want: "x"},
+		{in: "\u001c\u001d\u001e\u001fy\u0085", want: "y"},
+		{in: "\u00a0z\u2028\u3000", want: "z"},
+		{in: "\u200bq\u200b", want: "\u200bq\u200b"},
+		{in: "", want: ""},
+	}
+	for _, tt := range tests {
+		if got := pyStrip(tt.in); got != tt.want {
+			t.Errorf("pyStrip(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // White space after the comma of a base64 data URL does not hide the media.
 func TestDataURLWithSpaceAfterTheCommaIsRedacted(t *testing.T) {
 	png := base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{7, 99, 201}, 300)...))
 	for _, url := range []string{"data:image/png;base64, " + png, "data:image/png;base64,\t" + png} {
-		record, err := compat.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + strings.ReplaceAll(url, "\t", `\t`) + `"}]}}}`))
+		record, err := jsonvalue.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + strings.ReplaceAll(url, "\t", `\t`) + `"}]}}}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, count := Record(record)
-		if count != 1 || strings.Contains(string(compat.Encode(got)), png[:40]) {
-			t.Errorf("count = %d, want the data URL redacted: %.80s", count, compat.Encode(got))
+		if count != 1 || strings.Contains(string(jsonvalue.Encode(got)), png[:40]) {
+			t.Errorf("count = %d, want the data URL redacted: %.80s", count, jsonvalue.Encode(got))
 		}
 	}
 }
@@ -276,12 +316,12 @@ func TestMIMEHintThatIsNotAMediaTypeIsNotKept(t *testing.T) {
 	}
 	for name, in := range tests {
 		t.Run(name, func(t *testing.T) {
-			record, err := compat.Decode([]byte(in))
+			record, err := jsonvalue.Decode([]byte(in))
 			if err != nil {
 				t.Fatal(err)
 			}
 			got, count := Record(record)
-			encoded := string(compat.Encode(got))
+			encoded := string(jsonvalue.Encode(got))
 			if count < 1 {
 				t.Fatalf("count = %d, want the media redacted: %s", count, encoded)
 			}
@@ -300,12 +340,12 @@ func TestMIMEHintThatIsAMediaTypeIsKept(t *testing.T) {
 		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + data + `"}}`: "image/png",
 	}
 	for in, want := range tests {
-		record, err := compat.Decode([]byte(in))
+		record, err := jsonvalue.Decode([]byte(in))
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, _ := Record(record)
-		if encoded := string(compat.Encode(got)); !strings.Contains(encoded, `"mime":"`+want+`"`) {
+		if encoded := string(jsonvalue.Encode(got)); !strings.Contains(encoded, `"mime":"`+want+`"`) {
 			t.Errorf("redacted = %s, want mime %q", encoded, want)
 		}
 	}

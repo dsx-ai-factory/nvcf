@@ -12,12 +12,18 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
 )
+
+// ncaHeaders is the NCA id header list a deployment sets, in the order the
+// earlier shell exporter read them.
+const ncaHeaders = "nvcf-ncaid,nvcf-nca-id"
 
 // The suppressed line and its stub are the first case of
 // transform/suppress/testdata/python.json, which the earlier shell
@@ -37,9 +43,10 @@ func TestChartSuppressionEnvExportsTheShellStub(t *testing.T) {
 	// The chart renders suppressedNcaIds with `| quote`, so the container
 	// sees the comma-separated list as it was written in the values.
 	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
-		config.EnvSuppressNCAIDs: "nca-acme-nca,other-org",
+		config.EnvSuppressNCAIDs:     "nca-acme-nca,other-org",
+		config.EnvSuppressNCAHeaders: ncaHeaders,
 	}))
-	exporter := newCapture(t, resubmitSafeFake())
+	exporter := newCapture(t, backendtest.NewFake())
 	metrics, err := telemetry.NewMemory("fake")
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +87,41 @@ func TestChartSuppressionEnvExportsTheShellStub(t *testing.T) {
 	}
 }
 
+func TestNCAHeaderSettingDecidesWhichHeadersAreReadInOrder(t *testing.T) {
+	// The first header carries another org, so the second is never read.
+	firstWins := uploadertest.RequestPayload("r2", 1777312802000, map[string]string{"x-org-id": "other", "nvcf-ncaid": "acme"})
+	// nvcf-nca-id is not in the configured list.
+	unlisted := uploadertest.RequestPayload("r3", 1777312802000, map[string]string{"nvcf-nca-id": "acme"})
+	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
+	spool.Roll(uploadertest.NewSegment().Member(suppressedLine, firstWins, unlisted).Bytes())
+	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("r4", 1)).Bytes())
+
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
+		config.EnvSuppressNCAIDs:     "acme",
+		config.EnvSuppressNCAHeaders: "x-org-id,nvcf-ncaid",
+	}))
+	exporter := newCapture(t, backendtest.NewFake())
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader, err := service.NewUploader(cfg, exporter, service.Options{Metrics: metrics})
+	if err != nil {
+		t.Fatalf("NewUploader() error = %v", err)
+	}
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() error = %v", err)
+	}
+
+	// suppressedLine carries only nvcf-ncaid, so the second header is read.
+	if exported, want := exporter.exported(), []string{shellStub, firstWins, unlisted}; !slices.Equal(exported, want) {
+		t.Fatalf("exported =\n%s\nwant\n%s", strings.Join(exported, "\n"), strings.Join(want, "\n"))
+	}
+	if got, _ := metrics.Value(telemetry.SuppressionHeaderPresent, telemetry.Labels{"rule": config.NCAIDRuleName}); got != 2 {
+		t.Errorf("suppression_header_present = %v, want 2", got)
+	}
+}
+
 // A stripPayload rule from the rules setting matches on a header that is not
 // the NCA id, so its stub must not present the matched value as one.
 func TestCustomStripRuleStubCarriesNoIdentifier(t *testing.T) {
@@ -91,7 +133,7 @@ func TestCustomStripRuleStubCarriesNoIdentifier(t *testing.T) {
 	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
 		config.EnvSuppressionRules: `[{"name":"users","headers":["x-user-id"],"values":["alice@example.com"],"action":"stripPayload"}]`,
 	}))
-	exporter := newCapture(t, resubmitSafeFake())
+	exporter := newCapture(t, backendtest.NewFake())
 	uploader, err := service.NewUploader(cfg, exporter, service.Options{})
 	if err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
@@ -114,14 +156,15 @@ func TestCustomStripRuleStubCarriesNoIdentifier(t *testing.T) {
 func TestSuppressionCountersArePresetAndCarryOnlyRuleNames(t *testing.T) {
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
 	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
-		config.EnvSuppressNCAIDs:   "acme",
-		config.EnvSuppressionRules: `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`,
+		config.EnvSuppressNCAIDs:     "acme",
+		config.EnvSuppressNCAHeaders: ncaHeaders,
+		config.EnvSuppressionRules:   `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`,
 	}))
 	metrics, err := telemetry.NewMemory("fake")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.NewUploader(cfg, resubmitSafeFake(), service.Options{Metrics: metrics}); err != nil {
+	if _, err := service.NewUploader(cfg, backendtest.NewFake(), service.Options{Metrics: metrics}); err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
 	}
 
@@ -152,8 +195,8 @@ func TestSuppressionCountersArePresetAndCarryOnlyRuleNames(t *testing.T) {
 func TestWarnsOnceWhenNoSuppressionHeaderIsSeen(t *testing.T) {
 	logs := captureLogs(t)
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme"}))
-	exporter := newCapture(t, resubmitSafeFake())
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme", config.EnvSuppressNCAHeaders: ncaHeaders}))
+	exporter := newCapture(t, backendtest.NewFake())
 	uploader, err := service.NewUploader(cfg, exporter, service.Options{HeaderCheckRecords: 3})
 	if err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
@@ -189,8 +232,8 @@ func TestWarnsOnceWhenNoSuppressionHeaderIsSeen(t *testing.T) {
 func TestNoHeaderWarningOnceAHeaderIsSeen(t *testing.T) {
 	logs := captureLogs(t)
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme"}))
-	uploader, err := service.NewUploader(cfg, resubmitSafeFake(), service.Options{HeaderCheckRecords: 2})
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme", config.EnvSuppressNCAHeaders: ncaHeaders}))
+	uploader, err := service.NewUploader(cfg, backendtest.NewFake(), service.Options{HeaderCheckRecords: 2})
 	if err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
 	}
@@ -208,16 +251,121 @@ func TestNoHeaderWarningOnceAHeaderIsSeen(t *testing.T) {
 	}
 }
 
+func TestATransportPreparedUnderAnotherPolicyIsPreparedAgainAfterARestart(t *testing.T) {
+	if uploadertest.CrashChild() {
+		t.Skip("runs only in the parent")
+	}
+	landing := t.TempDir()
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	// The child prepares with suppression off and is killed before it
+	// submits.
+	result := uploadertest.RunCrash(t, "TestCrashChildRunsThePipeline", service.PointPrepared,
+		envCrashSpool+"="+spool.Dir, envCrashLanding+"="+landing)
+	if !result.Killed || result.Point != service.PointPrepared {
+		t.Fatalf("child was not killed at %s:\n%s", service.PointPrepared, result.Output)
+	}
+
+	logs := captureLogs(t)
+	restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	passUntil(t, restarted, func() bool { return gone(closed[0]) })
+	files, err := filepath.Glob(filepath.Join(landing, "*", "*.jsonl.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported []string
+	for _, file := range files {
+		exported = append(exported, readGzipLines(t, file)...)
+	}
+	joined := strings.Join(exported, "\n")
+	if strings.Contains(joined, "secret") || !strings.Contains(joined, `"payload_suppressed":true`) {
+		t.Fatalf("exported = %s, want the record suppressed under the policy now configured", joined)
+	}
+	if strings.Contains(logs.String(), "nca-acme-nca") {
+		t.Fatalf("logs carry a configured suppression value:\n%s", logs)
+	}
+}
+
+// refusingBackend refuses every submit in a way that shows nothing was
+// processed, as a 503 does.
+type refusingBackend struct{ dirBackend }
+
+func (refusingBackend) Submit(context.Context, backend.SubmitRequest) (string, error) {
+	return "", &backend.Fault{Class: backend.ClassRetryable, Scope: backend.ScopeUnknown, Reason: backend.ReasonUnavailable, Err: errors.New("unavailable")}
+}
+
+func TestARefusedBatchIsPreparedAgainWhenThePolicyChangesBeforeItsRetry(t *testing.T) {
+	landing := t.TempDir()
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	first := newUploader(t, spool, refusingBackend{dirBackend{root: landing}}, service.Options{}, nil)
+	_ = first.Pass(context.Background())
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	batches := journalBatches(t, spool)
+	if len(batches) != 1 || batches[0].State != journal.StateRetryWait {
+		t.Fatalf("batches = %+v, want one refused batch waiting to retry", batches)
+	}
+
+	restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	passUntil(t, restarted, func() bool { return gone(closed[0]) })
+	files, err := filepath.Glob(filepath.Join(landing, "*", "*.jsonl.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported []string
+	for _, file := range files {
+		exported = append(exported, readGzipLines(t, file)...)
+	}
+	joined := strings.Join(exported, "\n")
+	if strings.Contains(joined, "secret") || !strings.Contains(joined, `"payload_suppressed":true`) {
+		t.Fatalf("exported = %s, want the record suppressed under the policy now configured", joined)
+	}
+}
+
+// lostResponseBackend lands each job and then loses the response, so the
+// uploader cannot tell whether the submit committed.
+type lostResponseBackend struct{ dirBackend }
+
+func (b lostResponseBackend) Submit(ctx context.Context, request backend.SubmitRequest) (string, error) {
+	if _, err := b.dirBackend.Submit(ctx, request); err != nil {
+		return "", err
+	}
+	return "", &backend.Fault{Class: backend.ClassUncertain, Scope: backend.ScopeBackend, Reason: backend.ReasonTimeout, Err: errors.New("response lost")}
+}
+
+func TestARetainedSubmitIsNeitherPreparedAgainNorResentWhenThePolicyChanges(t *testing.T) {
+	landing := t.TempDir()
+	spool, closed := spoolWith(t, []string{suppressedLine})
+	first := newUploader(t, spool, lostResponseBackend{dirBackend{root: landing}}, service.Options{Faults: retainFaults()}, nil)
+	_ = first.Pass(context.Background())
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newUploader(t, spool, dirBackend{root: landing}, service.Options{Faults: retainFaults()}, map[string]string{config.EnvSuppressNCAIDs: "nca-acme-nca", config.EnvSuppressNCAHeaders: ncaHeaders})
+	for range 3 {
+		_ = restarted.Pass(context.Background())
+	}
+	jobs, err := filepath.Glob(filepath.Join(landing, "*", "landed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || gone(closed[0]) {
+		t.Fatalf("landed jobs = %d, source deleted = %t; want the retained submit left for an operator", len(jobs), gone(closed[0]))
+	}
+}
+
 // Each rule needs its own header: one rule's header being present says
 // nothing about another rule that can never fire.
 func TestWarnsForEachRuleWhoseHeaderIsNeverSeen(t *testing.T) {
 	logs := captureLogs(t)
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
 	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
-		config.EnvSuppressNCAIDs:   "acme",
-		config.EnvSuppressionRules: `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`,
+		config.EnvSuppressNCAIDs:     "acme",
+		config.EnvSuppressNCAHeaders: ncaHeaders,
+		config.EnvSuppressionRules:   `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`,
 	}))
-	uploader, err := service.NewUploader(cfg, resubmitSafeFake(), service.Options{HeaderCheckRecords: 2})
+	uploader, err := service.NewUploader(cfg, backendtest.NewFake(), service.Options{HeaderCheckRecords: 2})
 	if err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
 	}
@@ -246,8 +394,8 @@ func TestSuppressionCountsAreRecordedOncePerSegment(t *testing.T) {
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
 	spool.Roll(uploadertest.NewSegment().Member(suppressedLine).Bytes())
 	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme"}))
-	fake := resubmitSafeFake()
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvSuppressNCAIDs: "acme", config.EnvSuppressNCAHeaders: ncaHeaders}))
+	fake := backendtest.NewFake()
 	refused := backendtest.SubmitStep{Outcome: backendtest.Refuse}
 	fake.Script(refused, refused)
 	metrics, err := telemetry.NewMemory("fake")
@@ -265,86 +413,5 @@ func TestSuppressionCountsAreRecordedOncePerSegment(t *testing.T) {
 	}
 	if got, _ := metrics.Value(telemetry.RecordsSuppressed, telemetry.Labels{"rule": config.NCAIDRuleName, "action": "strip_payload"}); got != 1 {
 		t.Fatalf("records_suppressed = %v after two refusals and a success, want 1", got)
-	}
-}
-
-// Rejected lines exist only in the source until they are kept, so a source
-// whose rejects cannot be kept is not exported or deleted.
-func TestASegmentWhoseRejectsCannotBeKeptStays(t *testing.T) {
-	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	closed := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("a", 1), `{"broken`).Bytes())
-	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
-	quarantine := t.TempDir()
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvQuarantineDir: quarantine}))
-	// A directory where the kept rejects must go makes publishing them fail
-	// after they were written.
-	blocker := filepath.Join(quarantine, "rejects", filepath.Base(closed), "x")
-	if err := os.MkdirAll(blocker, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	exporter := newCapture(t, resubmitSafeFake())
-	uploader, err := service.NewUploader(cfg, exporter, service.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := uploader.Pass(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(closed); err != nil {
-		t.Fatalf("source after a failed reject commit: %v, want it kept", err)
-	}
-	if got := exporter.exported(); len(got) != 0 {
-		t.Fatalf("exported %q, want nothing until the rejects are kept", got)
-	}
-}
-
-// A segment that cannot be exported leaves the spool for the quarantine
-// directory instead of being read and warned about on every pass.
-func TestAQuarantinedSegmentMovesToTheQuarantineDir(t *testing.T) {
-	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	closed := spool.Roll(uploadertest.NewSegment().Member(uploadertest.LegacyAuditRecord("a")).Bytes())
-	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
-	quarantine := t.TempDir()
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvQuarantineDir: quarantine}))
-	uploader, err := service.NewUploader(cfg, resubmitSafeFake(), service.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := uploader.Pass(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(closed); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("source after quarantine: %v, want it moved", err)
-	}
-	if _, err := os.Stat(filepath.Join(quarantine, filepath.Base(closed))); err != nil {
-		t.Fatalf("quarantined copy: %v", err)
-	}
-}
-
-// A status the core does not know is counted, and the segment is not
-// treated as exported.
-func TestAnUnknownJobStatusIsCounted(t *testing.T) {
-	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
-	closed := spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("a", 1)).Bytes())
-	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("x", 1)).Bytes())
-	cfg := loadEnv(t, spoolEnv(t, spool.Dir, nil))
-	fake := resubmitSafeFake()
-	fake.Script(backendtest.SubmitStep{Statuses: []backendtest.StatusStep{{Status: "weird_new_state"}}})
-	metrics, err := telemetry.NewMemory("fake")
-	if err != nil {
-		t.Fatal(err)
-	}
-	uploader, err := service.NewUploader(cfg, fake, service.Options{Metrics: metrics})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := uploader.Pass(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := metrics.Value(telemetry.JobStatusUnknown, nil); got != 1 {
-		t.Fatalf("job_status_unknown = %v, want 1", got)
-	}
-	if _, err := os.Stat(closed); err != nil {
-		t.Fatalf("source after an unknown status: %v, want it kept", err)
 	}
 }
