@@ -87,7 +87,7 @@ mod tests {
     use super::*;
     use super::{calibration::*, lifecycle::*, upstream::*};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
     use axum::Json;
     use axum::Router;
@@ -1182,7 +1182,7 @@ mod tests {
             (
                 "overload",
                 TestServerState {
-                    canary_overloaded: true,
+                    canary_status: Arc::new(AtomicU16::new(529)),
                     ..TestServerState::default()
                 },
             ),
@@ -1268,6 +1268,69 @@ mod tests {
         }
 
         // The next recovery canary answers normally and restores the model.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runtime_state.model_bringup_ready("test-model") != Some(true) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a passing recovery canary should restore the model");
+
+        stop.cancel();
+        task.await.unwrap();
+        progress.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_overload_keeps_a_model_demoted_for_a_failure_until_a_canary_passes() {
+        let canary_requests = Arc::new(AtomicUsize::new(0));
+        let canary_status = Arc::new(AtomicU16::new(500));
+        let base_url = spawn_test_server(TestServerState {
+            canary_requests: Some(canary_requests.clone()),
+            canary_status: canary_status.clone(),
+            ..TestServerState::default()
+        })
+        .await;
+        let runtime_state = PylonRuntimeState::new(
+            InferenceServerStatus::Active,
+            &["test-model".into(), "busy-model".into()],
+        );
+        let stop = CancellationToken::new();
+        let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
+        let task = tokio::spawn(run_bringup_task(
+            test_task_config(
+                base_url.to_string(),
+                BringupConfig {
+                    active_canary_interval: Duration::from_millis(10),
+                    canary_timeout: Duration::from_millis(100),
+                    ..BringupConfig::default()
+                },
+            ),
+            runtime_state.clone(),
+            stop.clone(),
+        ));
+
+        wait_for_bringup_ready(&runtime_state, false).await;
+
+        // Overload replies while another model serves must not restore a
+        // model demoted for a real failure.
+        canary_status.store(529, Ordering::SeqCst);
+        let overloaded_from = canary_requests.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while canary_requests.load(Ordering::SeqCst) < overloaded_from + 2 {
+                assert_eq!(
+                    runtime_state.model_bringup_ready("test-model"),
+                    Some(false),
+                    "an overloaded recovery canary should not restore the model"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("recovery canaries should keep running");
+        assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(false));
+
+        canary_status.store(0, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(3), async {
             while runtime_state.model_bringup_ready("test-model") != Some(true) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2065,7 +2128,8 @@ mod tests {
         canaries: Option<CanarySequence>,
         canary_requests: Option<Arc<AtomicUsize>>,
         canary_hangs: bool,
-        canary_overloaded: bool,
+        /// Error status for canaries in Dynamo's error shape; 0 answers normally.
+        canary_status: Arc<AtomicU16>,
         canary_token_delay: Option<Duration>,
         health_requests: Option<Arc<AtomicUsize>>,
         request_ids: Option<Arc<Mutex<Vec<String>>>>,
@@ -2090,7 +2154,7 @@ mod tests {
                 canaries: None,
                 canary_requests: None,
                 canary_hangs: false,
-                canary_overloaded: false,
+                canary_status: Arc::new(AtomicU16::new(0)),
                 canary_token_delay: None,
                 health_requests: None,
                 request_ids: None,
@@ -2267,14 +2331,15 @@ mod tests {
             if state.canary_hangs {
                 std::future::pending::<()>().await;
             }
-            if state.canary_overloaded {
-                // Dynamo's reply when every worker of the model is busy.
+            let canary_status = state.canary_status.load(Ordering::SeqCst);
+            if canary_status != 0 {
+                // 529 is Dynamo's reply when every worker of the model is busy.
                 return (
-                    StatusCode::from_u16(529).expect("529 is a valid status"),
+                    StatusCode::from_u16(canary_status).expect("test status is valid"),
                     Json(serde_json::json!({
                         "message": "Service temporarily overloaded",
                         "type": "Overloaded",
-                        "code": 529
+                        "code": canary_status
                     })),
                 )
                     .into_response();
