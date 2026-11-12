@@ -204,13 +204,12 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "nvsnap-server in-flight checkpoint/restore operations",
-      "description": "Gauges from nvsnap-server's /metrics. Sustained non-zero values indicate concurrent capture or restore activity.",
+      "title": "NvSnap operations in flight",
+      "description": "Checkpoint and restore operations the agents are running now (nvsnap_active_operations).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "targets": [
-        { "expr": "nvsnap_server_active_checkpoints", "legendFormat": "active checkpoints", "refId": "A" },
-        { "expr": "nvsnap_server_active_restores", "legendFormat": "active restores", "refId": "B" }
+        { "expr": "sum by (operation) (nvsnap_active_operations)", "legendFormat": "{{operation}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -222,17 +221,17 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "nvsnap-agent checkpoint + restore rate (req/s)",
-      "description": "Per-second checkpoint and restore operations on nvsnap-agent. Watch this during a scale event — restores spike as Hook A admits N pods, captures flatten as Hook B catches up.",
+      "title": "NvSnap captures and restores per hour, by outcome",
+      "description": "Captures and restores in the hour before each point, by outcome; the history dashboard (nvsnap-history) breaks them down.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "targets": [
-        { "expr": "sum(rate(nvsnap_agent_checkpoint_total[$__rate_interval]))", "legendFormat": "checkpoint", "refId": "A" },
-        { "expr": "sum(rate(nvsnap_agent_restore_total[$__rate_interval]))", "legendFormat": "restore", "refId": "B" }
+        { "expr": "sum by (outcome) (increase(nvsnap_capture_outcomes_total[1h]))", "legendFormat": "capture {{outcome}}", "refId": "A" },
+        { "expr": "sum by (outcome) (increase(nvsnap_restore_outcomes_total[1h]))", "legendFormat": "restore {{outcome}}", "refId": "B" }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps",
+          "unit": "none",
           "custom": { "drawStyle": "line", "fillOpacity": 10 }
         }
       }

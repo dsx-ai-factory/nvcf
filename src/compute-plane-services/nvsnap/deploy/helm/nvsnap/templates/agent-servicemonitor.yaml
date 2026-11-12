@@ -52,5 +52,11 @@ spec:
   endpoints:
     - port: http-api
       path: /metrics
+      {{- /* A new series' first observations are held until Prometheus has
+           scraped it at zero (internal/metrics/first_sight.go, 2 min): a
+           scrape interval over 40 s could miss the zero and lose them. */}}
+      {{- if not (regexMatch "^([1-9]|[1-3][0-9]|40)s$" (toString $sm.interval)) }}
+      {{- fail (printf "agent.metrics.serviceMonitor.interval %q: use whole seconds up to 40s; the agent's first-sight hold (2m) needs several scrapes" (toString $sm.interval)) }}
+      {{- end }}
       interval: {{ $sm.interval }}
 {{- end }}

@@ -6,7 +6,8 @@ agent releases. Three records, each answering its own question:
 
 | Record | Kept by | Answers |
 |---|---|---|
-| Prometheus series on each agent's `/metrics` | the cluster's Prometheus | trends: how long restores take, by phase; how often captures fail and why; how many pods start cold |
+| Prometheus series on each agent's `/metrics` | the cluster's Prometheus | trends: how long scale-up and restores take, by phase; how often captures fail and why; how many pods start cold; what is cached |
+| Alerts on those series (`deploy/helm/nvsnap/files/prometheus-rules.yaml`) | the cluster's Prometheus | what needs a look now: [RUNBOOK.md](RUNBOOK.md) |
 | One summary log line per capture, restore and pod start | the cluster's log store | one function's history: its captures and restores, with times |
 | Kubernetes events on the pods; a capture's last restores in its group record | the API server | live debugging with `kubectl` alone |
 
@@ -27,6 +28,7 @@ function or checkpoint label: those are in the summary lines.
 
 | Series | Type | Labels |
 |---|---|---|
+| `nvsnap_pod_start_seconds` | histogram | `method`, `gpu`, `ranks` |
 | `nvsnap_pod_ready_seconds` | histogram | `method`, `gpu`, `ranks` |
 | `nvsnap_restore_phase_seconds` | histogram | `method`, `phase`, `gpu`, `ranks` |
 | `nvsnap_restore_outcomes_total` | counter | `method`, `outcome`, `reason`, `gpu`, `ranks` |
@@ -35,6 +37,13 @@ function or checkpoint label: those are in the summary lines.
 | `nvsnap_capture_phase_seconds` | histogram | `method`, `phase`, `gpu`, `ranks` |
 | `nvsnap_capture_outcomes_total` | counter | `method`, `outcome`, `reason`, `gpu`, `ranks` |
 | `nvsnap_capture_bytes` | histogram | `method`, `part`, `gpu` |
+| `nvsnap_teardown_outcomes_total` | counter | `outcome`, `gpu`, `ranks` |
+| `nvsnap_teardown_seconds` | histogram | `gpu`, `ranks` |
+| `nvsnap_capture_records` | gauge, inventory leader | `state`, `bundle` |
+| `nvsnap_capture_record_oldest_seconds` | gauge, inventory leader | `state` |
+| `nvsnap_capture_records_unrestored` | gauge, inventory leader | |
+| `nvsnap_inventory_leader` | gauge | |
+| `nvsnap_inventory_scan_timestamp_seconds` | gauge | |
 | `nvsnap_admissions_total` | counter | `decision`, `reason` |
 | `nvsnap_webhook_requests_total` | counter | `code` |
 | `nvsnap_webhook_request_seconds` | histogram | |
@@ -61,12 +70,31 @@ Labels:
   `fsstore`, `volume` (`unknown` for a fetch that found no source). A
   checkpoint already on the node is no fetch.
 
+Every lifecycle event counts (the series in the table above; the older
+`nvsnap_checkpoint_*`, `nvsnap_restore_total` and API series are counted
+as before). A labelled series exists only from its first
+observation, and `increase()` and `rate()` cannot count the observation that
+created it: a counter first scraped at 1 has no 0 before it. On a cluster
+where a node captures or restores a few times a day, that would be most
+events, each node's first failure among them. So the agent creates a
+series at zero on its first observation and holds that observation, and any
+other made meanwhile, for two minutes, until Prometheus has scraped the zero
+(`internal/metrics/first_sight.go`). A series appears up to two minutes
+after its first event; an agent that stops within those two minutes loses
+the held observations. The chart refuses a scrape interval over 40 seconds,
+which the hold could not cover.
+
 What is measured:
 
-- **Pod start** (`pod_ready_seconds`): a GPU pod's creation to Ready, once per
-  pod, by the agent of its node. Only pods the webhook admitted count, and
-  only those that became Ready while the agent watched (an agent restart
-  does not count running pods again).
+- **Scale-up** (`pod_start_seconds`): a GPU pod's time from being scheduled,
+  its GPUs given to it, to Ready, once per pod, by the agent of its node:
+  the time a new instance takes once it has its GPUs. Compare `criu` with
+  `cold`.
+- **Pod start** (`pod_ready_seconds`): the same pods from their creation to
+  Ready, so with the time they waited for GPUs: a restored instance's pods
+  wait for the pods of the instance they replace to go. Only pods the
+  webhook admitted count, and only those that became Ready while the agent
+  watched (an agent restart does not count running pods again).
 - **Restore phases**: per rank, on its node: `criu`, `gpu` (GPU state reload
   and resume), `rank` (the node's whole restore). Per instance: `group`
   (placeholders running to every rank restored) and `ready` (restored to the
@@ -96,6 +124,28 @@ What is measured:
   gpushare library).
 - **Capture size** by `part`: `gpu` (GPU state), `rootfs` (rootfs diff),
   `memory` (the rest: process images), `cachedir`.
+- **Teardown** of a deleted restored instance
+  ([design](../design/GROUP-TEARDOWN.md)): per rank, by the agent of its
+  node, `outcome` `released` (every rank of its restore exited, then its pod
+  went) or `deadline` (its grace period ran out first and it was killed).
+  `teardown_seconds` is a released rank's time from its delete to that
+  point: mostly the engine's own graceful shutdown.
+- **Cached captures**: one agent of the cluster, the holder of the
+  `nvsnap-capture-inventory` Lease in the records' namespace
+  (`nvsnap_inventory_leader` 1), scans the capture records every minute
+  (`internal/agent/capture_inventory.go`). `capture_records` counts them by
+  `state` and the agent `bundle` that captured them: `complete` (verified;
+  restores use it), `verifying`, `abandoned` (still `verifying` in the
+  record, but its namespace went first), `failed`, `gpushare-failed`,
+  `restore-failed`, `capturing`, and `alias` (a record that names
+  another; `bundle` empty). `capture_record_oldest_seconds` is the oldest
+  record's age in each state, from its capture's start (from the record's
+  creation for a record with no start time, such as an alias);
+  `capture_records_unrestored` the complete records no restore has used
+  since their verification. `inventory_scan_timestamp_seconds` is the
+  leader's last successful scan. The other agents export the unlabelled
+  gauges at 0: read them with `max`. A new leader takes over within about a
+  minute of the old one stopping.
 - **Admissions**: the webhook's decision for a GPU rank of a captured
   configuration: `restore`, `fallback` (reason: the configuration's state,
   `failed`, `restore-failed`, `gpushare-failed`) or `cold` (reason:
@@ -124,8 +174,14 @@ histogram_quantile(0.95, sum by (le, method) (rate(nvsnap_pod_ready_seconds_buck
 # where a CRIU restore's time goes, p50, for 8-rank instances
 histogram_quantile(0.5, sum by (le, phase) (rate(nvsnap_restore_phase_seconds_bucket{method="criu", ranks="5-8"}[1d])))
 
+# scale-up, p50: restored against cold, last 7 days
+histogram_quantile(0.5, sum by (le, method) (rate(nvsnap_pod_start_seconds_bucket[7d])))
+
 # why captures did not happen
 sum by (outcome, reason) (increase(nvsnap_capture_outcomes_total{outcome=~"failed|refused|gpushare-failed|unverified"}[7d]))
+
+# what is cached, by state and agent release
+max by (state, bundle) (nvsnap_capture_records)
 ```
 
 ## Summary lines
@@ -134,7 +190,10 @@ Each agent logs one line at the end of each capture, restore and pod start:
 `msg="nvsnap capture summary"`, `"nvsnap restore summary"`,
 `"nvsnap pod ready summary"`. Fields: `pod` or `criuGroup`, `method`,
 `outcome`, `reason`, `error`, `ranks`, `gpu`, `seconds` and, where they
-apply, `bytes`, `restoredToReadySeconds`, `fallbackReason`, `bundle`. An
+apply, `bytes`, `restoredToReadySeconds`, `scheduledToReadySeconds`,
+`fallbackReason`, `bundle`. A restored rank's teardown logs
+`"group teardown: every rank has exited; the rank's pod may go"` with
+`teardownSeconds`, or a warning when its grace period ran out. An
 `abandoned` capture's line has `namespace` (the namespace that went),
 `restores` (how many successful restores of it its record keeps: at most
 the last 10, so not every restore that ran; `internal/agent/lifecycle_metrics.go`
@@ -151,8 +210,11 @@ sets after it marks the pod restored, so the start is counted `criu`, not
 - Events on the pods: `NvsnapCaptured`, `NvsnapCaptureFailed`,
   `NvsnapCaptureRefused` (on the captured instance's first rank),
   `NvsnapRestored`, `NvsnapRestoreFailed` (on the restore's first rank),
-  `NvsnapStarted` (on each GPU pod, with its time to Ready and how it
-  started), `NvsnapNotAdmitted` (on a rank the webhook never mutated, once).
+  `NvsnapStarted` (on each GPU pod, with its time to Ready from its
+  creation and from its scheduling, and how it started),
+  `NvsnapNotAdmitted` (on a rank the webhook never mutated, once),
+  `NvsnapTeardownDeadline` (on a restored rank killed before every rank of
+  its restore exited).
 - Events on the nodes: `NvsnapGPUFault`, naming a GPU that failed the probe,
   the step and the CUDA error. nvsnap does not cordon the node.
 - A capture's group record (`nvsnap-criu-group-<key>` ConfigMap) keeps its
@@ -205,7 +267,12 @@ agent:
       labels:                 # what that Prometheus selects monitors by
         prometheus.agent/servicemonitor-discover: "true"
         nvcf.nvidia.com/observability-target: "true"
-      interval: 30s
+      interval: 30s     # whole seconds, at most 40s (the first-sight hold)
+    prometheusRule:
+      enabled: auto     # the alerts, as a PrometheusRule
+      namespace: monitoring
+      labels:           # what the cluster's Prometheus selects rules by
+        release: prometheus-agent
     dashboard:
       enabled: true     # a Grafana dashboard ConfigMap (grafana_dashboard: "1")
       labels: {}
@@ -223,7 +290,8 @@ agent:
   collector of `examples/cluster-monitoring-sample/otel-collector-k8s.yaml`
   has its own scrape jobs. Add one for the agents: Kubernetes endpoints of
   the `nvsnap-agent` Service in the release's namespace, port `http-api`,
-  path `/metrics`.
+  path `/metrics`, every 40 seconds or more often (the first-sight hold
+  needs several scrapes; the chart can check only a ServiceMonitor's).
 - **An installer that may not read namespaces.** The chart looks up the
   configured namespace before using it. Set `namespace: ""` to use the
   release's namespace without a lookup.
@@ -232,5 +300,19 @@ To check that the agents are scraped, query `nvsnap_build_info` in the
 cluster's Prometheus: there is one series per agent.
 
 The dashboard is
-`deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`; import
-it by hand into a Grafana without the dashboard sidecar.
+`deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`, generated
+by `scripts/grafana-dashboard-history.py` (edit the script, not the JSON).
+Import it by hand into a Grafana without the dashboard sidecar. Its queries
+filter on a `cluster` label, which a Prometheus that remote-writes the
+series to a central store adds as an external label; its "All" also
+matches series without one.
+
+The alerts are `deploy/helm/nvsnap/files/prometheus-rules.yaml`, every
+one at severity `info`, with a [runbook](RUNBOOK.md) entry each. The chart
+installs them as a PrometheusRule, which only a Prometheus that evaluates
+rules acts on; with a collector that does not (an OpenTelemetry
+collector), load the file into the rule evaluator of the store it writes
+to. A Go test in the build checks that every alert has promtool cases and
+a runbook section. Check and
+unit-test them with `deploy/helm/nvsnap/files/test-rules.sh` (promtool, or
+the pinned Prometheus image).

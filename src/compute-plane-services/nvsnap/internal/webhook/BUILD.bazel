@@ -77,6 +77,7 @@ go_test(
         "instance_identity_test.go",
         "l2_mount_test.go",
         "liveness_test.go",
+        "main_test.go",
         "mergeplan_test.go",
         "model_volume_test.go",
         "mutate_test.go",

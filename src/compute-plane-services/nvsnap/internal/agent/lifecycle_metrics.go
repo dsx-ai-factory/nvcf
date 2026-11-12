@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -46,6 +47,9 @@ const (
 	eventRestored       = "NvsnapRestored"
 	eventRestoreFailed  = "NvsnapRestoreFailed"
 	eventStarted        = "NvsnapStarted"
+	// eventTeardownDeadline: a restored rank's pod was killed before every
+	// rank of its restore had exited (teardown_barrier.go).
+	eventTeardownDeadline = "NvsnapTeardownDeadline"
 )
 
 // podEvent records an event on pod; nothing without a kube client.
@@ -403,6 +407,15 @@ func (c *criuAutoRestorer) observePodReady(ctx context.Context, pod *corev1.Pod)
 	metrics.ObservePodReady(method, gpu, ranks, took)
 	fields := logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "method": method, "ranks": ranks, "gpu": gpu,
 		"seconds": int(took.Seconds()), "bundle": c.a.currentBundle()}
+	// The scale-up time: from the pod being given its GPUs, so not the
+	// time it waited for them (for a restore, for the pods it replaces to go).
+	started := ""
+	if at := scheduledAt(pod); !at.IsZero() {
+		d := ready.Sub(at)
+		metrics.ObservePodStart(method, gpu, ranks, d)
+		fields["scheduledToReadySeconds"] = int(d.Seconds())
+		started = fmt.Sprintf(", %s after it was scheduled", d.Round(time.Second))
+	}
 	if method == metrics.MethodCRIU {
 		if at := restoredAt(pod); !at.IsZero() {
 			d := ready.Sub(at.Time)
@@ -414,7 +427,7 @@ func (c *criuAutoRestorer) observePodReady(ctx context.Context, pod *corev1.Pod)
 		fields["fallbackReason"] = r
 	}
 	c.a.log.WithFields(fields).Info(podReadySummary)
-	c.a.podEvent(pod, false, eventStarted, "Ready %s after creation (%s start)", took.Round(time.Second), method)
+	c.a.podEvent(pod, false, eventStarted, "Ready %s after creation%s (%s start)", took.Round(time.Second), started, method)
 }
 
 // podStartMethod is how pod started: restored from a CRIU capture, seeded
@@ -432,4 +445,15 @@ func podStartMethod(pod *corev1.Pod) string {
 	default:
 		return metrics.MethodCold
 	}
+}
+
+// scheduledAt is when pod was bound to its node, given its GPUs; zero
+// when not known.
+func scheduledAt(pod *corev1.Pod) time.Time {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionTrue {
+			return c.LastTransitionTime.Time
+		}
+	}
+	return time.Time{}
 }

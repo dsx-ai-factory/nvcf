@@ -777,6 +777,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.startCRIUAutoRestore(ctx); err != nil {
 		a.log.WithError(err).Error("CRIU auto-restore failed to start; CRIU captures will not restore into new pods")
 	}
+	a.startCaptureInventory(ctx)
 	a.startGPUShareStoreReaper(ctx)
 	a.sweepRailsPods(ctx)
 	a.startRailsServeReaper(ctx)
