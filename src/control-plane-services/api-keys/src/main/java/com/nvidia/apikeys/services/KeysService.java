@@ -119,10 +119,9 @@ public class KeysService {
 
     public List<KeyByOwnerAndServiceVo> suspendKeys(SuspendKeysRequestVo request) {
         KeyOwnerVo keyOwner = request.getKeyOwner();
-        String serviceId = request.getService().getServiceId();
-
         var allKeys = keysDao.list(
-                keyOwner.getOwnerType(), keyOwner.getOwnerId(), serviceId);
+                keyOwner.getOwnerType(), keyOwner.getOwnerId(),
+                request.getService().serviceIdAliasGroup());
 
         return allKeys.stream()
                 .map(key -> key.getKeyStatus() != ACTIVE ? key : suspendKey(key, keyOwner))
@@ -162,10 +161,9 @@ public class KeysService {
 
     public List<KeyByOwnerAndServiceVo> listKeys(ListKeysRequestVo request) {
         KeyOwnerVo keyOwner = request.getKeyOwner();
-        String serviceId = request.getService().getServiceId();
-
         return keysDao.list(
-                keyOwner.getOwnerType(), keyOwner.getOwnerId(), serviceId);
+                keyOwner.getOwnerType(), keyOwner.getOwnerId(),
+                request.getService().serviceIdAliasGroup());
     }
 
     public void deleteKeys(KeyOwnerVo keyOwnerVo) {

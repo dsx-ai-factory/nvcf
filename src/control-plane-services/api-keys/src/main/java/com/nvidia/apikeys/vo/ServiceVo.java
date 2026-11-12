@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.vo;
 
+import java.util.LinkedHashSet;
 import java.util.Set;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -32,8 +33,19 @@ public class ServiceVo {
     private String serviceId;
     private String serviceName;
     private Set<String> audienceServiceIds;
+    private Set<String> legacyServiceIds;
     private int maxApiKeysPerUser;
     private int maxApiKeyTtlDays;
     private int maxAuthzSizeChars;
     private int minAuthzUpdateIntervalSeconds;
+
+    /** The registered ID first, then its legacy aliases. */
+    public Set<String> serviceIdAliasGroup() {
+        Set<String> group = new LinkedHashSet<>();
+        group.add(serviceId);
+        if (legacyServiceIds != null) {
+            group.addAll(legacyServiceIds);
+        }
+        return group;
+    }
 }

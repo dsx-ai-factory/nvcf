@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.services;
 
+import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -29,6 +30,8 @@ import com.nvidia.apikeys.dto.introspection.IntrospectionResponse;
 import com.nvidia.apikeys.dto.authz.AuthzResponse;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import static com.nvidia.apikeys.TestData.SERVICE_VO_1;
+import static com.nvidia.apikeys.TestData.servicesService;
 import org.mockito.InjectMocks;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -43,6 +46,9 @@ class AuthzServiceTest {
     private NakProperties nakPropertiesSpy = NakProperties.builder()
             .ncaId("test-nca-id")
             .build();
+
+    @Spy
+    private ServicesService servicesService = servicesService(SERVICE_VO_1);
 
     @InjectMocks
     private AuthzService authzService;
@@ -276,4 +282,44 @@ class AuthzServiceTest {
         assertNotNull(response);
     }
 
+
+    @Test
+    void evaluatePolicy_matchesLegacyPolicyAudienceToCanonicalRequest() throws Exception {
+        String json = """
+                {"authorizations": {"policies": [
+                    {"aud": "nvidia-cloud-functions-ncp-service-id-aketm", "policy": "legacy-policy"}
+                ]}}
+                """;
+        var introspectionResponse = jsonMapper.readValue(json, IntrospectionResponse.class);
+        var aliased = servicesService(SERVICE_VO_1.toBuilder()
+                .serviceId("cloud-functions")
+                .legacyServiceIds(Set.of(NVCF_SERVICE_ID))
+                .build());
+        var aliasedAuthz = new AuthzService(nakPropertiesSpy, aliased);
+
+        AuthzResponse.Result response = aliasedAuthz.evaluatePolicy(
+                "cloud-functions", introspectionResponse, "apikey.allow");
+
+        assertEquals("legacy-policy", response.getPolicy().get("policy").asString());
+    }
+
+    @Test
+    void evaluatePolicy_matchesCanonicalPolicyAudienceToLegacyRequest() throws Exception {
+        String json = """
+                {"authorizations": {"policies": [
+                    {"aud": "cloud-functions", "policy": "canonical-policy"}
+                ]}}
+                """;
+        var introspectionResponse = jsonMapper.readValue(json, IntrospectionResponse.class);
+        var aliased = servicesService(SERVICE_VO_1.toBuilder()
+                .serviceId("cloud-functions")
+                .legacyServiceIds(Set.of(NVCF_SERVICE_ID))
+                .build());
+        var aliasedAuthz = new AuthzService(nakPropertiesSpy, aliased);
+
+        AuthzResponse.Result response = aliasedAuthz.evaluatePolicy(
+                NVCF_SERVICE_ID, introspectionResponse, "apikey.allow");
+
+        assertEquals("canonical-policy", response.getPolicy().get("policy").asString());
+    }
 }
