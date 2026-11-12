@@ -235,10 +235,30 @@ static int signal_others(const char *procs, int sig) {
 	return n;
 }
 
+/* unsignaled_left reports whether a process SIGTERM could not reach is
+ * still listed in procs and alive (or, the list being full, might be). */
+static int unsignaled_left(const char *procs) {
+	if (unsignaled_full)
+		return 1;
+	if (n_unsignaled == 0)
+		return 0;
+	FILE *f = fopen(procs, "r");
+	if (!f)
+		return 1;
+	int left = 0;
+	long pid;
+	while (!left && fscanf(f, "%ld", &pid) == 1)
+		if (pid > 0 && is_unsignaled((pid_t)pid) && (kill((pid_t)pid, 0) == 0 || errno == EPERM))
+			left = 1;
+	fclose(f);
+	return left;
+}
+
 /* forward_term passes SIGTERM to the rest of the container and waits,
- * reaping what is this program's, until none of it is left. Returns 0 when
- * it cannot tell what the container holds (outside a pod, or its process
- * list unreadable), else 1 once the rest of the container is gone. */
+ * reaping what is this program's, until none of what it signaled is left.
+ * Returns 1 once the whole rest of the container is gone, else 0: it cannot
+ * tell what the container holds (outside a pod, or its process list
+ * unreadable), or a process it could not signal still runs. */
 static int forward_term(void) {
 	char procs[4200];
 	if (!procs_path(procs, sizeof procs))
@@ -247,7 +267,7 @@ static int forward_term(void) {
 	if (n < 0)
 		return 0;
 	if (n == 0)
-		return 1;
+		return !unsignaled_left(procs);
 	for (;;) {
 		while (waitpid(-1, NULL, WNOHANG) > 0) {
 		}
@@ -255,7 +275,7 @@ static int forward_term(void) {
 		if (n < 0)
 			return 0;
 		if (n == 0)
-			return 1;
+			return !unsignaled_left(procs);
 		struct timespec ts = {0, 100 * 1000 * 1000};
 		nanosleep(&ts, NULL);
 	}

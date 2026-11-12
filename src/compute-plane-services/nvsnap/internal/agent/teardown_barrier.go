@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,9 +54,9 @@ func teardownRank(p *corev1.Pod) bool {
 // teardownReleased reports whether terminating rank self may go: its own
 // workload has exited (selfExited) and so has every other rank of the same
 // restore in pods, its namespace's pods. A rank whose pod is gone has
-// exited. The same restore: the instance's ranks restored before self was
-// deleted, deleted yet or not; a replacement restored after is another
-// restore's.
+// exited. The same restore: the instance's ranks restored before self's
+// delete was requested, deleted yet or not; a replacement restored after
+// is another restore's.
 func teardownReleased(self *corev1.Pod, pods []corev1.Pod, selfExited bool) bool {
 	if !selfExited {
 		return false
@@ -64,7 +65,7 @@ func teardownReleased(self *corev1.Pod, pods []corev1.Pod, selfExited bool) bool
 	for i := range pods {
 		p := &pods[i]
 		if p.UID == self.UID || p.Namespace != self.Namespace || p.Annotations[webhook.CRIUGroupAnnotation] != key ||
-			!teardownRank(p) || !sameInstance(self, p) || !restoredBefore(p, self.DeletionTimestamp) {
+			!teardownRank(p) || !sameInstance(self, p) || !restoredBefore(p, deleteRequested(self)) {
 			continue
 		}
 		if p.Annotations[webhook.TeardownExitedAnnotation] == "" {
@@ -83,6 +84,17 @@ func restoredBefore(p *corev1.Pod, t *metav1.Time) bool {
 	}
 	at, err := time.Parse(time.RFC3339, p.Annotations[webhook.CRIURestoredAnnotation])
 	return err != nil || !at.After(t.Time)
+}
+
+// deleteRequested is when p's delete was asked for. The API server sets
+// DeletionTimestamp to that time plus the grace period, when the kubelet
+// kills what is left.
+func deleteRequested(p *corev1.Pod) *metav1.Time {
+	if p.DeletionTimestamp == nil || p.DeletionGracePeriodSeconds == nil {
+		return p.DeletionTimestamp
+	}
+	t := metav1.NewTime(p.DeletionTimestamp.Add(-time.Duration(*p.DeletionGracePeriodSeconds) * time.Second))
+	return &t
 }
 
 // teardownWorkDir is a pod's restore work volume in the agent's view of
@@ -132,21 +144,26 @@ func liftTeardownHold(dir string) error {
 }
 
 // considerTeardown holds a restored rank of this node: it arms the hold
-// once the rank runs restored, and drives its release once it terminates.
+// the first time it sees the rank restored, and drives its release once it
+// terminates. A rank first seen already terminating (the agent started or
+// re-listed meanwhile) is held too, unless its placeholder has already
+// gone past the point where it looks for the hold.
 func (c *criuAutoRestorer) considerTeardown(ctx context.Context, pod *corev1.Pod) {
 	if !teardownRank(pod) {
 		return
 	}
 	uid := string(pod.UID)
 	log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": pod.Annotations[webhook.CRIUGroupAnnotation]})
+	if _, done := c.attempted.LoadOrStore("teardown-hold/"+uid, struct{}{}); !done {
+		dir := teardownWorkDir(pod.UID)
+		if pod.DeletionTimestamp == nil || !teardownExited(dir) {
+			if err := armTeardownHold(dir); err != nil {
+				log.WithError(err).Warn("group teardown: cannot hold the restored rank's pod; it may leave before its peers have exited")
+				c.attempted.Delete("teardown-hold/" + uid)
+			}
+		}
+	}
 	if pod.DeletionTimestamp == nil {
-		if _, done := c.attempted.LoadOrStore("teardown-hold/"+uid, struct{}{}); done {
-			return
-		}
-		if err := armTeardownHold(teardownWorkDir(pod.UID)); err != nil {
-			log.WithError(err).Warn("group teardown: cannot hold the restored rank's pod; it may leave before its peers have exited")
-			c.attempted.Delete("teardown-hold/" + uid)
-		}
 		return
 	}
 	if _, done := c.attempted.LoadOrStore("teardown/"+uid, struct{}{}); done {
@@ -158,17 +175,14 @@ func (c *criuAutoRestorer) considerTeardown(ctx context.Context, pod *corev1.Pod
 // driveTeardown reports the terminating rank's workload gone once its
 // placeholder says so, and lifts its hold once every rank of its restore
 // has exited. It stops when the hold is gone (lifted, or the pod and its
-// volume with it) or the grace period is over, when the kubelet has killed
-// the pod anyway.
+// volume with it) or the grace period is over (DeletionTimestamp, with a
+// margin), when the kubelet has killed the pod anyway.
 func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, log *logrus.Entry) {
 	dir := teardownWorkDir(pod.UID)
-	grace := int64(corev1.DefaultTerminationGracePeriodSeconds)
-	if pod.DeletionGracePeriodSeconds != nil {
-		grace = *pod.DeletionGracePeriodSeconds
-	} else if pod.Spec.TerminationGracePeriodSeconds != nil {
-		grace = *pod.Spec.TerminationGracePeriodSeconds
-	}
-	deadline := pod.DeletionTimestamp.Add(time.Duration(grace)*time.Second + 30*time.Second)
+	deadline := pod.DeletionTimestamp.Add(30 * time.Second)
+	// The report names the pod by UID too: a pod of the same name admitted
+	// after a force delete is not this rank and must not be marked exited.
+	annotationPath := "/metadata/annotations/" + strings.NewReplacer("~", "~0", "/", "~1").Replace(webhook.TeardownExitedAnnotation)
 	reported := pod.Annotations[webhook.TeardownExitedAnnotation] != ""
 	t0 := time.Now()
 	tick := time.NewTicker(teardownPoll)
@@ -176,10 +190,14 @@ func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, l
 	for teardownHeld(dir) && time.Now().Before(deadline) {
 		exited := teardownExited(dir)
 		if exited && !reported {
-			patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`, webhook.TeardownExitedAnnotation, time.Now().UTC().Format(time.RFC3339))
-			_, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
-			reported = err == nil || apierrors.IsNotFound(err)
-			if err != nil && !apierrors.IsNotFound(err) {
+			patch := fmt.Sprintf(`[{"op":"test","path":"/metadata/uid","value":%q},{"op":"add","path":%q,"value":%q}]`,
+				pod.UID, annotationPath, time.Now().UTC().Format(time.RFC3339))
+			_, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.JSONPatchType, []byte(patch), metav1.PatchOptions{})
+			// Not found, or found under another UID (the test fails, 422): this
+			// rank's pod is gone, which its peers count as exited.
+			gone := apierrors.IsNotFound(err) || apierrors.IsInvalid(err)
+			reported = err == nil || gone
+			if err != nil && !gone {
 				log.WithError(err).Warn("group teardown: cannot report the rank's workload gone; trying again")
 			}
 		}

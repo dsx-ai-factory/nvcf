@@ -39,15 +39,19 @@ replacement went to the old pods' teardown, not to the restore.
 No rank's pod finishes terminating until every rank of its restore has exited, so every node's IMEX daemon outlives
 the imports of it.
 
-- The agent holds each restored rank of a group of more than one pod: once the pod is marked restored, it creates
-  `teardown-hold` on the pod's restore work volume (an emptyDir, reached through the kubelet's pod directory). A lone
-  restore, a companion (no GPU state), and a rank started cold are not held.
+- The agent holds each restored rank of a group of more than one pod: the first time it sees the pod marked restored,
+  it creates `teardown-hold` on the pod's restore work volume (an emptyDir, reached through the kubelet's pod
+  directory). A rank first seen already terminating is held too, unless its placeholder has already reported its
+  workload gone. A lone restore, a companion (no GPU state), and a rank started cold are not held.
 - On SIGTERM the placeholder (`nvsnap-idle`) passes the signal to its container's processes and waits for them, as
-  before. Then, if the hold is there, it creates `teardown-exited` and stays until the hold is gone.
+  before. Then, if the hold is there and every process of the container is gone, it creates `teardown-exited` and
+  stays until the hold is gone. A process it could not signal (`EPERM`) that still runs means its workload is not
+  gone: it neither reports nor holds, and exits as before.
 - The rank's agent sees `teardown-exited`, records it on the pod (`nvsnap.io/criu-teardown-exited`) for the other
   ranks' agents, and removes the hold once every rank of the same restore has recorded it, or is gone. The same
-  restore: the instance's ranks restored before this pod was deleted; a replacement restored later is not waited
-  for.
+  restore: the instance's ranks restored before this pod's delete was requested (its `DeletionTimestamp` less its
+  grace period); a replacement restored later is not waited for. The record is a JSON patch that first tests the
+  pod's UID, so a pod of the same name admitted after a force delete is never marked.
 
 No new channel between agents: each reads the others' state from the pods.
 
@@ -62,6 +66,7 @@ never makes teardown longer than the grace period allows.
 | An agent restarts during the teardown | The terminating pod is listed again and its release driven again; nothing is kept in memory |
 | One rank is deleted, the others run on | It is held until they exit or its grace period ends |
 | The placeholder cannot see its container's processes | It neither reports its workload gone nor holds (`nvsnap-idle` exits as before) |
+| A process of the container could not be signaled and still runs | Not reported gone: the other ranks wait for this one, at worst to the end of their grace period |
 | The workload writes the files itself | It can only release its own pod early. The agent creates the hold without following a link, and only reads the report |
 | An older placeholder, or an older agent | No hold is made or none is honoured: teardown is as before |
 
@@ -70,9 +75,10 @@ The work volume is the pod's own, so a hold never outlives its pod or applies to
 ## 4. Verification
 
 Unit: `cmd/nvsnap-idle/idle_test.go` (`TestIdleHoldsUntilTheGroupIsReleased`,
-`TestIdleWithoutAHoldExitsWithItsWorkload`, `TestIdleBlindToItsContainerIgnoresTheHold`);
-`internal/agent/teardown_barrier_test.go` (`TestTeardownRank`, `TestTeardownReleased`, `TestTeardownHoldFile`,
-`TestDriveTeardownLiftsTheHoldOnceEveryRankHasExited`).
+`TestIdleWithoutAHoldExitsWithItsWorkload`, `TestIdleBlindToItsContainerIgnoresTheHold`,
+`TestIdleUnsignaledProcessIsNotReportedGone`); `internal/agent/teardown_barrier_test.go` (`TestTeardownRank`,
+`TestTeardownReleased`, `TestTeardownHoldFile`, `TestDriveTeardownLiftsTheHoldOnceEveryRankHasExited`,
+`TestConsiderTeardownHoldsARankFirstSeenTerminating`, `TestDriveTeardownDoesNotMarkAPodOfTheSameName`).
 
 On a cluster, not yet run: delete a restored multi-node instance and measure, per node, the time from the delete to
 the old pods gone, the IMEX robust channel recovery and Xid 45 events, and threads waiting in

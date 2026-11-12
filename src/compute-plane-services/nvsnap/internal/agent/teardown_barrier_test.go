@@ -4,6 +4,7 @@
 package agent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -135,6 +136,27 @@ func TestTeardownReleased(t *testing.T) {
 			t.Error("held for a replacement restored after this rank was deleted")
 		}
 	})
+	t.Run("a replacement restored within the grace period does not hold", func(t *testing.T) {
+		// DeletionTimestamp is the request plus the grace period: a
+		// replacement restored after the request, before that deadline, is
+		// another restore's.
+		grace := int64(180)
+		req := teardownT0.Add(time.Hour)
+		self := terminating(restoredRank(0, 2), req.Add(time.Duration(grace)*time.Second))
+		self.DeletionGracePeriodSeconds = &grace
+		old := terminating(restoredRank(1, 2), req.Add(time.Duration(grace)*time.Second))
+		old.DeletionGracePeriodSeconds = &grace
+		repl := restoredRank(1, 2)
+		repl.Name, repl.UID = "rank-1-new", "uid-rank-1-new"
+		repl.Annotations[webhook.CRIURestoredAnnotation] = req.Add(time.Minute).Format(time.RFC3339)
+		if !teardownReleased(self, podList(self, exitedRank(old), repl), true) {
+			t.Error("held for a replacement restored after the delete was requested")
+		}
+		running := terminating(restoredRank(1, 2), req.Add(time.Duration(grace)*time.Second))
+		if teardownReleased(self, podList(self, running), true) {
+			t.Error("released while a rank restored before the request still runs")
+		}
+	})
 	t.Run("other instances and companions do not hold", func(t *testing.T) {
 		p := peers()
 		other := restoredRank(1, 4)
@@ -261,5 +283,79 @@ func TestDriveTeardownLiftsTheHoldOnceEveryRankHasExited(t *testing.T) {
 	}
 	if teardownHeld(dir) {
 		t.Error("the driver returned with the hold still on")
+	}
+}
+
+// A rank the agent first sees already terminating (it started, or re-listed,
+// meanwhile) is held too, while its placeholder has not yet reported its
+// workload gone.
+func TestConsiderTeardownHoldsARankFirstSeenTerminating(t *testing.T) {
+	root := t.TempDir()
+	old := cachedirPodsRoot
+	cachedirPodsRoot = root
+	t.Cleanup(func() { cachedirPodsRoot = old })
+
+	self := terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
+	kc := fake.NewSimpleClientset(self)
+	c := &criuAutoRestorer{a: &Agent{kubeClient: kc, log: logrus.New()}}
+	dir := teardownWorkDir(self.UID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c.considerTeardown(ctx, self)
+	if !teardownHeld(dir) {
+		t.Fatal("a restored rank first seen terminating was not held")
+	}
+
+	// Its placeholder already reported the workload gone, with no hold:
+	// nothing to hold any more.
+	other := terminating(restoredRank(1, 2), time.Now().Add(time.Minute))
+	odir := teardownWorkDir(other.UID)
+	if err := os.MkdirAll(odir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(odir, webhook.TeardownExitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.considerTeardown(ctx, other)
+	if teardownHeld(odir) {
+		t.Error("held a rank whose placeholder had already reported its workload gone")
+	}
+}
+
+// The exit report is bound to the rank's UID: a pod of the same name
+// admitted after a force delete is not marked exited.
+func TestDriveTeardownDoesNotMarkAPodOfTheSameName(t *testing.T) {
+	root := t.TempDir()
+	old, oldPoll := cachedirPodsRoot, teardownPoll
+	cachedirPodsRoot, teardownPoll = root, 20*time.Millisecond
+	t.Cleanup(func() { cachedirPodsRoot, teardownPoll = old, oldPoll })
+
+	self := terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
+	repl := restoredRank(0, 2)
+	repl.UID = "uid-rank-0-new"
+	kc := fake.NewSimpleClientset(repl)
+	c := &criuAutoRestorer{a: &Agent{kubeClient: kc, log: logrus.New()}}
+	dir := teardownWorkDir(self.UID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := armTeardownHold(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, webhook.TeardownExitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	c.driveTeardown(ctx, self, logrus.NewEntry(logrus.New()))
+	got, err := kc.CoreV1().Pods("ns").Get(t.Context(), repl.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[webhook.TeardownExitedAnnotation] != "" {
+		t.Error("the exit report marked a different pod of the same name")
 	}
 }

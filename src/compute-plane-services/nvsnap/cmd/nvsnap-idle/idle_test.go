@@ -479,6 +479,48 @@ func TestIdleReportsAProcessItCannotSignal(t *testing.T) {
 	<-waited
 }
 
+// A placeholder that could not signal a process of its container does not
+// report its workload gone while that process runs, hold or not: the
+// group's peers wait for it (at worst to the end of their grace period)
+// rather than leave the fabric while it may still hold memory from them.
+func TestIdleUnsignaledProcessIsNotReportedGone(t *testing.T) {
+	if err := syscall.Kill(1, 0); !errors.Is(err, syscall.EPERM) {
+		t.Skipf("pid 1 can be signaled here (%v)", err)
+	}
+	bin := buildIdle(t)
+	dir, teardown := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(teardown, "teardown-hold"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, waited := startWorkload(t, dir)
+	procs := filepath.Join(dir, "cgroup.procs")
+	if err := os.WriteFile(procs, []byte("1\n"+strconv.Itoa(w.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idle := exec.CommandContext(t.Context(), bin) //nolint:gosec // runs the program under test
+	idle.Env = append(os.Environ(), "NVSNAP_IDLE_PROCS="+procs, "NVSNAP_IDLE_TEARDOWN="+teardown)
+	if err := idle.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_ = idle.Process.Signal(syscall.SIGTERM)
+	exited := make(chan error, 1)
+	go func() { exited <- idle.Wait() }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatalf("placeholder: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = idle.Process.Kill()
+		t.Fatal("the placeholder held the pod with a process it could not signal still running")
+	}
+	if _, err := os.Stat(filepath.Join(teardown, "teardown-exited")); err == nil {
+		t.Error("reported the workload gone while a process it could not signal still runs")
+	}
+	<-waited
+}
+
 // startTermed starts the placeholder over a workload (startWorkload) with
 // NVSNAP_IDLE_TEARDOWN at teardown, sends it SIGTERM, and returns its exit.
 func startTermed(t *testing.T, bin, dir, teardown string) <-chan error {
