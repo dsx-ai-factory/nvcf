@@ -136,7 +136,7 @@ func (q *Quarantine) Entries() ([]Candidate, error) {
 		}
 		size, err := treeSize(filepath.Join(q.dir, item.Name()))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
 		entries = append(entries, Candidate{Key: item.Name(), Bytes: size, ModTime: info.ModTime()})
 	}
@@ -156,7 +156,7 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 		}
 		size, err := treeSize(filepath.Join(q.RejectsDir(), item.Name()))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
 		entries = append(entries, Candidate{Key: RejectsDirName + "/" + item.Name(), Bytes: size, ModTime: info.ModTime()})
 	}
@@ -218,14 +218,23 @@ func validEntryName(name string) bool {
 	return name != "" && name != "." && name != ".." && name != RejectsDirName && !strings.ContainsAny(name, `/\`)
 }
 
+// treeSize adds up the regular files under root. A file or directory that
+// is gone by the time the walk reaches it, such as one deleted meanwhile,
+// holds nothing.
 func treeSize(root string) (int64, error) {
 	var size int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		if d.Type().IsRegular() {
 			info, err := d.Info()
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -233,10 +242,7 @@ func treeSize(root string) (int64, error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return 0, fmt.Errorf("measure quarantine entry: %w", err)
-	}
-	return size, nil
+	return size, err
 }
 
 func syncDir(dir string) error {

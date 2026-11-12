@@ -7,11 +7,16 @@
 // first. Every deletion is counted, because each one is data that will not
 // reach its destination.
 //
-// Usage is measured on the whole filesystem that holds the spool, so the
-// spool needs a volume of its own. On a disk it shares with other data,
-// such as an emptyDir on the node's disk, that data counts as used: the
-// guard would pause preparing and delete segments without bringing usage
-// below the watermark.
+// Usage is measured on the whole filesystem that holds the spool. On a disk
+// the spool shares with other data, such as an emptyDir on the node's disk,
+// that data counts as used, and the spool's own size limit is not seen. A
+// budget fixes both: the files the spool holds are measured against the
+// spool's own size as well, and the fuller of the budget and the filesystem
+// sets the watermark, while the free-space floor holds in both.
+//
+// The free-space floor is at most half the share of the spool that the high
+// watermark leaves free, of the smaller of the filesystem and the budget, so
+// a small spool that relief brings back to its watermark prepares again.
 package diskguard
 
 import (
@@ -108,6 +113,9 @@ type Options struct {
 	Counter Counter
 	Gauges  Gauges
 	Logger  *slog.Logger
+	// Budget, when set, bounds the spool to its own size next to its
+	// filesystem.
+	Budget Budget
 }
 
 // Guard applies the disk rules. Enforce must not run concurrently with
@@ -115,6 +123,7 @@ type Options struct {
 type Guard struct {
 	cfg        Config
 	volume     Volume
+	budget     Budget
 	quarantine QuarantineStore
 	segments   Segments
 	counter    Counter
@@ -130,6 +139,7 @@ func New(cfg Config, volume Volume, quarantine QuarantineStore, segments Segment
 	g := &Guard{
 		cfg:        cfg,
 		volume:     volume,
+		budget:     opts.Budget,
 		quarantine: quarantine,
 		segments:   segments,
 		counter:    opts.Counter,
@@ -159,14 +169,14 @@ func (g *Guard) AllowPrepare(estimate int64, waiting int) (Decision, error) {
 	if waiting >= g.cfg.PrepareAhead {
 		return Decision{Reason: PausePrepareAhead}, nil
 	}
-	usage, err := g.volume.Usage()
+	r, err := g.room()
 	if err != nil {
 		return Decision{}, err
 	}
-	if g.aboveWatermark(usedBytes(usage), usage.Total) {
+	if r.excess > 0 {
 		return Decision{Reason: PauseHighWatermark}, nil
 	}
-	if int64(usage.Free) < max(2*estimate, g.cfg.MinFreeBytes) {
+	if r.free < max(2*estimate, r.floor) {
 		return Decision{Reason: PauseFreeSpace}, nil
 	}
 	return Decision{Allowed: true}, nil
@@ -178,7 +188,7 @@ func (g *Guard) AllowPrepare(estimate int64, waiting int) (Decision, error) {
 // is back at the watermark. Every deletion is counted.
 func (g *Guard) Enforce(now time.Time) (Report, error) {
 	var report Report
-	usage, err := g.volume.Usage()
+	r, err := g.room()
 	if err != nil {
 		return report, err
 	}
@@ -194,7 +204,7 @@ func (g *Guard) Enforce(now time.Time) (Report, error) {
 
 	// An entry whose removal failed is still on disk: it keeps counting in
 	// held, so the next entries go instead, and it is tried again next pass.
-	limit := int64(g.cfg.QuarantineMaxFraction * float64(usage.Total))
+	limit := int64(g.cfg.QuarantineMaxFraction * float64(r.total))
 	var fresh []Candidate
 	var held int64
 	for _, e := range entries {
@@ -222,10 +232,10 @@ func (g *Guard) Enforce(now time.Time) (Report, error) {
 		}
 	}
 
-	used := usedBytes(usage) - report.FreedBytes
-	if g.aboveWatermark(used, usage.Total) {
+	// Every byte freed comes off the budget and the filesystem alike.
+	if excess := r.excess - report.FreedBytes; excess > 0 {
 		report.AboveWatermark = true
-		errs = append(errs, g.relieve(used-watermarkBytes(g.cfg.HighWatermark, usage.Total), kept, &report))
+		errs = append(errs, g.relieve(excess, kept, &report))
 	}
 	if report.QuarantineEvicted > 0 || report.SegmentsEvicted > 0 {
 		g.logger.Warn("deleted spool data to stay within disk bounds",
@@ -302,10 +312,10 @@ func (g *Guard) removeQuarantine(e Candidate, report *Report) (bool, error) {
 	return true, nil
 }
 
-// UpdateGauges sets the spool gauges from the volume and the segments not
-// yet done.
+// UpdateGauges sets the spool gauges from the fuller volume, the least free
+// space, and the segments not yet done.
 func (g *Guard) UpdateGauges(now time.Time, pending []Candidate) error {
-	usage, err := g.volume.Usage()
+	r, err := g.room()
 	if err != nil {
 		return err
 	}
@@ -321,16 +331,66 @@ func (g *Guard) UpdateGauges(now time.Time, pending []Candidate) error {
 	if !oldest.IsZero() {
 		age = max(now.Sub(oldest).Seconds(), 0)
 	}
-	g.gauges.Set(GaugeSpoolUsedBytes, float64(usedBytes(usage)))
-	g.gauges.Set(GaugeSpoolFreeBytes, float64(usage.Free))
+	g.gauges.Set(GaugeSpoolUsedBytes, float64(r.used))
+	g.gauges.Set(GaugeSpoolFreeBytes, float64(r.free))
 	g.gauges.Set(GaugePendingSegments, float64(len(pending)))
 	g.gauges.Set(GaugePendingBytes, float64(bytes))
 	g.gauges.Set(GaugeOldestPendingAge, age)
 	return nil
 }
 
-func (g *Guard) aboveWatermark(used int64, total uint64) bool {
-	return used > watermarkBytes(g.cfg.HighWatermark, total)
+// room is the spool's room across the filesystem and, when set, the
+// budget.
+type room struct {
+	// used is the fuller volume's used bytes.
+	used int64
+	// excess is how far the fuller volume is above its high watermark, in
+	// bytes; zero or less is at or below it.
+	excess int64
+	// free is the least free space of the volumes.
+	free int64
+	// total is the smallest volume, the size quarantine's share is of.
+	total uint64
+	// floor is the least free space preparing leaves.
+	floor int64
+}
+
+// room measures the filesystem and the budget. The fuller is the one
+// further above, or less far below, its high watermark.
+func (g *Guard) room() (room, error) {
+	r, err := g.measure(g.volume)
+	if err != nil {
+		return room{}, err
+	}
+	if g.budget != nil {
+		size, held, err := g.budget.Held()
+		if err != nil {
+			return room{}, err
+		}
+		if excess := held - watermarkBytes(g.cfg.HighWatermark, uint64(size)); excess > r.excess {
+			r.used, r.excess = held, excess
+		}
+		r.free = min(r.free, max(size-held, 0))
+		r.total = min(r.total, uint64(size))
+	}
+	// Relief stops at the watermark, so the floor must sit below the free
+	// share the watermark leaves, or a small spool never prepares again.
+	r.floor = min(g.cfg.MinFreeBytes, int64((1-g.cfg.HighWatermark)/2*float64(r.total)))
+	return r, nil
+}
+
+func (g *Guard) measure(v Volume) (room, error) {
+	usage, err := v.Usage()
+	if err != nil {
+		return room{}, err
+	}
+	used := usedBytes(usage)
+	return room{
+		used:   used,
+		excess: used - watermarkBytes(g.cfg.HighWatermark, usage.Total),
+		free:   int64(usage.Free),
+		total:  usage.Total,
+	}, nil
 }
 
 func watermarkBytes(fraction float64, total uint64) int64 {

@@ -61,15 +61,27 @@ volume, so every step survives a restart.
    spool. If the spool is still above 85% full, the oldest closed segments
    that are in no batch are deleted. A segment in a batch that may have been
    sent, and the active segment, are never deleted. Preparing pauses while
-   the spool is above 85%, while free space is under 512 MiB or twice the
-   next segment's size, or while 16 prepared segments, or the batch
-   segment setting if larger, wait for a batch;
-   prepared work is still sent. Every deletion is counted in
+   the spool is above 85%, while free space is under twice the next
+   segment's size or under 512 MiB, or while 16 prepared segments, or the
+   batch segment setting if larger, wait for a batch; prepared work is
+   still sent. On a spool under about 6.7 GiB the 512 MiB floor is 7.5% of
+   the spool instead, half of what the 85% watermark leaves free, so a
+   spool that relief brings back to 85% can prepare again. Below about
+   3.3 GiB, 15% is under 512 MiB (154 MiB on a 1 GiB spool), and at the
+   watermark it is all the room left for Dynamo's active segment and the
+   transport being written: if they outgrow it, an emptyDir goes over its
+   size limit and the kubelet evicts the pod. Every deletion is counted in
    `segments_evicted` or `quarantine_evicted`. Fullness is measured on the
-   whole filesystem that holds the spool, so the spool needs a volume of
-   its own: on a disk shared with other data, such as an emptyDir on the
-   node's disk, that data counts too, and segments could be deleted
-   without bringing usage below the watermark.
+   whole filesystem that holds the spool. On a disk shared with other
+   data, such as an emptyDir on the node's disk, that data counts too and
+   the emptyDir's size limit is not seen, so the pod can be evicted for
+   going over the limit before the spool looks full. Set
+   `REQUEST_TRACE_UPLOADER_SPOOL_BUDGET_BYTES` to the spool's emptyDir
+   `sizeLimit` or its PVC size: the files under the source, state and
+   quarantine directories are then measured against that budget as well,
+   the fuller of the budget and the filesystem sets the 85% watermark,
+   free space is the least of the two, and quarantine's 20% and the
+   floor's 7.5% are of the smaller.
 
 Faults follow `internal/retry`: auth failures and outages hold every submit
 without moving a segment; a segment fault quarantines that segment after a
@@ -214,6 +226,13 @@ Optional, with defaults:
   default `30m`, from `1m` to `24h`
 - `REQUEST_TRACE_UPLOADER_RETRY_AFTER_MAX`: the longest a destination's
   Retry-After may hold uploads; default `30m`, from `1m` to `24h`
+- `REQUEST_TRACE_UPLOADER_SPOOL_BUDGET_BYTES`: the spool's own size, as
+  whole bytes with no unit, from `1073741824` (1 GiB) to
+  `1125899906842624` (1 PiB); default none, and `0` is none too. Set it
+  from the spool's emptyDir `sizeLimit` or its PVC size. The spool bounds
+  then count the files the spool holds against it as well as the
+  filesystem; see step 8 of How it works. Without it only the filesystem
+  counts.
 
 Time settings are Go durations with a unit, such as `30s`, `5m` or `1h`. A
 bare number, a negative value, zero where zero is not allowed, or a value
