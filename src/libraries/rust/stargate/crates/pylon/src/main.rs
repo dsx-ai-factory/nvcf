@@ -120,7 +120,7 @@ struct Args {
     /// Maximum concurrent requests used during calibration
     #[arg(long, default_value_t = 4, value_name = "N")]
     calibration_max_concurrency: usize,
-    /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while other requests make progress does not mark the model unavailable
+    /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while requests for any model name on this Pylon make progress does not mark the model unavailable; this assumes the names share workers, as aliases do
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     bringup_canary_timeout_ms: u64,
     /// Timeout for calibration requests in milliseconds

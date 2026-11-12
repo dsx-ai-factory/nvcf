@@ -666,11 +666,13 @@ pub(crate) enum CanaryResult {
     /// Recent request progress on the model made the canary unnecessary.
     SkippedRecentProgress,
     /// The canary timed out while the upstream made progress on other requests.
+    /// In the recovery phase it restored the model.
     TimedOutUpstreamBusy,
     /// The upstream rejected the canary as overloaded while it made progress
-    /// on other requests.
+    /// on other requests. In the recovery phase it restored the model.
     RejectedUpstreamBusy,
-    /// The canary failed and counted against the model.
+    /// The canary failed and counted against the model, including a busy
+    /// recovery canary for a model demoted for a real failure.
     Failed,
 }
 
