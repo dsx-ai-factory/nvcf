@@ -99,6 +99,23 @@ func (s llmShutdown) inferenceLifecycle() *corev1.Lifecycle {
 	}
 }
 
+// holdTelemetrySidecars delays the stop signal of the BYOO collector and
+// fluent-bit by the same pause, so they keep shipping the inference server's
+// logs and telemetry while it serves. Their images have no sleep binary, so
+// this uses the kubelet's sleep action (stable since Kubernetes 1.34).
+func (s llmShutdown) holdTelemetrySidecars(pod *corev1.Pod) {
+	for i := range pod.Spec.Containers {
+		switch pod.Spec.Containers[i].Name {
+		case common.ByooOTelCollectorPodNameBase, common.FluentbitContainerName:
+			pod.Spec.Containers[i].Lifecycle = &corev1.Lifecycle{
+				PreStop: &corev1.LifecycleHandler{
+					Sleep: &corev1.SleepAction{Seconds: int64(s.pause / time.Second)},
+				},
+			}
+		}
+	}
+}
+
 func normalizeLLMRequestRouterAddressEnvAliases(envSet map[string]string) {
 	llmRequestRouterAddress := envSet[llmRequestRouterAddressEnv]
 	if llmRequestRouterAddress == "" {

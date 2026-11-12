@@ -205,6 +205,68 @@ func TestTranslateContainerLLMWorkerDrainTimeoutOverridesFunctionEnv(t *testing.
 		"a function's own value must not outlast the inference pause")
 }
 
+// translateTelemetryContainerPod translates a container function with BYOO
+// logs and metrics telemetry, so the pod gets the collector and fluent-bit.
+func translateTelemetryContainerPod(t *testing.T, env map[string]string, functionType string, pause time.Duration) *corev1.Pod {
+	t.Helper()
+
+	env[common.OTelContainerEnv] = "registry.example.com/org/byoo-otel-collector:1.2.3"
+	telemetries := &common.TelemetriesLaunchSpecification{}
+	telemetries.Telemetries.Logs = &common.Telemetry{Protocol: "http", Provider: "SPLUNK", Endpoint: "endpoint", Name: "logs"}
+	telemetries.Telemetries.Metrics = &common.Telemetry{Protocol: "http", Provider: "GRAFANA_CLOUD", Endpoint: "endpoint", Name: "metrics"}
+
+	msg := newContainerFunctionMessage()
+	msg.Details.FunctionType = functionType
+	msg.LaunchSpecification.EnvironmentB64 = encodeTextEnv(env)
+	msg.LaunchSpecification.Telemetries = telemetries
+	tcfg := TranslateConfig{TranslateConfig: newFunctionTranslateConfig(nil), LLMInferenceStopPause: metav1.Duration{Duration: pause}}
+	tcfg.FluentbitEnabled = true
+
+	objs, err := Translate(msg, tcfg)
+	require.NoError(t, err)
+	return findPodByName(t, objs, "0-request")
+}
+
+func TestTranslateContainerLLMTelemetrySidecarsWaitForInference(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured time.Duration
+		wantPause  time.Duration
+	}{
+		{name: "default", configured: 0, wantPause: 60 * time.Second},
+		{name: "configured", configured: 90 * time.Second, wantPause: 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := translateTelemetryContainerPod(t, llmContainerFunctionEnv(), FunctionTypeLLM, tc.configured)
+
+			assert.Equal(t, tc.wantPause, preStopSleep(t, findContainerByName(t, pod.Spec.Containers, inferenceContainerName)))
+			for _, name := range []string{common.ByooOTelCollectorPodNameBase, common.FluentbitContainerName} {
+				c := findContainerByName(t, pod.Spec.Containers, name)
+				require.NotNil(t, c.Lifecycle, "sidecar %q has no lifecycle hooks", name)
+				require.NotNil(t, c.Lifecycle.PreStop, "sidecar %q has no preStop hook", name)
+				// The images have no sleep binary, so the hook must be the
+				// kubelet's sleep action, not exec.
+				require.NotNil(t, c.Lifecycle.PreStop.Sleep, "sidecar %q preStop is not a sleep action", name)
+				assert.Nil(t, c.Lifecycle.PreStop.Exec, "sidecar %q", name)
+				assert.Equal(t, tc.wantPause, time.Duration(c.Lifecycle.PreStop.Sleep.Seconds)*time.Second,
+					"sidecar %q must keep shipping telemetry while the inference server serves", name)
+			}
+		})
+	}
+}
+
+func TestTranslateContainerNonLLMTelemetrySidecarsKeepDefaultShutdown(t *testing.T) {
+	pod := translateTelemetryContainerPod(t, map[string]string{
+		common.ContainerFunctionImageEnv: "nvcr.io/nvidia/function:latest",
+		common.UtilsImageEnv:             "nvcr.io/nvidia/utils:latest",
+		common.InitImageEnv:              "nvcr.io/nvidia/init:latest",
+	}, "", 5*time.Minute)
+
+	for _, name := range []string{common.ByooOTelCollectorPodNameBase, common.FluentbitContainerName} {
+		assert.Nil(t, findContainerByName(t, pod.Spec.Containers, name).Lifecycle, "sidecar %q", name)
+	}
+}
+
 func TestTranslateContainerNonLLMKeepsDefaultShutdown(t *testing.T) {
 	msg := newContainerFunctionMessage()
 	msg.LaunchSpecification.EnvironmentB64 = encodeTextEnv(map[string]string{

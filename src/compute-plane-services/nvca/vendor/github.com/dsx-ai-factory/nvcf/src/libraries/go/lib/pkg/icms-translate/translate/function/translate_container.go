@@ -472,6 +472,9 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			if fluentbitCM != nil {
 				objs = append(objs, fluentbitCM)
 			}
+			if isLLM {
+				newLLMShutdown(tcfg.LLMInferenceStopPause.Duration).holdTelemetrySidecars(pod)
+			}
 		}
 
 		objs = append(objs, pod)

@@ -55,7 +55,12 @@ deadline. A removed pod therefore releases its GPU up to one pause later. To
 change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
 chart values, for example `90s`, between `10s` and `1h`; it applies to worker
 pods created after NVCA picks up the new value. The pause runs `sleep` in the
-function container; an image without `sleep` stops at once, as before.
+function container; an image without `sleep` stops at once, as before. When
+the function uses Bring Your Own Observability (BYOO), the BYOO collector and
+log-forwarder sidecars wait for the same pause, so telemetry from requests
+served during the pause is still sent. They use the Kubernetes `sleep`
+lifecycle action, which is stable since Kubernetes 1.34. The function
+container's own shutdown output after the pause may not be sent.
 
 ## Enable on an Existing Installation
 
