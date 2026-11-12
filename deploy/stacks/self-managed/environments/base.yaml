@@ -852,6 +852,7 @@ grpcproxy:
 #       }
 #   - Give workers the CA that issued Envoy's frontend certificate through
 #     global.nvcaOperator.agent.workerCallbackCaPem in the compute-plane stack.
+#     HTTP callbacks trust that CA from worker-utils 1.4.0.
 #     Workers need no stack CA when Envoy's frontend certificate comes from a
 #     public CA (tls.frontend below).
 # Workers' TLS always ends at Envoy. Envoy then opens its own TLS session to
