@@ -143,7 +143,7 @@ func TestClaimGroupRecordNamesIt(t *testing.T) {
 	a, _ := identityAgent(t, "sr-1")
 	c := &criuAutoRestorer{a: a}
 	leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "sr-1", Name: "p-0"}}
-	rec, err := c.claimGroupRecord(context.Background(), "k1", leader, 1)
+	rec, err := c.claimGroupRecord(context.Background(), "k1", 0, leader, 1)
 	if err != nil || rec == nil {
 		t.Fatalf("claim: %v %v", rec, err)
 	}

@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # When a CRIU capture or the gpushare library fails: the caches
 
-Status: 2.1, 2.3, 2.5 done; 2.2, 2.6, 2.7 implemented 2026-11-01, gate scenarios pending. Scope: `internal/agent/criu_group.go` (capture attempts and
+Status: 2.1, 2.3, 2.5 done; 2.2, 2.6, 2.7 implemented 2026-11-01, gate scenarios pending; 2.8 implemented 2026-11-12, not on a cluster yet. Scope: `internal/agent/criu_group.go` (capture attempts and
 the group record), `internal/webhook/mutate.go`, `cachedir.go` and `gpushare.go` (method per configuration),
 `internal/agent/gpushare.go` (resume after a failed dump), `internal/rootfsonly` and `internal/agent/rails_*.go`
 (the cachedir capture under a CRIU cluster and its transport).
@@ -22,6 +22,7 @@ the group record), `internal/webhook/mutate.go`, `cachedir.go` and `gpushare.go`
   - [2.5 What the preflight can find, it finds before the freeze](#25-what-the-preflight-can-find-it-finds-before-the-freeze)
   - [2.6 A workload that fails under the gpushare library](#26-a-workload-that-fails-under-the-gpushare-library)
   - [2.7 The cachedir capture over the bedrock peer](#27-the-cachedir-capture-over-the-bedrock-peer)
+  - [2.8 GPU drivers CRIU cannot serve on](#28-gpu-drivers-criu-cannot-serve-on)
 - [3. Status](#3-status)
 - [4. Tests](#4-tests)
 - [5. Not in this design](#5-not-in-this-design)
@@ -141,16 +142,64 @@ Restore, for a rank whose capture is complete:
 The pod mounts only its capture and marker directory, never the checkpoint directory. No new process, port or pod.
 The checkpoint reaper retires captures no record names.
 
+### 2.8 GPU drivers CRIU cannot serve on
+
+**Problem.** A driver older than 610 cannot restore multicast (NVLS) objects: tensor-parallel engines on NVSwitch
+systems fail at `remap` ([GPUSHARE.md](GPUSHARE.md#requirements-and-limits)). Nothing checked the driver, so on such
+a cluster each configuration would spend up to three captures, each with a failed restore and a cold start, before
+2.2 fell it back. And the group record key named no driver, so a capture could be restored under another one.
+
+**Design** (`internal/agent/driver_gate.go`):
+
+- **Each agent reports its node's driver.** At start it reads the major from `/proc/driver/nvidia/version` (else the
+  node's `nvidia.com/cuda.driver.major` label) and stamps it on its own pod as `nvsnap.io/driver-major`
+  (`reportDriver`, tried again every 30 s until done). A GPU node whose driver is not loaded yet (the agent can
+  start before the GPU operator) keeps trying; only a node without GPUs reports none.
+- **Admission goes by every GPU node.** The webhook does not know the node a pod will run on, so the agent answering
+  it reads every agent pod's report, and its own node's driver (`clusterDriver`, cached a minute; a failed read keeps
+  the last view and is tried again after the minute). CRIU serves only when every report names
+  the same major, at least `agent.criuMinDriverMajor` (`--criu-min-driver-major`, default 610). Otherwise
+  (`driverGate`):
+  - a GPU pod falls back to the cachedir with reason `driver`, with or without a record (`criuFallbackFor`), and
+    without the gpushare library;
+  - no capture is restored, so a companion starts cold (`lookupCRIUGroupFor`);
+  - a pod admitted before the drivers changed is not captured (`considerGroupCapture`, and again in
+    `captureGroup` with the read its keys are made from), and its capture hold is released;
+  - the checkpoint reaper keeps the cachedir records these pods are seeded from, which have no group record.
+- **The key names the driver.** With one major reported, the group record key is made with it
+  (`criuGroupKeyDriver`; the tenant scope is unchanged) and the record keeps it (`driver`). A capture is never
+  restored under another major: after a driver upgrade every configuration is captured once more. The trust check
+  takes the record's driver as well as the cluster's (`groupKeyRefusal`), so a placeholder admitted just before a
+  change is not refused, which would leave it waiting. On its node the restore does not run when the node's driver is
+  not the record's (`driverMismatch`): the pod is replaced, as for a checkpoint that could not be fetched, without
+  counting against the capture, and its replacement is admitted under the drivers as they are now.
+- **No reports, no change.** With no agent reporting (an older agent build), keys and decisions are as before.
+
+**Limits.**
+
+- One node on another major turns CRIU off for the whole cluster, though most pods would land on nodes it could
+  serve. Pinning restores to nodes of the capture's driver (node affinity) would keep it on, at the risk of pods
+  pending when those nodes are full; not done.
+- Rolling out this change, or a driver upgrade, makes every configuration's records unreachable: their keys name no
+  driver, or the old one. Each configuration is captured once more, and its old records and captures are retired by
+  the reaper.
+- Pods restored outside group records (the lone-pod catalog path) are keyed by driver already
+  (`checkpointstore.HashInput.CUDADriverMajor`), but not held to the minimum.
+
 ## 3. Status
 
-Done (unit tested): 2.1, 2.3, 2.5. Done (unit tested, not yet on a cluster): 2.2, 2.6, 2.7. Not done: 2.4.
+Done (unit tested): 2.1, 2.3, 2.5. Done (unit tested, not yet on a cluster): 2.2, 2.6, 2.7, 2.8. Not done: 2.4.
 
 ## 4. Tests
 
 - Unit: one attempt per bundle version; the webhook's fallback lookup and method choice for each record state and
   bundle; a fallback pod gets the cachedir mutations and, for `gpushare-failed`, no library; the record holds every
   member's error and is bounded; the agent marks a configuration after two failed starts of a never-Ready pod, not
-  of a Ready one; the rails fetch of a prefix, its sources from the manifest and its completeness check.
+  of a Ready one; the rails fetch of a prefix, its sources from the manifest and its completeness check. The driver
+  gate (`driver_gate_test.go`): the driver line of each kernel module form, the gate for no, one, an old and mixed
+  majors, the agents' reports read and cached, an agent stamping only its own pod, the key, admission and lookup
+  under each, the record's driver in the trust check, the capture skipped; a `driver` fallback pod has no library
+  and no capture hold.
 - Conformance gate: a CRIU capture made to fail (a post-dump action that exits 1) leaves the workload serving without
   replacement, the record `failed` with every member's error, and the next pod admitted with the cachedir capture; a
   workload that exits at start under the library is marked, readmitted without it, captured with cachedir, and its

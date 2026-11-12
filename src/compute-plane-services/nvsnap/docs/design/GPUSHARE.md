@@ -305,7 +305,10 @@ Limits of the move:
   NVSwitch systems fails at `remap` (NCCL NVLS, PyTorch symmetric memory and
   FlashInfer's all-reduce fusion use multicast). On x86 with 580.126.16 (RTX
   PRO 6000), the driver's own restore of processes sharing GPU memory (vLLM
-  TP=2) fails with `CUDA_ERROR_UNKNOWN`.
+  TP=2) fails with `CUDA_ERROR_UNKNOWN`. The agents enforce the minimum: on a cluster with
+  an older driver, or more than one, GPU pods fall back to the cachedir
+  (`agent.criuMinDriverMajor`,
+  [CRIU-CAPTURE-FALLBACK.md](CRIU-CAPTURE-FALLBACK.md#28-gpu-drivers-criu-cannot-serve-on)).
 - Exported fds the app keeps: after `release`, every fd referring to memory
   the process exported is pointed at `/dev/null` (numbers stay valid) so CRIU
   can dump it. Fds received from another process and kept are not covered.

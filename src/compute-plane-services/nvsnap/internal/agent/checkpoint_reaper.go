@@ -121,6 +121,10 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 			groups[strings.TrimPrefix(r.Name, criuGroupConfigMapPrefix)] = r.Data
 		}
 	}
+	// While the drivers keep CRIU off (driver_gate.go), every
+	// configuration falls back with no group record of its own, and its
+	// cachedir record is what seeds its pods.
+	gated := a.driverGate(ctx) != ""
 	named := map[string]bool{}
 	for i := range records.Items {
 		r := &records.Items[i]
@@ -132,7 +136,7 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 		if ok && g["state"] == criuGroupStateAlias {
 			g, ok = groups[g["alias"]]
 		}
-		if !ok || recordUsable(g) {
+		if !gated && (!ok || recordUsable(g)) {
 			if err := cms.Delete(ctx, r.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 				a.log.WithError(err).WithField("record", r.Name).Warn("checkpoint reaper: cannot delete a cachedir record no configuration falls back to")
 			}

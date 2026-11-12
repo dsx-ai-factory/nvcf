@@ -398,6 +398,7 @@ func TestCaptureGroup_CompanionWithoutAgent(t *testing.T) {
 					t.Fatal(cerr)
 				}
 			}
+			a.seedDrivers() // read: the count below is the companions' discovery
 			agentLists := 0
 			cs.PrependReactor("list", "pods", func(act k8stesting.Action) (bool, runtime.Object, error) {
 				if l, ok := act.(k8stesting.ListAction); ok && strings.Contains(l.GetListRestrictions().Labels.String(), "nvsnap-agent") {

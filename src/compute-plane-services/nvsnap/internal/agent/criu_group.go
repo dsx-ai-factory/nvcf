@@ -375,6 +375,15 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 		// pod that never becomes warm holds no other rank of its instance.
 		return false
 	}
+	if why := c.a.driverGate(ctx); why != "" {
+		// Admitted before the drivers changed (driver_gate.go): no CRIU
+		// capture under these drivers.
+		if _, logged := c.attempted.LoadOrStore("driver-gate/"+string(pod.UID), struct{}{}); !logged {
+			c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "reason": why}).
+				Info("CRIU group capture: skipped; the cluster's drivers keep CRIU from serving")
+		}
+		return false
+	}
 	if !rootfsonly.IsPodReady(pod) {
 		return true // not warm yet: nothing is decided
 	}
@@ -413,7 +422,7 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 	if size == 1 {
 		// One pod: its record is known now, so a captured configuration
 		// is not waited on again.
-		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKey(uri, scope)), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) {
+		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) {
 			return false
 		}
 	}
@@ -458,6 +467,14 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": leader.Namespace + "/" + leader.Name, "size": size})
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
+	// One read of the drivers for the gate and for every key and record
+	// of this capture.
+	view := a.clusterDriver(ctx)
+	if why := view.Gate(a.criuMinDriverMajor()); why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the cluster's drivers keep CRIU from serving")
+		return false
+	}
+	drv := view.Major()
 	select {
 	case <-ctx.Done():
 		return false
@@ -525,7 +542,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	if err != nil {
 		// Labelled by the ranks' configuration: the instance's own key
 		// takes its companions too.
-		return c.companionsUnknown(ctx, criuGroupKey(instanceConfigURI(ranks), scope), leader, len(ranks), err, log)
+		return c.companionsUnknown(ctx, criuGroupKeyDriver(instanceConfigURI(ranks), scope, drv), leader, len(ranks), err, log)
 	}
 	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
@@ -551,10 +568,10 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		uris = append(uris, u)
 	}
-	key := criuGroupKey(instanceConfigURIOf(uris), scope)
+	key := criuGroupKeyDriver(instanceConfigURIOf(uris), scope, drv)
 	log = log.WithField("criuGroup", key)
 	if prev, gerr := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); gerr == nil && !c.groupRecaptures(ctx, prev.Data) {
-		c.writeGroupAliases(ctx, key, scope, uris, len(ranks), log)
+		c.writeGroupAliases(ctx, key, scope, drv, uris, len(ranks), log)
 		log.WithFields(logrus.Fields{"state": prev.Data["state"], "captures": prev.Data["captures"], "source": prev.Data["source"]}).
 			Info("CRIU group capture: skipped; the configuration's record says it is captured, being captured, or out of attempts")
 		return false
@@ -604,7 +621,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		log.WithField("blocking", len(b)).Warn("CRIU group capture: skipped; the preflight found what would fail it")
 		if why := configurationRefusal(b); why != "" {
-			c.recordRefusal(ctx, key, scope, uris, len(ranks), leader, why, log)
+			c.recordRefusal(ctx, key, scope, drv, uris, len(ranks), leader, why, log)
 		}
 		return false
 	}
@@ -626,7 +643,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		c.unholdForCapture(ctx, members, log)
 		return true
 	}
-	record, err := c.claimGroupRecord(ctx, key, leader, len(uris))
+	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris))
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot claim the group record")
 		// Not captured yet: the members are held as before, by the limit
@@ -714,7 +731,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}); uerr != nil {
 		log.WithError(uerr).Error("CRIU group capture: cannot update the group record")
 	} else if data["state"] == criuGroupStateVerifying {
-		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, uris, len(ranks), log)
+		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, drv, uris, len(ranks), log)
 		nodes := make([]string, len(members))
 		for i, m := range members {
 			nodes[i] = m.Spec.NodeName
@@ -822,7 +839,7 @@ func ranksAgreePerTemplate(ranks []*corev1.Pod) error {
 // configuration find the instance's record from its own configuration, as
 // admission looks it up. A real record already under a rank's key (a
 // uniform instance of that configuration) is left alone.
-func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope string, uris []string, ranks int, log *logrus.Entry) {
+func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope string, drv int, uris []string, ranks int, log *logrus.Entry) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	// A companion is admitted by its own configuration alone: its alias
 	// names its slot, or the slots of every companion of that
@@ -834,7 +851,7 @@ func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope str
 	}
 	done := map[string]bool{key: true}
 	for i, uri := range uris {
-		akey := criuGroupKey(uri, scope)
+		akey := criuGroupKeyDriver(uri, scope, drv)
 		if done[akey] {
 			continue
 		}
@@ -923,11 +940,15 @@ func (c *criuAutoRestorer) namespaceGone(ctx context.Context, name string) bool 
 // claimGroupRecord makes the agent the capturer of key: it creates the
 // record, or takes over one that may be captured again. It returns nil
 // when another agent holds it.
-func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, leader *corev1.Pod, size int) (*corev1.ConfigMap, error) {
+func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv int, leader *corev1.Pod, size int) (*corev1.ConfigMap, error) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	data := map[string]string{"state": criuGroupStateCapturing, "size": strconv.Itoa(size), "captures": "1",
 		"source": leader.Namespace + "/" + leader.Name, "startedAt": time.Now().UTC().Format(time.RFC3339),
 		groupAgentBundleKey: c.a.currentBundle()}
+	if drv > 0 {
+		// The driver its key was made with (driver_gate.go).
+		data[recordDriverKey] = strconv.Itoa(drv)
+	}
 	record := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName(key), Labels: map[string]string{"app.kubernetes.io/managed-by": "nvsnap"}},
 		Data:       data,
@@ -974,8 +995,8 @@ func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, lea
 // capture's record, it gets the aliases admission looks it up by: an
 // instance with companions is keyed by all its members, its pods by their
 // own configuration.
-func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string, uris []string, ranks int, leader *corev1.Pod, why string, log *logrus.Entry) {
-	record, err := c.claimGroupRecord(ctx, key, leader, len(uris))
+func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string, drv int, uris []string, ranks int, leader *corev1.Pod, why string, log *logrus.Entry) {
+	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris))
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot record the preflight's refusal")
 		return
@@ -993,7 +1014,7 @@ func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string,
 		log.WithError(err).Warn("CRIU group capture: cannot record the preflight's refusal")
 		return
 	}
-	c.writeGroupAliases(ctx, key, scope, uris, ranks, log)
+	c.writeGroupAliases(ctx, key, scope, drv, uris, ranks, log)
 	log.Warn("CRIU group capture: recorded as failed; the preflight refuses every capture of this configuration under this agent version")
 	c.observeRefusal(ctx, key, leader, ranks, why, log)
 }

@@ -102,6 +102,15 @@ agent:
   # saves it whole, so the checkpoint grows by that much. Empty is 1 TiB.
   criuGhostLimit: ""
 
+  # Oldest NVIDIA driver major CRIU captures and restores on. Each agent
+  # reports its node's driver; when any GPU node's is older, or the GPU
+  # nodes run more than one major, GPU pods fall back to the cachedir
+  # instead (fallback reason "driver"). Driver 580 cannot restore the
+  # multicast memory tensor-parallel engines use on NVSwitch systems
+  # (docs/design/GPUSHARE.md). A cluster whose workloads keep multicast
+  # off can lower it. Empty is 610.
+  criuMinDriverMajor: ""
+
   # Give a restored pod the pod address it had when it was captured, on its
   # loopback and translated to its new address at its edge, so sockets the
   # engine opens after the restore can still use it (NCCL opens peer

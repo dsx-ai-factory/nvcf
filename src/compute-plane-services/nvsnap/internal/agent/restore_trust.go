@@ -221,19 +221,34 @@ func (c *criuAutoRestorer) groupKeyRefusal(ctx context.Context, pod *corev1.Pod,
 	if err != nil {
 		return "", fmt.Errorf("%w: the namespace's tenant scope: %w", errRestoreUnverified, err)
 	}
-	own := criuGroupKey(uri, scope)
-	if own == key {
-		return "", nil
-	}
-	alias, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(own), metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "the group record is not its configuration's in its tenant scope", nil
+	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
+	// The key names a driver major as well (driver_gate.go): the record's
+	// own, which the cluster's may have moved on from since the pod was
+	// admitted, else the cluster's now. The tenant scope is checked either
+	// way: it is in every key.
+	drivers := []int{c.a.keyDriver(ctx)}
+	if rec, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); err == nil {
+		if d := recordDriver(rec.Data); d != drivers[0] {
+			drivers = append(drivers, d)
 		}
-		return "", fmt.Errorf("%w: its configuration's group record: %w", errRestoreUnverified, err)
+	} else if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("%w: the group record: %w", errRestoreUnverified, err)
 	}
-	if alias.Data["state"] == criuGroupStateAlias && alias.Data["alias"] == key {
-		return "", nil
+	for _, drv := range drivers {
+		own := criuGroupKeyDriver(uri, scope, drv)
+		if own == key {
+			return "", nil
+		}
+		alias, err := cms.Get(ctx, criuGroupConfigMapName(own), metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("%w: its configuration's group record: %w", errRestoreUnverified, err)
+		}
+		if alias.Data["state"] == criuGroupStateAlias && alias.Data["alias"] == key {
+			return "", nil
+		}
 	}
 	return "the group record is not its configuration's in its tenant scope", nil
 }

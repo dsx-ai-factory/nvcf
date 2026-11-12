@@ -157,7 +157,9 @@ What is measured:
   minute of the old one stopping.
 - **Admissions**: the webhook's decision for a GPU rank of a captured
   configuration: `restore`, `fallback` (reason: the configuration's state,
-  `failed`, `restore-failed`, `gpushare-failed`) or `cold` (reason:
+  `failed`, `restore-failed`, `gpushare-failed`, or `driver`: the GPU
+  nodes' drivers keep CRIU off, a pod of any configuration counted,
+  [CRIU-CAPTURE-FALLBACK.md](../design/CRIU-CAPTURE-FALLBACK.md#28-gpu-drivers-criu-cannot-serve-on)) or `cold` (reason:
   `size-mismatch`, `not-restorable-as-group`, `checkpoint-blocked`,
   `own-instance`, `prepare-failed`, `model-unavailable`). A pod of a
   configuration with no capture is not counted. The agents add `missed`:

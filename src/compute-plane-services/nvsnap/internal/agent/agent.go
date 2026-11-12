@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -67,6 +68,9 @@ type Config struct {
 	// CRIUGhostLimit bounds, in bytes, the contents of one deleted file a
 	// dump saves (criu --ghost-limit); 0 is defaultGhostLimit.
 	CRIUGhostLimit int64
+	// CRIUMinDriverMajor is the oldest NVIDIA driver major CRIU serves on;
+	// 0 is DefaultCRIUMinDriverMajor (driver_gate.go).
+	CRIUMinDriverMajor int
 	// RestoreCapturedAddress gives a restored pod the captured pod address
 	// on its loopback, translated at its edge, when no other pod uses it
 	// (restore_address.go).
@@ -313,6 +317,11 @@ const DefaultWriterPullSecret = "nvsnap-agent-pull" //nolint:gosec // secret nam
 
 // Agent is the NVSNAP node agent
 type Agent struct {
+	// drivers is the cluster's GPU drivers as the agents report them
+	// (driver_gate.go).
+	drivers driverView
+	// ownDriver is this node's driver major once read; 0 before.
+	ownDriver atomic.Int64
 	// freezes are this node's members waiting at a group capture's freeze point.
 	freezes freezePoints
 	// holds are this node's member pods frozen for a group capture
@@ -778,6 +787,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.log.WithError(err).Error("CRIU auto-restore failed to start; CRIU captures will not restore into new pods")
 	}
 	a.startCaptureInventory(ctx)
+	a.startDriverReport(ctx)
 	a.startGPUShareStoreReaper(ctx)
 	a.sweepRailsPods(ctx)
 	a.startRailsServeReaper(ctx)

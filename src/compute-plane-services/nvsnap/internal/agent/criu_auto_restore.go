@@ -262,6 +262,11 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	t0 := time.Now()
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid}}
 	err := func() error {
+		if why := c.driverMismatch(rctx, groupKey); why != "" {
+			// Not run, and not held against the capture: the replacement is
+			// admitted under the cluster's drivers as they are now.
+			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
+		}
 		_, err := a.restoreProbed(rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
