@@ -146,6 +146,8 @@ type Result struct {
 	Suppressed int
 	// Evaluated counts records checked against suppression rules.
 	Evaluated int
+	// EvaluatedByType counts Evaluated by record type, as ReceivedByType.
+	EvaluatedByType map[string]int
 	// HeaderPresent counts evaluated records that carried a rule's header.
 	HeaderPresent int
 	// RedactedParts counts media parts replaced.
@@ -189,6 +191,9 @@ type RuleCount struct {
 	HeaderPresent int
 	// Matched counts records the rule acted on.
 	Matched int
+	// Unresolved counts records strict suppression stripped because this
+	// rule's header group had no value.
+	Unresolved int
 }
 
 // Bad counts lines that could not be exported.
@@ -348,6 +353,10 @@ func (p *Preparer) apply(value *jsonvalue.Value, line []byte, result *Result) (R
 	out.Suppression = outcome
 	if outcome.Evaluated {
 		result.Evaluated++
+		if result.EvaluatedByType == nil {
+			result.EvaluatedByType = map[string]int{}
+		}
+		result.EvaluatedByType[recordType(event)]++
 	}
 	if outcome.HeaderPresent {
 		result.HeaderPresent++
@@ -361,6 +370,11 @@ func (p *Preparer) apply(value *jsonvalue.Value, line []byte, result *Result) (R
 		count := result.Rules[outcome.Rule]
 		count.Matched++
 		result.countRule(outcome.Rule, count)
+	}
+	for _, name := range outcome.Unresolved {
+		count := result.Rules[name]
+		count.Unresolved++
+		result.countRule(name, count)
 	}
 	switch outcome.Action {
 	case suppress.DropRecord:

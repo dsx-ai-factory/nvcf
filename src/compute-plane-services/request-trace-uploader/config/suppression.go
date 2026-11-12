@@ -33,6 +33,11 @@ const (
 	// EnvSuppressHeaderless is the policy for records that carry no headers
 	// while suppression is on: "export" (the default) or "drop".
 	EnvSuppressHeaderless = "REQUEST_TRACE_UPLOADER_SUPPRESS_HEADERLESS"
+	// EnvSuppressionStrict turns on strict suppression: a payload record on
+	// which some rule's header has no value is stripped, because that rule
+	// cannot tell whether the record is one it suppresses. "true" or
+	// "false"; the default is false.
+	EnvSuppressionStrict = "REQUEST_TRACE_UPLOADER_SUPPRESSION_STRICT"
 	// NCAIDRuleName names the rule EnvSuppressNCAIDs builds.
 	NCAIDRuleName = "nca_id"
 )
@@ -101,6 +106,11 @@ func suppressionValue(lookup LookupFunc) (suppress.Config, error) {
 	default:
 		return suppress.Config{}, fmt.Errorf("%s must be %q or %q", EnvSuppressHeaderless, suppress.HeaderlessExport, suppress.HeaderlessDrop)
 	}
+	strict, err := strictBool(lookup, EnvSuppressionStrict, false)
+	if err != nil {
+		return suppress.Config{}, err
+	}
+	cfg.Strict = strict
 
 	if err := cfg.Validate(); err != nil {
 		return suppress.Config{}, fmt.Errorf("%s or %s: %w", EnvSuppressNCAIDs, EnvSuppressionRules, err)

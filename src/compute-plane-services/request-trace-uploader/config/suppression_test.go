@@ -171,6 +171,36 @@ func TestLoadHeaderlessPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadSuppressionStrict(t *testing.T) {
+	tests := []struct {
+		name  string
+		value *string
+		want  bool
+	}{
+		{name: "unset is off"},
+		{name: "true", value: ptr("true"), want: true},
+		{name: "false", value: ptr("false")},
+		{name: "blank is off", value: ptr(" ")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := map[string]string{}
+			if tt.value != nil {
+				env[EnvSuppressionStrict] = *tt.value
+			}
+			cfg, warnings, err := Load(mapLookup(requiredEnv(env)))
+			if err != nil || len(warnings) > 0 {
+				t.Fatalf("Load() = %v, %v", warnings, err)
+			}
+			if cfg.Suppression.Strict != tt.want {
+				t.Fatalf("Strict = %v, want %v", cfg.Suppression.Strict, tt.want)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
+
 func TestLoadRejectsInvalidSuppression(t *testing.T) {
 	rule := func(body string) map[string]string {
 		return map[string]string{EnvSuppressionRules: "[" + body + "]"}
@@ -198,6 +228,7 @@ func TestLoadRejectsInvalidSuppression(t *testing.T) {
 			EnvSuppressionRules:   `[{"name":"nca_id","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`,
 		}},
 		{name: "unknown headerless policy", env: map[string]string{EnvSuppressHeaderless: "reject"}},
+		{name: "strict is not a boolean", env: map[string]string{EnvSuppressionStrict: "yes"}},
 		{name: "quoted nca id", env: map[string]string{EnvSuppressNCAIDs: `"acme"`}},
 		{name: "nca ids joined by a semicolon", env: map[string]string{EnvSuppressNCAIDs: "acme;o1"}},
 		{name: "nca ids joined by a space", env: map[string]string{EnvSuppressNCAIDs: "acme o1"}},

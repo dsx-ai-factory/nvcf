@@ -175,7 +175,7 @@ func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 		EnvRetryInitialBackoff, EnvRetryMaximumBackoff, EnvRetryMultiplier,
 		EnvScanInterval, EnvSecretsFile, EnvSegmentPrefix, EnvSourceDir,
 		EnvStateDir, EnvStatusInterval, EnvSuppressHeaderless,
-		EnvSuppressionRules, EnvSuppressNCAHeaders, EnvSuppressNCAIDs,
+		EnvSuppressionRules, EnvSuppressionStrict, EnvSuppressNCAHeaders, EnvSuppressNCAIDs,
 	}
 	var got []string
 	for name := range knownSettings() {

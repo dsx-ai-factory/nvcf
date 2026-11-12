@@ -163,12 +163,14 @@ var outcome = map[string][]string{"status": {"success", "failure"}}
 // event types Dynamo v1.4.0 writes, and "unknown" for any other line.
 var RecordTypes = []string{"request_end", "request_payload", "tool_start", "tool_end", "tool_error", "unknown"}
 
-// payloadRecords is the one record type that carries headers in Dynamo
-// v1.4.0, so the only one suppression evaluates.
+// payloadRecords is the one record type that carries a request payload in
+// Dynamo v1.4.0.
 var payloadRecords = map[string][]string{"record_type": {"request_payload"}}
 
-// SuppressionActions are the action label values of RecordsSuppressed.
-var SuppressionActions = []string{"strip_payload", "drop_record"}
+// SuppressionActions are the action label values of RecordsSuppressed:
+// what a matching rule did, or "strip_unresolved" for a record strict
+// suppression stripped because the rule's header had no value.
+var SuppressionActions = []string{"strip_payload", "drop_record", "strip_unresolved"}
 
 // QuarantineReasons are the reason label values of SegmentsQuarantined: the
 // reasons prepare, batching and the fault policy record, and the backend
@@ -211,7 +213,8 @@ var catalog = cloneAll([]Instrument{
 	{Name: BatchSegments, Kind: Histogram, Unit: "1", Buckets: countBuckets},
 	{Name: BatchBytes, Kind: Histogram, Unit: "By", Buckets: bytesBuckets},
 	{Name: BatchSplits, Kind: Counter, Unit: "1"},
-	{Name: RecordsEvaluated, Kind: Counter, Unit: "1", Labels: []string{"record_type"}, Values: payloadRecords},
+	{Name: RecordsEvaluated, Kind: Counter, Unit: "1", Labels: []string{"record_type"},
+		Values: map[string][]string{"record_type": RecordTypes}},
 	{Name: RecordsSuppressed, Kind: Counter, Unit: "1", Labels: []string{"rule", "action"},
 		Values: map[string][]string{"action": SuppressionActions}},
 	{Name: SuppressionHeaderPresent, Kind: Counter, Unit: "1", Labels: []string{"rule"}},

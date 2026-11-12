@@ -415,3 +415,50 @@ func TestSuppressionCountsAreRecordedOncePerSegment(t *testing.T) {
 		t.Fatalf("records_suppressed = %v after two refusals and a success, want 1", got)
 	}
 }
+
+// With strict suppression on, a payload record whose rule header was not
+// captured is exported only as a stub: the producer may have dropped the
+// header of a suppressed customer.
+func TestStrictSuppressionStripsPayloadsWhoseHeaderIsMissing(t *testing.T) {
+	logs := captureLogs(t)
+	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
+	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestPayload("r1", 1, nil)).Bytes())
+	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestPayload("r2", 2, nil), uploadertest.RequestEnd("r2", 3)).Bytes())
+	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("active", 4)).Bytes())
+	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{
+		config.EnvSuppressNCAIDs:     "acme",
+		config.EnvSuppressNCAHeaders: ncaHeaders,
+		config.EnvSuppressionStrict:  "true",
+	}))
+	exporter := newCapture(t, backendtest.NewFake())
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader, err := service.NewUploader(cfg, exporter, service.Options{Metrics: metrics})
+	if err != nil {
+		t.Fatalf("NewUploader() error = %v", err)
+	}
+	unresolved := telemetry.Labels{"rule": config.NCAIDRuleName, "action": "strip_unresolved"}
+	if _, ok := metrics.Value(telemetry.RecordsSuppressed, unresolved); !ok {
+		t.Fatalf("records_suppressed%v is not preset", unresolved)
+	}
+
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() error = %v", err)
+	}
+
+	exported := strings.Join(exporter.exported(), "\n")
+	if strings.Contains(exported, "synthetic prompt") || strings.Contains(exported, "synthetic reply") {
+		t.Fatalf("exported a body whose rule header was missing:\n%s", exported)
+	}
+	if got := strings.Count(exported, `"suppression_reason":"header_unresolved"`); got != 2 {
+		t.Fatalf("exported %d strict stubs, want 2:\n%s", got, exported)
+	}
+	if got, _ := metrics.Value(telemetry.RecordsSuppressed, unresolved); got != 2 {
+		t.Errorf("records_suppressed%v = %v, want 2", unresolved, got)
+	}
+	if got := strings.Count(logs.String(), "strict suppression stripped"); got != 1 {
+		t.Errorf("strict warnings = %d, want one for the rule:\n%s", got, logs)
+	}
+}
