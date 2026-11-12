@@ -437,6 +437,20 @@ async fn relay_stream<const CONFIRM_DELIVERY: bool>(
 }
 
 pub fn build_relay_transport_config(config: RelayEndpointConfig) -> Result<Arc<TransportConfig>> {
+    Ok(Arc::new(relay_transport(config)?))
+}
+
+/// Transport for the relay's upstream connection, where Stargate opens one
+/// stream per proxied request. Listeners keep quinn's default stream limit.
+pub fn build_relay_client_transport_config(
+    config: RelayEndpointConfig,
+) -> Result<Arc<TransportConfig>> {
+    let mut transport = relay_transport(config)?;
+    transport.max_concurrent_bidi_streams(stargate_tls::MAX_CONCURRENT_TUNNEL_STREAMS.into());
+    Ok(Arc::new(transport))
+}
+
+fn relay_transport(config: RelayEndpointConfig) -> Result<TransportConfig> {
     let mut transport = TransportConfig::default();
     let idle_timeout = config
         .max_idle_timeout
@@ -444,7 +458,7 @@ pub fn build_relay_transport_config(config: RelayEndpointConfig) -> Result<Arc<T
         .context("relay max idle timeout must fit QUIC transport parameters")?;
     transport.max_idle_timeout(Some(idle_timeout));
     transport.keep_alive_interval(config.keep_alive_interval);
-    Ok(Arc::new(transport))
+    Ok(transport)
 }
 
 pub fn build_relay_endpoints(
@@ -460,7 +474,7 @@ fn build_relay_endpoints_with_factory(
     mut build_client_endpoint: impl FnMut(SocketAddr) -> std::io::Result<Endpoint>,
 ) -> Result<RelayEndpoints> {
     let mut client_config = client_config;
-    client_config.transport_config(build_relay_transport_config(config)?);
+    client_config.transport_config(build_relay_client_transport_config(config)?);
 
     let mut endpoint_v4 = build_client_endpoint((Ipv4Addr::UNSPECIFIED, 0).into())
         .context("bind IPv4 relay endpoint")?;
