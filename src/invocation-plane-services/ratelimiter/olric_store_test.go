@@ -19,6 +19,7 @@ package ratelimiter
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"strconv"
@@ -208,9 +209,9 @@ func TestStoreGetConcurrentIncrementsCounted(t *testing.T) {
 
 	resp, err := store.GetDMap().Get(ctx, store.getCacheKey(key))
 	require.NoError(t, err)
-	stored, err := resp.Int()
-	require.NoError(t, err)
-	require.Equal(t, calls, stored, "lost or duplicated increments under concurrency")
+	var stored counterState
+	require.NoError(t, json.Unmarshal(resp.RawValue(), &stored))
+	require.Equal(t, calls, stored.Count, "lost or duplicated increments under concurrency")
 }
 
 // TestStoreGetConcurrentIncrementsAcrossNodes runs concurrent Store.Get
@@ -252,9 +253,9 @@ func TestStoreGetConcurrentIncrementsAcrossNodes(t *testing.T) {
 
 	resp, err := stores[0].GetDMap().Get(ctx, stores[0].getCacheKey(key))
 	require.NoError(t, err)
-	stored, err := resp.Int()
-	require.NoError(t, err)
-	require.Equal(t, calls, stored, "lost or duplicated increments across nodes")
+	var stored counterState
+	require.NoError(t, json.Unmarshal(resp.RawValue(), &stored))
+	require.Equal(t, calls, stored.Count, "lost or duplicated increments across nodes")
 }
 
 // TestStoreGetOverCapContention pushes more concurrent checks through one
@@ -334,6 +335,49 @@ func TestStoreGetWindowLifecycle(t *testing.T) {
 	restarted, err := store.Get(ctx, key, rate)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, restarted.Limit-restarted.Remaining, "the counter must restart after the window expires")
+}
+
+// TestStoreGetWindowIdentityInSwap pins the window identity in the atomic
+// comparison: after a window expires and the next check restarts the counter
+// at 1, a retry still holding the previous window's bytes must not match the
+// new window, even though both hold counter 1. With a bare counter value the
+// swap would match and write the old expiry over the new window, letting the
+// next check restart the counter early and admit beyond the configured rate.
+func TestStoreGetWindowIdentityInSwap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping embedded Olric test in -short mode")
+	}
+
+	ctx := context.Background()
+	store := newTestStore(t)
+	dmap := store.GetDMap()
+	key := "2394-window-identity"
+
+	rate := limiter.Rate{Limit: 1000, Period: time.Second}
+	first, err := store.Get(ctx, key, rate)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, first.Limit-first.Remaining)
+
+	stale, err := dmap.Get(ctx, store.getCacheKey(key))
+	require.NoError(t, err)
+	staleRaw := stale.RawValue()
+
+	// Let window one expire; the next check starts window two, also at 1.
+	time.Sleep(1100 * time.Millisecond)
+	second, err := store.Get(ctx, key, rate)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, second.Limit-second.Remaining, "the counter must restart after the window expires")
+
+	// The stale window-one bytes must not match window two.
+	swapped, _, err := dmap.CompareAndSwap(ctx, store.getCacheKey(key), staleRaw, 99, olric.PX(time.Hour))
+	require.NoError(t, err)
+	require.False(t, swapped, "a stale window's bytes must not match a new window that restarted at the same counter")
+
+	resp, err := dmap.Get(ctx, store.getCacheKey(key))
+	require.NoError(t, err)
+	var stored counterState
+	require.NoError(t, json.Unmarshal(resp.RawValue(), &stored))
+	require.Equal(t, 1, stored.Count, "the failed swap must not have written")
 }
 
 // TestStoreGetRestartsKeyWithoutTTL covers the branch that resets a TTL-less

@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -113,6 +114,32 @@ func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (lim
 	return common.GetContextFromState(now, rate, expiration, int64(value)), nil
 }
 
+// counterState is the single serialized value stored per rate-limit key. The
+// window expiry rides inside the value so the compare-and-swap expected bytes
+// carry the window identity as well as the counter: a retry that paused
+// across expiry cannot match a new window that restarted at the same counter
+// and write the old expiry over it.
+type counterState struct {
+	Count  int   `json:"c"`
+	Expiry int64 `json:"e"` // window end, absolute Unix milliseconds
+}
+
+// decodeCounter reads a stored counter. Values written with the embedded
+// window identity decode as counterState; a legacy plain-int counter (written
+// by the previous Get+Put code, or seeded without a TTL) falls back to the
+// key's stored TTL as its window identity.
+func decodeCounter(resp *olric.GetResponse) (counterState, error) {
+	var state counterState
+	if err := json.Unmarshal(resp.RawValue(), &state); err == nil {
+		return state, nil
+	}
+	if n, err := resp.Int(); err == nil {
+		return counterState{Count: n, Expiry: resp.TTL()}, nil
+	} else {
+		return counterState{}, fmt.Errorf("decode counter value: %w", err)
+	}
+}
+
 // increment bumps the per-key counter by one and returns the new value with
 // the window expiration.
 //
@@ -131,6 +158,11 @@ func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (lim
 // of re-arming a stale expiry: the swap still compares against the old bytes,
 // so the write stays atomic, and the partition owner reports an expired key
 // as absent, so the next attempt inserts a fresh window.
+//
+// The window expiry is embedded in the stored value (see counterState), so
+// the compare-and-swap expected bytes carry the window identity as well as the
+// counter: a retry that paused across expiry cannot match a new window that
+// restarted at the same counter and write the old expiry over it.
 func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.Rate) (int, time.Time, error) {
 	// current is the value the next swap compares against. nil means the key
 	// does not exist and the next swap must insert it.
@@ -142,50 +174,67 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 		}
 		var (
 			expected   []byte
-			newValue   int
+			newValue   []byte
+			newCount   int
 			options    []olric.PutOption
 			expiration time.Time
 		)
 
 		// startWindow restarts the counter at 1 and arms the window TTL in
 		// the same atomic write.
-		startWindow := func() {
-			newValue = 1
+		startWindow := func() error {
+			expiration = time.Now().Add(rate.Period)
+			newCount = 1
+			b, err := json.Marshal(counterState{Count: newCount, Expiry: expiration.UnixMilli()})
+			if err != nil {
+				return fmt.Errorf("encode counter for %s: %w", redactKey(fullKey), err)
+			}
+			newValue = b
 			if rate.Period.Milliseconds() > 0 {
 				options = append(options, olric.PX(rate.Period))
 			}
-			expiration = time.Now().Add(rate.Period)
+			return nil
 		}
 
 		if current == nil {
 			// Insert-if-absent: expected stays nil, so the swap only succeeds
 			// when the key does not exist. Counter creation and window TTL
 			// arming are a single atomic write.
-			startWindow()
+			if err := startWindow(); err != nil {
+				return 0, time.Time{}, err
+			}
 		} else {
-			old, err := current.Int()
+			// The expected bytes embed the window expiry, so a retry that
+			// paused across expiry cannot match a new window that restarted
+			// at the same counter.
+			expected = current.RawValue()
+			state, err := decodeCounter(current)
 			if err != nil {
 				// fullKey embeds the raw per-user subject, so only a short hash
 				// prefix may leave the process. The returned error is logged by the
 				// caller - do not log it here as well.
 				return 0, time.Time{}, fmt.Errorf("decode counter for %s: %w", redactKey(fullKey), err)
 			}
-			expected = current.RawValue()
-			// GetResponse.TTL reports the stored expiry as an absolute Unix
-			// millisecond timestamp.
-			ttl := current.TTL()
-			if remaining := time.Until(time.UnixMilli(ttl)); ttl > 0 && remaining > 0 {
+			if window := state.Expiry; window > 0 && time.Until(time.UnixMilli(window)) > 0 {
 				// Same window: increment in place and keep the absolute expiry.
-				// PXAT re-arms it verbatim, where a remaining-duration
+				// PXAT re-arms the key TTL verbatim, where a remaining-duration
 				// round-trip can truncate to zero near the window edge.
-				newValue = old + 1
-				options = append(options, olric.PXAT(time.Duration(ttl)*time.Millisecond))
-				expiration = time.UnixMilli(ttl)
+				expiration = time.UnixMilli(window)
+				newCount = state.Count + 1
+				newValue, err = json.Marshal(counterState{Count: newCount, Expiry: window})
+				if err != nil {
+					return 0, time.Time{}, fmt.Errorf("encode counter for %s: %w", redactKey(fullKey), err)
+				}
+				if ttl := current.TTL(); ttl > 0 {
+					options = append(options, olric.PXAT(time.Duration(ttl)*time.Millisecond))
+				}
 			} else {
 				// The window ended between the read and the swap, or the key
 				// has no TTL left: restart the window at 1. The swap still
 				// compares against the old bytes, so it stays atomic.
-				startWindow()
+				if err := startWindow(); err != nil {
+					return 0, time.Time{}, err
+				}
 			}
 		}
 
@@ -194,7 +243,7 @@ func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.
 			return 0, time.Time{}, fmt.Errorf("compare-and-swap counter for %s: %w", redactKey(fullKey), err)
 		}
 		if swapped {
-			return newValue, expiration, nil
+			return newCount, expiration, nil
 		}
 		// Another check updated the key first. next holds what is stored now,
 		// nil when the key expired in between. Retry against that value.
