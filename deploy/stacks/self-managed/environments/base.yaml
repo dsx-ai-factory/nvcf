@@ -199,7 +199,7 @@ api:
           init-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-init-oss:1.2.4
           utils-container-image:
             go: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-utils-oss:1.2.6
-          ess-agent-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/ess-agent:1.4.4
+          ess-agent-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/ess-agent:1.4.5
           llm-credential-manager-image: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-llm-credentials-oss:1.1.5
 
 # NVCT API in-cluster ESS base URL, mirroring api.essBaseURL. Empty defaults to
@@ -214,7 +214,7 @@ nvctApi:
         sidecars:
           init-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-init-oss:1.2.4
           utils-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-task-oss:1.1.6
-          ess-agent-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/ess-agent:1.4.4
+          ess-agent-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/ess-agent:1.4.5
 
 # Image overrides for the API account-bootstrap job. alpine-k8s is not
 # republished under the public nvidia/nvcf catalog. The API chart defaults to
@@ -246,7 +246,7 @@ accounts:
 # These static global values are processed in the values template
 natsAuthCalloutService:
   image:
-    tag: "0.8.6"
+    tag: "0.8.8"
 
 nats:
   enabled: true
@@ -682,6 +682,10 @@ invocation:
     maxUnavailable: 1
 
 adminIssuerProxy:
+  # Chart 1.5.3 defaults to 1.1.2. 1.1.3 is the same service rebuilt with Go
+  # 1.26.10 and the patched CA bundle.
+  image:
+    tag: "1.1.3"
   podDisruptionBudget:
     enabled: false
     maxUnavailable: 1
@@ -693,7 +697,7 @@ functionautoscaler:
 
 reval:
   image:
-    tag: "0.20.3"
+    tag: "0.20.4"
   podDisruptionBudget:
     enabled: false
     maxUnavailable: 1
