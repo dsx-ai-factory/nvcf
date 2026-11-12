@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -34,7 +35,9 @@ import (
 //
 // Transient errors include: timeouts, rate limiting (429), service unavailable (503),
 // internal server errors (500), conflicts (409), network-level errors, and context
-// cancellation/deadline exceeded.
+// cancellation/deadline exceeded, plus CSI mount-path errors that are expected while
+// a volume is first provisioned (DeadlineExceeded, or "device or resource busy" while
+// mkfs runs).
 //
 // Non-transient errors that should be surfaced as reconcile failures include:
 // Forbidden (403), Unauthorized (401), Invalid (422), Gone (410), etc.
@@ -56,6 +59,27 @@ func IsTransient(err error) bool {
 		return true
 	}
 
+	// CSI mount-path errors seen while a volume is still being provisioned
+	if isTransientCSIMountError(err) {
+		return true
+	}
+
 	// Context cancellation / deadline exceeded
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// isTransientCSIMountError reports whether err is a CSI mount failure that is
+// expected to clear on retry while a volume is still being provisioned, such as
+// NVMesh creating the XFS filesystem on a freshly provisioned volume. The kubelet
+// volume manager surfaces these as plain strings rather than typed errors, so they
+// are matched on message content; that also covers wrapped errors, since wrapping
+// preserves the message.
+func isTransientCSIMountError(err error) bool {
+	msg := err.Error()
+	if !strings.Contains(msg, "rpc error: code = ") {
+		return false
+	}
+
+	return strings.Contains(msg, "code = DeadlineExceeded") ||
+		strings.Contains(strings.ToLower(msg), "device or resource busy")
 }
