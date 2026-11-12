@@ -62,7 +62,8 @@ volume, so every step survives a restart.
    that are in no batch are deleted. A segment in a batch that may have been
    sent, and the active segment, are never deleted. Preparing pauses while
    the spool is above 85%, while free space is under 512 MiB or twice the
-   next segment's size, or while 16 prepared segments wait for a batch;
+   next segment's size, or while 16 prepared segments, or the batch
+   segment setting if larger, wait for a batch;
    prepared work is still sent. Every deletion is counted in
    `segments_evicted` or `quarantine_evicted`. Fullness is measured on the
    whole filesystem that holds the spool, so the spool needs a volume of
@@ -178,6 +179,41 @@ Optional, with defaults:
   to `24h`
 - `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL`: how often every open job is
   polled, whatever the backend; default `30s`, from `1s` to `1h`
+- `REQUEST_TRACE_UPLOADER_BATCH_MAX_SEGMENTS`: the most segments in one
+  upload batch; default `16` or the backend's file limit per job if lower,
+  from `1` to `500`. A value above the backend's limit stops startup.
+  `objectstore` and `debug` take one file per job, so they accept only `1`,
+  which changes nothing; leave it unset for them.
+- `REQUEST_TRACE_UPLOADER_BATCH_MAX_BYTES`: the most transport bytes in one
+  upload batch, as whole bytes with no unit; default `1073741824` (1 GiB)
+  or the backend's batch limit if lower, from `1048576` (1 MiB) to
+  `17179869184` (16 GiB). A value above the backend's batch limit stops
+  startup. A segment whose transport alone is larger is quarantined. On a
+  backend that sends one segment per job, such as `objectstore` and
+  `debug`, this is only the largest transport accepted; `objectstore` also
+  takes no object over 5 GiB.
+- `REQUEST_TRACE_UPLOADER_CREATES_PER_MINUTE`: how many backend jobs one
+  pod may create per minute; default `30`, from `1` to `600`
+- `REQUEST_TRACE_UPLOADER_CREATE_BURST`: how many creates may start back to
+  back after the budget was idle; default `1`, from `1` to `100`
+- `REQUEST_TRACE_UPLOADER_SEGMENT_SCOPE_FAILURES`: how many failures of one
+  segment, while other segments succeed, quarantine it; default `5`, from
+  `2` to `100`. At `1` a fault of the whole destination would quarantine
+  healthy segments instead of holding.
+- `REQUEST_TRACE_UPLOADER_UNCONFIRMED_RESENDS`: on a backend that cannot
+  take a resend safely, how many times a submit that got no job id and that
+  the destination could not confirm is sent again before the work is
+  quarantined, a batch being split first; default `2`, from `0` to `10`.
+  Each resend may land a duplicate and is counted in `submits_ambiguous`.
+  The count is kept in memory, so a restart or a split starts it again.
+  Other uncertain submits, such as timeouts during an outage, are retried
+  with no limit. `objectstore` and `debug` take a resend safely, so it has
+  no effect on them.
+- `REQUEST_TRACE_UPLOADER_AUTH_MAX_BACKOFF`: the longest hold after the
+  destination refuses the credentials; holds double from `1m` up to it;
+  default `30m`, from `1m` to `24h`
+- `REQUEST_TRACE_UPLOADER_RETRY_AFTER_MAX`: the longest a destination's
+  Retry-After may hold uploads; default `30m`, from `1m` to `24h`
 
 Time settings are Go durations with a unit, such as `30s`, `5m` or `1h`. A
 bare number, a negative value, zero where zero is not allowed, or a value
