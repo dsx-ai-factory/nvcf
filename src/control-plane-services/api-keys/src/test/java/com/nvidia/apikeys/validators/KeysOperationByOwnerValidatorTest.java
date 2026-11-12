@@ -63,7 +63,10 @@ import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import static com.nvidia.apikeys.TestData.servicesService;
+import com.nvidia.apikeys.services.ServicesService;
 import org.mockito.InjectMocks;
+import org.mockito.Spy;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -85,6 +88,9 @@ class KeysOperationByOwnerValidatorTest {
     @Mock
     private ValidatingKeyLoader validatingKeyLoaderMock;
 
+    @Spy
+    private ServicesService servicesService = servicesService(SERVICE_VO_1);
+
     @InjectMocks
     private KeysOperationByOwnerValidator keysOperationByOwnerValidator;
 
@@ -93,7 +99,7 @@ class KeysOperationByOwnerValidatorTest {
         when(clockMock.instant()).thenReturn(TEST_TIME);
         when(authzConverterMock.readValidAuthorizations(SERVICE_VO_1, AUTHORIZATION_JSON_NODES_1))
                 .thenReturn(KEY_AUTHZ_1);
-        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_VO_1.serviceIdAliasGroup()))
                 .thenReturn(List.of());
         when(credentialServiceMock.generateApiKey()).thenReturn(GENERATED_KEY_VO_1);
         when(nakPropertiesMock.getKeepAfterExpiredDuration()).thenReturn(Duration.ofDays(30));
@@ -113,7 +119,7 @@ class KeysOperationByOwnerValidatorTest {
         when(clockMock.instant()).thenReturn(TEST_TIME);
         when(authzConverterMock.readValidAuthorizations(SERVICE_VO_1, AUTHORIZATION_JSON_NODES_1))
                 .thenReturn(KEY_AUTHZ_1);
-        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_VO_1.serviceIdAliasGroup()))
                 .thenReturn(List.of());
         when(credentialServiceMock.generateApiKey()).thenReturn(GENERATED_KEY_VO_1);
         when(nakPropertiesMock.getKeepAfterExpiredDuration()).thenReturn(Duration.ofDays(30));
@@ -134,7 +140,7 @@ class KeysOperationByOwnerValidatorTest {
     @Test
     void validateCreateKeyRequest_buildsValidRequest_keep5days() {
         when(clockMock.instant()).thenReturn(TEST_TIME);
-        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_VO_1.serviceIdAliasGroup()))
                 .thenReturn(List.of());
         when(credentialServiceMock.generateApiKey()).thenReturn(GENERATED_KEY_VO_1);
         when(nakPropertiesMock.getKeepAfterExpiredDuration()).thenReturn(Duration.ofDays(5));
@@ -165,7 +171,7 @@ class KeysOperationByOwnerValidatorTest {
         ServiceVo serviceVo = SERVICE_VO_1.toBuilder()
                 .maxApiKeysPerUser(0)
                 .build();
-        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, SERVICE_VO_1.serviceIdAliasGroup()))
                 .thenReturn(List.of());
 
         assertThrowsExceptionWithDetails(
@@ -211,5 +217,24 @@ class KeysOperationByOwnerValidatorTest {
 
         verify(keyRequestValidatorMock).assertKeyActive(KEY_VO_1);
         verifyNoMoreInteractions(keyRequestValidatorMock);
+    }
+
+
+    @Test
+    void validateCreateKeyRequest_keyLimitCountsLegacyAndCanonicalKeys() {
+        ServiceVo aliased = SERVICE_VO_1.toBuilder()
+                .serviceId("cloud-functions")
+                .legacyServiceIds(Set.of(SERVICE_ID_1))
+                .audienceServiceIds(Set.of("cloud-functions"))
+                .maxApiKeysPerUser(2)
+                .build();
+        when(keysDaoMock.list(USER, USER_KEY_OWNER_ID_1, aliased.serviceIdAliasGroup()))
+                .thenReturn(List.of(KEY_BY_OWNER_AND_SERVICE_VO_1, KEY_BY_OWNER_AND_SERVICE_VO_1));
+
+        assertThrowsExceptionWithDetails(
+                BadRequestException.class,
+                () -> keysOperationByOwnerValidator.validateCreateKeyRequest(
+                        aliased, KEY_OWNER_VO_1, CREATE_KEY_REQUEST_1),
+                "Actor reached maximum allowed number of keys in service");
     }
 }

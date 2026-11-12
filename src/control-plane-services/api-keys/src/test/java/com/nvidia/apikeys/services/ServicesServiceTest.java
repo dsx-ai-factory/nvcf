@@ -17,6 +17,10 @@
 
 package com.nvidia.apikeys.services;
 
+import java.util.Set;
+import com.nvidia.apikeys.vo.ServiceVo;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static com.nvidia.apikeys.TestData.servicesService;
 import static com.nvidia.apikeys.TestData.SERVICE_ID_1;
 import static com.nvidia.apikeys.TestData.SERVICE_VO_1;
 import static com.nvidia.apikeys.utils.TestUtils.assertThrowsExceptionWithDetails;
@@ -67,5 +71,86 @@ class ServicesServiceTest {
     @Test
     void listServices() {
         assertThat(service.listServices()).isEqualTo(List.of(SERVICE_VO_1));
+    }
+
+
+    private static final String CANONICAL_ID = "cloud-functions";
+    private static final String OTHER_CANONICAL_ID = "cloud-tasks";
+    private static final String OTHER_LEGACY_ID = "custom-legacy-tasks-id";
+
+    private static ServicesService aliasedServices() {
+        return servicesService(
+                SERVICE_VO_1.toBuilder()
+                        .serviceId(CANONICAL_ID)
+                        .legacyServiceIds(Set.of(SERVICE_ID_1))
+                        .audienceServiceIds(Set.of(CANONICAL_ID))
+                        .build(),
+                SERVICE_VO_1.toBuilder()
+                        .serviceId(OTHER_CANONICAL_ID)
+                        .legacyServiceIds(Set.of(OTHER_LEGACY_ID))
+                        .audienceServiceIds(Set.of(OTHER_CANONICAL_ID))
+                        .build());
+    }
+
+    @Test
+    void getServiceById_findsByCanonicalAndLegacyId() {
+        ServicesService aliased = aliasedServices();
+
+        assertThat(aliased.loadById(CANONICAL_ID).getServiceId()).isEqualTo(CANONICAL_ID);
+        assertThat(aliased.loadById(SERVICE_ID_1).getServiceId()).isEqualTo(CANONICAL_ID);
+        assertThat(aliased.loadById(OTHER_LEGACY_ID).getServiceId()).isEqualTo(OTHER_CANONICAL_ID);
+    }
+
+    @Test
+    void getServiceById_unknownIdIsNotFound() {
+        assertThat(aliasedServices().getServiceById("not-existing")).isEmpty();
+    }
+
+    @Test
+    void registrationWithoutAliasesBehavesAsBefore() {
+        assertThat(service.getServiceById(SERVICE_ID_1)).contains(SERVICE_VO_1);
+        assertThat(service.toCanonicalId(SERVICE_ID_1)).isEqualTo(SERVICE_ID_1);
+        assertThat(service.storedServiceIds(SERVICE_ID_1)).containsExactly(SERVICE_ID_1);
+    }
+
+    @Test
+    void toCanonicalId_mapsLegacyIdAndKeepsOthers() {
+        ServicesService aliased = aliasedServices();
+
+        assertThat(aliased.toCanonicalId(SERVICE_ID_1)).isEqualTo(CANONICAL_ID);
+        assertThat(aliased.toCanonicalId(OTHER_LEGACY_ID)).isEqualTo(OTHER_CANONICAL_ID);
+        assertThat(aliased.toCanonicalId(CANONICAL_ID)).isEqualTo(CANONICAL_ID);
+        assertThat(aliased.toCanonicalId("unknown")).isEqualTo("unknown");
+        assertThat(aliased.toCanonicalId(null)).isNull();
+    }
+
+    @Test
+    void storedServiceIds_returnsCanonicalThenLegacyForEitherForm() {
+        ServicesService aliased = aliasedServices();
+
+        assertThat(aliased.storedServiceIds(CANONICAL_ID))
+                .containsExactly(CANONICAL_ID, SERVICE_ID_1);
+        assertThat(aliased.storedServiceIds(SERVICE_ID_1))
+                .containsExactly(CANONICAL_ID, SERVICE_ID_1);
+        assertThat(aliased.storedServiceIds("unknown")).containsExactly("unknown");
+    }
+
+    @Test
+    void constructor_rejectsLegacyIdUsedByTwoServices() {
+        ServiceVo first = SERVICE_VO_1.toBuilder()
+                .serviceId(CANONICAL_ID).legacyServiceIds(Set.of(SERVICE_ID_1)).build();
+        ServiceVo second = SERVICE_VO_1.toBuilder()
+                .serviceId(OTHER_CANONICAL_ID).legacyServiceIds(Set.of(SERVICE_ID_1)).build();
+
+        assertThrows(IllegalStateException.class, () -> servicesService(first, second));
+    }
+
+    @Test
+    void constructor_rejectsLegacyIdEqualToRegisteredId() {
+        ServiceVo first = SERVICE_VO_1.toBuilder()
+                .serviceId(CANONICAL_ID).legacyServiceIds(Set.of(OTHER_CANONICAL_ID)).build();
+        ServiceVo second = SERVICE_VO_1.toBuilder().serviceId(OTHER_CANONICAL_ID).build();
+
+        assertThrows(IllegalStateException.class, () -> servicesService(first, second));
     }
 }

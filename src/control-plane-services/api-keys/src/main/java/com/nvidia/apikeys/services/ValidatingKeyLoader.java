@@ -31,11 +31,15 @@ import org.springframework.stereotype.Service;
 public class ValidatingKeyLoader {
 
     private final KeysDao keysDao;
+    private final ServicesService servicesService;
 
     public KeyByOwnerAndServiceVo loadKeyByOwnerAndServiceVo(
             KeyOwnerVo keyOwner, String serviceId, String keyId) {
-        return keysDao.getKeyByOwnerAndServiceAndId(
-                        keyOwner.getOwnerType(), keyOwner.getOwnerId(), serviceId, keyId)
+        return servicesService.storedServiceIds(serviceId).stream()
+                .map(id -> keysDao.getKeyByOwnerAndServiceAndId(
+                        keyOwner.getOwnerType(), keyOwner.getOwnerId(), id, keyId))
+                .flatMap(Optional::stream)
+                .findFirst()
                 .orElseThrow(() -> new NotFoundException("Key not found"));
     }
 

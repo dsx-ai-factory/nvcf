@@ -20,12 +20,14 @@ package com.nvidia.apikeys.validators;
 import com.nvidia.apikeys.caching.CachingKeysLoader;
 import com.nvidia.apikeys.caching.IntrospectionKeyOwnerValidator;
 import com.nvidia.apikeys.dto.introspection.IntrospectionRequest;
+import com.nvidia.apikeys.services.ServicesService;
 import com.nvidia.apikeys.vo.KeyStatus;
 import com.nvidia.apikeys.vo.KeyVo;
 import com.nvidia.boot.exceptions.BootResponseException;
 import com.nvidia.boot.exceptions.NotFoundException;
 import com.nvidia.boot.exceptions.BadRequestException;
 import java.util.Set;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.SetUtils;
@@ -38,6 +40,7 @@ public class IntrospectionValidator {
 
     private final IntrospectionKeyOwnerValidator introspectionKeyOwnerValidator;
     private final CachingKeysLoader cachingKeysLoader;
+    private final ServicesService servicesService;
 
     public KeyVo validate(IntrospectionRequest request, String apiKeyHash) {
         KeyVo key = cachingKeysLoader.loadKeyByHash(apiKeyHash);
@@ -73,9 +76,11 @@ public class IntrospectionValidator {
         }
     }
 
-    private static void assertAudienceServiceMatches(IntrospectionRequest request, KeyVo key) {
-        Set<String> validAudiences = SetUtils.emptyIfNull(key.getAudienceServiceIds());
-        if (!validAudiences.contains(request.getAudienceServiceId())) {
+    private void assertAudienceServiceMatches(IntrospectionRequest request, KeyVo key) {
+        Set<String> validAudiences = SetUtils.emptyIfNull(key.getAudienceServiceIds()).stream()
+                .map(servicesService::toCanonicalId)
+                .collect(Collectors.toSet());
+        if (!validAudiences.contains(servicesService.toCanonicalId(request.getAudienceServiceId()))) {
             throw new BadRequestException("audience_service_id invalid");
         }
     }

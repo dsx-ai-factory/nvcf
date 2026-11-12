@@ -42,7 +42,11 @@ import org.junit.jupiter.params.provider.EmptySource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import static com.nvidia.apikeys.TestData.SERVICE_VO_1;
+import static com.nvidia.apikeys.TestData.servicesService;
+import com.nvidia.apikeys.services.ServicesService;
 import org.mockito.InjectMocks;
+import org.mockito.Spy;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -53,6 +57,9 @@ class IntrospectionValidatorTest {
     private CachingKeysLoader keyLoader;
     @Mock
     private IntrospectionKeyOwnerValidator introspectionKeyOwnerValidatorMock;
+    @Spy
+    private ServicesService servicesService = servicesService(SERVICE_VO_1);
+
     @InjectMocks
     private IntrospectionValidator validator;
 
@@ -139,4 +146,51 @@ class IntrospectionValidatorTest {
                 "Unexpected error during key introspection");
     }
 
+
+    @Test
+    void validate_acceptsLegacyAudienceRequestForCanonicalKey() {
+        useAliasedServices();
+        when(keyLoader.loadKeyByHash(API_KEY_HASH_1)).thenReturn(
+                KEY_VO_1.toBuilder().audienceServiceIds(Set.of("cloud-functions")).build());
+
+        assertThat(validator.validate(INTROSPECTION_REQUEST_1, API_KEY_HASH_1).getKeyHash())
+                .isEqualTo(KEY_VO_1.getKeyHash());
+    }
+
+    @Test
+    void validate_acceptsCanonicalAudienceRequestForLegacyKey() {
+        useAliasedServices();
+        when(keyLoader.loadKeyByHash(API_KEY_HASH_1)).thenReturn(KEY_VO_1);
+
+        var request = INTROSPECTION_REQUEST_1.toBuilder()
+                .audienceServiceId("cloud-functions").build();
+
+        assertThat(validator.validate(request, API_KEY_HASH_1).getKeyHash())
+                .isEqualTo(KEY_VO_1.getKeyHash());
+    }
+
+    @Test
+    void validate_rejectsOtherServiceAudienceWhenAliasesAreConfigured() {
+        useAliasedServices();
+        when(keyLoader.loadKeyByHash(API_KEY_HASH_1)).thenReturn(KEY_VO_1);
+
+        var request = INTROSPECTION_REQUEST_1.toBuilder()
+                .audienceServiceId("cloud-tasks").build();
+
+        assertThrowsExceptionWithDetails(
+                BadRequestException.class,
+                () -> validator.validate(request, API_KEY_HASH_1),
+                "audience_service_id invalid");
+    }
+
+    private void useAliasedServices() {
+        servicesService = servicesService(
+                SERVICE_VO_1.toBuilder()
+                        .serviceId("cloud-functions")
+                        .legacyServiceIds(Set.of(SERVICE_VO_1.getServiceId()))
+                        .build(),
+                SERVICE_VO_1.toBuilder().serviceId("cloud-tasks").build());
+        validator = new IntrospectionValidator(
+                introspectionKeyOwnerValidatorMock, keyLoader, servicesService);
+    }
 }
