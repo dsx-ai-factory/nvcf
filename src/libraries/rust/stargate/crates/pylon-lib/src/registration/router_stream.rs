@@ -246,6 +246,9 @@ pub(super) async fn run_router_registration_stream(
             advertised_reverse_connected = reverse_connected;
             last_send = Instant::now();
         };
+        // A stop that cancels a pending update send ends the loop as a failed
+        // send, but the reverse tunnel still drains, so it needs the drain bound.
+        let stopped = stopped || stop.is_cancelled();
 
         // Close the registration before the reverse tunnel stops accepting, so
         // the router stops picking this server first.
