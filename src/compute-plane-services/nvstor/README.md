@@ -228,16 +228,13 @@ pass.
 
 #### nvstor-peer image
 
-`nvstor-peer-image` is a multi-arch image (amd64 and arm64) on Ubuntu noble:
-nvstor-peer at `/usr/local/bin/nvstor-peer`, built optimised whatever the
-compilation mode, and a layer with `libibverbs`, the verbs providers
-(`libmlx5` among them) and `libnl` from the same pinned packages, listed in
-`/var/lib/dpkg/status.d` for image scanners (apt and dpkg do not read it, so
-an image built on this one must not install rdma-core again). There is no
-`iproute2`: inspect a pod's rails with `kubectl debug` or from the node. It
-runs as root (a fetch
-applies source owners only with `CAP_CHOWN`, `CAP_DAC_OVERRIDE` and
-`CAP_FOWNER`) and sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility` for
+`nvstor-peer-image` is a multi-arch image (amd64 and arm64) on Ubuntu noble
+with an optimised nvstor-peer at `/usr/local/bin/nvstor-peer` and the
+rdma-core runtime libraries from pinned packages. They are listed in
+`/var/lib/dpkg/status.d` for image scanners, which apt and dpkg do not read,
+so an image built on this one must not install rdma-core again. There is no
+`iproute2`: inspect a pod's rails with `kubectl debug` or from the node. It runs as root, which a fetch needs to apply
+source owners, and sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility` for
 `--gpu`.
 
 ```bash

@@ -50,6 +50,10 @@ licenses bans sources`). After any change to `Cargo.lock`, regenerate
   version so mismatched peers fail with a clear message.
 - Documents describe the code as it is. When code changes behaviour, the
   documents that describe it change in the same commit.
+- One home per fact: link to the document that holds it instead of
+  repeating it, and delete text that is no longer true instead of marking it
+  out of date. Keep usage (how to run it) apart from internals (how it
+  works).
 
 ## Checks
 

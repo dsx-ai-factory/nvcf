@@ -18,7 +18,7 @@
 # serves its copy to the next replicas. No node serves more than
 # --max-fetchers (4, the default) copies at once, so with N replicas the copy
 # is a tree of depth about log5(N) instead of N fetchers on one NIC
-# (docs/peer-copy.md, "Fan-out").
+# (docs/peer-copy.md, "Fan-out" and "Serve after fetch").
 #
 #   nvstor-peer-origin  serves /var/lib/nvstor/models read-only.
 #   nvstor-peer          headless Service over every pod that is Ready to
