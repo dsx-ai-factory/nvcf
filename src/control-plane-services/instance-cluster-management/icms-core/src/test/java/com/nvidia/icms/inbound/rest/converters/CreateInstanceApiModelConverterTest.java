@@ -161,30 +161,6 @@ class CreateInstanceApiModelConverterTest {
         assertEquals(functionDetails.getFunctionVersionId(), result.getFunctionVersionId());
         assertEquals("test-owner-nca", result.getOwnerNcaId());
         assertEquals(functionType, result.getFunctionType());
-        assertNull(result.getTerminationGracePeriodDurationForFunction());
-    }
-
-    @Test
-    void testConvertWithFunctionTerminationGracePeriod() {
-        // Given
-        CreateSpotInstanceRequestApiModel request = new CreateSpotInstanceRequestApiModel();
-        request.setAction("RequestInstances");
-        request.setInstanceCount(1);
-
-        CreateSpotInstanceFunctionDetailsApiModel functionDetails = new CreateSpotInstanceFunctionDetailsApiModel();
-        functionDetails.setFunctionId(UUID.randomUUID());
-        functionDetails.setFunctionVersionId(UUID.randomUUID());
-        functionDetails.setFunctionType(FunctionType.LLM);
-        functionDetails.setTerminationGracePeriodDuration(Duration.ofMinutes(10));
-
-        request.setFunctionDetails(functionDetails);
-
-        // When
-        SpotInstanceRequestSchema result = converter.toSpotInstanceRequestSchema(request);
-
-        // Then
-        assertEquals(Duration.ofMinutes(10), result.getTerminationGracePeriodDurationForFunction());
-        assertNull(result.getTerminationGracePeriodDuration());
     }
 
     @Test

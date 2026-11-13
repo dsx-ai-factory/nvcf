@@ -17,7 +17,6 @@
 package com.nvidia.icms.inbound.rest.model;
 
 import io.swagger.v3.oas.annotations.media.Schema;
-import java.time.Duration;
 import java.util.UUID;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -46,7 +45,4 @@ public class CreateSpotInstanceFunctionDetailsApiModel {
 
     @Schema(hidden = true)
     FunctionType functionType;
-
-    @Schema(hidden = true)
-    Duration terminationGracePeriodDuration;
 }

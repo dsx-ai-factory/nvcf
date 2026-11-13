@@ -16,7 +16,6 @@
  */
 package com.nvidia.icms.outbound.sqs.model;
 
-import com.fasterxml.jackson.annotation.JsonInclude;
 import com.nvidia.icms.inbound.rest.model.FunctionType;
 import io.swagger.v3.oas.annotations.media.Schema;
 import java.util.UUID;
@@ -40,9 +39,4 @@ public class FunctionDetails {
 
     @Schema(description = "Unique identifier of the function version")
     private UUID functionVersionId;
-
-    @JsonInclude(JsonInclude.Include.NON_NULL)
-    @Schema(description = "ISO 8601 duration the function instance is given to finish its in-flight work before it is deleted",
-            nullable = true)
-    private String terminationGracePeriodDuration;
 }
