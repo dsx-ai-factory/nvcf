@@ -7,13 +7,13 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 )
 
 func namedRules() Config {
 	return Config{Rules: []Rule{
 		{Name: "tenants", Headers: []string{"x-tenant"}, Values: []string{"t1"}, Action: DropRecord},
-		{Name: "nca_id", Headers: DefaultHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
+		{Name: "nca_id", Headers: ncaHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
 	}}
 }
 
@@ -106,7 +106,7 @@ func TestConfigValidateRejectsBadNamesAndPolicies(t *testing.T) {
 		cfg  Config
 	}{
 		{name: "duplicate rule name", cfg: Config{Rules: []Rule{
-			{Name: "a", Headers: DefaultHeaders, Values: []string{"x"}, Action: StripPayload},
+			{Name: "a", Headers: ncaHeaders, Values: []string{"x"}, Action: StripPayload},
 			{Name: "a", Headers: []string{"x-tenant"}, Values: []string{"y"}, Action: DropRecord},
 		}}},
 		{name: "unknown headerless policy", cfg: Config{Headerless: "reject"}},
@@ -158,7 +158,7 @@ func TestStubFromAnotherRuleCarriesNoIdentifier(t *testing.T) {
 			if outcome.Action != StripPayload || outcome.Rule != "users" {
 				t.Fatalf("outcome = %+v, want stripPayload by rule users", outcome)
 			}
-			if encoded := string(compat.Encode(got)); encoded != tt.want {
+			if encoded := string(jsonvalue.Encode(got)); encoded != tt.want {
 				t.Fatalf("stub = %s\nwant   %s", encoded, tt.want)
 			}
 		})
@@ -168,12 +168,12 @@ func TestStubFromAnotherRuleCarriesNoIdentifier(t *testing.T) {
 // The NCA id rule keeps the earlier uploader's stub byte for byte, whatever
 // the rule is named.
 func TestNCAIDRuleStubRecordsTheID(t *testing.T) {
-	cfg := FromIDs([]string{"acme"})
+	cfg := FromIDs([]string{"acme"}, ncaHeaders...)
 	cfg.Rules[0].Name = "nca_id"
 	engine := mustEngine(t, cfg)
 	got, _ := engine.Apply(mustDecode(t, `{"event_type":"request_payload","payload":{"request_id":"r1","http_request_headers":{"nvcf-ncaid":"acme"}}}`))
 	want := `{"event_type":"request_payload","payload":{"request_id":"r1","payload_complete":false,"payload_drop_reason":"nca_id","payload_suppressed":true,"suppression_reason":"nca_id","nca_id":"acme","http_request_headers":{"nvcf-ncaid":"acme"}}}`
-	if encoded := string(compat.Encode(got)); encoded != want {
+	if encoded := string(jsonvalue.Encode(got)); encoded != want {
 		t.Fatalf("stub = %s\nwant   %s", encoded, want)
 	}
 }
@@ -183,7 +183,7 @@ func TestNCAIDRuleStubRecordsTheID(t *testing.T) {
 // a stub.
 func TestDropBeatsStripWhenBothMatch(t *testing.T) {
 	engine := mustEngine(t, Config{Rules: []Rule{
-		{Name: "nca_id", Headers: DefaultHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
+		{Name: "nca_id", Headers: ncaHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
 		{Name: "tenants", Headers: []string{"x-tenant"}, Values: []string{"t1"}, Action: DropRecord},
 	}})
 	got, outcome := engine.Apply(mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"acme","x-tenant":"t1"}}}`))
