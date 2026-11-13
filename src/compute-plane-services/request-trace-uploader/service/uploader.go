@@ -72,6 +72,7 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	}
 	prepareConfig := transform.DefaultConfig()
 	prepareConfig.Suppression = cfg.Suppression
+	prepareConfig.Redact = !cfg.SkipRedaction
 	preparer, err := transform.New(prepareConfig)
 	if err != nil {
 		return nil, err
@@ -82,6 +83,9 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	}
 	metrics = telemetry.Safe(metrics)
 	telemetry.Preset(metrics)
+	if receiver, ok := client.(telemetry.Receiver); ok {
+		receiver.UseMetrics(metrics)
+	}
 	rules.preset(metrics)
 	threshold := opts.HeaderCheckRecords
 	if threshold <= 0 {
@@ -173,11 +177,11 @@ func (u *Uploader) checkSecretsFile(context.Context) error {
 // Pass exports every closed segment once. A segment that fails is logged
 // and left for the next pass.
 func (u *Uploader) Pass(ctx context.Context) error {
-	segments, err := segment.Discover(u.cfg.SourceDir, u.cfg.SegmentPrefix)
+	scan, err := segment.ScanDir(u.cfg.SourceDir, u.cfg.Prefixes())
 	if err != nil {
 		return fmt.Errorf("discover request trace segments: %w", err)
 	}
-	for _, item := range segments {
+	for _, item := range scan.Closed {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -249,6 +253,11 @@ func (u *Uploader) export(ctx context.Context, item segment.Segment) error {
 		return backendError("read backend status", u.client, err)
 	}
 	slog.Info("submitted request trace segment", "segment", item.Index, "records", result.Written, "status", status)
+	switch status {
+	case backend.StatusPending, backend.StatusSucceeded, backend.StatusFailed, backend.StatusNotFound:
+	default:
+		u.metrics.Add(telemetry.JobStatusUnknown, 1, nil)
+	}
 	if status != backend.StatusSucceeded {
 		return nil
 	}

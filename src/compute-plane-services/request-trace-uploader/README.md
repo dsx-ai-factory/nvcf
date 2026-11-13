@@ -46,13 +46,28 @@ Optional, with defaults:
 - `REQUEST_TRACE_UPLOADER_STATE_DIR`: default under the source directory
 - `REQUEST_TRACE_UPLOADER_QUARANTINE_DIR`: default under the source directory
 - `HEALTH_ADDR`: default `:8011`
-- `REQUEST_TRACE_UPLOADER_SCAN_INTERVAL_SECONDS`: default `30`
+- `REQUEST_TRACE_UPLOADER_SCAN_INTERVAL`: default `30s`
 - `REQUEST_TRACE_UPLOADER_ATTEMPT_TIMEOUT`: default `30s`
 - `REQUEST_TRACE_UPLOADER_OPERATION_TIMEOUT`: default `90s`
 - `REQUEST_TRACE_UPLOADER_MAX_RETRIES`: default `2`
 - `REQUEST_TRACE_UPLOADER_RETRY_INITIAL_BACKOFF`: default `100ms`
 - `REQUEST_TRACE_UPLOADER_RETRY_MAX_BACKOFF`: default `15s`
 - `REQUEST_TRACE_UPLOADER_RETRY_MULTIPLIER`: default `2.0`
+- `REQUEST_TRACE_UPLOADER_AUDIT_PREFIX`: a second segment family on the same
+  spool; default none
+- `REQUEST_TRACE_UPLOADER_REDACT_MULTIMODAL`: default `true`
+- `REQUEST_TRACE_UPLOADER_DRAIN_TIMEOUT`: shutdown drain after SIGTERM;
+  default `60s`, `0s` for none. Set it to fit the pod's grace period.
+- `REQUEST_TRACE_UPLOADER_MAX_JOB_AGE`: how long a submitted job may stay
+  unfinished before it is reported stranded; default `6h`
+- `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL`: how often every open job is
+  polled; default `30s`
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_RESUME`: how long intake stays stopped
+  after a quarantine trip; default `1h`
+
+Time settings above are Go durations with a unit, such as `30s`, `5m` or
+`1h`. A bare number, a negative value, or a value out of range stops
+startup.
 
 Kratos Bulk Upload is an asynchronous job API, so it polls for terminal status.
 These settings apply only to that backend:
@@ -62,9 +77,16 @@ These settings apply only to that backend:
 
 Object-store submission is synchronous and has no status poll.
 
-Invalid policy values fall back to defaults and produce a safe startup warning.
-Missing paths, unreadable secret files, an unknown backend, and incompatible
-required values prevent readiness.
+The binary loads configuration strictly. An invalid or incompatible value,
+or an unknown name that starts with `REQUEST_TRACE_UPLOADER_`, stops startup
+with a non-zero exit. Errors name the setting, never its value.
+`config.Load` on its own still falls back to defaults with a warning, for
+callers that want that.
+
+The uploader reads only the names listed here. It has no aliases, so a
+deployment sets these names directly.
+
+Missing paths and unreadable secret files prevent readiness.
 
 ## Record suppression
 
