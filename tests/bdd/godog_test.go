@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -114,11 +115,20 @@ func (f *fakeRunner) RunWithTTY(ctx context.Context, command string) (harness.Re
 	return f.Run(ctx, command)
 }
 
+// vanityPodCountCommand is the single-cluster Helmfile feature's wait for
+// the old Vanity Gateway pod to finish draining after a restart.
+const vanityPodCountCommand = `/bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'`
+
 // newFakeRunner returns a runner pre-loaded with canned responses for
 // specific commands. Commands not in the map resolve to ExitCode 0
-// with empty streams. Pass nil for an all-zero-exit runner.
+// with empty streams. Pass nil for an all-zero-exit runner. The Vanity
+// Gateway pod count always reports one pod unless a test overrides it.
 func newFakeRunner(canned map[string]harness.Result) *fakeRunner {
-	return &fakeRunner{results: canned, runs: nil, respond: taskLifecycleResponder()}
+	results := map[string]harness.Result{
+		vanityPodCountCommand: {ExitCode: 0, Stdout: "vanity-gateway pods: 1.\n"},
+	}
+	maps.Copy(results, canned)
+	return &fakeRunner{results: results, runs: nil, respond: taskLifecycleResponder()}
 }
 
 // newWiringSuite builds a Suite tailored for the wiring tests: a
@@ -577,7 +587,9 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	vanityShadow := newVanityShadowFake("", decisionRoutes)
 	vanityShadow.attach(runner)
 	decisionRoutes.attach(runner, suite.Config.RepoRoot)
-	suite.HTTP = vanityShadow
+	requestBody := newVanityRequestBodyFake("", vanityShadow)
+	requestBody.attach(runner)
+	suite.HTTP = requestBody
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
 	var out strings.Builder
@@ -702,7 +714,12 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
-	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 11)
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
+	for _, key := range []string{"early", "late"} {
+		if !requestBody.seen[key] {
+			t.Errorf("vanity request body scenario never sent the %s-field request", key)
+		}
+	}
 	for _, key := range []string{"shadow-warmup", "promptCacheKey", "firstMessageHash", "continuation", "failing-shadow"} {
 		if !vanityShadow.seen[key] {
 			t.Errorf("vanity shadow scenario never exercised %s", key)
@@ -4475,6 +4492,125 @@ func (f *vanityShadowFake) attach(runner *fakeRunner) {
 	}
 }
 
+// vanityRequestBodyFake stands in for the direct Vanity Gateway model route
+// in the request body scenario. Like SAMPLE_LLM_ECHO_IMAGE with
+// x_load_tester_echo, it replies with the request it received. Each broken
+// mode reproduces one way a gateway could change a large body.
+type vanityRequestBodyFake struct {
+	broken string
+	seen   map[string]bool
+	inner  harness.HTTPClient
+}
+
+const vanityRequestBodyPaddingCommand = `/bin/bash -c 'printf "%080000d" 0 | tr 0 a'`
+
+func newVanityRequestBodyFake(broken string, inner harness.HTTPClient) *vanityRequestBodyFake {
+	return &vanityRequestBodyFake{broken: broken, seen: map[string]bool{}, inner: inner}
+}
+
+func (f *vanityRequestBodyFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
+	if rawURL != "http://vanity-openai.localhost:8080/v1/chat/completions" || !strings.Contains(body, `"model":"bdd-request-body"`) {
+		return f.inner.Do(ctx, method, rawURL, headers, body)
+	}
+	if method != "POST" || headers["Authorization"] != "Bearer wiring-function-api-key" || headers["Content-Type"] != "application/json" {
+		return harness.HTTPResponse{Status: 401}, nil
+	}
+	padding := strings.Repeat("a", 80000)
+	switch {
+	case strings.Contains(body, "bdd-early-"+padding):
+		f.seen["early"] = true
+		if f.broken == "rewrites-early-body" {
+			body = strings.Replace(body, `"stream":false`, `"stream":true`, 1)
+		}
+	case strings.Contains(body, "bdd-late-"+padding):
+		f.seen["late"] = true
+		if f.broken == "truncates-late-body" {
+			body = strings.Replace(body, padding, padding[:65536], 1)
+		}
+	default:
+		return harness.HTTPResponse{}, fmt.Errorf("request body scenario sent an unexpected body of %d bytes", len(body))
+	}
+	content, err := json.Marshal(body)
+	if err != nil {
+		return harness.HTTPResponse{}, err
+	}
+	return harness.HTTPResponse{Status: 200, Body: `{"object":"chat.completion","choices":[{"message":{"content":` + string(content) + `}}]}`}, nil
+}
+
+func (f *vanityRequestBodyFake) attach(runner *fakeRunner) {
+	previous := runner.onRun
+	runner.onRun = func(command string) error {
+		switch {
+		case command == vanityRequestBodyPaddingCommand:
+			runner.results[command] = harness.Result{Stdout: strings.Repeat("a", 80000)}
+		case strings.Contains(command, " function invoke ") && strings.Contains(command, "bdd-request-body-ready"):
+			runner.results[command] = harness.Result{Stdout: `{"object":"chat.completion","choices":[{"message":{"content":"{\"messages\":[{\"content\":\"bdd-request-body-ready\"}]}"}}]}`}
+		case strings.Contains(command, "httproute/vanity-gateway") && strings.Contains(command, "-o yaml"):
+			runner.results[command] = harness.Result{Stdout: "spec:\n  hostnames:\n    - vanity.localhost\n    - vanity-openai.localhost\n"}
+		}
+		if previous != nil {
+			return previous(command)
+		}
+		return nil
+	}
+}
+
+func TestVanityRequestBodyScenarioRejectsChangedBodies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("SAMPLE_LLM_ECHO_IMAGE", "nvcr.io/test-org/test-team/openai-compatible-sample:test")
+	seedFunctionAPIKey(t, home)
+	data, err := os.ReadFile(mustResolveFeaturePath(t, "single-cluster-helmfile.feature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, scenario, found := strings.Cut(string(data), "    @vanity-request-body\n")
+	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	if !found || !ended {
+		t.Fatal("missing vanity request body scenario")
+	}
+	for _, broken := range []string{"", "rewrites-early-body", "truncates-late-body"} {
+		t.Run(broken, func(t *testing.T) {
+			runner := newFakeRunner(map[string]harness.Result{})
+			runner.onRun = func(command string) error {
+				if strings.Contains(command, " status --json") {
+					runner.results[command] = harness.Result{Stdout: `{"currentFunction":{"hasFunction":true,"functionId":"function-1","versionId":"version-1"}}`}
+				}
+				return nil
+			}
+			suite := newWiringSuite(t, runner)
+			envFile := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd.yaml")
+			if err := os.MkdirAll(filepath.Dir(envFile), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(envFile, []byte("addons: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fake := newVanityRequestBodyFake(broken, &llmRoutingHTTPFake{seen: map[string]bool{}})
+			fake.attach(runner)
+			suite.HTTP = fake
+			sc := steps.NewScenarioContext(suite)
+			var out strings.Builder
+			status := godog.TestSuite{
+				Name:                "vanity-request-body-feature",
+				ScenarioInitializer: func(ctx *godog.ScenarioContext) { steps.RegisterAll(ctx, sc) },
+				Options:             &godog.Options{Format: "pretty", Output: &out, Strict: true, FeatureContents: []godog.Feature{{Name: "vanity", Contents: []byte("Feature: Vanity request bodies\n" + scenario)}}},
+			}.Run()
+			if broken != "" && status == 0 {
+				t.Fatalf("feature did not reject the %s gateway:\n%s", broken, out.String())
+			}
+			if broken == "" && status != 0 {
+				t.Fatalf("feature failed:\n%s", out.String())
+			}
+			if broken == "" && (!fake.seen["early"] || !fake.seen["late"]) {
+				t.Fatalf("feature did not send both requests: %v", fake.seen)
+			}
+		})
+	}
+}
+
 func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -4487,7 +4623,7 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, scenario, found := strings.Cut(string(data), "    @vanity-shadow-sampling\n")
-	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	scenario, _, ended := strings.Cut(scenario, "\n    # Large model requests through a direct Vanity Gateway")
 	if !found || !ended {
 		t.Fatal("missing vanity shadow scenario")
 	}

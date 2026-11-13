@@ -111,6 +111,7 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	if err != nil {
 		return nil, err
 	}
+	modelDirector.requestBodyLimit = maxRequestSize
 	if serverConfig.NvcfControlPlaneEndpoint != "" {
 		modelDirector.privateModels, err = sharedPrivateModelAccess(serverConfig.NvcfControlPlaneEndpoint, transport)
 		if err != nil {

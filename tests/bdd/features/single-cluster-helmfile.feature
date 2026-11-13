@@ -305,6 +305,12 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=vanity-gateway KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
       And I successfully run command "kubectl --context k3d-ncp-local rollout restart deployment/vanity-gateway --namespace nvcf"
       Then deployment "vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should complete rollout within "5m"
+      # The old pod keeps serving with the previous mapping during its 70 s
+      # preStop, so wait until only the new pod is left.
+      And I poll command for up to 360 seconds until output contains "vanity-gateway pods: 1.":
+        """
+        /bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'
+        """
 
       When I successfully invoke the function selected by NVCF CLI through Vanity Gateway host "vanity.localhost" path "/bdd/echo" with timeout "120" seconds:
         """
@@ -766,6 +772,118 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       Then Prometheus metrics on port "10083" of pods selected by "app.kubernetes.io/name=helm-nvcf-vanity-gateway,app.kubernetes.io/instance=vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should total within "30s":
         | metric                                     | labels                                         | comparison | total |
         | http_server_request_duration_seconds_count | nvcf_shadow=true,http_response_status_code=404 | exactly    | 1     |
+
+    # Large model requests through a direct Vanity Gateway model route. The
+    # gateway reads at most 64 KiB before it routes, then forwards the rest of
+    # a longer body as it arrives when model and stream come first, and reads
+    # the whole body when they come last. Either way the model server must
+    # receive the client's bytes unchanged. SAMPLE_LLM_ECHO_IMAGE runs as a
+    # container function behind the invocation service and replies with the
+    # request it received when x_load_tester_echo is true. Each content field
+    # carries 80000 bytes, longer than the 64 KiB prefix. Depends on the
+    # earlier install and registration scenarios.
+    @vanity-request-body
+    Scenario: Vanity Gateway forwards large model requests unchanged whatever the field order
+      Given environment variable "SAMPLE_LLM_ECHO_IMAGE" is set
+      And I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully create function "bdd-vanity-request-body" from image "${SAMPLE_LLM_ECHO_IMAGE}" with CLI options:
+        | option           | value                |
+        | --inference-url  | /v1/chat/completions |
+        | --inference-port | 8000                 |
+        | --health-uri     | /health              |
+        | --health-port    | 8000                 |
+        | --health-timeout | PT30S                |
+      And I export the function selected by NVCF CLI to environment variables "BDD_REQUEST_BODY_FUNCTION_ID" and "BDD_REQUEST_BODY_VERSION_ID"
+      And function "${BDD_REQUEST_BODY_FUNCTION_ID}" version "${BDD_REQUEST_BODY_VERSION_ID}" is deleted at scenario teardown
+      And function "${BDD_REQUEST_BODY_FUNCTION_ID}" version "${BDD_REQUEST_BODY_VERSION_ID}" is undeployed at scenario teardown
+      And I successfully deploy the function selected by NVCF CLI with options:
+        | option          | value           |
+        | --gpu           | H100            |
+        | --instance-type | NCP.GPU.H100_1x |
+        | --backend       | ncp-local       |
+        | --regions       | us-west-1       |
+        | --min-instances | 1               |
+        | --max-instances | 1               |
+        | --timeout       | 900             |
+      And I successfully generate a function API key with CLI options:
+        | option        | value                                                               |
+        | --description | bdd-vanity-request-body                                             |
+        | --scopes      | invoke_function,list_functions,queue_details,list_functions_details |
+
+      # The first call proves the function answers before the gateway is
+      # involved.
+      When I successfully invoke the function selected by NVCF CLI over HTTP with timeout "120" seconds and poll duration "5" seconds:
+        """
+        {"model":"bdd-request-body","x_load_tester_echo":true,"messages":[{"role":"user","content":"bdd-request-body-ready"}]}
+        """
+      Then the command output should contain "bdd-request-body-ready"
+
+      When I successfully run command:
+        """
+        /bin/bash -c 'printf "%080000d" 0 | tr 0 a'
+        """
+      And I export command output to environment variable "BDD_REQUEST_BODY_PADDING"
+
+      When I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "addons.vanityGateway.mappingConfig.v2config.openai" to:
+        """
+        host: vanity-openai.localhost:8080
+        chatCompletions:
+          bdd_request_body:
+            modelName: bdd-request-body
+            functionID: ${BDD_REQUEST_BODY_FUNCTION_ID}
+            functionVersionID: ${BDD_REQUEST_BODY_VERSION_ID}
+            usePexec: false
+        """
+      And I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "ingress.gatewayApi.routes.vanityGateway.hostnames" to:
+        """
+        - vanity.localhost
+        - vanity-openai.localhost
+        """
+      When I successfully run command "k3d kubeconfig merge ncp-local --output ${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml --overwrite --kubeconfig-switch-context=false"
+      And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=ingress KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
+      And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=vanity-gateway KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
+      And I successfully run command "kubectl --context k3d-ncp-local rollout restart deployment/vanity-gateway --namespace nvcf"
+      Then deployment "vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should complete rollout within "5m"
+      # The old pod keeps serving with the previous mapping during its 70 s
+      # preStop, so wait until only the new pod is left.
+      And I poll command for up to 360 seconds until output contains "vanity-gateway pods: 1.":
+        """
+        /bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'
+        """
+      And Kubernetes resource "httproute/vanity-gateway" in namespace "envoy-gateway-system" using context "k3d-ncp-local" should contain:
+        """
+        spec:
+          hostnames:
+            - vanity.localhost
+            - vanity-openai.localhost
+        """
+      And these Gateway API routes should be accepted and resolved using context "k3d-ncp-local" within "2m":
+        | kind      | name           | namespace            | parent    |
+        | HTTPRoute | vanity-gateway | envoy-gateway-system | shared-gw |
+
+      # model and stream first: routed from the prefix.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      And the HTTP request header "Content-Type" is "application/json"
+      When I send a "POST" request to "http://vanity-openai.localhost:8080/v1/chat/completions" with timeout 120 seconds and body:
+        """
+        {"model":"bdd-request-body","stream":false,"x_load_tester_echo":true,"messages":[{"role":"user","content":"bdd-early-${BDD_REQUEST_BODY_PADDING}"}]}
+        """
+      Then the HTTP status should be 200
+      And the HTTP response JSON field "choices.0.message.content.model" should equal "bdd-request-body"
+      And the HTTP response JSON field "choices.0.message.content.stream" should equal "false"
+      And the HTTP response JSON field "choices.0.message.content.messages.0.content" should equal "bdd-early-${BDD_REQUEST_BODY_PADDING}"
+
+      # model and stream last: read in full before routing.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      And the HTTP request header "Content-Type" is "application/json"
+      When I send a "POST" request to "http://vanity-openai.localhost:8080/v1/chat/completions" with timeout 120 seconds and body:
+        """
+        {"x_load_tester_echo":true,"messages":[{"role":"user","content":"bdd-late-${BDD_REQUEST_BODY_PADDING}"}],"model":"bdd-request-body","stream":false}
+        """
+      Then the HTTP status should be 200
+      And the HTTP response JSON field "choices.0.message.content.model" should equal "bdd-request-body"
+      And the HTTP response JSON field "choices.0.message.content.messages.0.content" should equal "bdd-late-${BDD_REQUEST_BODY_PADDING}"
 
     # Proves the serve path the @llm-gateway scenario only installs:
     # LLM-type functions route through llm-api-gateway and
@@ -1342,6 +1460,12 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=vanity-gateway KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
       And I successfully run command "kubectl --context k3d-ncp-local rollout restart deployment/vanity-gateway --namespace nvcf"
       Then deployment "vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should complete rollout within "5m"
+      # The old pod keeps serving with the previous mapping during its 70 s
+      # preStop, so wait until only the new pod is left.
+      And I poll command for up to 360 seconds until output contains "vanity-gateway pods: 1.":
+        """
+        /bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'
+        """
       And Kubernetes resource "httproute/vanity-gateway" in namespace "envoy-gateway-system" using context "k3d-ncp-local" should contain:
         """
         spec:

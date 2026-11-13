@@ -34,13 +34,15 @@ import (
 // they return to the pool. Tests set it so any read of a released buffer fails.
 var poisonReleasedRequestBodies atomic.Bool
 
+// releaseRequestBodyBuffer returns buffer to the pool. Put resets the buffer
+// after recording its length; resetting first would calibrate the pool as if
+// every body were empty.
 func releaseRequestBodyBuffer(buffer *bytebufferpool.ByteBuffer) {
 	if poisonReleasedRequestBodies.Load() {
 		for i := range buffer.B {
 			buffer.B[i] = 'X'
 		}
 	}
-	buffer.Reset()
 	bytebufferpool.Put(buffer)
 }
 
@@ -98,7 +100,14 @@ func readOpenAIRequestBody(request *http.Request, bodyDescription string) (*pool
 		return nil, fmt.Errorf("expecting %s", bodyDescription)
 	}
 
-	buffer := bytebufferpool.Get()
+	return bufferRemainingRequestBody(request, bytebufferpool.Get())
+}
+
+// bufferRemainingRequestBody appends the unread request body to buffer, which
+// may already hold a prefix read from it, and replaces request.Body with a
+// pooled reader over the complete body. The buffer returns to the pool on error
+// or when the last reader of the body closes.
+func bufferRemainingRequestBody(request *http.Request, buffer *bytebufferpool.ByteBuffer) (*pooledRequestBody, error) {
 	_, err := io.Copy(buffer, request.Body)
 	_ = request.Body.Close()
 	if err != nil {

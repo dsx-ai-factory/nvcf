@@ -1142,9 +1142,13 @@ addons:
       maxRequestSizeBytes: 67108864
 ```
 
-The gateway holds each model API request body in memory while it routes the
-request. LLM Gateway routes and shadow models add more copies. In one
-in-process test, a single 64 MiB request raised gateway heap use by about
+The gateway holds a model API request body in memory while it routes the
+request, unless the body is larger than 64 KiB, its first 64 KiB contain
+`model` and `stream` (decision routes: `model`), and the model's route
+forwards the body unchanged. Then it holds only that prefix and forwards the
+rest as it arrives. LLM Gateway routes and shadow models always hold the
+full body and add more copies. In one in-process test, a single 64 MiB
+request held in full raised gateway heap use by about
 224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
 900 MiB with one shadow model. Treat these numbers as examples, not limits.
 When raising this limit, also raise
