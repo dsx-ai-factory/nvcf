@@ -2,7 +2,7 @@ module nvcf-grpc-proxy
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/MadAppGang/httplog v1.3.0
