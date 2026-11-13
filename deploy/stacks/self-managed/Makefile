@@ -49,6 +49,9 @@ test:
 	@tests/nonroot-ui-migrations.sh
 	@tests/ha-value-wiring.sh
 	@tests/ha-chart-render.sh
+	@tests/worker-callback-proxy-wiring.sh
+	@tests/self-managed-111-pins.sh
+	@tests/legacy-image-keys-passthrough.sh
 
 test-published-charts:
 	@: "$${NVCF_PUBLISHED_CHART_REGISTRY:?NVCF_PUBLISHED_CHART_REGISTRY is required}"
