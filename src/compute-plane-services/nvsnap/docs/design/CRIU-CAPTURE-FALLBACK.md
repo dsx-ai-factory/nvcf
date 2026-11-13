@@ -172,7 +172,10 @@ a cluster each configuration would spend up to three captures, each with a faile
   takes the record's driver as well as the cluster's (`groupKeyRefusal`), so a placeholder admitted just before a
   change is not refused, which would leave it waiting. On its node the restore does not run when the node's driver is
   not the record's (`driverMismatch`): the pod is replaced, as for a checkpoint that could not be fetched, without
-  counting against the capture, and its replacement is admitted under the drivers as they are now.
+  counting against the capture, and its replacement is admitted under the drivers as they are now. A group restore
+  checks every rank's node before it starts (`groupDriverMismatch`), by the driver the node's agent stamps on its pod
+  (this node's own for the leader): one rank on another driver ends the restore as not run, every pod of the instance
+  is replaced, and the checkpoints are kept. A node whose agent reports no driver is not refused.
 - **No reports, no change.** With no agent reporting (an older agent build), keys and decisions are as before.
 
 **Limits.**

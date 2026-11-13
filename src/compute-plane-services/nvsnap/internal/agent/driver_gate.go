@@ -366,3 +366,47 @@ func (c *criuAutoRestorer) driverMismatch(ctx context.Context, key string) strin
 	}
 	return fmt.Sprintf("this node runs driver %d; the capture was taken under %d", own, want)
 }
+
+// groupDriverMismatch is driverMismatch for a group restore: why ranks
+// may not be restored from group record key, because the node one of them
+// runs on reports another driver major than the capture's. Each rank is
+// restored on its own node, so the leader's driver alone does not answer
+// for the others: a node's driver is the one its agent stamps on its pod
+// (DriverMajorAnnotation), this node's its own. "" when every rank may,
+// or when the record's driver or a node's is unknown.
+func (c *criuAutoRestorer) groupDriverMismatch(ctx context.Context, key string, ranks []*corev1.Pod) string {
+	if key == "" {
+		return ""
+	}
+	d, err := c.a.groupRecordData(ctx, key)
+	if err != nil {
+		return ""
+	}
+	want := recordDriver(d)
+	if want == 0 {
+		return ""
+	}
+	nodes := map[string]int{}
+	if list, lerr := c.a.kubeClient.CoreV1().Pods(c.a.agentNamespace()).List(ctx, metav1.ListOptions{LabelSelector: agentLabelSelector}); lerr == nil {
+		for i := range list.Items {
+			p := &list.Items[i]
+			if p.DeletionTimestamp != nil || p.Spec.NodeName == "" {
+				continue
+			}
+			if n, aerr := strconv.Atoi(p.Annotations[DriverMajorAnnotation]); aerr == nil && n > 0 {
+				nodes[p.Spec.NodeName] = n
+			}
+		}
+	} else {
+		c.a.log.WithError(lerr).Warn("CRIU group restore: cannot list the agents to read the ranks' drivers; checking this node's only")
+	}
+	if own := int(c.a.ownDriver.Load()); own > 0 && c.a.config.NodeName != "" {
+		nodes[c.a.config.NodeName] = own
+	}
+	for _, p := range ranks {
+		if n := nodes[p.Spec.NodeName]; n > 0 && n != want {
+			return fmt.Sprintf("rank %s is on node %s, which runs driver %d; the capture was taken under %d", p.Name, p.Spec.NodeName, n, want)
+		}
+	}
+	return ""
+}

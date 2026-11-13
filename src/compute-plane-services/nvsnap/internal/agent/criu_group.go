@@ -1241,6 +1241,14 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			return
 		}
 	}
+	// A capture is restored only under the driver it was taken with, on
+	// every rank's node (driver_gate.go). Not run, and not held against the
+	// capture: the replacements are admitted under the drivers as they are
+	// now.
+	if why := c.groupDriverMismatch(ctx, key, ranks); why != "" {
+		c.failGroup(ctx, leader, key, false, fmt.Errorf("%w: %s", errCheckpointUnavailable, why), log)
+		return
+	}
 	// failGroup deletes the pods after it has blocked their checkpoints. Were
 	// the driver to delete them first, their replacements could be admitted
 	// as placeholders of the same checkpoints and wait for a restore that

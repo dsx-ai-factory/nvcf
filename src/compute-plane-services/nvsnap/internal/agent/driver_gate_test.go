@@ -404,3 +404,104 @@ func TestDriverMismatch(t *testing.T) {
 		t.Fatalf("same driver: %q", why)
 	}
 }
+
+// Each rank is checked on its own node: the leader's driver matching the
+// capture's does not let a rank on a node of another driver through. A
+// node whose driver is unknown, or a record without one, lets it.
+func TestGroupDriverMismatch(t *testing.T) {
+	noServiceAccount(t)
+	a, cs := fallbackAgent(t)
+	ctx := context.Background()
+	for key, drv := range map[string]string{"k610": "610", "knone": ""} {
+		d := map[string]string{"state": "complete", "size": "2", "checkpoint.0": "c0", "checkpoint.1": "c1"}
+		if drv != "" {
+			d[recordDriverKey] = drv
+		}
+		r := record(criuGroupConfigMapName(key), d)
+		if _, err := cs.CoreV1().ConfigMaps(a.criuFailedNamespace()).Create(ctx, &r, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ns := a.agentNamespace()
+	driverAgentPod(t, cs, ns, "n1", 610)
+	driverAgentPod(t, cs, ns, "n2", 615)
+	driverAgentPod(t, cs, ns, "n3", 0)
+	a.ownDriver.Store(610) // n0, this node
+	c := &criuAutoRestorer{a: a}
+	on := func(nodes ...string) []*corev1.Pod {
+		ps := make([]*corev1.Pod, 0, len(nodes))
+		for i, n := range nodes {
+			ps = append(ps, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "r" + strconv.Itoa(i)}, Spec: corev1.PodSpec{NodeName: n}})
+		}
+		return ps
+	}
+	if why := c.groupDriverMismatch(ctx, "k610", on("n0", "n2")); !strings.Contains(why, "r1") || !strings.Contains(why, "615") {
+		t.Fatalf("a rank on a 615 node, 610 capture: %q", why)
+	}
+	for name, tc := range map[string]struct {
+		key   string
+		ranks []*corev1.Pod
+	}{
+		"same driver everywhere":    {"k610", on("n0", "n1")},
+		"a node reporting none":     {"k610", on("n0", "n3")},
+		"a node without an agent":   {"k610", on("n0", "n9")},
+		"a record without a driver": {"knone", on("n0", "n2")},
+		"no record":                 {"missing", on("n0", "n2")},
+		"no key":                    {"", on("n0", "n2")},
+	} {
+		if why := c.groupDriverMismatch(ctx, tc.key, tc.ranks); why != "" {
+			t.Errorf("%s: %q, want none", name, why)
+		}
+	}
+	// This node's own driver is its own, whatever its agent pod says.
+	a.ownDriver.Store(615)
+	if why := c.groupDriverMismatch(ctx, "k610", on("n0", "n1")); !strings.Contains(why, "n0") {
+		t.Fatalf("this node on 615, 610 capture: %q", why)
+	}
+}
+
+// A group restore whose ranks include one on a node of another driver
+// than the capture's does not run: the instance starts again, its
+// checkpoints stay usable, and it counts as a stall.
+func TestRestoreGroup_RankOnAnotherDriver(t *testing.T) {
+	noServiceAccount(t)
+	c, kc, leader := groupFixture(t)
+	var logs strings.Builder
+	c.a.log.SetOutput(&logs)
+	ctx := context.Background()
+	setRecord(t, kc, map[string]string{recordDriverKey: "610"})
+	for node, drv := range map[string]int{"node-kimi-0": 610, "node-kimi-1": 615} {
+		driverAgentPod(t, kc, c.a.agentNamespace(), node, drv)
+	}
+	for _, name := range []string{"kimi-0", "kimi-1"} {
+		p, err := kc.CoreV1().Pods("fn").Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Annotations[webhook.CRIURestoreContainerAnnotation] = "engine"
+		p.Annotations[webhook.CRIUGroupOrdinalAnnotation] = name[len(name)-1:]
+		p.Annotations[webhook.CRIUGroupSizeAnnotation] = "2"
+		p.Spec.NodeName = "node-" + name
+		p.Status.Phase = corev1.PodRunning
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "engine", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+		if p, err = kc.CoreV1().Pods("fn").Update(ctx, p, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if name == "kimi-0" {
+			leader = p
+		}
+	}
+	rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	c.restoreGroup(rctx, leader, "k1", 2)
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["stalls"] != "1" || !strings.Contains(logs.String(), "driver 615") {
+		t.Fatalf("record = %v; want the restore ended as not run over the rank's driver\n%s", cm.Data, logs.String())
+	}
+	if c.Blocked(ctx, "c0") || c.Blocked(ctx, "c1") {
+		t.Error("a restore that never ran blocked its checkpoints")
+	}
+	if got := remainingPods(t, kc); len(got) != 1 || got[0] != "other-0" {
+		t.Errorf("pods left = %v, want only the other instance", got)
+	}
+}
