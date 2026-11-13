@@ -19,6 +19,7 @@ package worker
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"nvcf-grpc-proxy/proxy/metrics"
 	"nvcf-grpc-proxy/proxy/pool"
 	"nvcf-grpc-proxy/proxy/rp"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -228,6 +230,18 @@ func (w *WorkerConnection) SetConnection(conn net.Conn) error {
 			w.endTunnel()
 			w.onInactive()
 		}
+		// After an upgrade, ReverseProxy closes the client side as soon as the
+		// worker goes, which would record client_closed. Record the worker as
+		// the cause first, when a read or write shows it is gone.
+		wrapped.onPeerGone = func() {
+			// Copy the error before signalling the tunnel: client cleanup can
+			// evict this connection before onClose runs, and the eviction log
+			// would otherwise report no close error.
+			w.SetCloseError(wrapped.FirstError())
+			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
+			w.MarkClosed(time.Now())
+			w.endTunnel()
+		}
 		dialOnce := atomic.Bool{}
 		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if !dialOnce.Swap(true) {
@@ -337,6 +351,10 @@ type errBox struct{ err error }
 type CloseFuncConn struct {
 	net.Conn
 	onClose func()
+	// onPeerGone runs when a read or write fails on a connection the proxy has
+	// not closed itself: the worker ended it or stopped answering.
+	onPeerGone func()
+	closing    atomic.Bool
 	// firstErr is the first transport error seen on this connection. Recorded
 	// on Read and Write rather than in Close, because by the time Close runs
 	// the underlying cause has usually been discarded. First writer wins: the
@@ -352,6 +370,13 @@ func (c *CloseFuncConn) Read(b []byte) (int, error) {
 
 func (c *CloseFuncConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
+	// A write deadline hit after partial progress is not worker loss: the
+	// HTTP/2 transport (writeWithByteTimeout) keeps writing the remainder with
+	// a fresh deadline. Only a timeout with no progress, or any other error,
+	// is terminal.
+	if n > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+		return n, err
+	}
 	c.recordErr(err)
 	return n, err
 }
@@ -361,6 +386,9 @@ func (c *CloseFuncConn) recordErr(err error) {
 		return
 	}
 	c.firstErr.CompareAndSwap(nil, &errBox{err: err})
+	if c.onPeerGone != nil && !c.closing.Load() {
+		c.onPeerGone()
+	}
 }
 
 // FirstError returns the first transport error seen, or nil if the connection
@@ -373,6 +401,7 @@ func (c *CloseFuncConn) FirstError() error {
 }
 
 func (c *CloseFuncConn) Close() error {
+	c.closing.Store(true)
 	c.onClose()
 	return c.Conn.Close()
 }
