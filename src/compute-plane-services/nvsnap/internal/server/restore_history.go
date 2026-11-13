@@ -132,7 +132,7 @@ func (t *restoreTracker) observePod(pod *corev1.Pod, deleted, unknown bool, now 
 	defer t.mu.Unlock()
 	b := t.byPod[pod.UID]
 	if b == nil {
-		b = t.batchFor(pod.Namespace, key, instanceOf(pod), pod.CreationTimestamp.Time)
+		b = t.batchFor(pod.Namespace, key, instanceOf(pod), ordinal, pod.CreationTimestamp.Time)
 		t.byPod[pod.UID] = b
 	}
 	b.seen = now
@@ -181,12 +181,13 @@ func (t *restoreTracker) observePod(pod *corev1.Pod, deleted, unknown bool, now 
 	}
 }
 
-// batchFor is the restore of instance of key in ns that a pod created at
-// created belongs to: one created within fnstatus.RestoreMatchWindow of
-// it, unless every pod of that one had gone before it was created (a new
-// restore); else a new one. A pod seen after its restore's other pods went
-// (a server restart, a re-list) still joins it.
-func (t *restoreTracker) batchFor(ns, key, instance string, created time.Time) *restoreBatch {
+// batchFor is the restore of instance of key in ns that a pod of rank
+// ordinal created at created belongs to: one created within
+// fnstatus.RestoreMatchWindow of it, unless every pod of that one had gone
+// before it was created (a new restore); else one whose pod of that rank
+// it replaces, however late; else a new one. A pod seen after its
+// restore's other pods went (a server restart, a re-list) still joins it.
+func (t *restoreTracker) batchFor(ns, key, instance string, ordinal int, created time.Time) *restoreBatch {
 	for _, b := range t.batches {
 		if b.ns == ns && b.key == key && b.instance == instance && absDuration(created.Sub(b.created)) <= fnstatus.RestoreMatchWindow &&
 			!(b.over() && created.After(b.lastGone())) {
@@ -195,6 +196,11 @@ func (t *restoreTracker) batchFor(ns, key, instance string, created time.Time) *
 				b.created = created
 				t.batches[b.id()] = b
 			}
+			return b
+		}
+	}
+	for _, b := range t.batches {
+		if b.ns == ns && b.key == key && b.instance == instance && created.After(b.created) && b.replacedBy(ordinal) {
 			return b
 		}
 	}
@@ -208,6 +214,31 @@ func (t *restoreTracker) batchFor(ns, key, instance string, created time.Time) *
 
 func (b *restoreBatch) id() string {
 	return b.ns + "/" + b.key + "/" + b.instance + "/" + b.created.UTC().Format(time.RFC3339)
+}
+
+// replacedBy reports whether a new pod of rank ordinal replaces the
+// restore's pod of that rank: the restore goes on (a pod of it is not
+// deleted) and its pod of the rank was deleted before it was ever Ready.
+// The agent replaces a rank that way when it must (a target pod given an
+// address another pod of the instance had at capture), once the instance's
+// earlier pods went, which can be minutes after the restore's pods were
+// created. A rank deleted after it was Ready is not: its replacement is
+// not part of the restore.
+func (b *restoreBatch) replacedBy(ordinal int) bool {
+	live, replaced := false, false
+	for _, p := range b.pods {
+		if p.deleteReq.IsZero() && !p.gone {
+			if p.ordinal == ordinal {
+				return false
+			}
+			live = true
+			continue
+		}
+		if p.ordinal == ordinal && p.ready.IsZero() {
+			replaced = true
+		}
+	}
+	return live && replaced
 }
 
 // over reports whether every pod of the restore is gone.

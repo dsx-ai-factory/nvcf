@@ -202,6 +202,56 @@ func TestRestoreTrackerReplacedRank(t *testing.T) {
 	}
 }
 
+// A rank the agent replaces late in the restore (its pod given an address
+// another pod of the instance had at capture, seen once the instance's
+// earlier pods went) is still of that restore, however late: one entry,
+// restored, timed from the replacement; not two gone. A rank replaced
+// after it was Ready, and a restore after every pod was deleted, are not.
+func TestRestoreTrackerLateReplacedRank(t *testing.T) {
+	tr := newRestoreTracker()
+	var ranks []*corev1.Pod
+	for i := 0; i < 4; i++ {
+		ranks = append(ranks, withCondition(rankPod(i, "ns", "k", "0", histT0), corev1.PodScheduled, histT0))
+		tr.observePod(ranks[i], false, false, histT0)
+	}
+	replaced := histT0.Add(2*time.Minute + 40*time.Second)
+	tr.observePod(deleting(ranks[0], replaced), false, false, replaced)
+	tr.observePod(ranks[0], true, false, replaced.Add(2*time.Second))
+	leader := rankPod(0, "ns", "k", "0", replaced.Add(4*time.Second))
+	tr.observePod(leader, false, false, replaced.Add(4*time.Second))
+	if e, _ := onlyEntry(t, tr, 4); e.Outcome != fnstatus.RestoreRestoring || e.Leader != string(leader.UID) {
+		t.Fatalf("%+v, want one restore, still restoring, led by the replacement", e)
+	}
+	ready := histT0.Add(5 * time.Minute)
+	tr.observePod(up(leader, replaced.Add(5*time.Second), ready), false, false, ready)
+	for _, p := range ranks[1:] {
+		tr.observePod(withCondition(p, corev1.PodReady, ready), false, false, ready)
+	}
+	e, _ := onlyEntry(t, tr, 4)
+	if e.Outcome != fnstatus.RestoreRestored || e.ScaleUpSeconds != 300 || e.At != histT0.Format(time.RFC3339) {
+		t.Fatalf("%+v, want restored at %s in 300 s", e, histT0.Format(time.RFC3339))
+	}
+
+	// A rank replaced after it was Ready: a restore of its own.
+	crashed := histT0.Add(time.Hour)
+	tr.observePod(deleting(ranks[1], crashed), true, false, crashed)
+	tr.observePod(rankPod(1, "ns", "k", "0", crashed.Add(time.Second)), false, false, crashed)
+	if got, _ := entries(t, tr, 4); len(got) != 2 {
+		t.Fatalf("%d restores, want 2: a rank replaced once Ready is not the restore's", len(got))
+	}
+
+	// Every pod deleted, then the next restore minutes later: its own.
+	tr = newRestoreTracker()
+	for i := 0; i < 2; i++ {
+		p := withCondition(rankPod(i, "ns", "k", "0", histT0), corev1.PodScheduled, histT0)
+		tr.observePod(deleting(p, histT0.Add(time.Minute)), false, false, histT0.Add(time.Minute))
+	}
+	tr.observePod(rankPod(0, "ns", "k", "0", histT0.Add(3*time.Minute)), false, false, histT0.Add(3*time.Minute))
+	if got, _ := entries(t, tr, 2); len(got) != 2 {
+		t.Fatalf("%d restores, want 2: no pod of the first goes on", len(got))
+	}
+}
+
 // Deleted before every rank was Ready: gone, and no teardown. A restore
 // whose pods all went is final even when fewer ranks were seen.
 func TestRestoreTrackerGoneBeforeReady(t *testing.T) {

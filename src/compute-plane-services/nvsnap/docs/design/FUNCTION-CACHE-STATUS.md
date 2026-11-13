@@ -178,7 +178,12 @@ them; nothing new is written on the admission, capture or restore path.
    are created within two minutes of each other, unless every pod of the
    earlier restore had gone first; it is dated by its first pod's
    creation. A rank replaced during the restore counts once, as its newest
-   pod. An entry is updated as its pods change:
+   pod, however late the replacement comes: the agent replaces a rank whose
+   pod got an address another pod of the instance had at capture once the
+   instance's earlier pods went, minutes in. A pod joins the restore as a
+   replacement when the restore goes on and its pod of that rank was
+   deleted before it was ever Ready; a rank replaced after it was Ready
+   starts an entry of its own. An entry is updated as its pods change:
    - **every rank is Ready**: it records `scaleUpSeconds`, the last rank's
      Ready less the first rank's PodScheduled;
    - **every rank is deleted before that** (it failed and was replaced, or
@@ -242,8 +247,6 @@ An entry:
 **Limits.**
 
 - Pods admitted before the label existed are not watched.
-- A rank replaced more than two minutes into its restore starts an entry
-  of its own.
 - A restore that starts and ends while the server is down, or whose pods
   are all deleted then, is missed or left `restoring`.
 - History is per cluster.
