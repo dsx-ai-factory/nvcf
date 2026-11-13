@@ -28,7 +28,9 @@ use crate::quic_http_tunnel::{
 };
 
 use super::types::RegistrationSessionConfig;
-use super::{REVERSE_TUNNEL_ACCEPT_WINDOW, REVERSE_TUNNEL_CONNECT_TIMEOUT};
+use super::{
+    REVERSE_TUNNEL_ACCEPT_WINDOW, REVERSE_TUNNEL_CLOSE_LINGER, REVERSE_TUNNEL_CONNECT_TIMEOUT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReverseTunnelEndpoint {
@@ -241,8 +243,10 @@ pub(super) async fn run_reverse_tunnel_loop(
                             // Accept the streams the router sent before it saw the
                             // registration close. A timeout is the normal outcome.
                             let _ = tokio::time::timeout(accept_window, handle.closed()).await;
+                            handle.drain(REVERSE_TUNNEL_CLOSE_LINGER).await;
+                        } else {
+                            handle.shutdown().await;
                         }
-                        handle.shutdown().await;
                         state_tx.send_if_modified(|state| state.mark_disconnected(&endpoint));
                         return;
                     }

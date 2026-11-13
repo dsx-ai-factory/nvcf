@@ -49,7 +49,7 @@ pub struct InferenceServerRegistrationConfig {
     pub tunnel_protocol: TunnelTransportProtocol,
     pub auth_token_provider: Option<Arc<AuthTokenProvider>>,
     /// Longest shutdown wait, counted from SIGTERM. It covers the accept
-    /// window and the in-flight drain.
+    /// window, the in-flight drain, and the final tunnel wait.
     pub shutdown_drain_timeout: Duration,
 }
 
