@@ -126,9 +126,9 @@ SIS does not publish to the v3 API.
 ## Enable gRPC proxy session events
 
 The gRPC proxy can publish an event each time a worker attaches to a session.
-These events are off by default. Event Ledger stores one record per attachment
-and does not expire them yet, so storage grows with session count. To enable
-them, set:
+These events are off by default. Event Ledger expires new gRPC proxy event rows
+three hours after their last write and associated stats rows after 72 hours.
+Existing rows are not changed. To enable publishing, set:
 
 ```yaml
 addons:

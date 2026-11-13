@@ -19,6 +19,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/common"
 	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
@@ -282,7 +283,40 @@ type V3Config struct {
 	// AccountColumnsEnabled stores nca_id and function_id in their own columns.
 	// Enable it only after the event_ledger 04 migration has been applied. While
 	// disabled, those values stay in details.attributes and are not validated.
-	AccountColumnsEnabled bool `mapstructure:"account-columns-enabled"`
+	AccountColumnsEnabled    bool `mapstructure:"account-columns-enabled"`
+	GrpcProxyEventTTLSeconds int  `mapstructure:"grpc-proxy-event-ttl-seconds"`
+	GrpcProxyStatsTTLSeconds int  `mapstructure:"grpc-proxy-stats-ttl-seconds"`
+}
+
+const (
+	DefaultGrpcProxyEventTTLSeconds = 3 * 60 * 60
+	DefaultGrpcProxyStatsTTLSeconds = 72 * 60 * 60
+	MaxCassandraTTLSeconds          = 20 * 365 * 24 * 60 * 60
+)
+
+func (v V3Config) WithDefaults() V3Config {
+	if v.GrpcProxyEventTTLSeconds == 0 {
+		v.GrpcProxyEventTTLSeconds = DefaultGrpcProxyEventTTLSeconds
+	}
+	if v.GrpcProxyStatsTTLSeconds == 0 {
+		v.GrpcProxyStatsTTLSeconds = DefaultGrpcProxyStatsTTLSeconds
+	}
+	return v
+}
+
+func (v V3Config) Validate() error {
+	for _, ttl := range []struct {
+		name    string
+		seconds int
+	}{
+		{"grpc-proxy-event-ttl-seconds", v.GrpcProxyEventTTLSeconds},
+		{"grpc-proxy-stats-ttl-seconds", v.GrpcProxyStatsTTLSeconds},
+	} {
+		if ttl.seconds < 1 || ttl.seconds > MaxCassandraTTLSeconds {
+			return fmt.Errorf("v3.%s must be between 1 and %d", ttl.name, MaxCassandraTTLSeconds)
+		}
+	}
+	return nil
 }
 
 // CacheConfig configures the local stats write cache. The inactivity TTL is

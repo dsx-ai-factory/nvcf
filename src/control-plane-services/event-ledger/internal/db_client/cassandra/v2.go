@@ -46,7 +46,26 @@ import (
 const (
 	statsV3Table         = "stats_v3"
 	filteredStatsV3Table = "stats_v3_ngc"
+	grpcProxySource      = "grpc-proxy"
 )
+
+func (c *CassandraHandler) grpcProxyTTL(source string, stats bool) int {
+	if source != grpcProxySource {
+		return 0
+	}
+	retention := c.v3Retention.WithDefaults()
+	if stats {
+		return retention.GrpcProxyStatsTTLSeconds
+	}
+	return retention.GrpcProxyEventTTLSeconds
+}
+
+func withTTL(query string, args []any, ttl int) (string, []any) {
+	if ttl > 0 {
+		return query + " USING TTL ?", append(args, ttl)
+	}
+	return query, args
+}
 
 // --- V2 Methods ---
 
@@ -1065,40 +1084,14 @@ func (c *CassandraHandler) UpsertEventV3(traceCtx context.Context, namespace, ev
 
 	err := c.executeWithSessionRecreation(traceCtx, func() error {
 		// Use LWT (Lightweight Transaction) to atomically insert if not exists
-		insertQuery := `INSERT INTO events_v3 (namespace, context, event_name, source, details, timestamp, created_at, updated_at) 
+		insertQuery := `INSERT INTO events_v3 (namespace, context, event_name, source, details, timestamp, created_at, updated_at)
 						VALUES (?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS`
+		insertQuery, insertArgs := withTTL(insertQuery, []any{
+			namespace, eventContext, eventName, source, details, timestamp, timestamp, timestamp,
+		}, c.grpcProxyTTL(source, false))
 
-		var applied bool
-		// Variables to scan existing row if IF NOT EXISTS fails
-		// When CAS fails, Cassandra returns all columns in this order:
-		// PK: namespace, context
-		// Clustering: event_name
-		// Other (alphabetical): created_at, details, source, timestamp, updated_at
-		var existingNamespace, existingContext, existingEventName, existingSource string
-		var existingDetails []byte
-		var existingCreatedAt, existingTimestamp, existingUpdatedAt time.Time
-
-		// Try to insert as new record
-		casApplied, err := c.session.Query(insertQuery,
-			namespace,
-			eventContext,
-			eventName,
-			source,
-			details,
-			timestamp,
-			timestamp, // created_at
-			timestamp, // updated_at
-		).WithContext(traceCtx).ScanCAS(
-			&existingNamespace,
-			&existingContext,
-			&existingEventName,
-			&existingCreatedAt,
-			&existingDetails,
-			&existingSource,
-			&existingTimestamp,
-			&existingUpdatedAt,
-		)
-		applied = casApplied
+		previous := make(map[string]any)
+		applied, err := c.session.Query(insertQuery, insertArgs...).WithContext(traceCtx).MapScanCAS(previous)
 
 		if err != nil {
 			logger.ErrorContext(traceCtx, "Failed to insert event into events_v3 table",
@@ -1119,19 +1112,20 @@ func (c *CassandraHandler) UpsertEventV3(traceCtx context.Context, namespace, ev
 				zap.String("source", source))
 		} else {
 			// Record exists - update it preserving created_at
-			updateQuery := `INSERT INTO events_v3 (namespace, context, event_name, source, details, timestamp, created_at, updated_at) 
-							VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-
-			if err := c.session.Query(updateQuery,
-				namespace,
-				eventContext,
-				eventName,
-				source,
-				details,
-				timestamp,         // event timestamp
-				existingCreatedAt, // preserve original created_at
-				time.Now(),        // updated_at = current time
-			).WithContext(traceCtx).Exec(); err != nil {
+			createdAt, ok := previous["created_at"].(time.Time)
+			if !ok {
+				createdAt = timestamp
+			}
+			ev := data_access.EventV3UpsertRecord{
+				Namespace: namespace, Context: eventContext, EventName: eventName,
+				Source: source, Details: details, Timestamp: timestamp,
+			}
+			if c.grpcProxyTTL(source, false) > 0 {
+				ev.NcaID, _ = previous["nca_id"].(string)
+				ev.FunctionID, _ = previous["function_id"].(string)
+			}
+			updateQuery, updateArgs := eventsV3InsertStatement(ev, createdAt, time.Now(), c.grpcProxyTTL(source, false))
+			if err := c.session.Query(updateQuery, updateArgs...).WithContext(traceCtx).Exec(); err != nil {
 				logger.ErrorContext(traceCtx, "Failed to update event in events_v3 table",
 					zap.Error(err),
 					zap.String("namespace", namespace),
@@ -1171,20 +1165,43 @@ func accountColumns(ev data_access.EventV3UpsertRecord, columns string, placehol
 	return columns, placeholders, args
 }
 
-func eventsV3InsertStatement(ev data_access.EventV3UpsertRecord, createdAt, updatedAt time.Time) (string, []any) {
+func eventsV3InsertStatement(ev data_access.EventV3UpsertRecord, createdAt, updatedAt time.Time, ttl int) (string, []any) {
 	columns, placeholders, args := accountColumns(ev,
 		"namespace, context, event_name, source, details, timestamp, created_at, updated_at",
 		"?, ?, ?, ?, ?, ?, ?, ?",
 		[]any{ev.Namespace, ev.Context, ev.EventName, ev.Source, ev.Details, ev.Timestamp, createdAt, updatedAt})
-	return "INSERT INTO events_v3 (" + columns + ") VALUES (" + placeholders + ")", args
+	return withTTL("INSERT INTO events_v3 ("+columns+") VALUES ("+placeholders+")", args, ttl)
 }
 
-func statsV3InsertStatement(ev data_access.EventV3UpsertRecord, createdAt, updatedAt time.Time) (string, []any) {
+func statsV3InsertStatement(ev data_access.EventV3UpsertRecord, createdAt, updatedAt time.Time, ttl int) (string, []any) {
 	columns, placeholders, args := accountColumns(ev,
 		"namespace, context, event_name, timestamp, created_at, updated_at",
 		"?, ?, ?, ?, ?, ?",
 		[]any{ev.Namespace, ev.Context, ev.EventName, ev.Timestamp, createdAt, updatedAt})
-	return "INSERT INTO " + statsV3Table + " (" + columns + ") VALUES (" + placeholders + ")", args
+	return withTTL("INSERT INTO "+statsV3Table+" ("+columns+") VALUES ("+placeholders+")", args, ttl)
+}
+
+func hasGrpcProxyEvents(events []data_access.EventV3UpsertRecord) bool {
+	for _, ev := range events {
+		if ev.Source == grpcProxySource {
+			return true
+		}
+	}
+	return false
+}
+
+// A conditional batch can refresh both the stats columns and the INSERT row
+// marker, which a conditional UPDATE alone cannot replace.
+func statsV3UpdateStatement(table, setClause, namespace, eventContext string, args []any, ttl int) (string, []any) {
+	if ttl == 0 {
+		return fmt.Sprintf(`UPDATE %s SET %s WHERE namespace = ? AND context = ? IF timestamp < ?`, table, setClause), args
+	}
+	query := fmt.Sprintf(`BEGIN BATCH
+		UPDATE %s USING TTL ? SET %s WHERE namespace = ? AND context = ? IF timestamp < ?;
+		INSERT INTO %s (namespace, context) VALUES (?, ?) USING TTL ?;
+		APPLY BATCH`, table, setClause, table)
+	args = append([]any{ttl}, args...)
+	return query, append(args, namespace, eventContext, ttl)
 }
 
 // BulkUpsertEventsV3 inserts or updates multiple events in the events_v3 table.
@@ -1230,12 +1247,41 @@ func (c *CassandraHandler) upsertPartitionEventsV3(traceCtx context.Context, nam
 
 	return c.executeWithSessionRecreation(traceCtx, func() error {
 		selectQuery := `SELECT event_name, created_at FROM events_v3 WHERE namespace = ? AND context = ?`
+		readAccountColumns := c.v3Retention.AccountColumnsEnabled || hasGrpcProxyEvents(events)
+		if c.v3Retention.AccountColumnsEnabled {
+			selectQuery = `SELECT event_name, created_at, nca_id, function_id FROM events_v3 WHERE namespace = ? AND context = ?`
+		} else if readAccountColumns {
+			// SELECT * also works against keyspaces that predate the account columns.
+			selectQuery = `SELECT * FROM events_v3 WHERE namespace = ? AND context = ?`
+		}
 		iter := c.session.Query(selectQuery, namespace, eventContext).WithContext(traceCtx).Iter()
-		existingCreatedAt := make(map[string]time.Time)
+		type existingEvent struct {
+			createdAt  time.Time
+			ncaID      string
+			functionID string
+		}
+		existing := make(map[string]existingEvent)
 		var scannedEventName string
 		var scannedCreatedAt time.Time
-		for iter.Scan(&scannedEventName, &scannedCreatedAt) {
-			existingCreatedAt[scannedEventName] = scannedCreatedAt
+		var scannedNcaID, scannedFunctionID string
+		for {
+			var scanned bool
+			if readAccountColumns && !c.v3Retention.AccountColumnsEnabled {
+				row := make(map[string]any)
+				scanned = iter.MapScan(row)
+				scannedEventName, _ = row["event_name"].(string)
+				scannedCreatedAt, _ = row["created_at"].(time.Time)
+				scannedNcaID, _ = row["nca_id"].(string)
+				scannedFunctionID, _ = row["function_id"].(string)
+			} else if readAccountColumns {
+				scanned = iter.Scan(&scannedEventName, &scannedCreatedAt, &scannedNcaID, &scannedFunctionID)
+			} else {
+				scanned = iter.Scan(&scannedEventName, &scannedCreatedAt)
+			}
+			if !scanned {
+				break
+			}
+			existing[scannedEventName] = existingEvent{scannedCreatedAt, scannedNcaID, scannedFunctionID}
 		}
 		if err := iter.Close(); err != nil {
 			logger.ErrorContext(traceCtx, "Failed to fetch existing events for partition",
@@ -1249,10 +1295,18 @@ func (c *CassandraHandler) upsertPartitionEventsV3(traceCtx context.Context, nam
 		now := time.Now()
 		for _, ev := range events {
 			createdAt := ev.Timestamp
-			if ca, exists := existingCreatedAt[ev.EventName]; exists {
-				createdAt = ca
+			if old, ok := existing[ev.EventName]; ok {
+				createdAt = old.createdAt
+				if c.grpcProxyTTL(ev.Source, false) > 0 {
+					if ev.NcaID == "" {
+						ev.NcaID = old.ncaID
+					}
+					if ev.FunctionID == "" {
+						ev.FunctionID = old.functionID
+					}
+				}
 			}
-			insertQuery, args := eventsV3InsertStatement(ev, createdAt, now)
+			insertQuery, args := eventsV3InsertStatement(ev, createdAt, now, c.grpcProxyTTL(ev.Source, false))
 			batch.Query(insertQuery, args...)
 		}
 
@@ -1321,14 +1375,42 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 
 	return c.executeWithSessionRecreation(traceCtx, func() error {
 		selectQuery := `SELECT context, created_at, timestamp FROM stats_v3 WHERE namespace = ?`
+		readAccountColumns := c.v3Retention.AccountColumnsEnabled || hasGrpcProxyEvents(events)
+		if c.v3Retention.AccountColumnsEnabled {
+			selectQuery = `SELECT context, created_at, timestamp, nca_id, function_id FROM stats_v3 WHERE namespace = ?`
+		} else if readAccountColumns {
+			selectQuery = `SELECT * FROM stats_v3 WHERE namespace = ?`
+		}
 		iter := c.session.Query(selectQuery, namespace).WithContext(traceCtx).Iter()
 		existingCreatedAt := make(map[string]time.Time)
 		existingTimestamp := make(map[string]time.Time)
+		existingNcaID := make(map[string]string)
+		existingFunctionID := make(map[string]string)
 		var scannedContext string
 		var scannedCreatedAt, scannedTimestamp time.Time
-		for iter.Scan(&scannedContext, &scannedCreatedAt, &scannedTimestamp) {
+		var scannedNcaID, scannedFunctionID string
+		for {
+			var scanned bool
+			if readAccountColumns && !c.v3Retention.AccountColumnsEnabled {
+				row := make(map[string]any)
+				scanned = iter.MapScan(row)
+				scannedContext, _ = row["context"].(string)
+				scannedCreatedAt, _ = row["created_at"].(time.Time)
+				scannedTimestamp, _ = row["timestamp"].(time.Time)
+				scannedNcaID, _ = row["nca_id"].(string)
+				scannedFunctionID, _ = row["function_id"].(string)
+			} else if readAccountColumns {
+				scanned = iter.Scan(&scannedContext, &scannedCreatedAt, &scannedTimestamp, &scannedNcaID, &scannedFunctionID)
+			} else {
+				scanned = iter.Scan(&scannedContext, &scannedCreatedAt, &scannedTimestamp)
+			}
+			if !scanned {
+				break
+			}
 			existingCreatedAt[scannedContext] = scannedCreatedAt
 			existingTimestamp[scannedContext] = scannedTimestamp
+			existingNcaID[scannedContext] = scannedNcaID
+			existingFunctionID[scannedContext] = scannedFunctionID
 		}
 		if err := iter.Close(); err != nil {
 			logger.ErrorContext(traceCtx, "Failed to fetch existing stats for namespace",
@@ -1362,7 +1444,15 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 			if ca, exists := existingCreatedAt[ev.Context]; exists {
 				createdAt = ca
 			}
-			insertQuery, args := statsV3InsertStatement(ev, createdAt, now)
+			if c.grpcProxyTTL(ev.Source, true) > 0 {
+				if ev.NcaID == "" {
+					ev.NcaID = existingNcaID[ev.Context]
+				}
+				if ev.FunctionID == "" {
+					ev.FunctionID = existingFunctionID[ev.Context]
+				}
+			}
+			insertQuery, args := statsV3InsertStatement(ev, createdAt, now, c.grpcProxyTTL(ev.Source, true))
 			batch.Query(insertQuery, args...)
 		}
 
@@ -1390,22 +1480,23 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 
 // UpsertStatsV3 inserts or updates latest event stats in the stats_v3 table
 // Replaces the previous event for this (namespace, context) regardless of event_name
-func (c *CassandraHandler) UpsertStatsV3(traceCtx context.Context, namespace, eventContext, eventName string, timestamp time.Time) error {
-	return c.upsertStatsRow(traceCtx, statsV3Table, namespace, eventContext, eventName, timestamp, "", "")
+func (c *CassandraHandler) UpsertStatsV3(traceCtx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time) error {
+	return c.upsertStatsRow(traceCtx, statsV3Table, namespace, eventContext, eventName, source, timestamp, "", "")
 }
 
 // UpsertFilteredStatsV3 inserts or updates latest event stats in the filtered stats table.
 // Callers must apply the filtered event-name allowlist before invoking this method.
 // ncaID and functionID are optional; empty values are not written.
-func (c *CassandraHandler) UpsertFilteredStatsV3(traceCtx context.Context, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error {
-	return c.upsertStatsRow(traceCtx, filteredStatsV3Table, namespace, eventContext, eventName, timestamp, ncaID, functionID)
+func (c *CassandraHandler) UpsertFilteredStatsV3(traceCtx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error {
+	return c.upsertStatsRow(traceCtx, filteredStatsV3Table, namespace, eventContext, eventName, source, timestamp, ncaID, functionID)
 }
 
 // upsertStatsRow is the shared latest-wins LWT upsert for stats_v3-shaped tables.
 // table must be a trusted, code-controlled identifier (not user input).
 // Empty ncaID and functionID are not written, so they cannot clear stored values.
-func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error {
+func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error {
 	logger := logging.GetLogger(traceCtx)
+	ttl := c.grpcProxyTTL(source, true)
 
 	err := c.executeWithSessionRecreation(traceCtx, func() error {
 		columns, placeholders, insertArgs := accountColumns(
@@ -1414,6 +1505,7 @@ func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, names
 			"?, ?, ?, ?, ?, ?",
 			[]any{namespace, eventContext, eventName, timestamp, timestamp /* created_at */, timestamp /* updated_at */})
 		insertQuery := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s) IF NOT EXISTS`, table, columns, placeholders)
+		insertQuery, insertArgs = withTTL(insertQuery, insertArgs, ttl)
 
 		previous := make(map[string]any)
 		applied, err := c.session.Query(insertQuery, insertArgs...).WithContext(traceCtx).MapScanCAS(previous)
@@ -1433,6 +1525,20 @@ func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, names
 
 		setClause := "event_name = ?, timestamp = ?, updated_at = ?"
 		updateArgs := []any{eventName, timestamp, time.Now()}
+		if ttl > 0 {
+			createdAt, ok := previous["created_at"].(time.Time)
+			if !ok {
+				createdAt = timestamp
+			}
+			setClause += ", created_at = ?"
+			updateArgs = append(updateArgs, createdAt)
+			if ncaID == "" {
+				ncaID, _ = previous["nca_id"].(string)
+			}
+			if functionID == "" {
+				functionID, _ = previous["function_id"].(string)
+			}
+		}
 		if ncaID != "" {
 			setClause += ", nca_id = ?"
 			updateArgs = append(updateArgs, ncaID)
@@ -1442,10 +1548,7 @@ func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, names
 			updateArgs = append(updateArgs, functionID)
 		}
 		updateArgs = append(updateArgs, namespace, eventContext, timestamp)
-		updateQuery := fmt.Sprintf(`UPDATE %s
-						SET %s
-						WHERE namespace = ? AND context = ?
-						IF timestamp < ?`, table, setClause)
+		updateQuery, updateArgs := statsV3UpdateStatement(table, setClause, namespace, eventContext, updateArgs, ttl)
 
 		previous = make(map[string]any)
 		applied, err = c.session.Query(updateQuery, updateArgs...).WithContext(traceCtx).MapScanCAS(previous)

@@ -45,6 +45,7 @@ go_test(
         "common_test.go",
         "v2_resilience_test.go",
         "v2_test.go",
+        "v3_retention_test.go",
     ],
     embed = [":cassandra"],
     deps = [
@@ -52,6 +53,7 @@ go_test(
         "//src/control-plane-services/event-ledger/internal/data_access",
         "//src/control-plane-services/event-ledger/internal/observability/logging",
         "@com_github_gocql_gocql//:gocql",
+        "@com_github_google_uuid//:uuid",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
         "@com_github_uptrace_opentelemetry_go_extra_otelzap//:otelzap",

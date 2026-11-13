@@ -435,10 +435,15 @@ var _ data_access.DBHandler = (*CassandraHandler)(nil)
 var _ data_access.DBHandlerV2 = (*CassandraHandler)(nil)
 
 type CassandraHandler struct {
-	session *gocql.Session
-	logger  *otelzap.Logger
-	cluster *gocql.ClusterConfig // Store cluster config for session recreation
-	mutex   sync.RWMutex         // Protect session recreation
+	session     *gocql.Session
+	logger      *otelzap.Logger
+	cluster     *gocql.ClusterConfig // Store cluster config for session recreation
+	mutex       sync.RWMutex         // Protect session recreation
+	v3Retention config.V3Config
+}
+
+func (c *CassandraHandler) ConfigureV3Retention(cfg config.V3Config) {
+	c.v3Retention = cfg.WithDefaults()
 }
 
 // OTelQueryObserver Custom Query Observer for OpenTelemetry

@@ -57,6 +57,7 @@ type statsUpsertCall struct {
 	namespace  string
 	context    string
 	eventName  string
+	source     string
 	timestamp  time.Time
 	ncaID      string
 	functionID string
@@ -100,13 +101,13 @@ func (m *mockDBHandlerV3) UpsertEventV3(ctx context.Context, namespace, eventCon
 	return nil
 }
 
-func (m *mockDBHandlerV3) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time) error {
-	m.upsertStatsCalls = append(m.upsertStatsCalls, statsUpsertCall{namespace, eventContext, eventName, timestamp, "", ""})
+func (m *mockDBHandlerV3) UpsertStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time) error {
+	m.upsertStatsCalls = append(m.upsertStatsCalls, statsUpsertCall{namespace, eventContext, eventName, source, timestamp, "", ""})
 	return nil
 }
 
-func (m *mockDBHandlerV3) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName string, timestamp time.Time, ncaID, functionID string) error {
-	m.upsertFilteredStatsCalls = append(m.upsertFilteredStatsCalls, statsUpsertCall{namespace, eventContext, eventName, timestamp, ncaID, functionID})
+func (m *mockDBHandlerV3) UpsertFilteredStatsV3(ctx context.Context, namespace, eventContext, eventName, source string, timestamp time.Time, ncaID, functionID string) error {
+	m.upsertFilteredStatsCalls = append(m.upsertFilteredStatsCalls, statsUpsertCall{namespace, eventContext, eventName, source, timestamp, ncaID, functionID})
 	return nil
 }
 
@@ -1745,6 +1746,17 @@ func TestStoreK8sEvent_FilteredStats_MatchingEvent_Upserts(t *testing.T) {
 	assert.Equal(t, "ns-1", call.namespace)
 	assert.Equal(t, "instance_id=pod-1", call.context)
 	assert.Equal(t, "ready", call.eventName)
+	assert.Equal(t, "kubernetes", call.source)
+}
+
+func TestStoreEventPassesSourceToStatsWrites(t *testing.T) {
+	db := &mockDBHandlerV3{}
+	server := newTestServerWithStatsConfig(t, db, config.StatsConfig{FilteredStatsEnabledEventNames: []string{"ready"}})
+	event := makeEvent("ready")
+	event.Source = "grpc-proxy"
+	require.NoError(t, server.storeK8sEvent(makeStoreCtx(server), event))
+	require.Equal(t, "grpc-proxy", db.upsertStatsCalls[0].source)
+	require.Equal(t, "grpc-proxy", db.upsertFilteredStatsCalls[0].source)
 }
 
 // Non-empty filtered-view allowlist + non-matching event -> filtered stats table NOT written.
