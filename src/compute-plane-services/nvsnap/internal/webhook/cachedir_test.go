@@ -252,3 +252,35 @@ func TestCacheDir_ModelFromClusterCacheNotInjected(t *testing.T) {
 		t.Error("an emptyDir model volume is still captured")
 	}
 }
+
+// A chart-supplied model-cache claim — the Dynamo DGD mounts "model-cache"
+// at /opt/models and sets HF_HOME/NIM_CACHE_PATH to it — is a cluster-served
+// model too, so the pod is left untouched: injecting the cachedir env would
+// rewrite those paths to <CacheDir>/model and the claim would go unused
+// (nvbugs#6942082).
+func TestCacheDir_ChartModelCachePVCNotInjected(t *testing.T) {
+	m := &Mutator{CacheDir: "/opt/nvsnap", MainContainer: 0}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "sr-1", Name: "agg-worker-0", Labels: map[string]string{CaptureLabel: "true"}},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "main",
+				Image: "dynamo-worker:test",
+				Env: []corev1.EnvVar{
+					{Name: "HF_HOME", Value: "/opt/models"},
+					{Name: "NIM_CACHE_PATH", Value: "/opt/models"},
+				},
+				VolumeMounts: []corev1.VolumeMount{{Name: chartModelCacheVolumeName, MountPath: "/opt/models"}},
+			}},
+			Volumes: []corev1.Volume{{Name: chartModelCacheVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "model-cache"}}}},
+		},
+	}
+	if patches := m.cacheDirCapturePatches(pod); len(patches) != 0 {
+		t.Errorf("worker with a model-cache PVC got %d patches; HF_HOME/NIM_CACHE_PATH would be rewritten to %s/model", len(patches), m.CacheDir)
+	}
+	// An emptyDir of the same name is pod-local storage: still captured.
+	pod.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+	if patches := m.cacheDirCapturePatches(pod); len(patches) == 0 {
+		t.Error("an emptyDir model-cache volume is still captured")
+	}
+}

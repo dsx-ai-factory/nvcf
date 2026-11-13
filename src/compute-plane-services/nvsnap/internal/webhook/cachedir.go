@@ -511,12 +511,18 @@ const prewarmChunkBytes = 256 << 20
 // the NVCA model cache.
 const nvcaModelVolumeName = "model-data"
 
+// chartModelCacheVolumeName is the volume name a chart-supplied model cache
+// uses (the Dynamo DGD charts mount their model-cache claim at /opt/models).
+// Like the NVCA claim it already holds the model, so the cachedir env must
+// not point the engine somewhere else (nvbugs#6942082).
+const chartModelCacheVolumeName = "model-cache"
+
 // modelServedFromClusterCache reports whether the pod's model volume is a
 // claim rather than pod-local storage.
 func modelServedFromClusterCache(pod *corev1.Pod) bool {
 	for i := range pod.Spec.Volumes {
 		v := &pod.Spec.Volumes[i]
-		if v.Name == nvcaModelVolumeName && v.PersistentVolumeClaim != nil {
+		if (v.Name == nvcaModelVolumeName || v.Name == chartModelCacheVolumeName) && v.PersistentVolumeClaim != nil {
 			return true
 		}
 	}
