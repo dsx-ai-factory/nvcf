@@ -30,11 +30,10 @@ fi
 SERVICE_ACCOUNT_NAMESPACE="api-keys"
 SERVICE_ACCOUNT_NAME="api-keys-api"
 
-# Legacy service ids. They must match the NVCF_SERVICE_ID, NVCT_SERVICE_ID and
-# EVENT_LEDGER_SERVICE_ID values consumed by NAK and the calling services.
-NVCF_SERVICE_ID="${NVCF_SERVICE_ID:-nvidia-cloud-functions-ncp-service-id-aketm}"
-NVCT_SERVICE_ID="${NVCT_SERVICE_ID:-nvidia-cloud-tasks-ncp-service-id-nvcttasks}"
-EVENT_LEDGER_SERVICE_ID="${EVENT_LEDGER_SERVICE_ID:-nvidia-event-ledger-ncp-service-id-ckozoh6f}"
+# Legacy service ids, kept as aliases of the canonical ids.
+NVCF_SERVICE_ID="nvidia-cloud-functions-ncp-service-id-aketm"
+NVCT_SERVICE_ID="nvidia-cloud-tasks-ncp-service-id-nvcttasks"
+EVENT_LEDGER_SERVICE_ID="nvidia-event-ledger-ncp-service-id-ckozoh6f"
 
 #-------------------------------------------
 # Set defaults for secret paths and policies
