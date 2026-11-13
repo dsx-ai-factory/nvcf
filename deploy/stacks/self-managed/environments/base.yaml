@@ -196,11 +196,13 @@ api:
     configData:
       nvcf:
         sidecars:
-          init-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-init-oss:1.2.4
+          init-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-init-oss:1.2.5
           utils-container-image:
-            go: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-utils-oss:1.2.6
+            go: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-utils-oss:1.2.7
           ess-agent-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/ess-agent:1.4.5
-          llm-credential-manager-image: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-llm-credentials-oss:1.1.5
+          # The API chart defaults to 2.118.2, which predates the patched CA bundle.
+          niclls-container: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf_worker_niclls:2.118.5
+          llm-credential-manager-image: ${nvcf.sidecars.hostname}/${nvcf.sidecars.repository}/nvcf-worker-llm-credentials-oss:1.1.6
 
 # NVCT API in-cluster ESS base URL, mirroring api.essBaseURL. Empty defaults to
 # global.workerEndpoints.essServiceURL; NVCT_ESS_WORKER_BASE_URL stays on it.
@@ -212,8 +214,8 @@ nvctApi:
     configData:
       nvct:
         sidecars:
-          init-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-init-oss:1.2.4
-          utils-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-task-oss:1.1.6
+          init-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-init-oss:1.2.5
+          utils-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/nvcf-worker-task-oss:1.1.7
           ess-agent-container: ${nvct.sidecars.hostname}/${nvct.sidecars.repository}/ess-agent:1.4.5
 
 # Image overrides for the API account-bootstrap job. alpine-k8s is not
@@ -444,7 +446,7 @@ addons:
     enabled: false
     gateway:
       image:
-        tag: "0.14.11"
+        tag: "0.14.12"
     requestRouter:
       image:
         tag: "0.18.3"
@@ -576,7 +578,7 @@ addons:
     enabled: false
     replicaCount: 2
     image:
-      tag: "1.35.3"
+      tag: "1.35.4"
       pullPolicy: IfNotPresent
     config:
       mappingPath: /etc/vanity-gateway/config/config.yaml
@@ -625,7 +627,7 @@ stateMetrics:
 
 rateLimiter:
   image:
-    tag: "1.17.5"
+    tag: "1.17.6"
   enabled: true
   replicaCount: 1
   # PDB: enable when replicaCount > 1.
@@ -809,7 +811,7 @@ ingress:
 
 grpcproxy:
   image:
-    tag: "1.33.7"
+    tag: "1.33.8"
   # PDB: disabled by default. Enable when running multiple grpc-proxy replicas.
   podDisruptionBudget:
     enabled: false
