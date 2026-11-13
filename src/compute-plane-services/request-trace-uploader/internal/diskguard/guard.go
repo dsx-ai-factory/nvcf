@@ -258,6 +258,17 @@ func (g *Guard) relieve(need int64, quarantine []Candidate, report *Report) erro
 		}
 	}
 	if freed < need {
+		// A deleted file can free more space than its length, such as a
+		// small file that fills a whole block, and a removal that failed part
+		// way can free space it does not report, so usage is measured again
+		// before a segment, which may not have been sent, is evicted.
+		if usage, err := g.volume.Usage(); err != nil {
+			errs = append(errs, fmt.Errorf("measure spool volume: %w", err))
+		} else {
+			need, freed = usedBytes(usage)-watermarkBytes(g.cfg.HighWatermark, usage.Total), 0
+		}
+	}
+	if freed < need {
 		segments, err := g.segments.Evictable()
 		if err != nil {
 			return errors.Join(append(errs, err)...)

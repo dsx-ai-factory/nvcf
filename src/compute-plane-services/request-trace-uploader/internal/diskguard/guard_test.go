@@ -25,7 +25,13 @@ func (v *fakeVolume) Usage() (diskguard.Usage, error) { return v.usage, nil }
 // fakeStore serves both quarantine and segments, and records removals in
 // order.
 type fakeStore struct {
-	kind       string
+	kind string
+	// volume, when set, gets the freed space back on each removal: the
+	// item's diskBytes entry, or its logical size.
+	volume    *fakeVolume
+	diskBytes map[string]int64
+	// partial frees this many bytes for a key whose removal fails.
+	partial    map[string]int64
 	items      []diskguard.Candidate
 	removed    *[]string
 	unsynced   map[string]bool
@@ -45,12 +51,22 @@ func (s *fakeStore) drop(key string) error {
 	}
 	s.attempts[key]++
 	if err := s.fail[key]; err != nil {
+		if s.volume != nil {
+			s.volume.usage.Free += uint64(s.partial[key])
+		}
 		return err
 	}
 	for i, item := range s.items {
 		if item.Key == key {
 			s.items = append(s.items[:i], s.items[i+1:]...)
 			*s.removed = append(*s.removed, s.kind+":"+key)
+			if s.volume != nil {
+				freed, ok := s.diskBytes[key]
+				if !ok {
+					freed = item.Bytes
+				}
+				s.volume.usage.Free += uint64(freed)
+			}
 			if s.unsynced[key] {
 				return fmt.Errorf("remove %s: %w", key, diskguard.ErrDeletedNotSynced)
 			}
@@ -86,8 +102,8 @@ type world struct {
 
 func newWorld(total, free uint64) *world {
 	w := &world{volume: &fakeVolume{usage: diskguard.Usage{Total: total, Free: free}}, metrics: newMetrics()}
-	w.quarantine = &fakeStore{kind: "quarantine", removed: &w.removed}
-	w.segments = &fakeStore{kind: "segment", removed: &w.removed}
+	w.quarantine = &fakeStore{kind: "quarantine", removed: &w.removed, volume: w.volume}
+	w.segments = &fakeStore{kind: "segment", removed: &w.removed, volume: w.volume}
 	return w
 }
 
@@ -495,4 +511,44 @@ func TestEvictionOrderDoesNotDependOnTheStoreSlice(t *testing.T) {
 			t.Fatalf("removed %s, want both entries older than the max age", got)
 		}
 	})
+}
+
+// A deleted file can free more space than its length, such as a small reject
+// artifact that fills a whole block. Usage is measured again after quarantine
+// relief, so no segment, which may not have been sent, is evicted once the
+// spool is back under the watermark.
+func TestSegmentsAreNotEvictedOnceQuarantineReliefFreedEnoughSpace(t *testing.T) {
+	// 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+	w := newWorld(1000, 50)
+	w.quarantine.items = []diskguard.Candidate{item("q-new", 10, time.Hour), item("q-old", 10, 2*time.Hour)}
+	w.quarantine.diskBytes = map[string]int64{"q-new": 60, "q-old": 60}
+	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour)}
+
+	report, err := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	if err != nil {
+		t.Fatalf("Enforce: %v", err)
+	}
+	if got := strings.Join(w.removed, ","); got != "quarantine:q-old,quarantine:q-new" {
+		t.Fatalf("evicted %s, want only the quarantine: it freed 120 bytes on disk", got)
+	}
+	if report.SegmentsEvicted != 0 {
+		t.Fatalf("report = %+v, want no segment evicted", report)
+	}
+}
+
+// A quarantine removal that fails part way can still free space, though it
+// reports none. Usage is measured before any segment is evicted, so the
+// space it freed is seen.
+func TestSegmentsAreNotEvictedAfterAQuarantineRemovalThatFailedPartWay(t *testing.T) {
+	// 950 of 1000 bytes used; the watermark is 850, so 100 must go.
+	w := newWorld(1000, 50)
+	w.quarantine.items = []diskguard.Candidate{item("q-old", 130, 8*24*time.Hour)}
+	w.quarantine.fail = map[string]error{"q-old": errors.New("removed part of the entry")}
+	w.quarantine.partial = map[string]int64{"q-old": 130}
+	w.segments.items = []diskguard.Candidate{item("s-mid", 60, 4*time.Hour), item("s-old", 50, 5*time.Hour)}
+
+	report, _ := w.guard(t, diskguard.DefaultConfig()).Enforce(now)
+	if report.SegmentsEvicted != 0 {
+		t.Fatalf("evicted %v, want no segment: the failed removal freed 130 bytes", w.removed)
+	}
 }
