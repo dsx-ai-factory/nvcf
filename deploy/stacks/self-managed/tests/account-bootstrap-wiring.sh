@@ -89,7 +89,7 @@ render_api_values "$work_dir/disabled.yaml" >/dev/null ||
   fail "api.accountBootstrap.enabled: false still renders the account-bootstrap Job"
 
 # Only a boolean passes. Null would render as "<no value>", which the chart
-# reads as true, so the Job would still run.
+# reads as true, so the Job would still run. Quoted values are rejected too.
 for value in null '"false"'; do
   write_environment <<EOF
 global:
