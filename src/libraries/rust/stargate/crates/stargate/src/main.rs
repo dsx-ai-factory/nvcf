@@ -613,7 +613,9 @@ mod tests {
     #[test]
     fn reverse_tunnel_liveness_defaults_and_overrides_parse() {
         assert_eq!(
-            proxy_transport(&parse_args("")).quic.reverse_tunnel_liveness,
+            proxy_transport(&parse_args(""))
+                .quic
+                .reverse_tunnel_liveness,
             ReverseTunnelLiveness {
                 keep_alive_interval: Duration::from_secs(5),
                 max_idle_timeout: Duration::from_secs(15),
@@ -634,7 +636,10 @@ mod tests {
 
     #[test]
     fn reverse_tunnel_liveness_rejects_zero_and_late_keep_alive() {
-        assert_parse_error("--reverse-tunnel-keep-alive-interval-ms 0", "greater than 0");
+        assert_parse_error(
+            "--reverse-tunnel-keep-alive-interval-ms 0",
+            "greater than 0",
+        );
         assert_parse_error("--reverse-tunnel-max-idle-timeout-ms 0", "greater than 0");
         let args = parse_args(
             "--reverse-tunnel-keep-alive-interval-ms 1000 \

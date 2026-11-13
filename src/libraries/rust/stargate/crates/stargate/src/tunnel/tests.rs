@@ -643,6 +643,7 @@ fn start_tunnel_relay(
     let server_config = build_server_config(
         &stargate_tls::ServerTlsIdentity::SelfSigned,
         tunnel_protocol,
+        super::ReverseTunnelLiveness::default(),
     )
     .expect("relay server config");
     let endpoint = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
