@@ -524,17 +524,24 @@ async fn reverse_tunnel_liveness_keeps_quiet_tunnel_and_detects_vanished_peer() 
     client.set_default_client_config(
         build_client_config(None, true, TunnelTransportProtocol::RawQuic).expect("client config"),
     );
-    let client_connection = client
-        .connect(relay_addr, "stargate")
-        .unwrap()
-        .await
-        .expect("client should connect through the relay");
-    let server_connection = server
-        .accept()
-        .await
-        .expect("server should accept")
-        .await
-        .expect("server connection should complete");
+    // quinn starts the server handshake only once the server accepts it, so
+    // drive both sides together.
+    let connecting = client.connect(relay_addr, "stargate").unwrap();
+    let (client_connection, server_connection) = tokio::join!(
+        async {
+            connecting
+                .await
+                .expect("client should connect through the relay")
+        },
+        async {
+            server
+                .accept()
+                .await
+                .expect("server should accept")
+                .await
+                .expect("server connection should complete")
+        },
+    );
 
     // A quiet but healthy tunnel outlives several idle timeouts.
     tokio::time::sleep(liveness.max_idle_timeout * 3).await;
