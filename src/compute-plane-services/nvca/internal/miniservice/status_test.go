@@ -1586,6 +1586,11 @@ func unscheduledPod(name, namespace string, since time.Time) *corev1.Pod {
 	}
 }
 
+func withCreationTimestamp(pod *corev1.Pod, created time.Time) *corev1.Pod {
+	pod.CreationTimestamp = metav1.NewTime(created)
+	return pod
+}
+
 func TestPodSchedulingRequeueAfter(t *testing.T) {
 	const namespace = "sr-test"
 	const timeout = 10 * time.Minute
@@ -1643,6 +1648,19 @@ func TestPodSchedulingRequeueAfter(t *testing.T) {
 		{
 			name: "pod that just became unschedulable waits the full timeout",
 			pods: []*corev1.Pod{unscheduledPod("new", namespace, now)},
+			want: timeout,
+		},
+		{
+			// The KAI scheduler rewrites the PodScheduled=False transition time on
+			// every scheduling attempt. The deadline is measured from creation, so
+			// it does not move.
+			name: "deadline is measured from creation, not a just-rewritten transition time",
+			pods: []*corev1.Pod{withCreationTimestamp(unscheduledPod("kai", namespace, now), now.Add(-7*time.Minute))},
+			want: 3*time.Minute + podSchedulingRequeueSlack,
+		},
+		{
+			name: "pod created longer ago than the timeout is left to the status check",
+			pods: []*corev1.Pod{withCreationTimestamp(unscheduledPod("kai-stuck", namespace, now), now.Add(-timeout-time.Minute))},
 			want: timeout,
 		},
 	}

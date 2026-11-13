@@ -154,30 +154,36 @@ func TestDoStatus_WorkerTerminalBadStateForImagePullBackOff(t *testing.T) {
 	}
 }
 
-// TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline checks that a status
-// check that finds an unscheduled pod requeues for that pod's own scheduling
-// deadline. A pod that becomes unschedulable just after the previous check would
-// otherwise be judged stuck one full scheduling timeout late.
-func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
-	const ns = "test-requeue-ns"
-	timeConfig := (&nvcak8sutil.TimeConfig{}).Complete()
-	schedulingTimeout := timeConfig.PodScheduledThreshold
-	untilDeadline := 30 * time.Second
-
-	ctx := newTestContext()
-	utilsPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: common.UtilsPodName, Namespace: ns},
-		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: common.UtilsContainerName}}},
+// unscheduledUtilsPod returns a pending utils pod created at created whose
+// PodScheduled=False condition last transitioned at transitioned. The KAI
+// scheduler rewrites that transition time on every scheduling attempt, so in a
+// cluster it stays within seconds of now while the pod waits.
+func unscheduledUtilsPod(ns string, created, transitioned time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              common.UtilsPodName,
+			Namespace:         ns,
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: common.UtilsContainerName}}},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
 			Conditions: []corev1.PodCondition{{
 				Type:               corev1.PodScheduled,
 				Status:             corev1.ConditionFalse,
 				Reason:             corev1.PodReasonUnschedulable,
-				LastTransitionTime: metav1.NewTime(time.Now().Add(-schedulingTimeout + untilDeadline)),
+				LastTransitionTime: metav1.NewTime(transitioned),
 			}},
 		},
 	}
+}
+
+// doStatusAggressiveWithPod runs one aggressive-mode status check for a
+// MiniService whose namespace holds only pod.
+func doStatusAggressiveWithPod(t *testing.T, ns string, timeConfig *nvcak8sutil.TimeConfig,
+	pod *corev1.Pod) (*v1alpha1.MiniService, reconcile.Result, error) {
+	t.Helper()
+	ctx := newTestContext()
 	ms := &v1alpha1.MiniService{
 		ObjectMeta: metav1.ObjectMeta{Name: "requeue-test-ms", UID: "requeue-test-uid"},
 		Spec:       v1alpha1.MiniServiceSpec{Namespace: ns, ICMSRequestName: "requeue-test-icms"},
@@ -189,7 +195,7 @@ func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
 
 	c, _ := newFakeClient(mgrScheme,
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}},
-		utilsPod,
+		pod,
 	)
 	cache := chartcache.New(t.TempDir())
 	require.NoError(t, cache.Start(ctx))
@@ -205,13 +211,49 @@ func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
 	require.NoError(t, r.saveRenderedData(ctx, ms, []byte("[]")))
 
 	res, err := r.doStatus(ctx, ms, icmsReq)
+	return ms, res, err
+}
+
+// TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline checks that a status
+// check that finds an unscheduled pod requeues for that pod's own scheduling
+// deadline, measured from the pod's creation time. A pod that becomes
+// unschedulable just after the previous check would otherwise be judged stuck
+// one full scheduling timeout late, and a deadline measured from the
+// PodScheduled transition time would keep moving when the scheduler rewrites it.
+func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
+	timeConfig := (&nvcak8sutil.TimeConfig{}).Complete()
+	schedulingTimeout := timeConfig.PodScheduledThreshold
+	untilDeadline := 30 * time.Second
+	now := time.Now()
+
+	ms, res, err := doStatusAggressiveWithPod(t, "test-requeue-ns", timeConfig,
+		unscheduledUtilsPod("test-requeue-ns", now.Add(-schedulingTimeout+untilDeadline), now))
 	require.NoError(t, err)
 
 	cond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionObjectsHealthy)
 	require.NotNil(t, cond)
 	assert.Equal(t, v1alpha1.MiniServiceStatusReasonWaitingObjectReadiness, cond.Reason)
-	// The stored transition time is truncated to whole seconds, so the
+	// The stored creation time is truncated to whole seconds, so the
 	// deadline can be up to a second earlier than requested.
 	assert.Greater(t, res.RequeueAfter, untilDeadline-2*time.Second)
 	assert.LessOrEqual(t, res.RequeueAfter, untilDeadline+podSchedulingRequeueSlack)
+}
+
+// TestDoStatusAggressive_UnscheduledPodTimesOutFromCreation checks that a pod
+// that has been unschedulable since it was created longer ago than the
+// scheduling timeout is reported as stuck, even though its PodScheduled=False
+// transition time was rewritten a second ago.
+func TestDoStatusAggressive_UnscheduledPodTimesOutFromCreation(t *testing.T) {
+	timeConfig := (&nvcak8sutil.TimeConfig{}).Complete()
+	schedulingTimeout := timeConfig.PodScheduledThreshold
+	now := time.Now()
+
+	ms, _, err := doStatusAggressiveWithPod(t, "test-stuck-ns", timeConfig,
+		unscheduledUtilsPod("test-stuck-ns", now.Add(-schedulingTimeout-time.Minute), now.Add(-time.Second)))
+	require.NoError(t, err)
+
+	cond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionObjectsHealthy)
+	require.NotNil(t, cond)
+	assert.Equal(t, v1alpha1.MiniServiceStatusReasonObjectsFailedWithinBackoffTimeout, cond.Reason)
+	assert.Contains(t, cond.Message, "PodStuckScheduling")
 }

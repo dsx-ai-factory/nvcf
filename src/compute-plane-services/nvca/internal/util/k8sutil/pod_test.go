@@ -464,6 +464,59 @@ func TestIsTimeSincePodLaunchedLaterThan(t *testing.T) {
 			duration: 0,
 			want:     true,
 		},
+		{
+			// The KAI scheduler rewrites the PodScheduled=False transition time on
+			// every scheduling attempt, so it is always recent. The timeout must be
+			// measured from when the pod was created.
+			name: "pod unschedulable since creation with a just-rewritten transition time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-11 * time.Minute)}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						Reason:             corev1.PodReasonUnschedulable,
+						LastTransitionTime: metav1.Time{Time: now.Add(-time.Second)},
+					}},
+				},
+			},
+			duration: 10 * time.Minute,
+			want:     true,
+		},
+		{
+			name: "fresh unschedulable pod",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-time.Minute)}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						Reason:             corev1.PodReasonUnschedulable,
+						LastTransitionTime: metav1.Time{Time: now.Add(-time.Second)},
+					}},
+				},
+			},
+			duration: 10 * time.Minute,
+			want:     false,
+		},
+		{
+			name: "started pod is measured from its start time, not its creation time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)}},
+				Status: corev1.PodStatus{
+					StartTime: &metav1.Time{Time: now.Add(-30 * time.Minute)},
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionTrue,
+						LastTransitionTime: metav1.Time{Time: now.Add(-30 * time.Minute)},
+					}},
+				},
+			},
+			duration: time.Hour,
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -502,7 +555,7 @@ func TestPodLaunchTime(t *testing.T) {
 			wantOK: true,
 		},
 		{
-			name: "unscheduled pod uses the condition transition time",
+			name: "unscheduled pod uses its creation time, not the condition transition time",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
 				Status: corev1.PodStatus{
@@ -513,8 +566,34 @@ func TestPodLaunchTime(t *testing.T) {
 					}},
 				},
 			},
+			want:   created,
+			wantOK: true,
+		},
+		{
+			name: "unscheduled pod without a creation time falls back to the condition transition time",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
 			want:   unscheduledSince,
 			wantOK: true,
+		},
+		{
+			name: "unscheduled pod without any time has no launch time",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:   corev1.PodScheduled,
+						Status: corev1.ConditionFalse,
+					}},
+				},
+			},
+			wantOK: false,
 		},
 		{
 			name: "scheduled pod without a start time has no launch time",
