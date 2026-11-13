@@ -141,7 +141,7 @@ func TestDropRecordRuleDropsTheRecord(t *testing.T) {
 func TestFirstMatchingRuleWins(t *testing.T) {
 	engine := mustEngine(t, Config{Rules: []Rule{
 		{Headers: []string{"x-tenant"}, Values: []string{"t1"}, Action: DropRecord},
-		{Headers: DefaultHeaders, Values: []string{"acme"}, Action: StripPayload},
+		{Headers: DefaultHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
 	}})
 	record := mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"acme","x-tenant":"t1"}}}`)
 
