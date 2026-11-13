@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -30,49 +31,6 @@ func gunzip(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
-}
-
-func TestJSONLFileWritesGzipLinesOnClose(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "transport.jsonl.gz")
-	writer, err := CreateJSONLFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, payload := range []string{`{"a":1}`, `{"b":2}`} {
-		if err := writer.Write(Record{Payload: []byte(payload)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("transport visible before Close: %v", err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if got := gunzip(t, path); got != "{\"a\":1}\n{\"b\":2}\n" {
-		t.Fatalf("transport = %q", got)
-	}
-	entries, err := os.ReadDir(filepath.Dir(path))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("directory has %d entries (%v), want only the transport", len(entries), err)
-	}
-}
-
-func TestJSONLFileAbortLeavesNothing(t *testing.T) {
-	dir := t.TempDir()
-	writer, err := CreateJSONLFile(filepath.Join(dir, "transport.jsonl.gz"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Write(Record{Payload: []byte(`{}`)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Abort(); err != nil {
-		t.Fatal(err)
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatalf("directory has %d entries after Abort, want none", len(entries))
-	}
 }
 
 func TestRejectFileCreatesNothingWhenUnused(t *testing.T) {
@@ -204,5 +162,35 @@ func TestRejectFileRetriesTheDirectorySyncThatFailed(t *testing.T) {
 	}
 	if err := retry.Discard(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Reject errors are logged, so they carry no file system paths.
+func TestRejectFileErrorsCarryNoPaths(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "blocker-file")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rejects := NewRejectFile(filepath.Join(blocker, "rejects"))
+	_, err := rejects.Write([]byte("bad line\n"))
+	if err == nil || strings.Contains(err.Error(), "blocker-file") {
+		t.Fatalf("Write() error = %v, want an error with no path", err)
+	}
+
+	dir := t.TempDir()
+	rejects = NewRejectFile(dir)
+	if _, err := rejects.Write([]byte("bad line\n")); err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the artifact must go makes the publish fail.
+	if err := os.MkdirAll(filepath.Join(dir, "seg-1.jsonl.gz", "x"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	_, err = rejects.Commit("seg-1")
+	if err == nil || strings.Contains(err.Error(), dir) {
+		t.Fatalf("Commit() error = %v, want an error with no path", err)
+	}
+	if got, _ := filepath.Glob(filepath.Join(dir, ".reject.*.tmp")); len(got) != 0 {
+		t.Fatalf("temporary files after a failed commit: %v", got)
 	}
 }

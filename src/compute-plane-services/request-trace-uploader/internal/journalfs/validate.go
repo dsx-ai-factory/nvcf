@@ -65,6 +65,9 @@ func validSegment(seg *journal.Segment, transportDir string) error {
 	if !segmentIDPattern.MatchString(seg.SHA256) {
 		errs = append(errs, errors.New("segment content hash is not sha256 hex"))
 	}
+	if seg.Faults < 0 {
+		errs = append(errs, errors.New("segment fault count is negative"))
+	}
 	if !segmentStates[seg.State] {
 		errs = append(errs, fmt.Errorf("unknown segment state %q", seg.State))
 	}

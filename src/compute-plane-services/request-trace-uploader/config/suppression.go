@@ -11,6 +11,7 @@ import (
 	"io"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/suppress"
@@ -18,9 +19,13 @@ import (
 
 const (
 	// EnvSuppressNCAIDs lists suppressed NCA ids, separated by commas. It
-	// builds one stripPayload rule, named NCAIDRuleName, on the NCA id
-	// headers. Unset or blank turns it off.
+	// builds one stripPayload rule, named NCAIDRuleName, on the headers in
+	// EnvSuppressNCAHeaders. Unset or blank turns it off.
 	EnvSuppressNCAIDs = "REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_IDS"
+	// EnvSuppressNCAHeaders lists, separated by commas, the headers that
+	// carry the NCA id, in the order they are read. The uploader has no
+	// built-in list: it is required while EnvSuppressNCAIDs has an id.
+	EnvSuppressNCAHeaders = "REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_HEADERS"
 	// EnvSuppressionRules holds further named rules as a JSON list of
 	// {"name", "headers", "values", "action"} objects. They are evaluated
 	// after the NCA id rule, in order.
@@ -67,11 +72,18 @@ type ruleSpec struct {
 // because values can be customer identifiers.
 func suppressionValue(lookup LookupFunc) (suppress.Config, error) {
 	var cfg suppress.Config
+	headers, err := ncaHeaders(valueOrDefault(lookup, EnvSuppressNCAHeaders, ""))
+	if err != nil {
+		return suppress.Config{}, err
+	}
 	idList := strings.Split(valueOrDefault(lookup, EnvSuppressNCAIDs, ""), ",")
 	if err := checkValues(idList); err != nil {
 		return suppress.Config{}, fmt.Errorf("%s %w", EnvSuppressNCAIDs, err)
 	}
-	ids := suppress.FromIDs(idList)
+	ids := suppress.FromIDs(idList, headers...)
+	if len(ids.Rules) > 0 && len(headers) == 0 {
+		return suppress.Config{}, fmt.Errorf("%s is set, so %s must list the headers that carry the NCA id", EnvSuppressNCAIDs, EnvSuppressNCAHeaders)
+	}
 	for _, rule := range ids.Rules {
 		rule.Name = NCAIDRuleName
 		cfg.Rules = append(cfg.Rules, rule)
@@ -105,6 +117,28 @@ var ruleFields = func() []string {
 	}
 	return names
 }()
+
+// ncaHeaders parses EnvSuppressNCAHeaders. Unset or blank is no list. Each
+// name is trimmed and lower-cased, as header lookup ignores case; a blank or
+// repeated name is an error. Errors give positions, not names.
+func ncaHeaders(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	headers := make([]string, 0, len(parts))
+	for i, part := range parts {
+		header := strings.ToLower(strings.TrimSpace(part))
+		if header == "" {
+			return nil, fmt.Errorf("%s entry %d is blank", EnvSuppressNCAHeaders, i)
+		}
+		if j := slices.Index(headers, header); j >= 0 {
+			return nil, fmt.Errorf("%s entry %d repeats entry %d", EnvSuppressNCAHeaders, i, j)
+		}
+		headers = append(headers, header)
+	}
+	return headers, nil
+}
 
 func explicitRules(raw string) ([]suppress.Rule, error) {
 	trimmed := strings.TrimSpace(raw)

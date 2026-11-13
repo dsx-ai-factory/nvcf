@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry/otlp"
 )
 
 // TestMainExitsNonZeroOnAnyInvalidOrUnknownSetting checks that the process
@@ -31,6 +32,10 @@ func TestMainExitsNonZeroOnAnyInvalidOrUnknownSetting(t *testing.T) {
 		"bare number for a duration":        {env: []string{config.EnvScanInterval + "=30"}, named: config.EnvScanInterval},
 		"bare number for a strict duration": {env: []string{config.EnvDrainTimeout + "=60"}, named: config.EnvDrainTimeout},
 		"bare zero for a duration":          {env: []string{config.EnvDrainTimeout + "=0"}, named: config.EnvDrainTimeout},
+		"metrics endpoint without protocol": {
+			env:   []string{otlp.EnvMetricsEndpoint + "=http://127.0.0.1:4318/v1/metrics"},
+			named: otlp.EnvMetricsProtocol,
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

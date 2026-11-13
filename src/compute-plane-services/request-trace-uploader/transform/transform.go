@@ -8,7 +8,7 @@
 //
 // The record handling here is backend-neutral. A backend that needs rows in
 // a table format implements Writer; one that stores records as they are can
-// use JSONLFile.
+// use the gzip JSON-lines writer in the format package.
 package transform
 
 import (
@@ -16,10 +16,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/record"
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/redact"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/suppress"
 )
@@ -37,9 +38,6 @@ const (
 
 // Quarantine reasons.
 const (
-	// ReasonUnsupportedVersion marks a segment written by a Dynamo release
-	// older than v1.4.0.
-	ReasonUnsupportedVersion = "unsupported_dynamo_version"
 	// ReasonBadRecords marks a segment whose share of bad lines reached
 	// MaxBadRecordFraction.
 	ReasonBadRecords = "bad_records"
@@ -100,15 +98,15 @@ type Record struct {
 	// Line is the 1-based line number in the segment.
 	Line int
 	// Value is the record after suppression and redaction.
-	Value *compat.Value
-	// Payload is the source line unchanged, or Value re-serialized the way
-	// the earlier Python uploader wrote it when suppression or redaction
-	// changed the record.
+	Value *jsonvalue.Value
+	// Payload is the source line unchanged, or Value written as compact
+	// UTF-8 JSON by jsonvalue.Encode when suppression or redaction changed the
+	// record.
 	Payload []byte
 	// Headers holds copies of the header objects of the exported record,
 	// after suppression and redaction, in lookup order: a suppressed record
 	// has only its stub's headers. See suppress.ResolveHeader.
-	Headers []*compat.Value
+	Headers []*jsonvalue.Value
 	// CarriesPayload reports a request_payload record.
 	CarriesPayload bool
 	// Suppression reports what the suppression rules did.
@@ -136,6 +134,10 @@ type Result struct {
 	Fingerprint []byte
 	// Received counts non-empty source lines.
 	Received int
+	// ReceivedByType counts Received by record type. A line that is not a
+	// Dynamo v1.4.0 record of a known type, such as an unparseable line, an
+	// older release's record, or a new event type, is counted as "unknown".
+	ReceivedByType map[string]int
 	// Written counts records handed to the writer.
 	Written int
 	// Dropped counts records removed by a dropRecord rule.
@@ -165,6 +167,10 @@ type Result struct {
 	ChecksumFailures int
 	// Quarantine is the reason the segment must be quarantined, or empty.
 	Quarantine string
+	// UnsupportedVersion counts records from a Dynamo release older than
+	// v1.4.0. They are dropped, not rejected: they parse, but cannot be read
+	// as v1.4.0 records. They do not count as bad lines.
+	UnsupportedVersion int
 	// Rules counts, per named suppression rule, what the rule saw.
 	Rules map[string]RuleCount
 	// Incomplete counts request_payload records whose source says
@@ -219,13 +225,12 @@ func (p *Preparer) Prepare(ctx context.Context, path string, w Writer, rejects i
 	if rejects == nil {
 		rejects = io.Discard
 	}
-	rejectSink := &switchableWriter{w: rejects}
 	if err := ctx.Err(); err != nil {
 		return result, errors.Join(err, w.Abort())
 	}
 	// Lines drains oversized lines inside Next, through the reject writer,
 	// so the context is checked on every reject write too.
-	lines, err := record.OpenLines(path, record.LineOptions{MaxLineBytes: p.cfg.RawLineMax, Reject: contextWriter{ctx: ctx, w: rejectSink}})
+	lines, err := record.OpenLines(path, record.LineOptions{MaxLineBytes: p.cfg.RawLineMax, Reject: contextWriter{ctx: ctx, w: rejects}})
 	if err != nil {
 		return result, errors.Join(err, w.Abort())
 	}
@@ -235,32 +240,23 @@ func (p *Preparer) Prepare(ctx context.Context, path string, w Writer, rejects i
 		}
 	}()
 
-	// legacy stops record handling at the first record from an unsupported
-	// Dynamo release. The pass still reads to the end of the file, so the
-	// fingerprint covers the whole file and the losses are counted.
-	legacy := false
 	for lines.Next() {
 		if err := ctx.Err(); err != nil {
 			return result, errors.Join(err, w.Abort())
 		}
 		result.Received++
-		if legacy {
-			continue
-		}
 		line := lines.Line()
-		value, decodeErr := compat.Decode(line)
+		value, decodeErr := jsonvalue.Decode(line)
+		result.countType(value, decodeErr == nil)
 		if decodeErr != nil {
 			result.Unparseable++
-			if err := reject(rejectSink, line); err != nil {
+			if err := reject(rejects, line); err != nil {
 				return result, errors.Join(err, w.Abort())
 			}
 			continue
 		}
 		if isLegacyRecord(value) {
-			legacy = true
-			// The whole segment is quarantined, so nothing after this
-			// record is rejected line by line.
-			rejectSink.off = true
+			result.UnsupportedVersion++
 			continue
 		}
 		out, ok := p.transform(value, line, &result)
@@ -269,7 +265,7 @@ func (p *Preparer) Prepare(ctx context.Context, path string, w Writer, rejects i
 		}
 		if int64(len(out.Payload)) > p.cfg.RowMax {
 			result.RowTooLarge++
-			if err := reject(rejectSink, line); err != nil {
+			if err := reject(rejects, line); err != nil {
 				return result, errors.Join(err, w.Abort())
 			}
 			continue
@@ -295,11 +291,14 @@ func (p *Preparer) Prepare(ctx context.Context, path string, w Writer, rejects i
 	result.LostBytes = stats.LostBytes
 	result.Resyncs = stats.Resyncs
 	result.ChecksumFailures = stats.ChecksumFailures
-	if legacy {
-		result.Quarantine = ReasonUnsupportedVersion
-	} else {
-		result.Quarantine = p.quarantineReason(result)
+	if result.UnsupportedVersion > 0 {
+		// One line per segment: a deployment on an older Dynamo would
+		// otherwise log every record.
+		slog.Error("dropped request trace records from an unsupported Dynamo version",
+			"records", result.UnsupportedVersion,
+			"error", record.ErrLegacyAuditRecord)
 	}
+	result.Quarantine = p.quarantineReason(result)
 	if result.Quarantine != "" || result.Written == 0 {
 		return result, w.Abort()
 	}
@@ -323,26 +322,12 @@ func (c contextWriter) Write(p []byte) (int, error) {
 	return c.w.Write(p)
 }
 
-// switchableWriter passes writes through until it is switched off, then
-// discards them.
-type switchableWriter struct {
-	w   io.Writer
-	off bool
-}
-
-func (s *switchableWriter) Write(p []byte) (int, error) {
-	if s.off {
-		return len(p), nil
-	}
-	return s.w.Write(p)
-}
-
 // transform applies suppression, then redaction, and reports false when the
 // record is dropped. A suppressed record is replaced by its stub, which is
 // redacted too: it keeps no body, but its copied fields could still hold
 // media. The record is re-serialized only when something changed, so other
 // records keep their source bytes.
-func (p *Preparer) transform(value *compat.Value, line []byte, result *Result) (Record, bool) {
+func (p *Preparer) transform(value *jsonvalue.Value, line []byte, result *Result) (Record, bool) {
 	out, ok := p.apply(value, line, result)
 	if ok {
 		out.Headers = cloneAll(suppress.HeaderSets(suppress.EventOf(out.Value)))
@@ -350,7 +335,7 @@ func (p *Preparer) transform(value *compat.Value, line []byte, result *Result) (
 	return out, ok
 }
 
-func (p *Preparer) apply(value *compat.Value, line []byte, result *Result) (Record, bool) {
+func (p *Preparer) apply(value *jsonvalue.Value, line []byte, result *Result) (Record, bool) {
 	event := suppress.EventOf(value)
 	out := Record{
 		CarriesPayload: suppress.CarriesPayload(event),
@@ -397,7 +382,7 @@ func (p *Preparer) apply(value *compat.Value, line []byte, result *Result) (Reco
 				out.RedactedParts = parts
 			}
 		}
-		out.Payload = compat.Encode(out.Value)
+		out.Payload = jsonvalue.Encode(out.Value)
 		return out, true
 	}
 	out.Value = value
@@ -405,11 +390,25 @@ func (p *Preparer) apply(value *compat.Value, line []byte, result *Result) (Reco
 		redacted, parts := redact.Record(value)
 		if parts > 0 {
 			out.Value = redacted
-			out.Payload = compat.Encode(redacted)
+			out.Payload = jsonvalue.Encode(redacted)
 			out.RedactedParts = parts
 		}
 	}
 	return out, true
+}
+
+// countType counts one received line by its record type. An unparseable line
+// has none and an older release's record carries no event type, so both are
+// counted as "unknown".
+func (r *Result) countType(value *jsonvalue.Value, parsed bool) {
+	if r.ReceivedByType == nil {
+		r.ReceivedByType = map[string]int{}
+	}
+	if !parsed {
+		r.ReceivedByType["unknown"]++
+		return
+	}
+	r.ReceivedByType[recordType(suppress.EventOf(value))]++
 }
 
 func (r *Result) countRule(name string, count RuleCount) {
@@ -422,9 +421,9 @@ func (r *Result) countRule(name string, count RuleCount) {
 // payloadIncomplete reports a payload whose payload_complete is JSON false.
 // A missing or non-boolean flag is not counted: the flag is parsed, never
 // assumed.
-func payloadIncomplete(event *compat.Value) bool {
+func payloadIncomplete(event *jsonvalue.Value) bool {
 	payload := event.Get("payload")
-	if payload == nil || payload.Kind() != compat.Object {
+	if payload == nil || payload.Kind() != jsonvalue.Object {
 		return false
 	}
 	complete, ok := payload.Get("payload_complete").Bool()
@@ -433,8 +432,8 @@ func payloadIncomplete(event *compat.Value) bool {
 
 // recordType returns event's type when Dynamo v1.4.0 defines it, and
 // "unknown" otherwise, so it is safe as a metric label.
-func recordType(event *compat.Value) string {
-	if event != nil && event.Kind() == compat.Object {
+func recordType(event *jsonvalue.Value) string {
+	if event != nil && event.Kind() == jsonvalue.Object {
 		if text, ok := event.Get("event_type").String(); ok && record.EventType(text).Known() {
 			return text
 		}
@@ -464,21 +463,21 @@ func (p *Preparer) quarantineReason(result Result) string {
 // event_type, bare or under "event". The body is picked as suppression picks
 // it. Parsing one as a v1.4.0 record would produce empty fields rather than
 // fail.
-func isLegacyRecord(value *compat.Value) bool {
+func isLegacyRecord(value *jsonvalue.Value) bool {
 	body := suppress.EventOf(value)
 	if body == nil {
 		return false
 	}
 	version := body.Get("schema_version")
 	eventType := body.Get("event_type")
-	return version != nil && version.Kind() == compat.Int && (eventType == nil || eventType.Kind() == compat.Null)
+	return version != nil && version.Kind() == jsonvalue.Int && (eventType == nil || eventType.Kind() == jsonvalue.Null)
 }
 
-func cloneAll(values []*compat.Value) []*compat.Value {
+func cloneAll(values []*jsonvalue.Value) []*jsonvalue.Value {
 	if len(values) == 0 {
 		return nil
 	}
-	out := make([]*compat.Value, len(values))
+	out := make([]*jsonvalue.Value, len(values))
 	for i, v := range values {
 		out[i] = v.Clone()
 	}
