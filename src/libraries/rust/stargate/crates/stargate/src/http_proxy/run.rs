@@ -103,6 +103,20 @@ impl<'a> ProxyRequestRun<'a> {
         (!self.failed_cluster_ids.is_empty()).then_some(&self.failed_cluster_ids)
     }
 
+    // `&mut self` keeps the request future `Send`: the run state is not `Sync`.
+    pub(super) async fn has_untried_cluster(&mut self, current_cluster_id: &str) -> bool {
+        self.app
+            .state
+            .routing_target_snapshot(&self.request.request_inputs.target)
+            .await
+            .is_some_and(|snapshot| {
+                snapshot.clusters().iter().any(|candidate| {
+                    candidate.cluster_id != current_cluster_id
+                        && !self.failed_cluster_ids.contains(&candidate.cluster_id)
+                })
+            })
+    }
+
     fn load_balancer_request(&self) -> LoadBalancerRequest<'_> {
         let request_inputs = &self.request.request_inputs;
         LoadBalancerRequest {

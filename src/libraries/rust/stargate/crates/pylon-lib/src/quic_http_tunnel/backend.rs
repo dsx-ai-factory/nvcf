@@ -29,7 +29,8 @@ pub enum UpstreamBackend {
     /// Forward requests unchanged; derive nothing. Inbound engine priority
     /// headers are still stripped.
     Passthrough,
-    /// Derive the engine priority headers from `x-priority`.
+    /// Derive the engine priority headers from `x-priority`, and mark a 404
+    /// with `content-length: 0` retryable.
     #[default]
     Dynamo,
 }

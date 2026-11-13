@@ -177,12 +177,11 @@ struct TunnelResponse {
     body: Vec<u8>,
 }
 
-const RETRY_CONTROL_REQUEST_HEADERS: [&str; 5] = [
+const RETRY_CONTROL_REQUEST_HEADERS: [&str; 4] = [
     "x-stargate-upstream-retryable",
     "x-stargate-retryable",
     "x-stargate-retry-reason",
     "x-stargate-retry-after-ms",
-    "x-vendor-retryable",
 ];
 const TEST_ADMITTED_MODELS: [&str; 11] = [
     "model-a",
@@ -437,10 +436,6 @@ fn reverse_tunnel_app_from_config_preserves_forwarding_settings() {
 #[test]
 fn pylon_request_header_filter_strips_tunnel_headers_case_insensitively()
 -> std::result::Result<(), reqwest::header::InvalidHeaderName> {
-    let retry = PylonRetryConfig {
-        upstream_retry_header: HeaderName::from_static("x-vendor-retryable"),
-        ..PylonRetryConfig::default()
-    };
     for name in [
         "Connection",
         "Proxy-Connection",
@@ -454,10 +449,9 @@ fn pylon_request_header_filter_strips_tunnel_headers_case_insensitively()
     .into_iter()
     .chain(RETRY_CONTROL_REQUEST_HEADERS)
     {
-        assert!(!should_forward_header(
-            &HeaderName::from_bytes(name.as_bytes())?,
-            &retry
-        ));
+        assert!(!should_forward_header(&HeaderName::from_bytes(
+            name.as_bytes()
+        )?));
     }
     for name in [
         "X-Request-Id",
@@ -465,7 +459,7 @@ fn pylon_request_header_filter_strips_tunnel_headers_case_insensitively()
         "X-Vendor-Test",
     ] {
         assert!(
-            should_forward_header(&HeaderName::from_bytes(name.as_bytes())?, &retry),
+            should_forward_header(&HeaderName::from_bytes(name.as_bytes())?),
             "{name} must reach the backend"
         );
     }
@@ -555,18 +549,14 @@ fn pylon_otel_parent_attribute_uses_traceparent_header() {
 #[test]
 fn pylon_response_header_filter_strips_internal_headers_case_insensitively()
 -> std::result::Result<(), reqwest::header::InvalidHeaderName> {
-    let retry = PylonRetryConfig::default();
-
     for name in [b"Connection".as_slice(), b"X-Stargate-Retryable"] {
-        assert!(!should_forward_response_header(
-            &HeaderName::from_bytes(name)?,
-            &retry,
-        ));
+        assert!(!should_forward_response_header(&HeaderName::from_bytes(
+            name
+        )?));
     }
-    assert!(should_forward_response_header(
-        &HeaderName::from_bytes(b"X-Kv-Cache-Hit")?,
-        &retry,
-    ));
+    assert!(should_forward_response_header(&HeaderName::from_bytes(
+        b"X-Kv-Cache-Hit"
+    )?));
     Ok(())
 }
 
@@ -1624,8 +1614,7 @@ async fn quic_tunnel_forwards_to_http_backend() {
                 sse
             }),
         );
-    let (mut config, _metrics) = metered_test_tunnel_config_for(app).await;
-    config.forwarding.retry.upstream_retry_header = HeaderName::from_static("x-vendor-retryable");
+    let (config, _metrics) = metered_test_tunnel_config_for(app).await;
     let mut tunnel = RawTunnelTest::start(config).await;
 
     let mut headers =
@@ -1874,16 +1863,12 @@ async fn quic_tunnel_rejects_pending_generation_before_upstream() {
 }
 
 #[tokio::test]
-async fn quic_tunnel_marks_explicit_retryable_upstream_rejection() {
+async fn quic_tunnel_marks_listed_upstream_status_retryable() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|_req: Request| async move {
             let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            response.headers_mut().insert(
-                HeaderName::from_static("x-stargate-upstream-retryable"),
-                HeaderValue::from_static("true"),
-            );
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             response
                 .headers_mut()
                 .insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
@@ -1901,18 +1886,18 @@ async fn quic_tunnel_marks_explicit_retryable_upstream_rejection() {
             br#"{"messages":[],"stream":true}"#,
         )
         .await;
-    let response = tunnel.response(StatusCode::TOO_MANY_REQUESTS).await;
+    let response = tunnel.response(StatusCode::SERVICE_UNAVAILABLE).await;
     assert_retry_metadata(
         &response.headers,
         true,
-        "upstream_admission_rejected",
+        "upstream_unavailable",
         Some("2000"),
     );
 
     let metrics = metrics_text(&metrics);
     assert_metric(
         &metrics,
-        r#"pylon_retryable_responses_total{inference_server_id="inst-a",reason="upstream_admission_rejected",status="429"} 1"#,
+        r#"pylon_retryable_responses_total{inference_server_id="inst-a",reason="upstream_unavailable",status="503"} 1"#,
     );
 }
 
@@ -2009,7 +1994,7 @@ async fn webtransport_tunnel_rejects_queue_estimate_mismatch_before_upstream() {
 }
 
 #[tokio::test]
-async fn quic_tunnel_strips_spoofed_retry_headers_without_upstream_signal() {
+async fn quic_tunnel_strips_spoofed_retry_headers_from_unlisted_status() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|_req: Request| async move {
@@ -2049,7 +2034,7 @@ async fn quic_tunnel_strips_spoofed_retry_headers_without_upstream_signal() {
     let metrics = metrics_text(&metrics);
     assert_metric(
         &metrics,
-        r#"pylon_nonretryable_failures_total{inference_server_id="inst-a",reason="missing_upstream_retry_header"} 1"#,
+        r#"pylon_nonretryable_failures_total{inference_server_id="inst-a",reason="upstream_nonretryable_status"} 1"#,
     );
 }
 
