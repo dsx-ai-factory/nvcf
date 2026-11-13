@@ -270,9 +270,9 @@ func TestCacheDir_ChartModelCachePVCNotInjected(t *testing.T) {
 					{Name: "HF_HOME", Value: "/opt/models"},
 					{Name: "NIM_CACHE_PATH", Value: "/opt/models"},
 				},
-				VolumeMounts: []corev1.VolumeMount{{Name: chartModelCacheVolumeName, MountPath: "/opt/models"}},
+				VolumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/opt/models"}},
 			}},
-			Volumes: []corev1.Volume{{Name: chartModelCacheVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "model-cache"}}}},
+			Volumes: []corev1.Volume{{Name: "model-cache", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "model-cache"}}}},
 		},
 	}
 	if patches := m.cacheDirCapturePatches(pod); len(patches) != 0 {
@@ -282,5 +282,49 @@ func TestCacheDir_ChartModelCachePVCNotInjected(t *testing.T) {
 	pod.Spec.Volumes[0].VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
 	if patches := m.cacheDirCapturePatches(pod); len(patches) == 0 {
 		t.Error("an emptyDir model-cache volume is still captured")
+	}
+}
+
+// The opt-out keys on the pod's own HF_HOME/NIM_CACHE_PATH landing on a
+// claim-backed mount, whatever the volume happens to be named: a chart that
+// calls its claim "hf-cache" and mounts it at /workspace/models is served
+// from a cluster model cache just as much as NVCA's "model-data".
+func TestCacheDir_ArbitrarilyNamedModelPVCNotInjected(t *testing.T) {
+	m := &Mutator{CacheDir: "/opt/nvsnap", MainContainer: 0}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "sr-2", Name: "worker-0", Labels: map[string]string{CaptureLabel: "true"}},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:         "main",
+				Image:        "dynamo-worker:test",
+				Env:          []corev1.EnvVar{{Name: "HF_HOME", Value: "/workspace/models/hub"}},
+				VolumeMounts: []corev1.VolumeMount{{Name: "hf-cache", MountPath: "/workspace/models"}},
+			}},
+			Volumes: []corev1.Volume{{Name: "hf-cache", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hf-cache"}}}},
+		},
+	}
+	if patches := m.cacheDirCapturePatches(pod); len(patches) != 0 {
+		t.Errorf("worker with a model PVC named %q got %d patches; HF_HOME would be rewritten to %s/model", "hf-cache", len(patches), m.CacheDir)
+	}
+}
+
+// A claim the pod's model env does NOT point at (a results/scratch PVC) is
+// not a model cache: that pod still gets the cachedir injection.
+func TestCacheDir_UnrelatedPVCStillInjected(t *testing.T) {
+	m := &Mutator{CacheDir: "/opt/nvsnap", MainContainer: 0}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "sr-3", Name: "worker-0", Labels: map[string]string{CaptureLabel: "true"}},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:         "main",
+				Image:        "dynamo-worker:test",
+				Env:          []corev1.EnvVar{{Name: "HF_HOME", Value: "/root/.cache/huggingface"}},
+				VolumeMounts: []corev1.VolumeMount{{Name: "results", MountPath: "/results"}},
+			}},
+			Volumes: []corev1.Volume{{Name: "results", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "results"}}}},
+		},
+	}
+	if patches := m.cacheDirCapturePatches(pod); len(patches) == 0 {
+		t.Error("a pod whose only claim is unrelated to the model is still captured")
 	}
 }
