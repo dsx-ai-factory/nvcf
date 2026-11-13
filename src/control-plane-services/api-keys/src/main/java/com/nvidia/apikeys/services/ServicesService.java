@@ -24,12 +24,16 @@ import com.nvidia.apikeys.utils.JsonUtils;
 import com.nvidia.apikeys.vo.ServiceVo;
 import com.nvidia.boot.exceptions.NotFoundException;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.MapUtils;
+import org.apache.commons.collections4.SetUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.stereotype.Service;
 
@@ -44,15 +48,30 @@ public class ServicesService {
     public ServicesService(NakProperties config)
             throws JacksonException {
         log.info("Initializing services {}", config.getRegistrations());
-        List<ServiceVo> registrations = JsonUtils.getRequestResponseJsonMapper().readValue(
-                config.getRegistrations(), new TypeReference<>() {
-                });
+        List<ServiceVo> registrations = JsonUtils.getRequestResponseJsonMapper().<List<ServiceVo>>readValue(
+                        config.getRegistrations(), new TypeReference<>() {
+                        })
+                .stream()
+                .map(registration -> withConfiguredLegacyId(registration, config))
+                .toList();
 
         this.services = registrations.stream()
                 .collect(Collectors.toUnmodifiableMap(ServiceVo::getServiceId, s -> s));
         this.servicesByAlias = indexAliases(registrations);
 
         log.debug("Registered services: {}", this.services.values());
+    }
+
+    private static ServiceVo withConfiguredLegacyId(ServiceVo registration, NakProperties config) {
+        String configured = MapUtils.getString(
+                config.getLegacyServiceIds(), registration.getServiceId());
+        if (StringUtils.isBlank(configured)) {
+            return registration;
+        }
+        Set<String> merged = new LinkedHashSet<>(
+                SetUtils.emptyIfNull(registration.getLegacyServiceIds()));
+        merged.add(configured);
+        return registration.toBuilder().legacyServiceIds(merged).build();
     }
 
     private static Map<String, ServiceVo> indexAliases(List<ServiceVo> registrations) {

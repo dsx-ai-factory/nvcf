@@ -52,6 +52,9 @@ public class NakProperties {
     @NotEmpty
     private Map<String, String> serviceIdMap;
 
+    // Canonical service id to its legacy id. Merged into the matching registration as an alias.
+    private Map<String, String> legacyServiceIds;
+
     // Must equal the rule in nvcf-core's default nvcf.api-keys.account-rate-limit-evaluation-uri.
     @Builder.Default
     private String tieredRateLimitRuleName = "apikey.account_rate_limit";
