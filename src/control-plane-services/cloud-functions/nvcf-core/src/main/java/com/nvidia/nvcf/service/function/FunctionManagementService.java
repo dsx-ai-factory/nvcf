@@ -194,45 +194,66 @@ public class FunctionManagementService {
             Predicate<FunctionEntity> authFilterForPrivateFunctions,
             Predicate<FunctionEntity> authFilterForAuthorizedFunctions,
             Set<VisibilityEnum> visibilities) {
+        return lookupFunctions(ncaId,
+                               authFilterForPrivateFunctions,
+                               authFilterForAuthorizedFunctions,
+                               visibilities)
+                .stream()
+                .map(func -> toFunctionDto(func, false, false))
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    /**
+     * Returns the entity of each function version that
+     * {@link #getFunctions(String, Predicate, Predicate, Set)} returns for the same arguments,
+     * without building function details. Listings that need only ids use it, so that they
+     * apply the same lookups and filters.
+     *
+     * @param ncaId                            NVIDIA Cloud Account Id
+     * @param authFilterForPrivateFunctions    filter to determine if function in own account should
+     *                                         be included
+     * @param authFilterForAuthorizedFunctions filter to determine if function in authorized account
+     *                                         should be included
+     * @param visibilities                     private,authorized,public
+     * @return one entity per function version
+     */
+    public List<FunctionEntity> lookupFunctions(
+            String ncaId,
+            Predicate<FunctionEntity> authFilterForPrivateFunctions,
+            Predicate<FunctionEntity> authFilterForAuthorizedFunctions,
+            Set<VisibilityEnum> visibilities) {
         if (StringUtils.isBlank(ncaId)) {
             log.error(MESG_NCA_ID_BLANK);
             throw new BadRequestException(MESG_NCA_ID_BLANK);
         }
 
         log.debug(MESG_RETRIEVE_FUNCTIONS_BY_ACC, ncaId, "Retrieving");
-        List<FunctionDto> publicFunctions = List.of();
+        List<FunctionEntity> publicFunctions = List.of();
         if (visibilities.contains(VisibilityEnum.PUBLIC)) {
-            publicFunctions = azpsService.lookupPublicFunctions()
-                    .stream()
-                    .map(func -> toFunctionDto(func, false, false))
-                    .filter(Objects::nonNull)
-                    .toList();
+            publicFunctions = azpsService.lookupPublicFunctions();
         }
         log.debug(MESG_RETRIEVE_FUNCTIONS_BY_ACC, ncaId, "Retrieved public");
 
-        List<FunctionDto> privateFunctions = List.of();
+        List<FunctionEntity> privateFunctions = List.of();
         if (visibilities.contains(VisibilityEnum.PRIVATE)) {
             privateFunctions = functionLookupService.lookupEntitiesUsingAccountId(ncaId)
                     .filter(authFilterForPrivateFunctions)
-                    .map(func -> toFunctionDto(func, false, false))
-                    .filter(Objects::nonNull)
                     .toList();
         }
         log.debug(MESG_RETRIEVE_FUNCTIONS_BY_ACC, ncaId, "Retrieved own");
 
-        List<FunctionDto> authorizedFunctions = List.of();
+        List<FunctionEntity> authorizedFunctions = List.of();
         if (visibilities.contains(VisibilityEnum.AUTHORIZED)) {
             authorizedFunctions = azpsService.lookupFunctionsByAuthorizedAccount(ncaId)
                     .filter(authFilterForAuthorizedFunctions)
-                    .map(func -> toFunctionDto(func, false, false))
-                    .filter(Objects::nonNull)
                     .toList();
         }
         log.debug(MESG_RETRIEVE_FUNCTIONS_BY_ACC, ncaId, "Retrieved authorized");
 
         return Stream.of(publicFunctions, privateFunctions, authorizedFunctions)
                 .flatMap(Collection::stream)
-                .filter(distinct(FunctionDto::versionId))
+                .filter(distinct(FunctionEntity::getFunctionVersionId))
                 .toList();
     }
 
