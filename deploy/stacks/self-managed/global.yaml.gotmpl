@@ -1184,10 +1184,6 @@ api:
   {{- $apiEnv = mergeOverwrite $apiEnv $renderedApiEnv }}
   env:
     {{- toYaml $apiEnv | nindent 4 }}
-  {{- with dig "api" "podAnnotations" dict .Values }}
-  podAnnotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
 
   {{- /* Pylon lives in remote config rather than a Kubernetes image field. */}}
   {{- $apiPodAnnotations := deepCopy (dig "api" "podAnnotations" dict .Values) }}
@@ -1415,10 +1411,6 @@ nvctApi:
     {{- if .Values.global.observability.tracing.enabled }}
     MANAGEMENT_OTLP_TRACING_ENDPOINT: "{{ .Values.global.observability.tracing.collectorProtocol }}://{{ .Values.global.observability.tracing.collectorEndpoint }}:{{ .Values.global.observability.tracing.collectorPort }}/v1/traces"
     {{- end }}
-  {{- with dig "nvctApi" "podAnnotations" dict .Values }}
-  podAnnotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
 
 eventLedger:
   {{- if .Values.global.imagePullSecrets }}

@@ -61,13 +61,15 @@ releases=(
   "openbao-server|.openbao.server.annotations|openbao.server.annotations"
 )
 
-# 1. Unset: no release gets pod annotations from the stack.
+# 1. Unset: no release gets operator pod annotations from the stack. The stack
+#    itself annotates the API and NVCT API with the release-artifact images, so
+#    only keys it does not own count.
 printf '{}\n' >"$environment_file"
 for entry in "${releases[@]}"; do
   IFS='|' read -r release path key <<<"$entry"
   values="$work_dir/$release-default.yaml"
   render_values "$release" "$values"
-  assert_yaml_value "$values" "$path" null "default $release: $key must not be emitted"
+  assert_yaml_value "$values" "(($path) // {}) | keys | map(select(test(\"^release-artifact-\") | not)) | length" 0 "default $release: $key must carry no operator annotations"
 done
 
 # 2. Set: each release gets its own annotations and no other release's.
