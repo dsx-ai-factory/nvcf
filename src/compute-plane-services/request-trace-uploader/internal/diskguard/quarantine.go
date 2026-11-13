@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ErrDeletedNotSynced reports data that was deleted but whose directory
@@ -37,8 +38,12 @@ const RejectsDirName = "rejects"
 //
 //	<dir>/<segment id>/          a quarantined segment and its files
 //	<dir>/rejects/<segment id>.* reject artifacts
+//
+// Admit, Entries and Remove hold one lock, so a listing never shows an entry
+// that an admission is still filling, and nothing removes it mid-admission.
 type Quarantine struct {
 	dir string
+	mu  sync.Mutex
 }
 
 // NewQuarantine returns the quarantine at dir.
@@ -63,6 +68,8 @@ func (q *Quarantine) Admit(id string, paths ...string) error {
 	if !validEntryName(id) {
 		return fmt.Errorf("quarantine id %q is not a plain name", id)
 	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	entry := filepath.Join(q.dir, id)
 	if err := linkDurable(entry); err != nil {
 		return err
@@ -113,6 +120,8 @@ func moveInto(path, dir string) error {
 // its size and modification time. A quarantine that does not exist yet is
 // empty.
 func (q *Quarantine) Entries() ([]Candidate, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	items, err := os.ReadDir(q.dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -167,6 +176,8 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 // "rejects/<name>". Any other key is refused, so a key can never reach
 // outside the quarantine.
 func (q *Quarantine) Remove(key string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	parts := strings.Split(key, "/")
 	valid := (len(parts) == 1 && validEntryName(parts[0])) ||
 		(len(parts) == 2 && parts[0] == RejectsDirName && validEntryName(parts[1]))

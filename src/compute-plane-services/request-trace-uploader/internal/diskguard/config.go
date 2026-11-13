@@ -20,16 +20,19 @@ const (
 )
 
 // Policy is what the guard deletes when the spool is above the high
-// watermark. Every deleted item is counted as loss.
+// watermark. The quarantine age and share limits delete entries under every
+// policy. Every deleted item is counted as loss.
 type Policy string
 
 const (
 	// PolicyQuarantineThenOldest deletes quarantined entries first, then the
 	// oldest closed segments.
 	PolicyQuarantineThenOldest Policy = "quarantine-then-oldest"
-	// PolicyOldest deletes the oldest closed segments and keeps quarantine.
+	// PolicyOldest deletes the oldest closed segments and leaves quarantine
+	// to its own limits.
 	PolicyOldest Policy = "oldest"
-	// PolicyNone deletes nothing; preparing pauses until space frees up.
+	// PolicyNone deletes nothing above the high watermark; preparing pauses
+	// until space frees up. The quarantine limits still apply.
 	PolicyNone Policy = "none"
 )
 

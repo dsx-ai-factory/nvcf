@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -178,6 +179,12 @@ func (l *Loader) read() (map[string]Secret, error) {
 	}
 	if len(data) > maxFileBytes {
 		return nil, fmt.Errorf("read secrets file: larger than %d bytes", maxFileBytes)
+	}
+	// Decoding would replace an invalid byte with U+FFFD and accept the
+	// changed value, so a damaged file is refused and the last good
+	// credentials stay.
+	if !utf8.Valid(data) {
+		return nil, errors.New("read secrets file: not valid UTF-8")
 	}
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(data, &document); err != nil {

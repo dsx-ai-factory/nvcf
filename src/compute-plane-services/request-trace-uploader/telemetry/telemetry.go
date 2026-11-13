@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"sort"
 )
 
@@ -113,7 +114,9 @@ var labelValuePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
 var outcome = map[string][]string{"status": {"success", "failure"}}
 
-var catalog = []Instrument{
+// The catalog keeps its own copies, so an exported value list changed later
+// cannot change it either.
+var catalog = cloneAll([]Instrument{
 	{Name: Uploads, Kind: Counter, Unit: "1", Labels: []string{"status"}, Values: outcome},
 	{Name: UploadDuration, Kind: Histogram, Unit: "s"},
 	{Name: SourceBytes, Kind: Counter, Unit: "By"},
@@ -141,7 +144,7 @@ var catalog = []Instrument{
 	{Name: BatchSegments, Kind: Histogram, Unit: "1"},
 	{Name: BatchBytes, Kind: Histogram, Unit: "By"},
 	{Name: BatchSplits, Kind: Counter, Unit: "1"},
-}
+})
 
 var byName = func() map[string]Instrument {
 	index := make(map[string]Instrument, len(catalog))
@@ -151,15 +154,36 @@ var byName = func() map[string]Instrument {
 	return index
 }()
 
-// Instruments returns the catalog in a stable order.
+// Instruments returns copies of the catalog in a stable order.
 func Instruments() []Instrument {
-	return append([]Instrument(nil), catalog...)
+	return cloneAll(catalog)
 }
 
-// Lookup returns the instrument named name.
+// Lookup returns a copy of the instrument named name.
 func Lookup(name string) (Instrument, bool) {
 	instrument, ok := byName[name]
-	return instrument, ok
+	return instrument.clone(), ok
+}
+
+// clone returns a copy of i that shares no slice or map with it.
+func (i Instrument) clone() Instrument {
+	i.Labels = slices.Clone(i.Labels)
+	if i.Values != nil {
+		values := make(map[string][]string, len(i.Values))
+		for key, list := range i.Values {
+			values[key] = slices.Clone(list)
+		}
+		i.Values = values
+	}
+	return i
+}
+
+func cloneAll(instruments []Instrument) []Instrument {
+	out := make([]Instrument, len(instruments))
+	for n, instrument := range instruments {
+		out[n] = instrument.clone()
+	}
+	return out
 }
 
 // Metrics records observations. Implementations must not block or fail the
