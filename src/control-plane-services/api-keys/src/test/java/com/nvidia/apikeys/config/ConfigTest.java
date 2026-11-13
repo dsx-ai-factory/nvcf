@@ -17,7 +17,7 @@
 
 package com.nvidia.apikeys.config;
 
-import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import com.nvidia.apikeys.App;
 import com.nvidia.apikeys.config.IntegrationTestConfiguration.TestCleanerExtension;
@@ -66,6 +66,14 @@ class ConfigTest extends BaseIntegrationTest {
                 .isEqualTo("nvidia-cloud-tasks-ncp-service-id-nvcttasks");
         assertThat(environment.getProperty("apikeys.service-id-map.event-ledger"))
                 .isEqualTo("event-ledger");
+    }
+
+    @Test
+    void legacyServiceIdsShouldBindForEachCanonicalServiceId() {
+        assertThat(nakProperties.getLegacyServiceIds())
+                .containsEntry("cloud-functions", "nvidia-cloud-functions-ncp-service-id-aketm")
+                .containsEntry("cloud-tasks", "nvidia-cloud-tasks-ncp-service-id-nvcttasks")
+                .containsEntry("event-ledger", "nvidia-event-ledger-ncp-service-id-ckozoh6f");
     }
 
     @Test
