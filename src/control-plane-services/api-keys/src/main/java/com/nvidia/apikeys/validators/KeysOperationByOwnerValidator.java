@@ -24,6 +24,7 @@ import com.nvidia.apikeys.dto.keys.UpdateAuthorizationsRequest;
 import com.nvidia.apikeys.persistance.dao.KeysDao;
 import com.nvidia.apikeys.services.CredentialService;
 import com.nvidia.apikeys.services.MillisecondPrecisionClock;
+import com.nvidia.apikeys.services.ServicesService;
 import com.nvidia.apikeys.services.ValidatingKeyLoader;
 import com.nvidia.apikeys.vo.CreateKeyRequestVo;
 import com.nvidia.apikeys.vo.DeleteKeyRequestVo;
@@ -39,6 +40,7 @@ import com.nvidia.boot.exceptions.BadRequestException;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.apache.commons.collections4.CollectionUtils;
 import org.springframework.stereotype.Service;
@@ -56,6 +58,7 @@ public class KeysOperationByOwnerValidator {
     private final ValidatingAuthorizationsConverter authorizationsConverter;
     private final MillisecondPrecisionClock clock;
     private final ValidatingKeyLoader validatingKeyLoader;
+    private final ServicesService servicesService;
 
     public ListKeysRequestVo validateListKeysRequest(ServiceVo service, KeyOwnerVo keyOwnerVo) {
         return ListKeysRequestVo.builder()
@@ -71,10 +74,11 @@ public class KeysOperationByOwnerValidator {
         keyRequestValidator.assertExpirationDateValid(service, createKeyRequest.getExpiresAt());
 
         Set<String> audienceServiceIds = keyRequestValidator.getValidAudienceServiceIds(
-                service, createKeyRequest.getAudienceServiceIds());
+                service, toCanonicalIds(createKeyRequest.getAudienceServiceIds()));
 
         List<KeyByOwnerAndServiceVo> existingActorKeys = keysDao.list(
-                keyOwnerVo.getOwnerType(), keyOwnerVo.getOwnerId(), service.getServiceId());
+                keyOwnerVo.getOwnerType(), keyOwnerVo.getOwnerId(),
+                service.serviceIdAliasGroup());
 
         assertNotReachedLimitKeysPerService(service, keyOwnerVo, existingActorKeys);
 
@@ -143,6 +147,15 @@ public class KeysOperationByOwnerValidator {
                 .service(service)
                 .keyOwner(keyOwnerVo)
                 .build();
+    }
+
+    private Set<String> toCanonicalIds(Set<String> serviceIds) {
+        if (serviceIds == null) {
+            return null;
+        }
+        return serviceIds.stream()
+                .map(servicesService::toCanonicalId)
+                .collect(Collectors.toSet());
     }
 
     private void assertNotReachedLimitKeysPerService(

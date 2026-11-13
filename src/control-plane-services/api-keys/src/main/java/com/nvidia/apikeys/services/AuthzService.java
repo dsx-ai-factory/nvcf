@@ -34,6 +34,7 @@ public class AuthzService {
     private static final String AUD_FIELD = "aud";
 
     private final NakProperties nakProperties;
+    private final ServicesService servicesService;
 
 
     public AuthzResponse.Result evaluatePolicy(
@@ -74,7 +75,9 @@ public class AuthzService {
         for (JsonNode policy : policies) {
             if (policy.isObject() && policy.has(AUD_FIELD)) {
                 JsonNode audNode = policy.get(AUD_FIELD);
-                if (audNode.isString() && Objects.equals(audNode.asString(), audienceServiceId)) {
+                if (audNode.isString() && Objects.equals(
+                        servicesService.toCanonicalId(audNode.asString()),
+                        servicesService.toCanonicalId(audienceServiceId))) {
                     return policy;
                 }
             }

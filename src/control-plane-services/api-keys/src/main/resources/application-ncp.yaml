@@ -43,8 +43,8 @@ management:
 apikeys:
   nca-id: ${NVCF_NCA_ID:nvcf-default}  # Hardcoded till we support multitenancy in self-hosted env
   service-id-map:
-    nvcf: ${NVCF_SERVICE_ID:nvidia-cloud-functions-ncp-service-id-aketm}
-    nvct: ${NVCT_SERVICE_ID:nvidia-cloud-tasks-ncp-service-id-nvcttasks}
-    event-ledger: ${EVENT_LEDGER_SERVICE_ID:nvidia-event-ledger-ncp-service-id-ckozoh6f}
+    nvcf: cloud-functions
+    nvct: cloud-tasks
+    event-ledger: event-ledger
   key-prefix: nvapi-nvcf-stg-
   keep-after-expired-duration: P2D

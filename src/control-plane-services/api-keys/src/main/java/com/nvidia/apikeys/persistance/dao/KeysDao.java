@@ -33,6 +33,7 @@ import com.nvidia.apikeys.vo.SavedKeyVo;
 import com.nvidia.boot.exceptions.ServiceUnavailableException;
 import com.nvidia.boot.exceptions.UnprocessableEntityException;
 import java.time.Clock;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -213,6 +214,13 @@ public class KeysDao {
                 .stream()
                 .filter(Objects::nonNull)
                 .map(this::modelToValidatedVo)
+                .toList();
+    }
+
+    public List<KeyByOwnerAndServiceVo> list(
+            KeyOwnerType ownerType, String ownerId, Collection<String> serviceIds) {
+        return serviceIds.stream()
+                .flatMap(serviceId -> list(ownerType, ownerId, serviceId).stream())
                 .toList();
     }
 

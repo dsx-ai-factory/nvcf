@@ -173,8 +173,12 @@ apikeys:
   nca-id: nvcf-default
   registrations: ${kv.registrations.services}
   service-id-map:
-    nvcf: nvidia-cloud-functions-ncp-service-id-aketm
-    nvct: nvidia-cloud-tasks-ncp-service-id-nvcttasks
+    nvcf: cloud-functions
+    nvct: cloud-tasks
+    event-ledger: event-ledger
+  legacy-service-ids:
+    cloud-functions: nvidia-cloud-functions-ncp-service-id-aketm
+    cloud-tasks: nvidia-cloud-tasks-ncp-service-id-nvcttasks
     event-ledger: nvidia-event-ledger-ncp-service-id-ckozoh6f
   key-prefix: nvcfapi-
   data-domain-key: ${kv.data-domain-key.value}

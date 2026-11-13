@@ -19,6 +19,7 @@ package com.nvidia.apikeys;
 
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ObjectNode;
+import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.dto.introspection.IntrospectionRequest;
 import com.nvidia.apikeys.dto.introspection.IntrospectionResponse;
 import com.nvidia.apikeys.dto.keys.CreateKeyRequest;
@@ -31,6 +32,7 @@ import com.nvidia.apikeys.dto.keys.UpdateKeyOwnerStatusRequest;
 import com.nvidia.apikeys.dto.keys.UpdateKeyStatusRequest;
 import com.nvidia.apikeys.dto.services.ServiceDto;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
+import com.nvidia.apikeys.services.ServicesService;
 import com.nvidia.apikeys.utils.JsonUtils;
 import com.nvidia.apikeys.vo.CachedIntrospectionResponse;
 import com.nvidia.apikeys.vo.CreateKeyRequestVo;
@@ -49,6 +51,7 @@ import com.nvidia.apikeys.vo.UpdateKeyRequestVo;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public class TestData {
@@ -69,6 +72,19 @@ public class TestData {
     public static final Integer SERVICE_MAX_API_KEY_TTL_DAYS_2 = 36524;
     public static final Integer SERVICE_MAX_AUTHZ_SIZE_CHARS_2 = 2048;
     public static final Integer SERVICE_MIN_AUTHZ_UPDATE_INTERVAL_SECONDS_2 = 5;
+
+    public static ServicesService servicesService(ServiceVo... services) {
+        return servicesService(Map.of(), services);
+    }
+
+    public static ServicesService servicesService(
+            Map<String, String> configuredLegacyIds, ServiceVo... services) {
+        String registrations = TEST_OM.writeValueAsString(List.of(services));
+        return new ServicesService(NakProperties.builder()
+                .registrations(registrations)
+                .legacyServiceIds(configuredLegacyIds)
+                .build());
+    }
 
     public static ServiceVo SERVICE_VO_1 = ServiceVo.builder()
             .serviceId(SERVICE_ID_1)

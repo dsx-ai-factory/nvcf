@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.services;
 
+import java.util.Set;
 import static com.nvidia.apikeys.TestData.KEY_ID_1;
 import static com.nvidia.apikeys.TestData.KEY_OWNER_VO_1;
 import static com.nvidia.apikeys.TestData.SERVICE_ID_1;
@@ -32,7 +33,10 @@ import com.nvidia.boot.exceptions.NotFoundException;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import static com.nvidia.apikeys.TestData.SERVICE_VO_1;
+import static com.nvidia.apikeys.TestData.servicesService;
 import org.mockito.InjectMocks;
+import org.mockito.Spy;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -44,6 +48,9 @@ class ValidatingKeyLoaderTest {
 
     @Mock
     private KeyByOwnerAndServiceVo keyByOwnerAndServiceVoMock;
+
+    @Spy
+    private ServicesService servicesService = servicesService(SERVICE_VO_1);
 
     @InjectMocks
     private ValidatingKeyLoader keyLoader;
@@ -68,5 +75,26 @@ class ValidatingKeyLoaderTest {
                 NotFoundException.class,
                 () -> keyLoader.loadKeyByOwnerAndServiceVo(KEY_OWNER_VO_1, SERVICE_ID_1, KEY_ID_1)))
                 .hasMessageContaining("Key not found");
+    }
+
+
+    @Test
+    void loadKeyByOwnerAndServiceVo_findsLegacyStoredKeyThroughCanonicalId() {
+        var aliased = servicesService(SERVICE_VO_1.toBuilder()
+                .serviceId("cloud-functions")
+                .legacyServiceIds(Set.of(SERVICE_ID_1))
+                .build());
+        var loader = new ValidatingKeyLoader(keysDaoMock, aliased);
+        when(keysDaoMock.getKeyByOwnerAndServiceAndId(
+                USER, USER_KEY_OWNER_ID_1, "cloud-functions", KEY_ID_1))
+                .thenReturn(Optional.empty());
+        when(keysDaoMock.getKeyByOwnerAndServiceAndId(
+                USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1, KEY_ID_1))
+                .thenReturn(Optional.of(keyByOwnerAndServiceVoMock));
+
+        assertThat(loader.loadKeyByOwnerAndServiceVo(KEY_OWNER_VO_1, "cloud-functions", KEY_ID_1))
+                .isEqualTo(keyByOwnerAndServiceVoMock);
+        assertThat(loader.loadKeyByOwnerAndServiceVo(KEY_OWNER_VO_1, SERVICE_ID_1, KEY_ID_1))
+                .isEqualTo(keyByOwnerAndServiceVoMock);
     }
 }
