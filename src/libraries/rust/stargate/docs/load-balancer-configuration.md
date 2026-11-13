@@ -283,6 +283,10 @@ Stargate can upgrade before Pylons and registration relays, including
 `stargate-k8s-router`: missing maximum data retains mean-based routing.
 Older relays decode and re-encode registrations without preserving the new
 field. Upgrade those relays and Pylons to enable stable maximum-based weights.
+Existing function versions retain the Pylon image captured at creation.
+Replacing pods or redeploying the same version does not apply a new image.
+After updating the control plane, create and deploy a new function version.
+See [LLM function enablement](../../../../../docs/self-managed/llm-function-enablement.md).
 Mean-based fallback weights can change during traffic until then.
 The fallback also applies to current Pylons without an established maximum.
 For shared clusters, one backend with missing or invalid maximum data clears

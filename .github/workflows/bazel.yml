@@ -213,7 +213,7 @@ jobs:
           case "$EVENT" in
             workflow_dispatch) run_all=true ;;
             pull_request)
-              if ! changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null); then
+              if ! changed=$(git diff --no-renames --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null); then
                 echo "diff vs origin/${BASE_REF} failed; running full matrix"
                 run_all=true
               else
@@ -234,7 +234,7 @@ jobs:
               elif ! git rev-parse --verify -q "${MERGE_BASE_SHA}^{commit}" >/dev/null 2>&1; then
                 echo "merge_group base ${MERGE_BASE_SHA} not in history; running full matrix"
                 run_all=true
-              elif ! changed=$(git diff --name-only "${MERGE_BASE_SHA}...${HEAD_SHA}" 2>/dev/null); then
+              elif ! changed=$(git diff --no-renames --name-only "${MERGE_BASE_SHA}...${HEAD_SHA}" 2>/dev/null); then
                 echo "diff ${MERGE_BASE_SHA}...${HEAD_SHA} failed; running full matrix"
                 run_all=true
               else
@@ -245,7 +245,7 @@ jobs:
             *)
               if [ -z "${BEFORE_SHA}" ] || [ "${BEFORE_SHA}" = "0000000000000000000000000000000000000000" ]; then
                 run_all=true
-              elif ! changed=$(git diff --name-only "${BEFORE_SHA}..${HEAD_SHA}" 2>/dev/null); then
+              elif ! changed=$(git diff --no-renames --name-only "${BEFORE_SHA}..${HEAD_SHA}" 2>/dev/null); then
                 echo "diff ${BEFORE_SHA}..${HEAD_SHA} failed (rewritten history?); running full matrix"
                 run_all=true
               else
