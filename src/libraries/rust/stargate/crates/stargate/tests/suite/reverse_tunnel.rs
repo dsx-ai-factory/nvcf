@@ -944,10 +944,9 @@ async fn reverse_backend_shutdown_drains_in_flight_request_until_drain_timeout()
                 (resp.status(), resp.text().await)
             }
         });
-        backend
-            .entered
-            .recv()
+        tokio::time::timeout(Duration::from_secs(10), backend.entered.recv())
             .await
+            .expect("backend should receive the request within 10s")
             .expect("backend should receive the request");
         let shutdown = tokio::spawn(async move {
             let started = tokio::time::Instant::now();
