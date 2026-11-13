@@ -38,6 +38,19 @@ const (
 	// quarantine trip before it reads new segments again, as a duration such
 	// as "1h".
 	EnvQuarantineResume = "REQUEST_TRACE_UPLOADER_QUARANTINE_RESUME"
+	// EnvRecordMaxBytes is the most bytes one source record, one line of a
+	// segment, may have, as whole bytes. A longer record is not parsed: its
+	// raw bytes go to the local reject file and it is counted.
+	EnvRecordMaxBytes = "REQUEST_TRACE_UPLOADER_RECORD_MAX_BYTES"
+	// DefaultRecordMaxBytes is the default for EnvRecordMaxBytes, 256 MiB.
+	DefaultRecordMaxBytes = int64(256) << 20
+	// EnvObjectStoreResponseTimeout bounds how long the objectstore backend
+	// waits for a store's answer once a request, body included, is sent, as
+	// a duration such as "5m". It never cuts an upload on a slow link.
+	EnvObjectStoreResponseTimeout = "REQUEST_TRACE_UPLOADER_OBJECTSTORE_RESPONSE_TIMEOUT"
+	// DefaultObjectStoreResponseTimeout is the default for
+	// EnvObjectStoreResponseTimeout.
+	DefaultObjectStoreResponseTimeout = 5 * time.Minute
 
 	DefaultDrainTimeout     = 60 * time.Second
 	DefaultMaxJobAge        = 6 * time.Hour
@@ -46,6 +59,12 @@ const (
 	// maxQuarantineTrip bounds EnvQuarantineTrip. A larger run is no longer
 	// a useful stop.
 	maxQuarantineTrip = 1000
+	// minRecordMaxBytes keeps a unit mistake, such as 256 meant as MiB,
+	// from rejecting every record.
+	minRecordMaxBytes = int64(1) << 20
+	// maxRecordMaxBytes is the reader's own bound on one line; a larger
+	// record would not fit the memory the design plans for.
+	maxRecordMaxBytes = int64(512) << 20
 
 	// settingPrefix starts every setting name this package reads, except
 	// HEALTH_ADDR. LoadStrict rejects any other name with this prefix.
@@ -146,6 +165,21 @@ func strictInt(lookup LookupFunc, name string, fallback, minimum, maximum int) (
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < minimum || parsed > maximum {
 		return 0, fmt.Errorf("%s must be a whole number from %d to %d", name, minimum, maximum)
+	}
+	return parsed, nil
+}
+
+// strictBytes parses a whole-bytes setting, such as 268435456 for 256 MiB,
+// within bounds. A unit suffix or any other bad value is an error and never
+// a fallback.
+func strictBytes(lookup LookupFunc, name string, fallback, minimum, maximum int64) (int64, error) {
+	value := strings.TrimSpace(valueOrDefault(lookup, name, ""))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < minimum || parsed > maximum {
+		return 0, fmt.Errorf("%s must be whole bytes, with no unit, from %d to %d", name, minimum, maximum)
 	}
 	return parsed, nil
 }

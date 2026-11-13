@@ -125,6 +125,9 @@ type Config struct {
 	// QuarantineResume is how long intake stays stopped after a trip before
 	// it reads new segments again. Zero uses the fault handling default.
 	QuarantineResume time.Duration
+	// RecordMaxBytes is the most bytes one source record may have. Zero, as
+	// in a Config built by hand, uses DefaultRecordMaxBytes.
+	RecordMaxBytes int64
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -150,6 +153,10 @@ type ObjectStorePolicy struct {
 	// exists to exercise config, key computation, and hostname namespacing
 	// without a destination, the same role debug plays for the read path.
 	DryRun bool
+	// ResponseTimeout bounds the wait for a store's answer once a request,
+	// body included, is sent. Zero, as in a Config built by hand, uses
+	// DefaultObjectStoreResponseTimeout; it never means no bound.
+	ResponseTimeout time.Duration
 }
 
 // RetryPolicy bounds each remote operation. AttemptTimeout bounds each backend
@@ -234,6 +241,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		PathStyle: boolValue(lookup, EnvObjectStorePathStyle, false, &warnings),
 		DryRun:    boolValue(lookup, EnvObjectStoreDryRun, false, &warnings),
 	}
+	objectStore.ResponseTimeout, err = strictDuration(lookup, EnvObjectStoreResponseTimeout, DefaultObjectStoreResponseTimeout, 10*time.Second, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
 	debugVerbosity := debugVerbosityValue(lookup, EnvDebugVerbosity, &warnings)
 	suppression, err := suppressionValue(lookup)
 	if err != nil {
@@ -267,6 +278,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	recordMaxBytes, err := strictBytes(lookup, EnvRecordMaxBytes, DefaultRecordMaxBytes, minRecordMaxBytes, maxRecordMaxBytes)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -296,6 +311,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 
 		QuarantineTrip:   quarantineTrip,
 		QuarantineResume: quarantineResume,
+		RecordMaxBytes:   recordMaxBytes,
 	}, warnings, nil
 }
 

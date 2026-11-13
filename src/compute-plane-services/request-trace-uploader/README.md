@@ -179,6 +179,11 @@ Optional, with defaults:
   to `24h`
 - `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL`: how often every open job is
   polled, whatever the backend; default `30s`, from `1s` to `1h`
+- `REQUEST_TRACE_UPLOADER_RECORD_MAX_BYTES`: the most bytes one source
+  record (one line) may have, as whole bytes with no unit; default
+  `268435456` (256 MiB), from `1048576` (1 MiB) to `536870912` (512 MiB). A
+  longer record is not parsed: its raw bytes go to the local reject file and
+  it is counted as `records_unreadable` with reason `line_too_long`.
 
 Time settings are Go durations with a unit, such as `30s`, `5m` or `1h`. A
 bare number, a negative value, zero where zero is not allowed, or a value
@@ -196,6 +201,11 @@ Used only by one backend:
   addressing, which most stores other than AWS need; default `false`
 - `REQUEST_TRACE_UPLOADER_OBJECTSTORE_DRY_RUN`: log what would be uploaded,
   send nothing and need no credentials; default `false`
+- `REQUEST_TRACE_UPLOADER_OBJECTSTORE_RESPONSE_TIMEOUT`: how long to wait
+  for the store's answer once a request, body included, is sent; default
+  `5m`, from `10s` to `1h`. It applies to each request, never cuts an upload
+  on a slow link, and ends a wait on a store that took the object and never
+  answers.
 - `REQUEST_TRACE_UPLOADER_DEBUG_VERBOSITY`: `basic` (default) or `detailed`
   logging for `debug`
 
