@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.services;
 
+import java.util.Map;
 import java.util.Set;
 import com.nvidia.apikeys.vo.ServiceVo;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -152,5 +153,63 @@ class ServicesServiceTest {
         ServiceVo second = SERVICE_VO_1.toBuilder().serviceId(OTHER_CANONICAL_ID).build();
 
         assertThrows(IllegalStateException.class, () -> servicesService(first, second));
+    }
+
+    @Test
+    void configuredLegacyId_becomesAliasOfRegistrationWithoutAliases() {
+        ServicesService configured = servicesService(
+                Map.of(CANONICAL_ID, SERVICE_ID_1),
+                SERVICE_VO_1.toBuilder().serviceId(CANONICAL_ID).build());
+
+        assertThat(configured.loadById(SERVICE_ID_1).getServiceId()).isEqualTo(CANONICAL_ID);
+        assertThat(configured.storedServiceIds(CANONICAL_ID))
+                .containsExactly(CANONICAL_ID, SERVICE_ID_1);
+    }
+
+    @Test
+    void configuredLegacyId_overridesDefaultWhenOperatorSetsIt() {
+        ServicesService configured = servicesService(
+                Map.of(CANONICAL_ID, "operator-chosen-id"),
+                SERVICE_VO_1.toBuilder().serviceId(CANONICAL_ID).build());
+
+        assertThat(configured.loadById("operator-chosen-id").getServiceId())
+                .isEqualTo(CANONICAL_ID);
+        assertThat(configured.getServiceById(SERVICE_ID_1)).isEmpty();
+    }
+
+    @Test
+    void configuredLegacyId_isMergedWithAliasFromRegistration() {
+        ServicesService configured = servicesService(
+                Map.of(CANONICAL_ID, "operator-chosen-id"),
+                SERVICE_VO_1.toBuilder()
+                        .serviceId(CANONICAL_ID)
+                        .legacyServiceIds(Set.of(SERVICE_ID_1))
+                        .build());
+
+        assertThat(configured.storedServiceIds(CANONICAL_ID))
+                .containsExactlyInAnyOrder(CANONICAL_ID, SERVICE_ID_1, "operator-chosen-id");
+    }
+
+    @Test
+    void configuredLegacyId_sameAsRegistrationAliasIsNotDuplicated() {
+        ServicesService configured = servicesService(
+                Map.of(CANONICAL_ID, SERVICE_ID_1),
+                SERVICE_VO_1.toBuilder()
+                        .serviceId(CANONICAL_ID)
+                        .legacyServiceIds(Set.of(SERVICE_ID_1))
+                        .build());
+
+        assertThat(configured.storedServiceIds(CANONICAL_ID))
+                .containsExactly(CANONICAL_ID, SERVICE_ID_1);
+    }
+
+    @Test
+    void configuredLegacyId_forUnregisteredServiceIsIgnored() {
+        ServicesService configured = servicesService(
+                Map.of(OTHER_CANONICAL_ID, OTHER_LEGACY_ID),
+                SERVICE_VO_1);
+
+        assertThat(configured.getServiceById(OTHER_LEGACY_ID)).isEmpty();
+        assertThat(configured.storedServiceIds(SERVICE_ID_1)).containsExactly(SERVICE_ID_1);
     }
 }

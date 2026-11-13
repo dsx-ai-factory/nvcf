@@ -51,6 +51,7 @@ import com.nvidia.apikeys.vo.UpdateKeyRequestVo;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public class TestData {
@@ -73,8 +74,16 @@ public class TestData {
     public static final Integer SERVICE_MIN_AUTHZ_UPDATE_INTERVAL_SECONDS_2 = 5;
 
     public static ServicesService servicesService(ServiceVo... services) {
+        return servicesService(Map.of(), services);
+    }
+
+    public static ServicesService servicesService(
+            Map<String, String> configuredLegacyIds, ServiceVo... services) {
         String registrations = TEST_OM.writeValueAsString(List.of(services));
-        return new ServicesService(NakProperties.builder().registrations(registrations).build());
+        return new ServicesService(NakProperties.builder()
+                .registrations(registrations)
+                .legacyServiceIds(configuredLegacyIds)
+                .build());
     }
 
     public static ServiceVo SERVICE_VO_1 = ServiceVo.builder()
