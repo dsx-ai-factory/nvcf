@@ -231,6 +231,12 @@ nvctApi:
 #       registry: <your-registry>
 #       repository: <your-repository>/alpine-k8s
 #       tag: "1.37.0"
+#
+# The account-bootstrap hook Job creates the NVCF account on install and
+# upgrade. When the account is provisioned another way, turn the Job off.
+# Unset, the API chart default (true) applies:
+#   accountBootstrap:
+#     enabled: false
 
 # The bundled upgrade receipt uses its chart's public upstream helper image.
 # Global NVCF image settings do not select this third-party image. To use a

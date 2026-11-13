@@ -1124,7 +1124,16 @@ api:
   {{- $accountBootstrapRepository := dig "api" "accountBootstrap" "image" "repository" "" .Values }}
   {{- $accountBootstrapTag := dig "api" "accountBootstrap" "image" "tag" "" .Values }}
   {{- $accountBootstrapPullPolicy := dig "api" "accountBootstrap" "image" "pullPolicy" "" .Values }}
+  {{- $accountBootstrap := dig "api" "accountBootstrap" dict .Values }}
   accountBootstrap:
+    {{- /* Unset leaves the chart default. A quoted "false" is truthy in the
+           chart and would still run the hook Job, so only a boolean passes. */}}
+    {{- if hasKey $accountBootstrap "enabled" }}
+    {{- if not (kindIs "bool" $accountBootstrap.enabled) }}
+    {{- fail (printf "api.accountBootstrap.enabled must be a YAML boolean, true or false. Got %q" (toString $accountBootstrap.enabled)) }}
+    {{- end }}
+    enabled: {{ $accountBootstrap.enabled }}
+    {{- end }}
     {{- if or $accountBootstrapRegistry $accountBootstrapRepository $accountBootstrapTag $accountBootstrapPullPolicy }}
     image:
       {{- with $accountBootstrapRegistry }}

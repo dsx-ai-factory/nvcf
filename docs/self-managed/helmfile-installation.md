@@ -752,6 +752,12 @@ api.accountBootstrap.registryCredentials): ACR (Azure), ECR (AWS), NVCR
 
 </Note>
 
+The API chart's account-bootstrap hook Job creates the default NVCF account
+with these registry credentials on install and upgrade. If the account is provisioned
+another way, set `api.accountBootstrap.enabled: false` in
+`environments/<environment>.yaml` to skip the Job. The value must be a YAML
+boolean.
+
 #### Generating Base64-encoded Registry Credentials
 
 Registry credentials must be base64-encoded in the format `username:password`. For detailed instructions on setting up credentials for specific registries (including IAM user creation for ECR), see [third-party-registries-self-hosted](./third-party-registries.md).
