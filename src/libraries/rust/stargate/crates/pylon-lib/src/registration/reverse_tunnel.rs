@@ -230,17 +230,17 @@ pub(super) async fn run_reverse_tunnel_loop(
                 tokio::select! {
                     _ = stop.cancelled() => {
                         if registration_stop.is_cancelled() {
+                            let accept_window =
+                                REVERSE_TUNNEL_ACCEPT_WINDOW.min(config.shutdown_drain_timeout);
                             tracing::info!(
                                 router_addr = %router_addr,
                                 inference_server_id = %config.inference_server_id,
-                                accept_window_ms = REVERSE_TUNNEL_ACCEPT_WINDOW.as_millis(),
+                                accept_window_ms = accept_window.as_millis(),
                                 "reverse tunnel draining"
                             );
                             // Accept the streams the router sent before it saw the
                             // registration close. A timeout is the normal outcome.
-                            let _ =
-                                tokio::time::timeout(REVERSE_TUNNEL_ACCEPT_WINDOW, handle.closed())
-                                    .await;
+                            let _ = tokio::time::timeout(accept_window, handle.closed()).await;
                         }
                         handle.shutdown().await;
                         state_tx.send_if_modified(|state| state.mark_disconnected(&endpoint));

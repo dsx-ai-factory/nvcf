@@ -25,7 +25,7 @@ use super::core::{
     forward_tunnel_request, next_body_len, request_body_buffer, serve_bidi_streams,
 };
 
-// Matches the registration drain timeout; a longer wait is aborted during
+// Matches the default shutdown drain timeout; a longer wait is aborted during
 // shutdown anyway.
 const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(90);
 

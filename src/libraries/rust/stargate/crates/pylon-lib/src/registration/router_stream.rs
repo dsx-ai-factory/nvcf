@@ -29,7 +29,6 @@ use stargate_proto::pb::stargate_control_plane_client::StargateControlPlaneClien
 use stargate_proto::pb::{InferenceServerAck, InferenceServerRegistration, InferenceServerStatus};
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
 
-use super::REGISTRATION_DRAIN_TIMEOUT;
 use super::grpc_endpoint::{
     StargateGrpcEndpoint, classify_stargate_grpc_certificate_failure,
     connect_stargate_grpc_channel, grpc_error_chain, log_stargate_grpc_certificate_failure,
@@ -254,7 +253,7 @@ pub(super) async fn run_router_registration_stream(
         drop(advertised_status);
         if let Some(task) = reverse_task {
             let timeout = if stopped {
-                REGISTRATION_DRAIN_TIMEOUT
+                config.shutdown_drain_timeout
             } else {
                 TASK_SHUTDOWN_TIMEOUT
             };

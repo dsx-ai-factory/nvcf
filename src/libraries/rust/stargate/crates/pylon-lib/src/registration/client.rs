@@ -15,13 +15,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
 
-use super::REGISTRATION_DRAIN_TIMEOUT;
 use super::discovery::run_watch_stargate_discovery;
 use super::grpc_endpoint::StargateGrpcEndpoint;
 use super::router_stream::run_router_registration_stream;
@@ -29,6 +29,7 @@ use super::topology::RegistrationRouterTopology;
 use super::types::{ClientError, InferenceServerRegistrationConfig, RegistrationSessionConfig};
 
 async fn run_registration_session(config: RegistrationSessionConfig, stop: CancellationToken) {
+    let drain_timeout = config.shutdown_drain_timeout;
     let config = Arc::new(config);
     let (router_topology_tx, router_topology_rx) =
         watch::channel(RegistrationRouterTopology::default());
@@ -51,7 +52,7 @@ async fn run_registration_session(config: RegistrationSessionConfig, stop: Cance
     let tasks = vec![watch_task, registration_task];
 
     stop.cancelled().await;
-    OwnedTask::shutdown_all(tasks, REGISTRATION_DRAIN_TIMEOUT).await;
+    OwnedTask::shutdown_all(tasks, drain_timeout).await;
 }
 
 async fn run_registration_supervisor(
@@ -105,7 +106,7 @@ async fn run_registration_supervisor(
 
     OwnedTask::shutdown_all(
         per_router_tasks.into_values().collect(),
-        REGISTRATION_DRAIN_TIMEOUT,
+        config.shutdown_drain_timeout,
     )
     .await;
 }
@@ -113,6 +114,7 @@ async fn run_registration_supervisor(
 #[derive(Default)]
 pub struct InferenceServerRegistrationClient {
     running: Option<OwnedTask>,
+    drain_timeout: Duration,
 }
 
 impl InferenceServerRegistrationClient {
@@ -122,7 +124,7 @@ impl InferenceServerRegistrationClient {
 
     pub async fn shutdown(&mut self) {
         if let Some(running) = self.running.take() {
-            running.shutdown(REGISTRATION_DRAIN_TIMEOUT).await;
+            running.shutdown(self.drain_timeout).await;
         }
     }
 
@@ -137,7 +139,8 @@ impl InferenceServerRegistrationClient {
 
     pub fn start(&mut self, config: InferenceServerRegistrationConfig) -> Result<(), ClientError> {
         self.stop();
-        let config = config.try_into()?;
+        let config: RegistrationSessionConfig = config.try_into()?;
+        self.drain_timeout = config.shutdown_drain_timeout;
         self.running = Some(OwnedTask::spawn("registration session", move |stop| {
             run_registration_session(config, stop)
         }));
@@ -181,6 +184,7 @@ mod tests {
         let (running, dropped) = spawn_pending_owned_task().await;
         let client = InferenceServerRegistrationClient {
             running: Some(running),
+            ..Default::default()
         };
 
         // Dropping the client must tear down its one physical session root.

@@ -564,6 +564,7 @@ fn registration_config_from_plan(
         tunnel_protocol: args.tunnel_protocol,
         forwarding,
         auth_token_provider: plan.auth_token_provider.clone(),
+        shutdown_drain_timeout: Duration::from_millis(args.pylon_shutdown_drain_timeout_ms),
     }
 }
 
@@ -1416,6 +1417,10 @@ mod tests {
         assert_eq!(config.inference_server_url, "quic://127.0.0.1:4567");
         assert_eq!(config.min_update_interval, Duration::from_millis(250));
         assert!(!config.reverse_tunnel);
+        assert_eq!(
+            config.shutdown_drain_timeout,
+            pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+        );
     }
 
     #[test]
@@ -1451,6 +1456,8 @@ mod tests {
             "789",
             "--auth-token",
             "token-from-cli",
+            "--pylon-shutdown-drain-timeout-ms",
+            "55000",
         ]);
         let forwarding = test_forwarding(&plan);
         let metrics = forwarding.metrics.clone().unwrap();
@@ -1480,6 +1487,7 @@ mod tests {
         );
         assert!(config.quic_insecure);
         assert_eq!(config.tunnel_protocol, TunnelTransportProtocol::Http3);
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(55));
         assert!(Arc::ptr_eq(
             config.forwarding.metrics.as_ref().unwrap(),
             &metrics

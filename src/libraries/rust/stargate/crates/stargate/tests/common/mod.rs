@@ -1403,6 +1403,7 @@ fn test_registration_config(
         quic_insecure: true,
         tunnel_protocol: Default::default(),
         auth_token_provider: None,
+        shutdown_drain_timeout: pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     }
 }
 

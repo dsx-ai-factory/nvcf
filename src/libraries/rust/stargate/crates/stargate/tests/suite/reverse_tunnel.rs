@@ -84,14 +84,32 @@ impl ReverseStargate {
         backend_addr: SocketAddr,
         model: &str,
     ) -> InferenceServerRegistrationClient {
+        self.register_backend_with_drain_timeout(
+            inference_server_id,
+            backend_addr,
+            model,
+            pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+        )
+    }
+
+    fn register_backend_with_drain_timeout(
+        &self,
+        inference_server_id: &str,
+        backend_addr: SocketAddr,
+        model: &str,
+        shutdown_drain_timeout: Duration,
+    ) -> InferenceServerRegistrationClient {
         let mut client = InferenceServerRegistrationClient::default();
         client
-            .start(reverse_backend_registration(
-                self.grpc_addr,
-                inference_server_id,
-                backend_addr,
-                model,
-            ))
+            .start(InferenceServerRegistrationConfig {
+                shutdown_drain_timeout,
+                ..reverse_backend_registration(
+                    self.grpc_addr,
+                    inference_server_id,
+                    backend_addr,
+                    model,
+                )
+            })
             .unwrap_or_else(|error| {
                 panic!("failed to register reverse backend {inference_server_id}: {error}")
             });
@@ -878,42 +896,87 @@ async fn reverse_backend_shutdown_under_load_fails_no_requests() {
     Arc::into_inner(stargate).unwrap().shutdown().await;
 }
 
-/// Regression: Pylon aborted in-flight requests 5 s into shutdown.
+/// Regression: Pylon aborted in-flight requests 5 s into shutdown. Shutdown now
+/// waits for them until the configured drain timeout, counted from its start.
 #[tokio::test]
-async fn reverse_backend_shutdown_lets_long_in_flight_request_finish() {
-    let stargate = Arc::new(ReverseStargate::start("test-sg-rt-drain-inflight").await);
-    let mut backend = start_held_backend("rt-drain-inflight-model").await;
-    let mut reg = stargate.register_backend(
-        "rt-drain-inflight-inst",
-        backend.addr,
-        "rt-drain-inflight-model",
-    );
-    stargate.wait_for_routing("rt-drain-inflight-model").await;
-    backend.hold.store(true, Ordering::SeqCst);
+async fn reverse_backend_shutdown_drains_in_flight_request_until_drain_timeout() {
+    struct Case {
+        name: &'static str,
+        drain_timeout: Duration,
+        release_after: Duration,
+        waits_for_request: bool,
+    }
+    let cases = [
+        // Longer than the 5 s task shutdown timeout that used to cut the request.
+        Case {
+            name: "default drain timeout",
+            drain_timeout: pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+            release_after: Duration::from_secs(6),
+            waits_for_request: true,
+        },
+        Case {
+            name: "drain timeout shorter than the request",
+            drain_timeout: Duration::from_secs(1),
+            release_after: Duration::from_secs(3),
+            waits_for_request: false,
+        },
+    ];
 
-    let request = tokio::spawn({
-        let stargate = stargate.clone();
-        async move {
-            let resp = stargate
-                .post_streaming_chat("rt-drain-inflight-model", "req-rt-drain-inflight")
-                .await;
-            (resp.status(), resp.text().await)
+    for case in cases {
+        let name = case.name;
+        let stargate = Arc::new(ReverseStargate::start("test-sg-rt-drain-inflight").await);
+        let mut backend = start_held_backend("rt-drain-inflight-model").await;
+        let mut reg = stargate.register_backend_with_drain_timeout(
+            "rt-drain-inflight-inst",
+            backend.addr,
+            "rt-drain-inflight-model",
+            case.drain_timeout,
+        );
+        stargate.wait_for_routing("rt-drain-inflight-model").await;
+        backend.hold.store(true, Ordering::SeqCst);
+
+        let request = tokio::spawn({
+            let stargate = stargate.clone();
+            async move {
+                let resp = stargate
+                    .post_streaming_chat("rt-drain-inflight-model", "req-rt-drain-inflight")
+                    .await;
+                (resp.status(), resp.text().await)
+            }
+        });
+        backend
+            .entered
+            .recv()
+            .await
+            .expect("backend should receive the request");
+        let shutdown = tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            reg.shutdown().await;
+            started.elapsed()
+        });
+        tokio::time::sleep(case.release_after).await;
+        backend.release.notify_one();
+
+        let (status, body) = request.await.unwrap();
+        let shutdown_took = shutdown.await.unwrap();
+        if case.waits_for_request {
+            assert!(
+                shutdown_took >= case.release_after,
+                "{name}: shutdown took {shutdown_took:?}"
+            );
+            assert_eq!(status, StatusCode::OK, "{name}");
+            let body = body.expect("in-flight response body should complete");
+            assert_sse_done(
+                &parse_sse_events(&body).expect("in-flight response should be valid SSE"),
+            );
+        } else {
+            // The process exit that follows shutdown cuts the request; this
+            // harness keeps running, so only the shutdown time is checked.
+            assert!(
+                shutdown_took < case.drain_timeout + Duration::from_secs(1),
+                "{name}: shutdown took {shutdown_took:?}"
+            );
         }
-    });
-    backend
-        .entered
-        .recv()
-        .await
-        .expect("backend should receive the request");
-    let shutdown = tokio::spawn(async move { reg.shutdown().await });
-    // Hold the request past the 5 s task shutdown timeout.
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    backend.release.notify_one();
-
-    let (status, body) = request.await.unwrap();
-    shutdown.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
-    let body = body.expect("in-flight response body should complete");
-    assert_sse_done(&parse_sse_events(&body).expect("in-flight response should be valid SSE"));
-    Arc::into_inner(stargate).unwrap().shutdown().await;
+        Arc::into_inner(stargate).unwrap().shutdown().await;
+    }
 }
