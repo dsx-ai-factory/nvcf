@@ -229,7 +229,9 @@ sets after it marks the pod restored, so the start is counted `criu`, not
 - Events on the nodes: `NvsnapGPUFault`, naming a GPU that failed the probe,
   the step and the CUDA error. nvsnap does not cordon the node.
 - A capture's group record (`nvsnap-criu-group-<key>` ConfigMap) keeps its
-  last 10 restores under `restores`, newest last, as `RFC3339=seconds`.
+  last 10 restores under `restores`, newest last, as
+  `RFC3339=seconds=<UID of the restore's rank 0 pod>` (an older agent
+  wrote `RFC3339=seconds`).
   Restores that failed on faulty GPUs are counted under `gpuFaults`, the
   last one's GPUs under `lastGPUFault`; they do not count toward the
   failures that give a capture up (`restoreFailures`).

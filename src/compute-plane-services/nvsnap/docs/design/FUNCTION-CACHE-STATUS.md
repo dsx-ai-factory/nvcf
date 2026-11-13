@@ -183,6 +183,9 @@ them; nothing new is written on the admission, capture or restore path.
      Ready less the first rank's PodScheduled;
    - **every rank is deleted before that** (it failed and was replaced, or
      was scaled down), or its pods are all gone: the outcome is `gone`;
+   - **its pods are all gone**: `endedAt` is when the last went. A pod of
+     the instance created after that starts a restore of its own, however
+     soon it follows;
    - **a rank's restore failed and it started cold in place**: the outcome
      is `cold-started`, with no times;
    - **a restored instance of more than one rank is deleted**: once every
@@ -195,13 +198,18 @@ them; nothing new is written on the admission, capture or restore path.
 3. **The server merges into the object.** On each pass it reads the
    object's current `history` and adds the entries it finished. Each entry
    is the same restore as one kept of the same namespace, key and instance
-   dated within two minutes of it, so a server restart that no longer sees
-   a restore's first pod does not add it again. Once 50 are kept, a
-   restore older than the oldest is not added. The record's restore time
-   (`restoreSeconds`: of the record's stamps, the one closest to the last
-   rank's restore, within two minutes; every instance of a configuration
-   shares the record) and the bundle that took the capture
-   (`capturedBy`) are copied from the record. A restore is forgotten once
+   dated within two minutes of it, unless either began at or after the
+   other's `endedAt`, so a server restart that no longer sees a restore's
+   first pod does not add it again, and a replacement is not taken for the
+   restore it followed. Once 50 are kept, a restore older than the oldest
+   is not added. The record's restore time (`restoreSeconds`) and the
+   bundle that took the capture (`capturedBy`) are copied from the record.
+   Every instance of a configuration shares the record, so the agent
+   stamps each restore with the UID of its rank 0's pod, and the entry
+   takes the stamp that names its own. A stamp from an older agent names
+   no pod; it is taken only when it is the one stamp within two minutes of
+   the last rank's restore, and otherwise the entry has no
+   `restoreSeconds`. A restore is forgotten once
    its pods are gone and its object has been written with it; nothing is
    merged before the watch has listed the pods.
    History survives a recapture, because the object is per version. It is
@@ -213,7 +221,7 @@ them; nothing new is written on the admission, capture or restore path.
    nvsnapfunctions` gains `RESTORES`, `GONE`, `P50-SCALEUP-S` and
    `P50-TEARDOWN-S` (and `KILLED` with `-o wide`).
 
-An entry, about 150 bytes, so about 8 KB per object:
+An entry:
 
 ```yaml
 - at: "2026-11-12T17:54:00Z"   # its first pod's creation
@@ -223,6 +231,7 @@ An entry, about 150 bytes, so about 8 KB per object:
   ranks: 4
   outcome: restored        # restoring, restored, gone, cold-started
   restoredAt: "2026-11-12T17:57:29Z"
+  endedAt: "2026-11-12T19:02:11Z"   # once its pods are all gone
   restoreSeconds: 144
   scaleUpSeconds: 168
   teardownSeconds: 105     # once the instance is deleted
@@ -278,7 +287,13 @@ An entry, about 150 bytes, so about 8 KB per object:
   record, rewritten on a change and not otherwise, and deleted with the
   last record; others' objects are kept; a failed list deletes nothing;
   only the records' namespace and nvsnap's records are read; a status
-  read back (int64) equals the one written (float64).
+  read back (int64) equals the one written (float64). History: a
+  replacement that follows its restore within the match window is a
+  restore of its own (`TestRestoreHistoryReplacementWithinTheWindow`);
+  each restore takes the record stamp naming its rank 0 pod, and an
+  unnamed stamp only when it is the one near (`TestRecordRestoreSeconds`);
+  without the CRD the restores followed still age out
+  (`TestFunctionStatus_RestoresAgeOutWithoutTheCRD`).
 - Cluster: the CRD and the view role pass a server-side dry run. After
   install, a capture shows `capturing`, `verifying`, `complete` in turn,
   and a user bound only to `view` can list the objects.

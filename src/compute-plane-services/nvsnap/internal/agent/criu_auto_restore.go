@@ -291,7 +291,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		took, now := time.Since(t0), time.Now()
 		record(func(d map[string]string) bool {
 			changed := recordRestored(d, id, string(uid)+"/"+container)
-			return recordRestoreHistory(d, id, now, took) || changed
+			return recordRestoreHistory(d, id, now, took, uid) || changed
 		})
 		return
 	}

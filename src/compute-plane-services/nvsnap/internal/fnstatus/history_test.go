@@ -90,16 +90,32 @@ func TestHistoryKeepsTheNewestAndCountsAll(t *testing.T) {
 
 func TestRecordRestoreSeconds(t *testing.T) {
 	restored := time.Date(2026, 11, 12, 17, 57, 25, 0, time.UTC)
-	// Another instance's restore ended at 17:55 and one at 17:58: the
-	// closest stamp is this restore's.
-	d := map[string]string{"restores": "2026-11-12T17:55:00Z=40.0 2026-11-12T17:57:29Z=144.5 2026-11-12T17:58:30Z=99.0"}
-	if got := RecordRestoreSeconds(d, restored, 2*time.Minute); got != 144.5 {
-		t.Fatalf("got %v, want the stamp closest to its last rank's restore (144.5)", got)
+	// Three instances' restores ended within a minute: each restore's time
+	// is its own stamp's, by its rank 0's pod, whichever is nearest.
+	d := map[string]string{"restores": "2026-11-12T17:57:20Z=40.0=uid-a 2026-11-12T17:57:29Z=144.5=uid-b 2026-11-12T17:57:25Z=99.0=uid-c"}
+	for leader, want := range map[string]float64{"uid-a": 40, "uid-b": 144.5, "uid-c": 99, "uid-d": 0, "": 0} {
+		if got := RecordRestoreSeconds(d, leader, restored, 2*time.Minute); got != want {
+			t.Errorf("leader %q: got %v, want %v", leader, got, want)
+		}
 	}
-	if got := RecordRestoreSeconds(d, restored.Add(time.Hour), 2*time.Minute); got != 0 {
+	// Stamps that name no restore (an older agent): one within the
+	// tolerance is this restore's; two could be either's, so none.
+	one := map[string]string{"restores": "2026-11-12T17:50:00Z=40.0 2026-11-12T17:57:29Z=144.5"}
+	if got := RecordRestoreSeconds(one, "uid-b", restored, 2*time.Minute); got != 144.5 {
+		t.Fatalf("got %v, want the one unnamed stamp within the tolerance (144.5)", got)
+	}
+	two := map[string]string{"restores": "2026-11-12T17:57:20Z=40.0 2026-11-12T17:57:29Z=144.5"}
+	if got := RecordRestoreSeconds(two, "uid-b", restored, 2*time.Minute); got != 0 {
+		t.Fatalf("got %v, want none from two unnamed stamps within the tolerance", got)
+	}
+	mixed := map[string]string{"restores": "2026-11-12T17:57:20Z=40.0=uid-a 2026-11-12T17:57:29Z=144.5"}
+	if got := RecordRestoreSeconds(mixed, "uid-b", restored, 2*time.Minute); got != 0 {
+		t.Fatalf("got %v, want none: another restore's stamp is as near", got)
+	}
+	if got := RecordRestoreSeconds(one, "uid-b", restored.Add(time.Hour), 2*time.Minute); got != 0 {
 		t.Fatalf("got %v, want none within the tolerance", got)
 	}
-	if got := RecordRestoreSeconds(map[string]string{"restores": "junk 2026-11-12T17:57:29Z=x"}, restored, time.Hour); got != 0 {
+	if got := RecordRestoreSeconds(map[string]string{"restores": "junk 2026-11-12T17:57:29Z=x"}, "", restored, time.Hour); got != 0 {
 		t.Fatalf("got %v from junk", got)
 	}
 }

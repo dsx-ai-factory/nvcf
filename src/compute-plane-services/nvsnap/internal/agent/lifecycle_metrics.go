@@ -283,21 +283,27 @@ func (c *criuAutoRestorer) observeRestore(key string, pod *corev1.Pod, gpu strin
 }
 
 // groupRestoresKey keeps a capture's last restores in its group record,
-// newest last, as "RFC3339=seconds" separated by spaces: kubectl alone
-// shows how its recent restores went.
+// newest last, as "RFC3339=seconds=leader" separated by spaces, leader the
+// UID of the restore's rank 0's pod (fnstatus.RecordStamps): kubectl alone
+// shows how its recent restores went, and the server tells the instances'
+// restores apart.
 const (
 	groupRestoresKey = "restores"
 	groupRestoresMax = 10
 )
 
 // recordRestoreHistory adds a restore of checkpoint id at at, which took
-// took, to group record data d when id is of its capture.
-func recordRestoreHistory(d map[string]string, id string, at time.Time, took time.Duration) bool {
+// took, its rank 0's pod leader, to group record data d when id is of its
+// capture.
+func recordRestoreHistory(d map[string]string, id string, at time.Time, took time.Duration, leader types.UID) bool {
 	if !recordOf(d, id) {
 		return false
 	}
-	entries := append(strings.Fields(d[groupRestoresKey]),
-		at.UTC().Format(time.RFC3339)+"="+strconv.FormatFloat(took.Seconds(), 'f', 1, 64))
+	stamp := at.UTC().Format(time.RFC3339) + "=" + strconv.FormatFloat(took.Seconds(), 'f', 1, 64)
+	if leader != "" {
+		stamp += "=" + string(leader)
+	}
+	entries := append(strings.Fields(d[groupRestoresKey]), stamp)
 	if len(entries) > groupRestoresMax {
 		entries = entries[len(entries)-groupRestoresMax:]
 	}

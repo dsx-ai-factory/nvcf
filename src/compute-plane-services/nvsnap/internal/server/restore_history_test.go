@@ -260,7 +260,7 @@ func TestRestoreTrackerTellsRestoresApart(t *testing.T) {
 func historyRecord() *corev1.ConfigMap {
 	return fsRecord("nvsnap-criu-group-k", fsVersion, map[string]string{"state": "complete", "size": "3",
 		"checkpoint.0": "c0", "checkpoint.1": "c1", "checkpoint.2": "c2", "companion.2": "true",
-		"restores": "2026-11-12T17:56:20Z=40.0 2026-11-12T17:56:30Z=144.5", "agentBundle": "v0.2.91-rc9"})
+		"restores": "2026-11-12T17:56:30Z=40.0=another-instance 2026-11-12T17:56:20Z=144.5=sr-1-0-r0-175400", "agentBundle": "v0.2.91-rc9"})
 }
 
 // The objects keep the history: merged in on each pass, carried across
@@ -284,7 +284,8 @@ func TestFunctionStatus_History(t *testing.T) {
 		t.Fatalf("history %+v", h)
 	}
 	e := h.Entries[0]
-	// The record's two stamps: 144.5 is the one closest to the last rank's restore.
+	// The record's two stamps: 144.5 names this restore's rank 0 pod; the
+	// other instance's is nearer its last rank's restore.
 	if e.Outcome != fnstatus.RestoreRestored || e.Ranks != 2 || e.ScaleUpSeconds != 168 || e.RestoreSeconds != 144.5 || e.CapturedBy != "v0.2.91-rc9" {
 		t.Fatalf("entry %+v", e)
 	}
@@ -340,7 +341,8 @@ func TestFunctionStatus_HistoryKeptUntilWritten(t *testing.T) {
 	f, _, dc := functionStatus(historyRecord())
 	f.Restores = newRestoreTracker()
 	f.Restores.synced = func() bool { return true }
-	if err := f.reconcileOnce(ctx); err != nil { // the object, no history yet
+	f.Now = func() time.Time { return histT0.Add(2 * time.Hour) } // the restores' times, not the wall clock
+	if err := f.reconcileOnce(ctx); err != nil {                  // the object, no history yet
 		t.Fatal(err)
 	}
 	r0 := up(rankPod(0, "sr-1", "k", "0", histT0), histT0, histT0.Add(time.Minute))
@@ -371,5 +373,68 @@ func TestFunctionStatus_HistoryKeptUntilWritten(t *testing.T) {
 	}
 	if got, _ := entries(t, f.Restores, 2); len(got) != 0 {
 		t.Fatalf("a written restore is still followed: %v", got)
+	}
+}
+
+// With the NvsnapFunction CRD missing (a steady state), no object is
+// written, but the restores followed still age out.
+func TestFunctionStatus_RestoresAgeOutWithoutTheCRD(t *testing.T) {
+	ctx := context.Background()
+	f, _, dc := functionStatus(historyRecord())
+	f.Restores = newRestoreTracker()
+	f.Restores.synced = func() bool { return true }
+	now := histT0
+	f.Now = func() time.Time { return now }
+	dc.PrependReactor("list", "nvsnapfunctions", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: "nvsnap.io", Resource: "nvsnapfunctions"}, "")
+	})
+	f.Restores.observePod(up(rankPod(0, "sr-1", "k", "0", histT0), histT0, histT0.Add(time.Minute)), false, false, histT0)
+	if err := f.reconcileOnce(ctx); !apierrors.IsNotFound(err) {
+		t.Fatalf("err %v, want not found", err)
+	}
+	if got, _ := entries(t, f.Restores, 2); len(got) != 1 {
+		t.Fatalf("a restore heard of just now was dropped (%d followed)", len(got))
+	}
+	now = histT0.Add(restoreForget + time.Minute)
+	if err := f.reconcileOnce(ctx); !apierrors.IsNotFound(err) {
+		t.Fatalf("err %v, want not found", err)
+	}
+	f.Restores.mu.Lock()
+	n, m := len(f.Restores.batches), len(f.Restores.byPod)
+	f.Restores.mu.Unlock()
+	if n != 0 || m != 0 {
+		t.Fatalf("restores not heard of for %v are still followed without the CRD (%d batches, %d pods)", restoreForget, n, m)
+	}
+}
+
+// A restore whose pods all went (T+30 s) followed by its replacement
+// (first pod T+45 s), within the match window: two restores, each with its
+// own outcome, whichever pass first writes either.
+func TestRestoreHistoryReplacementWithinTheWindow(t *testing.T) {
+	for _, together := range []bool{false, true} {
+		tr := newRestoreTracker()
+		r0 := withCondition(rankPod(0, "ns", "k", "0", histT0), corev1.PodScheduled, histT0)
+		r1 := withCondition(rankPod(1, "ns", "k", "0", histT0), corev1.PodScheduled, histT0)
+		tr.observePod(r0, false, false, histT0)
+		tr.observePod(r1, false, false, histT0)
+		tr.observePod(r0, true, false, histT0.Add(30*time.Second))
+		tr.observePod(r1, true, false, histT0.Add(30*time.Second))
+		var h fnstatus.History
+		if !together {
+			first, over := entries(t, tr, 2)
+			h = h.Merge(first)
+			tr.forget(over, histT0.Add(31*time.Second))
+		}
+		n0 := up(rankPod(0, "ns", "k", "0", histT0.Add(45*time.Second)), histT0.Add(46*time.Second), histT0.Add(3*time.Minute))
+		n1 := up(rankPod(1, "ns", "k", "0", histT0.Add(45*time.Second)), histT0.Add(46*time.Second), histT0.Add(3*time.Minute))
+		n0.UID, n1.UID = "n0", "n1"
+		tr.observePod(n0, false, false, histT0.Add(3*time.Minute))
+		tr.observePod(n1, false, false, histT0.Add(3*time.Minute))
+		got, _ := entries(t, tr, 2)
+		h = h.Merge(got)
+		if h.Restores != 2 || h.Gone != 1 || len(h.Entries) != 2 ||
+			h.Entries[0].Outcome != fnstatus.RestoreGone || h.Entries[1].Outcome != fnstatus.RestoreRestored {
+			t.Fatalf("together=%v: %+v, want the gone restore and its restored replacement", together, h)
+		}
 	}
 }

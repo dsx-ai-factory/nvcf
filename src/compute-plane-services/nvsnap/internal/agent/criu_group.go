@@ -1297,7 +1297,7 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			// The pods this restore made: the restored-pod watch acts on a
 			// rank only when its group record names it.
 			changed := recordRestored(d, id, strings.Join(uids, ","))
-			return recordRestoreHistory(d, id, now, took) || changed
+			return recordRestoreHistory(d, id, now, took, ranks[0].UID) || changed
 		}); uerr != nil && !apierrors.IsNotFound(uerr) {
 			log.WithError(uerr).Warn("CRIU group restore: cannot record the restored pods; their engines are not watched")
 		}

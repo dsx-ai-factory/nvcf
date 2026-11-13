@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// HistoryMax bounds a function version's history: about 200 bytes each.
+// HistoryMax bounds a function version's history.
 const HistoryMax = 50
 
 // RestoreMatchWindow: the pods of one instance's restore are created
@@ -53,6 +53,9 @@ type Restore struct {
 	Outcome  string `json:"outcome"`
 	// RestoredAt is when its last rank was restored.
 	RestoredAt string `json:"restoredAt,omitempty"`
+	// EndedAt is when its last pod went: a restore of the instance first
+	// seen at or after it is another one, however soon it followed.
+	EndedAt string `json:"endedAt,omitempty"`
 	// RestoreSeconds is the record's time for the restore (placeholders
 	// running to every rank restored), when it kept one.
 	RestoreSeconds float64 `json:"restoreSeconds,omitempty"`
@@ -64,12 +67,20 @@ type Restore struct {
 	Teardown        string  `json:"teardown,omitempty"`
 	// CapturedBy is the agent bundle that took the capture restored.
 	CapturedBy string `json:"capturedBy,omitempty"`
+	// Leader is the UID of its rank 0's pod: what names the restore in
+	// the record's stamps. Not kept.
+	Leader string `json:"-"`
 }
 
 // same reports whether r and u are one restore: one instance of one
-// configuration in one namespace, first seen within RestoreMatchWindow.
+// configuration in one namespace, first seen within RestoreMatchWindow,
+// and neither first seen once the other had ended (a replacement that
+// followed within the window is a restore of its own).
 func (r Restore) same(u Restore) bool {
 	if r.Namespace != u.Namespace || r.Key != u.Key || r.Instance != u.Instance {
+		return false
+	}
+	if startedAfterEnd(u.At, r.EndedAt) || startedAfterEnd(r.At, u.EndedAt) {
 		return false
 	}
 	a, err1 := time.Parse(time.RFC3339, r.At)
@@ -79,6 +90,17 @@ func (r Restore) same(u Restore) bool {
 	}
 	d := a.Sub(b)
 	return d <= RestoreMatchWindow && d >= -RestoreMatchWindow
+}
+
+// startedAfterEnd reports whether a restore first seen at at began once a
+// restore that ended at ended was over (both to the second).
+func startedAfterEnd(at, ended string) bool {
+	if ended == "" {
+		return false
+	}
+	a, err1 := time.Parse(time.RFC3339, at)
+	e, err2 := time.Parse(time.RFC3339, ended)
+	return err1 == nil && err2 == nil && !a.Before(e)
 }
 
 // History is the restore part of a status.
@@ -178,6 +200,9 @@ func update(prev, u Restore) Restore {
 	if prev.RestoredAt == "" {
 		prev.RestoredAt = u.RestoredAt
 	}
+	if prev.EndedAt == "" {
+		prev.EndedAt = u.EndedAt
+	}
 	return prev
 }
 
@@ -200,34 +225,67 @@ func median(rs []Restore, f func(Restore) float64) float64 {
 	return float64(int64(m*10+0.5)) / 10
 }
 
-// RecordRestoreSeconds is the time record data d keeps for the restore
-// that ended closest to restored, its last rank's restore, and within
-// tolerance of it (the record's restores are "RFC3339=seconds", stamped
-// when a restore ends; all instances of a configuration share the
-// record); 0 for none.
-func RecordRestoreSeconds(d map[string]string, restored time.Time, tolerance time.Duration) float64 {
-	best, bestOff := 0.0, tolerance+1
+// RecordStamp is one of a record's restores: "RFC3339=seconds=leader",
+// stamped when the restore ends, leader the UID of its rank 0's pod (an
+// agent before the leader was stamped wrote "RFC3339=seconds").
+type RecordStamp struct {
+	At      time.Time
+	Seconds float64
+	Leader  string
+}
+
+// RecordStamps are the restores record data d keeps, oldest first;
+// malformed ones are skipped.
+func RecordStamps(d map[string]string) []RecordStamp {
+	var out []RecordStamp
 	for _, e := range strings.Fields(d["restores"]) {
-		ts, secs, ok := strings.Cut(e, "=")
-		if !ok {
+		parts := strings.SplitN(e, "=", 3)
+		if len(parts) < 2 {
 			continue
 		}
-		t, err := time.Parse(time.RFC3339, ts)
-		if err != nil {
+		t, err1 := time.Parse(time.RFC3339, parts[0])
+		v, err2 := strconv.ParseFloat(parts[1], 64)
+		if err1 != nil || err2 != nil {
 			continue
 		}
-		off := t.Sub(restored)
+		s := RecordStamp{At: t, Seconds: v}
+		if len(parts) == 3 {
+			s.Leader = parts[2]
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// RecordRestoreSeconds is the time record data d keeps for the restore
+// whose rank 0's pod is leader (all instances of a configuration share
+// the record); 0 for none. A stamp that names no leader is taken only
+// when it is the one stamp within tolerance of restored, the restore's
+// last rank's restore: with two, the time could be another instance's.
+func RecordRestoreSeconds(d map[string]string, leader string, restored time.Time, tolerance time.Duration) float64 {
+	unnamed, near := 0.0, 0
+	for _, s := range RecordStamps(d) {
+		if s.Leader != "" {
+			if leader != "" && s.Leader == leader {
+				return s.Seconds
+			}
+		}
+		off := s.At.Sub(restored)
 		if off < 0 {
 			off = -off
 		}
-		if off > tolerance || off >= bestOff {
+		if off > tolerance {
 			continue
 		}
-		if v, err := strconv.ParseFloat(secs, 64); err == nil {
-			best, bestOff = v, off
+		near++
+		if s.Leader == "" {
+			unnamed = s.Seconds
 		}
 	}
-	return best
+	if near == 1 {
+		return unnamed
+	}
+	return 0
 }
 
 // GPURanks is the number of GPU ranks of record data d: its members less

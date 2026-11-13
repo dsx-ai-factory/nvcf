@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -225,9 +226,10 @@ func configuration(key string, d, c map[string]string) Configuration {
 	}
 	if h := strings.Fields(d["restores"]); len(h) > 0 {
 		cfg.Restores = len(h)
-		at, secs, _ := strings.Cut(h[len(h)-1], "=")
-		cfg.LastRestoreAt = at
-		cfg.LastRestoreSeconds, _ = strconv.ParseFloat(secs, 64)
+		if s := RecordStamps(map[string]string{"restores": h[len(h)-1]}); len(s) == 1 {
+			cfg.LastRestoreAt = s[0].At.UTC().Format(time.RFC3339)
+			cfg.LastRestoreSeconds = s[0].Seconds
+		}
 	}
 	if c != nil {
 		cfg.Cachedir = cachedirRanks(c, cfg.Ranks)

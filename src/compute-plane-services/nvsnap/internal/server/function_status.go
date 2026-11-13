@@ -49,6 +49,15 @@ type FunctionStatus struct {
 	// Restores follows the restores' pods for each version's history
 	// (restore_history.go); nil keeps none.
 	Restores *restoreTracker
+	// Now is the clock the restores are aged by; nil is time.Now.
+	Now func() time.Time
+}
+
+func (f *FunctionStatus) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
 }
 
 // Run keeps the objects every Interval until ctx is cancelled.
@@ -89,7 +98,10 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 	records, err := f.KubeClient.CoreV1().ConfigMaps(f.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=nvsnap"})
 	if err != nil {
 		// Never delete on a list that failed: an empty view is a claim
-		// that nothing is cached.
+		// that nothing is cached. The restores followed still age out.
+		if f.Restores != nil {
+			f.Restores.forget(nil, f.now())
+		}
 		return err
 	}
 	want := fnstatus.Project(records.Items)
@@ -101,6 +113,12 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 	objs := f.DynClient.Resource(functionGVR)
 	have, err := objs.List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=" + functionManagedBy})
 	if err != nil {
+		// No object is written (the CRD may not be installed, a steady
+		// state): the restores followed are still aged out, or they would
+		// grow with every labelled pod until the server restarts.
+		if f.Restores != nil {
+			f.Restores.forget(nil, f.now())
+		}
 		return err
 	}
 	existing := make(map[string]*unstructured.Unstructured, len(have.Items))
@@ -168,14 +186,14 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 				done = append(done, ids...)
 			}
 		}
-		f.Restores.forget(done, time.Now())
+		f.Restores.forget(done, f.now())
 	}
 	return firstErr
 }
 
-// restoreTimeTolerance bounds how far the record's stamp of a restore may
-// be from its last rank's restore: the agent stamps it when the restore
-// ends.
+// restoreTimeTolerance bounds how far a record's stamp that names no
+// restore may be from the restore's last rank's restore: the agent stamps
+// it when the restore ends.
 const restoreTimeTolerance = 2 * time.Minute
 
 // restoresByObject is the restores followed, by the object of their
@@ -210,7 +228,7 @@ func (f *FunctionStatus) restoresByObject(records []corev1.ConfigMap) (map[strin
 		}
 		for _, e := range rs {
 			if at, err := time.Parse(time.RFC3339, e.RestoredAt); err == nil {
-				e.RestoreSeconds = fnstatus.RecordRestoreSeconds(r.data, at, restoreTimeTolerance)
+				e.RestoreSeconds = fnstatus.RecordRestoreSeconds(r.data, e.Leader, at, restoreTimeTolerance)
 			}
 			e.CapturedBy = r.data["agentBundle"]
 			out[r.object] = append(out[r.object], e)

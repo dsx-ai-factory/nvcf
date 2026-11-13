@@ -212,6 +212,27 @@ func TestDriveTeardownRecordsItsOutcome(t *testing.T) {
 			outcome(metrics.TeardownReleased)-released, outcome(metrics.TeardownDeadline)-deadline)
 	}
 
+	// The work dir goes (the kubelet killed the pod) while the peers are
+	// listed: the hold went with it, unlifted, so a deadline, not released.
+	self = terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
+	self.UID = "dir-gone-0"
+	peer = exitedRank(terminating(restoredRank(1, 2), time.Now().Add(time.Minute)))
+	c = &criuAutoRestorer{a: &Agent{kubeClient: fake.NewSimpleClientset(self, peer), log: logrus.New()}}
+	dir = arm(self, true)
+	liftHold = func(d string) error {
+		if err := os.RemoveAll(d); err != nil {
+			t.Fatal(err)
+		}
+		return liftTeardownHold(d)
+	}
+	c.driveTeardown(t.Context(), self, logrus.NewEntry(quietLog()))
+	liftHold = liftTeardownHold
+	if outcome(metrics.TeardownReleased)-released != 2 || outcome(metrics.TeardownDeadline)-deadline != 3 {
+		t.Fatalf("a hold gone with its work dir: released +%v (want +2), deadline +%v (want +3)",
+			outcome(metrics.TeardownReleased)-released, outcome(metrics.TeardownDeadline)-deadline)
+	}
+	deadline++
+
 	// The agent stopping is neither.
 	self = terminating(restoredRank(0, 2), time.Now().Add(time.Minute))
 	self.UID = "stopped-0"

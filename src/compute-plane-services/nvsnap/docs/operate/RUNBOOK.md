@@ -51,7 +51,7 @@ Everything below takes `kubectl` alone.
 
 3. **The capture record.** Its state, the agent release that captured it,
    its members and nodes, its last 10 restores (`restores`, as
-   `RFC3339=seconds`), and why it failed (`reason`):
+   `RFC3339=seconds=<rank 0 pod UID>`), and why it failed (`reason`):
 
    ```bash
    kubectl -n nvsnap-system get cm nvsnap-criu-group-<key> -o yaml

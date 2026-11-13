@@ -70,6 +70,7 @@ where the files column says.
 | `nvsnap.io/deadline` | `DeadlineAnnotation` (internal/election/election.go) | Is the RFC3339 time after which the reconciler treats the leader as failed even if its pod is still around. |
 | `nvsnap.io/demo-name` | `annDemoName` (internal/server/manifests.go) |  |
 | `nvsnap.io/desc` | `annDesc` (internal/server/manifests.go) |  |
+| `nvsnap.io/driver-major` | `DriverMajorAnnotation` (internal/agent/driver_gate.go) | Is the NVIDIA driver major of the agent's node, on the agent's own pod. |
 | `nvsnap.io/election-id` | `ElectionIDAnnotation` (internal/election/election.go) | On the leader pod is the id the webhook minted at admission and used as the Lease holder. |
 | `nvsnap.io/fallback-capture` | `FallbackCaptureAnnotation` (internal/webhook/criu_fallback.go) | Names the cachedir capture a fallback pod is seeded from; the agent on its node fetches it. |
 | `nvsnap.io/fallback-reason` | `FallbackReasonAnnotation` (internal/webhook/criu_fallback.go) | Is the group record state that made the pod fall back; the agent captures the cachedir of a pod that carries it. |

@@ -136,7 +136,6 @@ func teardownExited(dir string) bool {
 	return err == nil
 }
 
-// liftTeardownHold removes the hold (a link is removed, not followed).
 // teardownGone reports whether the work dir itself is gone: the pod's
 // volumes were torn down.
 func teardownGone(dir string) bool {
@@ -144,12 +143,24 @@ func teardownGone(dir string) bool {
 	return errors.Is(err, fs.ErrNotExist)
 }
 
+// errTeardownDirGone: the hold was not lifted, the work dir went with it
+// (the kubelet killed the pod and removed its volumes).
+var errTeardownDirGone = errors.New("the rank's work volume is gone")
+
 // liftHold is liftTeardownHold; a test makes it fail.
 var liftHold = liftTeardownHold
 
+// liftTeardownHold removes the hold (a link is removed, not followed). A
+// hold already gone with the work dir is errTeardownDirGone, not a lift.
 func liftTeardownHold(dir string) error {
-	if err := os.Remove(filepath.Join(dir, webhook.TeardownHoldFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	err := os.Remove(filepath.Join(dir, webhook.TeardownHoldFile))
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, fs.ErrNotExist):
 		return err
+	case teardownGone(dir):
+		return errTeardownDirGone
 	}
 	return nil
 }
@@ -242,7 +253,11 @@ func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, l
 		if exited && reported {
 			pods, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
 			if err == nil && teardownReleased(pod, pods.Items, true) {
-				if err := liftHold(dir); err != nil {
+				if err := liftHold(dir); errors.Is(err, errTeardownDirGone) {
+					// The pod was killed while the peers were listed: a
+					// deadline, which the deferred check records.
+					return
+				} else if err != nil {
 					// Tried again next tick: the pod is held at worst to its
 					// deadline, and only a hold still on then is a deadline.
 					if !liftFailed {

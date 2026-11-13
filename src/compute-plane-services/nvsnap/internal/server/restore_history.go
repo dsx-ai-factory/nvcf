@@ -273,6 +273,11 @@ func (b *restoreBatch) current() map[int]*restorePod {
 func (b *restoreBatch) entry(ranks int) fnstatus.Restore {
 	r := fnstatus.Restore{At: b.created.UTC().Format(time.RFC3339), Namespace: b.ns, Key: b.key, Instance: b.instance, Outcome: fnstatus.RestoreRestoring}
 	cur := b.current()
+	for uid, p := range b.pods {
+		if p.ordinal == 0 && p == cur[0] {
+			r.Leader = string(uid)
+		}
+	}
 	if ranks < len(cur) {
 		ranks = len(cur)
 	}
@@ -312,6 +317,9 @@ func (b *restoreBatch) entry(ranks int) fnstatus.Restore {
 	}
 	if !lastRestored.IsZero() {
 		r.RestoredAt = lastRestored.UTC().Format(time.RFC3339)
+	}
+	if b.over() {
+		r.EndedAt = b.lastGone().UTC().Format(time.RFC3339)
 	}
 	switch {
 	case cold:
