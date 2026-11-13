@@ -775,7 +775,9 @@ func (r *Reconciler) readerVolumeDriver(ctx context.Context, pv *corev1.Persiste
 
 // configuredMountOptionsFor returns the configured cache mount options that
 // apply to a reader PV on driver, logging when they are withheld.
-func (r *Reconciler) configuredMountOptionsFor(ctx context.Context, pv *corev1.PersistentVolume, driver string) []string {
+func (r *Reconciler) configuredMountOptionsFor(
+	ctx context.Context, pv *corev1.PersistentVolume, driver string,
+) []string {
 	configured := ConfiguredReaderMountOptions(driver, r.csiVolumeMountOptions)
 	if len(configured) == 0 && len(r.csiVolumeMountOptions) != 0 {
 		logf.FromContext(ctx).V(1).Info("Not applying configured cache mount options to a reader on another driver",
@@ -823,7 +825,9 @@ func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 // it is durable. ok is false when the request has no selection, the selection
 // is not durable, or it cannot be parsed; the caller then falls back to the
 // ConfigMap path so a bad annotation never strips the options a driver needs.
-func durableReaderSelection(ctx context.Context, st *nvcav1new.StorageRequest) (*PersistedModelCacheStorageSelection, bool) {
+func durableReaderSelection(
+	ctx context.Context, st *nvcav1new.StorageRequest,
+) (*PersistedModelCacheStorageSelection, bool) {
 	if st == nil {
 		return nil, false
 	}
