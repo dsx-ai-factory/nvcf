@@ -380,6 +380,12 @@ impl BringupError {
             _ => false,
         }
     }
+
+    /// Returns whether the upstream rejected the request as overloaded. 529 is
+    /// Dynamo's default status for a model whose workers are all busy.
+    pub(crate) fn is_overloaded(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if status.as_u16() == 529)
+    }
 }
 
 #[derive(Debug, Deserialize)]
