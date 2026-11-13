@@ -25,3 +25,13 @@ nvcfUi:
 
 The chart rejects other selectors. Custom migration images must support
 `NVCF_KUBECTL_MINOR` to use an explicit selector.
+
+For versioned OpenBao bridge and target-only installations, set
+`nvcfUi.openbaoMigrations.jwtPluginVersion` to `JWT_PLUGIN_TARGET_VERSION`
+from the qualified server image's `/openbao/jwt-plugin-versions.env`.
+The UI hook creates the optional NVCT JWT mount in a separate migration Job;
+it does not inherit the core Job's version manifest. Empty preserves legacy
+behavior. An explicit version pins newly created mounts without changing
+existing mount selections. Use the OpenBao JWT upgrade runbook to convert
+existing mounts and qualify removal. Pause this hook during bridge rollback
+and catalog cleanup.

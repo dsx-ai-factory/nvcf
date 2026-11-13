@@ -13,3 +13,8 @@ and unseals file-backed test servers inside that container. It preserves data
 across layout changes; it never manages host containers or cluster resources.
 The operator actions and assertions are in
 `tests/bdd/features/openbao-jwt-plugin-lifecycle.feature`.
+
+`runtime-raft.sh` prepares three disposable persistent voters for
+`tests/bdd/features/openbao-jwt-plugin-ha.feature`. It only starts, unseals
+and replaces checked standbys using normal failover. The feature owns version,
+voter, signing, rollback and target-only assertions.

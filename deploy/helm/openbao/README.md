@@ -32,11 +32,37 @@ The lifecycle driver can check and tune mounts independently of Helm hooks.
 The migration Job rechecks catalog readiness after rollout because the active
 member can change after preflight. Its init container also supplies the server
 image's version manifest to migrations.
+Target-only preflight rejects a rollback-window `BAO_JWT_PLUGIN_VERSION`
+override that differs from the image target, including Secret-backed values.
 
 Publish and qualify the matching bridge server and migrations images before
 advancing chart or stack image pins. Existing deployments need the staged
 [JWT plugin upgrade procedure](../../../docs/self-managed/runbooks/openbao-jwt-plugin-upgrade.md),
 including the explicit old version and a later cleanup release.
+
+Target-only cleanup uses `helm/scripts/jwt-plugin-cluster.sh`, included as
+`scripts/jwt-plugin-cluster.sh` in the chart package. It requires an explicit
+context, namespace, StatefulSet, platform image digest, maintenance-window ID
+and evidence file. `record-active` records a serving active only when a
+supplied JWT/consumer probe succeeds. Record before and after one normal
+failover; multi-member clusters need two distinct active records, not one
+record per voter. `check-cleanup` and `cleanup` recheck every member's image,
+health, Raft identity and the recorded inventory. Pod replacement,
+container restart or mount changes invalidate the evidence. The tool does not
+transfer leadership or replace pods. Its standard chart layout uses local
+HTTP on port 8200 and the Raft node ID in `/openbao/data/node-id` or the
+`BAO_RAFT_NODE_ID` environment variable.
+
+If the runtime reports a bare image config digest, also supply
+`--image-manifest FILE` with the raw platform manifest from release evidence.
+The tool verifies the file's SHA-256 against `--expected-image-digest` before
+using its config digest. An observed runtime ID alone is not a trusted image
+reference.
+
+HA deployments must use this cluster tool. The image's direct
+`jwt-plugin-lifecycle cleanup` command accepts only a positively verified
+non-HA server. Neither path provides a server-side mount lock; keep conflicting
+operators and automation paused throughout the maintenance window.
 
 ## Prerequisites
 

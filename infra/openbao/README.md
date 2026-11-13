@@ -19,8 +19,9 @@ built from the matching official distribution source. See
 
 Release-worthy changes under `infra/openbao` publish the `nvcf-openbao`
 image. GitHub source releases use tags in the `infra/openbao/vX.Y.Z` stream.
-Each release rebuilds both supported architectures from the source and
-dependency pins in this directory.
+Bridge releases build both supported architectures from the source and
+dependency pins in this directory. Target-only releases copy the selected
+bridge's server and target plugin bytes instead of rebuilding their identities.
 
 ## Plugin binaries
 
@@ -45,12 +46,20 @@ catalog digests are cluster-wide.
 Use [the JWT plugin upgrade procedure](../../docs/self-managed/runbooks/openbao-jwt-plugin-upgrade.md)
 for bridge rollout, version pinning, rollback, and later cleanup. The bridge
 keeps old binaries by default. A later qualified release can build with
-`--build-arg JWT_INCLUDE_LEGACY=false` after the metadata gate passes. Keep
-the target source and build inputs unchanged so its digest remains identical.
+`--build-arg JWT_INCLUDE_LEGACY=false` after the metadata gate passes. Supply
+`--build-arg JWT_TARGET_IMAGE=<qualified-bridge-image>@sha256:<digest>`.
+The target-only stage copies that image's server, version manifest and target
+plugin, then packages them on a clean runtime base. The old binaries remain
+only in intermediate build stages, not the final image layers. The manifest
+records `JWT_PLUGIN_BRIDGE_IMAGE` for upgrade-stop diagnostics.
 The bridge still includes the old Go 1.27.0 plugin for existing catalogs.
 Do not treat that bridge image as complete removal of vulnerable binaries.
 After all mounts use the target version, verify a target-only image with
 `EXPECT_TARGET_ONLY=true RUNTIME_IMAGE=<image> sh scripts/test-runtime-packages.sh`.
+The verifier compares the target plugin and server against the source bridge.
+Set `BRIDGE_IMAGE` explicitly when checking an older test image whose manifest
+does not record its bridge. Verify AMD64 and ARM64 separately. Packaging refuses
+an output directory that already contains a plugin layout.
 
 The image build compiles it in a Dockerfile build stage, so `docker build .`
 here produces the same image as the release pipeline:

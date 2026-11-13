@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 set -eu
 
+# shellcheck source=infra/openbao/jwt-plugin-versions.env
 . "${JWT_VERSIONS_FILE:-/versions.env}"
 output=${JWT_PACKAGE_OUTPUT:-/out}
 legacy=${JWT_LEGACY_BINARY:-/legacy/vault-plugin-secrets-jwt}
@@ -12,6 +13,10 @@ case ${JWT_INCLUDE_LEGACY:-true} in
     true|false) ;;
     *) echo 'JWT_INCLUDE_LEGACY must be true or false' >&2; exit 1 ;;
 esac
+if [ -e "$output/plugins" ] || [ -e "$output/plugin-config" ]; then
+    echo 'JWT package output must be fresh; refusing to retain an earlier layout' >&2
+    exit 1
+fi
 mkdir -p "$output/plugins" "$output/plugin-config"
 config="$output/plugin-config/jwt.hcl"
 printf 'plugin_directory = "/openbao/plugins"\nplugin_auto_register = true\n' > "$config"

@@ -41,11 +41,15 @@ if [ -n "${RUNTIME_IMAGE:-}" ]; then
     apk list --installed brotli-libs ca-certificates ca-certificates-bundle
     cat /etc/apk/repositories
     bao version
+    jwt-plugin-lifecycle image-check
   '
   DOCKER_DEFAULT_PLATFORM="linux/$arch" "$script_dir/verify-runtime-ca.sh" "$RUNTIME_IMAGE"
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT INT TERM
-  . "$openbao_dir/jwt-plugin-versions.env"
+  docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$RUNTIME_IMAGE" -ec \
+    'cat /openbao/jwt-plugin-versions.env' > "$work/jwt-plugin-versions.env"
+  # shellcheck source=infra/openbao/jwt-plugin-versions.env
+  . "$work/jwt-plugin-versions.env"
   docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$RUNTIME_IMAGE" -ec \
     'cat /usr/bin/bao' > "$work/bao-linux-$arch"
   docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$RUNTIME_IMAGE" -ec \
@@ -61,6 +65,20 @@ if [ -n "${RUNTIME_IMAGE:-}" ]; then
       test ! -e "/openbao/plugins/vault-plugin-secrets-jwt-$JWT_PLUGIN_OLD_VERSION"
       test -x "/openbao/plugins/vault-plugin-secrets-jwt-$JWT_PLUGIN_TARGET_VERSION"
     '
+    bridge=${BRIDGE_IMAGE:-${JWT_PLUGIN_BRIDGE_IMAGE:-}}
+    test -n "$bridge" || { echo 'target-only verification requires the source BRIDGE_IMAGE' >&2; exit 1; }
+    bridge_target=$(docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$bridge" -ec '
+      . /openbao/jwt-plugin-versions.env
+      sha256sum "/openbao/plugins/vault-plugin-secrets-jwt-$JWT_PLUGIN_TARGET_VERSION"
+    ')
+    target_hash=$(docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$RUNTIME_IMAGE" -ec '
+      . /openbao/jwt-plugin-versions.env
+      sha256sum "/openbao/plugins/vault-plugin-secrets-jwt-$JWT_PLUGIN_TARGET_VERSION"
+    ')
+    test "$bridge_target" = "$target_hash" || { echo 'bridge/target-only plugin identity drift' >&2; exit 1; }
+    bridge_server=$(docker run --rm --platform "linux/$arch" --entrypoint sha256sum "$bridge" /usr/bin/bao)
+    target_server=$(docker run --rm --platform "linux/$arch" --entrypoint sha256sum "$RUNTIME_IMAGE" /usr/bin/bao)
+    test "$bridge_server" = "$target_server" || { echo 'bridge/target-only server identity drift' >&2; exit 1; }
   fi
   if [ -n "${BASELINE_IMAGE:-}" ]; then
     baseline=$(docker run --rm --platform "linux/$arch" --entrypoint /bin/sh "$BASELINE_IMAGE" -ec \

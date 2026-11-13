@@ -6,18 +6,28 @@
 # deployments mount the manifest copied from their actual server image.
 jwt_plugin_version() {
     local version=${BAO_JWT_PLUGIN_VERSION:-}
-    if [[ -z $version && -n ${BAO_JWT_PLUGIN_VERSIONS_FILE:-} ]]; then
+    local manifest_values manifest_target bridge_image
+    if [[ -n ${BAO_JWT_PLUGIN_VERSIONS_FILE:-} ]]; then
         [[ -r $BAO_JWT_PLUGIN_VERSIONS_FILE ]] || {
             echo 'JWT plugin version manifest is missing' >&2
             return 1
         }
-        version=$(
-            source "$BAO_JWT_PLUGIN_VERSIONS_FILE"
-            printf '%s' "${JWT_PLUGIN_TARGET_VERSION:-}"
-        )
-        [[ -n $version ]] || { echo 'JWT target version is missing' >&2; return 1; }
+        manifest_values=$(
+            unset JWT_PLUGIN_TARGET_VERSION JWT_PLUGIN_BRIDGE_IMAGE
+            # shellcheck source=infra/openbao/jwt-plugin-versions.env
+            source "$BAO_JWT_PLUGIN_VERSIONS_FILE" || exit 1
+            printf '%s|%s' "${JWT_PLUGIN_TARGET_VERSION:-}" "${JWT_PLUGIN_BRIDGE_IMAGE:-}"
+        ) || return 1
+        manifest_target=${manifest_values%%|*}
+        bridge_image=${manifest_values#*|}
+        [[ -n $manifest_target ]] || { echo 'JWT target version is missing' >&2; return 1; }
+        if [[ -n $bridge_image && -n $version && $version != "$manifest_target" ]]; then
+            echo 'Target-only migrations must select the manifest target; remove the old-version override' >&2
+            return 1
+        fi
+        version=${version:-$manifest_target}
     fi
-    if [[ -z $version && ${JWT_PLUGIN_LIFECYCLE_MODE:-legacy} == versioned ]]; then
+    if [[ -z ${BAO_JWT_PLUGIN_VERSIONS_FILE:-} && ${JWT_PLUGIN_LIFECYCLE_MODE:-legacy} == versioned ]]; then
         echo 'Versioned JWT mounts require the server image version manifest' >&2
         return 1
     fi

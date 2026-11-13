@@ -39,6 +39,11 @@ the duration of each state transition and cleanup. The driver validates the
 complete inventory before tuning, but multiple tune operations are not atomic.
 Rerun the same command after fixing a failure to resume.
 
+Do not manually re-register versions declared by the image to repair catalog
+drift. Manual registration can replace a declarative entry with a
+non-declarative one and block active startup, even when its SHA matches.
+Catalog drift requires a separately qualified recovery procedure.
+
 Commands below use Bash, `kubectl`, `jq`, the default namespace, and the
 chart-managed root-token Secret. Use an authorized operator credential if your
 installation manages tokens differently. Do not enable shell tracing.
@@ -140,9 +145,8 @@ do not receive the target plugin's fixes until a separate maintenance window
 completes the migration below. Do not leave the final stack in `bridge` mode;
 that suppresses migrations.
 
-The all-member active checks below apply when changing existing mount
-selections. They remain a qualification requirement for that separate
-procedure; installing both binaries alone does not complete it.
+Changing existing mount selections requires the separate maintenance
+procedure below. Installing both binaries alone does not complete migration.
 
 ## Pin, Rotate, Then Upgrade
 
@@ -162,25 +166,26 @@ recovered member, then replace the former active as a standby. Never replace
 multiple members at once. Reassign `BAO_POD` to the current active after each
 transfer.
 
-After the rotation, verify each member while it is active. Record the member
-name, run the requested `status` or `verify` check, and issue a JWT and verify
-its signature with the recorded public key. Transfer leadership and repeat
-until every member has been active and checked. Confirm the new active and
-cluster health after each transfer. Stop if a transfer or check fails, or if
-leadership cannot be transferred to an unchecked member. Do not proceed based
-on a status response forwarded from a standby.
+Before and after a normal failover, run the requested `status` or `verify`
+check on the actual active member. Issue JWTs, verify their signatures with
+retained public keys, and check existing/new consumers and agent renewal.
+Confirm the member's local `sys/leader` reports `is_self: true`; a forwarded
+standby response does not identify the serving member.
 
-OpenBao 2.6.3 step-down has no target selector and can alternate between the
-same two members. If this prevents the all-member check, stop at this gate;
-see [the supported-transfer follow-up](https://github.com/dsx-ai-factory/nvcf/issues/3241).
-Do not change Raft membership or skip a member to continue.
+Use `bao operator step-down` on the verified active member and wait for a
+different healthy member to become active. Keep the original cluster ID and
+voter IDs/addresses. Every member must complete the checked rotation, but each
+member does not need to become active. Do not change membership to influence
+leader selection. Stop on a failed transfer, unhealthy quorum or failed probe.
+If a request times out, inspect actual leadership before another operation.
 
 ```bash
 bao_admin jwt-plugin-lifecycle pin-old
 ```
 
-Rotate and check every member as described above, using
-`bao_admin jwt-plugin-lifecycle status` on each active member.
+Rotate every member as described above. Use
+`bao_admin jwt-plugin-lifecycle status` on the active members before and after
+a normal failover.
 Require every legacy mount's configured and running versions to equal the old
 version and its running SHA to equal the old catalog SHA. Existing mounts
 already on the target stay there when `pin-old` is repeated. New mounts use the
@@ -190,8 +195,8 @@ target version. The next command refuses any mount still running unversioned.
 bao_admin jwt-plugin-lifecycle upgrade
 ```
 
-Rotate and check every member again, using
-`bao_admin jwt-plugin-lifecycle verify` on each active member. Tuning updates
+Rotate every member again, using
+`bao_admin jwt-plugin-lifecycle verify` before and after normal failover. Tuning updates
 configured metadata; rotation switches the running backend. If a check fails,
 stop and inspect `status`. Preserve existing keys, roles, and policies.
 
@@ -239,8 +244,8 @@ Roll back plugin selection explicitly:
 bao_admin jwt-plugin-lifecycle rollback
 ```
 
-Repeat the checked member rotation and active-member checks from the previous
-section, using `bao_admin jwt-plugin-lifecycle status` on each member.
+Repeat the checked member rotation and normal-failover probes from the previous
+section, using `bao_admin jwt-plugin-lifecycle status` on the serving active.
 Require configured and running versions to equal the explicit old version,
 with the old SHA, and repeat JWT issuance and signature verification. If
 migrations must run, set their `BAO_JWT_PLUGIN_VERSION` environment variable
@@ -252,36 +257,190 @@ downgrades and snapshot restore need a separately validated recovery plan.
 
 ## Cleanup in a Later Release
 
-Do not combine setup/tune and cleanup in one release. After the rollback
-window and successful consumer validation, freeze mount changes and run:
+The required upgrade path is:
+
+`legacy deployment -> qualified bridge B -> completed mount migration -> later target-only T`
+
+B and T identify qualified releases, not chart modes. Installing B alone does
+not qualify a deployment for T. The deferred path retains existing mount
+selections and must complete the separate conversion first. A deployment may
+qualify by its verified state rather than a recorded product version. A fresh
+installation may start at T in `versioned` mode.
+
+Do not combine setup/tune and cleanup in one release. After rollback,
+re-upgrade and consumer validation, close the rollback window before replacing
+any member with T. Pause out-of-band migrations, mount creation, tuning and
+conflicting operator automation throughout this transition. Keep these writers
+paused through catalog cleanup. Inventory comparisons detect drift; they do
+not provide a server-side lock.
 
 ```bash
 bao_admin jwt-plugin-lifecycle check-cleanup
 ```
 
-The gate rejects old, unversioned, missing, or unexpected configured/running
-versions and running SHA values. Check every member is on the intended image.
-Qualify a later target-only image built with `JWT_INCLUDE_LEGACY=false`.
-It must retain exactly the same target binary and catalog digest as the bridge.
-The target-only image omits old command paths and old registration stanzas.
-Deploy and rotate it with the same health checks, without changing the target
-plugin version. Keep `openbao.jwtPluginLifecycle.mode=versioned` and use hooks
-so the target-only preflight verifies mounts before the rollout. Verify again
-after leadership changes.
+This mount-level gate rejects old, unversioned, missing or unexpected
+configured/running versions, unknown catalog versions and running SHA values.
+It does not prove that every member has completed its image rollout. A failed
+inventory query must stop the procedure, not be interpreted as no mounts.
+
+T is built with `JWT_INCLUDE_LEGACY=false` and
+`JWT_TARGET_IMAGE=<qualified-bridge-image>@sha256:<digest>`. Its clean final
+image copies B's server and target plugin bytes. Verify their per-architecture
+hashes against B, the old paths and declarations are absent, and runtime
+security checks pass. The manifest records the source bridge for diagnostics.
+Never recompile a different binary under the existing target catalog version.
+
+Deploy T with hooks enabled and `openbao.jwtPluginLifecycle.mode=versioned`.
+The preflight must reject legacy, mixed or unverifiable mount state before
+changing server pods or OpenBao storage. Remove a rollback-window
+`BAO_JWT_PLUGIN_VERSION` override or set it to the manifest target. T rejects
+an old/unknown override, including values supplied by a Secret, before the
+server template changes. Its migration selector also rejects non-target
+overrides when supplied with the T manifest.
+
+Let the controlled Helm migration hooks finish before manual member
+replacement. These hooks create target-pinned mounts compatible with both B
+and T; the preflight checks the same version override as the migration Job.
+Keep other mount writers paused. Follow standby-first replacement and
+the checked normal-failover procedure. Preserve quorum and stop on any failed
+check. Never delete binary paths from a running container.
+
+Before resuming the optional UI migration hook, set
+`nvcfUi.openbaoMigrations.jwtPluginVersion` to `JWT_PLUGIN_TARGET_VERSION`
+from the qualified server's `/openbao/jwt-plugin-versions.env`. Apply this
+setting to fresh T installs too. The UI addon can create the NVCT JWT mount;
+its separate Job does not inherit the core migration Job's manifest or
+environment. The setting pins new mounts only. Inventory existing UI-owned
+mounts with the other JWT mounts before removal. During a bridge rollback,
+pause the UI hook along with the other mount writers.
+
+Use the cluster tool from the qualified chart package after every member runs
+T. Extract that verified package into a fresh operator directory:
 
 ```bash
-bao_admin jwt-plugin-lifecycle verify
-bao_admin jwt-plugin-lifecycle cleanup
+OPERATOR_DIR=<fresh-operator-directory>
+QUALIFIED_CHART_PACKAGE=<verified-target-chart.tgz>
+mkdir "$OPERATOR_DIR"
+tar -xf "$QUALIFIED_CHART_PACKAGE" -C "$OPERATOR_DIR"
+JWT_CLUSTER_TOOL="$OPERATOR_DIR/helm-nvcf-openbao-server/scripts/jwt-plugin-cluster.sh"
+T_PLATFORM_MANIFEST=<raw-platform-manifest-from-qualified-release>
+JWT_CLUSTER_ARGS=(
+  --context "<explicit-kube-context>"
+  --namespace vault-system
+  --statefulset openbao-server
+  --expected-image-digest "sha256:<qualified-platform-manifest-digest>"
+  --image-manifest "$T_PLATFORM_MANIFEST"
+  --maintenance-window "<unique-maintenance-window-id>"
+  --evidence "$OPERATOR_DIR/failover-evidence.json"
+)
+```
+
+Use the platform digest from the release evidence, not a multi-architecture
+index digest or a mutable tag. Preserve the manifest's exact bytes. The tool
+checks its SHA-256 before reading the config digest. This supports runtimes
+that report only config IDs without trusting a copied observed ID. The tool
+checks the chart's standard local HTTP
+listener and Raft data directory. It reads the chart-managed root-token Secret;
+use `--token-secret` for another authorized Secret with a `root_token` key.
+Credentials travel over stdin and must not appear in arguments or reports.
+The operator host needs Bash, `kubectl`, `jq` and `sha256sum` or `shasum`.
+
+Provide a reviewed executable JWT/consumer probe. It receives
+`JWT_PROBE_CONTEXT`, `JWT_PROBE_NAMESPACE` and `JWT_PROBE_POD` and must exit
+nonzero on failure. It must issue and verify JWTs from applicable mounts,
+check retained public keys and test existing/new consumers. Do not print
+tokens or credentials. The cluster tool records the probe's successful exit;
+it does not inspect the probe or replace its signature/consumer assertions.
+
+After every member uses T, record the current active and its consumer probe:
+
+```bash
+CURRENT_ACTIVE_POD=<verified-current-active-pod>
+JWT_CONSUMER_PROBE=<absolute-path-to-reviewed-executable-probe>
+bash "$JWT_CLUSTER_TOOL" record-active "${JWT_CLUSTER_ARGS[@]}" \
+  --pod "$CURRENT_ACTIVE_POD" --probe "$JWT_CONSUMER_PROBE"
+```
+
+Perform one normal `bao operator step-down`, wait for a different healthy
+active, and repeat `record-active` for that member with the same arguments.
+Multi-member clusters require successful probes on two distinct active members;
+they do not require every voter to become active. A one-voter Raft cluster
+requires one record and provides no failover qualification. The tool does not
+transfer leadership. A forwarded standby response cannot serve as active proof.
+
+The evidence binds the cluster, StatefulSet generation, Pod UIDs, container
+identities/restart counts, image digest, target SHA, Raft voters and mount
+accessors/config/options/versions. Member replacement, restart or mount changes
+require a fresh evidence file and repeated before/after-failover probes. Evidence is an operator
+record, not a cryptographic attestation. Keep it in the maintenance record.
+
+```bash
+bash "$JWT_CLUSTER_TOOL" check-cleanup "${JWT_CLUSTER_ARGS[@]}"
+bash "$JWT_CLUSTER_TOOL" cleanup "${JWT_CLUSTER_ARGS[@]}" \
+  --confirm-rollback-window-closed
 bao_admin bao secrets list -detailed
 bao_admin bao plugin list -detailed
 ```
 
-Cleanup rechecks mount state and refuses to deregister entries from a local
-image that still carries the old paths. It removes the explicit old and
-unversioned catalog entries only. Removing declarations first prevents a
-later restart from registering the old entries again. Never delete binary
-paths from a running container. Retain backups according to your recovery
-policy; rollback to the retired plugin ends after cleanup.
+Cleanup rechecks all members and live inventory before each catalog deletion.
+It removes only the explicit old and unversioned entries. Partial cleanup can
+be retried while the freeze and evidence remain valid; already absent entries
+are not recreated. Removing declarations from every member first prevents
+restart from re-registering the old entries.
+Declarative-only entries may already disappear when T becomes active. Their
+absence alone does not prove that every member has finished its rollout.
+
+The direct `jwt-plugin-lifecycle cleanup` command rejects HA or unverifiable
+servers. It remains available for verified non-HA installations, including
+the isolated file-backed runtime tests.
+
+## Recovery After Removal
+
+Ordinary old-plugin rollback ends when its binary is removed. Catalog entries
+alone cannot restore that capability. Keep a separately qualified recovery
+bridge with the same OpenBao server and target bytes as T, plus the original
+old binary and versioned declaration. A pre-bridge image is not this artifact.
+
+Keep the maintenance freeze and record current storage, catalog and workload
+state. Roll the recovery bridge onto all members with target selections
+unchanged and lifecycle mode still `versioned`, using the checked standby/active
+procedure. Its deployment preflight accepts a catalog containing only the
+target after verifying every mount's configured/running target version and SHA.
+It does not require the removed old declaration before the bridge can restore
+that declaration on startup. Verify the server and
+plugin hashes, restored old catalog declaration, preserved keys and target
+consumers before changing any mount selection.
+
+If old-plugin recovery is required, run the explicit `rollback` operation,
+rotate every member, verify normal failover and configured/running old versions
+and hashes. Test existing/new consumers and validate signatures with retained
+keys. Then qualify re-upgrade to target, return to T and collect new failover
+evidence before repeating cleanup.
+
+Qualify this procedure starting after T has removed the old catalog entries.
+An image change or successful tune alone is not recovery evidence. Snapshot
+restore and OpenBao server downgrade remain separate recovery procedures and
+are not implied by these plugin steps.
+
+## Release Qualification
+
+Publish the exact B/T upgrade-stop matrix with each applicable release. Record
+source commits, per-platform image digests/raw manifests and plugin hashes,
+server/agent and migration images, chart/stack/umbrella identities and original
+inventories.
+Record applicability, publication and pin consumption separately for main and
+each maintained release train. A merge or source release does not prove
+customer image/chart availability. Do not rewrite historical artifacts.
+
+Inventory other published plugin versions before qualifying a path. Unknown
+versions require their own compatible bridge or an explicit unsupported-path
+entry. Do not silently reuse this bridge for a different stored checksum.
+Release qualification must use the actual published images on supported
+architectures, single/split clusters and supported Kubernetes versions. Include
+JWT/secret consumers, agent authentication/renewal, rollback/re-upgrade,
+target-only cleanup, fresh installation and post-removal recovery. Retain
+security scan evidence that the legacy binary is absent. Local file-backed
+tests and fake Kubernetes checks do not qualify HA or customer publication.
 
 ```mermaid
 flowchart LR
@@ -291,6 +450,9 @@ flowchart LR
   C --> D[Tune target and rotate members]
   D --> E[Validate all mounts and retain rollback window]
   E --> F[Later target-only image]
-  F --> G[Verify then remove old catalog entries]
+  F --> I[Verify all images and consumers across normal failover]
+  I --> G[Verify all members then remove old catalog entries]
+  G --> R[Separate qualified recovery bridge]
+  R --> D
   D --> C
 ```

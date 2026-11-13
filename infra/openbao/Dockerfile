@@ -20,8 +20,12 @@ ARG BAO_RUNTIME_IMAGE=openbao/openbao:2.6.3@sha256:a60afafda36337abe833c4a63894b
 # old source would not preserve the digest stored in existing catalogs.
 ARG JWT_LEGACY_IMAGE=nvcr.io/nvidia/nvcf/nvcf-openbao:2.6.3-nv-1.3.7@sha256:0400a19179569c7c718106fccf6b296d169dcf5c6df0f17272f7d2453785337e
 ARG JWT_INCLUDE_LEGACY=true
+# Required only for target-only builds. Copy published bytes instead of
+# recompiling an existing immutable catalog version.
+ARG JWT_TARGET_IMAGE=scratch
 
 FROM ${JWT_LEGACY_IMAGE} AS legacy-plugin
+FROM ${JWT_TARGET_IMAGE} AS published-bridge
 
 FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS bao-build
 ARG BAO_VERSION
@@ -59,11 +63,28 @@ COPY jwt-plugin-versions.env /versions.env
 COPY scripts/package-jwt-plugins.sh /package-jwt-plugins.sh
 
 FROM plugin-package-base AS plugin-package-true
+ARG TARGETARCH
 COPY --from=legacy-plugin /openbao/plugins/vault-plugin-secrets-jwt /legacy/vault-plugin-secrets-jwt
-RUN JWT_INCLUDE_LEGACY=true /bin/sh /package-jwt-plugins.sh
+COPY --from=bao-build /out/bao-linux-${TARGETARCH} /server/bao
+RUN JWT_INCLUDE_LEGACY=true /bin/sh /package-jwt-plugins.sh && \
+    cp /versions.env /out/jwt-plugin-versions.env && cp /server/bao /out/bao
 
-FROM plugin-package-base AS plugin-package-false
-RUN JWT_INCLUDE_LEGACY=false /bin/sh /package-jwt-plugins.sh
+FROM ${BAO_RUNTIME_IMAGE} AS plugin-package-false
+USER root
+ARG JWT_TARGET_IMAGE
+RUN printf '%s\n' "$JWT_TARGET_IMAGE" | grep -Eq '^[a-zA-Z0-9._/:@-]+@sha256:[0-9a-f]{64}$'
+COPY --from=published-bridge /openbao/plugins/ /bridge/plugins/
+COPY --from=published-bridge /openbao/jwt-plugin-versions.env /versions.env
+COPY --from=published-bridge /usr/bin/bao /server/bao
+COPY scripts/package-jwt-plugins.sh /package-jwt-plugins.sh
+RUN . /versions.env && \
+    test -x /bridge/plugins/vault-plugin-secrets-jwt && \
+    test -x "/bridge/plugins/vault-plugin-secrets-jwt-${JWT_PLUGIN_OLD_VERSION}" && \
+    JWT_TARGET_BINARY="/bridge/plugins/vault-plugin-secrets-jwt-${JWT_PLUGIN_TARGET_VERSION}" \
+    JWT_INCLUDE_LEGACY=false /bin/sh /package-jwt-plugins.sh && \
+    cp /versions.env /out/jwt-plugin-versions.env && \
+    printf '\nJWT_PLUGIN_BRIDGE_IMAGE=%s\n' "$JWT_TARGET_IMAGE" >> /out/jwt-plugin-versions.env && \
+    cp /server/bao /out/bao
 
 # BuildKit skips the legacy image dependency when selecting target-only output.
 FROM plugin-package-${JWT_INCLUDE_LEGACY} AS plugin-package
@@ -83,10 +104,10 @@ RUN apk upgrade --no-cache && \
       'ca-certificates-bundle>=20261020-r0' curl jq bash && \
     mkdir -p /openbao/plugins
 
-COPY --from=bao-build --chmod=0555 /out/bao-linux-${TARGETARCH} /usr/bin/bao
+COPY --from=plugin-package --chmod=0555 /out/bao /usr/bin/bao
 COPY --from=plugin-package /out/plugins/ /openbao/plugins/
 COPY --from=plugin-package /out/plugin-config/ /openbao/plugin-config/
-COPY jwt-plugin-versions.env /openbao/jwt-plugin-versions.env
+COPY --from=plugin-package /out/jwt-plugin-versions.env /openbao/jwt-plugin-versions.env
 COPY --chmod=0555 scripts/jwt-plugin-lifecycle.sh /usr/local/bin/jwt-plugin-lifecycle
 RUN mv /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-entrypoint-upstream.sh
 COPY --chmod=0555 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

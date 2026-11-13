@@ -18,6 +18,10 @@
 # pre-upgrade so the auth role and sign policies exist before the server pods
 # come up and the Vault Agent tries to log in.
 {{- $bao := .Values.nvcfUi.openbaoMigrations }}
+{{- $jwtVersion := get $bao "jwtPluginVersion" | toString }}
+{{- if and $jwtVersion (not (regexMatch "^v[0-9]+\\.[0-9]+\\.[0-9]+([+-][0-9A-Za-z.-]+)?$" $jwtVersion)) }}
+{{- fail "nvcfUi.openbaoMigrations.jwtPluginVersion must be empty or a v-prefixed plugin version" }}
+{{- end }}
 {{- $kubectlMinor := get $bao "kubectlMinor" | toString }}
 {{- if not (has $kubectlMinor (list "" "1.36" "1.37")) }}
 {{- fail "nvcfUi.openbaoMigrations.kubectlMinor must be empty, 1.36, or 1.37" }}
@@ -88,6 +92,10 @@ spec:
               value: "false"
             - name: ADDONS_NVCF_UI_ENABLED
               value: "true"
+            {{- if $jwtVersion }}
+            - name: BAO_JWT_PLUGIN_VERSION
+              value: {{ $jwtVersion | quote }}
+            {{- end }}
             - name: BAO_SERVICE
               value: {{ ($bao.baoService | default (printf "openbao-server.%s.svc.cluster.local" $bao.namespace)) | quote }}
             - name: BAO_PORT

@@ -86,6 +86,10 @@ nvcfUi:
     # Empty uses the image default. Select "1.36" for Kubernetes 1.35;
     # "1.37" is also supported by the migration image.
     kubectlMinor: ""
+    # Select the target from the qualified OpenBao image version manifest for
+    # versioned bridge and target-only deployments. Empty preserves legacy
+    # behavior. This only pins newly created mounts, not existing selections.
+    jwtPluginVersion: ""
     # OpenBao connection. When baoService is empty, the template derives
     # openbao-server.<namespace>.svc.cluster.local.
     baoService: ""

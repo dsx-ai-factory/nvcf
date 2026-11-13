@@ -114,7 +114,8 @@ class ChartLifecycleTest(unittest.TestCase):
                   "component": "server"}
         self.state["statefulset"] = {"spec": {"replicas": 2, "selector": {"matchLabels": labels}}}
         self.state["pods"] = [
-            {"metadata": {"name": name, "labels": dict(labels)}, "status": {"phase": "Running"}}
+            {"metadata": {"name": name, "labels": dict(labels)},
+             "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}}
             for name in ("renamed-bao-0", "renamed-bao-1")]
 
     def test_member_inventory_uses_live_selector_and_ignores_other_and_retired_pods(self):
@@ -145,6 +146,29 @@ class ChartLifecycleTest(unittest.TestCase):
         result = self.run_script(["sh", str(SCRIPTS / "check-jwt-members.sh")])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("found 1", result.stderr)
+
+    def test_unready_member_blocks_versioned_mode(self):
+        self.seed_members()
+        self.state["pods"][1]["status"]["conditions"][0]["status"] = "False"
+        result = self.run_script(["sh", str(SCRIPTS / "check-jwt-members.sh")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be Ready", result.stderr)
+        self.assertFalse(any("exec" in call for call in self.state["calls"]))
+
+    def test_target_only_rejects_a_rollback_migration_override_before_member_exec(self):
+        self.seed_members()
+        manifest = self.root / "manifest.env"
+        manifest.write_text(manifest.read_text() + "\nJWT_PLUGIN_BRIDGE_IMAGE=qualified-bridge\n")
+        versions = dict(line.split("=", 1) for line in manifest.read_text().splitlines()
+                        if line and not line.startswith("#"))
+        self.env["BAO_JWT_PLUGIN_VERSION"] = versions["JWT_PLUGIN_OLD_VERSION"]
+        result = self.run_script(["sh", str(SCRIPTS / "check-jwt-members.sh")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("remove the old-version override", result.stderr)
+        self.assertFalse(any("exec" in call for call in self.state["calls"]))
+        self.env["BAO_JWT_PLUGIN_VERSION"] = versions["JWT_PLUGIN_TARGET_VERSION"]
+        result = self.run_script(["sh", str(SCRIPTS / "check-jwt-members.sh")])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_legacy_baseline_matches_chart_and_manifest(self):
         dockerfile = (REPO / "infra/openbao/Dockerfile").read_text()

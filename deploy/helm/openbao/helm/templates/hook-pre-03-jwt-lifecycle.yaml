@@ -5,6 +5,12 @@
 {{- fail "JWT bridge mode is for existing releases; use versioned mode for a fresh install" }}
 {{- end }}
 {{- $name := include "nvcf-openbao.serverFullname" . }}
+{{- $jwtOverrideEnv := list }}
+{{- range .Values.openbao.migrations.env }}
+{{- if eq .name "BAO_JWT_PLUGIN_VERSION" }}
+{{- $jwtOverrideEnv = append $jwtOverrideEnv . }}
+{{- end }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -53,9 +59,15 @@ spec:
         - name: check-migrations-and-members
           image: "{{ include "openbao.image" (dict "image" .Values.openbao.migrations.image "name" "openbao.migrations.image") }}"
           imagePullPolicy: {{ .Values.openbao.migrations.image.pullPolicy }}
-          {{- with (include "nvcf-openbao.kubectlEnv" .) }}
+          {{- $kubectlEnv := include "nvcf-openbao.kubectlEnv" . }}
+          {{- if or $kubectlEnv $jwtOverrideEnv }}
           env:
+            {{- with $kubectlEnv }}
             {{- . | nindent 12 }}
+            {{- end }}
+            {{- with $jwtOverrideEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -65,6 +77,12 @@ spec:
           args:
             - |
               test -r /app/migrations/utils/jwt_plugin_version.sh
+              . /versions/manifest.env
+              if test -n "${JWT_PLUGIN_BRIDGE_IMAGE:-}" && test -n "${BAO_JWT_PLUGIN_VERSION:-}" && \
+                 test "$BAO_JWT_PLUGIN_VERSION" != "$JWT_PLUGIN_TARGET_VERSION"; then
+                echo 'Target-only migrations must select the manifest target; remove the old-version override' >&2
+                exit 1
+              fi
               {{- if .Release.IsUpgrade }}
               JWT_SERVER_NAMESPACE={{ include "nvcf-openbao.namespace" . | quote }}
               JWT_SERVER_STATEFULSET={{ $name | quote }}
@@ -101,7 +119,10 @@ spec:
               {{- if eq $mode "bridge" }}
               jwt-plugin-lifecycle bridge-preflight
               {{- else }}
-              jwt-plugin-lifecycle wait-ready
+              . /openbao/jwt-plugin-versions.env
+              if test -x "/openbao/plugins/vault-plugin-secrets-jwt-${JWT_PLUGIN_OLD_VERSION}"; then
+                jwt-plugin-lifecycle wait-ready
+              fi
               jwt-plugin-lifecycle deployment-preflight
               {{- end }}
               {{- end }}

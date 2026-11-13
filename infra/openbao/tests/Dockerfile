@@ -18,6 +18,7 @@ FROM ${OPENBAO_IMAGE}
 COPY --from=legacy-server --chmod=0555 /usr/bin/bao /test/bao-legacy
 COPY --from=verifier --chmod=0555 /out/jwtverify /test/jwtverify
 COPY --chmod=0555 tests/runtime-server.sh tests/runtime-bao.sh /test/
+COPY --chmod=0555 tests/runtime-raft.sh tests/runtime-raft-bao.sh /test/
 COPY scripts/package-jwt-plugins.sh /test/package-jwt-plugins.sh
 ENTRYPOINT ["/bin/sleep"]
 CMD ["infinity"]
