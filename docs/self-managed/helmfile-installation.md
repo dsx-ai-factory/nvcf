@@ -752,11 +752,14 @@ api.accountBootstrap.registryCredentials): ACR (Azure), ECR (AWS), NVCR
 
 </Note>
 
-The API chart's account-bootstrap hook Job creates the default NVCF account
-with these registry credentials on install and upgrade. If the account is provisioned
-another way, set `api.accountBootstrap.enabled: false` in
-`environments/<environment>.yaml` to skip the Job. The value must be a YAML
-boolean.
+The API chart's account-bootstrap hook Job runs on install and upgrade and
+creates the default NVCF account with these registry credentials if it does not
+exist. If the account is provisioned another way, set
+`api.accountBootstrap.enabled: false` in `environments/<environment>.yaml` to
+skip the Job. The value must be a YAML boolean. This also removes the
+`nvcf-api-account-bootstrap` ServiceAccount, which the token steps in
+[Update NVCF Account Quota Limits](./runbooks/update-nvcf-account-quota-limits.md)
+use.
 
 #### Generating Base64-encoded Registry Credentials
 

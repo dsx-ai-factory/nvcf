@@ -88,20 +88,23 @@ render_api_values "$work_dir/disabled.yaml" >/dev/null ||
 [[ "$(count_bootstrap_jobs "$work_dir/disabled.yaml")" == 0 ]] ||
   fail "api.accountBootstrap.enabled: false still renders the account-bootstrap Job"
 
-# A quoted "false" is truthy in the chart and would still run the Job.
-write_environment <<'EOF'
+# Only a boolean passes. Null would render as "<no value>", which the chart
+# reads as true, so the Job would still run.
+for value in null '"false"'; do
+  write_environment <<EOF
 global:
   image:
     registry: nvcr.io
     repository: nvidia/nvcf
 api:
   accountBootstrap:
-    enabled: "false"
+    enabled: ${value}
 EOF
-if render_api_values "$work_dir/quoted.yaml" >"$work_dir/quoted.log" 2>&1; then
-  fail "quoted api.accountBootstrap.enabled was accepted"
-fi
-grep -Fq "api.accountBootstrap.enabled must be a YAML boolean" "$work_dir/quoted.log" ||
-  fail "quoted api.accountBootstrap.enabled did not return the expected error"
+  if render_api_values "$work_dir/invalid.yaml" >"$work_dir/invalid.log" 2>&1; then
+    fail "api.accountBootstrap.enabled: ${value} was accepted"
+  fi
+  grep -Fq "api.accountBootstrap.enabled must be a YAML boolean" "$work_dir/invalid.log" ||
+    fail "api.accountBootstrap.enabled: ${value} did not return the expected error"
+done
 
 echo "account-bootstrap-wiring: ok"
