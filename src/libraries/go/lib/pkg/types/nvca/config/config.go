@@ -82,6 +82,9 @@ func DecodeConfig(data []byte, extraConfigDatas ...[]byte) (cfg Config, err erro
 		if err := v.MergeConfig(bytes.NewReader(extraCfgData)); err != nil {
 			return cfg, fmt.Errorf("merge extra config: %w", err)
 		}
+		if err := mergeLegacyLogChunkSize(v, extraCfgData); err != nil {
+			return cfg, fmt.Errorf("merge extra config: %w", err)
+		}
 	}
 	if err := v.Unmarshal(&cfg, NewViperDecoderConfig()); err != nil {
 		err = fmt.Errorf("decode merged config: %w", err)
@@ -99,6 +102,45 @@ func DecodeConfig(data []byte, extraConfigDatas ...[]byte) (cfg Config, err erro
 		return cfg, fmt.Errorf("validate merged config: %w", err)
 	}
 	return cfg, nil
+}
+
+// mergeLegacyLogChunkSize restates an extra input's deprecated
+// agent.byooLogChunking.maxBodyBytes value under the canonical maxPayloadBytes
+// key, so an override input that uses the legacy spelling still wins over a
+// value already merged from an earlier input. An input that sets
+// maxPayloadBytes itself is left alone, keeping the canonical key's precedence
+// within one input.
+func mergeLegacyLogChunkSize(v *viper.Viper, data []byte) error {
+	var doc map[string]any
+	// The merge above already parsed data and reported any syntax error.
+	_ = yaml.Unmarshal(data, &doc)
+	// validateYAMLKeys rejected inputs that spell one key more than one way,
+	// so at most one key folds to each of these names.
+	chunking := doc
+	for _, name := range []string{"agent", "byooLogChunking"} {
+		next, _ := foldedValue(chunking, name).(map[string]any)
+		if next == nil {
+			return nil
+		}
+		chunking = next
+	}
+	size := foldedValue(chunking, "maxBodyBytes")
+	if size == nil || foldedValue(chunking, "maxPayloadBytes") != nil {
+		return nil
+	}
+	return v.MergeConfigMap(map[string]any{
+		"agent": map[string]any{"byooLogChunking": map[string]any{"maxPayloadBytes": size}},
+	})
+}
+
+// foldedValue returns the value of the key that equals name after case folding.
+func foldedValue(m map[string]any, name string) any {
+	for key, value := range m {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return nil
 }
 
 func EncodeConfig(cfg Config, extraConfigs ...Config) ([]byte, error) {

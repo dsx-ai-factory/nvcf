@@ -311,3 +311,38 @@ func TestDecodeConfigReportsInvalidYAMLFromDecoder(t *testing.T) {
 	assert.False(t, errors.As(err, &conflict))
 	assert.ErrorContains(t, err, "read config: ")
 }
+
+// TestDecodeConfigLegacyLogChunkingOverrideWinsOverChartValue reproduces the
+// legacy-override precedence defect named in nvbugs#6884625: the chart-
+// generated base spells the setting byooLogChunking.maxPayloadBytes, while the
+// cluster-spec override spells the same setting BYOOLogChunking.maxBodyBytes.
+// The override input must win, and the effective config must be identical on
+// every decode so the operator does not keep restarting the agent.
+func TestDecodeConfigLegacyLogChunkingOverrideWinsOverChartValue(t *testing.T) {
+	chartGenerated := []byte(`agent:
+  byooLogChunking:
+    dryRun: false
+    maxPayloadBytes: 131072
+`)
+	legacyOverride := []byte(`agent:
+  BYOOLogChunking:
+    dryRun: false
+    exporterBatchMaxSizeBytes: 1000000
+    maxBodyBytes: 262144
+`)
+	var first string
+	for i := range 20 {
+		cfg, err := DecodeConfig(chartGenerated, legacyOverride)
+		require.NoError(t, err)
+		completed := cfg.Complete()
+		encoded, err := EncodeConfig(completed)
+		require.NoError(t, err)
+		if i == 0 {
+			first = string(encoded)
+		}
+		require.Equal(t, first, string(encoded),
+			"the effective agent config must be identical on every decode")
+		require.Equal(t, int64(262144), completed.Agent.BYOOLogChunking.MaxPayloadBytes,
+			"the legacy BYOOLogChunking/maxBodyBytes override must set the effective log chunk size")
+	}
+}
