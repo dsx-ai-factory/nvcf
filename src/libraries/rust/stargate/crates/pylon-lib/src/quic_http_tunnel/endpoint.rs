@@ -91,10 +91,15 @@ pub(super) fn build_trusted_client_config(
     insecure: bool,
     tunnel_protocol: TunnelTransportProtocol,
 ) -> Result<quinn::ClientConfig> {
-    stargate_tls::build_quic_client_config(
+    let mut config = stargate_tls::build_quic_client_config(
         cert_pem,
         insecure,
         tunnel_protocol.alpn_protocols(),
         "TLS cert required when --quic-insecure is not set",
-    )
+    )?;
+    // Stargate opens one stream per request on the connection pylon dials.
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(stargate_tls::MAX_CONCURRENT_TUNNEL_STREAMS.into());
+    config.transport_config(std::sync::Arc::new(transport));
+    Ok(config)
 }

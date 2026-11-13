@@ -17,6 +17,7 @@ not name it.
 - [CRIU with gpushare, group restore across 2 nodes](#criu-with-gpushare-group-restore-across-2-nodes)
 - [CRIU, single GPU](#criu-single-gpu)
 - [cachedir](#cachedir)
+- [Cache-set refresh](#cache-set-refresh)
 - [Records](#records)
 <!-- /toc -->
 
@@ -89,6 +90,18 @@ Time to ready, cold and restored. nvsnap build: not recorded.
 | Qwen2.5-32B-Instruct, Helm chart, 2 replicas | vLLM TP=4 | H100, EKS with NVMesh, 2026-09-25 | 325 s | 170 s |
 | Llama-3.1-70B-Instruct | vLLM TP=4 | H100, EKS with NVMesh, 2026-09-25 | 632 s | 246 s |
 
+## Cache-set refresh
+
+GB300, 2026-10-01, Nemotron Omni, nvsnap build not recorded
+([results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md),
+section 6).
+
+| What was measured | Result |
+|---|---|
+| First start compiling one kernel the cold run never produced, before the refresh | 24 s |
+| Start of a restarted container that kept the kernel, against a first start | 62 to 70 s against 93 to 100 s |
+| Collecting generation 2 from eight warm ranks | 59 s, 7.51 GB (generation 1: 7.45 GB) |
+
 ## Records
 
 | Record | What it holds |
@@ -98,4 +111,4 @@ Time to ready, cold and restored. nvsnap build: not recorded.
 | [results/KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | Kimi-K3 group restores on 2 nodes with 4x GB300 each (2026-10-24): clock budgets and waits, fetch, CRIU and GPU-load times, remap times |
 | [design/GPUSHARE.md](design/GPUSHARE.md#validation) | gpushare validation |
 | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) | Model volume results (H100, NVMesh, September 2026) |
-| [design/helm-chart-cache-election.md](design/helm-chart-cache-election.md) | Election results (H100, NVMesh, 2026-09-25) |
+| [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | Election results (H100, NVMesh, 2026-09-25); cache-set refresh run (GB300, 2026-10-01) |

@@ -346,9 +346,12 @@ func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.forgetFallback(pod.UID)
 	c.readyObserved.Delete(pod.UID)
 	c.captureDecided.Delete(pod.UID)
+	c.companionFailures.Delete(pod.UID)
 	c.bundleWaitSince.Delete(pod.UID)
 	c.agentWaitSince.Delete(pod.UID)
 	c.attempted.Delete("capture/" + string(pod.UID))
+	c.attempted.Delete("teardown-hold/" + string(pod.UID))
+	c.attempted.Delete("teardown/" + string(pod.UID))
 	prefix := string(pod.UID) + "\x00"
 	c.verdicts.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {

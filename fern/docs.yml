@@ -29,6 +29,9 @@ versions:
 - display-name: "1.0.4"
   slug: "1.0.4"
   ref: docs/versions/1.0.4
+- display-name: "1.1.0"
+  slug: "1.1.0"
+  ref: docs/versions/1.1.0
 - display-name: "1.0.3"
   slug: "1.0.3"
   ref: docs/releases/1.0.3

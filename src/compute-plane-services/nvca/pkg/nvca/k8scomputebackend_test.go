@@ -851,6 +851,42 @@ func Test_translateFunctionLaunchSpecification(t *testing.T) {
 	assert.Equal(t, []string{"--backend-connectivity=reverse"}, backendConnectivityArgs)
 	assert.Equal(t, []string{"--initial-input-tps=100"}, initialInputTPSArgs)
 
+	// The agent's workload.llmInferenceStopPause reaches the translated LLM pod.
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 90 * time.Second
+	reqLLMPause := reqLLM.DeepCopy()
+	reqLLMPause.Name = "sr-llm-pause"
+	gotArtifactsPause, err := kc.translateFunctionLaunchSpecification(ctx, reqLLMPause)
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 0
+	require.NoError(t, err)
+	pausePod := &corev1.Pod{}
+	for _, artifact := range gotArtifactsPause {
+		if artifact.Type == function.LaunchArtifactTypePod {
+			podBytes, err := base64.StdEncoding.DecodeString(artifact.Specification)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(podBytes, pausePod))
+			break
+		}
+	}
+	require.NotNil(t, pausePod.Spec.TerminationGracePeriodSeconds)
+	assert.Equal(t, int64(150), *pausePod.Spec.TerminationGracePeriodSeconds)
+	for _, c := range pausePod.Spec.Containers {
+		switch c.Name {
+		case "inference":
+			require.NotNil(t, c.Lifecycle)
+			require.NotNil(t, c.Lifecycle.PreStop)
+			require.NotNil(t, c.Lifecycle.PreStop.Exec)
+			assert.Equal(t, []string{"sleep", "90"}, c.Lifecycle.PreStop.Exec.Command)
+		case function.LLMWorkerContainerName:
+			var drain []string
+			for _, env := range c.Env {
+				if env.Name == "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS" {
+					drain = append(drain, env.Value)
+				}
+			}
+			assert.Equal(t, []string{"85000"}, drain)
+		}
+	}
+
 	// Helm chart basic function.
 	msgMetaHelmChart := cmHelmChart.CreationQueueMessageMetadata
 	reqHelmChart := &nvcav2beta1.ICMSRequest{

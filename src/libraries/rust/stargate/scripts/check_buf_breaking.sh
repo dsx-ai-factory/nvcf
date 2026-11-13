@@ -16,86 +16,37 @@
 
 set -euo pipefail
 
-against="${1:-.git#branch=main}"
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: scripts/check_buf_breaking.sh <base-ref> [repo-relative-schema-directory-or-file]" >&2
+  exit 2
+fi
 if ! command -v buf >/dev/null 2>&1; then
   echo "buf is required on PATH" >&2
   exit 127
 fi
 
-if buf breaking --against "$against" --error-format=json >"$tmp"; then
-  exit 0
+workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo="$(git -C "$workspace" rev-parse --show-toplevel)"
+prefix="$(git -C "$workspace" rev-parse --show-prefix)"
+schemas="${2:-${prefix}crates/proto/proto}"
+base="$(git -C "$repo" rev-parse --verify --end-of-options "$1^{commit}")"
+baseline="$(mktemp -d)"
+trap 'rm -rf "$baseline"' EXIT
+
+# Export only the base schemas. Candidate config cannot weaken this check,
+# and a missing base/schema is an error rather than a skipped comparison.
+candidate="$repo/$schemas"
+against="$baseline"
+if [[ "$schemas" == *.proto ]]; then
+  mkdir "$baseline/base" "$baseline/candidate"
+  name="$(basename "$schemas")"
+  git -C "$repo" show "$base:$schemas" > "$baseline/base/$name"
+  cp "$candidate" "$baseline/candidate/$name"
+  candidate="$baseline/candidate"
+  against="$baseline/base"
+else
+  git -C "$repo" archive "$base:$schemas" | tar -x -C "$baseline"
 fi
-
-python3 - "$tmp" <<'PY'
-import collections
-import json
-import sys
-
-# Calibration is now entirely local Pylon startup behavior. The wire protocol
-# intentionally removes its RPC, messages, enum, registration flag, and ACK
-# directives. Keep this allowance exact so future protobuf breaks still fail.
-PROTO_PATH = "crates/proto/proto/stargate.proto"
-expected_messages_by_rule = {
-    "ENUM_NO_DELETE": [
-        'Previously present enum "CalibrationState" was deleted from file.',
-    ],
-    "FIELD_NO_DELETE": [
-        'Previously present field "2" with name "model_calibration_directives" on message "InferenceServerAck" was deleted.',
-        'Previously present field "6" with name "coordinated_calibration" on message "InferenceServerRegistration" was deleted.',
-    ],
-    "MESSAGE_NO_DELETE": [
-        'Previously present message "ModelCalibrationDirective" was deleted from file.',
-        'Previously present message "SubmitClusterCalibrationRequest" was deleted from file.',
-        'Previously present message "SubmitClusterCalibrationResponse" was deleted from file.',
-    ],
-    "RPC_NO_DELETE": [
-        'Previously present RPC "SubmitClusterCalibration" on service "StargateControlPlane" was deleted.',
-    ],
-}
-allowed = collections.Counter(
-    (PROTO_PATH, rule, message)
-    for rule, messages in expected_messages_by_rule.items()
-    for message in messages
-)
-
-actual = collections.Counter()
-path = sys.argv[1]
-with open(path, encoding="utf-8") as handle:
-    for line_number, line in enumerate(handle, start=1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            violation = json.loads(line)
-        except json.JSONDecodeError as error:
-            print(
-                f"buf breaking returned non-JSON output on line {line_number}: {error}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        actual[
-            (
-                violation.get("path"),
-                violation.get("type"),
-                violation.get("message"),
-            )
-        ] += 1
-
-extra = actual - allowed
-missing = allowed - actual
-if extra or missing:
-    if extra:
-        print("unexpected protobuf breaking changes:", file=sys.stderr)
-        for (path, rule, message), count in sorted(extra.items()):
-            print(f"- {path} {rule} x{count}: {message}", file=sys.stderr)
-    if missing:
-        print("expected calibration-removal changes were not observed:", file=sys.stderr)
-        for (path, rule, message), count in sorted(missing.items()):
-            print(f"- {path} {rule} x{count}: {message}", file=sys.stderr)
-    sys.exit(1)
-
-print("buf breaking: only the expected calibration-removal changes were detected")
-PY
+buf breaking "$candidate" \
+  --against "$against" \
+  --config '{"version":"v2","breaking":{"use":["FILE"]}}'

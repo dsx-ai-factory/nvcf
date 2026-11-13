@@ -32,27 +32,37 @@ import (
 )
 
 func main() {
-	cfg, warnings, err := config.LoadFromEnv()
+	cfg, _, err := loadConfig(os.LookupEnv, os.Environ()...)
 	if err != nil {
 		slog.Error("invalid request trace uploader configuration", "error", err)
 		os.Exit(1)
 	}
-	for _, warning := range warnings {
-		slog.Warn("request trace uploader configuration fallback", "setting", warning)
-	}
 
 	slog.Info("request trace uploader starting", "backend", cfg.Backend, "compiled_backends", backend.Registered())
 
-	svc, err := service.New(cfg)
+	client, err := backend.New(cfg)
 	if err != nil {
-		slog.Error("create request trace uploader service", "error", err)
+		slog.Error("create request trace uploader backend", "error", err)
+		os.Exit(1)
+	}
+	uploader, err := service.NewUploader(cfg, client, service.Options{})
+	if err != nil {
+		slog.Error("create request trace uploader", "error", err)
 		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := svc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := uploader.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("request trace uploader stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+// loadConfig reads configuration strictly from the uploader's own setting
+// names, so any invalid value or unknown setting in environ stops startup.
+// Strict loading leaves no warnings to return.
+func loadConfig(lookup config.LookupFunc, environ ...string) (config.Config, []string, error) {
+	cfg, err := config.LoadStrict(lookup, environ)
+	return cfg, nil, err
 }

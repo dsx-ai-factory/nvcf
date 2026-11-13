@@ -46,13 +46,28 @@ Optional, with defaults:
 - `REQUEST_TRACE_UPLOADER_STATE_DIR`: default under the source directory
 - `REQUEST_TRACE_UPLOADER_QUARANTINE_DIR`: default under the source directory
 - `HEALTH_ADDR`: default `:8011`
-- `REQUEST_TRACE_UPLOADER_SCAN_INTERVAL_SECONDS`: default `30`
+- `REQUEST_TRACE_UPLOADER_SCAN_INTERVAL`: default `30s`
 - `REQUEST_TRACE_UPLOADER_ATTEMPT_TIMEOUT`: default `30s`
 - `REQUEST_TRACE_UPLOADER_OPERATION_TIMEOUT`: default `90s`
 - `REQUEST_TRACE_UPLOADER_MAX_RETRIES`: default `2`
 - `REQUEST_TRACE_UPLOADER_RETRY_INITIAL_BACKOFF`: default `100ms`
 - `REQUEST_TRACE_UPLOADER_RETRY_MAX_BACKOFF`: default `15s`
 - `REQUEST_TRACE_UPLOADER_RETRY_MULTIPLIER`: default `2.0`
+- `REQUEST_TRACE_UPLOADER_AUDIT_PREFIX`: a second segment family on the same
+  spool; default none
+- `REQUEST_TRACE_UPLOADER_REDACT_MULTIMODAL`: default `true`
+- `REQUEST_TRACE_UPLOADER_DRAIN_TIMEOUT`: shutdown drain after SIGTERM;
+  default `60s`, `0s` for none. Set it to fit the pod's grace period.
+- `REQUEST_TRACE_UPLOADER_MAX_JOB_AGE`: how long a submitted job may stay
+  unfinished before it is reported stranded; default `6h`
+- `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL`: how often every open job is
+  polled; default `30s`
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_RESUME`: how long intake stays stopped
+  after a quarantine trip; default `1h`
+
+Time settings above are Go durations with a unit, such as `30s`, `5m` or
+`1h`. A bare number, a negative value, or a value out of range stops
+startup.
 
 Kratos Bulk Upload is an asynchronous job API, so it polls for terminal status.
 These settings apply only to that backend:
@@ -62,9 +77,47 @@ These settings apply only to that backend:
 
 Object-store submission is synchronous and has no status poll.
 
-Invalid policy values fall back to defaults and produce a safe startup warning.
-Missing paths, unreadable secret files, an unknown backend, and incompatible
-required values prevent readiness.
+The binary loads configuration strictly. An invalid or incompatible value,
+or an unknown name that starts with `REQUEST_TRACE_UPLOADER_`, stops startup
+with a non-zero exit. Errors name the setting, never its value.
+`config.Load` on its own still falls back to defaults with a warning, for
+callers that want that.
 
-Record suppression is configured as rules with a header group, match values,
-and an action. It is not part of this scaffold.
+The uploader reads only the names listed here. It has no aliases, so a
+deployment sets these names directly.
+
+Missing paths and unreadable secret files prevent readiness.
+
+## Record suppression
+
+Suppression runs before redaction on every record of a closed segment. A
+rule has an operator-assigned name, a header group, match values, and an
+action. The first matching rule wins.
+
+- `REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_IDS`: comma-separated NCA ids. Each id
+  is trimmed, and an `nca-<id>-nca` form is reduced to `<id>`. The list
+  builds one `stripPayload` rule named `nca_id` on the `nvcf-ncaid` and
+  `nvcf-nca-id` headers. Unset or blank turns it off. An id that is empty
+  once reduced, such as `nca--nca`, stops startup.
+- `REQUEST_TRACE_UPLOADER_SUPPRESSION_RULES`: further rules as a JSON list,
+  evaluated after the NCA id rule, for example
+  `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`.
+  A name is a short lowercase token. The action is `stripPayload` or
+  `dropRecord`.
+- `REQUEST_TRACE_UPLOADER_SUPPRESS_HEADERLESS`: `export` (default) or `drop`
+  for records of a type that carries no headers. In Dynamo v1.4.0 only
+  `request_payload` carries headers. It applies only while a rule exists.
+
+`stripPayload` replaces the record with the stub the earlier shell exporter
+wrote, byte for byte. `dropRecord` removes the record.
+
+An unparseable rule list, an unknown action or policy, a missing or repeated
+name, or a rule with no value stops startup with a non-zero exit.
+
+Counters: `records_suppressed` (`rule`, `action`), `records_evaluated`
+(`record_type`), `suppression_header_present` (`rule`), and
+`records_incomplete` (`record_type`) for payload records whose
+`payload_complete` is false. Header names and values never become
+attributes. When suppression is on and the first 100 payload records carry
+no rule header, the uploader logs one warning. It never holds or drops
+records for that.

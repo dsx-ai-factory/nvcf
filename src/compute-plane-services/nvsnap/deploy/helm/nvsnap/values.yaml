@@ -131,7 +131,7 @@ agent:
   podCacheDir: "/opt/nvsnap"
 
   # One downloader per cache hash for chart-shaped model workloads
-  # (docs/design/helm-chart-cache-election.md). At admission the
+  # (docs/ARCHITECTURE.md, section 7). At admission the
   # webhook composes the cache hash of every GPU pod that names a model;
   # if a promoted capture exists the pod restores from it, otherwise one
   # pod is elected to capture and the rest are held by a scheduling gate
@@ -173,7 +173,7 @@ agent:
     # captures and caches.
     tenantLabel: ""
 
-  # Compile cache set refresh (docs/design/helm-chart-cache-refresh.md),
+  # Compile cache set refresh (docs/ARCHITECTURE.md, section 7),
   # off by default. When on, a warm rank whose cachedir gained files before
   # it reported Ready (what the next start pays for) proposes a refresh;
   # one agent collects a new generation of the set from the warm ranks and
@@ -181,7 +181,7 @@ agent:
   # refreshCooldown is the least time between generations of one set; a
   # superseded generation with no reader bound is retired about an hour
   # after it is replaced. Turn on per cluster when a measured case needs
-  # it (docs/design/helm-chart-cache-refresh.md records its one run).
+  # it (docs/results/HELM-CHART-CACHE-2026-09.md records its one run).
   cacheVolume:
     refresh: false
     refreshCooldown: 6h

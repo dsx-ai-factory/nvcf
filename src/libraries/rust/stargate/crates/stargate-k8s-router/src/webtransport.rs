@@ -21,7 +21,9 @@ use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
-use stargate_forwarding::{HostnameMatcher, RelayEndpointConfig, build_relay_transport_config};
+use stargate_forwarding::{
+    HostnameMatcher, RelayEndpointConfig, build_relay_client_transport_config,
+};
 use stargate_protocol::TunnelTransportProtocol;
 use stargate_protocol::tunnel_contract::WEBTRANSPORT_TUNNEL_PATH;
 use stargate_tls::ServerTlsIdentity;
@@ -93,11 +95,11 @@ impl WebTransportRouterRuntime {
             Some(reloader) => reloader.current_identity().clone(),
             None => ServerTlsIdentity::from_optional_pem(config.tls_cert_pem, config.tls_key_pem)?,
         };
-        let mut upstream_client_config = client_config(
+        let upstream_client_config = upstream_client_config(
             config.upstream_tls_cert_pem.as_deref(),
             config.quic_insecure,
+            relay_config,
         )?;
-        upstream_client_config.transport_config(build_relay_transport_config(relay_config)?);
         let server_config = build_webtransport_server_config(&identity, relay_config)?;
         let endpoint = Endpoint::server(server_config, config.listen_addr)
             .context("bind WebTransport router QUIC listener")?;
@@ -804,6 +806,16 @@ fn build_webtransport_server_config(
     )
 }
 
+fn upstream_client_config(
+    cert_pem: Option<&[u8]>,
+    quic_insecure: bool,
+    relay_config: RelayEndpointConfig,
+) -> Result<ClientConfig> {
+    let mut config = client_config(cert_pem, quic_insecure)?;
+    config.transport_config(build_relay_client_transport_config(relay_config)?);
+    Ok(config)
+}
+
 fn client_config(cert_pem: Option<&[u8]>, quic_insecure: bool) -> Result<ClientConfig> {
     build_upstream_client_config(
         cert_pem,
@@ -1500,6 +1512,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upstream_connection_accepts_more_streams_than_default_limit() -> Result<()> {
+        // Above quinn's default of 100; Stargate holds one stream per in-flight request.
+        const HELD_STREAMS: usize = 150;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pair = connect_quic_pair_with_client_config(upstream_client_config(
+            None,
+            true,
+            RelayEndpointConfig::default(),
+        )?)
+        .await?;
+
+        let stargate = pair.server_connection.clone();
+        let opener = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..HELD_STREAMS {
+                let (mut send, recv) = stargate.open_bi().await?;
+                send.write_all(b"x").await?;
+                held.push((send, recv));
+            }
+            anyhow::Ok(held)
+        });
+        let mut accepted = Vec::new();
+        while accepted.len() < HELD_STREAMS {
+            match tokio::time::timeout(TEST_TIMEOUT, pair.client_connection.accept_bi()).await {
+                Ok(stream) => accepted.push(stream?),
+                Err(_) => break,
+            }
+        }
+        let accepted_count = accepted.len();
+        opener.abort();
+
+        assert_eq!(
+            accepted_count, HELD_STREAMS,
+            "the router must accept every stream Stargate opens on the upstream connection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_drains_active_webtransport_stream_before_closing_session() -> Result<()> {
         let fixture = connect_bridge_fixture().await?;
         let shutdown = CancellationToken::new();
@@ -1684,13 +1735,19 @@ mod tests {
 
     async fn connect_quic_pair() -> Result<QuicPair> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        connect_quic_pair_with_client_config(client_config(None, true)?).await
+    }
+
+    async fn connect_quic_pair_with_client_config(
+        client_quic_config: ClientConfig,
+    ) -> Result<QuicPair> {
         let server_endpoint = Endpoint::server(
             server_config(&stargate_tls::ServerTlsIdentity::SelfSigned)?,
             "127.0.0.1:0".parse()?,
         )?;
         let server_addr = server_endpoint.local_addr()?;
         let mut client_endpoint = Endpoint::client("127.0.0.1:0".parse()?)?;
-        client_endpoint.set_default_client_config(client_config(None, true)?);
+        client_endpoint.set_default_client_config(client_quic_config);
         let connecting = client_endpoint.connect(server_addr, "stargate")?;
         let incoming = server_endpoint
             .accept()

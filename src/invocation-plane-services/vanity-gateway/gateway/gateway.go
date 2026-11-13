@@ -130,6 +130,9 @@ func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error)
 	if err := setupShadowMetrics(); err != nil {
 		return nil, fmt.Errorf("failed to setup shadow metrics: %w", err)
 	}
+	if err := setupRequestBodyMetrics(); err != nil {
+		return nil, fmt.Errorf("failed to setup request body metrics: %w", err)
+	}
 	if err := setupPrivateModelMetrics(); err != nil {
 		return nil, fmt.Errorf("failed to setup private model metrics: %w", err)
 	}

@@ -243,3 +243,52 @@ func TestSegmentWithNoTrailingNewlineIsRead(t *testing.T) {
 		t.Fatalf("records = %d, want the final unterminated record", len(records))
 	}
 }
+
+// A file with bytes but no readable gzip data is not a clean empty segment.
+func TestReaderReportsAFileWithNoReadableData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "request-trace.000000.jsonl.gz")
+	if err := os.WriteFile(path, []byte("this is not gzip\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	records, stats, err := readAll(t, path)
+	if !errors.Is(err, ErrUnreadable) || len(records) != 0 || stats.LostBytes == 0 {
+		t.Fatalf("records = %d stats = %+v err = %v, want ErrUnreadable", len(records), stats, err)
+	}
+}
+
+func TestReaderReportsAChecksumFailure(t *testing.T) {
+	line := `{"schema":"dynamo.request.trace.v1","event_type":"request_end","event_time_unix_ms":1,"request":{"request_id":"a1"}}`
+	damaged := storedMember(t, line)
+	i := bytes.Index(damaged, []byte("a1"))
+	damaged[i+1] = '9'
+	path := filepath.Join(t.TempDir(), "request-trace.000000.jsonl.gz")
+	if err := os.WriteFile(path, damaged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, stats, err := readAll(t, path)
+	if !errors.Is(err, ErrDamaged) || stats.ChecksumFailures != 1 {
+		t.Fatalf("stats = %+v err = %v, want ErrDamaged and one checksum failure", stats, err)
+	}
+}
+
+func TestReaderReportsResyncsAndTheFileHash(t *testing.T) {
+	second := member(t, noisy("b", 60))
+	line := `{"schema":"dynamo.request.trace.v1","event_type":"request_end","event_time_unix_ms":1,"request":{"request_id":"a1"}}`
+	path := writeRaw(t, member(t, line), second[:len(second)/2], member(t, line))
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	for reader.Next() {
+	}
+	if err := reader.Err(); err != nil {
+		t.Fatalf("Err() = %v", err)
+	}
+	if reader.Stats().Resyncs != 1 {
+		t.Errorf("resyncs = %d, want 1", reader.Stats().Resyncs)
+	}
+	if want := fileSum(t, path); !bytes.Equal(reader.Sum(), want) {
+		t.Errorf("Sum() = %x, want %x", reader.Sum(), want)
+	}
+}

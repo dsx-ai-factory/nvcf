@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +32,6 @@ use pylon_lib::{
     start_metrics_server, start_model_lifecycle, start_quic_http_tunnel,
     start_stats_collector_with_engine_stats, stats_aggregator_update_channel,
 };
-use reqwest::header::HeaderName;
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_protocol::BackendConnectivity;
 use stargate_runtime::wait_for_termination_signal;
@@ -769,14 +767,6 @@ pub(crate) fn pylon_retry_config_from_args(args: &Args) -> Result<PylonRetryConf
         retryable_upstream_status_codes: parse_retryable_status_codes(
             &args.pylon_retryable_upstream_status_codes,
         )?,
-        require_upstream_retry_header: args.pylon_require_upstream_retry_header,
-        upstream_retry_header: HeaderName::from_str(args.pylon_upstream_retry_header.trim())
-            .with_context(|| {
-                format!(
-                    "invalid pylon upstream retry header: {}",
-                    args.pylon_upstream_retry_header
-                )
-            })?,
         propagate_retry_after: args.pylon_propagate_retry_after,
         local_connect_failures_retryable: args.pylon_local_connect_failures_retryable,
     })
