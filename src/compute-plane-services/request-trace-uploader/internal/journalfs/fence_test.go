@@ -507,3 +507,48 @@ func TestARetriedFenceSyncsTheUnreadableDirectory(t *testing.T) {
 		t.Fatalf("unreadable/ synced at step %d, journal file moved at step %d: %v", synced, journalMove, events)
 	}
 }
+
+// A sweep whose directory sync failed has already removed the file. The
+// next sweep finds it gone and must still sync the directory, or the
+// removal may not survive a power loss.
+func TestASweepRepeatedAfterAFailedSyncStillSyncsTheDirectory(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	createBatch(t, store, batchFor("b1", "primary", ids, transports))
+	if err := store.SetReceipt("b1", journal.Receipt{Backend: "fake", ID: "job-1"}); err != nil {
+		t.Fatalf("SetReceipt: %v", err)
+	}
+	if err := store.ConfirmBatch("b1"); err != nil {
+		t.Fatalf("ConfirmBatch: %v", err)
+	}
+	if err := store.BeginCleaning(ids[0]); err != nil {
+		t.Fatalf("BeginCleaning: %v", err)
+	}
+	if err := store.FinishCleaning(ids[0]); err != nil {
+		t.Fatalf("FinishCleaning: %v", err)
+	}
+	h.clock.Advance(25 * time.Hour)
+	segments := filepath.Join(h.cfg.StateDir, "segments")
+	store.hooks.beforeSyncDir = func(dir string) error {
+		if dir == segments {
+			return errCrash
+		}
+		return nil
+	}
+	if _, err := store.Sweep(); !errors.Is(err, errCrash) {
+		t.Fatalf("Sweep error = %v, want the failed directory sync", err)
+	}
+
+	var events []string
+	store.hooks = hooks{event: func(kind, path string) { events = append(events, kind+" "+path) }}
+	if _, err := store.Sweep(); err != nil {
+		t.Fatalf("repeated Sweep: %v", err)
+	}
+	if !slices.Contains(events, "sync-dir "+segments) {
+		t.Fatalf("repeated sweep steps = %v, want the segments directory synced", events)
+	}
+	if _, ok := store.Segment(ids[0]); ok {
+		t.Fatal("tombstone kept after the repeated sweep")
+	}
+}

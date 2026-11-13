@@ -120,13 +120,11 @@ func syncDir(dir string) error {
 }
 
 // removeDurably deletes path and syncs its directory. A missing file is not
-// an error, so a step that a crash interrupted can be repeated.
-func removeDurably(path string) error {
-	if err := os.Remove(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
+// an error, so a step that a crash interrupted can be repeated; the
+// directory is still synced, because the earlier removal may not be durable.
+func removeDurably(h hooks, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove journal file: %w", err)
 	}
-	return syncDir(filepath.Dir(path))
+	return syncDirWith(h, filepath.Dir(path))
 }
