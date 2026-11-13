@@ -160,6 +160,26 @@ func TestHistorySameRestoreWithinTheWindow(t *testing.T) {
 	}
 }
 
+// A restore written while its pods were up has no end yet. When it ends
+// and its replacement starts within the window, the pass that brings both
+// keeps them apart in either order: the end is taken first.
+func TestHistoryReplacementAfterAnUnendedEntry(t *testing.T) {
+	a := restoreAt(0)
+	a.Instance = "g/0"
+	a.Outcome = RestoreRestored
+	ended := a
+	ended.EndedAt = time.Date(2026, 11, 12, 0, 0, 30, 0, time.UTC).Format(time.RFC3339)
+	repl := a
+	repl.At = time.Date(2026, 11, 12, 0, 0, 40, 0, time.UTC).Format(time.RFC3339) // 10 s after a's end
+	repl.Outcome = RestoreRestoring
+	for _, upd := range [][]Restore{{repl, ended}, {ended, repl}} {
+		h := History{}.Merge([]Restore{a}).Merge(upd)
+		if h.Restores != 2 || len(h.Entries) != 2 || h.Entries[0].EndedAt != ended.EndedAt {
+			t.Fatalf("pass %v: %+v, want the ended restore and its replacement apart", []string{upd[0].At, upd[1].At}, h)
+		}
+	}
+}
+
 func TestGPURanks(t *testing.T) {
 	if got := GPURanks(map[string]string{"size": "7", "companion.4": "true", "companion.5": "true", "companion.6": "true"}); got != 4 {
 		t.Fatalf("GPURanks = %d, want 4 (7 members less 3 companions)", got)

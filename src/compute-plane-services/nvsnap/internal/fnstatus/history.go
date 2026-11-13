@@ -121,8 +121,12 @@ type History struct {
 // Merge adds the restores in upd to h: a new restore is appended and
 // counted; one it has is updated with what upd knows more of. It keeps the
 // newest HistoryMax: once full, a restore older than the oldest kept is
-// not added (it was kept and dropped before, or is too old to keep).
+// not added (it was kept and dropped before, or is too old to keep). The
+// restores in upd are taken oldest first: a restore's end is known before
+// its replacement, first seen after it, is matched (same).
 func (h History) Merge(upd []Restore) History {
+	upd = append([]Restore(nil), upd...)
+	sort.SliceStable(upd, func(a, b int) bool { return upd[a].At < upd[b].At })
 	out := append([]Restore(nil), h.Entries...)
 	oldest := ""
 	if len(out) >= HistoryMax {
