@@ -309,8 +309,10 @@ impl RunningPylon {
             tunnel,
             ..
         } = self;
+        // Requests that arrive during the registration drain need admitted
+        // model generations, so the model lifecycle stops only after it.
+        registration_client.shutdown().await;
         tokio::join!(
-            registration_client.shutdown(),
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
