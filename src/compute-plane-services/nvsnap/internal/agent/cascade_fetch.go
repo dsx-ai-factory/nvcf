@@ -34,15 +34,34 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 )
+
+// fetchSource is the metrics label of a cascade tier.
+func fetchSource(tier string) string {
+	switch tier {
+	case "rails":
+		return "rails"
+	case "L2-peer":
+		return "peer"
+	case "L2-fsstore":
+		return "fsstore"
+	case "L2-volume":
+		return "volume"
+	default:
+		return "unknown"
+	}
+}
 
 // Phase 5d.1 restore-side cascading peer fetch.
 //
 // EnsureLocal makes a checkpoint locally available on this agent's
-// node before restore-entrypoint runs. Three priority tiers:
+// node before the in-namespace restore runs. Priority tiers:
 //
 //	1. Same-node hostPath — already there, zero transit.
+//	   Then, when configured: the rails (bedrock-peer over the nodes'
+//	   RDMA NICs, rails_fetch.go), a shared filesystem, the L2 volume.
 //	2. Peer agent HTTP — any node in the catalog's peer list serves
 //	   it; we try most-recently-seen first. Each successful fetch
 //	   registers THIS agent as a new peer for future fanouts.
@@ -80,6 +99,19 @@ var peerFetchConcurrency = func() int {
 // files at slow links should still finish under this; if they don't,
 // the peer is degraded and we'd rather fail fast.
 const peerFetchTimeoutPerFile = 5 * time.Minute
+
+// peerFetchFloorRate is the slowest transfer a peer may keep up on a large
+// file before it is abandoned: the per-file limit grows with the file, so
+// a multi-GB chunk is not cut off at the small-file limit.
+const peerFetchFloorRate = 50 << 20 // bytes per second
+
+// peerFetchTimeout is the time one file of size bytes may take.
+func peerFetchTimeout(size int64) time.Duration {
+	if d := time.Duration(size/peerFetchFloorRate) * time.Second; d > peerFetchTimeoutPerFile {
+		return d
+	}
+	return peerFetchTimeoutPerFile
+}
 
 // peerHTTPClient is the HTTP client used for peer + blob-store fetches.
 // http.DefaultClient's default Transport has MaxIdleConnsPerHost: 2,
@@ -125,9 +157,16 @@ var peerHTTPClient = &http.Client{
 //
 // Idempotent: same-node check first means a no-op if the dump is
 // already local (e.g., this is the capture node itself).
-func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
+func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) (retErr error) {
 	ctx, span := tracing.Tracer().Start(ctx, "cascade.ensure_local")
 	defer span.End()
+	// Where the bytes came from, for the fetch metrics; "" until a tier
+	// has them.
+	var tier string
+	setTier := func(t string) {
+		tier = t
+		span.SetAttributes(attribute.String("nvsnap.cascade.tier", t))
+	}
 	span.SetAttributes(attribute.String("nvsnap.checkpoint_id", checkpointID))
 
 	// This ID becomes a directory that the cascade below creates, deletes
@@ -138,23 +177,95 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
 	}
 
 	localDir := filepath.Join(a.config.CheckpointDir, checkpointID)
+	// One fetch per checkpoint: the others wait for it and find it local.
+	defer lockLocalFetch(checkpointID)()
+	// Nor while a cancelled rails fetch of it may still write there.
+	if a.railsFetchStillRunning(ctx, checkpointID) {
+		return fmt.Errorf("checkpoint %s: %w", checkpointID, errRailsFetchRunning)
+	}
 
-	// Tier 1: same-node short-circuit. If inventory.img exists locally,
-	// the checkpoint is already here — capture-source node, or a
-	// previous restore deposited it.
-	if fi, err := os.Stat(filepath.Join(localDir, "inventory.img")); err == nil && fi.Size() > 0 {
-		span.SetAttributes(attribute.String("nvsnap.cascade.tier", "L1-local"))
+	// Tier 1: same-node short-circuit: the capture node, or a finished
+	// earlier fetch.
+	if localCheckpointComplete(a.config.CheckpointDir, checkpointID) {
+		setTier("L1-local")
 		a.log.WithField("checkpoint_id", checkpointID).Info("EnsureLocal: same-node hit, skipping cascade")
 		// Still register as peer in case we somehow weren't tracked.
 		_ = a.registerAsPeer(ctx, checkpointID)
 		return nil
 	}
+	// From here on the checkpoint is fetched: its source and time are kept.
+	start := time.Now()
+	defer func() {
+		metrics.ObserveFetch(fetchSource(tier), retErr == nil, time.Since(start))
+	}()
 
 	// Tier 2: shared filesystem (FSStore). Phase 2c — when the cluster
 	// has a DFS mounted on every node, the agent reads directly from
 	// the shared mount and skips the network cascade entirely. Probed
 	// before catalog lookup so DFS-equipped clusters don't even hit
 	// nvsnap-server for already-published checkpoints.
+	if err := beginLocalFetch(a.config.CheckpointDir, checkpointID); err != nil {
+		return fmt.Errorf("prepare %s for the fetch: %w", localDir, err)
+	}
+	fetched := false
+	// stillWriting: a cancelled rails fetch may still write into the
+	// directory; it is left as it is.
+	stillWriting := false
+	defer func() {
+		if stillWriting {
+			return
+		}
+		if err := endLocalFetch(a.config.CheckpointDir, checkpointID, fetched); err != nil {
+			a.log.WithError(err).WithField("checkpoint_id", checkpointID).Error("EnsureLocal: cannot mark the fetch done; the next restore fetches again")
+		}
+	}()
+
+	// Rails tier: copy from nodes that hold the checkpoint over their RDMA
+	// NICs (rails_fetch.go). Any failure falls through to the tiers below.
+	var sources *catalogSources
+	// small: the rails tier found the checkpoint under its minimum. The
+	// HTTP peers then come before the L2 volume: they move it in about a
+	// second, where a volume takes its attach and mount first.
+	small := false
+	if a.railsEnabled() && a.config.CatalogURL != "" {
+		railsStart := time.Now()
+		var err error
+		if sources, err = a.fetchCheckpointSources(ctx, checkpointID); err != nil {
+			a.log.WithError(err).WithField("checkpoint_id", checkpointID).Warn("EnsureLocal: cannot list the sources for the rails tier; trying the next tier")
+		} else if err := a.fetchOverRails(ctx, checkpointID, localDir, sources.Peers); err == nil {
+			fetched = true
+			setTier("rails")
+			a.log.WithFields(map[string]interface{}{"checkpoint_id": checkpointID, "elapsed": time.Since(railsStart).String()}).
+				Info("EnsureLocal: fetched over the rails")
+			if err := a.registerAsPeer(ctx, checkpointID); err != nil {
+				a.log.WithError(err).Warn("peer-add to catalog failed (non-fatal)")
+			}
+			return nil
+		} else if errors.Is(err, errRailsFetchRunning) {
+			stillWriting = true
+			a.log.WithError(err).WithField("checkpoint_id", checkpointID).Error("EnsureLocal: the rails fetch was cancelled and may still be writing; not trying another tier into the same directory")
+			return err
+		} else {
+			entry := a.log.WithError(err).WithField("checkpoint_id", checkpointID)
+			small = errors.Is(err, errRailsSmall)
+			if errors.Is(err, errRailsUnavailable) {
+				entry.Info("EnsureLocal: rails tier not available; trying the next tier")
+			} else {
+				entry.Warn("EnsureLocal: rails fetch failed; trying the next tier")
+			}
+			_ = clearFiles(localDir)
+		}
+	}
+	if small {
+		err := a.fetchFromPeers(ctx, checkpointID, localDir, sources)
+		if err == nil {
+			fetched = true
+			setTier("L2-peer")
+			return nil
+		}
+		a.log.WithError(err).WithField("checkpoint_id", checkpointID).Warn("EnsureLocal: the peers could not deliver a small checkpoint; trying the shared tiers")
+	}
+
 	if a.fsStore.hasCheckpoint(checkpointID) {
 		fsCtx, fsSpan := tracing.Tracer().Start(ctx, "cascade.fsstore_fetch")
 		fsSpan.SetAttributes(attribute.String("nvsnap.cascade.tier", "L2-fsstore"))
@@ -166,14 +277,15 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
 			fsSpan.End()
 			a.log.WithError(err).WithField("checkpoint_id", checkpointID).
 				Warn("FSStore copy failed; falling through to peer cascade")
-			_ = os.RemoveAll(localDir)
+			_ = clearFiles(localDir)
 		} else {
 			fsSpan.End()
-			span.SetAttributes(attribute.String("nvsnap.cascade.tier", "L2-fsstore"))
+			setTier("L2-fsstore")
 			a.log.WithFields(map[string]interface{}{
 				"checkpoint_id": checkpointID,
 				"elapsed":       time.Since(fsStart).String(),
 			}).Info("EnsureLocal: FSStore copy complete")
+			fetched = true
 			if err := a.registerAsPeer(ctx, checkpointID); err != nil {
 				a.log.WithError(err).Warn("peer-add to catalog failed (non-fatal)")
 			}
@@ -181,19 +293,60 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
 		}
 	}
 
+	// Tier 3: the checkpoint's L2 copy, read from durable storage on this
+	// node. Unavailable (no ready copy, no L2) falls through to the peers;
+	// so does a failed read, which keeps the peers as the last resort.
+	l2Start := time.Now()
+	if err := a.fetchFromL2(ctx, checkpointID, localDir); err == nil {
+		fetched = true
+		setTier("L2-volume")
+		a.log.WithFields(map[string]interface{}{"checkpoint_id": checkpointID, "elapsed": time.Since(l2Start).String()}).
+			Info("EnsureLocal: fetched from the L2 volume")
+		if err := a.registerAsPeer(ctx, checkpointID); err != nil {
+			a.log.WithError(err).Warn("peer-add to catalog failed (non-fatal)")
+		}
+		return nil
+	} else if errors.Is(err, errL2Unavailable) {
+		a.log.WithError(err).WithField("checkpoint_id", checkpointID).Info("EnsureLocal: no L2 copy to read; trying the peers")
+	} else {
+		a.log.WithError(err).WithField("checkpoint_id", checkpointID).Warn("EnsureLocal: L2 read failed; trying the peers")
+		_ = clearFiles(localDir)
+	}
+
 	if a.config.CatalogURL == "" {
 		return fmt.Errorf("checkpoint %s not local and CatalogURL unset; cannot cascade", checkpointID)
 	}
 
-	sources, err := a.fetchCheckpointSources(ctx, checkpointID)
-	if err != nil {
-		return fmt.Errorf("query catalog sources: %w", err)
+	if small {
+		// The peers were tried first and failed; the shared tiers too.
+		err := fmt.Errorf("checkpoint %s: no tier delivered it", checkpointID)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "all tiers failed")
+		return err
 	}
+	if err := a.fetchFromPeers(ctx, checkpointID, localDir, sources); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "all tiers failed")
+		return err
+	}
+	fetched = true
+	setTier("L2-peer")
+	return nil
+}
 
+// fetchFromPeers copies checkpointID into localDir from the agents that
+// hold it (sources, from the catalog), and registers this node as a source
+// once it has it.
+func (a *Agent) fetchFromPeers(ctx context.Context, checkpointID, localDir string, sources *catalogSources) error {
+	if sources == nil {
+		var err error
+		if sources, err = a.fetchCheckpointSources(ctx, checkpointID); err != nil {
+			return fmt.Errorf("query catalog sources: %w", err)
+		}
+	}
 	a.log.WithFields(map[string]interface{}{
 		"checkpoint_id": checkpointID,
 		"peer_count":    len(sources.Peers),
-		"blob_uri":      sources.BlobURI,
 	}).Info("EnsureLocal: cascade starting")
 
 	// Tier 2: try peers in LEAST-LOADED order. Skip self.
@@ -257,12 +410,11 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
 			peerSpan.SetStatus(codes.Error, "peer fetch failed")
 			peerSpan.End()
 			log.WithError(peerErr).Warn("peer fetch failed; trying next")
-			// Best-effort cleanup of partial download.
-			_ = os.RemoveAll(localDir)
+			// Clear the partial download, keeping the directories.
+			_ = clearFiles(localDir)
 			continue
 		}
 		peerSpan.End()
-		span.SetAttributes(attribute.String("nvsnap.cascade.tier", "L2-peer"))
 		log.WithField("elapsed", time.Since(start).String()).Info("EnsureLocal: peer fetch complete")
 		// Register self as a new peer so future fanouts can use us.
 		if regErr := a.registerAsPeer(ctx, checkpointID); regErr != nil {
@@ -271,133 +423,7 @@ func (a *Agent) EnsureLocal(ctx context.Context, checkpointID string) error {
 		return nil
 	}
 
-	// Tier 3: blob-store fallback. The catalog hands us the
-	// nvsnap-blobstore base URL; we fetch the per-capture manifest
-	// and parallel-download blobs into the same destDir layout
-	// the peer path produces.
-	if sources.BlobURI != "" {
-		blobCtx, blobSpan := tracing.Tracer().Start(ctx, "cascade.blobstore_fetch")
-		blobSpan.SetAttributes(
-			attribute.String("nvsnap.cascade.tier", "L3-blobstore"),
-			attribute.String("nvsnap.blob.uri", sources.BlobURI),
-		)
-		log := a.log.WithFields(map[string]interface{}{
-			"checkpoint_id": checkpointID,
-			"blob_uri":      sources.BlobURI,
-		})
-		log.Info("EnsureLocal: falling back to blob store")
-		blobStart := time.Now()
-		if blobErr := a.fetchFromBlobStore(blobCtx, sources.BlobURI, checkpointID, localDir); blobErr != nil {
-			blobSpan.RecordError(blobErr)
-			blobSpan.SetStatus(codes.Error, "blob fallback failed")
-			blobSpan.End()
-			_ = os.RemoveAll(localDir)
-			return fmt.Errorf("blob fallback failed: %w", blobErr)
-		}
-		blobSpan.End()
-		span.SetAttributes(attribute.String("nvsnap.cascade.tier", "L3-blobstore"))
-		log.WithField("elapsed", time.Since(blobStart).String()).Info("EnsureLocal: blob store fetch complete")
-		if regErr := a.registerAsPeer(ctx, checkpointID); regErr != nil {
-			a.log.WithError(regErr).Warn("peer-add to catalog failed (non-fatal)")
-		}
-		return nil
-	}
-	err = fmt.Errorf("all %d peers failed for checkpoint %s and no blob URI in catalog", len(sources.Peers), checkpointID)
-	span.RecordError(err)
-	span.SetStatus(codes.Error, "all tiers failed")
-	return err
-}
-
-// blobStoreManifest mirrors the manifest format from
-// internal/blobstore.Manifest. Defined here to keep the agent
-// → blobstore dep one-way (HTTP only).
-type blobStoreManifest struct {
-	Files []struct {
-		Path   string `json:"path"`
-		SHA256 string `json:"sha256"`
-		Size   int64  `json:"size"`
-	} `json:"files"`
-}
-
-// fetchFromBlobStore downloads a complete checkpoint from the
-// cluster nvsnap-blobstore. Two-step: GET manifest, then
-// parallel-fetch each blob by sha256 into destDir/<path>.
-//
-// The manifest is the source of truth for path layout — blobs
-// are content-addressed so the same blob can back many paths
-// (across captures, or even within one capture if files dedupe).
-func (a *Agent) fetchFromBlobStore(ctx context.Context, blobBaseURL, checkpointID, destDir string) error {
-	manifestURL := fmt.Sprintf("%s/v1/capture/%s/manifest.json",
-		blobBaseURL, url.PathEscape(checkpointID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, http.NoBody)
-	if err != nil {
-		return err
-	}
-	resp, err := peerHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("manifest GET: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("manifest GET %d: %s", resp.StatusCode, body)
-	}
-	var m blobStoreManifest
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return fmt.Errorf("decode manifest: %w", err)
-	}
-
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return err
-	}
-
-	type blobTask struct {
-		path string
-		sha  string
-		size int64
-	}
-	tasks := make(chan blobTask, len(m.Files))
-	for _, f := range m.Files {
-		tasks <- blobTask{path: f.Path, sha: f.SHA256, size: f.Size}
-	}
-	close(tasks)
-
-	errCh := make(chan error, peerFetchConcurrency)
-	var wg sync.WaitGroup
-	for i := 0; i < peerFetchConcurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for t := range tasks {
-				if err := a.fetchOneBlob(ctx, blobBaseURL, t.sha, t.size, t.path, destDir); err != nil {
-					errCh <- fmt.Errorf("blob %s (path=%s): %w", t.sha, t.path, err)
-					return
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	close(errCh)
-	for e := range errCh {
-		return e // first error wins
-	}
-	return nil
-}
-
-// fetchOneBlob downloads a single blob by sha256 from the blob
-// store and writes it to destDir/<relPath>. Range-chunks files
-// >= rangeFetchThreshold for parallelism on large blobs.
-func (a *Agent) fetchOneBlob(ctx context.Context, blobBaseURL, sha string, expectedSize int64, relPath, destDir string) error {
-	blobURL := fmt.Sprintf("%s/v1/blob/%s", blobBaseURL, sha)
-	fileCtx, cancel := context.WithTimeout(ctx, peerFetchTimeoutPerFile)
-	defer cancel()
-	// Same as the peer path: relPath comes from a manifest the blob store
-	// served, not from us.
-	dst, err := joinWithinRoot(destDir, filepath.FromSlash(relPath))
-	if err != nil {
-		return fmt.Errorf("manifest entry %q: %w", relPath, err)
-	}
-	return downloadToFile(fileCtx, peerHTTPClient, []string{blobURL}, expectedSize, dst)
+	return fmt.Errorf("all %d peers failed for checkpoint %s", len(sources.Peers), checkpointID)
 }
 
 // catalogSources mirrors the JSON returned by nvsnap-server's
@@ -406,7 +432,6 @@ func (a *Agent) fetchOneBlob(ctx context.Context, blobBaseURL, sha string, expec
 type catalogSources struct {
 	CheckpointID string     `json:"checkpoint_id"`
 	Peers        []peerInfo `json:"peers"`
-	BlobURI      string     `json:"blob_uri"`
 }
 
 func (a *Agent) fetchCheckpointSources(ctx context.Context, checkpointID string) (*catalogSources, error) {
@@ -452,23 +477,9 @@ type peerManifest struct {
 //   - Size mismatch on a downloaded file: bytes truncated mid-stream;
 //     count as a peer failure.
 func (a *Agent) fetchFromPeer(ctx context.Context, peerURL string, alternateURLs []string, checkpointID, destDir string) error {
-	manifestURL := fmt.Sprintf("%s/v1/checkpoints/%s/manifest", peerURL, url.PathEscape(checkpointID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, http.NoBody)
+	m, err := getPeerManifest(ctx, peerURL, checkpointID)
 	if err != nil {
 		return err
-	}
-	resp, err := peerHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("manifest GET: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("manifest GET %d: %s", resp.StatusCode, body)
-	}
-	var m peerManifest
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return fmt.Errorf("decode manifest: %w", err)
 	}
 
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -515,6 +526,29 @@ func (a *Agent) fetchFromPeer(ctx context.Context, peerURL string, alternateURLs
 	return nil
 }
 
+// getPeerManifest asks a peer agent for its file list of checkpointID.
+func getPeerManifest(ctx context.Context, peerURL, checkpointID string) (*peerManifest, error) {
+	manifestURL := fmt.Sprintf("%s/v1/checkpoints/%s/manifest", peerURL, url.PathEscape(checkpointID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := peerHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("manifest GET: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("manifest GET %d: %s", resp.StatusCode, body)
+	}
+	var m peerManifest
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("decode manifest: %w", err)
+	}
+	return &m, nil
+}
+
 func (a *Agent) fetchOneFile(ctx context.Context, peerURL string, alternateURLs []string, checkpointID, relPath string, expectedSize int64, destDir string) error {
 	// Build the source-URL list: primary first, then any alternates.
 	// downloadToFile uses urls[0] for small files; large files chunk
@@ -532,7 +566,7 @@ func (a *Agent) fetchOneFile(ctx context.Context, peerURL string, alternateURLs 
 		urls = append(urls, fmt.Sprintf("%s/v1/checkpoints/%s/file?path=%s",
 			alt, url.PathEscape(checkpointID), url.QueryEscape(relPath)))
 	}
-	fileCtx, cancel := context.WithTimeout(ctx, peerFetchTimeoutPerFile)
+	fileCtx, cancel := context.WithTimeout(ctx, peerFetchTimeout(expectedSize))
 	defer cancel()
 	// relPath is an entry in the manifest the peer served, so it decides
 	// where we write. Confine it to destDir.

@@ -30,25 +30,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/configs"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/health"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/progress"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/secrets"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/types"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/upload"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metering"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metrics"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/nvct"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proto/nvct"
-	sharedTypes "github.com/NVIDIA/nvcf/src/libraries/go/worker/types"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/configs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/health"
+	taskmetrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/progress"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/secrets"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/upload"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metering"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/nvct"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proto/nvct"
+	sharedTypes "github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
 )
 
 type NVCTWorker struct {
@@ -207,11 +211,20 @@ func NewNVCTWorker(ctx context.Context, zapLogger *logs.ZapLogger, config config
 			// only running a healthcheck server
 			servers.WithRegisterServer(func(*grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/v1/health/live"),
-			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": workerHealth}),
+			servers.WithAdditionalHTTPHandlers(additionalHTTPHandlers(workerHealth)),
 		),
 	}
 
 	return w, nil
+}
+
+func additionalHTTPHandlers(ready http.Handler) map[string]http.Handler {
+	handler := version.HandlerFor("nvcf-worker-task", version.Version, version.GitHash)
+	handler = promhttp.InstrumentHandlerDuration(taskmetrics.InfoRequestDuration, handler)
+	return map[string]http.Handler{
+		"/v1/health/ready": ready,
+		"/info":            otelhttp.NewHandler(handler, "nvcf-worker-task.info"),
+	}
 }
 
 // Setup NVCT worker.

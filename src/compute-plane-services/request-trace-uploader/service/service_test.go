@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 )
 
 func TestInitializeReadinessAndDiscovery(t *testing.T) {
@@ -115,7 +115,7 @@ func (b *stubBackend) Status(_ context.Context, id string) (backend.Status, erro
 	if b.status != "" {
 		return b.status, nil
 	}
-	return backend.StatusSuccess, nil
+	return backend.StatusSucceeded, nil
 }
 
 func (b *stubBackend) Capabilities() backend.Capabilities {

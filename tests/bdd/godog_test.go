@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -114,11 +115,20 @@ func (f *fakeRunner) RunWithTTY(ctx context.Context, command string) (harness.Re
 	return f.Run(ctx, command)
 }
 
+// vanityPodCountCommand is the single-cluster Helmfile feature's wait for
+// the old Vanity Gateway pod to finish draining after a restart.
+const vanityPodCountCommand = `/bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'`
+
 // newFakeRunner returns a runner pre-loaded with canned responses for
 // specific commands. Commands not in the map resolve to ExitCode 0
-// with empty streams. Pass nil for an all-zero-exit runner.
+// with empty streams. Pass nil for an all-zero-exit runner. The Vanity
+// Gateway pod count always reports one pod unless a test overrides it.
 func newFakeRunner(canned map[string]harness.Result) *fakeRunner {
-	return &fakeRunner{results: canned, runs: nil, respond: taskLifecycleResponder()}
+	results := map[string]harness.Result{
+		vanityPodCountCommand: {ExitCode: 0, Stdout: "vanity-gateway pods: 1.\n"},
+	}
+	maps.Copy(results, canned)
+	return &fakeRunner{results: results, runs: nil, respond: taskLifecycleResponder()}
 }
 
 // newWiringSuite builds a Suite tailored for the wiring tests: a
@@ -485,6 +495,10 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		" --regions us-west-1 --min-instances 1 --max-instances 1 --timeout 900"
 	const gatewayTransportCommand = "kubectl --context k3d-ncp-local get configmap/llm-api-gateway -n nvcf -o jsonpath={.data.NVCF_GRPC_INSECURE}"
 	const gatewayServiceMonitorCommand = "helm get manifest llm-api-gateway --namespace nvcf --kube-context k3d-ncp-local"
+	const llmWorkerShutdownCommand = `kubectl --context k3d-ncp-local get pods --all-namespaces --selector function-id=function-1` +
+		` -o jsonpath='{range .items[*]}grace={.spec.terminationGracePeriodSeconds}` +
+		` prestop={.spec.containers[?(@.name=="inference")].lifecycle.preStop.exec.command[*]}` +
+		` drain={.spec.containers[?(@.name=="llm-worker")].env[?(@.name=="PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS")].value}{"\n"}{end}'`
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("NGC_API_KEY", "test-key")
@@ -495,6 +509,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	t.Setenv("SAMPLE_HELM_TASK_CHART", "https://charts.example.test/task-helmchart-test.tgz")
 	t.Setenv("SAMPLE_HELM_TASK_CHART_WITHOUT_RESOURCES", "https://charts.example.test/task-helmchart-test-missing-resources.tgz")
 	t.Setenv("SAMPLE_LLM_ECHO_IMAGE", "nvcr.io/test-org/test-team/openai-compatible-echo:test")
+	t.Setenv("SAMPLE_LLM_DECISIONS_IMAGE", "nvcr.io/test-org/test-team/openai-compatible-decisions:test")
 	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
 	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
 	runner := newFakeRunner(map[string]harness.Result{
@@ -503,7 +518,9 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 			ExitCode: 0,
 			Stdout:   "data:\n  nvcf-api.yaml: |\n    nvcf:\n      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
 		},
-		gatewayTransportCommand:      {ExitCode: 0, Stdout: "true"},
+		gatewayTransportCommand:  {ExitCode: 0, Stdout: "true"},
+		llmWorkerShutdownCommand: {ExitCode: 0, Stdout: "grace=120 prestop=sleep 60 drain=55000\n"},
+		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}": {ExitCode: 0, Stdout: "67108864"},
 		gatewayServiceMonitorCommand: {ExitCode: 0, Stdout: "kind: ConfigMap\nmetadata:\n  name: llm-api-gateway\n"},
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
 			ExitCode: 0,
@@ -571,9 +588,13 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
 	seedFunctionAPIKey(t, home)
 
-	vanityShadow := newVanityShadowFake("", &llmRoutingHTTPFake{seen: map[string]bool{}})
+	decisionRoutes := newDecisionRoutesFake("", &llmRoutingHTTPFake{seen: map[string]bool{}})
+	vanityShadow := newVanityShadowFake("", decisionRoutes)
 	vanityShadow.attach(runner)
-	suite.HTTP = vanityShadow
+	decisionRoutes.attach(runner, suite.Config.RepoRoot)
+	requestBody := newVanityRequestBodyFake("", vanityShadow)
+	requestBody.attach(runner)
+	suite.HTTP = requestBody
 	sc := steps.NewScenarioContext(suite)
 	featurePath := mustResolveFeaturePath(t, "single-cluster-helmfile.feature")
 	var out strings.Builder
@@ -689,10 +710,21 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		"--function-type LLM") {
 		t.Fatal("LLM field-fidelity function was not created from SAMPLE_LLM_ECHO_IMAGE")
 	}
+	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
+		"function create --name bdd-llm-decision-routes",
+		"--image nvcr.io/test-org/test-team/openai-compatible-decisions:test",
+		"--function-type LLM") {
+		t.Fatal("decision route function was not created from SAMPLE_LLM_DECISIONS_IMAGE")
+	}
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
-	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 8)
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
+	for _, key := range []string{"early", "late"} {
+		if !requestBody.seen[key] {
+			t.Errorf("vanity request body scenario never sent the %s-field request", key)
+		}
+	}
 	for _, key := range []string{"shadow-warmup", "promptCacheKey", "firstMessageHash", "continuation", "failing-shadow"} {
 		if !vanityShadow.seen[key] {
 			t.Errorf("vanity shadow scenario never exercised %s", key)
@@ -1739,6 +1771,7 @@ func TestMultiClusterHelmfileLLMRegistrationMultiregionFeatureFileWiresToSteps(t
 		key  string
 		want string
 	}{
+		{key: "llmRequestRouter.kubernetes.advertisedHostnameTemplate", want: strconv.Quote("{pod_name}.llm-request-router-region-b-headless.nvcf.svc.cluster.local")},
 		{key: "llmRequestRouter.backendRouter.enabled", want: "true"},
 		{key: "llmRequestRouter.serviceAccount.create", want: "false"},
 		{key: "llmRequestRouter.pki.enabled", want: "false"},
@@ -1804,11 +1837,14 @@ func TestMultiClusterHelmfileLLMRegistrationMultiregionFeatureFileWiresToSteps(t
 	if err != nil {
 		t.Fatalf("resolve multi-region environment: %v", err)
 	}
+	if err := dsl.MatchYAMLSubtree(environmentPath, "addons.llm.requestRouter.grpcTls.dnsNames",
+		"- region-b-watch.nvcf.svc.cluster.local", dsl.MatchExact); err != nil {
+		t.Fatalf("additional Gateway TLS DNS names must form a dense list: %v", err)
+	}
 	for _, expectation := range []struct {
 		key  string
 		want string
 	}{
-		{key: "addons.llm.requestRouter.grpcTls.dnsNames[1]", want: "region-b-watch.nvcf.svc.cluster.local"},
 		{key: "addons.llm.pki.dnsNames[2]", want: "region-b-watch.nvcf.svc.cluster.local"},
 		{key: "addons.llm.pki.dnsNames[3]", want: "*.llm-request-router-region-b-headless.nvcf.svc.cluster.local"},
 	} {
@@ -2358,7 +2394,15 @@ func seedUpstreamImageRenderOutput(t *testing.T, repoRoot string) {
 	t.Helper()
 	manifests := map[string]string{
 		"01-nats/templates/nats.yaml": `# Source: helm-nvcf-nats/templates/nkey-secret.yaml
+image: docker.io/synadia/nats-server:fixture-tag
 image: docker.io/natsio/nats-server-config-reloader:fixture-tag
+image: docker.io/natsio/nats-box:fixture-tag
+`,
+		"01-cert-manager/templates/cert-manager.yaml": `image: nvcr.io/nvidia/nvcf/cert-manager-controller:fixture-tag
+image: nvcr.io/nvidia/nvcf/cert-manager-webhook:fixture-tag
+image: nvcr.io/nvidia/nvcf/cert-manager-cainjector:fixture-tag
+image: nvcr.io/nvidia/nvcf/cert-manager-startupapicheck:fixture-tag
+--acme-http01-solver-image=quay.io/jetstack/cert-manager-acmesolver:fixture-tag
 `,
 		"02-cassandra/templates/cassandra.yaml": "image: nvcf-cassandra-migrations:latest\n",
 		"03-api/templates/api.yaml":             "image: docker.io/alpine/k8s:fixture-tag\n",
@@ -2386,12 +2430,21 @@ spec:
   dnsNames:
     - llm-request-router.nvcf.svc.cluster.local
 worker-address: llm-request-router-backend-router.nvcf.svc.cluster.local:50071
-env:
-  - name: ADDONS_LLM_ENABLED
-    value: "true"
-  - name: NVCF_SERVICE_PKI_ALLOWED_DOMAINS
-    value: "nvcf.svc.cluster.local"
 image: nvcr.io/test-org/test-team/nvcf-openbao-migrations:fixture-tag
+---
+kind: Job
+metadata:
+  name: openbao-server-migrations
+spec:
+  template:
+    spec:
+      containers:
+        - name: bao-migrations
+          env:
+            - name: ADDONS_LLM_ENABLED
+              value: "true"
+            - name: NVCF_SERVICE_PKI_ALLOWED_DOMAINS
+              value: nvcf.svc.cluster.local
 `
 	filePath := filepath.Join(repoRoot, "deploy", "stacks", "self-managed", "out", "01-pki", "templates", "pki.yaml")
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
@@ -3078,7 +3131,26 @@ func TestSingleClusterHelmfile(t *testing.T) {
 	if os.Getenv(sampleLLMEchoImageEnv) == "" {
 		t.Setenv(sampleLLMEchoImageEnv, "nvcr.io/"+os.Getenv("SAMPLE_NGC_ORG")+"/"+os.Getenv("SAMPLE_NGC_TEAM")+"/"+sampleLLMEchoDefaultImage)
 	}
-	runLiveFeature(t, "single-cluster-helmfile.feature")
+	tags := singleClusterHelmfileTags()
+	if tags != "" {
+		t.Logf("%s is not set, so the @llm-decision-routes scenarios are skipped", sampleLLMDecisionsImageEnv)
+	}
+	runLiveFeatureTags(t, "single-cluster-helmfile.feature", tags)
+}
+
+// sampleLLMDecisionsImageEnv selects the OpenAI-compatible sample the decision
+// route scenarios deploy. The scenarios are opt-in: they also need gateway,
+// Stargate, Pylon and Vanity Gateway builds that serve the routes, so they run
+// only when an operator sets this variable.
+const sampleLLMDecisionsImageEnv = "SAMPLE_LLM_DECISIONS_IMAGE"
+
+// singleClusterHelmfileTags excludes the decision route scenarios unless
+// SAMPLE_LLM_DECISIONS_IMAGE is set.
+func singleClusterHelmfileTags() string {
+	if os.Getenv(sampleLLMDecisionsImageEnv) == "" {
+		return "~@llm-decision-routes"
+	}
+	return ""
 }
 
 // sampleLLMEchoImageEnv selects the OpenAI-compatible sample the LLM
@@ -3533,6 +3605,8 @@ func (f *eventLedgerHTTPFake) Do(_ context.Context, method, rawURL string, heade
 		return harness.HTTPResponse{Status: 403}, nil
 	case method == "POST":
 		return harness.HTTPResponse{Status: 403}, nil
+	case path == "/status":
+		return harness.HTTPResponse{Status: 200, Body: `{"status":"healthy","auth":{"jwt_jwks":{"status":"available"}}}`}, nil
 	}
 	namespace := strings.Split(path, "/")[4]
 	params, _ := url.ParseQuery(query)
@@ -3551,6 +3625,7 @@ func (f *eventLedgerHTTPFake) Do(_ context.Context, method, rawURL string, heade
 // collector is enabled. The scenario must still pick the SIS context.
 const (
 	fakeNVCAContext = "cluster_id=c1,instance_id=i1,resource_id=r1"
+	fakePodContext  = "cluster_id=c1,deployment_id=d1,instance_id=i1"
 	fakeSISContext  = "deployment_id=d1,gpu_specification_id=g1,instance_id=i1"
 )
 
@@ -3563,6 +3638,7 @@ func (f *eventLedgerHTTPFake) contextEvents() map[string][]fakeEvent {
 	}
 	return map[string][]fakeEvent{
 		fakeNVCAContext: {{"ICMSRequest.InstanceStatusUpdate.running", "nvca"}},
+		fakePodContext:  {{"Pod.Scheduled", "nvca"}},
 		fakeSISContext:  sis,
 	}
 }
@@ -3576,7 +3652,7 @@ func (f *eventLedgerHTTPFake) stats(namespace, eventFilter string) harness.HTTPR
 	byEvent := map[string]int{}
 	if namespace == "version-1" {
 		events := f.contextEvents()
-		for _, ctx := range []string{fakeNVCAContext, fakeSISContext} {
+		for _, ctx := range []string{fakeNVCAContext, fakePodContext, fakeSISContext} {
 			latest := events[ctx][len(events[ctx])-1].name
 			if eventFilter != "" && !strings.Contains(","+eventFilter+",", ","+latest+",") {
 				continue
@@ -3609,11 +3685,91 @@ func (f *eventLedgerHTTPFake) events(namespace string, params url.Values) harnes
 	events := []event{}
 	if namespace == "version-1" {
 		for _, e := range f.contextEvents()[eventContext] {
-			events = append(events, event{e.name, e.source, map[string]any{"attributes": map[string]string{"functionid": "function-1", "function_id": "function-1"}}})
+			attributes := map[string]string{"functionid": "function-1", "function_id": "function-1"}
+			if e.source == "nvca" {
+				attributes["k8s.event.reason"] = "InstanceStatusUpdate"
+			}
+			events = append(events, event{e.name, e.source, map[string]any{"attributes": attributes}})
 		}
 	}
 	body, _ := json.Marshal(map[string]any{"namespace": namespace, "context": eventContext, "events": events})
 	return harness.HTTPResponse{Status: 200, Body: string(body)}
+}
+
+const eventLedgerEmptyVersionID = "00000000-0000-4000-8000-00000000e1de"
+
+// eventLedgerCLIResponder models nvcf-cli output without reducing JSON-mode
+// checks to plain-text substring fixtures. It covers input errors, empty
+// results, and the NVCA contexts used by the live CLI scenario.
+func eventLedgerCLIResponder(command string) (harness.Result, bool) {
+	failure := func(message string) (harness.Result, bool) {
+		return harness.Result{ExitCode: 1, Stderr: "Error: " + message + "\n"}, true
+	}
+	isStats := strings.Contains(command, " stats get")
+	isEvents := strings.Contains(command, " stages events list")
+	if !isStats && !isEvents {
+		return harness.Result{}, false
+	}
+	switch {
+	case strings.Contains(command, "not-a-uuid"):
+		return failure(`invalid function version ID "not-a-uuid": must be a UUID`)
+	case strings.Contains(command, "--attribute-key") && !strings.Contains(command, "--attribute-value"):
+		return failure("--attribute-key and --attribute-value must be used together")
+	case isStats && strings.HasSuffix(command, "stats get"):
+		return failure("--function-version-id is required")
+	case strings.Contains(command, "nvcf-cli-local-no-key.yaml"):
+		return failure("no Event Ledger API key configured, run 'nvcf-cli api-key generate --for event-ledger'")
+	}
+
+	isJSON := strings.Contains(command, " --json")
+	isEmpty := strings.Contains(command, eventLedgerEmptyVersionID)
+	if isEvents {
+		if isEmpty {
+			if isJSON {
+				return harness.Result{Stdout: `{"namespace":"` + eventLedgerEmptyVersionID +
+					`","context":"deployment_id=bdd-deployment,gpu_specification_id=bdd-gpu,` +
+					`cluster_id=bdd-cluster,instance_id=bdd-instance,resource_id=bdd-resource","events":[]}`}, true
+			}
+			return harness.Result{Stdout: "Function version: " + eventLedgerEmptyVersionID + "\nContext: \nNo events found.\n"}, true
+		}
+		for _, required := range []string{
+			"--function-version-id version-1",
+			"--cluster-id c1",
+			"--instance-id i1",
+			"--resource-id r1",
+			"--json",
+		} {
+			if !strings.Contains(command, required) {
+				return harness.Result{Stdout: `{"namespace":"version-1","context":"","events":[]}`}, true
+			}
+		}
+		return harness.Result{Stdout: "{\n" +
+			`  "namespace": "version-1",` + "\n" +
+			`  "context": "` + fakeNVCAContext + `",` + "\n" +
+			`  "events": [{` + "\n" +
+			`    "event_name": "ICMSRequest.InstanceStatusUpdate.running",` + "\n" +
+			`    "source": "nvca",` + "\n" +
+			`    "details": {"attributes":{"function_id":"function-1","k8s.event.reason":"InstanceStatusUpdate"}}` + "\n" +
+			"  }]\n}"}, true
+	}
+
+	if isEmpty {
+		if isJSON {
+			return harness.Result{Stdout: `{"namespace":"` + eventLedgerEmptyVersionID + `","summary":{"total_contexts":0,"by_event":{}},"contexts":[]}`}, true
+		}
+		return harness.Result{Stdout: "Function version: " + eventLedgerEmptyVersionID + "\nContexts: 0\n"}, true
+	}
+	if strings.Contains(command, "ICMSRequest.InstanceStatusUpdate.running") {
+		return harness.Result{Stdout: `{"namespace":"version-1",` +
+			`"summary":{"total_contexts":1,"by_event":{"ICMSRequest.InstanceStatusUpdate.running":1}},` +
+			`"contexts":[{"context":"` + fakeNVCAContext +
+			`","event_name":"ICMSRequest.InstanceStatusUpdate.running"}]}`}, true
+	}
+	return harness.Result{Stdout: `{"namespace":"version-1",` +
+		`"summary":{"total_contexts":3,"by_event":{"ICMSRequest.InstanceStatusUpdate.running":1,"Pod.Scheduled":1,"InstanceReady":1}},` +
+		`"contexts":[{"context":"` + fakeNVCAContext + `","event_name":"ICMSRequest.InstanceStatusUpdate.running"},` +
+		`{"context":"` + fakePodContext + `","event_name":"Pod.Scheduled"},` +
+		`{"context":"` + fakeSISContext + `","event_name":"InstanceReady"}]}`}, true
 }
 
 func eventLedgerHelmListJSON() string {
@@ -3740,7 +3896,34 @@ func TestEventLedgerFeatureFileWiresToSteps(t *testing.T) {
 			ExitCode: 0,
 			Stdout:   "  ICMS_FNDS_MESSAGES_ENABLED: \"true\"\n  ICMS_FNDS_MESSAGES_V3_ENABLED: \"true\"\n",
 		},
+		"kubectl get nvcfbackend/ncp-local --namespace nvca-operator --context k3d-ncp-local -o yaml": {
+			ExitCode: 0,
+			Stdout:   "spec:\n  otelCollector:\n    enabled: true\n",
+		},
 	})
+	baseRespond := runner.respond
+	runner.respond = func(command string) (harness.Result, bool) {
+		if result, ok := eventLedgerCLIResponder(command); ok {
+			return result, true
+		}
+		switch {
+		case strings.Contains(command, `initContainers[?(@.name=="nvca-otel-collector")]`):
+			return harness.Result{ExitCode: 0, Stdout: "NVCA_OTEL_COLLECTOR_FNDS_ENDPOINT=" +
+				"http://event-ledger.nvcf.svc.cluster.local:8080/v3/ledger/k8s-events\n" +
+				"NVCA_OTEL_COLLECTOR_BEARER_TOKEN_FILE=/var/run/secrets/tokens/token\n" +
+				"NVCA_OTEL_COLLECTOR_AUTHENTICATOR=bearertokenauth\n"}, true
+		case strings.Contains(command, fakeNVCAContext) && strings.Contains(command, `tr "," "&"`):
+			return harness.Result{ExitCode: 0, Stdout: "cluster_id=c1&instance_id=i1&resource_id=r1\n"}, true
+		case strings.Contains(command, fakeNVCAContext) && strings.Contains(command, `s/^cluster_id=//p`):
+			return harness.Result{ExitCode: 0, Stdout: "c1\n"}, true
+		case strings.Contains(command, fakeNVCAContext) && strings.Contains(command, `s/^instance_id=//p`):
+			return harness.Result{ExitCode: 0, Stdout: "i1\n"}, true
+		case strings.Contains(command, fakeNVCAContext) && strings.Contains(command, `s/^resource_id=//p`):
+			return harness.Result{ExitCode: 0, Stdout: "r1\n"}, true
+		default:
+			return baseRespond(command)
+		}
+	}
 	runner.onRun = func(command string) error {
 		if strings.Contains(command, " function delete --deployment-only") {
 			destroyed = true
@@ -3790,6 +3973,29 @@ func TestEventLedgerFeatureFileWiresToSteps(t *testing.T) {
 	}
 	if !commandRanThatContains(runs, " function delete --deployment-only") {
 		t.Fatal("function undeploy command was never invoked")
+	}
+	for _, command := range []string{
+		" api-key generate --for event-ledger ",
+		"nvcf-cli-local-no-key.yaml stats get",
+		"stats get --function-version-id not-a-uuid",
+		"stats get --function-version-id " + eventLedgerEmptyVersionID,
+		"stages events list --function-version-id " + eventLedgerEmptyVersionID,
+		"stats get --function-version-id version-1 --json",
+		" stats get --event-filter ICMSRequest.InstanceStatusUpdate.running --json",
+	} {
+		if !commandRanThatContains(runs, command) {
+			t.Fatalf("Event Ledger CLI command was never invoked: %s", command)
+		}
+	}
+	if !commandRanThatContainsAll(runs,
+		" stages events list ",
+		"--function-version-id version-1",
+		"--cluster-id c1",
+		"--instance-id i1",
+		"--resource-id r1",
+		"--json",
+	) {
+		t.Fatal("Event Ledger CLI event read did not use the complete NVCA context")
 	}
 	for _, secret := range []string{"admin-jwt", "nvapi-test", "nvapi-write"} {
 		if commandRanThatContains(runs, secret) {
@@ -4027,6 +4233,8 @@ func TestLLMRoutingFeaturesRejectIncompleteAndMisroutedResponses(t *testing.T) {
 		if !found {
 			t.Fatal("missing LLM scenario")
 		}
+		// The decision route scenarios have their own wiring test.
+		scenario, _, _ = strings.Cut(scenario, "\n    # Beta decision routes")
 		brokenModes := []string{"", "chat-stream", "responses", "classic", "pexec", "unlisted", "long-nonstream", "long-stream", "long-nonstream-too-fast", "long-stream-too-fast"}
 		exercised := []string{"chat-stream", "responses", "classic", "pexec", "unlisted", "long-nonstream", "long-stream"}
 		// Field fidelity runs only in the single-cluster feature.
@@ -4047,6 +4255,9 @@ func TestLLMRoutingFeaturesRejectIncompleteAndMisroutedResponses(t *testing.T) {
 					}
 					if strings.Contains(command, "curl ") {
 						runner.results[command] = harness.Result{Stdout: "401"}
+					}
+					if strings.Contains(command, "get pods --all-namespaces --selector function-id=") {
+						runner.results[command] = harness.Result{Stdout: "grace=120 prestop=sleep 60 drain=55000\n"}
 					}
 					return nil
 				}
@@ -4117,6 +4328,9 @@ func (f *vanityShadowFake) Do(ctx context.Context, method, rawURL string, header
 		return harness.HTTPResponse{}, err
 	}
 	if u.Host != "vanity-openai.localhost:8080" {
+		return f.inner.Do(ctx, method, rawURL, headers, body)
+	}
+	if isDecisionRoutePath(u.Path) {
 		return f.inner.Do(ctx, method, rawURL, headers, body)
 	}
 	if method != "POST" || headers["Authorization"] != "Bearer wiring-function-api-key" || headers["Content-Type"] != "application/json" {
@@ -4286,6 +4500,125 @@ func (f *vanityShadowFake) attach(runner *fakeRunner) {
 	}
 }
 
+// vanityRequestBodyFake stands in for the direct Vanity Gateway model route
+// in the request body scenario. Like SAMPLE_LLM_ECHO_IMAGE with
+// x_load_tester_echo, it replies with the request it received. Each broken
+// mode reproduces one way a gateway could change a large body.
+type vanityRequestBodyFake struct {
+	broken string
+	seen   map[string]bool
+	inner  harness.HTTPClient
+}
+
+const vanityRequestBodyPaddingCommand = `/bin/bash -c 'printf "%080000d" 0 | tr 0 a'`
+
+func newVanityRequestBodyFake(broken string, inner harness.HTTPClient) *vanityRequestBodyFake {
+	return &vanityRequestBodyFake{broken: broken, seen: map[string]bool{}, inner: inner}
+}
+
+func (f *vanityRequestBodyFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
+	if rawURL != "http://vanity-openai.localhost:8080/v1/chat/completions" || !strings.Contains(body, `"model":"bdd-request-body"`) {
+		return f.inner.Do(ctx, method, rawURL, headers, body)
+	}
+	if method != "POST" || headers["Authorization"] != "Bearer wiring-function-api-key" || headers["Content-Type"] != "application/json" {
+		return harness.HTTPResponse{Status: 401}, nil
+	}
+	padding := strings.Repeat("a", 80000)
+	switch {
+	case strings.Contains(body, "bdd-early-"+padding):
+		f.seen["early"] = true
+		if f.broken == "rewrites-early-body" {
+			body = strings.Replace(body, `"stream":false`, `"stream":true`, 1)
+		}
+	case strings.Contains(body, "bdd-late-"+padding):
+		f.seen["late"] = true
+		if f.broken == "truncates-late-body" {
+			body = strings.Replace(body, padding, padding[:65536], 1)
+		}
+	default:
+		return harness.HTTPResponse{}, fmt.Errorf("request body scenario sent an unexpected body of %d bytes", len(body))
+	}
+	content, err := json.Marshal(body)
+	if err != nil {
+		return harness.HTTPResponse{}, err
+	}
+	return harness.HTTPResponse{Status: 200, Body: `{"object":"chat.completion","choices":[{"message":{"content":` + string(content) + `}}]}`}, nil
+}
+
+func (f *vanityRequestBodyFake) attach(runner *fakeRunner) {
+	previous := runner.onRun
+	runner.onRun = func(command string) error {
+		switch {
+		case command == vanityRequestBodyPaddingCommand:
+			runner.results[command] = harness.Result{Stdout: strings.Repeat("a", 80000)}
+		case strings.Contains(command, " function invoke ") && strings.Contains(command, "bdd-request-body-ready"):
+			runner.results[command] = harness.Result{Stdout: `{"object":"chat.completion","choices":[{"message":{"content":"{\"messages\":[{\"content\":\"bdd-request-body-ready\"}]}"}}]}`}
+		case strings.Contains(command, "httproute/vanity-gateway") && strings.Contains(command, "-o yaml"):
+			runner.results[command] = harness.Result{Stdout: "spec:\n  hostnames:\n    - vanity.localhost\n    - vanity-openai.localhost\n"}
+		}
+		if previous != nil {
+			return previous(command)
+		}
+		return nil
+	}
+}
+
+func TestVanityRequestBodyScenarioRejectsChangedBodies(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("SAMPLE_LLM_ECHO_IMAGE", "nvcr.io/test-org/test-team/openai-compatible-sample:test")
+	seedFunctionAPIKey(t, home)
+	data, err := os.ReadFile(mustResolveFeaturePath(t, "single-cluster-helmfile.feature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, scenario, found := strings.Cut(string(data), "    @vanity-request-body\n")
+	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	if !found || !ended {
+		t.Fatal("missing vanity request body scenario")
+	}
+	for _, broken := range []string{"", "rewrites-early-body", "truncates-late-body"} {
+		t.Run(broken, func(t *testing.T) {
+			runner := newFakeRunner(map[string]harness.Result{})
+			runner.onRun = func(command string) error {
+				if strings.Contains(command, " status --json") {
+					runner.results[command] = harness.Result{Stdout: `{"currentFunction":{"hasFunction":true,"functionId":"function-1","versionId":"version-1"}}`}
+				}
+				return nil
+			}
+			suite := newWiringSuite(t, runner)
+			envFile := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd.yaml")
+			if err := os.MkdirAll(filepath.Dir(envFile), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(envFile, []byte("addons: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fake := newVanityRequestBodyFake(broken, &llmRoutingHTTPFake{seen: map[string]bool{}})
+			fake.attach(runner)
+			suite.HTTP = fake
+			sc := steps.NewScenarioContext(suite)
+			var out strings.Builder
+			status := godog.TestSuite{
+				Name:                "vanity-request-body-feature",
+				ScenarioInitializer: func(ctx *godog.ScenarioContext) { steps.RegisterAll(ctx, sc) },
+				Options:             &godog.Options{Format: "pretty", Output: &out, Strict: true, FeatureContents: []godog.Feature{{Name: "vanity", Contents: []byte("Feature: Vanity request bodies\n" + scenario)}}},
+			}.Run()
+			if broken != "" && status == 0 {
+				t.Fatalf("feature did not reject the %s gateway:\n%s", broken, out.String())
+			}
+			if broken == "" && status != 0 {
+				t.Fatalf("feature failed:\n%s", out.String())
+			}
+			if broken == "" && (!fake.seen["early"] || !fake.seen["late"]) {
+				t.Fatalf("feature did not send both requests: %v", fake.seen)
+			}
+		})
+	}
+}
+
 func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -4298,7 +4631,7 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, scenario, found := strings.Cut(string(data), "    @vanity-shadow-sampling\n")
-	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	scenario, _, ended := strings.Cut(scenario, "\n    # Large model requests through a direct Vanity Gateway")
 	if !found || !ended {
 		t.Fatal("missing vanity shadow scenario")
 	}

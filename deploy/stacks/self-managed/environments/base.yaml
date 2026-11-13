@@ -46,6 +46,14 @@ global:
     registry: nvcr.io
     repository: YOUR_ORG/YOUR_TEAM
 
+  # nvcf-openbao-migrations image tag shared by OpenBao, LLS HMAC rotation and
+  # the NVCF UI. Set openbao.migrations.image.tag,
+  # addons.lls.hmacRotation.image.tag or addons.nvcfUi.openbaoMigrations.image.tag
+  # to pin one component.
+  openbaoMigrations:
+    image:
+      tag: "0.23.1"
+
   # =============================================================================
   # Worker Sidecar Registry Configuration
   # =============================================================================
@@ -75,9 +83,20 @@ global:
     nvctServiceURL: ""
     # NVCT task worker env: NVCT_FQDN_GRPC
     nvctGrpcServiceURL: ""
-    # Invocation service worker stream address.
+    # Invocation service worker stream address. Empty advertises each pod's
+    # own address. Every replica advertises a set value, so invocation-service
+    # stays at one replica under HA when it is set.
     invocationServiceURL: ""
-    # gRPC proxy worker CONNECT endpoint advertised by the proxy.
+    # Proxy that workers dial for invocation callbacks
+    # (WORKER_STREAM_PROPERTIES__PROXY_ADDRESS). Used only when
+    # workerCallbackProxy.enabled is true; empty uses
+    # https://invocation.<workerDomain>:10084. Set it when workers reach Envoy
+    # through another https name under *.<workerDomain>.
+    invocationProxyURL: ""
+    # gRPC proxy worker CONNECT endpoint advertised by the proxy. Empty
+    # advertises each pod's IP. Every replica advertises a set value, so
+    # grpc-proxy stays at one replica under HA when it is set, unless
+    # grpcproxy.http3 is enabled, which puts each pod's IP in front of it.
     grpcProxyWorkerConnectURL: ""
     # Pylon discovery endpoint. Empty uses
     # llm-request-router-backend-router.nvcf.svc.cluster.local:50071 when backend
@@ -180,6 +199,7 @@ functionAutoscaler:
 # the LLM addon is enabled, the stack defaults the Pylon image from
 # global.sidecars (or global.image) at version 0.25.0.
 api:
+  podAnnotations: {}
   env: {}
   # In-cluster ESS base URL for the API's own ESS calls. Empty defaults to
   # global.workerEndpoints.essServiceURL. In split-plane deployments that value
@@ -196,6 +216,7 @@ api:
 # Remote config is passed to the NVCT API chart and overrides its packaged
 # application profile, mirroring api.remoteConfig.
 nvctApi:
+  podAnnotations: {}
   essBaseURL: ""
   remoteConfig:
     configData: {}
@@ -230,6 +251,7 @@ accounts:
 # These static global values are processed in the values template
 nats:
   enabled: true
+  podAnnotations: {}
   # How workers authenticate to NATS.
   #   nkey: the NVCF API gives every worker the control plane's shared NATS
   #     NKey as NKEY_SEED. The default.
@@ -276,6 +298,8 @@ nats:
     #   tls:
     #     enabled: true
     #     secretName: nats-server-tls   # cert-manager-issued; SAN = external NATS hostname
+  # The server defaults to docker.io/synadia/nats-server:2.14.9-alpine3.22.
+  # Set container.image.registry, repository, and tag together for a mirror.
   # CPU and memory for each NATS server container. The chart sets none, so the
   # servers run as BestEffort and nats-server sizes its Go runtime to every
   # core on the node. Set a CPU limit so the runtime sizes itself to it, and
@@ -293,14 +317,21 @@ nats:
   #         cpu: <cores>
   # Image overrides for the NATS config reloader. The reloader is not
   # republished under the public nvidia/nvcf catalog, so it defaults to its
-  # upstream source, docker.io/natsio/nats-server-config-reloader:0.24.0.
+  # upstream source, docker.io/natsio/nats-server-config-reloader:0.25.0.
   # Leave these unset unless you have mirrored the image into your own
   # registry, in which case set registry and repository together:
   # reloader:
   #   image:
   #     registry: <your-registry>
   #     repository: <your-repository>/nats-server-config-reloader
-  #     tag: "0.24.0"
+  #     tag: "0.25.0"
+  # NATS box also defaults to its public upstream image, independently of
+  # global.image. Set registry and repository together for a private mirror.
+  # natsBox:
+  #   container:
+  #     image:
+  #       registry: <your-registry>
+  #       repository: <your-repository>/nats-box
   # PDB: the upstream NATS chart enables a disruption budget by default.
   # Override here to disable it or adjust the minAvailable threshold.
   podDisruptionBudget:
@@ -353,7 +384,7 @@ certManager:
   # and has no namespace. The nvcf-pki Helm release that creates it and the
   # cert-manager ServiceAccount it authenticates as both live in the
   # cert-manager namespace. The bundled helm-nvcf-cert-manager chart ships
-  # installCRDs=true by default. Set this to false when cert-manager is
+  # crds.enabled=true by default. Set enabled to false when cert-manager is
   # installed outside this stack; that external installation must still
   # provide ServiceAccount/cert-manager in the cert-manager namespace.
   enabled: true
@@ -362,7 +393,7 @@ certManager:
   # acmesolver:
   #   image:
   #     repository: nvcr.io/YOUR_ORG/YOUR_TEAM/cert-manager-acmesolver
-  #     tag: "v1.20.2"
+  #     tag: "v1.20.5"
 
 openbao:
   enabled: true
@@ -396,6 +427,7 @@ openbao:
     podDisruptionBudget:
       minAvailable: 1
   server:
+    annotations: {}
     ha:
       # PDB for the HA Raft StatefulSet. The upstream chart enables this by
       # default with maxUnavailable derived from replica count.
@@ -530,6 +562,10 @@ addons:
   # When enabled, deploys the event-ledger service backed by Cassandra.
   eventLedger:
     enabled: true
+    # gRPC proxy session events: one record per worker attachment, never
+    # expired. Off until Event Ledger can expire them.
+    grpcProxyEvents:
+      enabled: false
 
   # Vanity Gateway addon for optional vanity and OpenAI-compatible invocation routes.
   # Disabled by default; enabling this deploys the vanity-gateway service and its
@@ -545,6 +581,8 @@ addons:
       mappingPath: /etc/vanity-gateway/config/config.yaml
       nvcfApiEndpoint: http://invocation.nvcf.svc.cluster.local:8080
       llmGatewayEndpoint: http://llm-api-gateway.nvcf.svc.cluster.local:8080
+      # Model API request body limit in bytes (25 MiB). Must be positive.
+      maxRequestSizeBytes: 26214400
       # Empty by default because the Vanity Gateway chart does not create Vault
       # Agent injection. Set this only when another component mounts the secrets
       # file into the pod.
@@ -602,6 +640,7 @@ icms:
 # Set enabled: true for any service running more than one replica.
 
 apikeys:
+  podAnnotations: {}
   # Operator-set api-keys service env, deep-merged over the chart defaults
   # (AWS_REGION / SPRING_PROFILES_ACTIVE). Set NVCF_NCA_ID to the NCA the
   # api-keys service authorizes keys against. Leave unset to keep the chart
@@ -614,11 +653,13 @@ apikeys:
     maxUnavailable: 1
 
 ess:
+  podAnnotations: {}
   podDisruptionBudget:
     enabled: false
     maxUnavailable: 1
 
 invocation:
+  podAnnotations: {}
   env:
     # Keep request subjects aligned with the API and worker consumers.
     NATS_PROPERTIES__REGION: ncp
@@ -767,7 +808,9 @@ ingress:
         # listenerName defaults to llm-quic in the gateway-routes chart.
 
 grpcproxy:
-  # PDB: disabled by default. Enable when running multiple grpc-proxy replicas.
+  podAnnotations: {}
+  # PDB: disabled by default. highAvailability.mode replaces it with the HA PDB
+  # when it scales grpc-proxy.
   podDisruptionBudget:
     enabled: false
     maxUnavailable: 1
@@ -782,6 +825,88 @@ grpcproxy:
   # an external compute-worker endpoint.
   natsServiceURL: ""
   workerConnectBaseURL: ""
+
+# Worker callback proxy (Envoy), for workers in another cluster that cannot
+# reach control-plane pod IPs. Envoy routes each callback to the grpc-proxy or
+# invocation-service pod that holds the request. Single-cluster installs do
+# not need it: workers call the pod directly, and highAvailability scales both
+# services either way.
+#
+# With it enabled, grpc-proxy serves HTTP/3 callbacks and advertises
+# https://<dashed-pod-ip>.<workerDomain>, and invocation-service sends worker
+# streams through the proxy. The OpenBao service PKI issues the Envoy and
+# grpc-proxy certificates through addons.llm.pki's issuer
+# (ClusterIssuer/nvcf-openbao-pki by default), without the LLM add-on.
+# Requires openbao.enabled and cert-manager. Not supported with split-plane
+# worker URLs (global.workerEndpoints.invocationServiceURL,
+# global.workerEndpoints.grpcProxyWorkerConnectURL, or
+# grpcproxy.workerConnectBaseURL).
+#
+# Before enabling:
+#   - Resolve *.<workerDomain> to the worker-callback-proxy Service from the
+#     compute plane, for example with a wildcard DNS record or, on k3s and
+#     AKS, a CoreDNS rewrite in kube-system/coredns-custom:
+#       rewrite stop {
+#         name regex (.+)\.<workerDomain with dots escaped>\.$ worker-callback-proxy.nvcf.svc.cluster.local.
+#         answer auto
+#       }
+#   - Give workers the CA that issued Envoy's frontend certificate through
+#     global.nvcaOperator.agent.workerCallbackCaPem in the compute-plane stack.
+#     HTTP callbacks trust that CA from worker-utils 1.4.0.
+#     Workers need no stack CA when Envoy's frontend certificate comes from a
+#     public CA (tls.frontend below).
+# Workers' TLS always ends at Envoy. Envoy then opens its own TLS session to
+# the invocation-service pod and checks it against the stack CA, unless
+# invocation.upstreamTls.enabled is false.
+# See docs/self-managed/worker-callback-proxy.md.
+workerCallbackProxy:
+  enabled: false
+  # REQUIRED when enabled. Workers call back on <dashed-pod-ip>.<workerDomain>,
+  # for example grpc-worker.example.com. The stack adds it to the OpenBao
+  # signing role's allowed domains when addons.llm.pki.allowedDomains does not
+  # already cover it.
+  workerDomain: ""
+  # Set only for source-tree validation. Empty uses the released OCI chart.
+  chartPath: ""
+  # Envoy's frontend certificate, the one workers verify for *.<workerDomain>.
+  # It is independent of the grpc-proxy and invocation-service pod
+  # certificates, which the stack CA always issues. Default: issued by the
+  # stack's OpenBao issuer. Set one of these to use a public CA instead:
+  # tls:
+  #   frontend:
+  #     existingSecret: <kubernetes.io/tls Secret for *.<workerDomain>>
+  #     certificate:
+  #       issuerRef: { kind: ClusterIssuer, name: <issuer> }
+  # How Envoy reaches the invocation-service pod. The worker's own TLS session
+  # ends at Envoy either way.
+  invocation:
+    upstreamTls:
+      # true: Envoy opens a separate TLS session to the pod on 8443 and checks
+      # the pod certificate against the stack CA. false: Envoy sends plain HTTP
+      # to the pod on 8080, only for a trusted network between them.
+      enabled: true
+    connect:
+      # CONNECT is a raw TCP tunnel to the pod that Envoy cannot read or
+      # restrict, and the worker runs its own TLS through it. The stack gives
+      # workers only http:// targets, which they send as forward-proxy
+      # requests, so it is off. Set true only for workers older than
+      # worker-utils 1.3.2. Forward-proxy requests reach only the worker
+      # callback path.
+      enabled: false
+  # replicaCount defaults to the chart value (2).
+  # replicaCount: 2
+  # Workers in another cluster reach Envoy through this Service, so expose it,
+  # for example as a LoadBalancer, and point *.<workerDomain> and
+  # global.workerEndpoints.invocationProxyURL at its address. Passed to the
+  # chart as is.
+  # service:
+  #   type: LoadBalancer
+  # The chart defaults to the upstream image, docker.io/envoyproxy/envoy.
+  # Set registry and repository together to use a mirror:
+  # image:
+  #   registry: <your-registry>
+  #   repository: <your-repository>/envoy
+  #   tag: v1.40.1
 
 # Control-plane high availability.
 # global.yaml.gotmpl maps mode onto chart values (replicaCount, affinity, zone

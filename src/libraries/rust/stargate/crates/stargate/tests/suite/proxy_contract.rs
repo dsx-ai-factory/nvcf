@@ -37,7 +37,7 @@ use pylon_lib::{
     CurrentModelStats, InferenceServerRegistrationClient, InferenceServerRegistrationConfig,
     PylonQueueMismatchRetryConfig, PylonRuntimeState, QuicHttpTunnelConfig, QuicHttpTunnelHandle,
     RequestObservation, RequestObservationEndpoint, RequestObservationState,
-    TunnelTransportProtocol, start_quic_http_tunnel,
+    TunnelTransportProtocol, UpstreamBackend, start_quic_http_tunnel,
 };
 use stargate::proxy::ProxyRetryConfig;
 use stargate::routing::RoutingTargetKey;
@@ -374,11 +374,7 @@ async fn start_capturing_chat_backend(retryable_rejection: bool) -> CapturingCha
                     bodies.lock().expect("body capture poisoned").push(body);
                     if retryable_rejection {
                         let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-                        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                        response.headers_mut().insert(
-                            HeaderName::from_static("x-stargate-upstream-retryable"),
-                            HeaderValue::from_static("true"),
-                        );
+                        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                         return response;
                     }
                     Response::builder()
@@ -396,6 +392,42 @@ async fn start_capturing_chat_backend(retryable_rejection: bool) -> CapturingCha
         axum::serve(listener, app).await.unwrap();
     });
     CapturingChatBackend { addr, hits, bodies }
+}
+
+/// A model server that answers every chat request with one error head and
+/// body, the way a Dynamo frontend refuses work before any output.
+async fn start_status_backend(status: StatusCode, body: &'static str) -> CapturingChatBackend {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_app = hits.clone();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |req: Request| {
+                let hits = hits_for_app.clone();
+                async move {
+                    let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut response = Response::builder().status(status);
+                    if !body.is_empty() {
+                        response = response.header("content-type", "application/json");
+                    }
+                    response
+                        .body(Body::from(body))
+                        .expect("error response should build")
+                }
+            }),
+        )
+        .route("/health", get(|| async { "ok" }));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    CapturingChatBackend {
+        addr,
+        hits,
+        bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+    }
 }
 
 fn make_stargate_runtime_with_retry(
@@ -599,6 +631,44 @@ impl ProxyFixture {
         self.own_tunnel(tunnel);
     }
 
+    /// Registers one Pylon instance as its own cluster, as production Pylons
+    /// do, in front of a model server that always answers `status`.
+    async fn add_status_backend(
+        &mut self,
+        instance_id: &str,
+        model: &str,
+        queued_input_size: u64,
+        upstream_backend: UpstreamBackend,
+        status: StatusCode,
+        body: &'static str,
+    ) -> CapturingChatBackend {
+        let runtime = active_runtime(model);
+        set_model_queue(&runtime, model, queued_input_size);
+        let backend = start_status_backend(status, body).await;
+        let mut tunnel_config = QuicHttpTunnelConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            format!("http://{}", backend.addr),
+        );
+        tunnel_config.forwarding.runtime_state = runtime.clone();
+        tunnel_config.forwarding.upstream_backend = upstream_backend;
+        let tunnel = start_quic_http_tunnel(tunnel_config)
+            .await
+            .expect("status backend tunnel failed to start");
+        self.register(
+            active_registration_config_with_state(
+                self.grpc_addr,
+                instance_id,
+                instance_id,
+                format!("quic://{}", tunnel.listen_addr()),
+                format!("http://{}", backend.addr),
+                runtime,
+            ),
+            "status backend registration failed",
+        );
+        self.own_tunnel(tunnel);
+        backend
+    }
+
     async fn add_capturing_direct_backend(
         &mut self,
         backend_id: &str,
@@ -719,11 +789,7 @@ async fn start_retryable_rejecting_inst() -> (std::net::SocketAddr, String, Quic
             "/v1/chat/completions",
             post(|_req: Request| async move {
                 let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                response.headers_mut().insert(
-                    HeaderName::from_static("x-stargate-upstream-retryable"),
-                    HeaderValue::from_static("true"),
-                );
+                *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
                 response
             }),
         )
@@ -1375,7 +1441,7 @@ async fn exercise_reverse_retryable_rejection(protocol: TunnelTransportProtocol)
         &model,
         &reject_id,
         &success_id,
-        "upstream_admission_rejected",
+        "upstream_unavailable",
         2.0,
     );
 
@@ -1670,6 +1736,14 @@ async fn terminal_queue_mismatch_is_sanitized_across_tunnel_protocols_and_endpoi
                 (
                     "/v1/embeddings",
                     serde_json::json!({"model": model, "input": "hello"}),
+                ),
+                (
+                    "/v1/decisions",
+                    serde_json::json!({"model": model, "input": "hello", "questions": []}),
+                ),
+                (
+                    "/v1/systemone",
+                    serde_json::json!({"model": model, "state": "hello", "questions": {}}),
                 ),
             ] {
                 let body = Bytes::from(body.to_string());
@@ -2584,7 +2658,11 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
         .await
         .expect("budget-limited request failed");
 
-        if budget_limited_resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        // Only a response from the rejecting backend counts: Stargate also
+        // answers 503 while no backend is ready.
+        if budget_limited_resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            && reject_backend.hits() > 0
+        {
             assert!(
                 budget_limited_resp
                     .headers()
@@ -2600,7 +2678,7 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
             );
             assert_metric_sample(
                 &metrics,
-                r#"stargate_proxy_retry_exhausted_total{model="retry-model",reason="upstream_admission_rejected",routing_key=""}"#,
+                r#"stargate_proxy_retry_exhausted_total{model="retry-model",reason="upstream_unavailable",routing_key=""}"#,
                 false,
                 "budget exhaustion should not also count upstream reason",
             );
@@ -2648,11 +2726,11 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
     let metrics = fixture.metrics();
     for (sample, context) in [
         (
-            r#"stargate_proxy_retries_total{model="retry-model",reason="upstream_admission_rejected",routing_key=""}"#,
+            r#"stargate_proxy_retries_total{model="retry-model",reason="upstream_unavailable",routing_key=""}"#,
             "missing retry counter",
         ),
         (
-            r#"stargate_proxy_attempts_total{inference_server_id="retry-reject",model="retry-model",result="upstream_429",routing_key=""}"#,
+            r#"stargate_proxy_attempts_total{inference_server_id="retry-reject",model="retry-model",result="upstream_503",routing_key=""}"#,
             "missing rejecting attempt counter",
         ),
         (
@@ -2660,7 +2738,7 @@ async fn retryable_upstream_rejection_retries_alternate_backend() {
             "missing success attempt counter",
         ),
         (
-            r#"stargate_requests_total{inference_server_id="retry-reject",model="retry-model",routing_key="",status="429"} 1"#,
+            r#"stargate_requests_total{inference_server_id="retry-reject",model="retry-model",routing_key="",status="503"} 1"#,
             "hidden retryable attempt should not increment request counter",
         ),
         (
@@ -3108,7 +3186,7 @@ async fn chunked_replay_overflow_records_413_request_metric() {
         let metrics = fixture.metrics();
         if resp.status() == StatusCode::PAYLOAD_TOO_LARGE
             && metrics.contains(
-                r#"stargate_proxy_attempts_total{inference_server_id="chunk-overflow-reject",model="chunk-overflow-model",result="upstream_429",routing_key=""}"#,
+                r#"stargate_proxy_attempts_total{inference_server_id="chunk-overflow-reject",model="chunk-overflow-model",result="upstream_503",routing_key=""}"#,
             )
         {
             assert!(
@@ -3133,9 +3211,31 @@ async fn chunked_replay_overflow_records_413_request_metric() {
 #[tokio::test]
 async fn retryable_single_backend_exhausts_eligible_backends() {
     let mut fixture = ProxyFixture::start("test-sg-retry-single-exhaust").await;
-    fixture
-        .add_retryable_backend("single-reject", "single-exhaust-model")
-        .await;
+    // The rejection must be Pylon's own. For a model server error, the client
+    // gets the model server response when no cluster is left.
+    let (upstream_addr, upstream) = start_health_only_backend().await;
+    let mut config = QuicHttpTunnelConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        format!("http://{upstream_addr}"),
+    );
+    config.forwarding.retry.local_connect_failures_retryable = true;
+    let tunnel = start_quic_http_tunnel(config)
+        .await
+        .expect("single reject tunnel failed to start");
+    fixture.register(
+        active_registration_config(
+            fixture.grpc_addr,
+            "single-reject",
+            format!("quic://{}", tunnel.listen_addr()),
+            format!("http://{upstream_addr}"),
+            "single-exhaust-model",
+        ),
+        "registration failed",
+    );
+    fixture.own_tunnel(tunnel);
+    fixture.wait_for_clusters("single-exhaust-model", 1).await;
+    upstream.abort();
+    let _ = upstream.await;
 
     let metrics = poll_until(
         "single retryable backend should exhaust eligible backends",
@@ -3148,7 +3248,7 @@ async fn retryable_single_backend_exhausts_eligible_backends() {
                 let metrics = metrics_text(registry);
                 (response.status() == StatusCode::SERVICE_UNAVAILABLE
                     && metrics.contains(
-                        r#"stargate_proxy_attempts_total{inference_server_id="single-reject",model="single-exhaust-model",result="upstream_429",routing_key=""}"#,
+                        r#"stargate_proxy_attempts_total{inference_server_id="single-reject",model="single-exhaust-model",result="upstream_503",routing_key=""}"#,
                     ))
                 .then_some(metrics)
             }
@@ -3163,6 +3263,164 @@ async fn retryable_single_backend_exhausts_eligible_backends() {
     );
 
     fixture.shutdown().await;
+}
+
+// Error bodies as a Dynamo frontend returns them.
+const DYNAMO_OVERLOADED_BODY: &str = r#"{"error":{"message":"Service temporarily overloaded","type":"overloaded_error","param":null,"code":"overloaded_error"}}"#;
+const DYNAMO_SERVER_ERROR_BODY: &str = r#"{"error":{"message":"Failed to generate completions","type":"server_error","param":null,"code":null}}"#;
+const DYNAMO_NOT_READY_BODY: &str =
+    r#"{"error":{"message":"Model `backend-error-model` is not ready to serve requests yet."}}"#;
+const DYNAMO_NOT_FOUND_BODY: &str =
+    r#"{"message":"Model not found","type":"Not Found","code":404}"#;
+const GENERIC_ERROR_BODY: &str = r#"{"error":"upstream failure"}"#;
+
+#[tokio::test]
+async fn backend_error_before_output_is_retried_on_an_untried_instance() {
+    use UpstreamBackend::{Dynamo, Passthrough};
+    // (label, Pylon backend mode, status of the failing instance, its body,
+    // retry reason when the healthy instance serves the request)
+    #[rustfmt::skip] // one case per line
+    let cases: &[(&str, UpstreamBackend, u16, &str, Option<&str>)] = &[
+        ("overloaded_529", Dynamo, 529, DYNAMO_OVERLOADED_BODY, Some("upstream_overloaded")),
+        ("not_ready_503", Dynamo, 503, DYNAMO_NOT_READY_BODY, Some("upstream_unavailable")),
+        // Dynamo's answer once the model has left its registry.
+        ("model_unregistered_404", Dynamo, 404, "", Some("upstream_model_unregistered")),
+        // Only a Dynamo frontend gives the empty 404 that meaning.
+        ("passthrough_empty_404", Passthrough, 404, "", None),
+        ("model_not_found_404", Dynamo, 404, DYNAMO_NOT_FOUND_BODY, None),
+        // A 500 can come from the request itself.
+        ("server_error_500", Dynamo, 500, DYNAMO_SERVER_ERROR_BODY, None),
+        ("bad_gateway_502", Dynamo, 502, GENERIC_ERROR_BODY, None),
+        ("gateway_timeout_504", Dynamo, 504, GENERIC_ERROR_BODY, None),
+        ("rate_limited_429", Dynamo, 429, GENERIC_ERROR_BODY, None),
+    ];
+    let model = "backend-error-model";
+    for &(label, upstream_backend, status, body, retry_reason) in cases {
+        let status = StatusCode::from_u16(status).unwrap();
+        let mut fixture = ProxyFixture::start(&format!("test-sg-backend-error-{label}")).await;
+        // The failing instance looks idle, so it keeps attracting first attempts.
+        let failing = fixture
+            .add_status_backend("inst-a", model, 0, upstream_backend, status, body)
+            .await;
+        let healthy_runtime = active_runtime(model);
+        set_model_queue(&healthy_runtime, model, 1);
+        fixture
+            .add_dummy_backend("inst-b", "inst-b", model, healthy_runtime)
+            .await;
+        fixture.wait_for_clusters(model, 2).await;
+
+        let mut failures = Vec::new();
+        for seq in 0..10 {
+            let response = fixture
+                .chat_request(model, &format!("req-{label}-{seq}"))
+                .send()
+                .await
+                .expect("request failed");
+            if response.status() != StatusCode::OK {
+                failures.push(response.status());
+            }
+            let _ = response.bytes().await;
+        }
+        assert!(
+            failing.hits() > 0,
+            "{label}: failing instance got no traffic"
+        );
+        if let Some(retry_reason) = retry_reason {
+            assert!(failures.is_empty(), "{label}: client saw {failures:?}");
+            assert_eq!(
+                metric_sum_value(
+                    &fixture.metrics(),
+                    "stargate_proxy_retries_total",
+                    &[&format!(r#"reason="{retry_reason}""#)],
+                ),
+                failing.hits() as f64,
+                "{label}"
+            );
+        } else {
+            assert_eq!(failures.len(), failing.hits(), "{label}: {failures:?}");
+            assert!(
+                failures.iter().all(|failure| *failure == status),
+                "{label}: {failures:?}"
+            );
+        }
+        fixture.shutdown().await;
+    }
+}
+
+fn dynamo_error_body(status: u16) -> &'static str {
+    match status {
+        529 => DYNAMO_OVERLOADED_BODY,
+        503 => DYNAMO_NOT_READY_BODY,
+        500 => DYNAMO_SERVER_ERROR_BODY,
+        _ => GENERIC_ERROR_BODY,
+    }
+}
+
+#[tokio::test]
+async fn backend_errors_on_every_instance_stop_at_the_retry_limits() {
+    // (label, status of each instance, instances tried, whether the client gets the router's overload response)
+    let cases: &[(&str, &[u16], usize, bool)] = &[
+        ("single_instance_529", &[529], 1, true),
+        ("two_instances_529", &[529, 529], 2, true),
+        // The request retry limit is 2.
+        ("four_instances_529", &[529, 529, 529, 529], 3, true),
+        ("single_instance_503", &[503], 1, false),
+        // A 500 is not retried.
+        ("two_instances_500", &[500, 500], 1, false),
+        // Not every instance was overloaded, so the last backend response is relayed.
+        ("mixed_503_and_529", &[503, 529], 2, false),
+    ];
+    let model = "backend-error-model";
+    for &(label, statuses, expected_tried, is_overload_response) in cases {
+        let mut fixture = ProxyFixture::start(&format!("test-sg-backend-errors-{label}")).await;
+        let mut backends = Vec::new();
+        for (index, status) in statuses.iter().enumerate() {
+            backends.push(
+                fixture
+                    .add_status_backend(
+                        &format!("inst-{index}"),
+                        model,
+                        0,
+                        UpstreamBackend::Dynamo,
+                        StatusCode::from_u16(*status).unwrap(),
+                        dynamo_error_body(*status),
+                    )
+                    .await,
+            );
+        }
+        fixture.wait_for_clusters(model, statuses.len()).await;
+
+        let response = fixture
+            .chat_request(model, &format!("req-{label}"))
+            .send()
+            .await
+            .expect("request failed");
+        let status = response.status();
+        let error_code = response
+            .headers()
+            .get("x-stargate-error-code")
+            .map(|value| value.to_str().unwrap().to_owned());
+        let body = response.text().await.unwrap();
+        if is_overload_response {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{label}");
+            assert_eq!(error_code.as_deref(), Some("overloaded_error"), "{label}");
+        } else {
+            assert!(statuses.contains(&status.as_u16()), "{label}: {status}");
+            assert_eq!(
+                error_code, None,
+                "{label}: backend response should be relayed unchanged"
+            );
+            assert_eq!(body, dynamo_error_body(status.as_u16()), "{label}");
+        }
+        let hits: Vec<usize> = backends.iter().map(CapturingChatBackend::hits).collect();
+        assert_eq!(
+            hits.iter().sum::<usize>(),
+            expected_tried,
+            "{label}: {hits:?}"
+        );
+        assert!(hits.iter().all(|hits| *hits <= 1), "{label}: {hits:?}");
+        fixture.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -3382,7 +3640,7 @@ async fn retryable_application_errors_preserve_response_after_retries_stop() {
                 "127.0.0.1:0".parse().unwrap(),
                 format!("http://{upstream_addr}"),
             );
-            config.forwarding.retry.require_upstream_retry_header = false;
+            config.forwarding.retry.retryable_upstream_status_codes = vec![status];
             let tunnel = start_quic_http_tunnel(config)
                 .await
                 .expect("start application error tunnel");
@@ -3423,12 +3681,12 @@ async fn retryable_application_errors_preserve_response_after_retries_stop() {
             assert_delta!(
                 &before, &after, "stargate_proxy_retries_total", if budget.is_some() { 0.0 } else { 1.0 };
                 r#"model="application-error-model""#,
-                r#"reason="upstream_admission_rejected""#
+                r#"reason="upstream_unavailable""#
             );
             let reason = if budget.is_some() {
                 "retry_budget_exhausted"
             } else {
-                "upstream_admission_rejected"
+                "upstream_unavailable"
             };
             assert_delta!(
                 &before, &after, "stargate_proxy_retry_exhausted_total", 1.0;
@@ -3449,12 +3707,13 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
         ..ProxyRetryConfig::default()
     };
     let mut fixture = ProxyFixture::start_with_retry("test-sg-request-retry-limit", retry).await;
-    fixture
-        .add_retryable_backend("retry-limit-a", "retry-limit-model")
-        .await;
-    fixture
-        .add_retryable_backend("retry-limit-b", "retry-limit-model")
-        .await;
+    // The third backend stays untried, so the retry limit ends the request.
+    for backend_id in ["retry-limit-a", "retry-limit-b", "retry-limit-c"] {
+        fixture
+            .add_retryable_backend(backend_id, "retry-limit-model")
+            .await;
+    }
+    fixture.wait_for_clusters("retry-limit-model", 3).await;
 
     let response = poll_until(
         "request retry limit should preserve the upstream rejection",
@@ -3463,7 +3722,7 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
             let request = fixture.chat_request("retry-limit-model", "req-retry-limit");
             async move {
                 let response = request.send().await.expect("request failed");
-                (response.status() == StatusCode::TOO_MANY_REQUESTS).then_some(response)
+                (response.status() == StatusCode::SERVICE_UNAVAILABLE).then_some(response)
             }
         },
     )
@@ -3471,12 +3730,19 @@ async fn request_retry_limit_returns_last_retryable_rejection() {
     assert!(response.headers().get("x-stargate-retryable").is_none());
     let body: serde_json::Value = response.json().await.expect("read upstream rejection body");
     assert_eq!(body, serde_json::json!({"error": "queue full"}));
-    assert_metric_sample(
-        &fixture.metrics(),
-        r#"stargate_proxy_retry_exhausted_total{model="retry-limit-model",reason="upstream_admission_rejected",routing_key=""} 1"#,
-        true,
-        "missing request retry exhausted metric",
-    );
+    let metrics = fixture.metrics();
+    for (sample, context) in [
+        (
+            r#"stargate_proxy_retries_total{model="retry-limit-model",reason="upstream_unavailable",routing_key=""} 1"#,
+            "the request should retry once",
+        ),
+        (
+            r#"stargate_proxy_retry_exhausted_total{model="retry-limit-model",reason="upstream_unavailable",routing_key=""} 1"#,
+            "missing request retry exhausted metric",
+        ),
+    ] {
+        assert_metric_sample(&metrics, sample, true, context);
+    }
 
     fixture.shutdown().await;
 }
@@ -3570,17 +3836,21 @@ async fn submitted_post_is_not_replayed_after_header_timeout() {
     let model = "review-duplicate-post";
     let hits = Arc::new(AtomicUsize::new(0));
     let backend_hits = hits.clone();
+    let slow_completed = Arc::new(AtomicUsize::new(0));
+    let backend_slow_completed = slow_completed.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = listener.local_addr().unwrap();
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(move |req: Request| {
             let hits = backend_hits.clone();
+            let slow_completed = backend_slow_completed.clone();
             async move {
                 axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap();
                 let prior = hits.fetch_add(1, Ordering::SeqCst);
                 if prior == 0 {
                     tokio::time::sleep(Duration::from_millis(900)).await;
+                    slow_completed.fetch_add(1, Ordering::SeqCst);
                 }
                 Response::builder()
                     .header("content-type", "text/event-stream")
@@ -3651,6 +3921,9 @@ async fn submitted_post_is_not_replayed_after_header_timeout() {
     let status = response.status();
     let body = response.text().await.unwrap();
     let accepted = hits.load(Ordering::SeqCst);
+    // Outlast the slow backend: the timed-out request must have been cancelled.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let slow_completed = slow_completed.load(Ordering::SeqCst);
     let ambiguous = fixture
         .handle
         .metrics()
@@ -3661,10 +3934,14 @@ async fn submitted_post_is_not_replayed_after_header_timeout() {
     fixture.shutdown().await;
     backend_task.abort();
     let _ = backend_task.await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         accepted, 1,
         "one POST was accepted {accepted} times; final status={status}, body={body}"
+    );
+    assert_eq!(
+        slow_completed, 0,
+        "the backend request kept running after the header timeout"
     );
     let ambiguous = ambiguous.expect("ambiguous delivery counter missing");
     assert_eq!(ambiguous.get_metric().len(), 1);
@@ -3847,6 +4124,444 @@ async fn exercise_native_messages_contract(protocol: TunnelTransportProtocol, re
     }
     fixture.shutdown().await;
     backend_task.abort();
+}
+
+const DECISION_ROUTES: [(&str, &str); 2] = [
+    ("/v1/decisions", "decisions-model"),
+    ("/v1/systemone", "systemone-model"),
+];
+const DECISION_OK: &str =
+    r#"{"model":"m","answers":[{"type":"predicate","name":"q","probability":0.99}]}"#;
+const DECISION_RATE_LIMITED: &str =
+    r#"{"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limited"}}"#;
+const DECISION_FASTAPI_400: &str =
+    r#"{"detail":[{"loc":["body","questions"],"msg":"field required","type":"missing"}]}"#;
+const DECISION_OPENAI_400: &str = r#"{"error":{"message":"bad question","type":"invalid_request_error","param":"questions","code":"invalid_question"}}"#;
+const DECISION_MAX_BODY: usize = 32 << 20;
+
+type DecisionCapture = (String, axum::http::HeaderMap, Bytes);
+
+struct DecisionBackend {
+    addr: std::net::SocketAddr,
+    hits: Arc<AtomicUsize>,
+    captures: tokio::sync::mpsc::UnboundedReceiver<DecisionCapture>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_decision_backend(path: &'static str) -> DecisionBackend {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (capture_tx, captures) = tokio::sync::mpsc::unbounded_channel();
+    let handler_hits = hits.clone();
+    let app = Router::new()
+        .route(
+            path,
+            post(move |req: Request| {
+                let capture_tx = capture_tx.clone();
+                let hits = handler_hits.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body = axum::body::to_bytes(body, DECISION_MAX_BODY).await.unwrap();
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let query = parts.uri.query().unwrap_or_default().to_string();
+                    capture_tx
+                        .send((parts.uri.to_string(), parts.headers, body))
+                        .unwrap();
+                    let mut response =
+                        Response::builder().header("content-type", "application/json");
+                    let (status, text) = if query.contains("mode=rate_limit") {
+                        response = response.header("retry-after", "7");
+                        (StatusCode::TOO_MANY_REQUESTS, DECISION_RATE_LIMITED)
+                    } else if query.contains("mode=fastapi_400") {
+                        (StatusCode::BAD_REQUEST, DECISION_FASTAPI_400)
+                    } else if query.contains("mode=openai_400") {
+                        (StatusCode::BAD_REQUEST, DECISION_OPENAI_400)
+                    } else {
+                        (StatusCode::OK, DECISION_OK)
+                    };
+                    response.status(status).body(Body::from(text)).unwrap()
+                }
+            }),
+        )
+        .route("/health", get(|| async { "ok" }));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    DecisionBackend {
+        addr,
+        hits,
+        captures,
+        task,
+    }
+}
+
+async fn register_http_backend(
+    fixture: &mut ProxyFixture,
+    id: &str,
+    model: &str,
+    addr: std::net::SocketAddr,
+    protocol: TunnelTransportProtocol,
+    reverse: bool,
+) {
+    let runtime_state = active_runtime(model);
+    if reverse {
+        fixture.register(
+            reverse_registration_config_for_protocol(
+                fixture.grpc_addr,
+                id,
+                id,
+                format!("http://{addr}"),
+                protocol,
+                runtime_state,
+            ),
+            "reverse registration failed",
+        );
+    } else {
+        let mut config =
+            QuicHttpTunnelConfig::new("127.0.0.1:0".parse().unwrap(), format!("http://{addr}"));
+        config.tunnel_protocol = protocol;
+        config.forwarding.runtime_state = runtime_state.clone();
+        let tunnel = start_quic_http_tunnel(config).await.unwrap();
+        fixture.register(
+            active_registration_config_with_state(
+                fixture.grpc_addr,
+                id,
+                id,
+                format!("quic://{}", tunnel.listen_addr()),
+                format!("http://{addr}"),
+                runtime_state,
+            ),
+            "direct registration failed",
+        );
+        fixture.own_tunnel(tunnel);
+    }
+    fixture.wait_for_clusters(model, 1).await;
+}
+
+fn large_image_body(model: &str, target_bytes: usize) -> Vec<u8> {
+    let image = "QUJD".repeat(target_bytes / 4);
+    serde_json::to_vec(&serde_json::json!({
+        "model": model,
+        "input": [{"type": "input_image", "image_url": format!("data:image/png;base64,{image}")}],
+        "questions": [{"type": "predicate", "name": "q", "text": "is it a cat?"}],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn decision_routes_pass_requests_and_backend_responses_through() {
+    for protocol in [
+        TunnelTransportProtocol::RawQuic,
+        TunnelTransportProtocol::Http3,
+        TunnelTransportProtocol::WebTransport,
+    ] {
+        for reverse in [false, true] {
+            for (path, model) in DECISION_ROUTES {
+                exercise_decision_route_contract(protocol, reverse, path, model).await;
+            }
+        }
+    }
+}
+
+async fn exercise_decision_route_contract(
+    protocol: TunnelTransportProtocol,
+    reverse: bool,
+    path: &'static str,
+    model: &str,
+) {
+    let case = if reverse {
+        TunnelTestCase::reverse(protocol)
+    } else {
+        TunnelTestCase::direct(protocol)
+    };
+    let label = format!("{path} {protocol:?} reverse={reverse}");
+    let id = format!(
+        "decision-{}-{reverse}-{}",
+        case.protocol_label(),
+        &path[4..]
+    );
+    let (mut fixture, _) = ProxyFixture::start_for_tunnel_case(&id, case).await;
+    let mut backend = start_decision_backend(path).await;
+    register_http_backend(&mut fixture, &id, model, backend.addr, protocol, reverse).await;
+    let client = reqwest::Client::new();
+
+    // Vendor headers reach the backend and a small body is byte-identical.
+    let small = serde_json::to_vec(&serde_json::json!({
+        "model": model, "input": "hello", "questions": [{"type": "predicate", "name": "q"}],
+    }))
+    .unwrap();
+    let response = proxy_request(&client, fixture.http_addr, path, model, "req-decision-ok")
+        .header("typesafe-danger-zone-images", "true")
+        .header("x-vendor-test", "v")
+        .body(small.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{label}");
+    assert_eq!(response.text().await.unwrap(), DECISION_OK, "{label}");
+    let (captured_path, headers, body) = backend.captures.recv().await.unwrap();
+    assert_eq!(captured_path, path, "{label}");
+    assert_eq!(body.as_ref(), small, "{label}");
+    assert_eq!(headers["typesafe-danger-zone-images"], "true", "{label}");
+    assert_eq!(headers["x-vendor-test"], "v", "{label}");
+
+    // A base64 image sized request arrives unchanged.
+    let large = large_image_body(model, 13 * 1024 * 1024);
+    let response = proxy_request(
+        &client,
+        fixture.http_addr,
+        path,
+        model,
+        "req-decision-large",
+    )
+    .header("typesafe-danger-zone-images", "true")
+    .body(large.clone())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{label}");
+    let (_, headers, body) = backend.captures.recv().await.unwrap();
+    assert_eq!(body.len(), large.len(), "{label}");
+    assert!(body.as_ref() == large.as_slice(), "{label}: body changed");
+    assert_eq!(headers["typesafe-danger-zone-images"], "true", "{label}");
+
+    // Backend errors reach the client unchanged and are not retried.
+    for (mode, status, retry_after, expected) in [
+        (
+            "rate_limit",
+            StatusCode::TOO_MANY_REQUESTS,
+            Some("7"),
+            DECISION_RATE_LIMITED,
+        ),
+        (
+            "fastapi_400",
+            StatusCode::BAD_REQUEST,
+            None,
+            DECISION_FASTAPI_400,
+        ),
+        (
+            "openai_400",
+            StatusCode::BAD_REQUEST,
+            None,
+            DECISION_OPENAI_400,
+        ),
+    ] {
+        let response = proxy_request(
+            &client,
+            fixture.http_addr,
+            &format!("{path}?mode={mode}"),
+            model,
+            "req-decision-error",
+        )
+        .body(small.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), status, "{label} {mode}");
+        assert_eq!(
+            response_header(&response, "retry-after"),
+            retry_after,
+            "{label} {mode}"
+        );
+        assert_eq!(response.text().await.unwrap(), expected, "{label} {mode}");
+        backend.captures.recv().await.unwrap();
+    }
+    assert_eq!(
+        backend.hits.load(Ordering::SeqCst),
+        5,
+        "{label}: each request must reach the backend exactly once"
+    );
+
+    fixture.shutdown().await;
+    backend.task.abort();
+}
+
+#[tokio::test]
+async fn decision_routes_enforce_required_headers_without_upstream_call() {
+    let mut fixture = ProxyFixture::start("test-sg-decision-headers").await;
+    for (path, model) in DECISION_ROUTES {
+        let backend = start_decision_backend(path).await;
+        register_http_backend(
+            &mut fixture,
+            &format!("decision-headers-{}", &path[4..]),
+            model,
+            backend.addr,
+            TunnelTransportProtocol::RawQuic,
+            false,
+        )
+        .await;
+        for missing in ["x-model", "x-input-tokens", "x-request-id"] {
+            let mut request = reqwest::Client::new()
+                .post(format!("http://{}{path}", fixture.http_addr))
+                .header("content-type", "application/json");
+            for (name, value) in [
+                ("x-model", model),
+                ("x-input-tokens", "1"),
+                ("x-request-id", "req-decision-headers"),
+            ] {
+                if name != missing {
+                    request = request.header(name, value);
+                }
+            }
+            let response = request
+                .body(format!(r#"{{"model":"{model}","input":"hi"}}"#))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{path} without {missing}"
+            );
+            assert_eq!(
+                response_header(&response, "x-stargate-error-code"),
+                Some("invalid_request"),
+                "{path} without {missing}"
+            );
+        }
+        assert_eq!(
+            backend.hits.load(Ordering::SeqCst),
+            0,
+            "{path}: upstream must not run when a required header is missing"
+        );
+        backend.task.abort();
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn decision_routes_reject_content_length_over_replay_limit_with_413() {
+    let mut fixture = ProxyFixture::start("test-sg-decision-413").await;
+    for (path, model) in DECISION_ROUTES {
+        let backend = start_decision_backend(path).await;
+        register_http_backend(
+            &mut fixture,
+            &format!("decision-413-{}", &path[4..]),
+            model,
+            backend.addr,
+            TunnelTransportProtocol::RawQuic,
+            false,
+        )
+        .await;
+        // Send only the head of a request that declares a body over the default
+        // 64 MiB replay limit; the proxy must answer before any body is sent.
+        let declared = 64 * 1024 * 1024 + 1;
+        let mut stream = tokio::net::TcpStream::connect(fixture.http_addr)
+            .await
+            .unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nx-model: {model}\r\nx-request-id: req-413\r\nx-input-tokens: 1\r\ncontent-type: application/json\r\ncontent-length: {declared}\r\n\r\n",
+            fixture.http_addr
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, head.as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+        )
+        .await
+        .expect("413 response timed out")
+        .unwrap();
+        let text = String::from_utf8_lossy(&buf[..read]);
+        assert!(text.starts_with("HTTP/1.1 413"), "{path}: got {text}");
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("x-stargate-error-code: request_too_large"),
+            "{path}: got {text}"
+        );
+        assert_eq!(backend.hits.load(Ordering::SeqCst), 0, "{path}");
+        backend.task.abort();
+    }
+    fixture.shutdown().await;
+}
+
+/// A backend that answers every request with a closing 200 until the returned
+/// task is aborted. Closing each connection keeps Pylon from reusing a pooled
+/// connection once the backend is gone.
+async fn start_health_only_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok",
+                )
+                .await;
+            });
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn decision_routes_mark_pylon_errors_when_the_backend_is_down() {
+    let mut fixture = ProxyFixture::start("test-sg-decision-backend-down").await;
+    for (path, model) in DECISION_ROUTES {
+        let (addr, backend) = start_health_only_backend().await;
+        register_http_backend(
+            &mut fixture,
+            &format!("decision-down-{}", &path[4..]),
+            model,
+            addr,
+            TunnelTransportProtocol::RawQuic,
+            false,
+        )
+        .await;
+        // The backend goes down after registration, so Pylon's local connect fails.
+        backend.abort();
+        let _ = backend.await;
+        let response = proxy_request(
+            &reqwest::Client::new(),
+            fixture.http_addr,
+            path,
+            model,
+            "req-decision-down",
+        )
+        .body(format!(r#"{{"model":"{model}","questions":[]}}"#))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(
+            response_header(&response, "x-stargate-error-code"),
+            Some("local_connect_failure"),
+            "{path}"
+        );
+        for internal in ["x-stargate-retryable", "x-stargate-retry-reason"] {
+            assert_eq!(response_header(&response, internal), None, "{path}");
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn decision_routes_unknown_model_carries_stargate_error_code() {
+    let (_, http_addr, handle) = start_stargate("test-sg-decision-unknown").await;
+    for (path, _) in DECISION_ROUTES {
+        let response = proxy_request(
+            &reqwest::Client::new(),
+            http_addr,
+            path,
+            "nonexistent",
+            "req-decision-unknown",
+        )
+        .body(r#"{"model":"nonexistent","input":"hi"}"#)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            response_header(&response, "x-stargate-error-code"),
+            Some("no_eligible_candidates"),
+            "{path}"
+        );
+    }
+    finish_stargate(handle).await;
 }
 
 #[tokio::test]

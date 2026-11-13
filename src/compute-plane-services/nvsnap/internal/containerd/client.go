@@ -26,9 +26,10 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/namespaces"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvsnap/internal/runtime"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/runtime"
 )
 
 const defaultNamespace = "k8s.io"
@@ -130,6 +131,17 @@ func (c *Client) FindContainerByID(ctx context.Context, containerID string) (*ru
 		return nil, fmt.Errorf("%w: load container %s: %w", runtime.ErrNotFound, containerID, err)
 	}
 	return c.containerInfo(ctx, container)
+}
+
+// ContainerSpec returns the OCI spec container id was created with.
+func (c *Client) ContainerSpec(ctx context.Context, id string) (*specs.Spec, error) {
+	ctx = namespaces.WithNamespace(ctx, c.ns)
+
+	container, err := c.client.LoadContainer(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("%w: load container %s: %w", runtime.ErrNotFound, id, err)
+	}
+	return container.Spec(ctx)
 }
 
 // FindContainerByName resolves a container by name or ID.

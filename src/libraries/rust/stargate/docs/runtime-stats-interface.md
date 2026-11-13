@@ -235,7 +235,8 @@ If request stats go stale, volatile output TPS is cleared. Sticky input TPS
 stays until a later valid sample replaces it.
 The maximum is the greatest max-eligible `last_mean_input_tps` published for the
 current model generation. A configured `--initial-input-tps`, engine stats
-stream counters, embeddings samples, and calibration can raise it. An OpenAI
+stream counters, embeddings and decision request samples, and calibration can
+raise it. An OpenAI
 fallback mean raises it only when every request it counts reported uncached
 prompt tokens under the Fallback rules above. Other fallback means update
 `last_mean_input_tps` but not the maximum, because cached input may be counted
@@ -244,8 +245,10 @@ samples, so the mean dilutes one outlier sample. Lower means do not reduce it,
 and generation replacement clears it. It is absent until the first max-eligible
 mean. A backend whose fallback usage never reports cached-token details, such
 as Chat traffic without `include_usage`, or whose traffic is only near-full
-cache hits, never gets a maximum this way. Use `--do-calibration` or `--initial-input-tps` for such
-backends, because default Pulsar ranking requires a maximum (see below).
+cache hits, never gets a maximum this way. Default Pulsar falls back to the
+positive finite last mean while the aggregate maximum is absent. Use
+`--do-calibration` or `--initial-input-tps` to establish a stable maximum for
+such backends. Until then, their ranking weights can change with the mean.
 
 Pylon publishes `pylon_model_max_input_tps` when the maximum is known and removes
 the series when the model is removed or replaced with unknown maximum state.
@@ -292,7 +295,8 @@ does not inflate that gauge.
 ## Mock Defaults
 
 `mock-dynamo` serves the stats stream, OpenAI-compatible
-chat/Responses/embeddings endpoints, and `/kv-cache/stats`. Use
+chat/Responses/embeddings endpoints, the decision routes, and
+`/kv-cache/stats`. Use
 `pylon --engine-stats-stream=off` when a test intentionally exercises OpenAI
 fallback.
 

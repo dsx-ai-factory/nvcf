@@ -22,6 +22,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -40,15 +41,15 @@ import (
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/middleware"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/middleware"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/common/core/types"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/config"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/data_access"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/pkg/codex"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/pkg/testutils"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/common/core/types"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/config"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/data_access"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/pkg/codex"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/pkg/testutils"
 )
 
 // statsUpsertCall records an UpsertStatsV3 / UpsertFilteredStatsV3 invocation for assertions.
@@ -63,6 +64,7 @@ type statsUpsertCall struct {
 
 // Mock DBHandlerV2 for V3 tests
 type mockDBHandlerV3 struct {
+	eventRecords []data_access.EventV3Record
 	storedEvents []struct {
 		namespace string
 		context   string
@@ -169,6 +171,9 @@ func (m *mockDBHandlerV3) GetFilteredStatsV3(ctx context.Context, namespace stri
 }
 
 func (m *mockDBHandlerV3) GetEventsV3(ctx context.Context, namespace, eventContext string) ([]data_access.EventV3Record, error) {
+	if m.eventRecords != nil {
+		return m.eventRecords, nil
+	}
 	// Return mock data based on namespace and context (canonical format)
 	if namespace == "test-namespace" && eventContext == "instance_id=pod-1" {
 		now := time.Now()
@@ -221,6 +226,14 @@ func (m *mockDBHandlerV3) ReadDeploymentDeploymentStats(context.Context, uuid.UU
 func (m *mockDBHandlerV3) ListDeploymentInstancesPaginated(ctx context.Context, functionVersionId, deploymentId uuid.UUID, paginationParams data_access.PaginationParams) (data_access.PaginatedInstancesResponse, error) {
 	return data_access.PaginatedInstancesResponse{}, nil
 }
+func (m *mockDBHandlerV3) GetAccountEventsV3(ctx context.Context, namespace, eventContext, ncaID, functionID string) ([]data_access.EventV3Record, error) {
+	return []data_access.EventV3Record{}, nil
+}
+
+func (m *mockDBHandlerV3) GetAccountStatsV3(ctx context.Context, namespace, ncaID, functionID string) ([]data_access.StatsV3Record, error) {
+	return []data_access.StatsV3Record{}, nil
+}
+
 func (m *mockDBHandlerV3) Close() error {
 	return nil
 }
@@ -1352,6 +1365,72 @@ func TestGetEventsV3_Success(t *testing.T) {
 	assert.NotZero(t, response.Events[0].Timestamp)
 	assert.NotZero(t, response.Events[0].CreatedAt)
 	assert.NotZero(t, response.Events[0].UpdatedAt)
+}
+
+func TestGetEventsV3_DecodesStoredCloudEventBody(t *testing.T) {
+	const payload = `{"instanceType":"GPU","logMessage":"container in restart loop\nretrying","sequence":9007199254740993}`
+	ce := makeCloudEvent(t, "event-1", "InstanceDestroyed", "pod-1", time.Now())
+	require.NoError(t, ce.SetData(cloudevents.ApplicationJSON, json.RawMessage(payload)))
+	event, err := extractCloudEvent(context.Background(), ce)
+	require.NoError(t, err)
+
+	// This is also the representation of existing Cassandra records.
+	var stored EventDetails
+	require.NoError(t, json.Unmarshal(event.DetailsJSON, &stored))
+	assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(payload)), stored.Body)
+	db := &mockDBHandlerV3{eventRecords: []data_access.EventV3Record{{
+		EventName: event.EventName, Source: event.Source,
+		Details: event.DetailsJSON, Timestamp: event.Timestamp,
+	}}}
+	logger := testutils.InitTestLogger(t)
+	server := NewServer(Connections{DbHandlerV2: db}, logger, nil, "test",
+		&config.HTTPClientConfig{}, config.PaginationConfig{}, config.StatsConfig{})
+	req := httptest.NewRequest(http.MethodGet, "/v3/ledger/namespace/test-namespace/events?instance_id=pod-1", nil)
+	ctx := context.WithValue(req.Context(), logging.LoggerKey, logging.NewTraceLogger(req.Context(), logger))
+	req = mux.SetURLVars(req.WithContext(ctx), map[string]string{"namespace": "test-namespace"})
+	w := httptest.NewRecorder()
+	server.GetEventsV3(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var response struct {
+		Events []struct {
+			Details struct {
+				Body json.RawMessage `json:"body"`
+			} `json:"details"`
+		} `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Events, 1)
+	assert.JSONEq(t, payload, string(response.Events[0].Details.Body))
+	assert.Contains(t, w.Body.String(), "9007199254740993")
+	assert.NotContains(t, w.Body.String(), base64.StdEncoding.EncodeToString([]byte(payload)))
+}
+
+func TestDecodeEventBodyPreservesOtherPayloads(t *testing.T) {
+	for _, body := range []any{
+		nil,
+		"plain message",
+		`{"already":"json text"}`,
+		base64.StdEncoding.EncodeToString([]byte("plain message")),
+		base64.StdEncoding.EncodeToString([]byte{0xff, 0x00, 0xfe}),
+		base64.StdEncoding.EncodeToString([]byte(`{"invalid":`)),
+		base64.StdEncoding.EncodeToString([]byte(`123`)),
+		base64.StdEncoding.EncodeToString([]byte(`null`)),
+		base64.StdEncoding.EncodeToString([]byte(`"text"`)),
+		map[string]any{"reason": "BackOff"},
+		[]any{"already", "structured"},
+	} {
+		t.Run(fmt.Sprintf("%v", body), func(t *testing.T) {
+			assert.Equal(t, body, decodeEventBody(body))
+		})
+	}
+}
+
+func TestDecodeEventBodyAcceptsJSONArray(t *testing.T) {
+	const payload = ` [{"message":"ready"}] `
+	body := decodeEventBody(base64.StdEncoding.EncodeToString([]byte(payload)))
+	raw, ok := body.(json.RawMessage)
+	require.True(t, ok)
+	assert.JSONEq(t, payload, string(raw))
 }
 
 // TestGetEventsV3_AttributeFilter verifies the optional generic attribute filter

@@ -64,6 +64,8 @@ const (
 	headerStreamTruncateAfter = "X-Load-Tester-Stream-Truncate-After-Chunks"
 	headerMaxConcurrency      = "X-Load-Tester-Max-Concurrency"
 	headerEcho                = "X-Load-Tester-Echo"
+	headerSSELineEnding       = "X-Load-Tester-SSE-Line-Ending"
+	headerSSESplitBytes       = "X-Load-Tester-SSE-Split-Bytes"
 
 	bodyQueueDelay          = "x_load_tester_queue_delay_ms"
 	bodyTTFT                = "x_load_tester_ttft_ms"
@@ -78,6 +80,8 @@ const (
 	bodyStreamTruncateAfter = "x_load_tester_stream_truncate_after_chunks"
 	bodyMaxConcurrency      = "x_load_tester_max_concurrency"
 	bodyEcho                = "x_load_tester_echo"
+	bodySSELineEnding       = "x_load_tester_sse_line_ending"
+	bodySSESplitBytes       = "x_load_tester_sse_split_bytes"
 
 	loadTesterHeaderPrefix = "x-load-tester-"
 )
@@ -102,11 +106,15 @@ type benchmarkTuning struct {
 	StreamErrorAfter    int
 	StreamTruncateAfter int
 	MaxConcurrency      int
+	// SSELineEnding and SSESplitBytes change how the Messages stream is written (see sse_format.go).
+	SSELineEnding string
+	SSESplitBytes int
 }
 
 type serverConfig struct {
 	maxOutputChunks int
 	defaults        controlDefaults
+	body            bodyConfig
 }
 
 // controlDefaults apply to a request that does not set the matching control.
@@ -130,6 +138,8 @@ type benchmarkBodyControls struct {
 	StreamTruncateAfter json.RawMessage `json:"x_load_tester_stream_truncate_after_chunks"`
 	MaxConcurrency      json.RawMessage `json:"x_load_tester_max_concurrency"`
 	Echo                json.RawMessage `json:"x_load_tester_echo"`
+	SSELineEnding       json.RawMessage `json:"x_load_tester_sse_line_ending"`
+	SSESplitBytes       json.RawMessage `json:"x_load_tester_sse_split_bytes"`
 
 	// requestBody is the raw body for routes that support the echo control.
 	requestBody []byte
@@ -351,11 +361,13 @@ func main() {
 		Addr:              ":8000",
 		Handler:           newRouterWithConfig(config),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       config.body.readTimeout,
 		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("listening on %s with max output chunks %d, default TTFT %s, default ITL %s, default chunk %q",
 		server.Addr, config.maxOutputChunks, config.defaults.TTFT, config.defaults.ITL, config.defaults.Chunk)
+	log.Printf("max request bytes %d (decision routes %d), read timeout %s, request log %t",
+		config.body.limit(maxRequestBytes), config.body.limit(decisionMaxRequestBytes), config.body.readTimeout, config.body.log != nil)
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -371,7 +383,7 @@ func defaultServerConfig() serverConfig {
 }
 
 func newRouterWithConfig(config serverConfig) http.Handler {
-	mux := http.NewServeMux()
+	mux := newBodyControlMux(config.body)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/v1/models/", handleModel)
@@ -380,6 +392,8 @@ func newRouterWithConfig(config serverConfig) http.Handler {
 	mux.HandleFunc("/v1/completions", func(w http.ResponseWriter, r *http.Request) { handleCompletions(w, r, config) })
 	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) { handleEmbeddings(w, r, config) })
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { handleMessages(w, r, config) })
+	mux.HandleFunc(decisionRoute, handleDecisions)
+	mux.HandleFunc(systemOneRoute, handleSystemOne)
 	return mux
 }
 
@@ -714,6 +728,20 @@ func resolveBenchmarkTuning(r *http.Request, body benchmarkBodyControls, config 
 		return benchmarkTuning{}, err
 	}
 
+	lineEnding, hasLineEnding, lineEndingName, err := textControl(r, headerSSELineEnding, bodySSELineEnding, body.SSELineEnding)
+	if err != nil {
+		return benchmarkTuning{}, err
+	}
+	if hasLineEnding {
+		if !validSSELineEnding(lineEnding) {
+			return benchmarkTuning{}, fmt.Errorf("%s must be lf, crlf or cr", lineEndingName)
+		}
+		tuning.SSELineEnding = lineEnding
+	}
+	if tuning.SSESplitBytes, _, _, err = integerControl(r, headerSSESplitBytes, bodySSESplitBytes, body.SSESplitBytes, 0, 0, maxOutputBytes); err != nil {
+		return benchmarkTuning{}, err
+	}
+
 	chunkBytes := len(tuning.Chunk)
 	if tuning.ChunkBytes > 0 {
 		chunkBytes = tuning.ChunkBytes
@@ -756,6 +784,11 @@ func loadServerConfig(getenv func(string) string) (serverConfig, error) {
 		}
 		config.defaults.Chunk = value
 	}
+	body, err := loadBodyConfig(getenv)
+	if err != nil {
+		return serverConfig{}, err
+	}
+	config.body = body
 	return config, nil
 }
 
@@ -990,7 +1023,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 
 // decodeJSONBody decodes one JSON object and returns the bytes it was read from.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, destination any) ([]byte, error) {
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestBodyLimit(r, maxRequestBytes)))
 	if err != nil {
 		return nil, err
 	}

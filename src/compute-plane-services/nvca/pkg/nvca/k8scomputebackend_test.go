@@ -29,9 +29,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
@@ -55,19 +55,19 @@ import (
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/icms"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	k8smock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
-	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	nvcafake "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	featureflagmock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
-	fakenodefeatures "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/fake"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
-	nvcatypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/icms"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	k8smock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
+	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	nvcafake "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	featureflagmock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
+	fakenodefeatures "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/fake"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 func init() {
@@ -850,6 +850,42 @@ func Test_translateFunctionLaunchSpecification(t *testing.T) {
 	}
 	assert.Equal(t, []string{"--backend-connectivity=reverse"}, backendConnectivityArgs)
 	assert.Equal(t, []string{"--initial-input-tps=100"}, initialInputTPSArgs)
+
+	// The agent's workload.llmInferenceStopPause reaches the translated LLM pod.
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 90 * time.Second
+	reqLLMPause := reqLLM.DeepCopy()
+	reqLLMPause.Name = "sr-llm-pause"
+	gotArtifactsPause, err := kc.translateFunctionLaunchSpecification(ctx, reqLLMPause)
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 0
+	require.NoError(t, err)
+	pausePod := &corev1.Pod{}
+	for _, artifact := range gotArtifactsPause {
+		if artifact.Type == function.LaunchArtifactTypePod {
+			podBytes, err := base64.StdEncoding.DecodeString(artifact.Specification)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(podBytes, pausePod))
+			break
+		}
+	}
+	require.NotNil(t, pausePod.Spec.TerminationGracePeriodSeconds)
+	assert.Equal(t, int64(150), *pausePod.Spec.TerminationGracePeriodSeconds)
+	for _, c := range pausePod.Spec.Containers {
+		switch c.Name {
+		case "inference":
+			require.NotNil(t, c.Lifecycle)
+			require.NotNil(t, c.Lifecycle.PreStop)
+			require.NotNil(t, c.Lifecycle.PreStop.Exec)
+			assert.Equal(t, []string{"sleep", "90"}, c.Lifecycle.PreStop.Exec.Command)
+		case function.LLMWorkerContainerName:
+			var drain []string
+			for _, env := range c.Env {
+				if env.Name == "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS" {
+					drain = append(drain, env.Value)
+				}
+			}
+			assert.Equal(t, []string{"85000"}, drain)
+		}
+	}
 
 	// Helm chart basic function.
 	msgMetaHelmChart := cmHelmChart.CreationQueueMessageMetadata

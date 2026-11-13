@@ -117,7 +117,9 @@ public class CreateInstanceApiModelConverter {
             builder.functionId(createRequest.getFunctionDetails().getFunctionId())
                     .functionName(createRequest.getFunctionDetails().getFunctionName())
                     .functionVersionId(createRequest.getFunctionDetails().getFunctionVersionId())
-                    .ownerNcaId(createRequest.getFunctionDetails().getOwnerNcaId());
+                    .ownerNcaId(createRequest.getFunctionDetails().getOwnerNcaId())
+                    .terminationGracePeriodDurationForFunction(
+                            createRequest.getFunctionDetails().getTerminationGracePeriodDuration());
 
             if (createRequest.getFunctionDetails().getFunctionType() != null) {
                 builder.functionType(createRequest.getFunctionDetails().getFunctionType());

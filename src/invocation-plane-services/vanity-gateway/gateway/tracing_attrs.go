@@ -32,6 +32,8 @@ const (
 	traceAttrIsShadow                  attribute.Key = "is_shadow"
 	traceAttrModelName                 attribute.Key = "model.name"
 	traceAttrModelStream               attribute.Key = "model.stream"
+	traceAttrRequestBodyMode           attribute.Key = "request.body.mode"
+	traceAttrRequestBodyReason         attribute.Key = "request.body.reason"
 	traceAttrSessionTimeoutSeconds     attribute.Key = "session_timeout.seconds"
 	traceAttrShadowDispatched          attribute.Key = "shadow.dispatched"
 	traceAttrShadowDispatchedCount     attribute.Key = "shadow.dispatched_count"
@@ -41,10 +43,16 @@ const (
 	traceAttrShadowSamplingMethods     attribute.Key = "shadow.sampling_methods"
 	traceAttrShadowTargetModel         attribute.Key = "shadow.target_model"
 	traceAttrShadowTargetModels        attribute.Key = "shadow.target_models"
+	traceAttrUpstreamKind              attribute.Key = "upstream.kind"
 
 	traceAttrValueEndpointAnthropic  = "anthropic"
 	traceAttrValueEndpointOpenAI     = "openai"
 	traceAttrValueEndpointLLMGateway = "llm_gateway"
+	traceAttrValueEndpointDecisions  = "decisions"
+	traceAttrValueEndpointSystemOne  = "systemone"
+
+	traceAttrValueUpstreamLLMGateway = "llm_gateway"
+	traceAttrValueUpstreamDirect     = "direct"
 
 	shadowDroppedReasonBodyReadError    = "body_read_error"
 	shadowDroppedReasonBodyRewriteError = "body_rewrite_error"

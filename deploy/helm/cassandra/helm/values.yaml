@@ -14,6 +14,13 @@
 # limitations under the License.
 
 ---
+# CI indexes the prefilled image settings below. Helm consumes those settings
+# directly; override them with ordinary values files. NVCF builds retain
+# their owning image releases.
+ownedImages:
+  cassandraServer: cassandra.image
+  cassandraMigrations: cassandra.migrations.image
+
 cassandra:
   # Namespace to deploy chart resources. Defaults to the release namespace.
   namespace: ""
@@ -27,11 +34,9 @@ cassandra:
     defaultStorageClass: ""
 
   image:
-    # registry: must be supplied in additional values
-    # repository: must be supplied in additional values
-    registry: ""
-    repository: ""
-    tag: 5.0.9-nv-2.0.5
+    registry: nvcr.io
+    repository: nvidia/nvcf/cassandra
+    tag: 5.0.9-nv-2.0.7
     pullPolicy: IfNotPresent
 
   replicaCount: 3
@@ -74,6 +79,13 @@ cassandra:
     # streaming connection is rejected as version-incompatible even though
     # gossip and schema exchange succeed.
     storage_compatibility_mode: NONE
+    # Secondary-index (SAI) reads are range reads, which the coordinator never
+    # retries on another replica, so a crashed replica stalls them for the whole
+    # timeout. 5s gives healthy range reads room to finish (normal function
+    # lookups take up to about 2s on a small cluster) and leaves about 5s of the
+    # services' 10s driver request timeout for the driver retry policy to retry
+    # on another coordinator. Larger values leave the retry too little time.
+    range_request_timeout: 5000ms
     # Automatic repair (Cassandra 5.0). Values supplied by the Cassandra SME.
     reject_repair_compaction_threshold: 1024
     repair_disk_headroom_reject_ratio: 0.2
@@ -222,11 +234,9 @@ cassandra:
 
   migrations:
     image:
-      # registry: must be supplied in additional values
-      # repository: must be supplied in additional values
-      registry: ""
-      repository: ""
-      tag: 0.18.1
+      registry: nvcr.io
+      repository: nvidia/nvcf/nvcf-cassandra-migrations
+      tag: 0.19.4
       pullPolicy: Always
 
   dbUser:

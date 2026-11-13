@@ -110,6 +110,10 @@
             "nvcfApiEndpoint": {
               "$ref": "#/definitions/nonEmptyString"
             },
+            "nvcfControlPlaneEndpoint": {
+              "type": "string",
+              "pattern": "^$|^https?://[^/]+/?$"
+            },
             "llmGatewayEndpoint": {
               "type": "string",
               "pattern": "^$|^https?://[^/]+/?$"
@@ -129,8 +133,15 @@
             "shadowMaxConcurrent": {
               "type": "integer",
               "minimum": 1
+            },
+            "maxRequestSizeBytes": {
+              "description": "Maximum model API request body size in bytes (default 26214400, or 25 MiB).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
             }
           },
+          "required": ["maxRequestSizeBytes"],
           "additionalProperties": false
         },
         "mappingConfig": {
@@ -144,6 +155,9 @@
                 },
                 "anthropicMessages": {
                   "$ref": "#/definitions/openAIStickyEndpointRoutes"
+                },
+                "typesafeSystemOne": {
+                  "$ref": "#/definitions/openAIDecisionRoutes"
                 },
                 "vanity": {
                   "$ref": "#/definitions/vanityRoutes"
@@ -273,6 +287,29 @@
                                 "required": [
                                   "embeddings"
                                 ]
+                              },
+                              {
+                                "properties": {
+                                  "decisions": {
+                                    "not": {
+                                      "additionalProperties": {
+                                        "not": {
+                                          "properties": {
+                                            "functionType": {
+                                              "const": "LLM"
+                                            }
+                                          },
+                                          "required": [
+                                            "functionType"
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "required": [
+                                  "decisions"
+                                ]
                               }
                             ]
                           }
@@ -302,6 +339,29 @@
                         },
                         "required": [
                           "anthropicMessages"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "typesafeSystemOne": {
+                            "not": {
+                              "additionalProperties": {
+                                "not": {
+                                  "properties": {
+                                    "functionType": {
+                                      "const": "LLM"
+                                    }
+                                  },
+                                  "required": [
+                                    "functionType"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "typesafeSystemOne"
                         ]
                       }
                     ]
@@ -356,6 +416,9 @@
         },
         "embeddings": {
           "$ref": "#/definitions/openAILLMEndpointRoutes"
+        },
+        "decisions": {
+          "$ref": "#/definitions/openAIDecisionRoutes"
         },
         "responses": {
           "$ref": "#/definitions/openAIStickyEndpointRoutes"
@@ -782,6 +845,24 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/definitions/openAINonStickyLLMModelRoute"
+      }
+    },
+    "openAIDecisionRoutes": {
+      "description": "Decision routes return backend 429 bodies unchanged, so tooManyRequestsMessage must be empty.",
+      "type": "object",
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "#/definitions/openAINonStickyLLMModelRoute"
+          },
+          {
+            "patternProperties": {
+              "^(?i)toomanyrequestsmessage$": {
+                "maxLength": 0
+              }
+            }
+          }
+        ]
       }
     },
     "openAINonStickyLLMModelRoute": {

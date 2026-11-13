@@ -1,0 +1,582 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package webhook
+
+// CRIU restore of a scaled-up pod. When a pod's nvsnap.io/restore-from
+// resolves to a CRIU capture, the pod becomes its own restore placeholder:
+// its main container idles instead of starting the engine, the checkpoints
+// directory is mounted, and the agent on its node restores the captured
+// process into it once it runs (internal/agent/criu_auto_restore.go). The
+// restored process then answers the pod's readiness probe like a fresh
+// start would, only sooner.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+)
+
+const (
+	// CRIURestoreAnnotation names the checkpoint the agent restores into
+	// this pod; CRIURestoreContainerAnnotation names the container.
+	CRIURestoreAnnotation          = "nvsnap.io/criu-restore"
+	CRIURestoreContainerAnnotation = "nvsnap.io/criu-restore-container"
+
+	// CRIURestoredCondition gates a restore placeholder's readiness: the
+	// agent sets it True once the restore is done. The pod's own readiness
+	// probe cannot tell: a process of the restored tree that holds no GPU
+	// (a health server) runs, and answers, while the GPU processes still
+	// load their memory.
+	CRIURestoredCondition corev1.PodConditionType = "nvsnap.io/restored"
+
+	criuCheckpointsVolume = "nvsnap-criu-checkpoints"
+	// criuCheckpointsMount is where the restore reads the images
+	// (/checkpoints/<id>), the same path the agent's placeholder uses.
+	criuCheckpointsMount = "/checkpoints"
+
+	restoreWorkVolume = RestoreWorkVolume
+	// RestoreWorkVolume names the placeholder's work volume, an emptyDir the
+	// node's agent also reaches through the kubelet's pod directory.
+	RestoreWorkVolume = "nvsnap-restore-work"
+	// RestoreWorkMountPath is the placeholder's own writable directory for
+	// what a restore writes: CRIU's log and stats (criu -W) and a group
+	// restore's session. The checkpoint itself is mounted read-only: later
+	// restores on the node use the same images.
+	RestoreWorkMountPath = "/nvsnap-restore-work"
+
+	// ColdEntrypointMeta is the capture record key holding, as a JSON
+	// list, what the source container's runtime ran ahead of the pod's own
+	// args: the image entrypoint, and its command when the pod gives no
+	// args. A placeholder in a pod nothing would recreate starts it, with
+	// its own args, in place when its restore fails.
+	ColdEntrypointMeta = "cold_entrypoint"
+	// ColdStartMarker is where the placeholder's idle program records a
+	// cold start, on the work volume, which outlives the container: a
+	// restarted container starts the workload at once.
+	ColdStartMarker = RestoreWorkMountPath + "/cold-start"
+	// ColdStartedAnnotation marks a placeholder whose restore failed and
+	// that the agent started cold in place, with the time it did.
+	ColdStartedAnnotation = "nvsnap.io/criu-cold-started"
+
+	// TeardownHoldFile is the agent's hold on a restored group rank's
+	// placeholder, on its work volume: once its workload has gone, the
+	// placeholder stays until the agent removes it, once every rank of the
+	// group has exited, so no node leaves the group's fabric while a peer
+	// still holds memory imported from it (docs/design/GROUP-TEARDOWN.md).
+	// cmd/nvsnap-idle names it too.
+	TeardownHoldFile = "teardown-hold"
+	// TeardownExitedFile is the placeholder's report, on its work volume,
+	// that its workload has gone. cmd/nvsnap-idle names it too.
+	TeardownExitedFile = "teardown-exited"
+	// TeardownExitedAnnotation marks a terminating restored rank whose
+	// workload has exited, for the other ranks' agents.
+	TeardownExitedAnnotation = "nvsnap.io/criu-teardown-exited"
+)
+
+// criuCheckpointID returns the CRIU checkpoint a capture record points to,
+// or "" when the record is not a CRIU capture.
+func criuCheckpointID(man checkpointstore.Manifest) string { return CRIUCheckpointID(man) }
+
+// CRIUCheckpointID returns the CRIU checkpoint a capture record points to,
+// or "" when the record is not a CRIU capture.
+func CRIUCheckpointID(man checkpointstore.Manifest) string {
+	if man.CaptureMethod != "criu" && man.SourcePodMeta["engine"] != "criu" {
+		return ""
+	}
+	return man.SourcePodMeta["checkpoint_id"]
+}
+
+// criuRestoreFor looks up the capture record for hash on the L2 backend
+// (where CRIU captures are recorded) and returns its checkpoint id when the
+// pod should be restored with CRIU.
+func (m *Mutator) criuRestoreFor(ctx context.Context, pod *corev1.Pod, hash string, log logrus.FieldLogger) (string, checkpointstore.Manifest) {
+	var man checkpointstore.Manifest
+	var id string
+	if name := NamesOwnInstance(pod); name != "" {
+		log.WithField("env", name).Info("CRIU restore: the pod names its own instance in its configuration; it starts from the caches")
+		return "", man
+	}
+	for _, b := range []checkpointstore.Backend{m.Backend, m.L2Backend} {
+		if b == nil {
+			continue
+		}
+		got, err := b.Stat(ctx, hash)
+		if err != nil {
+			continue
+		}
+		if id = criuCheckpointID(got); id != "" {
+			man = got
+			break
+		}
+	}
+	if id == "" {
+		return "", man
+	}
+	if why := m.criuScopeMismatch(ctx, pod, man); why != "" {
+		log.WithField("checkpoint", id).Warn("CRIU restore: " + why + "; cold start")
+		return "", checkpointstore.Manifest{}
+	}
+	if m.CRIURestoreBlocked != nil && m.CRIURestoreBlocked(ctx, id) {
+		log.WithField("checkpoint", id).Warn("CRIU restore: this checkpoint failed to restore before; cold start")
+		return "", man
+	}
+	return id, man
+}
+
+// criuScopeMismatch returns why pod may not restore the CRIU capture man,
+// or "" when it may. A checkpoint holds the captured process's memory
+// (tokens, keys, request data), and the restore-from annotation is the
+// pod author's to write, so the capture must come from the pod's own
+// tenant scope, recorded at capture time. A rank of an instance capture
+// restores only with its instance, through the group record.
+func (m *Mutator) criuScopeMismatch(ctx context.Context, pod *corev1.Pod, man checkpointstore.Manifest) string {
+	if pod.Namespace == "" {
+		return "the pod's namespace is unknown"
+	}
+	scope := CRIUNamespaceScope(pod.Namespace)
+	if m.CRIUScope != nil {
+		var err error
+		if scope, err = m.CRIUScope(ctx, pod.Namespace); err != nil {
+			return fmt.Sprintf("cannot read the namespace's tenant scope: %v", err)
+		}
+	}
+	return CRIUScopeMismatch(man, scope)
+}
+
+// CRIUScopeMismatch returns why a pod of tenant scope scope may not
+// restore on its own from the CRIU capture man, or "" when it may: the
+// capture must record that same scope, and not be one rank of an instance
+// capture, which restores only with its instance. The webhook applies it
+// at admission, and the agent again before it fetches or restores, since
+// a pod's restore annotations are its author's to write.
+func CRIUScopeMismatch(man checkpointstore.Manifest, scope string) string {
+	if man.SourcePodMeta[checkpointstore.InstanceCaptureMetaKey] == "true" {
+		return "the checkpoint is one rank of an instance capture"
+	}
+	captured := man.SourcePodMeta[checkpointstore.CRIUScopeMetaKey]
+	if captured == "" {
+		return "the capture records no tenant scope"
+	}
+	if scope != captured {
+		return "the capture belongs to another tenant scope"
+	}
+	return ""
+}
+
+// CRIUNamespaceScope is the tenant scope of a namespace the platform has
+// not labelled with a function version: the namespace itself.
+func CRIUNamespaceScope(ns string) string { return "namespace/" + ns }
+
+// criuRestorePatches turns the pod into the restore placeholder for
+// checkpointID. The liveness and startup probes go: they would kill the
+// container before the restored process answers them. The readiness probe
+// stays, so the pod becomes Ready when the restored engine serves, and
+// not before the restore is done (CRIURestoredCondition).
+func (m *Mutator) criuRestorePatches(pod *corev1.Pod, checkpointID string, man checkpointstore.Manifest) ([]PatchOp, error) {
+	return m.criuPlaceholderPatches(pod, checkpointID, man, false)
+}
+
+// criuPlaceholderPatches is criuRestorePatches for a lone pod (group
+// false) or a rank or companion of a group restore (group true), whose
+// placeholder skips the init containers that would wait on its peers
+// (placeholderInitPatches).
+func (m *Mutator) criuPlaceholderPatches(pod *corev1.Pod, checkpointID string, man checkpointstore.Manifest, group bool) ([]PatchOp, error) {
+	// The capture checkpoints the first container with GPUs, or the
+	// container the record names (a companion's, captured by its
+	// connections to the ranks); that one becomes the placeholder,
+	// wherever the chart put it. The pod's other containers run as they
+	// are.
+	i := gpuContainerIndex(pod, m.MainContainer)
+	if name := man.SourcePodMeta[restoreContainerMeta]; name != "" {
+		i = containerIndex(pod, name)
+		if i < 0 {
+			return nil, fmt.Errorf("the checkpoint was taken from container %q, which this pod does not have", name)
+		}
+	}
+	if i < 0 || i >= len(pod.Spec.Containers) {
+		return nil, fmt.Errorf("MainContainer index %d out of range (have %d containers)", i, len(pod.Spec.Containers))
+	}
+	if m.CheckpointHostRoot == "" {
+		return nil, fmt.Errorf("CRIU restore: the checkpoint host root is not configured")
+	}
+	c := &pod.Spec.Containers[i]
+	base := fmt.Sprintf("/spec/containers/%d", i)
+	setOp := func(present bool) string {
+		if present {
+			return "replace"
+		}
+		return "add"
+	}
+	// The container idles until the restored process takes over: the
+	// helper (helper.go) runs a short child every two seconds, so once the
+	// agent raises the namespace's next pid the reserved range shows, and
+	// it reaps what the restore reparents to it. Given the workload's argv
+	// it can also start that in place, when the restore fails in a pod
+	// nothing would recreate (cmd/nvsnap-idle).
+	patches := []PatchOp{
+		{Op: setOp(c.Command != nil), Path: base + "/command", Value: []string{IdleBin}},
+	}
+	if argv := ColdArgv(c, man); len(argv) > 0 {
+		patches = append(patches, PatchOp{Op: setOp(c.Args != nil), Path: base + "/args",
+			Value: append([]string{"--cold-start", ColdStartMarker, "--"}, argv...)})
+	} else if c.Args != nil {
+		patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
+	}
+	patches = append(patches, placeholderInitPatches(pod, group)...)
+	if c.LivenessProbe != nil {
+		patches = append(patches, PatchOp{Op: "remove", Path: base + "/livenessProbe"})
+	}
+	if c.StartupProbe != nil {
+		patches = append(patches, PatchOp{Op: "remove", Path: base + "/startupProbe"})
+	}
+	// Only this checkpoint's directory: the node's other checkpoints hold
+	// other workloads' memory. It need not exist yet: on a node without
+	// the checkpoint the pod starts, and the agent fetches the checkpoint
+	// into the directory before it restores.
+	dir, orCreate := corev1.HostPathDirectory, corev1.HostPathDirectoryOrCreate
+	vols := []corev1.Volume{{
+		Name:         criuCheckpointsVolume,
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: m.CheckpointHostRoot + "/" + checkpointID, Type: &orCreate}},
+	}}
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == restoreWorkVolume {
+			return nil, fmt.Errorf("the pod declares the restore's work volume %s itself", restoreWorkVolume)
+		}
+	}
+	if mountAtPath(pod, RestoreWorkMountPath) {
+		return nil, fmt.Errorf("the pod mounts something at the restore's work path %s itself", RestoreWorkMountPath)
+	}
+	vols = append(vols, corev1.Volume{Name: restoreWorkVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+	mounts := []corev1.VolumeMount{
+		// Read-only: the restore only reads the images, and later restores
+		// of the checkpoint on this node read them too. What it writes goes
+		// to the work volume.
+		{Name: criuCheckpointsVolume, MountPath: criuCheckpointsMount + "/" + checkpointID, ReadOnly: true},
+		{Name: restoreWorkVolume, MountPath: RestoreWorkMountPath},
+		helperMount(),
+	}
+	if man.SourcePodMeta["gpushare"] == "true" {
+		// The restored processes re-map the library from where it was and
+		// load their GPU memory from the checkpoint's chunk store, at the
+		// store path they saved it from.
+		bundleRoot := m.HostBundleRoot
+		if bundleRoot == "" {
+			bundleRoot = DefaultHostBundleRoot
+		}
+		vols = append(vols, corev1.Volume{Name: gpushareStoreVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+			Path: m.CheckpointHostRoot + "/" + checkpointID + "/gpushare", Type: &orCreate}}})
+		// Read-only, like the images: the load reads it, and a restored pod
+		// is never captured into it.
+		mounts = append(mounts, corev1.VolumeMount{Name: gpushareStoreVolume, MountPath: GPUShareStorePath, ReadOnly: true})
+		libMounted := false
+		for _, vm := range c.VolumeMounts {
+			libMounted = libMounted || vm.MountPath == nvsnapToolsMountPath
+		}
+		if !libMounted {
+			vols = append(vols, corev1.Volume{Name: gpushareLibVolume, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: m.bundleDir(restoreBundle(man, m.BundleID)), Type: &dir}}})
+			mounts = append(mounts, corev1.VolumeMount{Name: gpushareLibVolume, MountPath: nvsnapToolsMountPath, ReadOnly: true})
+		}
+	}
+	// The tools the restore runs in the placeholder: the version the
+	// checkpoint recorded, like the library above (tools_mount.go).
+	toolsVol, toolsMount, ok := m.bundleTools(pod, restoreBundle(man, m.BundleID))
+	if !ok {
+		return nil, fmt.Errorf("the pod uses the node bundle's mount path %s or volume itself", BundleToolsMountPath)
+	}
+	vols, mounts = append(vols, toolsVol), append(mounts, toolsMount)
+	patches = append(patches, addVolumes(pod, vols)...)
+	patches = m.withHelperVolume(pod, patches)
+	patches = append(patches, addContainerMounts(i, c, mounts)...)
+	if pod.Annotations == nil {
+		patches = append(patches, PatchOp{Op: "add", Path: "/metadata/annotations", Value: map[string]string{}})
+	}
+	patches = append(patches,
+		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIURestoreAnnotation), Value: checkpointID},
+		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIURestoreContainerAnnotation), Value: c.Name},
+	)
+	patches = append(patches, criuNodePreference(pod, man.CapturedOnNodes)...)
+	patches = append(patches, restoredGatePatches(pod)...)
+	return patches, nil
+}
+
+// ColdArgv returns the argv container c starts its workload with, as the
+// pod would without nvsnap: its own command and args when it names a
+// command, else the image entrypoint the capture record man saw the runtime
+// start (the entrypoint lives in the image, not the pod) and c's own args.
+// The pod's args are passed as written, and the kubelet expands their $(VAR)
+// references for this pod; the image's strings are escaped so it leaves
+// them as they are. Nil when neither is known; the placeholder then
+// cannot start cold in place.
+func ColdArgv(c *corev1.Container, man checkpointstore.Manifest) []string {
+	if len(c.Command) > 0 {
+		if c.Command[0] == IdleBin {
+			return nil
+		}
+		return append(append([]string{}, c.Command...), c.Args...)
+	}
+	raw := man.SourcePodMeta[ColdEntrypointMeta]
+	if raw == "" {
+		return nil
+	}
+	var entry []string
+	if err := json.Unmarshal([]byte(raw), &entry); err != nil || len(entry) == 0 || entry[0] == "" || entry[0] == IdleBin {
+		return nil
+	}
+	// The image's own strings were never expanded by the kubelet; in the
+	// placeholder's args they would be, so each "$" is escaped as "$$".
+	argv := make([]string, 0, len(entry)+len(c.Args))
+	for _, e := range entry {
+		argv = append(argv, strings.ReplaceAll(e, "$", "$$"))
+	}
+	return append(argv, c.Args...)
+}
+
+// restoredGatePatches adds the CRIURestoredCondition readiness gate.
+func restoredGatePatches(pod *corev1.Pod) []PatchOp {
+	gate := corev1.PodReadinessGate{ConditionType: CRIURestoredCondition}
+	if HasRestoredGate(pod) {
+		return nil
+	}
+	if len(pod.Spec.ReadinessGates) == 0 {
+		return []PatchOp{{Op: "add", Path: "/spec/readinessGates", Value: []corev1.PodReadinessGate{gate}}}
+	}
+	return []PatchOp{{Op: "add", Path: "/spec/readinessGates/-", Value: gate}}
+}
+
+// HasRestoredGate reports whether pod's readiness waits on
+// CRIURestoredCondition.
+func HasRestoredGate(pod *corev1.Pod) bool {
+	for _, g := range pod.Spec.ReadinessGates {
+		if g.ConditionType == CRIURestoredCondition {
+			return true
+		}
+	}
+	return false
+}
+
+// gpuContainerIndex is the index of the first container with GPUs, else
+// fallback.
+// restoreContainerMeta is the manifest key naming the container a
+// checkpoint was taken from.
+const restoreContainerMeta = "restore_container"
+
+// containerIndex returns the index of the container named name, or -1.
+func containerIndex(pod *corev1.Pod, name string) int {
+	for i, c := range pod.Spec.Containers {
+		if c.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func gpuContainerIndex(pod *corev1.Pod, fallback int) int {
+	for i, c := range pod.Spec.Containers {
+		if _, ok := c.Resources.Limits["nvidia.com/gpu"]; ok {
+			return i
+		}
+	}
+	return fallback
+}
+
+// criuNodePreference prefers the nodes that already hold the checkpoint.
+// Preferred, not required: on any other node the agent fetches it first,
+// and a full capture node must not leave the pod unschedulable.
+func criuNodePreference(pod *corev1.Pod, nodes []string) []PatchOp {
+	if len(nodes) == 0 {
+		return nil
+	}
+	term := corev1.PreferredSchedulingTerm{
+		Weight: 100,
+		Preference: corev1.NodeSelectorTerm{MatchExpressions: []corev1.NodeSelectorRequirement{{
+			Key: "kubernetes.io/hostname", Operator: corev1.NodeSelectorOpIn, Values: nodes,
+		}}},
+	}
+	switch {
+	case pod.Spec.Affinity == nil:
+		return []PatchOp{{Op: "add", Path: "/spec/affinity", Value: corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{term}}}}}
+	case pod.Spec.Affinity.NodeAffinity == nil:
+		return []PatchOp{{Op: "add", Path: "/spec/affinity/nodeAffinity", Value: corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{term}}}}
+	case pod.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution == nil:
+		return []PatchOp{{Op: "add", Path: "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution",
+			Value: []corev1.PreferredSchedulingTerm{term}}}
+	default:
+		return []PatchOp{{Op: "add", Path: "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution/-", Value: term}}
+	}
+}
+
+// jsonPointerEscape escapes a key for a JSON Patch path (RFC 6901).
+func jsonPointerEscape(s string) string {
+	return strings.NewReplacer("~", "~0", "/", "~1").Replace(s)
+}
+
+// placeholderInitPatches skips, in a group restore's placeholder, the init
+// containers that would only wait on the instance's peers. A rank that
+// waits for its leader to serve (a Dynamo worker's wait-for-leader) never
+// starts, and the leader is a placeholder until the whole group is
+// restored. The restored process already went through its startup when it
+// was captured, so an init container matters only for what it leaves on a
+// volume that something running in the placeholder reads: the main
+// container, another container or sidecar of the pod, or an init container
+// kept for that reason (an init that extracts files another init merges
+// into the main container's certificates). Those are kept, followed through
+// such chains; the rest only wait or check, and run the helper's skip
+// instead, keeping their place so the other patches' indices hold.
+//
+// A lone placeholder runs every init container, as the pod would without
+// nvsnap: nothing it waits on is a placeholder, and if its restore fails it
+// starts the workload cold in place, which needs whatever they set up.
+//
+// A native sidecar (an init container with restartPolicy Always) is no
+// startup step: it serves beside the main container for the pod's life,
+// like any other sidecar, and runs unchanged. Skipped, it would exit, be
+// restarted, and hold back every init container after it.
+func placeholderInitPatches(pod *corev1.Pod, group bool) []PatchOp {
+	if !group {
+		return nil
+	}
+	keep := initsToKeep(pod)
+	var patches []PatchOp
+	for i := range pod.Spec.InitContainers {
+		init := &pod.Spec.InitContainers[i]
+		if keep[i] {
+			continue
+		}
+		base := fmt.Sprintf("/spec/initContainers/%d", i)
+		op := "add"
+		if init.Command != nil {
+			op = "replace"
+		}
+		patches = append(patches, PatchOp{Op: op, Path: base + "/command",
+			Value: []string{HelperBin, "skip", "--reason", "restore placeholder: " + init.Name + " leaves nothing the pod's running containers read"}})
+		if init.Args != nil {
+			patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
+		}
+		if init.VolumeMounts == nil {
+			patches = append(patches, PatchOp{Op: "add", Path: base + "/volumeMounts", Value: []corev1.VolumeMount{helperMount()}})
+		} else {
+			patches = append(patches, PatchOp{Op: "add", Path: base + "/volumeMounts/-", Value: helperMount()})
+		}
+	}
+	return patches
+}
+
+// initsToKeep reports, by index, the init containers a group placeholder
+// runs: native sidecars, and every init that writes a data volume read by a
+// container that runs in the placeholder (every regular container, every
+// native sidecar, every init kept), until no more are kept.
+func initsToKeep(pod *corev1.Pod) map[int]bool {
+	volumes := map[string]corev1.Volume{}
+	for i := range pod.Spec.Volumes {
+		volumes[pod.Spec.Volumes[i].Name] = pod.Spec.Volumes[i]
+	}
+	read := map[string]bool{}
+	mount := func(c *corev1.Container) {
+		for _, vm := range c.VolumeMounts {
+			read[vm.Name] = true
+		}
+	}
+	for i := range pod.Spec.Containers {
+		mount(&pod.Spec.Containers[i])
+	}
+	keep := map[int]bool{}
+	for i := range pod.Spec.InitContainers {
+		if NativeSidecar(&pod.Spec.InitContainers[i]) {
+			keep[i] = true
+			mount(&pod.Spec.InitContainers[i])
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := range pod.Spec.InitContainers {
+			init := &pod.Spec.InitContainers[i]
+			if keep[i] || !writesReadVolume(init, volumes, read) {
+				continue
+			}
+			keep[i], changed = true, true
+			mount(init)
+		}
+	}
+	return keep
+}
+
+// writesReadVolume reports whether init mounts, writable, a volume that
+// holds data (not a ConfigMap, Secret or projection) and is in read.
+func writesReadVolume(init *corev1.Container, volumes map[string]corev1.Volume, read map[string]bool) bool {
+	for _, vm := range init.VolumeMounts {
+		if vm.ReadOnly || !read[vm.Name] {
+			continue
+		}
+		v, ok := volumes[vm.Name]
+		if !ok {
+			return true // not knowable here: keep the init
+		}
+		s := v.VolumeSource
+		if s.EmptyDir != nil || s.PersistentVolumeClaim != nil || s.HostPath != nil || s.Ephemeral != nil || s.CSI != nil || s.NFS != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// NativeSidecar reports an init container that runs for the pod's life.
+func NativeSidecar(c *corev1.Container) bool {
+	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+}
+
+const (
+	// PIDReserveInit is the first init container of a restore placeholder
+	// whose containers share one pid namespace: it waits until the agent
+	// has raised the namespace's next pid to PIDReserveFloor, so every
+	// process the pod starts after it (a native sidecar, a sidecar, the
+	// placeholder) gets a pid above the range the restore recreates.
+	// Without it a sidecar started before the placeholder can hold a pid
+	// of the dumped tree, and the restore cannot recreate it.
+	PIDReserveInit = "nvsnap-reserve-pids"
+	// PIDReserveFloor is the next pid the agent raises a placeholder's pid
+	// namespace to.
+	PIDReserveFloor = 100000
+)
+
+var pidReserveResources = corev1.ResourceRequirements{
+	Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("16Mi")},
+	Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
+}
+
+// withPIDReserve appends to a placeholder's patches the PIDReserveInit
+// step, first among its init containers, when its containers share one pid
+// namespace. It goes last: other patches address init containers by
+// index or insert at the front.
+func withPIDReserve(pod *corev1.Pod, patches []PatchOp) []PatchOp {
+	if pod.Spec.ShareProcessNamespace == nil || !*pod.Spec.ShareProcessNamespace || len(pod.Spec.Containers) == 0 {
+		return patches
+	}
+	main := &pod.Spec.Containers[0]
+	c := corev1.Container{
+		Name:         PIDReserveInit,
+		Image:        main.Image,
+		Command:      []string{HelperBin, "await-pid-floor", "--floor", strconv.Itoa(PIDReserveFloor)},
+		VolumeMounts: []corev1.VolumeMount{helperMount()},
+	}
+	harden(&c, pidReserveResources, inheritPosture, main)
+	listExists := len(pod.Spec.InitContainers) > 0
+	for _, p := range patches {
+		listExists = listExists || (p.Op == "add" && p.Path == "/spec/initContainers")
+	}
+	if !listExists {
+		return append(patches, PatchOp{Op: "add", Path: "/spec/initContainers", Value: []corev1.Container{c}})
+	}
+	return append(patches, PatchOp{Op: "add", Path: "/spec/initContainers/0", Value: c})
+}

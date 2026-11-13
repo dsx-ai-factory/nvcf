@@ -177,12 +177,11 @@ struct TunnelResponse {
     body: Vec<u8>,
 }
 
-const RETRY_CONTROL_REQUEST_HEADERS: [&str; 5] = [
+const RETRY_CONTROL_REQUEST_HEADERS: [&str; 4] = [
     "x-stargate-upstream-retryable",
     "x-stargate-retryable",
     "x-stargate-retry-reason",
     "x-stargate-retry-after-ms",
-    "x-vendor-retryable",
 ];
 const TEST_ADMITTED_MODELS: [&str; 11] = [
     "model-a",
@@ -437,10 +436,6 @@ fn reverse_tunnel_app_from_config_preserves_forwarding_settings() {
 #[test]
 fn pylon_request_header_filter_strips_tunnel_headers_case_insensitively()
 -> std::result::Result<(), reqwest::header::InvalidHeaderName> {
-    let retry = PylonRetryConfig {
-        upstream_retry_header: HeaderName::from_static("x-vendor-retryable"),
-        ..PylonRetryConfig::default()
-    };
     for name in [
         "Connection",
         "Proxy-Connection",
@@ -454,15 +449,20 @@ fn pylon_request_header_filter_strips_tunnel_headers_case_insensitively()
     .into_iter()
     .chain(RETRY_CONTROL_REQUEST_HEADERS)
     {
-        assert!(!should_forward_header(
-            &HeaderName::from_bytes(name.as_bytes())?,
-            &retry
-        ));
+        assert!(!should_forward_header(&HeaderName::from_bytes(
+            name.as_bytes()
+        )?));
     }
-    assert!(should_forward_header(
-        &HeaderName::from_bytes(b"X-Request-Id")?,
-        &retry
-    ));
+    for name in [
+        "X-Request-Id",
+        "TypeSafe-Danger-Zone-Images",
+        "X-Vendor-Test",
+    ] {
+        assert!(
+            should_forward_header(&HeaderName::from_bytes(name.as_bytes())?),
+            "{name} must reach the backend"
+        );
+    }
     Ok(())
 }
 
@@ -549,18 +549,14 @@ fn pylon_otel_parent_attribute_uses_traceparent_header() {
 #[test]
 fn pylon_response_header_filter_strips_internal_headers_case_insensitively()
 -> std::result::Result<(), reqwest::header::InvalidHeaderName> {
-    let retry = PylonRetryConfig::default();
-
     for name in [b"Connection".as_slice(), b"X-Stargate-Retryable"] {
-        assert!(!should_forward_response_header(
-            &HeaderName::from_bytes(name)?,
-            &retry,
-        ));
+        assert!(!should_forward_response_header(&HeaderName::from_bytes(
+            name
+        )?));
     }
-    assert!(should_forward_response_header(
-        &HeaderName::from_bytes(b"X-Kv-Cache-Hit")?,
-        &retry,
-    ));
+    assert!(should_forward_response_header(&HeaderName::from_bytes(
+        b"X-Kv-Cache-Hit"
+    )?));
     Ok(())
 }
 
@@ -1618,8 +1614,7 @@ async fn quic_tunnel_forwards_to_http_backend() {
                 sse
             }),
         );
-    let (mut config, _metrics) = metered_test_tunnel_config_for(app).await;
-    config.forwarding.retry.upstream_retry_header = HeaderName::from_static("x-vendor-retryable");
+    let (config, _metrics) = metered_test_tunnel_config_for(app).await;
     let mut tunnel = RawTunnelTest::start(config).await;
 
     let mut headers =
@@ -1868,16 +1863,12 @@ async fn quic_tunnel_rejects_pending_generation_before_upstream() {
 }
 
 #[tokio::test]
-async fn quic_tunnel_marks_explicit_retryable_upstream_rejection() {
+async fn quic_tunnel_marks_listed_upstream_status_retryable() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|_req: Request| async move {
             let mut response = Response::new(Body::from(r#"{"error":"queue full"}"#));
-            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            response.headers_mut().insert(
-                HeaderName::from_static("x-stargate-upstream-retryable"),
-                HeaderValue::from_static("true"),
-            );
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
             response
                 .headers_mut()
                 .insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
@@ -1895,18 +1886,18 @@ async fn quic_tunnel_marks_explicit_retryable_upstream_rejection() {
             br#"{"messages":[],"stream":true}"#,
         )
         .await;
-    let response = tunnel.response(StatusCode::TOO_MANY_REQUESTS).await;
+    let response = tunnel.response(StatusCode::SERVICE_UNAVAILABLE).await;
     assert_retry_metadata(
         &response.headers,
         true,
-        "upstream_admission_rejected",
+        "upstream_unavailable",
         Some("2000"),
     );
 
     let metrics = metrics_text(&metrics);
     assert_metric(
         &metrics,
-        r#"pylon_retryable_responses_total{inference_server_id="inst-a",reason="upstream_admission_rejected",status="429"} 1"#,
+        r#"pylon_retryable_responses_total{inference_server_id="inst-a",reason="upstream_unavailable",status="503"} 1"#,
     );
 }
 
@@ -2003,7 +1994,7 @@ async fn webtransport_tunnel_rejects_queue_estimate_mismatch_before_upstream() {
 }
 
 #[tokio::test]
-async fn quic_tunnel_strips_spoofed_retry_headers_without_upstream_signal() {
+async fn quic_tunnel_strips_spoofed_retry_headers_from_unlisted_status() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|_req: Request| async move {
@@ -2043,7 +2034,7 @@ async fn quic_tunnel_strips_spoofed_retry_headers_without_upstream_signal() {
     let metrics = metrics_text(&metrics);
     assert_metric(
         &metrics,
-        r#"pylon_nonretryable_failures_total{inference_server_id="inst-a",reason="missing_upstream_retry_header"} 1"#,
+        r#"pylon_nonretryable_failures_total{inference_server_id="inst-a",reason="upstream_nonretryable_status"} 1"#,
     );
 }
 
@@ -3772,4 +3763,182 @@ async fn direct_tunnel_reloads_server_identity_for_new_connections() -> Result<(
     tunnel.shutdown().await;
     fs::remove_dir_all(root)?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AbandonedEngineState {
+    // Queued: the engine holds the response headers.
+    QueuedNoHeaders,
+    // Headers and one SSE event, then silence, as during hidden reasoning.
+    SilentSse,
+    // Headers of a plain (non-SSE) response, then silence until the body is ready.
+    SilentBody,
+    // An SSE event every 100 ms: a failed write also cancels.
+    StreamingSse,
+}
+
+struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn abandoned_engine(
+    state: AbandonedEngineState,
+    engine_dropped_tx: tokio::sync::oneshot::Sender<()>,
+) -> Router {
+    let engine_dropped_tx = Arc::new(std::sync::Mutex::new(Some(engine_dropped_tx)));
+    let handler = post(move || {
+        let guard = NotifyOnDrop(engine_dropped_tx.lock().unwrap().take());
+        async move {
+            match state {
+                    AbandonedEngineState::QueuedNoHeaders => {
+                        let _guard = guard;
+                        future::pending::<Response>().await
+                    }
+                    AbandonedEngineState::SilentBody => {
+                        let body = async_stream::stream! {
+                            let _guard = guard;
+                            future::pending::<()>().await;
+                            yield Ok::<_, std::convert::Infallible>(Bytes::new());
+                        };
+                        Response::builder()
+                            .header(axum::http::header::CONTENT_TYPE, "application/json")
+                            .body(Body::from_stream(body))
+                            .unwrap()
+                    }
+                    AbandonedEngineState::SilentSse | AbandonedEngineState::StreamingSse => {
+                        axum::response::Sse::new(async_stream::stream! {
+                            let _guard = guard;
+                            yield Ok::<_, std::convert::Infallible>(Event::default()
+                                .event("response.created")
+                                .data(r#"{"type":"response.created","sequence_number":0,"response":{"id":"r","status":"in_progress","output":[]}}"#));
+                            if matches!(state, AbandonedEngineState::SilentSse) {
+                                future::pending::<()>().await;
+                            }
+                            for sequence_number in 1u64.. {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                yield Ok(Event::default()
+                                    .event("response.reasoning_text.delta")
+                                    .data(format!(r#"{{"type":"response.reasoning_text.delta","sequence_number":{sequence_number},"item_id":"rs","output_index":0,"content_index":0,"delta":"t"}}"#)));
+                            }
+                        })
+                        .into_response()
+                    }
+                }
+        }
+    });
+    Router::new()
+        .route("/v1/responses", handler.clone())
+        .route("/v1/messages", handler)
+}
+
+// Opens a request on a fresh tunnel, then abandons it the way the router does
+// (client gone, or its header timeout): drop both stream halves, keep the connection.
+// Returns whether the engine request was dropped within 3 s.
+async fn router_abandons_request(
+    protocol: TunnelTransportProtocol,
+    state: AbandonedEngineState,
+) -> bool {
+    let (engine_dropped_tx, engine_dropped_rx) = tokio::sync::oneshot::channel();
+    let mut config = test_tunnel_config_for(abandoned_engine(state, engine_dropped_tx)).await;
+    config.tunnel_protocol = protocol;
+    // Pylon relays Responses as SSE; /v1/messages is relayed as a plain body.
+    let (path, body): (&str, &'static [u8]) = match state {
+        AbandonedEngineState::SilentBody => ("/v1/messages", br#"{"stream":false}"#),
+        _ => ("/v1/responses", br#"{"input":"hi","stream":true}"#),
+    };
+    let headers = tunnel_request_headers(path, "model-responses", "req-abandoned", "11");
+    let wait_for_head = !matches!(state, AbandonedEngineState::QueuedNoHeaders);
+    let engine_dropped = match protocol {
+        TunnelTransportProtocol::RawQuic => {
+            let mut tunnel = RawTunnelTest::start(config).await;
+            tunnel.send(headers, body).await;
+            if wait_for_head {
+                tunnel.response_head(StatusCode::OK).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let RawTunnelTest {
+                tunnel: handle,
+                _endpoint: endpoint,
+                send,
+                recv,
+            } = tunnel;
+            drop(recv);
+            drop(send);
+            let engine_dropped =
+                tokio::time::timeout(Duration::from_secs(3), engine_dropped_rx).await;
+            drop(endpoint);
+            let _ = tokio::time::timeout(Duration::from_secs(1), handle.shutdown()).await;
+            engine_dropped
+        }
+        TunnelTransportProtocol::WebTransport => {
+            let tunnel = start_quic_http_tunnel(config).await.unwrap();
+            let session = open_direct_webtransport_session(tunnel.listen_addr()).await;
+            let (mut send, mut recv) = session.connection.open_bi().await.unwrap();
+            let request_head = stargate_protocol::WebTransportHttpRequestHead {
+                method: reqwest::Method::POST,
+                path_and_query: path.to_string(),
+                headers,
+            };
+            let bidi_header = stargate_protocol::WebTransportBidiHeader::new(session.session_id)
+                .unwrap()
+                .to_bytes();
+            stargate_protocol::write_webtransport_http_request_head_after_prefix(
+                &mut send,
+                bidi_header,
+                &request_head,
+            )
+            .await
+            .unwrap();
+            write_direct_webtransport_request_body(&mut send, Bytes::from_static(body)).await;
+            if wait_for_head {
+                let head = stargate_protocol::read_webtransport_http_response_head(&mut recv)
+                    .await
+                    .unwrap();
+                assert_eq!(head.status, StatusCode::OK);
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            drop(recv);
+            drop(send);
+            let engine_dropped =
+                tokio::time::timeout(Duration::from_secs(3), engine_dropped_rx).await;
+            session.connection.close(0u32.into(), b"test complete");
+            drop(session);
+            let _ = tokio::time::timeout(Duration::from_secs(1), tunnel.shutdown()).await;
+            engine_dropped
+        }
+        TunnelTransportProtocol::Http3 => panic!("HTTP/3 tunnels cancel only on a failed write"),
+    };
+    engine_dropped.is_ok()
+}
+
+#[tokio::test]
+async fn tunnel_drops_engine_request_when_router_abandons_stream() {
+    let mut still_running = Vec::new();
+    for protocol in [
+        TunnelTransportProtocol::RawQuic,
+        TunnelTransportProtocol::WebTransport,
+    ] {
+        for state in [
+            AbandonedEngineState::QueuedNoHeaders,
+            AbandonedEngineState::SilentSse,
+            AbandonedEngineState::SilentBody,
+            AbandonedEngineState::StreamingSse,
+        ] {
+            if !router_abandons_request(protocol, state).await {
+                still_running.push((protocol, state));
+            }
+        }
+    }
+    assert!(
+        still_running.is_empty(),
+        "engine requests still running 3 s after the router abandoned the stream: {still_running:?}"
+    );
 }

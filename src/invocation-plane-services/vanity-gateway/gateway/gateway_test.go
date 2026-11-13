@@ -42,3 +42,14 @@ func TestNewNVCFGatewayRejectsNegativeMappingLoadTimeout(t *testing.T) {
 	require.Nil(t, gateway)
 	require.ErrorContains(t, err, "MAPPING_LOAD_TIMEOUT must not be negative")
 }
+
+func TestRequestSizeLimitRejectsNonPositiveConfig(t *testing.T) {
+	for _, value := range []int64{0, -1} {
+		cfg := Config{MaxRequestSizeBytes: &value}
+		_, err := cfg.requestSizeLimit()
+		require.ErrorContains(t, err, "MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+		service, err := NewNVCFGateway(nil, cfg)
+		require.Nil(t, service)
+		require.ErrorContains(t, err, "MAX_REQUEST_SIZE_BYTES")
+	}
+}

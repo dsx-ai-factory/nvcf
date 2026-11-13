@@ -18,7 +18,7 @@ limitations under the License.
 package metrics
 
 import (
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metrics"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -29,6 +29,13 @@ const (
 )
 
 var (
+	InfoRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: metrics.NvctRootNamespace,
+			Name:      "info_request_duration_seconds",
+			Help:      "Info request duration in seconds by response status.",
+		}, []string{"code"})
+
 	ResultCounter = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: metrics.NvctRootNamespace,
@@ -57,3 +64,9 @@ var (
 			Help:      "total number of NGC API response codes by action name",
 		}, []string{"status_code", "action"})
 )
+
+func init() {
+	for _, code := range []string{"200", "405"} {
+		InfoRequestDuration.WithLabelValues(code)
+	}
+}

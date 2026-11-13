@@ -76,15 +76,25 @@ api:
       nvcf:
         telemetry:
           enabled: false
+
+nvctApi:
+  remoteConfig:
+    configData:
+      nvct:
+        telemetry:
+          enabled: false
 ```
 
-The same setting is available as an environment variable,
-`api.env.NVCF_TELEMETRY_ENABLED: "false"`.
+Each API reads its own setting, so set both. The NVCF API setting is also
+available as an environment variable, `api.env.NVCF_TELEMETRY_ENABLED: "false"`.
+The stack builds the NVCT API environment itself, so remote config is the only
+route for the task side.
 
 With telemetry off, registering an endpoint or attaching one to a function
-returns 400 `telemetry is not supported on this deployment`. Deleting an
-endpoint still works, so endpoints registered before the change can be cleared.
-The API reads the setting once at startup, so changing it needs a restart.
+returns 400 `telemetry is not supported on this deployment`, and so does
+creating a task that attaches one. Deleting an endpoint still works, so
+endpoints registered before the change can be cleared. Each API reads the
+setting once at startup, so changing it needs a restart.
 
 The setting defaults to on, so a deployment that does not set it is unchanged.
 It is temporary and is removed once telemetry export is available everywhere.
@@ -176,6 +186,15 @@ from another exporter, scrape them into the target under the job names in the
 table and keep the workload `namespace`, `pod`, and `container` labels. The
 DCGM job reads these labels with an `exported_` prefix, which a scrape adds
 when the exporter labels conflict with the target labels.
+
+The worker and DCGM job names require observability stack 1.1.0 or later,
+which ships `nvcf-default-monitors` 0.3.0. Observability stack 1.0.0 has no
+`jobName` setting. Its PodMonitors store these series under the default job,
+`<namespace>/<PodMonitor name>`, such as
+`monitoring/nvcf-default-monitors-worker` and
+`monitoring/nvcf-default-monitors-dcgm`. Federation then exports no worker or
+DCGM series, such as `nvcf_worker_service_request_total` or
+`DCGM_FI_DEV_GPU_UTIL`. Upgrade the observability stack to export them.
 
 The compute-plane stack pins NVCA and BYOO collector releases that support this
 setting. Older releases ignore it and federate from the default target described
@@ -409,7 +428,9 @@ The collector sends each signal only to the endpoint attached for that signal.
 - Container logs, when `BYOOFluentBit` is on. For container workloads, Fluent
   Bit reads the logs of the inference or task container. For Helm workloads, it
   reads the logs of the application pods in the workload namespace that run on
-  the same node as the utils pod.
+  the same node as the utils pod. It skips the utils pod, the shared storage
+  SMB server pod, and any `byoo-otel-collector`, `fluentbit-logs`, or
+  `model-cache-init` container.
 - The collector's own `otelcol_*` metrics, with the workload metrics.
 - Worker, NVCA, DCGM, cAdvisor, and kube-state-metrics series for the workload,
   only when platform metrics federation is on. Federation is off by default on

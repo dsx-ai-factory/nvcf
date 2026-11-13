@@ -314,6 +314,7 @@ pub struct LifecycleDummyState {
     health_ok: Arc<AtomicBool>,
     completions_ok: Arc<AtomicBool>,
     completion_tokens: Arc<AtomicU32>,
+    canary_overloaded: Arc<AtomicBool>,
     health_requests: Arc<AtomicUsize>,
     canary_requests: Arc<AtomicUsize>,
     proxy_requests: Arc<AtomicUsize>,
@@ -324,6 +325,7 @@ pub struct LifecycleDummyBackend {
     health_ok: Arc<AtomicBool>,
     completions_ok: Arc<AtomicBool>,
     completion_tokens: Arc<AtomicU32>,
+    canary_overloaded: Arc<AtomicBool>,
     health_requests: Arc<AtomicUsize>,
     canary_requests: Arc<AtomicUsize>,
 }
@@ -335,6 +337,12 @@ impl LifecycleDummyBackend {
 
     pub fn set_completions_ok(&self, value: bool) {
         self.completions_ok.store(value, Ordering::SeqCst);
+    }
+
+    /// Answers canaries the way a Dynamo frontend answers requests while all
+    /// workers are busy; other requests still complete.
+    pub fn set_canary_overloaded(&self, value: bool) {
+        self.canary_overloaded.store(value, Ordering::SeqCst);
     }
 
     pub fn set_completion_tokens(&self, value: u32) {
@@ -492,6 +500,17 @@ pub async fn lifecycle_dummy_chat(
     } else if !is_calibration {
         state.proxy_requests.fetch_add(1, Ordering::SeqCst);
     }
+    if is_canary && state.canary_overloaded.load(Ordering::SeqCst) {
+        return (
+            StatusCode::from_u16(529).expect("529 is a valid status"),
+            Json(serde_json::json!({
+                "message": "Service temporarily overloaded",
+                "type": "Overloaded",
+                "code": 529
+            })),
+        )
+            .into_response();
+    }
     if !state.completions_ok.load(Ordering::SeqCst) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -550,6 +569,7 @@ pub fn base_config(
             stargate::registration::DEFAULT_REGISTRATION_UPDATE_MAX_IDLE_TIMEOUT,
         routing_reservation_ttl_min: Duration::from_millis(1),
         routing_reservation_ttl_max: Duration::from_millis(1000),
+        deregistered_model_grace: stargate::registration::DEFAULT_DEREGISTERED_MODEL_GRACE,
         proxy_transport: ProxyTransportConfig {
             quic: QuicTunnelConfig {
                 connect_timeout: Duration::from_secs(5),
@@ -796,6 +816,16 @@ pub fn make_stargate_runtime_with_model_discovery(
     build_test_runtime(id, config, TestDiscovery::SelfOnly, None).with_model_discovery()
 }
 
+pub fn make_stargate_runtime_with_model_discovery_and_deregistered_model_grace(
+    id: &str,
+    deregistered_model_grace: Duration,
+) -> (SocketAddr, SocketAddr, SocketAddr, StargateRuntime) {
+    let mut config = base_ephemeral_config(id);
+    config.model_discovery_listen_addr = ephemeral_loopback_addr();
+    config.deregistered_model_grace = deregistered_model_grace;
+    build_test_runtime(id, config, TestDiscovery::SelfOnly, None).with_model_discovery()
+}
+
 pub fn make_stargate_runtime_with_auth_and_model_discovery(
     id: &str,
     authenticator: Arc<dyn stargate::auth::WorkerAuthenticator>,
@@ -913,6 +943,7 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
     let health_ok = Arc::new(AtomicBool::new(true));
     let completions_ok = Arc::new(AtomicBool::new(true));
     let completion_tokens = Arc::new(AtomicU32::new(1));
+    let canary_overloaded = Arc::new(AtomicBool::new(false));
     let health_requests = Arc::new(AtomicUsize::new(0));
     let canary_requests = Arc::new(AtomicUsize::new(0));
     let proxy_requests = Arc::new(AtomicUsize::new(0));
@@ -924,6 +955,7 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
             health_ok: health_ok.clone(),
             completions_ok: completions_ok.clone(),
             completion_tokens: completion_tokens.clone(),
+            canary_overloaded: canary_overloaded.clone(),
             health_requests: health_requests.clone(),
             canary_requests: canary_requests.clone(),
             proxy_requests: proxy_requests.clone(),
@@ -936,6 +968,7 @@ pub async fn start_lifecycle_dummy_backend(model: &str) -> LifecycleDummyBackend
         health_ok,
         completions_ok,
         completion_tokens,
+        canary_overloaded,
         health_requests,
         canary_requests,
     }

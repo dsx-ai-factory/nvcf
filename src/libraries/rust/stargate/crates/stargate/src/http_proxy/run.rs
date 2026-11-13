@@ -103,6 +103,20 @@ impl<'a> ProxyRequestRun<'a> {
         (!self.failed_cluster_ids.is_empty()).then_some(&self.failed_cluster_ids)
     }
 
+    // `&mut self` keeps the request future `Send`: the run state is not `Sync`.
+    pub(super) async fn has_untried_cluster(&mut self, current_cluster_id: &str) -> bool {
+        self.app
+            .state
+            .routing_target_snapshot(&self.request.request_inputs.target)
+            .await
+            .is_some_and(|snapshot| {
+                snapshot.clusters().iter().any(|candidate| {
+                    candidate.cluster_id != current_cluster_id
+                        && !self.failed_cluster_ids.contains(&candidate.cluster_id)
+                })
+            })
+    }
+
     fn load_balancer_request(&self) -> LoadBalancerRequest<'_> {
         let request_inputs = &self.request.request_inputs;
         LoadBalancerRequest {
@@ -303,7 +317,7 @@ impl<'a> ProxyRequestRun<'a> {
     fn record_routing_selection(&mut self, routing: RoutingTraceFields<'_>) {
         let span = Span::current();
         span.record("routing.retry_attempts", self.routing_retry_attempts);
-        record_routing_to_span(&span, routing);
+        record_routing_to_span(&span, routing, self.request.lb_resolution.config());
         let Some(routing_started_at) = self.routing_started_at.take() else {
             return;
         };
@@ -686,10 +700,15 @@ mod tests {
             inputs.cache_affinity_key = affinity_key;
             let mut run = ProxyRequestRun::new(&app, prepared_request(&app, inputs));
             run.failed_cluster_ids.insert("cluster-a".to_string());
-            let result = run.run_routing_attempt().await;
-            assert!(
-                matches!(result, Some(Err(StatusCode::SERVICE_UNAVAILABLE))),
-                "all registered candidates are permanently excluded; got {result:?}",
+            let response = run
+                .run_routing_attempt()
+                .await
+                .expect("permanent exclusions should finalize")
+                .expect("permanent exclusions should return a response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers()[super::super::HEADER_STARGATE_ERROR_CODE],
+                "no_ready_backends"
             );
         }
         app.state.end_registration(registration).await;

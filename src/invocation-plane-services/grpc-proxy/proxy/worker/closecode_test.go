@@ -180,6 +180,36 @@ func TestCloseFuncConnRecordsFirstError(t *testing.T) {
 	}
 }
 
+// A failed read or write means the worker went away, unless the proxy had
+// already closed the connection itself.
+func TestCloseFuncConnReportsWorkerGoneUntilClosed(t *testing.T) {
+	ops := map[string]func(net.Conn) error{
+		"read":  func(c net.Conn) error { _, err := c.Read(make([]byte, 1)); return err },
+		"write": func(c net.Conn) error { _, err := c.Write([]byte("x")); return err },
+	}
+	for name, op := range ops {
+		t.Run(name, func(t *testing.T) {
+			proxyEnd, workerEnd := net.Pipe()
+			gone := 0
+			fc := &CloseFuncConn{Conn: proxyEnd, onClose: func() {}, onPeerGone: func() { gone++ }}
+
+			_ = workerEnd.Close()
+			if err := op(fc); err == nil {
+				t.Fatalf("%s succeeded after the worker closed its end", name)
+			}
+			if gone != 1 {
+				t.Fatalf("worker gone reported %d times, want 1", gone)
+			}
+
+			_ = fc.Close()
+			_ = op(fc)
+			if gone != 1 {
+				t.Errorf("a %s failing after the proxy closed the connection was blamed on the worker", name)
+			}
+		})
+	}
+}
+
 func TestCloseFuncConnNoErrorWhenClean(t *testing.T) {
 	fc := &CloseFuncConn{Conn: &stubConn{}, onClose: func() {}}
 	if _, err := fc.Write([]byte("x")); err != nil {
@@ -201,6 +231,8 @@ type stubConn struct {
 	writeErrs []error
 	n         int
 	w         int
+	// writeN is the byte count reported alongside each scripted write error.
+	writeN int
 }
 
 func (s *stubConn) Read([]byte) (int, error) {
@@ -216,7 +248,7 @@ func (s *stubConn) Write(b []byte) (int, error) {
 	if s.w < len(s.writeErrs) {
 		err := s.writeErrs[s.w]
 		s.w++
-		return 0, err
+		return s.writeN, err
 	}
 	return len(b), nil
 }
@@ -411,5 +443,42 @@ func TestDetailOmitsEmptyPeerFields(t *testing.T) {
 				t.Errorf("detail = %q, want it to omit %q", got, tc.wantAbsent)
 			}
 		})
+	}
+}
+
+// A write deadline hit after partial progress is retried by the HTTP/2
+// transport, so it must not be reported as the worker being gone.
+func TestCloseFuncConnPartialWriteTimeoutIsNotWorkerLoss(t *testing.T) {
+	gone := 0
+	fc := &CloseFuncConn{
+		Conn:       &stubConn{writeErrs: []error{os.ErrDeadlineExceeded}, writeN: 3},
+		onClose:    func() {},
+		onPeerGone: func() { gone++ },
+	}
+
+	if n, err := fc.Write([]byte("abcdef")); n != 3 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write() = (%d, %v), want (3, deadline exceeded) passed through", n, err)
+	}
+	if gone != 0 {
+		t.Errorf("onPeerGone ran %d times for a retryable partial write", gone)
+	}
+	if fc.FirstError() != nil {
+		t.Errorf("FirstError() = %v, want nil for a retryable partial write", fc.FirstError())
+	}
+}
+
+// A deadline hit with no progress is terminal: that is the worker not answering.
+func TestCloseFuncConnZeroProgressWriteTimeoutIsWorkerLoss(t *testing.T) {
+	gone := 0
+	fc := &CloseFuncConn{
+		Conn:       &stubConn{writeErrs: []error{os.ErrDeadlineExceeded}},
+		onClose:    func() {},
+		onPeerGone: func() { gone++ },
+	}
+
+	_, _ = fc.Write([]byte("abcdef"))
+
+	if gone != 1 {
+		t.Errorf("onPeerGone ran %d times, want 1 for a write that made no progress", gone)
 	}
 }

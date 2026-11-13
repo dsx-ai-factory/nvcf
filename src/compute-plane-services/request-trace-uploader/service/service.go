@@ -14,10 +14,10 @@ import (
 
 	"log/slog"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/config"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/segment"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/segment"
 )
 
 // Service owns local readiness checks and the sidecar HTTP server. It
@@ -126,7 +126,7 @@ func (s *Service) submit(ctx context.Context, item segment.Segment) error {
 		"segment", item.Index,
 		"bytes", item.Size,
 		"status", status)
-	if status != backend.StatusSuccess || !s.backend.Capabilities().Exports {
+	if status != backend.StatusSucceeded || !s.backend.Capabilities().Exports {
 		return nil
 	}
 	if err := os.Remove(item.Path); err != nil {
@@ -170,9 +170,13 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) httpServer() *http.Server {
+	return newHTTPServer(s.config.HealthAddr, s.Handler())
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
-		Addr:              s.config.HealthAddr,
-		Handler:           s.Handler(),
+		Addr:              addr,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

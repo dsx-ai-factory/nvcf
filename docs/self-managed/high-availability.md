@@ -32,8 +32,7 @@ For the replicated services, `preferred` guarantees continuity after a single
 **pod** failure but provides only best-effort node/zone separation — under
 capacity pressure, replicas can still end up co-located. `enforced` guarantees
 continuity after a single pod **or node** failure when the prerequisites below
-are met. `invocation-service` and `grpc-proxy` are still single-replica in both
-modes, so they are briefly unavailable while their Pod is rescheduled. Neither mode alone
+are met. Neither mode alone
 claims arbitrary availability-zone or site-loss tolerance; see
 [Zone spread for the quorum services](#zone-spread-for-the-quorum-services)
 and [Recovery objectives](#recovery-objectives-and-failure-behavior) for what
@@ -160,26 +159,75 @@ helmfile -e <env> apply
 An invalid mode fails the render fast with a clear error, so a typo cannot
 silently disable HA.
 
+> **Single-member Cassandra:** if your Cassandra runs a single member, do not
+> enable HA by setting the mode and applying. The Cassandra chart raises the
+> `system_auth` replication factor in a hook that runs after the StatefulSet
+> scales, and it does not repair the data, so administrator and service logins can
+> fail while every member shows `UN`. The migration ledger in the `schema_migrations`
+> keyspace is affected the same way, and a migration job then replays migrations
+> that already ran. Expand and repair Cassandra first, with the steps in
+> [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
+> then apply. Those steps need the setup from the upgrade guide: `kc` and
+> `BACKUP_DIR` from [Set up the session](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#set-up-the-session),
+> `CONTROL_STACK` from [Get the 1.1.5 packages and check artifacts](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#get-the-115-packages-and-check-artifacts),
+> and the migration ledger that
+> [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state)
+> saves for the steps to compare against. Outside the upgrade, set `CONTROL_STACK`
+> to the stack directory that holds your edited `environments/<environment-name>.yaml`
+> and `HELMFILE_ENV` to that name, so the steps read your selected HA mode.
+
 ## What HA changes, by tier
 
 ### Replica-safe Deployments
 
 Active-active Deployments with no leader election: `api`, `rateLimiter`,
 `natsAuthCalloutService`, `adminIssuerProxy`, `llmApiGateway` (when the LLM
-addon is enabled), and the control-plane services `nvctApi`, `notary`, `sis`,
-`apiKeys`, `reval`, and `ess` all follow the same convention. (`nvctApi` and
-`sis` run scheduled jobs but coordinate them with a distributed lock; `ess` runs
-its scheduled crypto jobs only in a separate worker that is not part of this
-stack, so the in-stack ESS API scales safely.)
+addon is enabled), `invocation-service`, `grpc-proxy`, and the control-plane
+services `nvctApi`, `notary`, `sis`, `apiKeys`, `reval`, and `ess` all follow
+the same convention. (`nvctApi` and `sis` run scheduled jobs but coordinate
+them with a distributed lock; `ess` runs its scheduled crypto jobs only in a
+separate worker that is not part of this stack, so the in-stack ESS API scales
+safely.)
 
-> **Note — `invocation-service` and `grpc-proxy` are deferred.** These two are
-> stateless too, but their multi-replica scaling is intentionally **held at a
-> single replica for now**, pending Envoy support in the self-hosted stack.
-> Worker callbacks are host-bound to the specific pod that accepted the request
-> (per-pod pod-IP / DNS addressing), which is safe in a single cluster; the
-> Envoy dependency is for the cross-cluster case. Until then they keep hostname
-> anti-affinity and zone spread (no-ops at one replica) and get **no HA PDB**
-> (a `minAvailable: 1` PDB on a singleton would block node drains).
+> **Note — worker callbacks for `invocation-service` and `grpc-proxy`.** A
+> worker calls back to the specific pod that accepted the request. Each pod
+> advertises its own address in the work message: grpc-proxy its Pod IP, and
+> invocation-service `<dashed-pod-ip>.invocation.nvcf.svc.cluster.local`, which
+> cluster DNS resolves to that pod. Workers in the same cluster reach that
+> address directly, so no proxy and no DNS change are needed. Workers in
+> another cluster cannot reach pod addresses; they need the
+> [Worker Callback Proxy](./worker-callback-proxy.md).
+>
+> The invocation-service name is a CoreDNS endpoint record, which CoreDNS
+> answers by default. It does not resolve if CoreDNS has `endpoint_pod_names`
+> enabled, or if the cluster uses a DNS provider that does not publish these
+> records. On those clusters, set `global.workerEndpoints.invocationServiceURL`,
+> which keeps invocation-service at a single replica.
+>
+> A fixed callback URL (`global.workerEndpoints.invocationServiceURL`,
+> `global.workerEndpoints.grpcProxyWorkerConnectURL`,
+> `grpcproxy.workerConnectBaseURL`, or
+> `WORKER_STREAM_PROPERTIES__SELF_ADDRESS` in `invocation.env`) is advertised
+> by every replica, so a callback could reach a pod that does not hold the
+> request. When one is set, the affected service stays at **a single replica**
+> under HA with its HPA disabled, keeps hostname anti-affinity and zone spread
+> (no-ops at one replica), and gets **no HA PDB** (a `minAvailable: 1` PDB on a
+> singleton would block node drains). grpc-proxy with HTTP/3 enabled
+> (`grpcproxy.http3.enabled`, or the worker callback proxy) is the exception:
+> each pod puts its own IP in front of the base URL, so it still scales.
+>
+> If you enable the HPA (`invocation.autoscaling.enabled` or
+> `grpcproxy.deployment.autoscaling.enabled`), HA raises its `minReplicas` to 2
+> and `maxReplicas` to at least that, because the HPA, not `replicaCount`,
+> then sets the pod count.
+>
+> These rules also read `secrets/<env>-secrets.yaml`, which the releases apply
+> last. A callback URL set there counts. A replica count or HPA bound set there
+> that conflicts with the HA sizing fails the render instead of being applied.
+>
+> These two charts have no rollout-strategy hook. The Kubernetes default
+> (25% `maxUnavailable` and `maxSurge`) rounds to `maxUnavailable: 0` and
+> `maxSurge: 1` at 2 replicas.
 
 Under HA each of these gets:
 
@@ -317,6 +365,28 @@ The control-plane services default to `LOCAL_QUORUM` consistency, and some
   [Zone spread for the quorum services](#zone-spread-for-the-quorum-services))
   and does not hold above three pods.
 
+#### Cassandra read retry policy (`RangeReadRetryPolicy`)
+
+When one Cassandra pod dies, index-backed reads (for example listing function
+versions) can fail for a few seconds until the other replicas stop treating
+the dead node as alive. The default `NextHostRetryPolicy` retries a read
+timeout on the next replica only when no data came back.
+
+The self-managed `nvcf-api` and `api-keys` services (ncp profile) select
+`RangeReadRetryPolicy`, which also retries once, on the next replica, a read
+timeout that has data but too few responses. This is independent of
+`highAvailability.mode`. To return to the default, or to tune resilience
+further, override the driver retry-policy class through the operator env hooks:
+
+```yaml
+api:
+  env:
+    SPRING_CASSANDRA_ADVANCED_RETRY_POLICY_CLASS: com.nvidia.boot.cassandra.retry.NextHostRetryPolicy
+apikeys:
+  env:
+    SPRING_CASSANDRA_ADVANCED_RETRY_POLICY_CLASS: com.nvidia.boot.cassandra.retry.NextHostRetryPolicy
+```
+
 ## Tuning scheduling policy (`global.affinity` / `global.topologySpreadConstraints`)
 
 Affinity and zone topology spread are shared scheduling policy, so you can
@@ -379,17 +449,19 @@ Confirm the replica-safe Deployments scaled and spread:
 kubectl -n nvcf get deploy nvcf-api -o wide
 kubectl -n nvcf get pods -o wide -l 'app.kubernetes.io/instance=api,!app.kubernetes.io/component'
 kubectl -n api-keys get deploy admin-token-issuer-proxy -o wide
-# invocation-service and grpc-proxy stay at 1 replica for now (deferred until Envoy)
+# invocation-service and grpc-proxy: 2 replicas, unless a fixed worker callback URL is set
 kubectl -n nvcf get deploy invocation-service grpc-proxy-deployment -o wide
 # ess-api scales to 2 (its scheduled crypto jobs run only in a separate worker, not in-stack)
 kubectl -n ess get deploy ess-api-deployment -o wide
 ```
 
-Confirm the JetStream RF took effect (streams report `Replicas: 3`):
+Confirm the JetStream RF took effect (streams report `Replicas: 3`). The NATS
+CLI is in the `nats-box` deployment; the `nats` server container does not
+include it:
 
 ```bash
-kubectl -n nats-system exec -it nats-0 -- nats stream ls
-kubectl -n nats-system exec -it nats-0 -- nats stream info <stream-name>
+kubectl -n nats-system exec deploy/nats-box -- nats stream ls
+kubectl -n nats-system exec deploy/nats-box -- nats stream info <stream-name>
 ```
 
 Confirm Cassandra keyspace replication:
@@ -419,8 +491,11 @@ With HA enabled and capacity in at least two AZs:
 - **Single node loss:** Multi-replica replica-safe Deployments keep
   serving from their surviving replica; the scheduler recreates the lost pod on
   another node (and the PDB prevents drains from removing the last one).
-  `invocation-service` and `grpc-proxy` (single replica until Envoy) are briefly
-  unavailable while the scheduler restarts the pod on another node. Quorum
+  In-flight requests on a lost `invocation-service` or `grpc-proxy` pod fail
+  and must be retried. With per-pod callback addresses (the default), new
+  requests go to the surviving replica. A service with a fixed worker callback
+  URL runs one replica, so it serves no new requests until its replacement pod
+  is Ready. Quorum
   services (Cassandra RF=3/`LOCAL_QUORUM`, NATS RF=3, OpenBao 3-node Raft)
   retain quorum with 2 of 3 members and continue serving reads and writes.
   For Cassandra this assumes the keyspaces are at RF=3, which an upgraded
@@ -462,7 +537,12 @@ in this order:
    labels, and `WaitForFirstConsumer` storage. If the cluster is not ready (or it
    is a single-node install), set `highAvailability.mode: none` to keep the
    current single-replica behavior.
-4. **Apply.** `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
+4. **Apply.** If Cassandra runs a single member and you chose `preferred` or
+   `enforced`, expand and repair it first with the steps in
+   [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first):
+   the sync would otherwise scale it and run the migration job before the ledger
+   is repaired. If a keyspace also replicates to another data center, read the
+   replication-map note in that section first. Then run `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
    Deployments roll with `maxUnavailable: 0` / `maxSurge: 1` (needs headroom for
    one surge pod); quorum services roll one member at a time and keep quorum.
 5. **Raise Cassandra keyspace replication.** The sync scales Cassandra to three
@@ -471,11 +551,16 @@ in this order:
    unavailable. Once all three Cassandra pods are Ready, raise each application
    keyspace to RF=3, then run a full repair on every member so the new replicas
    receive the existing data. Skip any keyspace your install does not have
-   (the query in [Validation](#validation) lists them):
+   (the query in [Validation](#validation) lists them). If you expanded
+   Cassandra first in step 4, these keyspaces are already at RF=3 and running
+   the block again is safe. The commands use the chart's default data-center
+   name, `ncp`; if you set `cassandra.cluster.datacenter` to another name, use
+   that name instead. Each `ALTER` replaces the whole replication map, so if a
+   keyspace also replicates to another data center, keep that entry in the map:
 
    ```bash
    read -rs -p "Cassandra administrator password: " CASSANDRA_PASSWORD; echo
-   for ks in nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
+   for ks in schema_migrations nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
      kubectl -n cassandra-system exec cassandra-0 -- \
        cqlsh -u cassandra -p "$CASSANDRA_PASSWORD" \
        -e "ALTER KEYSPACE $ks WITH replication = {'class': 'NetworkTopologyStrategy', 'ncp': '3'};"

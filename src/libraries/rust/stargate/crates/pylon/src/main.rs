@@ -20,10 +20,8 @@ use pylon_lib::{
     EngineStatsStreamMode, ModelDiscoveryProvider, TunnelTransportProtocol, UpstreamBackend,
 };
 use stargate_protocol::BackendConnectivity;
-use stargate_protocol::tunnel_contract::HEADER_STARGATE_UPSTREAM_RETRYABLE;
 
-const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "429,503";
-const DEFAULT_PYLON_UPSTREAM_RETRY_HEADER: &str = HEADER_STARGATE_UPSTREAM_RETRYABLE;
+const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "529,503";
 const DEFAULT_OTEL_SERVICE_NAME: &str = "pylon";
 
 mod startup;
@@ -89,9 +87,10 @@ struct Args {
     /// Upstream health path probed ahead of the built-in defaults; repeat to try several in order
     #[arg(long = "upstream-health-path", value_name = "PATH")]
     upstream_health_paths: Vec<String>,
-    /// How long startup retries the upstream health probe before exiting. `0` probes once
-    #[arg(long, default_value_t = 60000, value_name = "MS")]
-    upstream_health_wait_ms: u64,
+    /// How long startup retries the upstream health probe before exiting. `0` probes once.
+    /// Defaults to INFERENCE_READY_TIMEOUT when set, otherwise 60000
+    #[arg(long, value_name = "MS")]
+    upstream_health_wait_ms: Option<u64>,
     /// Run local input-TPS calibration before contacting Stargate. Use only when this is the cluster's sole Pylon
     #[arg(long, default_value_t = false)]
     do_calibration: bool,
@@ -108,7 +107,7 @@ struct Args {
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     active_canary_interval_ms: u64,
     /// Canary `max_tokens`. Generating more tokens than this is runaway generation; exact usage overrides the output estimate
-    #[arg(long, default_value_t = 237, value_name = "TOKENS")]
+    #[arg(long, default_value_t = 16, value_name = "TOKENS")]
     canary_max_generation_threshold: u32,
     /// Initial calibration request count; doubles after each completed load step
     #[arg(long, default_value_t = 5, value_name = "N")]
@@ -119,7 +118,7 @@ struct Args {
     /// Maximum concurrent requests used during calibration
     #[arg(long, default_value_t = 4, value_name = "N")]
     calibration_max_concurrency: usize,
-    /// Timeout for canary requests in milliseconds. An active canary that times out while other requests make progress does not mark the model unavailable
+    /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while requests for any model name on this Pylon make progress does not mark the model unavailable; this assumes the names share workers, as aliases do
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     bringup_canary_timeout_ms: u64,
     /// Timeout for calibration requests in milliseconds
@@ -166,7 +165,10 @@ struct Args {
         value_name = "NAME"
     )]
     otel_service_name: String,
-    /// Comma-separated upstream HTTP statuses that can be marked retryable
+    /// Comma-separated upstream HTTP statuses that Pylon marks retryable, for
+    /// every response with that status. An empty value turns these retries
+    /// off. The dynamo backend mode also marks a 404 with content-length 0;
+    /// this list does not control that rule.
     #[arg(
         long,
         default_value = DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -174,22 +176,6 @@ struct Args {
         value_name = "CODES"
     )]
     pylon_retryable_upstream_status_codes: String,
-    /// Require the upstream retry header before marking retryable statuses retryable
-    #[arg(
-        long,
-        action = clap::ArgAction::Set,
-        default_value_t = true,
-        env = "PYLON_REQUIRE_UPSTREAM_RETRY_HEADER"
-    )]
-    pylon_require_upstream_retry_header: bool,
-    /// Upstream response header that authorizes retrying retryable status codes
-    #[arg(
-        long,
-        default_value = DEFAULT_PYLON_UPSTREAM_RETRY_HEADER,
-        env = "PYLON_UPSTREAM_RETRY_HEADER",
-        value_name = "HEADER"
-    )]
-    pylon_upstream_retry_header: String,
     /// Convert upstream Retry-After responses into x-stargate-retry-after-ms
     #[arg(
         long,
@@ -234,7 +220,8 @@ struct Args {
     #[arg(long, env = "PYLON_QUEUE_MISMATCH_RETRY_AFTER_MS", value_name = "MS")]
     pylon_queue_mismatch_retry_after_ms: Option<u64>,
     /// Engine dialect spoken to the local upstream: "dynamo" derives the
-    /// engine priority headers from x-priority, "passthrough" derives nothing
+    /// engine priority headers from x-priority and marks a 404 with
+    /// content-length 0 retryable, "passthrough" does neither
     #[arg(
         long,
         default_value = "dynamo",
@@ -323,7 +310,6 @@ mod tests {
         EngineStatsStreamMode, ModelDiscoveryProvider, PylonQueueMismatchRetryConfig,
         PylonRetryConfig, TunnelForwardingConfig, TunnelTransportProtocol,
     };
-    use reqwest::header::HeaderName;
 
     use super::startup::{
         effective_cluster_id, normalize_base_url, pylon_queue_mismatch_retry_config_from_args,
@@ -471,11 +457,6 @@ mod tests {
             retry.retryable_upstream_status_codes,
             defaults.retryable_upstream_status_codes
         );
-        assert_eq!(
-            retry.require_upstream_retry_header,
-            defaults.require_upstream_retry_header
-        );
-        assert_eq!(retry.upstream_retry_header, defaults.upstream_retry_header);
         assert_eq!(retry.propagate_retry_after, defaults.propagate_retry_after);
         assert_eq!(
             retry.local_connect_failures_retryable,
@@ -488,9 +469,6 @@ mod tests {
         let args = parse_argv(&[
             "--pylon-retryable-upstream-status-codes",
             "418, 429,503",
-            "--pylon-require-upstream-retry-header=false",
-            "--pylon-upstream-retry-header",
-            "x-can-retry",
             "--pylon-propagate-retry-after=false",
             "--pylon-local-connect-failures-retryable=true",
         ]);
@@ -503,11 +481,6 @@ mod tests {
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
             ]
-        );
-        assert!(!retry.require_upstream_retry_header);
-        assert_eq!(
-            retry.upstream_retry_header,
-            HeaderName::from_static("x-can-retry")
         );
         assert!(!retry.propagate_retry_after);
         assert!(retry.local_connect_failures_retryable);

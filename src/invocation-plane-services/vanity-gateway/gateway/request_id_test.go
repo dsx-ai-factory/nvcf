@@ -54,7 +54,7 @@ func requireOneRequestID(t *testing.T, header http.Header, messages bool) string
 }
 
 func TestGatewayGeneratedErrorsCarryRequestID(t *testing.T) {
-	tooLarge := `{"model":"` + strings.Repeat("a", maxRequestSize) + `"}`
+	tooLarge := `{"model":"` + strings.Repeat("a", defaultMaxRequestSize) + `"}`
 	tests := []struct {
 		name   string
 		path   string
@@ -67,6 +67,11 @@ func TestGatewayGeneratedErrorsCarryRequestID(t *testing.T) {
 		{"messages unknown model", "/v1/messages", `{"model":"unknown"}`, nil, http.StatusNotFound},
 		{"messages body too large", "/v1/messages", tooLarge, nil, http.StatusRequestEntityTooLarge},
 		{"messages reserved shadow header", "/v1/messages", `{"model":"` + publicModel + `"}`, map[string]string{shadowHeader: "true"}, http.StatusBadRequest},
+		{"decisions malformed json", "/v1/decisions", `{`, nil, http.StatusBadRequest},
+		{"decisions unknown model", "/v1/decisions", `{"model":"unknown"}`, nil, http.StatusNotFound},
+		{"systemone malformed json", "/v1/systemone", `{`, nil, http.StatusBadRequest},
+		{"systemone unknown model", "/v1/systemone", `{"model":"unknown"}`, nil, http.StatusNotFound},
+		{"systemone body too large", "/v1/systemone", tooLarge, nil, http.StatusRequestEntityTooLarge},
 		{"chat malformed json", "/v1/chat/completions", `{`, nil, http.StatusBadRequest},
 		{"chat unknown model", "/v1/chat/completions", `{"model":"unknown"}`, nil, http.StatusNotFound},
 	}
