@@ -94,6 +94,9 @@ const columns: ColumnDef<TestRow, unknown>[] = [
 	},
 ];
 
+const columnIds = ["name", "status", "region", "invocations", "createdAt"];
+const columnLabels = ["Name", "Status", "Region", "Invocations", "Created"];
+
 function columnCells(headerName: string) {
 	const table = within(screen.getByRole("table"));
 	const headers = table.getAllByRole("columnheader");
@@ -179,6 +182,65 @@ describe("DataTable", () => {
 			);
 			expect(screen.getByRole("list")).toBeInTheDocument();
 			expect(screen.getAllByRole("listitem")).toHaveLength(3);
+		});
+
+		it("shows the no-columns state and restores every column", async () => {
+			const user = userEvent.setup();
+			renderTable();
+
+			for (const label of columnLabels) {
+				await user.click(screen.getByRole("menuitemcheckbox", { name: label }));
+			}
+
+			await waitFor(() => {
+				expect(screen.getByText("No columns selected")).toBeInTheDocument();
+			});
+			expect(screen.queryByRole("table")).not.toBeInTheDocument();
+
+			await user.click(
+				screen.getByRole("button", { name: /Show all columns/ }),
+			);
+
+			await waitFor(() => {
+				expect(screen.getByRole("table")).toBeInTheDocument();
+			});
+			for (const label of columnLabels) {
+				expect(
+					screen.getByRole("columnheader", { name: new RegExp(label) }),
+				).toBeInTheDocument();
+			}
+			expect(
+				screen.getByRole("cell", { name: "llm-gateway" }),
+			).toBeInTheDocument();
+		});
+
+		it("keeps renderContent output when every column is hidden", () => {
+			render(
+				<DataTable
+					columns={columns}
+					data={defaultData}
+					reactTableOptions={{
+						state: {
+							columnVisibility: Object.fromEntries(
+								columnIds.map((id) => [id, false]),
+							),
+						},
+					}}
+				>
+					<DataTable.Content<TestRow>
+						renderContent={({ rows }) => (
+							<ul>
+								{rows.map((row) => (
+									<li key={row.id}>{row.original.name}</li>
+								))}
+							</ul>
+						)}
+					/>
+				</DataTable>,
+			);
+
+			expect(screen.getAllByRole("listitem")).toHaveLength(3);
+			expect(screen.queryByText("No columns selected")).not.toBeInTheDocument();
 		});
 	});
 
