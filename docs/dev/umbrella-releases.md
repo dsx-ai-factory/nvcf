@@ -167,18 +167,18 @@ the docs default or publish the site.
 
 ## Prepare and activate maintained docs
 
-This section currently supports schema 1 products only. Schema 2 maintained
-docs preparation and activation are deferred until selected inventories can
-seed the docs catalog; see [the docs follow-up](https://github.com/NVIDIA/nvcf/issues/2798).
-The commands reject schema 2 instead of copying unrelated Development pins.
-Keep the existing published docs edition while that support is pending.
+Maintained docs support qualified schema 1 and schema 2 products. Schema 1
+uses the catalog at the manifest's `source_commit`. Schema 2 builds the catalog
+from the three selected original inventories, checking their hashes, versions,
+tags, commits, and deployment-plane ownership. It never selects latest releases.
 
 Protect `docs/versions/**` against deletion and force pushes. Require reviewed
 updates and applicable docs checks; these branches must permit approved
 corrections. Keep the stricter freeze on `docs/releases/**` unchanged.
 
-Prepare the documentation from a reviewed source commit using the published
-product identity:
+Prepare the documentation from a reviewed source commit containing the
+supported docs tooling, using the published product identity. The docs source
+and product tag commits may differ:
 
 ```bash
 go run -C tools/docs-version-sync . umbrella docs-prepare \
@@ -188,10 +188,32 @@ go run -C tools/docs-version-sync . umbrella docs-prepare \
   --commit REVIEWED_DOCS_SOURCE_COMMIT --out /tmp/nvcf-product-docs
 ```
 
-Review the prose against the selected combination. The tool seeds the catalog
-from the product's reviewed source and embeds the immutable product manifest.
-Commit the prepared files on `docs/versions/X.Y.Z` and push that branch after
-verifying its protection rules. Record the resulting full commit SHA.
+For schema 2, the tool downloads and verifies the stable public product assets.
+Alternatively, pass `--inventories /path/to/product-assets` for previously
+downloaded assets whose bytes match the manifest. The tool embeds the original
+inventories under `docs/umbrella-inventories/` and the immutable product manifest
+at `docs/umbrella-manifest.json`. Revision validation uses these committed bytes.
+
+The immutable product tag supplies descriptions, classifications, output
+definitions, and publication records matching the selected versions. Runtime
+pins come from the selected inventories and stack sources. Unselected
+Development artifacts and runtime overrides are excluded. Explicitly shared
+supplemental resources without stack ownership, such as the CLI, retain their
+independent versions and provenance. They are separate from the three-stack
+product selection. Schema 2's `source_commit` supplies provenance and license
+files; its catalog may predate the selected stack releases.
+
+Review the prose against the selected combination.
+The selected docs commit also supplies `fern/navigation.yml` and its pages.
+Fern does not filter pages by the version numbers in their titles. Review the
+prepared navigation and release notes for the selected product. For example,
+include the 1.0.4 upgrade procedure in the 1.0.4 edition; include a guide to a
+later release only when that edition intentionally documents the supported
+outgoing upgrade. A linked guide does not change the edition's selected stacks.
+
+Commit the prepared files on `docs/versions/X.Y.Z` after verifying its protection
+rules. For corrections, merge a reviewed content PR into that branch and record
+the merged full commit SHA. Advancing the branch alone does not publish it.
 
 From a canonical checkout, prepare the approval:
 
@@ -211,10 +233,20 @@ For initial activation, add the selector entry to `fern/docs.yml`:
   ref: docs/versions/X.Y.Z
 ```
 
-Set `fern/editions.yml`'s `default` to the new version and put its selector
-first. Retain every old version, all six tabs, Development, site settings,
-redirects, anchors, and downloads. Review this small canonical activation diff
-separately from the prepared sources and artifact publication.
+Activation requires qualification of the complete selected three-stack
+combination. Choose default promotion separately from initial activation.
+For a selectable, non-default edition, retain `fern/editions.yml`'s current
+`default`, keep that version's selector first, and add the new selector after it.
+Record the release owner's publication decision, upgrade procedure limitations,
+and their follow-up issues. Disclose unfinished upgrade procedures in the
+release notes and guides. Promote the new default only through a separate
+reviewed change after upgrade validation and other default-promotion gates are
+complete.
+
+When promoting the default, set `fern/editions.yml`'s `default` to the new version
+and put its selector first. Retain every old version, all six tabs, Development,
+site settings, redirects, anchors, and downloads. Review the canonical activation
+or promotion diff separately from the prepared sources and artifact publication.
 
 Commit the reviewed canonical inputs before running the publisher check.
 It requires clean `docs/` and `fern/` trees, including untracked and ignored

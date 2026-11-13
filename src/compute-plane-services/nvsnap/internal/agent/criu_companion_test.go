@@ -5,11 +5,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -271,5 +275,116 @@ func TestParseCRIUGroup_Containers(t *testing.T) {
 	delete(d, "container.1")
 	if g, ok := parseCRIUGroup("k", d); !ok || g.Containers[0] != "" || g.Containers[1] != "" {
 		t.Errorf("old record: %+v, %v", g.Containers, ok)
+	}
+	// A rank's recorded entrypoint reaches the webhook, which starts the
+	// placeholder cold in place with it.
+	d["coldEntrypoint.0"] = `["/opt/start.sh"]`
+	if g, ok := parseCRIUGroup("k", d); !ok || g.ColdEntrypoints[0] != `["/opt/start.sh"]` || g.ColdEntrypoints[1] != "" {
+		t.Errorf("entrypoints: %+v, %v", g.ColdEntrypoints, ok)
+	}
+}
+
+// A companion placeholder is released as soon as a GPU pod of its rollout
+// was admitted cold: the instance does not restore (seen on a test cluster: the
+// ranks' model volume was still downloading, and the companions waited the
+// full placeholder wait). A rank a group restore took, restored or not,
+// never releases it, nor do pods from before the rollout, pods being
+// deleted, or pods without GPUs.
+func TestRankAdmittedCold(t *testing.T) {
+	at := time.Date(2026, 10, 24, 22, 15, 0, 0, time.UTC)
+	companion := cpuPod("etcd-x", "10.0.0.9")
+	companion.CreationTimestamp = metav1.NewTime(at)
+	pod := func(p corev1.Pod, created time.Time, ann map[string]string) corev1.Pod {
+		p.CreationTimestamp = metav1.NewTime(created)
+		p.Annotations = ann
+		return p
+	}
+	group := map[string]string{webhook.CRIUGroupAnnotation: "k"}
+	restored := map[string]string{webhook.CRIUGroupAnnotation: "k", webhook.CRIURestoredAnnotation: "true"}
+	deleting := pod(gpuPod("rank-gone", "10.0.0.5"), at, nil)
+	deleting.DeletionTimestamp = &metav1.Time{Time: at}
+	for name, c := range map[string]struct {
+		pods []corev1.Pod
+		want string
+	}{
+		"rank admitted cold":         {[]corev1.Pod{pod(gpuPod("rank-0", "10.0.0.1"), at.Add(time.Second), nil)}, "rank-0"},
+		"rank created just before":   {[]corev1.Pod{pod(gpuPod("rank-0", "10.0.0.1"), at.Add(-30*time.Second), nil)}, "rank-0"},
+		"rank the restore took":      {[]corev1.Pod{pod(gpuPod("rank-0", "10.0.0.1"), at, group)}, ""},
+		"rank restored":              {[]corev1.Pod{pod(gpuPod("rank-0", "10.0.0.1"), at, restored)}, ""},
+		"GPU pod from before":        {[]corev1.Pod{pod(gpuPod("old", "10.0.0.2"), at.Add(-time.Hour), nil)}, ""},
+		"rank being deleted":         {[]corev1.Pod{deleting}, ""},
+		"another companion, no GPUs": {[]corev1.Pod{pod(cpuPod("nats-x", "10.0.0.3"), at, nil)}, ""},
+		"no pods":                    {nil, ""},
+	} {
+		if got := rankAdmittedCold(&companion, c.pods); got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+	}
+}
+
+// Only a pod's running containers are asked for connections: a container in
+// a crash loop holds none, and asking for it failed the whole capture.
+func TestRunningContainers(t *testing.T) {
+	p := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "alloy"}, {Name: "agent"}, {Name: "proxy"}}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+			{Name: "alloy", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}},
+			{Name: "proxy", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			{Name: "agent", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+		}},
+	}
+	if got := runningContainers(p); strings.Join(got, ",") != "agent,proxy" {
+		t.Errorf("running containers = %v, want agent,proxy in spec order", got)
+	}
+	crash := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "alloy"}}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+			{Name: "alloy", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}}}}}
+	if got := runningContainers(crash); len(got) != 0 {
+		t.Errorf("a crashed container counted as running: %v", got)
+	}
+	if got := runningContainers(&corev1.Pod{Spec: crash.Spec}); len(got) != 0 {
+		t.Errorf("a container without a status counted as running: %v", got)
+	}
+}
+
+// An instance whose companions cannot be told is tried again, and only a
+// failure that persists is counted as a refusal, once; another instance's
+// count is its own, and a pod forgotten starts over.
+func TestCompanionsUnknown_RetriesThenRefuses(t *testing.T) {
+	c, rec := lifecycleAgent(t, "GB300-companions")
+	ctx := context.Background()
+	leader := admittedPod(0, 2, time.Second)
+	labels := map[string]string{"outcome": metrics.CaptureRefused, "gpu": "GB300-companions"}
+	before := metricValue(t, metrics.CaptureOutcomes, labels)
+	err := errors.New("pod alloy: container alloy: connections: 404 Not Found: container not found")
+	for i := 1; i < companionMaxFailures; i++ {
+		if !c.companionsUnknown(ctx, "k", leader, 2, err, quietEntry()) {
+			t.Fatalf("attempt %d: not tried again", i)
+		}
+	}
+	other := admittedPod(1, 2, time.Second)
+	other.UID = "other"
+	if !c.companionsUnknown(ctx, "k2", other, 2, err, quietEntry()) {
+		t.Fatal("another instance's first failure was not tried again")
+	}
+	if metricValue(t, metrics.CaptureOutcomes, labels) != before {
+		t.Fatal("a refusal counted before the attempts ran out")
+	}
+	if c.companionsUnknown(ctx, "k", leader, 2, err, quietEntry()) {
+		t.Fatal("tried again after the last attempt")
+	}
+	if got := metricValue(t, metrics.CaptureOutcomes, labels) - before; got != 1 {
+		t.Fatalf("refusals counted %v, want 1", got)
+	}
+	if e := event(rec); !strings.Contains(e, eventCaptureRefused) || !strings.Contains(e, "attempts") {
+		t.Fatalf("event %q", e)
+	}
+	// The count started over: the next failure is tried again.
+	if !c.companionsUnknown(ctx, "k", leader, 2, err, quietEntry()) {
+		t.Fatal("the count did not start over")
+	}
+	c.forgetPod(leader)
+	if _, ok := c.companionFailures.Load(leader.UID); ok {
+		t.Fatal("a forgotten pod kept its count")
 	}
 }

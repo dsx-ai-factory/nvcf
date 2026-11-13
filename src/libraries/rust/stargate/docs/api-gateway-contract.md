@@ -235,6 +235,7 @@ Common errors:
 | `503` | `overloaded_error` | Capacity or admission rejection. | Treat as serving failure. |
 | `503` | `local_connect_failure` | Pylon could not connect to its model server. | Treat as serving failure. |
 | `503` | `model_generation_unavailable` | Pylon has not admitted the model generation. | Treat as serving failure. |
+| `504` | `upstream_timeout` | The request was sent, but Pylon sent no response headers before `--quic-request-timeout-ms`. A timeout while opening the tunnel stream returns `502`. | Treat as serving failure. |
 
 Stargate strips pylon retry metadata before returning downstream:
 `x-stargate-retryable`, `x-stargate-retry-reason`,
@@ -249,17 +250,31 @@ By default it does so only when its local queue estimate exceeds Stargate's by
 at least 10 s and at least 4 times (`--pylon-queue-mismatch-min-delta-ms`,
 `--pylon-queue-mismatch-tolerance-factor`). Stargate's estimate lags behind
 Pylon's under load, so smaller differences are expected.
-The local upstream may mark `429` or `503` retryable for pylon with
-`x-stargate-upstream-retryable: true`; pylon converts that to Stargate retry
-metadata and does not forward the upstream header downstream.
+
+Pylon marks a model server error retryable from the response head, before any
+output reaches Stargate. By default it marks `529` and `503`
+(`--pylon-retryable-upstream-status-codes`). In `dynamo` backend mode it also
+marks a `404` with `content-length: 0`, which a Dynamo frontend answers after
+the model leaves its registry. By default, other model server errors, such as
+`429` and `500`, reach the client unchanged.
+
+Stargate retries a marked response on a cluster that this request has not
+tried, up to `--proxy-max-request-retries` (default 2). When no untried
+cluster is left or the retries run out, the client gets the last model server
+response. If every answer that the request got was a `529`, the client gets
+`503` with `x-stargate-error-code: overloaded_error` instead. The LLM API
+gateway returns that response as `529`.
 
 Queued requests can wait a long time before their first output. Stargate waits
 up to `--quic-request-timeout-ms` (default 300000) for response headers from
-Pylon. After the engine returns headers, Pylon waits up to
-`--pylon-first-output-timeout-ms` (default 300000) for the first streamed output
-and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs. The two
-waits run one after the other, so a single attempt can wait for their sum before
-its first output, and each retry can wait that long again.
+Pylon. When that wait ends, Stargate returns `504` and drops the tunnel stream.
+Pylon then cancels the engine request, as it does when the caller disconnects.
+This works over raw QUIC tunnels, direct or through `stargate-k8s-router`, and
+over direct WebTransport tunnels. After the engine returns headers, Pylon waits
+up to `--pylon-first-output-timeout-ms` (default 300000) for the first streamed
+output and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs.
+The two waits run one after the other, so a single attempt can wait for their
+sum before its first output, and each retry can wait that long again.
 
 Gateway rules:
 

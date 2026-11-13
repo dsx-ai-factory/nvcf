@@ -44,6 +44,24 @@ When enabled, the stack creates:
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
 
+When a worker pod of a container-based LLM function is removed, for example on
+scale-down, the function container gets a `preStop` pause before its stop
+signal, so it keeps serving requests while the `pylon` sidecar stops. The
+pause is 60 seconds by default. The pod's termination grace period is the
+pause plus 60 seconds, or 120 seconds if that is longer, and the `pylon`
+sidecar gets `PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS` set to the pause minus 5
+seconds; a `pylon` version that reads this variable uses it as its drain
+deadline. A removed pod therefore releases its GPU up to one pause later. To
+change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
+chart values, for example `90s`, between `10s` and `1h`; it applies to worker
+pods created after NVCA picks up the new value. The pause runs `sleep` in the
+function container; an image without `sleep` stops at once, as before. When
+the function uses Bring Your Own Observability (BYOO), the BYOO collector and
+log-forwarder sidecars wait for the same pause, so telemetry from requests
+served during the pause is still sent. They use the Kubernetes `sleep`
+lifecycle action, which is stable since Kubernetes 1.34. The function
+container's own shutdown output after the pause may not be sent.
+
 ## Enable on an Existing Installation
 
 The addon can be enabled on a running control plane after the initial install
@@ -82,7 +100,7 @@ Before applying:
 3. Review the rendered change before applying:
 
    ```bash
-   cd path/to/nvcf-self-managed-stack
+   cd "$BUNDLE_DIR/deploy/stacks/self-managed"
    HELMFILE_ENV=<environment-name> helmfile --environment default diff --suppress-secrets
    ```
 
@@ -688,7 +706,7 @@ the API creates a new LLM function version.
 Apply the updated control-plane environment:
 
 ```bash
-cd path/to/nvcf-self-managed-stack
+cd "$BUNDLE_DIR/deploy/stacks/self-managed"
 make apply HELMFILE_ENV=<environment-name>
 ```
 

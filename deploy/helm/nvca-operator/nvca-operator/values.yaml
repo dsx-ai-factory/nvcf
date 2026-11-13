@@ -168,6 +168,7 @@ storage:
 ## @param worker.download.concurrentDownloads Artifacts worker-init fetches at once (WORKER_CONCURRENT_DOWNLOADS). Applies to worker pods, model-cache writer Jobs, and Helm model-cache-init. The default is worker-init's built-in value; 0 omits the variable and defers to the image.
 ## @param worker.download.concurrentChunks Ranged GETs per artifact (WORKER_CONCURRENT_CHUNKS). Total streams are concurrentDownloads times concurrentChunks. The default is worker-init's built-in value; 0 omits the variable and defers to the image.
 ## @param worker.download.chunkSizeBytes Bytes per ranged GET (WORKER_CHUNK_SIZE), 1 MiB to 4 GiB. The default is worker-init's built-in 16 MiB; 0 omits the variable and defers to the image.
+## @param worker.llmInferenceStopPause How long the inference container of an LLM container function keeps serving after its pod is deleted, while Pylon drains (e.g., "90s"; between "10s" and "1h"). Pylon's drain timeout and the pod's grace period are derived from it. Leave unset to keep the agent's built-in default (60s).
 worker:
   minHealthcheckRefreshWait: ""
   staticGPUCapacity: 0
@@ -199,6 +200,7 @@ worker:
     concurrentDownloads: 5
     concurrentChunks: 4
     chunkSizeBytes: 16777216
+  llmInferenceStopPause: ""
 ## @param agentConfig.mergeConfig Merge fields into the generated NVCA config. Must be a string.
 ## @description agentConfig.mergeConfig is deprecated for BYOO, storage, and worker settings. Use the top-level byoo/storage/worker values instead.
 agentConfig:
@@ -422,7 +424,7 @@ helmManaged:
   ## @param helmManaged.imageCredHelper.imageTag (REQUIRED) Image tag of "nvcf-image-credential-helper". Only override this if you know what you are doing.
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   ## @param helmManaged.otelCollector.enabled Enable OTel collector sidecar for helm-managed clusters
   ## @param helmManaged.otelCollector.imageRepository (OPTIONAL) Image repository of "otel-collector". Only override this if you know what you are doing. If not specified, it is nvcf-otel-collector under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).
   ## @param helmManaged.otelCollector.imageTag (REQUIRED) Image tag of "otel-collector". Only override this if you know what you are doing.
@@ -448,7 +450,7 @@ selfManaged:
   ## @param selfManaged.imageCredHelper.imageTag (REQUIRED) Image tag of "nvcf-image-credential-helper". Only override this if you know what you are doing.
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   ## @param selfManaged.otelCollector.enabled Enable OTel collector sidecar for self-managed clusters
   ## @param selfManaged.otelCollector.imageRepository (OPTIONAL) Image repository of "otel-collector". Only override this if you know what you are doing. If not specified, it is nvcf-otel-collector under the registry path of image.repository (nvcr.io/nvidia/nvcf-byoc when image.repository has none).
   ## @param selfManaged.otelCollector.imageTag (REQUIRED) Image tag of "otel-collector". Only override this if you know what you are doing.

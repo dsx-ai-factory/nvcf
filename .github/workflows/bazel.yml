@@ -74,6 +74,7 @@ jobs:
       matrix: ${{ steps.detect.outputs.matrix }}
       matrix_docker: ${{ steps.detect.outputs.matrix_docker }}
       any: ${{ steps.detect.outputs.any }}
+      compatibility: ${{ steps.detect.outputs.compatibility }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,6 +93,7 @@ jobs:
           bash tools/ci/test-bazel-remote-probe
           bash tools/ci/test-bazel-lock-touches-java
           python3 tools/ci/test-bazel-lock-touches-java-properties
+          python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_compatibility_scope.py'
 
       - name: Compute changed subtrees
         id: detect
@@ -211,7 +213,7 @@ jobs:
           case "$EVENT" in
             workflow_dispatch) run_all=true ;;
             pull_request)
-              if ! changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null); then
+              if ! changed=$(git diff --no-renames --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null); then
                 echo "diff vs origin/${BASE_REF} failed; running full matrix"
                 run_all=true
               else
@@ -232,7 +234,7 @@ jobs:
               elif ! git rev-parse --verify -q "${MERGE_BASE_SHA}^{commit}" >/dev/null 2>&1; then
                 echo "merge_group base ${MERGE_BASE_SHA} not in history; running full matrix"
                 run_all=true
-              elif ! changed=$(git diff --name-only "${MERGE_BASE_SHA}...${HEAD_SHA}" 2>/dev/null); then
+              elif ! changed=$(git diff --no-renames --name-only "${MERGE_BASE_SHA}...${HEAD_SHA}" 2>/dev/null); then
                 echo "diff ${MERGE_BASE_SHA}...${HEAD_SHA} failed; running full matrix"
                 run_all=true
               else
@@ -243,7 +245,7 @@ jobs:
             *)
               if [ -z "${BEFORE_SHA}" ] || [ "${BEFORE_SHA}" = "0000000000000000000000000000000000000000" ]; then
                 run_all=true
-              elif ! changed=$(git diff --name-only "${BEFORE_SHA}..${HEAD_SHA}" 2>/dev/null); then
+              elif ! changed=$(git diff --no-renames --name-only "${BEFORE_SHA}..${HEAD_SHA}" 2>/dev/null); then
                 echo "diff ${BEFORE_SHA}..${HEAD_SHA} failed (rewritten history?); running full matrix"
                 run_all=true
               else
@@ -267,6 +269,8 @@ jobs:
           if grep -q '^\.github/workflows/bazel\.yml$' <<<"$changed"; then
             run_all=true
           fi
+
+          echo "compatibility=$(bash src/libraries/rust/stargate/scripts/compatibility_scope.sh paths "$run_all" <<< "$changed")" >> "$GITHUB_OUTPUT"
 
           # Reverse-dependency edge. A discovered Java framework change
           # validates every discovered java-service row.
@@ -478,6 +482,72 @@ jobs:
           echo "matrix_docker=${include_docker}" >> "$GITHUB_OUTPUT"
           if [ "$total" -gt 0 ]; then echo "any=true" >> "$GITHUB_OUTPUT"; else echo "any=false" >> "$GITHUB_OUTPUT"; fi
 
+  compatibility:
+    name: LLM protocol compatibility
+    needs: detect
+    if: needs.detect.outputs.compatibility == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Buf (pinned, checksum-verified)
+        env:
+          BUF_VERSION: "1.75.0"
+          BUF_SHA256: "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/buf-bin"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/buf-bin/buf" \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "$BUF_SHA256  $RUNNER_TEMP/buf-bin/buf" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/buf-bin/buf"
+          echo "$RUNNER_TEMP/buf-bin" >> "$GITHUB_PATH"
+
+      - name: Check LLM protocol compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTRACT_RELEASE_REPO: dsx-ai-factory/nvcf
+          CONTRACT_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'HEAD^' }}
+          CONTRACT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTRACT_TARGET_BRANCH: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$CONTRACT_BASE" =~ ^0+$ ]]; then
+            CONTRACT_BASE="origin/$CONTRACT_DEFAULT_BRANCH"
+          fi
+          python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_check_buf_breaking.py'
+          python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_select_compatibility_baseline.py'
+          bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$CONTRACT_BASE"
+          for schemas in \
+            src/control-plane-services/cloud-functions/nvcf-core/src/main/proto/llm_gateway.proto \
+            src/invocation-plane-services/llm-api-gateway/nvcf/pb/llm_gateway.proto; do
+            bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$CONTRACT_BASE" "$schemas"
+          done
+          check_releases="$(bash src/libraries/rust/stargate/scripts/compatibility_scope.sh releases "$CONTRACT_TARGET_BRANCH" "$CONTRACT_DEFAULT_BRANCH")"
+          if [ "$check_releases" != "true" ]; then
+            echo "Maintenance branch: target-base checks passed; full release matrix belongs to the default branch"
+            exit 0
+          fi
+          gh api --paginate "repos/$CONTRACT_RELEASE_REPO/releases?per_page=100" \
+            --jq '.[] | {tag_name,published_at,draft,prerelease} | @json' \
+            > "$RUNNER_TEMP/stargate-releases.jsonl"
+          python3 src/libraries/rust/stargate/scripts/select_compatibility_baseline.py \
+            < "$RUNNER_TEMP/stargate-releases.jsonl" > "$RUNNER_TEMP/stargate-baseline.json"
+          cat "$RUNNER_TEMP/stargate-baseline.json"
+          jq -er '.supported_tags[]' "$RUNNER_TEMP/stargate-baseline.json" > "$RUNNER_TEMP/stargate-tags.txt"
+          release_refs=()
+          while IFS= read -r tag; do
+            release_refs+=("refs/tags/$tag")
+          done < "$RUNNER_TEMP/stargate-tags.txt"
+          git fetch --no-tags "https://github.com/$CONTRACT_RELEASE_REPO.git" "${release_refs[@]}"
+          # Check every supported tag, including off-main backports.
+          while read -r release_sha _; do
+            bash src/libraries/rust/stargate/scripts/check_buf_breaking.sh "$release_sha"
+          done < "$(git rev-parse --git-path FETCH_HEAD)"
+
   bazel:
     name: bazel (${{ matrix.subtree.id }})
     needs: detect
@@ -621,16 +691,6 @@ jobs:
           key: byoo-gomod-${{ hashFiles('src/compute-plane-services/byoo-otel-collector/otelcol/go.sum') }}
           restore-keys: |
             byoo-gomod-
-
-      # nvstor-rdma links libibverbs (rdma-core), which the bazel-ci image does
-      # not carry. This row builds and tests for the runner's own architecture,
-      # so the native development package is enough; nvstor's own workflow
-      # cross-builds arm64.
-      - name: Install rdma-core development files (nvstor)
-        if: matrix.subtree.id == 'nvstor' && steps.precheck.outputs.skip == 'false'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libibverbs-dev
 
       # Decide the remote cache to use. The public EC2 Buildbarn is reachable
       # from GitHub-hosted runners over grpcs with a bearer token. When the
@@ -1187,13 +1247,15 @@ jobs:
 
   bazel-verification:
     name: bazel required checks
-    needs: [detect, bazel, bazel-docker]
+    needs: [detect, compatibility, bazel, bazel-docker]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Check Bazel workflow result
         env:
           DETECT_RESULT: ${{ needs.detect.result }}
+          COMPATIBILITY_SELECTED: ${{ needs.detect.outputs.compatibility }}
+          COMPATIBILITY_RESULT: ${{ needs.compatibility.result }}
           BAZEL_RESULT: ${{ needs.bazel.result }}
           DOCKER_RESULT: ${{ needs.bazel-docker.result }}
           BAZEL_ANY: ${{ needs.detect.outputs.any }}
@@ -1206,6 +1268,11 @@ jobs:
 
           if [ "${DETECT_RESULT}" != "success" ]; then
             echo "detect changed subtrees did not complete successfully"
+            exit 1
+          fi
+
+          if [ "${COMPATIBILITY_SELECTED}" = "true" ] && [ "${COMPATIBILITY_RESULT}" != "success" ]; then
+            echo "LLM protocol compatibility did not complete successfully"
             exit 1
           fi
 

@@ -110,6 +110,10 @@
             "nvcfApiEndpoint": {
               "$ref": "#/definitions/nonEmptyString"
             },
+            "nvcfControlPlaneEndpoint": {
+              "type": "string",
+              "pattern": "^$|^https?://[^/]+/?$"
+            },
             "llmGatewayEndpoint": {
               "type": "string",
               "pattern": "^$|^https?://[^/]+/?$"
@@ -129,8 +133,15 @@
             "shadowMaxConcurrent": {
               "type": "integer",
               "minimum": 1
+            },
+            "maxRequestSizeBytes": {
+              "description": "Maximum model API request body size in bytes (default 26214400, or 25 MiB).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
             }
           },
+          "required": ["maxRequestSizeBytes"],
           "additionalProperties": false
         },
         "mappingConfig": {

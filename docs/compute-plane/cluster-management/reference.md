@@ -10,6 +10,13 @@ version for the authoritative list of parameters and defaults:
 
 </Warning>
 
+Image tags in the override examples describe the selected stack combination.
+The Compute Plane package passes its credential-helper tag through
+`global.nvcaOperator.selfManaged.imageCredHelper.imageTag`; the selected
+package sets `0.11.3`. A standalone chart can have an older default. Set the
+example override explicitly when using that image outside the stack, and
+check the rendered backend configuration before applying.
+
 ## How Values Are Structured
 
 The chart values are organized into two layers:
@@ -177,7 +184,7 @@ agentConfig:
 otelCollector:
   enabled: false
   imageRepository: ""       # Auto-calculated if empty
-  imageTag: 0.143.2
+  imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Helm-Managed Parameters
@@ -206,10 +213,10 @@ helmManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Self-Managed Parameters
@@ -226,10 +233,10 @@ selfManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 <Note>

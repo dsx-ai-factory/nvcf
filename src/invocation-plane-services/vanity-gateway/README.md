@@ -45,6 +45,7 @@ Configuration is passed through environment variables.
 | `MAPPING_PATH` | Yes | None | Path to the rendered mapping config file. |
 | `MAPPING_LOAD_TIMEOUT` | No | `15s` | Maximum time to wait at startup for `MAPPING_PATH` to appear. Increase this when a ConfigMap projection or remote-config sidecar materializes the file after the main container starts. Duration strings require a unit, such as `2m` or `90s`. A value without a unit is rejected when configuration is loaded, and a negative value is rejected at startup. |
 | `NVCF_API_ENDPOINT` | No | Service default | Upstream invocation service endpoint. In cluster deployments, this usually points to the in-cluster invocation service. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` | No | Empty | NVCF API base URL used to list the private models a caller's API key may access. Empty disables private model listing. See [Private Models](#private-models). |
 | `LLM_GATEWAY_ENDPOINT` | No | Empty | Upstream LLM Gateway endpoint. Required only when a model sets `functionType: LLM`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | Empty | OTLP endpoint for tracing. Empty disables OTLP export. |
 | `TRACING_ACCESS_TOKEN` | No | Empty | Access token for OTLP tracing. Also configurable in the secrets file under `$.tracingAccessToken`. |
@@ -52,11 +53,45 @@ Configuration is passed through environment variables.
 | `PRIVATE_MODEL_NAME_REGEX_PATTERN` | No | See below | Regex used to hide private model names from `/v1/models`. |
 | `POD_IP` | No | Empty | Added to trace attributes as `host.ip`. |
 | `AWS_REGION` | No | Empty | Added to trace attributes as `host.dc`. |
+| `MAX_REQUEST_SIZE_BYTES` | No | `26214400` (25 MiB) | Maximum model API request body size in bytes. Explicit values must be positive integers. Invalid values stop startup. |
 | `SHADOW_MAX_CONCURRENT` | No | `256` | Maximum concurrent shadow requests. Non-positive values use the default. |
 
 `PRIVATE_MODEL_NAME_REGEX_PATTERN` defaults to the value compiled into the
 service. Override it when your deployment uses different private model naming
 conventions.
+
+Set `MAX_REQUEST_SIZE_BYTES=67108864` for a 64 MiB limit. The native chart
+exposes the same setting as `vanityGateway.config.maxRequestSizeBytes`:
+
+```yaml
+vanityGateway:
+  config:
+    maxRequestSizeBytes: 67108864
+```
+
+The gateway holds a model API request body in memory while it routes the
+request, unless the body is larger than 64 KiB, its first 64 KiB contain
+`model` and `stream` (decision routes: `model`), and the model's route
+forwards the body unchanged. Then it holds only that prefix and forwards the
+rest as it arrives; see [Request Body Handling](#request-body-handling).
+LLM Gateway routes and shadow models always hold the full body and add more
+copies. In one in-process test, a single 64 MiB request held in full raised
+gateway heap use by about
+224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
+900 MiB with one shadow model. Treat these numbers as examples, not limits.
+When raising this limit, also raise `vanityGateway.resources.limits.memory`.
+Size it from a load test at your expected concurrency, with headroom. The
+chart's default memory limit is `512Mi`.
+
+Requests for models with `functionType: LLM` are also limited by the LLM
+Gateway, which rejects request bodies over 50 MiB (52428800 bytes) by default.
+
+The limit applies to all model API POST routes, including JSON and multipart
+image requests. Bodies exactly at the limit are accepted. Generic vanity
+pass-through routes and private-model lookup response limits are unchanged.
+Existing logs, spans, and request metrics still record rejected requests.
+Changing the environment setting requires a process restart; mapping reloads
+retain the configured limit.
 
 ## Configuration Sources
 
@@ -127,6 +162,17 @@ for OpenAI-compatible endpoints and `path` for Vanity URL routes.
 When `usePexec` is false or omitted, the gateway forwards to `NVCF_API_ENDPOINT`
 with `function-id` and `function-version-id` headers. When `usePexec` is true,
 the gateway rewrites the upstream path to the pexec endpoint instead.
+
+When a model route or Vanity URL route invokes a function through the
+invocation service, with or without `usePexec`, the gateway removes the
+caller's `X-Api-Key` and `Cookie` headers before forwarding, so these
+credentials never reach the function. `Authorization` is
+forwarded: the invocation service authenticates the request with it and removes
+it before the function sees the request. The invocation service does not read
+`X-Api-Key`, so a Messages request that authenticates only with `x-api-key` is
+rejected there with `401`. Configured `customHeaders` are set after this step.
+Models with `functionType: LLM` keep both headers, see
+[LLM Function Models](#llm-function-models).
 
 ```yaml
 v2config:
@@ -331,7 +377,9 @@ When a target's `cancelOnClientDisconnect` is `true`, the gateway cancels only
 that target if the client disconnects or cancels the primary request before the
 primary response completes. Other targets continue under their own policies.
 Sampling does not change primary validation, forwarded request bytes, or
-headers. Raw bearer credentials, prompt cache keys, and message content are not
+headers. A model with shadow targets reads each request body in full before
+dispatch, because sampling and replay read the body. See
+[Request Body Handling](#request-body-handling). Raw bearer credentials, prompt cache keys, and message content are not
 added to logs, traces, or metric labels.
 
 ### Vanity Mapping Fields
@@ -386,7 +434,8 @@ these requests. The LLM Gateway resolves the function from the model, so the
 gateway sets none of them, and a caller-supplied value is removed rather than
 forwarded: the mapping is what decides which function a caller reaches.
 Vanity Gateway passes `Authorization`, `NVCF-POLL-SECONDS`, and the caller's
-other headers to the LLM Gateway.
+other headers, including `X-Api-Key` and `Cookie`, to the LLM Gateway. The LLM
+Gateway accepts the API key in `x-api-key` on Messages requests.
 
 Config validation rejects `functionType: LLM` outside the supported
 sections, and rejects `usePexec`, `outgoingPathOverride`, and `sessionTimeout`
@@ -404,6 +453,103 @@ model may shadow a model served by the invocation service, or the reverse.
 `LLM_GATEWAY_ENDPOINT` is required whenever a model sets `functionType: LLM`. It
 is the outbound address of the LLM Gateway, so it is a full URL with a scheme
 and must not carry a path.
+
+The `model` rewrite needs the complete body, so requests for these models are
+read in full before they are forwarded. See
+[Request Body Handling](#request-body-handling).
+
+## Request Body Handling
+
+Model API routes need `model`, and outside `/v1/decisions` and
+`/v1/systemone` also `stream`, before they can choose a backend. The gateway
+reads at most 64 KiB of a JSON body before it decides how to read the rest.
+
+```mermaid
+flowchart TD
+  request[Model API request] --> limit{Content-Length over the route limit?}
+  limit -- yes --> rejected[Reject before reading the body]
+  limit -- no --> multipart{Multipart?}
+  multipart -- yes --> buffered[Buffered path: read the whole body, validate, route, forward]
+  multipart -- no --> prefix[Read up to 64 KiB]
+  prefix --> ended{Body ended?}
+  ended -- yes --> buffered
+  ended -- no --> fields{Routing fields in the prefix, and the route forwards the body unchanged?}
+  fields -- no --> buffered
+  fields -- yes --> streamed[Streamed path: route, forward the prefix, then the rest of the upload as it arrives]
+```
+
+- Buffered path: the gateway reads the complete body, decodes and validates it,
+  and then forwards it. Every body shorter than 64 KiB uses this path, so
+  small requests are validated exactly as before.
+- Streamed path: the gateway retains only the 64 KiB prefix, releases it once
+  forwarded, and applies backpressure from the upstream to the client upload.
+  The upstream request starts before the upload ends, so a slow upload holds
+  the upstream connection for as long as the client takes to send the body.
+  An upload that sends no bytes for 60 seconds ends the request. The backend
+  reads the body as the client sends it, so a backend whose body read timeout
+  is shorter than a slow upload fails the request; the buffered path delivers
+  the whole body at once.
+
+A body longer than the prefix streams when its top-level JSON object has
+`model`, and outside the decision routes `stream`, within the prefix. Other
+members may come first if they are complete, valid JSON within the prefix. The routing fields follow the buffered decoder:
+
+- Keys match without regard to ASCII case. The first `model` and the first
+  `stream` member win. Later duplicates are forwarded unchanged and not read.
+- `model` must be a non-empty string of printable ASCII without escapes.
+  `stream` must be `true` or `false`.
+- An escaped or non-ASCII key that may name a routing field, a `null` or
+  non-string `model`, an escaped `model` value, or a non-boolean `stream`
+  uses the buffered path, so the request is accepted or rejected as before.
+
+Field order is not a protocol guarantee. Some clients serialize `model` and
+`stream` first, such as Codex CLI 0.167.0 and OpenAI Python SDK 3.49.0. Others
+send the input first, such as OpenAI Python SDK 2.26.0, or keep the caller's
+property order, such as OpenAI Node SDK 7.55.0. Those requests use the buffered
+path.
+
+The buffered path is also used when:
+
+| Case | `reason` |
+| --- | --- |
+| The body ends within the prefix | `complete` |
+| `model` or `stream` is missing from the prefix. An omitted `stream` is not known to be absent until the body ends. | `late_fields` |
+| The object ends, or more data follows it, before the routing fields | `fields_absent` |
+| A routing field uses a form listed above | `nonstandard_fields` |
+| The prefix is not a JSON object, has a syntax error, or nests deeper than the JSON decoders accept | `invalid_prefix` |
+| `multipart/form-data` image requests | `multipart` |
+| The model is not routed by the endpoint | `model_not_found` |
+| The model is offline or past `eol` | `function_status` |
+| `functionType: LLM`, which rewrites `model` in the body | `llm_gateway` |
+| The model has shadow targets | `shadow` |
+
+The buffered cases keep their existing error responses and error precedence.
+A request whose `Content-Length` exceeds the route limit gets the same
+too-large error as before, without the gateway reading its body first.
+For `functionType: LLM`, the LLM Gateway also buffers the rewritten body, so
+those requests are not expected to use less memory.
+
+On the streamed path the gateway validates only the prefix up to the routing
+fields. Later bytes, including malformed JSON, trailing data, and duplicate
+routing keys, are forwarded unchanged and the backend accepts or rejects them.
+The buffered path rejects malformed JSON with `400` before dispatch.
+
+Failures after a streamed request is dispatched:
+
+- If an upload of unknown length passes the route body limit before the
+  upstream responds, the gateway stops the upstream body and returns the same
+  error as a limit reached before dispatch: `400` on OpenAI routes and `413` on
+  native routes. The upstream receives an incomplete body, never a complete
+  truncated one.
+- If the client disconnects, the upload fails, or the client sends no body
+  bytes for 60 seconds, the upstream request is aborted with an incomplete body
+  and the gateway records `client_canceled` (`499`), not an upstream error. An
+  upload that fails before dispatch still returns `500`.
+- If the upstream has already started its response, the failure ends that
+  response.
+- If the upstream answers before reading the whole body, the client receives
+  that response. The rest of the upload is not forwarded. A client that has
+  stopped sending receives it when the 60-second limit ends its upload.
 
 ## Invoking OpenAI-compatible Endpoints
 
@@ -525,6 +671,64 @@ snapshot. Metadata advertises configured values only; it adds no upstream
 lookup or limit enforcement. Anthropic-shaped discovery keeps its existing
 schema, including for aliases shared with OpenAI sections.
 
+### Private Models
+
+`GET /v1/models` lists public model names. When the request carries an NVCF
+API key in `Authorization: Bearer`, the list also includes the private models
+that key may access:
+
+```shell
+curl -s -H "Host: api.example.com" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
+  http://localhost:10081/v1/models
+```
+
+The gateway does not validate the key. It sends the key to
+`GET /v2/nvcf/functions?visibility=authorized,private` on
+`NVCF_CONTROL_PLANE_ENDPOINT`, and the NVCF API applies the same account and
+API key resource checks as invocation, version by version. A model whose name
+matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
+the function version it routes to. An entry without `functionVersionID` is
+listed when any version of its function is returned. Expiry,
+`supported_endpoints`, and metadata follow the public-model rules, and
+Anthropic clients get the same models in the Anthropic shape. An alias can
+route to different functions per section. A key sees it only for the sections
+whose route it may use: `supported_endpoints` lists only those, and Anthropic
+clients see the alias only when its Messages route is usable.
+
+`GET /v1/models/{model}` follows the same rule, including three-part names
+such as `private/acme/model`. A private name returns its model only when the
+key may access the function version it routes to. Otherwise the response is
+the same 404 as for an unknown name.
+
+The lookup never fails a request:
+
+| Case | Response |
+| --- | --- |
+| No bearer key | Public list, no NVCF API call |
+| Key accepted | Public list plus the private models the key may access |
+| NVCF API rejects the key (`401`) | Public list |
+| Key has no `list_functions` or `list_functions_details` scope (`403`) | Public list |
+| NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
+| `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
+
+Keyed responses carry `Cache-Control: private, no-store` and
+`NVCF-Private-Models`, which reports the lookup result: `authorized`,
+`unauthenticated`, `forbidden`, or `unavailable`. The NVCF API can answer
+`403` for an unrecognized `nvapi-` key, so that key reports `forbidden`. Model
+list responses carry `Vary: Authorization`.
+
+Results are cached per key for one minute, for up to 4096 keys, and survive
+mapping reloads. A reload that changes the set of private functions refreshes
+each key on its next request. Concurrent requests with the same key share one
+lookup. Each pod runs at most 16 lookups at once, each with a 5 second
+timeout, and a request never waits for a free slot. Keys without an
+authorized result share a per-pod budget of 50 lookups per second, so random
+tokens cannot drive NVCF API calls. Without a private alias in the mapping,
+there is no lookup. The lookup never follows a redirect, so the key goes only
+to `NVCF_CONTROL_PLANE_ENDPOINT`. A request that the gateway skips under these
+limits gets the key's last successful result or the public list.
+
 ## Invoking the Anthropic Messages Endpoint
 
 `v2config.anthropicMessages` maps public model names to functions for native
@@ -645,7 +849,7 @@ Requests must use `Content-Type: application/json`. A request without
 a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
 other media type returns `415`. Vendor headers such as
 `TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
-may be up to 25 MB.
+may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default).
 
 ```shell
 source .env
@@ -804,6 +1008,24 @@ combinations are emitted at zero on startup. The primary request span records
 the deciding methods in the `shadow.sampling_methods` attribute. Neither
 records cache keys, credentials, or message content.
 
+`nvcf_ai_api_gateway_request_body_reads_total` counts primary model API
+request bodies read without error. The `mode` label is `streamed` or
+`buffered`, and the `reason` label is `early_fields` for streamed requests or
+one of the buffered reasons in [Request Body Handling](#request-body-handling).
+All label combinations are emitted at zero on startup. The request span records
+`request.body.mode` and `request.body.reason`. Shadow replays are not counted.
+
+`nvcf_ai_api_gateway_private_model_lookups_total` counts private model access
+lookups. The `result` label is `authorized`, `unauthenticated`, `forbidden`,
+`unavailable`, or `limited`. The `cached` label is `true` for cache hits. A
+failed lookup counts as `unavailable` even when the key's last successful
+result is served, and a request inside the retry window after a failure counts
+as a cached `unavailable`. `limited` counts lookups the gateway skipped under
+its own limits.
+Requests that share an in-flight lookup are not counted again. All label
+combinations are emitted at zero on startup. The request span records
+`private_models.cached` and `private_models.result`.
+
 Every response on the model API host (`openai.host`) carries one
 `X-Request-Id`. The gateway keeps the caller's value or creates a UUID and sends
 the same value upstream, so the LLM Gateway logs the request under the same ID.
@@ -842,7 +1064,8 @@ labels to distinguish calls and failures:
 
 - `gateway_call_kind` is `inference` for proxied requests (including shadows),
   `poll` for status polls on `/v1/status/{requestId}`, which can long-poll for
-  minutes, and `health` for upstream readiness checks.
+  minutes, `health` for upstream readiness checks, and `model_access` for
+  private model access lookups to the NVCF API.
 - `error_source` is present on non-2xx responses. It accepts
   `invocation_service` or `worker` from the upstream `NVCF-Error-Source`
   response header. Missing or unrecognized values become `unknown`.
@@ -873,7 +1096,8 @@ function, status, and error-origin attributes retain their meaning.
 request from server telemetry entry to entry into the outbound transport,
 before client instrumentation, connection setup, upstream headers, or body
 streaming. It covers routing, validation, request-body parsing and rewriting,
-and shadow scheduling before primary dispatch. It is elapsed pre-upstream
+and shadow scheduling before primary dispatch. For a streamed request body it
+covers only the 64 KiB prefix read. It is elapsed pre-upstream
 processing time, including scheduling and request-body reads, not gateway CPU
 time or total gateway work. Post-dispatch processing is excluded.
 
