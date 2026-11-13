@@ -242,3 +242,25 @@ func withoutBackend(labels Labels) Labels {
 	}
 	return out
 }
+
+// A descriptor handed out by Lookup or Instruments is a copy: changing it
+// cannot change what Validate accepts.
+func TestChangingAReturnedInstrumentDoesNotChangeValidation(t *testing.T) {
+	looked, ok := Lookup(Uploads)
+	if !ok {
+		t.Fatal("uploads instrument missing")
+	}
+	looked.Labels[0] = "request_id"
+	looked.Values["status"][0] = "changed"
+	for _, instrument := range Instruments() {
+		if instrument.Name == Uploads {
+			instrument.Labels[0] = "request_id"
+		}
+	}
+	if err := Validate(Counter, Uploads, 1, Labels{"status": "success"}); err != nil {
+		t.Fatalf("Validate(status=success) = %v, want accepted", err)
+	}
+	if err := Validate(Counter, Uploads, 1, Labels{"request_id": "a"}); err == nil {
+		t.Fatal("Validate accepted a request_id label after a returned copy was changed")
+	}
+}

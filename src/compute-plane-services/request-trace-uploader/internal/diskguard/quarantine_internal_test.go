@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -190,5 +191,58 @@ func TestRemoveReportsTheSyncFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "seg-3")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("entry still present after Remove")
+	}
+}
+
+type halfFullVolume struct{}
+
+func (halfFullVolume) Usage() (Usage, error) { return Usage{Total: 1000, Free: 500}, nil }
+
+// Enforce can run while another goroutine admits a segment. It must never see
+// an entry that is half admitted: removing it then would leave the rest of
+// the segment's files outside the quarantine and fail the admission.
+func TestEnforceNeverSeesAHalfAdmittedEntry(t *testing.T) {
+	root := t.TempDir()
+	q := NewQuarantine(filepath.Join(root, "quarantine"))
+	source, transport := filepath.Join(root, "source"), filepath.Join(root, "transport")
+	for _, path := range []string{source, transport} {
+		// Each file alone is over the default quarantine share of the volume.
+		if err := os.WriteFile(path, make([]byte, 300), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guard, err := New(DefaultConfig(), halfFullVolume{}, q, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := rename
+	t.Cleanup(func() { rename = original })
+	enforced := make(chan error, 1)
+	first := true
+	rename = func(from, to string) error {
+		err := original(from, to)
+		if err == nil && first {
+			first = false
+			go func() { _, err := guard.Enforce(time.Now()); enforced <- err }()
+			// Give Enforce time to reach the entry while it is half admitted.
+			select {
+			case err := <-enforced:
+				enforced <- err
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+		return err
+	}
+
+	if err := q.Admit("seg", source, transport); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	if err := <-enforced; err != nil {
+		t.Fatalf("Enforce: %v", err)
+	}
+	for _, path := range []string{source, transport} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left outside the quarantine", filepath.Base(path))
+		}
 	}
 }

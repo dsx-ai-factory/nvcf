@@ -204,6 +204,8 @@ func TestReloadKeepsLastGoodValuesOnBadRead(t *testing.T) {
 		{"empty", ptr("")},
 		{"key missing", ptr(`{"` + testIDKey + `":"new-id"}`)},
 		{"key emptied", ptr(`{"` + testIDKey + `":"new-id","` + testSecretKey + `":""}`)},
+		// A damaged byte would be decoded as U+FFFD, giving a wrong credential.
+		{"invalid UTF-8 in a value", ptr(`{"` + testIDKey + `":"new-id","` + testSecretKey + "\":\"new-sec\xffret\"}")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
