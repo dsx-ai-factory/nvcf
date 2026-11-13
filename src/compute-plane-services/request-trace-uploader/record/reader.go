@@ -36,6 +36,9 @@ type Stats struct {
 	// ChecksumFailures counts gzip members that decoded but failed their
 	// checksum.
 	ChecksumFailures int
+	// UnsupportedVersion counts Dynamo v1.3.x AuditRecords, which are
+	// dropped. See ErrLegacyAuditRecord.
+	UnsupportedVersion int
 
 	cut int
 }
@@ -81,8 +84,8 @@ func (r *Reader) Next() bool {
 		rec, err := parseLine(line)
 		if err != nil {
 			if errors.Is(err, ErrLegacyAuditRecord) {
-				r.err = fmt.Errorf("line %d: %w", r.lines.Number(), err)
-				return false
+				r.stats.UnsupportedVersion++
+				continue
 			}
 			r.stats.Unparseable++
 			continue
