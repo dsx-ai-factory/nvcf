@@ -218,27 +218,29 @@ func (b *restoreBatch) id() string {
 
 // replacedBy reports whether a new pod of rank ordinal replaces the
 // restore's pod of that rank: the restore goes on (a pod of it is not
-// deleted) and its pod of the rank was deleted before it was ever Ready.
-// The agent replaces a rank that way when it must (a target pod given an
-// address another pod of the instance had at capture), once the instance's
-// earlier pods went, which can be minutes after the restore's pods were
-// created. A rank deleted after it was Ready is not: its replacement is
-// not part of the restore.
+// deleted) and its newest pod of the rank was deleted before it was ever
+// Ready. The agent replaces a rank that way when it must (a target pod
+// given an address another pod of the instance had at capture), once the
+// instance's earlier pods went, which can be minutes after the restore's
+// pods were created. A rank deleted after it was Ready is not: its
+// replacement is not part of the restore. Only the newest pod of the rank
+// counts: once a replacement was Ready, an earlier pod that never was
+// does not let a later one in.
 func (b *restoreBatch) replacedBy(ordinal int) bool {
-	live, replaced := false, false
+	live := false
+	var newest *restorePod
 	for _, p := range b.pods {
 		if p.deleteReq.IsZero() && !p.gone {
 			if p.ordinal == ordinal {
 				return false
 			}
 			live = true
-			continue
 		}
-		if p.ordinal == ordinal && p.ready.IsZero() {
-			replaced = true
+		if p.ordinal == ordinal && (newest == nil || p.created.After(newest.created)) {
+			newest = p
 		}
 	}
-	return live && replaced
+	return live && newest != nil && newest.ready.IsZero()
 }
 
 // over reports whether every pod of the restore is gone.

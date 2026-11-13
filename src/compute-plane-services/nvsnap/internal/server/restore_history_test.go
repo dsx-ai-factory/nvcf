@@ -232,12 +232,21 @@ func TestRestoreTrackerLateReplacedRank(t *testing.T) {
 		t.Fatalf("%+v, want restored at %s in 300 s", e, histT0.Format(time.RFC3339))
 	}
 
+	// Its replacement deleted once Ready, and a third rank 0 after: a
+	// restore of its own, though the first rank 0 never was Ready.
+	third := histT0.Add(30 * time.Minute)
+	tr.observePod(deleting(up(leader, replaced.Add(5*time.Second), ready), third), true, false, third)
+	tr.observePod(rankPod(0, "ns", "k", "0", third.Add(time.Second)), false, false, third)
+	if got, _ := entries(t, tr, 4); len(got) != 2 {
+		t.Fatalf("%d restores, want 2: the newest rank 0 was Ready, so the third is not the restore's", len(got))
+	}
+
 	// A rank replaced after it was Ready: a restore of its own.
 	crashed := histT0.Add(time.Hour)
 	tr.observePod(deleting(ranks[1], crashed), true, false, crashed)
 	tr.observePod(rankPod(1, "ns", "k", "0", crashed.Add(time.Second)), false, false, crashed)
-	if got, _ := entries(t, tr, 4); len(got) != 2 {
-		t.Fatalf("%d restores, want 2: a rank replaced once Ready is not the restore's", len(got))
+	if got, _ := entries(t, tr, 4); len(got) != 3 {
+		t.Fatalf("%d restores, want 3: a rank replaced once Ready is not the restore's", len(got))
 	}
 
 	// Every pod deleted, then the next restore minutes later: its own.

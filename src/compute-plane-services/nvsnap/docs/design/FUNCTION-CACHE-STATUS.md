@@ -181,9 +181,9 @@ them; nothing new is written on the admission, capture or restore path.
    pod, however late the replacement comes: the agent replaces a rank whose
    pod got an address another pod of the instance had at capture once the
    instance's earlier pods went, minutes in. A pod joins the restore as a
-   replacement when the restore goes on and its pod of that rank was
-   deleted before it was ever Ready; a rank replaced after it was Ready
-   starts an entry of its own. An entry is updated as its pods change:
+   replacement when the restore goes on and its newest pod of that rank
+   was deleted before it was ever Ready; a rank whose newest pod was Ready
+   before it went starts an entry of its own. An entry is updated as its pods change:
    - **every rank is Ready**: it records `scaleUpSeconds`, the last rank's
      Ready less the first rank's PodScheduled;
    - **every rank is deleted before that** (it failed and was replaced, or
