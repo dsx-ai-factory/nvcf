@@ -101,24 +101,20 @@ public class ServicesService {
                         String.format("Service '%s' not found", serviceId)));
     }
 
-    /** Finds a service by its registered ID or by one of its legacy IDs. */
+    // Finds a service by its registered ID or by one of its legacy IDs.
     public Optional<ServiceVo> getServiceById(String serviceId) {
-        ServiceVo service = services.get(serviceId);
-        return Optional.ofNullable(service != null ? service : servicesByAlias.get(serviceId));
+        return Optional.ofNullable(services.get(serviceId))
+                .or(() -> Optional.ofNullable(servicesByAlias.get(serviceId)));
     }
 
-    /**
-     * Maps a legacy service ID to the registered ID. Any other value is returned unchanged.
-     */
+    // Maps a legacy service ID to the registered ID. Any other value is returned unchanged.
     public String toCanonicalId(String serviceId) {
-        ServiceVo service = serviceId == null ? null : servicesByAlias.get(serviceId);
+        ServiceVo service = StringUtils.isBlank(serviceId) ? null : servicesByAlias.get(serviceId);
         return service != null ? service.getServiceId() : serviceId;
     }
 
-    /**
-     * The IDs that rows of the given service can be stored under: the registered ID and its legacy
-     * IDs. An unknown ID maps to itself.
-     */
+    // The IDs that rows of the given service can be stored under: the registered ID and its legacy
+    // IDs. An unknown ID maps to itself.
     public Set<String> storedServiceIds(String serviceId) {
         return getServiceById(serviceId)
                 .map(ServiceVo::serviceIdAliasGroup)

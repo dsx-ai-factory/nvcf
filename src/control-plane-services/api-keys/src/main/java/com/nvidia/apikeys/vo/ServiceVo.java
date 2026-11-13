@@ -39,7 +39,7 @@ public class ServiceVo {
     private int maxAuthzSizeChars;
     private int minAuthzUpdateIntervalSeconds;
 
-    /** The registered ID first, then its legacy aliases. */
+    // The registered ID first, then its legacy aliases.
     public Set<String> serviceIdAliasGroup() {
         Set<String> group = new LinkedHashSet<>();
         group.add(serviceId);
