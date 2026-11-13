@@ -933,6 +933,15 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
       And I export the function selected by NVCF CLI to environment variables "BDD_LLM_FUNCTION_ID" and "BDD_LLM_VERSION_ID"
 
+      # On removal, the worker pod keeps the inference server serving while
+      # Pylon drains: the default 60s preStop pause, a Pylon drain 5s
+      # shorter, and a grace period that leaves the server 60s to exit.
+      When I successfully run command:
+        """
+        kubectl --context k3d-ncp-local get pods --all-namespaces --selector function-id=${BDD_LLM_FUNCTION_ID} -o jsonpath='{range .items[*]}grace={.spec.terminationGracePeriodSeconds} prestop={.spec.containers[?(@.name=="inference")].lifecycle.preStop.exec.command[*]} drain={.spec.containers[?(@.name=="llm-worker")].env[?(@.name=="PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS")].value}{"\n"}{end}'
+        """
+      Then the command output should contain "grace=120 prestop=sleep 60 drain=55000"
+
       # Use the same authenticated function through each public entry point.
       Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
       And the HTTP request header "Content-Type" is "application/json"

@@ -21,6 +21,7 @@ fail() {
 
 expected_schema_refs() {
   cat <<'EOF'
+properties.worker.properties.llmInferenceStopPause	#/definitions/optionalDuration
 properties.worker.properties.timeouts.properties.credRenewInterval	#/definitions/optionalDuration
 properties.worker.properties.timeouts.properties.heartbeatInterval	#/definitions/optionalDuration
 properties.worker.properties.timeouts.properties.icmsRequestAckInterval	#/definitions/optionalDuration

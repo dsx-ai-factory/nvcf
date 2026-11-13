@@ -495,6 +495,10 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		" --regions us-west-1 --min-instances 1 --max-instances 1 --timeout 900"
 	const gatewayTransportCommand = "kubectl --context k3d-ncp-local get configmap/llm-api-gateway -n nvcf -o jsonpath={.data.NVCF_GRPC_INSECURE}"
 	const gatewayServiceMonitorCommand = "helm get manifest llm-api-gateway --namespace nvcf --kube-context k3d-ncp-local"
+	const llmWorkerShutdownCommand = `kubectl --context k3d-ncp-local get pods --all-namespaces --selector function-id=function-1` +
+		` -o jsonpath='{range .items[*]}grace={.spec.terminationGracePeriodSeconds}` +
+		` prestop={.spec.containers[?(@.name=="inference")].lifecycle.preStop.exec.command[*]}` +
+		` drain={.spec.containers[?(@.name=="llm-worker")].env[?(@.name=="PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS")].value}{"\n"}{end}'`
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("NGC_API_KEY", "test-key")
@@ -514,7 +518,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 			ExitCode: 0,
 			Stdout:   "data:\n  nvcf-api.yaml: |\n    nvcf:\n      sidecars:\n        llm-router-client-image: nvcr.io/test-org/test-team/pylon:test\n",
 		},
-		gatewayTransportCommand: {ExitCode: 0, Stdout: "true"},
+		gatewayTransportCommand:  {ExitCode: 0, Stdout: "true"},
+		llmWorkerShutdownCommand: {ExitCode: 0, Stdout: "grace=120 prestop=sleep 60 drain=55000\n"},
 		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}": {ExitCode: 0, Stdout: "67108864"},
 		gatewayServiceMonitorCommand: {ExitCode: 0, Stdout: "kind: ConfigMap\nmetadata:\n  name: llm-api-gateway\n"},
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
@@ -4250,6 +4255,9 @@ func TestLLMRoutingFeaturesRejectIncompleteAndMisroutedResponses(t *testing.T) {
 					}
 					if strings.Contains(command, "curl ") {
 						runner.results[command] = harness.Result{Stdout: "401"}
+					}
+					if strings.Contains(command, "get pods --all-namespaces --selector function-id=") {
+						runner.results[command] = harness.Result{Stdout: "grace=120 prestop=sleep 60 drain=55000\n"}
 					}
 					return nil
 				}
