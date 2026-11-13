@@ -817,8 +817,18 @@ func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 		return r.resolveCacheMountOptions(ctx, pv)
 	}
 	driver := r.readerVolumeDriver(ctx, pv, selection.Provisioner)
-	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions,
-		r.configuredMountOptionsFor(ctx, pv, driver))
+	extra := r.configuredMountOptionsFor(ctx, pv, driver)
+	// A durable shared-filesystem selection (rwxReadOnly) carries no required
+	// reader options, and the catalog cannot supply them, so a non-NVMesh
+	// driver's entry in the mount option ConfigMap is still honored here. That
+	// entry is where an installation keeps options such as NFS sec= that its
+	// readers need.
+	if driver != "" && driver != NVMeshStorageClassProvisioner {
+		if entry, found := r.provisionerDefaultMountOptions(ctx, driver); found {
+			extra = append(slices.Clone(entry), extra...)
+		}
+	}
+	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions, extra)
 }
 
 // durableReaderSelection returns the StorageRequest's persisted selection when

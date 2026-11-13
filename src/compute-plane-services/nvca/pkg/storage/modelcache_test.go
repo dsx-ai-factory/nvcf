@@ -2405,6 +2405,20 @@ func TestResolveReaderMountOptions(t *testing.T) {
 			want:       []string{},
 		},
 		{
+			// A durable rwxReadOnly selection carries no reader options, so an
+			// installation's per-driver ConfigMap entry (here NFS sec=) must
+			// still reach the reader.
+			name:      "fss reader on an rwx selection keeps its per-driver ConfigMap options",
+			selection: readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
+			pvDriver:  fssProvisioner,
+			cmData: map[string]string{
+				NVMeshStorageClassProvisioner: NVMeshCacheMountOptions,
+				fssProvisioner:                "sec=krb5p",
+			},
+			configured: nvmeshOptions,
+			want:       []string{"sec=krb5p"},
+		},
+		{
 			name:       "fss reader on a PV without a CSI driver falls back to the selection's provisioner",
 			selection:  readerSelectionAnnotation(t, fssProvisioner, ModelCacheTransitionRWXReadOnly, nil),
 			cmData:     nvmeshMountOptionDefaults,
