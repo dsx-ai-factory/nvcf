@@ -879,29 +879,42 @@ func (c K8sComputeBackend) waitForVolumeDetach(ctx context.Context, volumeName s
 */
 // readerMountOptionsForRequest returns the mount options for the read-only PV
 // that serves req. A durable request carries the catalog's readerMountOptions in
-// its persisted selection; those are required and the configured options are
+// its persisted selection; those are required, and the configured options are
 // appended except where they would negate one. Requests without a durable
-// selection keep the configured options unchanged, as before.
-func (c K8sComputeBackend) readerMountOptionsForRequest(ctx context.Context, req *nvcav2beta1.ICMSRequest) []string {
-	configured := c.bk8s.csiVolumeMountOptions
+// selection keep the configured options. Either way the configured options
+// apply only when pv is on the driver they are written for; see
+// nvcastorage.ConfiguredReaderMountOptions.
+func (c K8sComputeBackend) readerMountOptionsForRequest(ctx context.Context, req *nvcav2beta1.ICMSRequest,
+	pv *v1.PersistentVolume,
+) []string {
+	driver := ""
+	if pv != nil && pv.Spec.CSI != nil {
+		driver = pv.Spec.CSI.Driver
+	}
+	configuredFor := func(driver string) []string {
+		return nvcastorage.ConfiguredReaderMountOptions(driver, c.bk8s.csiVolumeMountOptions)
+	}
 	if req == nil {
-		return configured
+		return configuredFor(driver)
 	}
 	raw := req.Annotations[nvcastorage.ModelCacheStorageSelectionAnnotationKey]
 	if raw == "" {
-		return configured
+		return configuredFor(driver)
 	}
 	log := core.GetLogger(ctx)
 	selection, err := nvcastorage.ParsePersistedModelCacheStorageSelection(raw)
 	if err != nil {
 		log.WithError(err).Warnf("ignoring invalid model cache selection on %v/%v for reader mount options",
 			req.Namespace, req.Name)
-		return configured
+		return configuredFor(driver)
 	}
 	if selection.Mode != nvcastorage.ModelCacheSelectionDurable {
-		return configured
+		return configuredFor(driver)
 	}
-	merged, dropped := nvcastorage.MergeReaderMountOptions(selection.RequiredMountOptions, configured)
+	if driver == "" {
+		driver = selection.Provisioner
+	}
+	merged, dropped := nvcastorage.MergeReaderMountOptions(selection.RequiredMountOptions, configuredFor(driver))
 	if len(dropped) != 0 {
 		log.WithFields(logrus.Fields{
 			"request":  req.Namespace + "/" + req.Name,
@@ -1028,7 +1041,7 @@ func (c K8sComputeBackend) SetupPVCForReaders(ctx context.Context,
 			// set the new PVCRef
 			pvObj.Spec.ClaimRef = &newPVCRef
 			pvObj.Spec.AccessModes = ROAccessMode
-			pvObj.Spec.MountOptions = c.readerMountOptionsForRequest(ctx, req)
+			pvObj.Spec.MountOptions = c.readerMountOptionsForRequest(ctx, req, pvObj)
 
 			_, updateErr := c.clients.K8s.CoreV1().PersistentVolumes().Update(ctx, pvObj, metav1.UpdateOptions{})
 			return updateErr

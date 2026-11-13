@@ -576,29 +576,16 @@ func (r *Reconciler) doModelCacheSamba(ctx context.Context,
 
 var accessModesRO = []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}
 
-// provisionerDefaultMountOptions returns the mount options required by the
-// provisioner of the model cache storage class, taken from the mount option
-// ConfigMap. It reports false when the provisioner has no entry, in which case
-// the configured mount options are used as-is.
+// provisionerDefaultMountOptions returns the mount options the mount option
+// ConfigMap records for provisioner, the CSI driver of a read-only model cache
+// volume. It reports false when the provisioner is unknown or has no entry.
 //
-// The decision cannot be taken from the reconcile path: doModelCacheNVMesh also
-// serves requests with an empty backend, whose storage class need not be
-// provisioned by NVMesh at all. It is instead resolved from the storage class
-// named by DefaultModelCacheStorageClassName, or the override.
-//
-// The provisioner is resolved once, as a one time init: a StorageClass
-// provisioner is immutable, so it cannot change while the class exists. The
-// ConfigMap is read on each call so that an operator editing it takes effect
+// The ConfigMap is read on each call so that an operator editing it takes effect
 // without restarting the agent.
-//
-// A failed lookup is deliberately not remembered, so a storage class created
-// after the agent starts is picked up on a later reconcile rather than being
-// written off forever.
-func (r *Reconciler) provisionerDefaultMountOptions(ctx context.Context) ([]string, bool) {
+func (r *Reconciler) provisionerDefaultMountOptions(ctx context.Context, provisioner string) ([]string, bool) {
 	log := logf.FromContext(ctx)
 
-	provisioner, ok := r.modelCacheProvisionerName(ctx)
-	if !ok {
+	if provisioner == "" {
 		return nil, false
 	}
 
@@ -749,40 +736,94 @@ func negatesMountOption(required, configured string) bool {
 	return false
 }
 
-// resolveCacheMountOptions returns the mount options for a read-only model cache
-// PV. When the storage class provisioner has defaults, the volume always
-// receives them, with configured options appended except where they would negate
-// a default. Otherwise the configured options are used unchanged.
-func (r *Reconciler) resolveCacheMountOptions(ctx context.Context, pv *corev1.PersistentVolume) []string {
-	defaults, found := r.provisionerDefaultMountOptions(ctx)
-	if !found {
-		return r.csiVolumeMountOptions
+// ConfiguredReaderMountOptions returns the part of the configured cache mount
+// options (the agent's cacheMountOptions) that applies to a read-only model
+// cache volume on the given CSI driver.
+//
+// The configured options are one cluster-wide list with no driver attached.
+// They exist for NVMesh, the driver whose readers attach the same XFS
+// filesystem as the writer, and their default is the NVMesh XFS set
+// ro,norecovery,nouuid, which NFS and other filesystems reject outright. So they
+// apply to NVMesh readers only. Every other driver takes its reader options from
+// its own source: the storage capability catalog's readerMountOptions for a
+// durable selection, or its entry in the mount option ConfigMap. An empty driver
+// means it could not be determined; the configured options are then kept, as
+// they were before drivers were told apart.
+func ConfiguredReaderMountOptions(driver string, configured []string) []string {
+	if driver == "" || driver == NVMeshStorageClassProvisioner {
+		return configured
 	}
-	return r.mergeRequiredMountOptions(ctx, pv, defaults)
+	return nil
+}
+
+// readerVolumeDriver returns the CSI driver of a read-only model cache PV. The
+// PV's own CSI source is authoritative; fallback, then the model cache storage
+// class provisioner, are used only when the PV does not name one. It returns an
+// empty string when none of them is known.
+func (r *Reconciler) readerVolumeDriver(ctx context.Context, pv *corev1.PersistentVolume, fallback string) string {
+	if pv != nil && pv.Spec.CSI != nil && pv.Spec.CSI.Driver != "" {
+		return pv.Spec.CSI.Driver
+	}
+	if fallback != "" {
+		return fallback
+	}
+	if provisioner, ok := r.modelCacheProvisionerName(ctx); ok {
+		return provisioner
+	}
+	return ""
+}
+
+// configuredMountOptionsFor returns the configured cache mount options that
+// apply to a reader PV on driver, logging when they are withheld.
+func (r *Reconciler) configuredMountOptionsFor(ctx context.Context, pv *corev1.PersistentVolume, driver string) []string {
+	configured := ConfiguredReaderMountOptions(driver, r.csiVolumeMountOptions)
+	if len(configured) == 0 && len(r.csiVolumeMountOptions) != 0 {
+		logf.FromContext(ctx).V(1).Info("Not applying configured cache mount options to a reader on another driver",
+			"pv", pv.Name, "driver", driver,
+			"ignored", redactMountOptionValues(r.csiVolumeMountOptions))
+	}
+	return configured
+}
+
+// resolveCacheMountOptions returns the mount options for a read-only model cache
+// PV. When the PV's driver has an entry in the mount option ConfigMap, the
+// volume always receives it, with configured options appended (NVMesh only)
+// except where they would negate a default. Otherwise the configured options
+// are used, again only on NVMesh or when the driver is unknown.
+func (r *Reconciler) resolveCacheMountOptions(ctx context.Context, pv *corev1.PersistentVolume) []string {
+	driver := r.readerVolumeDriver(ctx, pv, "")
+	configured := r.configuredMountOptionsFor(ctx, pv, driver)
+	defaults, found := r.provisionerDefaultMountOptions(ctx, driver)
+	if !found {
+		return configured
+	}
+	return r.mergeRequiredMountOptions(ctx, pv, defaults, configured)
 }
 
 // resolveReaderMountOptions returns the mount options for the read-only PV that
 // serves the given StorageRequest. A durable request carries the catalog's
-// readerMountOptions in its persisted selection, so those are the required set
-// and the configured options are appended except where they would negate one.
-// Requests without a durable selection, including in-flight legacy requests,
-// keep the per-provisioner ConfigMap path.
+// readerMountOptions in its persisted selection, so those are the required set;
+// the configured options are appended, except where they would negate one, only
+// when the reader is on the driver they are written for (see
+// ConfiguredReaderMountOptions). Requests without a durable selection,
+// including in-flight legacy requests, keep the per-provisioner ConfigMap path.
 func (r *Reconciler) resolveReaderMountOptions(ctx context.Context,
 	st *nvcav1new.StorageRequest, pv *corev1.PersistentVolume,
 ) []string {
-	required, ok := selectionReaderMountOptions(ctx, st)
+	selection, ok := durableReaderSelection(ctx, st)
 	if !ok {
 		return r.resolveCacheMountOptions(ctx, pv)
 	}
-	return r.mergeRequiredMountOptions(ctx, pv, required)
+	driver := r.readerVolumeDriver(ctx, pv, selection.Provisioner)
+	return r.mergeRequiredMountOptions(ctx, pv, selection.RequiredMountOptions,
+		r.configuredMountOptionsFor(ctx, pv, driver))
 }
 
-// selectionReaderMountOptions returns the reader mount options recorded in the
-// StorageRequest's persisted selection. ok is false when the request has no
-// selection, the selection is not durable, or it cannot be parsed; the caller
-// then falls back to the ConfigMap path so a bad annotation never strips the
-// options a driver needs.
-func selectionReaderMountOptions(ctx context.Context, st *nvcav1new.StorageRequest) ([]string, bool) {
+// durableReaderSelection returns the StorageRequest's persisted selection when
+// it is durable. ok is false when the request has no selection, the selection
+// is not durable, or it cannot be parsed; the caller then falls back to the
+// ConfigMap path so a bad annotation never strips the options a driver needs.
+func durableReaderSelection(ctx context.Context, st *nvcav1new.StorageRequest) (*PersistedModelCacheStorageSelection, bool) {
 	if st == nil {
 		return nil, false
 	}
@@ -799,16 +840,16 @@ func selectionReaderMountOptions(ctx context.Context, st *nvcav1new.StorageReque
 	if selection.Mode != ModelCacheSelectionDurable {
 		return nil, false
 	}
-	return selection.RequiredMountOptions, true
+	return selection, true
 }
 
 // mergeRequiredMountOptions appends the configured options to the required
 // set, logging and dropping any configured option that would negate a required
 // one.
 func (r *Reconciler) mergeRequiredMountOptions(ctx context.Context,
-	pv *corev1.PersistentVolume, required []string,
+	pv *corev1.PersistentVolume, required, configured []string,
 ) []string {
-	merged, dropped := MergeReaderMountOptions(required, r.csiVolumeMountOptions)
+	merged, dropped := MergeReaderMountOptions(required, configured)
 	if len(dropped) != 0 {
 		logf.FromContext(ctx).Info("Ignoring configured cache mount options that conflict with required ones",
 			"pv", pv.Name,
