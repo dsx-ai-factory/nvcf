@@ -77,7 +77,9 @@ func item(key string, bytes int64, age time.Duration) diskguard.Candidate {
 }
 
 type world struct {
-	volume     *fakeVolume
+	volume *fakeVolume
+	// budget, when set, is the spool's own size next to its filesystem.
+	budget     *fakeBudget
 	quarantine *fakeStore
 	segments   *fakeStore
 	removed    []string
@@ -93,7 +95,11 @@ func newWorld(total, free uint64) *world {
 
 func (w *world) guard(t *testing.T, cfg diskguard.Config) *diskguard.Guard {
 	t.Helper()
-	g, err := diskguard.New(cfg, w.volume, w.quarantine, w.segments, diskguard.Options{Counter: w.metrics, Gauges: w.metrics})
+	opts := diskguard.Options{Counter: w.metrics, Gauges: w.metrics}
+	if w.budget != nil {
+		opts.Budget = w.budget
+	}
+	g, err := diskguard.New(cfg, w.volume, w.quarantine, w.segments, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -160,7 +166,9 @@ func TestAllowPrepare(t *testing.T) {
 		want        diskguard.PauseReason
 	}{
 		{"room to prepare", 4096 * mib, 2048 * mib, 30 << 20, 3, diskguard.PauseNone},
-		{"below the floor", 2048 * mib, 500 * mib, 30 << 20, 0, diskguard.PauseFreeSpace},
+		// 500 MiB free is under 512 MiB, but the floor of a small volume is
+		// at most half of the 15% its watermark leaves free.
+		{"small volume under its watermark", 2048 * mib, 500 * mib, 30 << 20, 0, diskguard.PauseNone},
 		{"twice the estimate is above the floor", 2048 * mib, 900 * mib, 600 << 20, 0, diskguard.PauseFreeSpace},
 		{"prepare ahead is full", 4096 * mib, 2048 * mib, 30 << 20, 16, diskguard.PausePrepareAhead},
 		{"above the high watermark", 100 * 1024 * mib, 10 * 1024 * mib, 1, 0, diskguard.PauseHighWatermark},

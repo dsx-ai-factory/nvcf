@@ -177,6 +177,7 @@ func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 		EnvRetryAfterMax, EnvRetryInitialBackoff, EnvRetryMaximumBackoff,
 		EnvRetryMultiplier, EnvScanInterval, EnvSecretsFile,
 		EnvSegmentPrefix, EnvSegmentScopeFailures, EnvSourceDir,
+		EnvSpoolBudgetBytes,
 		EnvStateDir, EnvStatusInterval, EnvSuppressHeaderless,
 		EnvSuppressionRules, EnvSuppressNCAHeaders, EnvSuppressNCAIDs,
 		EnvUnconfirmedResends,
