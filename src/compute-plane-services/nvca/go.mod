@@ -2,7 +2,7 @@ module github.com/NVIDIA/nvcf/src/compute-plane-services/nvca
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/NVIDIA/KAI-scheduler v0.12.6
