@@ -178,10 +178,10 @@ func unscheduledUtilsPod(ns string, created, transitioned time.Time) *corev1.Pod
 	}
 }
 
-// doStatusAggressiveWithPod runs one aggressive-mode status check for a
+// doStatusAggressiveWithPod runs one aggressive-mode status check at now for a
 // MiniService whose namespace holds only pod.
 func doStatusAggressiveWithPod(t *testing.T, ns string, timeConfig *nvcak8sutil.TimeConfig,
-	pod *corev1.Pod) (*v1alpha1.MiniService, reconcile.Result, error) {
+	pod *corev1.Pod, now time.Time) (*v1alpha1.MiniService, reconcile.Result, error) {
 	t.Helper()
 	ctx := newTestContext()
 	ms := &v1alpha1.MiniService{
@@ -206,7 +206,7 @@ func doStatusAggressiveWithPod(t *testing.T, ns string, timeConfig *nvcak8sutil.
 		Decoder:               serializer.NewCodecFactory(mgrScheme).UniversalDeserializer(),
 		chartCache:            cache,
 		newPermissionsChecker: newFakePermissionsChecker,
-		now:                   time.Now,
+		now:                   func() time.Time { return now },
 	}
 	require.NoError(t, r.saveRenderedData(ctx, ms, []byte("[]")))
 
@@ -227,7 +227,7 @@ func TestDoStatusAggressive_RequeuesAtUnscheduledPodDeadline(t *testing.T) {
 	now := time.Now()
 
 	ms, res, err := doStatusAggressiveWithPod(t, "test-requeue-ns", timeConfig,
-		unscheduledUtilsPod("test-requeue-ns", now.Add(-schedulingTimeout+untilDeadline), now))
+		unscheduledUtilsPod("test-requeue-ns", now.Add(-schedulingTimeout+untilDeadline), now), now)
 	require.NoError(t, err)
 
 	cond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionObjectsHealthy)
@@ -249,7 +249,7 @@ func TestDoStatusAggressive_UnscheduledPodTimesOutFromCreation(t *testing.T) {
 	now := time.Now()
 
 	ms, _, err := doStatusAggressiveWithPod(t, "test-stuck-ns", timeConfig,
-		unscheduledUtilsPod("test-stuck-ns", now.Add(-schedulingTimeout-time.Minute), now.Add(-time.Second)))
+		unscheduledUtilsPod("test-stuck-ns", now.Add(-schedulingTimeout-time.Minute), now.Add(-time.Second)), now)
 	require.NoError(t, err)
 
 	cond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionObjectsHealthy)
