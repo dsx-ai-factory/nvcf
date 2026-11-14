@@ -290,7 +290,8 @@ the parameters are removed.
 ## Audit cache-affinity key use
 
 The `proxying request` router log shows which routing method handles requests
-that carry a cache-affinity key. To count those requests by model and routing
+that carry a cache-affinity key. The router writes this log for each proxy
+attempt, so retries count again. To count keyed attempts by model and routing
 method, run the following command. The first filter removes terminal color
 codes from the log lines:
 
@@ -299,8 +300,8 @@ kubectl logs -n nvcf deployment/llm-request-router --all-pods=true --since=24h \
   | perl -pe 's/\e\[[0-9;]*m//g' \
   | grep 'proxying request' \
   | grep 'request.cache_affinity_key_present=true' \
-  | grep -oE ' (model_id|requested_algorithm)=("[^"]*"|[^ ]*)' \
-  | paste -d ' ' - - | sort | uniq -c | sort -rn
+  | grep -oE ' (model_id|requested_algorithm|routing_algorithm)=("[^"]*"|[^ ]*)' \
+  | paste -d ' ' - - - | sort | uniq -c | sort -rn
 ```
 
 For the routing methods that use the key and how to read the result, see

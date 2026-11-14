@@ -130,11 +130,12 @@ Only these algorithms use `x-cache-affinity-key`:
 | --- | --- |
 | `pulsar` | Yes. The key is part of the rendezvous ranking. |
 | `pulsar-wait-and-widen` | Yes. The affinity group is always present and has at least the top-ranked cluster. |
-| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is set. It is unset by default. |
+| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. It is unset by default. |
 | `power-of-n`, `round-robin`, `random` | No. |
 
-The `groq-multiregion` alias of `wait-and-widen` follows the same rule.
-Without an affinity group, requests with the same key can go to different
+Aliases in `routing_methods.json` follow the rule of their algorithm, such as
+`groq-multiregion` for `wait-and-widen` and `pulsar-multiregion` for
+`pulsar-wait-and-widen`. Without an affinity group, requests with the same key can go to different
 clusters and miss the engine prefix cache.
 
 To keep one key on one cluster with `wait-and-widen`, use this routing
@@ -159,22 +160,24 @@ the engine.
 
 ### Audit key use
 
-For each proxy attempt, Stargate writes the info log `proxying request`. These
-fields show whether a model routes keyed requests with an algorithm that uses
-the key:
+For each proxy attempt, Stargate writes the info log `proxying request`.
+Retries write it again. These fields show whether a model routes keyed
+requests with an algorithm that uses the key:
 
 - `model_id`: the routed model.
-- `requested_algorithm`: the `x-routing-method` value as received. It is empty
-  when the request uses the configured model algorithm.
+- `requested_algorithm`: the `x-routing-method` value as received, including
+  expression parameters. It is empty when the request has no header.
+- `routing_algorithm`: the canonical name of the algorithm that routed the
+  request.
 - `request.cache_affinity_key_present`: `true` when the request has
-  `x-cache-affinity-key`.
+  `x-cache-affinity-key`. This is a field of the request span. The text log
+  format appends it to the line.
 
 A keyed request ignores the key when its algorithm is `power-of-n`,
 `round-robin`, or `random`. It also ignores the key when the algorithm is
-`wait-and-widen` and neither the expression nor the `lb-config.json` entry sets
-`cache_affinity_backend_selection_count`. For an expression, the `effective`
-field of the `routing expression configuration built` log shows the count when
-it is set.
+`wait-and-widen` and neither the expression in `requested_algorithm` nor the
+model's `lb-config.json` entry sets `cache_affinity_backend_selection_count`
+above `0`.
 
 ## `power-of-n`
 
