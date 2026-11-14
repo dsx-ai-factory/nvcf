@@ -1320,3 +1320,120 @@ func TestModelVolumeController_NeverCapturesFromARestorePlaceholder(t *testing.T
 		t.Fatal("the primary was completed from a restore placeholder")
 	}
 }
+
+// nvbugs#6942084: the NVSnap compile-cache volume of a BYOO Dynamo
+// function was published as a complete set while the collector's own
+// read-write attachment of the NVMesh volume was still in place.
+// Admission then minted the ReadOnlyMany view of that primary in the
+// function namespace and NVMesh refused the attach on both GPU nodes
+// ("the requested Reservation Mode doesn't comply with the volume
+// Reservation Mode, please use the preempt flag to transition"), so the
+// decode pods stayed in Init:0/5 for the whole 30 minutes.
+//
+// The lingering VolumeAttachment stands for that reservation: the
+// mount holder is gone (the attach seam's release returns at once) but
+// the driver has not let go of the volume. A set must not be published
+// for read-only readers in that state.
+func TestModelVolumeController_CacheSetNotCompletedWhileVolumeStillAttached(t *testing.T) {
+	ctx := context.Background()
+	kc, cache, c := cacheController(t, "node-a")
+	const uri = "cache://0a9a0d3abb40d963"
+	sysNS := cache.Cfg.SystemNamespace()
+
+	// The collector wins the election and the fixture's provisioner
+	// binds the claim at once, as an Immediate NVMesh class does.
+	claim, created, err := cache.ClaimSizedClaim(ctx, uri, sysNS, resource.MustParse("1Gi"))
+	if err != nil || !created {
+		t.Fatalf("claim the set: %q created=%v err=%v", claim, created, err)
+	}
+	pvc, err := kc.CoreV1().PersistentVolumeClaims(sysNS).Get(ctx, claim, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the set claim: %v", err)
+	}
+	pvName := pvc.Spec.VolumeName
+	if pvName == "" || pvc.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("the set claim must be bound before collection: %+v", pvc.Spec)
+	}
+	if _, err := kc.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{}); err != nil {
+		t.Fatalf("the bound set volume %s must exist: %v", pvName, err)
+	}
+
+	// The reservation the writer left behind: the mount holder is gone,
+	// but the driver still holds the volume read-write.
+	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "csi-4c665887-1e91-42ca"},
+		Spec: storagev1.VolumeAttachmentSpec{Attacher: "nvmesh-csi.excelero.com", NodeName: "ip-10-1-245-80",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName}}}
+	if _, err := kc.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.Copier = &setCopier{}
+	mount := t.TempDir()
+	c.collectAttach = func(context.Context, string, string, string) (string, func(context.Context) error, error) {
+		return mount, func(context.Context) error { return nil }, nil
+	}
+
+	if err := c.collectSet(ctx, uri, sysNS, claim, nil, nil, c.Log); err == nil {
+		t.Fatalf("collectSet published the cache set while %s still carried a VolumeAttachment; the read-only views minted from it are what NVMesh refuses with the Reservation Mode mismatch: want an error, got nil", pvName)
+	}
+	pv, gerr := kc.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if gerr != nil {
+		t.Fatalf("get the set volume: %v", gerr)
+	}
+	if pv.Labels[modelvolume.CompleteLabel] == "true" {
+		t.Fatalf("primary %s labelled complete while a VolumeAttachment still holds it", pvName)
+	}
+}
+
+// nvbugs#6942084, through the Ready-pod collection path: a cache set
+// whose backing volume is still attached read-write when the collect
+// holder is gone must not be published. The decode pods of the BYOO
+// Dynamo function mount the ReadOnlyMany view of that very volume, and
+// NVMesh refuses that attach ("the requested Reservation Mode doesn't
+// comply with the volume Reservation Mode") for as long as the writer's
+// reservation stands; the pods then sit in Init:0/5. The lingering
+// VolumeAttachment stands for the reservation: the collect holder's
+// release returns at once, but the driver has not let go of the volume.
+func TestModelVolumeController_CacheSetNotPublishedWhileCollectorVolumeHeld(t *testing.T) {
+	ctx := context.Background()
+	kc, cache, c := cacheController(t, "node-a")
+	pod := cacheFixture(t, kc, cache, "node-a", 0, 1, true)
+	c.treeStat = func(string) (int64, int64, error) { return 31 << 20, 194, nil }
+	c.Copier = &setCopier{}
+	mount := t.TempDir()
+	c.collectAttach = func(context.Context, string, string, string) (string, func(context.Context) error, error) {
+		return mount, func(context.Context) error { return nil }, nil
+	}
+	// The fixture's provisioner binds the set claim to pvc-staged; the
+	// attachment on it is what the collector still holds.
+	pvName := "pvc-staged"
+	va := &storagev1.VolumeAttachment{ObjectMeta: metav1.ObjectMeta{Name: "csi-4c665887-1e91-42ca"},
+		Spec: storagev1.VolumeAttachmentSpec{Attacher: "nvmesh-csi.excelero.com", NodeName: "ip-10-1-245-80",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName}}}
+	if _, err := kc.StorageV1().VolumeAttachments().Create(ctx, va, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c.Handle(ctx, pod)
+	waitUntil(t, "collection attempt recorded as failed", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.attempts["set:cache://abc123"] == 1
+	})
+	if st, _ := cache.Lookup(ctx, "cache://abc123"); st.Complete {
+		t.Fatal("the set was published while its volume was still attached read-write; its read-only views are what NVMesh refuses")
+	}
+	// The refused publication releases the set claim, so a later attempt
+	// (once the driver has let go of the volume) collects afresh instead of
+	// inheriting a half-published one.
+	waitUntil(t, "set claim released after the refused publication", func() bool {
+		_, cerr := kc.CoreV1().PersistentVolumeClaims("nvsnap-system").Get(ctx, cache.Cfg.ClaimName("cache://abc123"), metav1.GetOptions{})
+		return cerr != nil
+	})
+	pv, err := kc.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the set volume: %v", err)
+	}
+	if pv.Labels[modelvolume.CompleteLabel] == "true" {
+		t.Errorf("primary %s labelled complete while a VolumeAttachment still holds it", pvName)
+	}
+}

@@ -1123,7 +1123,8 @@ func cacheSetSkip() map[string]bool {
 }
 
 func (c *ModelVolumeController) collectSet(ctx context.Context, uri, sysNS, claim string, ranks []rankSource, meta map[string]string, log logrus.FieldLogger) error {
-	if _, err := c.Cache.WaitBound(ctx, sysNS, claim, stagingBindTimeout); err != nil {
+	pvName, err := c.Cache.WaitBound(ctx, sysNS, claim, stagingBindTimeout)
+	if err != nil {
 		return err
 	}
 	attach := c.collectAttach
@@ -1158,6 +1159,17 @@ func (c *ModelVolumeController) collectSet(ctx context.Context, uri, sysNS, clai
 		return fmt.Errorf("release collect holder: %w", err)
 	}
 	released = true
+	// Readers attach this volume read-only; while the collector's own
+	// read-write attachment is still in place the driver refuses that
+	// attach (NVMesh: reservation mode mismatch), so the set is not
+	// published until the volume is detached.
+	detached, derr := c.Cache.Detached(ctx, pvName)
+	if derr != nil {
+		return fmt.Errorf("detach check for set volume %s: %w", pvName, derr)
+	}
+	if !detached {
+		return fmt.Errorf("set volume %s (claim %s/%s) still attached after the collect holder left; its ReadOnlyMany reader views would be refused", pvName, sysNS, claim)
+	}
 	// Both copies above keep the engine's owners and modes.
 	stamp := map[string]string{modelvolume.CacheOwnersAnnotation: modelvolume.CacheOwnersKept}
 	for k, v := range meta {
