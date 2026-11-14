@@ -20,7 +20,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
 import java.util.UUID;
 
-@Schema(description = "Function version that the account may invoke")
+@Schema(description = "DTO, with function and version ids, representing an invocable function")
 public record InvocableFunctionDto(
         @Schema(description = "Function id")
         @NotNull UUID id,

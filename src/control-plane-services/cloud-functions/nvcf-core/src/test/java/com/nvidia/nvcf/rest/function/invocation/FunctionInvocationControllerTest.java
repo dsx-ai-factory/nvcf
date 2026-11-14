@@ -17,6 +17,17 @@
 package com.nvidia.nvcf.rest.function.invocation;
 
 import static com.nvidia.nvcf.IntegrationTestConfiguration.MOCK_OAUTH2_TOKEN_SERVER;
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.ACTIVE;
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.DEGRADING;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.ALL;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.OWN;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.OWN_AND_SHARED;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.PUBLIC;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.SHARED;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.SHARED_DEGRADED_VERSION_ID;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.SHARED_FUNCTION_ID;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.SHARED_INACTIVE_VERSION_ID;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.concat;
 import static com.nvidia.nvcf.service.azp.AuthorizedPartiesService.AUTHORIZED_WILDCARD_ACCOUNT;
 import static com.nvidia.nvcf.util.MockApiKeysServer.resetToDefault;
 import static com.nvidia.nvcf.util.MockApiKeysServer.setResponse;
@@ -28,22 +39,10 @@ import static com.nvidia.nvcf.util.TestConstants.TEST_CLIENT_SUBJECT;
 import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID;
 import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID_2;
 import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID_3;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME_3;
 import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID;
-import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID_2;
 import static com.nvidia.nvcf.util.TestConstants.TEST_OWNER_ID;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_ID_1;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_NAME_V1;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_NAME_V2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_NCA_ID;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_VERSION_ID_1;
-import static com.nvidia.nvcf.util.TestConstants.TEST_PUBLIC_FUNCTION_VERSION_ID_2;
 import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_1;
 import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_3;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_4;
 import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_5;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,20 +50,21 @@ import com.nvidia.boot.mock.ngc.MockCasServer;
 import com.nvidia.boot.mock.ngc.MockNgcContainerRegistryServer;
 import com.nvidia.nvcf.IntegrationTestConfiguration;
 import com.nvidia.nvcf.NvcfTestApp;
+import com.nvidia.nvcf.persistence.function.entity.FunctionStatus;
 import com.nvidia.nvcf.rest.account.TestAccountService;
-import com.nvidia.nvcf.rest.azp.TestAuthorizedPartiesService;
-import com.nvidia.nvcf.rest.azp.dto.AuthorizedPartyDto;
 import com.nvidia.nvcf.rest.function.invocation.dto.InvocableFunctionDto;
 import com.nvidia.nvcf.rest.function.invocation.dto.ListInvocableFunctionsResponse;
+import com.nvidia.nvcf.rest.function.management.dto.FunctionStatusEnum;
 import com.nvidia.nvcf.rest.function.management.dto.ListFunctionsResponse;
 import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult.Resource;
 import com.nvidia.nvcf.service.common.TestCommonService;
 import com.nvidia.nvcf.util.MockApiKeysServer;
 import com.nvidia.nvcf.util.MockEssServer;
+import jakarta.annotation.Nullable;
 import java.net.URI;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterAll;
@@ -75,6 +75,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -99,21 +100,11 @@ class FunctionInvocationControllerTest {
 
     private static final String INVOCABLE_FUNCTIONS_URI =
             "/v2/nvcf/invocable/functions/versions/ids";
+    private static final String FUNCTIONS_URI = "/v2/nvcf/functions";
     private static final String API_KEY = "nvapi-stg-some-key";
-
-    private static final List<InvocableFunctionDto> OWN = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_3),
-            new InvocableFunctionDto(TEST_FUNCTION_ID_3, TEST_VERSION_ID_4));
-    private static final List<InvocableFunctionDto> SHARED = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2));
-    private static final List<InvocableFunctionDto> PUBLIC = List.of(
-            new InvocableFunctionDto(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_1),
-            new InvocableFunctionDto(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_2));
-    private static final List<InvocableFunctionDto> OWN_AND_SHARED =
-            Stream.concat(OWN.stream(), SHARED.stream()).toList();
-    private static final List<InvocableFunctionDto> ALL =
-            Stream.of(OWN, SHARED, PUBLIC).flatMap(List::stream).toList();
+    private static final List<Resource> ALL_RESOURCES = List.of(
+            new Resource("account-functions", "*"),
+            new Resource("authorized-functions", "*"));
 
     @Autowired
     private TestRestTemplate testRestTemplate;
@@ -122,10 +113,10 @@ class FunctionInvocationControllerTest {
     private TestCommonService testCommonService;
 
     @Autowired
-    private TestAuthorizedPartiesService testAuthPartiesService;
+    private TestAccountService testAccountService;
 
     @Autowired
-    private TestAccountService testAccountService;
+    private TestInvocableFunctionsService testInvocableFunctionsService;
 
     @Value("${nvcf.api-keys.base-url}")
     private String apiKeysBaseUrl;
@@ -153,36 +144,9 @@ class FunctionInvocationControllerTest {
         testAccountService.createDefaultAccountsClientsAndRegistries();
     }
 
-    // TEST_NCA_ID owns three function versions. TEST_NCA_ID_2 shares one of its two versions
-    // with it, and another account makes both versions of a function public.
     @BeforeEach
     void beforeEach() {
-        testAccountService.createAccountAndAssociateClients(TEST_PUBLIC_FUNCTION_NCA_ID, null);
-        testAuthPartiesService.createTestFunction(TEST_PUBLIC_FUNCTION_ID_1,
-                                                  TEST_PUBLIC_FUNCTION_VERSION_ID_1,
-                                                  TEST_PUBLIC_FUNCTION_NCA_ID,
-                                                  TEST_PUBLIC_FUNCTION_NAME_V1);
-        testAuthPartiesService.createTestFunction(TEST_PUBLIC_FUNCTION_ID_1,
-                                                  TEST_PUBLIC_FUNCTION_VERSION_ID_2,
-                                                  TEST_PUBLIC_FUNCTION_NCA_ID,
-                                                  TEST_PUBLIC_FUNCTION_NAME_V2);
-        testAuthPartiesService.associateAuthParties(
-                TEST_PUBLIC_FUNCTION_NCA_ID, TEST_PUBLIC_FUNCTION_ID_1, Optional.empty(),
-                Set.of(AuthorizedPartyDto.builder().ncaId(AUTHORIZED_WILDCARD_ACCOUNT).build()));
-
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID, TEST_VERSION_ID_1,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID, TEST_VERSION_ID_3,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_3, TEST_VERSION_ID_4,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME_3);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2,
-                                                  TEST_NCA_ID_2, TEST_FUNCTION_NAME_2);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5,
-                                                  TEST_NCA_ID_2, TEST_FUNCTION_NAME_2);
-        testAuthPartiesService.associateAuthParties(
-                TEST_NCA_ID_2, TEST_FUNCTION_ID_2, Optional.of(TEST_VERSION_ID_2),
-                Set.of(AuthorizedPartyDto.builder().ncaId(TEST_NCA_ID).build()));
+        testInvocableFunctionsService.createFunctionVersions();
     }
 
     @AfterAll
@@ -201,7 +165,7 @@ class FunctionInvocationControllerTest {
     void reset() {
         testCommonService.reset();
         resetToDefault();
-        testAccountService.deleteAccount(TEST_PUBLIC_FUNCTION_NCA_ID);
+        testInvocableFunctionsService.deleteAccounts();
     }
 
     // Only the list_functions scope is accepted: the response has no function details, and
@@ -219,10 +183,7 @@ class FunctionInvocationControllerTest {
     void shouldAcceptOnlyListFunctionsScopeForApiKeys(
             List<String> scopes,
             HttpStatus expectedStatus) {
-        setResponse(TEST_NCA_ID, TEST_OWNER_ID,
-                    List.of(new Resource("account-functions", "*"),
-                            new Resource("authorized-functions", "*")),
-                    scopes);
+        setResponse(TEST_NCA_ID, TEST_OWNER_ID, ALL_RESOURCES, scopes);
 
         var response = listInvocableFunctions(API_KEY, "visibility=private,authorized");
 
@@ -240,9 +201,7 @@ class FunctionInvocationControllerTest {
     void shouldAcceptOnlyListFunctionsScopeForTokens(
             List<String> scopes,
             HttpStatus expectedStatus) {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT, scopes, 100);
-
-        var response = listInvocableFunctions(token, "visibility=private,authorized");
+        var response = listInvocableFunctions(jwt(scopes), "visibility=private,authorized");
 
         assertThat(response.getStatusCode()).isEqualTo(expectedStatus);
         if (expectedStatus.isError()) {
@@ -253,21 +212,100 @@ class FunctionInvocationControllerTest {
                 .containsExactlyInAnyOrderElementsOf(OWN_AND_SHARED);
     }
 
-    // An API key's resources narrow the result, as they do for invocation.
     @Test
-    void shouldListOnlyTheVersionsTheApiKeyResourcesAllow() {
-        setResponse(TEST_NCA_ID, TEST_OWNER_ID,
-                    List.of(new Resource("function", TEST_FUNCTION_ID + "/" + TEST_VERSION_ID_1),
-                            new Resource("function", TEST_FUNCTION_ID_2 + "/*")),
-                    List.of(SCOPE_LIST_FUNCTIONS));
+    void shouldRejectARequestWithoutABearerToken() {
+        var response = listInvocableFunctions(null, "");
 
-        var response = listInvocableFunctions(API_KEY, "visibility=private,authorized");
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    // A version is listed only in a status that accepts invocations, whether the account owns
+    // it, it is shared with the account, or it is public, and whatever the bearer token.
+    @ParameterizedTest
+    @EnumSource(FunctionStatus.class)
+    void shouldListAVersionOnlyInAnInvocableStatus(FunctionStatus status) {
+        var versions = testInvocableFunctionsService.createFunctionVersionsInStatus(status);
+        var expected = status == ACTIVE || status == DEGRADING ? concat(ALL, versions) : ALL;
+        setResponse(TEST_NCA_ID, TEST_OWNER_ID, ALL_RESOURCES, List.of(SCOPE_LIST_FUNCTIONS));
+
+        for (var bearer : List.of(jwt(List.of(SCOPE_LIST_FUNCTIONS)), API_KEY)) {
+            var response = listInvocableFunctions(bearer, "");
+
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(response.getBody()).isNotNull();
+            assertThat(response.getBody().functions())
+                    .as("%s versions listed with %s", status,
+                        API_KEY.equals(bearer) ? "an API key" : "a JWT")
+                    .containsExactlyInAnyOrderElementsOf(expected);
+        }
+    }
+
+    // An API key's resources limit the versions that the account owns or that are shared with
+    // it, as they do for invocation, and a version that they allow is still listed only in an
+    // invocable status.
+    Stream<Arguments> resourceArgs() {
+        return Stream.of(
+                Arguments.of(List.of(new Resource("account-functions", "*")), OWN),
+                Arguments.of(List.of(new Resource("authorized-functions", "*")), SHARED),
+                Arguments.of(List.of(function(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
+                                     function(TEST_FUNCTION_ID_2, null)),
+                             List.of(new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
+                                     new InvocableFunctionDto(TEST_FUNCTION_ID_2,
+                                                              TEST_VERSION_ID_2))),
+                // An ACTIVE version that is not shared with the account.
+                Arguments.of(List.of(function(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5)), List.of()),
+                // Own and shared versions in statuses that do not accept invocations.
+                Arguments.of(List.of(function(TEST_FUNCTION_ID_3, null),
+                                     function(TEST_FUNCTION_ID_2, SHARED_DEGRADED_VERSION_ID),
+                                     function(SHARED_FUNCTION_ID, SHARED_INACTIVE_VERSION_ID)),
+                             List.of()));
+    }
+
+    @ParameterizedTest
+    @MethodSource("resourceArgs")
+    void shouldListOnlyTheVersionsThatTheApiKeyResourcesAllow(
+            List<Resource> resources,
+            List<InvocableFunctionDto> expected) {
+        setResponse(TEST_NCA_ID, TEST_OWNER_ID, resources, List.of(SCOPE_LIST_FUNCTIONS));
+        var query = "visibility=private,authorized";
+
+        var response = listInvocableFunctions(API_KEY, query);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isNotNull();
-        assertThat(response.getBody().functions()).containsExactlyInAnyOrder(
-                new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
-                new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2));
+        assertThat(response.getBody().functions())
+                .containsExactlyInAnyOrderElementsOf(expected)
+                .containsExactlyInAnyOrderElementsOf(invocableVersionsOfListing(API_KEY, query));
+    }
+
+    // Public versions are not limited by an API key's resources, as for invocation.
+    @Test
+    void shouldListPublicVersionsWhateverTheApiKeyResources() {
+        setResponse(TEST_NCA_ID, TEST_OWNER_ID,
+                    List.of(function(TEST_FUNCTION_ID, TEST_VERSION_ID_1)),
+                    List.of(SCOPE_LIST_FUNCTIONS));
+        var allowed = List.of(new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1));
+
+        var response = listInvocableFunctions(API_KEY, "");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().functions())
+                .containsExactlyInAnyOrderElementsOf(concat(allowed, PUBLIC))
+                .containsExactlyInAnyOrderElementsOf(invocableVersionsOfListing(API_KEY, ""));
+    }
+
+    // A version that the account owns and makes public is listed once.
+    @Test
+    void shouldListAVersionOnce() {
+        testInvocableFunctionsService.share(TEST_NCA_ID, TEST_FUNCTION_ID, Optional.empty(),
+                                            AUTHORIZED_WILDCARD_ACCOUNT);
+
+        var response = listInvocableFunctions(jwt(List.of(SCOPE_LIST_FUNCTIONS)), "");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().functions()).containsExactlyInAnyOrderElementsOf(ALL);
     }
 
     Stream<Arguments> visibilityArgs() {
@@ -283,51 +321,68 @@ class FunctionInvocationControllerTest {
     }
 
     // Each visibility includes only its kind of function, and the result has exactly the
-    // versions that the function listing returns for the same query.
+    // invocable versions of the function listing for the same query.
     @ParameterizedTest
     @MethodSource("visibilityArgs")
-    void shouldFilterByVisibilityLikeTheFunctionListing(
+    void shouldListTheInvocableVersionsOfTheFunctionListing(
             String query,
             List<InvocableFunctionDto> expected) {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
-                                                    List.of(SCOPE_LIST_FUNCTIONS), 100);
+        var token = jwt(List.of(SCOPE_LIST_FUNCTIONS));
 
         var response = listInvocableFunctions(token, query);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isNotNull();
-        assertThat(response.getBody().functions()).containsExactlyInAnyOrderElementsOf(expected);
-
-        var request = RequestEntity.get(URI.create("/v2/nvcf/functions?" + query))
-                .header("Authorization", "Bearer " + token)
-                .build();
-        var listing = testRestTemplate.exchange(request, ListFunctionsResponse.class);
-        assertThat(listing.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(listing.getBody()).isNotNull();
-        assertThat(response.getBody().functions()).containsExactlyInAnyOrderElementsOf(
-                listing.getBody().functions().stream()
-                        .map(dto -> new InvocableFunctionDto(dto.id(), dto.versionId()))
-                        .toList());
+        assertThat(response.getBody().functions())
+                .containsExactlyInAnyOrderElementsOf(expected)
+                .containsExactlyInAnyOrderElementsOf(invocableVersionsOfListing(token, query));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"visibility=invalid", "visibility=private,invalid"})
     void shouldRejectAnInvalidVisibility(String query) {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
-                                                    List.of(SCOPE_LIST_FUNCTIONS), 100);
-
-        var response = listInvocableFunctions(token, query);
+        var response = listInvocableFunctions(jwt(List.of(SCOPE_LIST_FUNCTIONS)), query);
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    private static String jwt(List<String> scopes) {
+        return MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT, scopes, 100);
+    }
+
+    private static Resource function(UUID id, @Nullable UUID versionId) {
+        return new Resource("function", id + "/" + (versionId == null ? "*" : versionId));
+    }
+
     private ResponseEntity<ListInvocableFunctionsResponse> listInvocableFunctions(
-            String token,
+            @Nullable String bearer,
             String query) {
-        var uri = query.isEmpty() ? INVOCABLE_FUNCTIONS_URI : INVOCABLE_FUNCTIONS_URI + "?" + query;
-        var request = RequestEntity.get(URI.create(uri))
-                .header("Authorization", "Bearer " + token)
-                .build();
-        return testRestTemplate.exchange(request, ListInvocableFunctionsResponse.class);
+        return get(withQuery(INVOCABLE_FUNCTIONS_URI, query), bearer,
+                   ListInvocableFunctionsResponse.class);
+    }
+
+    // The function and version ids of the versions in an invocable status in the function
+    // listing.
+    private List<InvocableFunctionDto> invocableVersionsOfListing(String bearer, String query) {
+        var response = get(withQuery(FUNCTIONS_URI, query), bearer, ListFunctionsResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        return response.getBody().functions().stream()
+                .filter(function -> function.status() == FunctionStatusEnum.ACTIVE
+                        || function.status() == FunctionStatusEnum.DEGRADING)
+                .map(function -> new InvocableFunctionDto(function.id(), function.versionId()))
+                .toList();
+    }
+
+    private <T> ResponseEntity<T> get(String uri, @Nullable String bearer, Class<T> type) {
+        var builder = RequestEntity.get(URI.create(uri));
+        if (bearer != null) {
+            builder = builder.header("Authorization", "Bearer " + bearer);
+        }
+        return testRestTemplate.exchange(builder.build(), type);
+    }
+
+    private static String withQuery(String uri, String query) {
+        return query.isEmpty() ? uri : uri + "?" + query;
     }
 }

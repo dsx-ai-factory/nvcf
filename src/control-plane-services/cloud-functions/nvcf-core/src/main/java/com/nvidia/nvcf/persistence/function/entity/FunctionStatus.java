@@ -33,6 +33,9 @@ public enum FunctionStatus {
     public static final EnumSet<FunctionStatus> BUSY_STATUSES =
             EnumSet.of(ACTIVE, DEPLOYING, DEGRADED, DEGRADING);
 
+    // Function versions in these statuses accept invocations.
+    public static final EnumSet<FunctionStatus> INVOCABLE_STATUSES = EnumSet.of(ACTIVE, DEGRADING);
+
     private final String name;
 
     FunctionStatus(String name) {

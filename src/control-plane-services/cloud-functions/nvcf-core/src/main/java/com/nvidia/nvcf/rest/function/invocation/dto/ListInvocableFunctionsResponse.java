@@ -22,8 +22,9 @@ import java.util.List;
 import lombok.Builder;
 
 @Builder
-@Schema(description = "Response body containing the function versions that an account may invoke")
+@Schema(description = "Response body containing list of function and version ids representing "
+        + "invocable functions based on the authorization token")
 public record ListInvocableFunctionsResponse(
-        @Schema(description = "Function id and version id of each function version")
+        @Schema(description = "Function and version ids of the invocable functions")
         @NotNull List<InvocableFunctionDto> functions) {
 }

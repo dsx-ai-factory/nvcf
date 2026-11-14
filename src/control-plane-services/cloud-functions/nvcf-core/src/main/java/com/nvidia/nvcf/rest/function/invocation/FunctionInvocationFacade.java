@@ -17,6 +17,7 @@
 package com.nvidia.nvcf.rest.function.invocation;
 
 import static com.nvidia.nvcf.configuration.notary.NotaryAuthManagerConfiguration.VALIDITY;
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.INVOCABLE_STATUSES;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.authorizedFunctionMatch;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.privateFunctionMatch;
 import static java.lang.String.format;
@@ -56,9 +57,9 @@ public class FunctionInvocationFacade {
     private final FunctionManagementService functionManagementService;
 
     /**
-     * Lists the id and version id of each function version that the account may invoke. It
-     * shares the lookup of the function listing, which applies the same account and API key
-     * checks as invocation, version by version.
+     * Lists the function and version ids of the invocable functions for the bearer token: the
+     * function versions in an invocable status that pass the same account and API key checks
+     * as invocation, version by version.
      */
     public ListInvocableFunctionsResponse listInvocableFunctions(
             String ncaId,
@@ -72,6 +73,7 @@ public class FunctionInvocationFacade {
                                                                      function),
                                  visibilities)
                 .stream()
+                .filter(function -> INVOCABLE_STATUSES.contains(function.getFunctionStatus()))
                 .map(function -> new InvocableFunctionDto(function.getFunctionId(),
                                                           function.getFunctionVersionId()))
                 .toList();

@@ -49,9 +49,9 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping(value = "/v2/nvcf/accounts/{ncaId}", produces = APPLICATION_JSON_VALUE)
 @Tag(name = "Cross-Account Invocable Functions for NVIDIA Super Admins",
         description = """
-                Defines endpoints for NVIDIA Super Admins that list the function versions an
-                 NVIDIA Cloud Account may invoke. All the endpoints defined in this API require a
-                 bearer token with 'admin:list_functions' scope in the HTTP Authorization header.
+                Defines endpoints for NVIDIA Super Admins to list the function version ids of the
+                 specified NVIDIA Cloud Account based on the bearer token specified using HTTP
+                 Authorization header. The bearer token must have 'admin:list_functions' scope.
                 """
 )
 public class XAccountFunctionInvocationController {
@@ -67,11 +67,10 @@ public class XAccountFunctionInvocationController {
     @Operation(
             summary = "List Invocable Functions",
             description = """
-                    Lists the id and version id of each function version that the specified NVIDIA
-                     Cloud Account may invoke, with the same account checks as function
-                     invocation. A version is listed whatever its deployment status. Requires a
-                     bearer token with 'admin:list_functions' scope in the HTTP Authorization
-                     header.
+                    Lists the function and version ids of the invocable functions that the
+                     specified NVIDIA Cloud Account owns or that are shared with it: function
+                     versions in ACTIVE or DEGRADING status. Requires a bearer token with
+                     'admin:list_functions' scope in the HTTP Authorization header.
                     """
     )
     @PreAuthorize("hasAuthority('admin:list_functions')")

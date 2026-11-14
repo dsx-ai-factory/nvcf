@@ -48,9 +48,9 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping(produces = APPLICATION_JSON_VALUE)
 @Tag(name = "Invocable Functions",
         description = """
-                Defines endpoints that list the function versions the authenticated NVIDIA Cloud
-                 Account may invoke. All the endpoints defined in this API require a bearer token
-                 with 'list_functions' scope in the HTTP Authorization header.
+                Defines endpoints to list function version ids based on the bearer token
+                 specified using HTTP Authorization header. The bearer token must have
+                 'list_functions' scope.
                 """
 )
 public class FunctionInvocationController {
@@ -64,11 +64,10 @@ public class FunctionInvocationController {
     @Operation(
             summary = "List Invocable Functions",
             description = """
-                    Lists the id and version id of each function version that the authenticated
-                     NVIDIA Cloud Account may invoke, with the same account and API key checks as
-                     function invocation. An API key lists only the function versions that its
-                     resources allow. A version is listed whatever its deployment status. Requires
-                     a bearer token with 'list_functions' scope in the HTTP Authorization header.
+                    Lists the function and version ids of the invocable functions based on the
+                     bearer token: function versions in ACTIVE or DEGRADING status that pass the
+                     same account and API key resource checks as function invocation. Requires a
+                     bearer token with 'list_functions' scope in the HTTP Authorization header.
                     """
     )
     @PreAuthorize("hasAnyAuthority('list_functions', 'apikey:list_functions')")

@@ -17,44 +17,44 @@
 package com.nvidia.nvcf.rest.function.invocation;
 
 import static com.nvidia.nvcf.IntegrationTestConfiguration.MOCK_OAUTH2_TOKEN_SERVER;
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.ACTIVE;
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.DEGRADING;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.ALL;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.OWN;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.OWN_AND_SHARED;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.OWN_BY_NCA_ID_2;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.PUBLIC;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.SHARED;
+import static com.nvidia.nvcf.rest.function.invocation.TestInvocableFunctionsService.concat;
 import static com.nvidia.nvcf.util.MockApiKeysServer.resetToDefault;
+import static com.nvidia.nvcf.util.MockApiKeysServer.setResponse;
 import static com.nvidia.nvcf.util.NvcfConstants.ADMIN_SCOPE_LIST_FUNCTIONS;
 import static com.nvidia.nvcf.util.NvcfConstants.ADMIN_SCOPE_LIST_FUNCTIONS_DETAILS;
 import static com.nvidia.nvcf.util.TestConstants.SCOPE_INVOKE_FUNCTION;
 import static com.nvidia.nvcf.util.TestConstants.SCOPE_LIST_FUNCTIONS;
 import static com.nvidia.nvcf.util.TestConstants.TEST_ADMIN_SUBJECT;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_ID_3;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_FUNCTION_NAME_3;
 import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID;
 import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_1;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_2;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_3;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_4;
-import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_5;
+import static com.nvidia.nvcf.util.TestConstants.TEST_OWNER_ID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.nvidia.boot.mock.ngc.MockCasServer;
 import com.nvidia.boot.mock.ngc.MockNgcContainerRegistryServer;
 import com.nvidia.nvcf.IntegrationTestConfiguration;
 import com.nvidia.nvcf.NvcfTestApp;
+import com.nvidia.nvcf.persistence.function.entity.FunctionStatus;
 import com.nvidia.nvcf.rest.account.TestAccountService;
-import com.nvidia.nvcf.rest.azp.TestAuthorizedPartiesService;
-import com.nvidia.nvcf.rest.azp.dto.AuthorizedPartyDto;
 import com.nvidia.nvcf.rest.function.invocation.dto.InvocableFunctionDto;
 import com.nvidia.nvcf.rest.function.invocation.dto.ListInvocableFunctionsResponse;
+import com.nvidia.nvcf.rest.function.management.dto.FunctionStatusEnum;
 import com.nvidia.nvcf.rest.function.management.dto.ListFunctionsResponse;
+import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult.Resource;
 import com.nvidia.nvcf.service.common.TestCommonService;
 import com.nvidia.nvcf.util.MockApiKeysServer;
 import com.nvidia.nvcf.util.MockEssServer;
+import jakarta.annotation.Nullable;
 import java.net.URI;
 import java.util.List;
-import java.util.Optional;
-import java.util.Set;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterAll;
@@ -65,6 +65,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -88,14 +89,7 @@ class XAccountFunctionInvocationControllerTest {
 
     private static final String INVOCABLE_FUNCTIONS_URI =
             "/v2/nvcf/accounts/%s/invocable/functions/versions/ids";
-
-    // TEST_NCA_ID owns three function versions, and TEST_NCA_ID_2 shares one of its two versions
-    // with it.
-    private static final List<InvocableFunctionDto> OWN_AND_SHARED = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_3),
-            new InvocableFunctionDto(TEST_FUNCTION_ID_3, TEST_VERSION_ID_4),
-            new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2));
+    private static final String FUNCTIONS_URI = "/v2/nvcf/accounts/%s/functions";
 
     @Autowired
     private TestRestTemplate testRestTemplate;
@@ -104,10 +98,10 @@ class XAccountFunctionInvocationControllerTest {
     private TestCommonService testCommonService;
 
     @Autowired
-    private TestAuthorizedPartiesService testAuthPartiesService;
+    private TestAccountService testAccountService;
 
     @Autowired
-    private TestAccountService testAccountService;
+    private TestInvocableFunctionsService testInvocableFunctionsService;
 
     @Value("${nvcf.api-keys.base-url}")
     private String apiKeysBaseUrl;
@@ -137,19 +131,7 @@ class XAccountFunctionInvocationControllerTest {
 
     @BeforeEach
     void beforeEach() {
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID, TEST_VERSION_ID_1,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID, TEST_VERSION_ID_3,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_3, TEST_VERSION_ID_4,
-                                                  TEST_NCA_ID, TEST_FUNCTION_NAME_3);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2,
-                                                  TEST_NCA_ID_2, TEST_FUNCTION_NAME_2);
-        testAuthPartiesService.createTestFunction(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5,
-                                                  TEST_NCA_ID_2, TEST_FUNCTION_NAME_2);
-        testAuthPartiesService.associateAuthParties(
-                TEST_NCA_ID_2, TEST_FUNCTION_ID_2, Optional.of(TEST_VERSION_ID_2),
-                Set.of(AuthorizedPartyDto.builder().ncaId(TEST_NCA_ID).build()));
+        testInvocableFunctionsService.createFunctionVersions();
     }
 
     @AfterAll
@@ -168,6 +150,7 @@ class XAccountFunctionInvocationControllerTest {
     void reset() {
         testCommonService.reset();
         resetToDefault();
+        testInvocableFunctionsService.deleteAccounts();
     }
 
     Stream<Arguments> scopeArgs() {
@@ -175,15 +158,15 @@ class XAccountFunctionInvocationControllerTest {
                 Arguments.of(List.of(ADMIN_SCOPE_LIST_FUNCTIONS), HttpStatus.OK),
                 Arguments.of(List.of(ADMIN_SCOPE_LIST_FUNCTIONS_DETAILS), HttpStatus.FORBIDDEN),
                 Arguments.of(List.of(SCOPE_LIST_FUNCTIONS), HttpStatus.FORBIDDEN),
-                Arguments.of(List.of(SCOPE_INVOKE_FUNCTION), HttpStatus.FORBIDDEN));
+                Arguments.of(List.of(SCOPE_INVOKE_FUNCTION), HttpStatus.FORBIDDEN),
+                Arguments.of(List.of(), HttpStatus.FORBIDDEN));
     }
 
     @ParameterizedTest
     @MethodSource("scopeArgs")
     void shouldAcceptOnlyAdminListFunctionsScope(List<String> scopes, HttpStatus expectedStatus) {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_ADMIN_SUBJECT, scopes, 100);
-
-        var response = listInvocableFunctions(token, TEST_NCA_ID, "visibility=private,authorized");
+        var response = listInvocableFunctions(jwt(scopes), TEST_NCA_ID,
+                                              "visibility=private,authorized");
 
         assertThat(response.getStatusCode()).isEqualTo(expectedStatus);
         if (expectedStatus.isError()) {
@@ -194,63 +177,132 @@ class XAccountFunctionInvocationControllerTest {
                 .containsExactlyInAnyOrderElementsOf(OWN_AND_SHARED);
     }
 
-    // The result is for the account in the path, not the caller's.
     @Test
-    void shouldListTheFunctionVersionsOfTheAccountInThePath() {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_ADMIN_SUBJECT,
-                                                    List.of(ADMIN_SCOPE_LIST_FUNCTIONS), 100);
+    void shouldRejectAnApiKey() {
+        setResponse(TEST_NCA_ID, TEST_OWNER_ID,
+                    List.of(new Resource("account-functions", "*"),
+                            new Resource("authorized-functions", "*")),
+                    List.of(SCOPE_LIST_FUNCTIONS));
 
-        var response = listInvocableFunctions(token, TEST_NCA_ID_2, "visibility=private");
+        var response = listInvocableFunctions("nvapi-stg-some-key", TEST_NCA_ID, "");
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody()).isNotNull();
-        assertThat(response.getBody().functions()).containsExactlyInAnyOrder(
-                new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
-                new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
     }
 
-    // The result has exactly the versions of the cross-account function listing.
     @Test
-    void shouldReturnTheVersionsOfTheCrossAccountFunctionListing() {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_ADMIN_SUBJECT,
-                                                    List.of(ADMIN_SCOPE_LIST_FUNCTIONS), 100);
-        var query = "visibility=private,authorized";
+    void shouldRejectARequestWithoutABearerToken() {
+        var response = listInvocableFunctions(null, TEST_NCA_ID, "");
 
-        var response = listInvocableFunctions(token, TEST_NCA_ID, query);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
 
-        var request = RequestEntity
-                .get(URI.create("/v2/nvcf/accounts/" + TEST_NCA_ID + "/functions?" + query))
-                .header("Authorization", "Bearer " + token)
-                .build();
-        var listing = testRestTemplate.exchange(request, ListFunctionsResponse.class);
+    // A version is listed only in a status that accepts invocations, whether the account owns
+    // it, it is shared with the account, or it is public.
+    @ParameterizedTest
+    @EnumSource(FunctionStatus.class)
+    void shouldListAVersionOnlyInAnInvocableStatus(FunctionStatus status) {
+        var versions = testInvocableFunctionsService.createFunctionVersionsInStatus(status);
+        var expected = status == ACTIVE || status == DEGRADING ? concat(ALL, versions) : ALL;
+
+        var response = listInvocableFunctions(adminJwt(), TEST_NCA_ID, "");
+
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(listing.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isNotNull();
-        assertThat(listing.getBody()).isNotNull();
-        assertThat(response.getBody().functions()).containsExactlyInAnyOrderElementsOf(
-                listing.getBody().functions().stream()
-                        .map(dto -> new InvocableFunctionDto(dto.id(), dto.versionId()))
-                        .toList());
+        assertThat(response.getBody().functions())
+                .as("%s versions listed", status)
+                .containsExactlyInAnyOrderElementsOf(expected);
+    }
+
+    Stream<Arguments> listingArgs() {
+        return Stream.of(
+                Arguments.of(TEST_NCA_ID, "visibility=private", OWN),
+                Arguments.of(TEST_NCA_ID, "visibility=authorized", SHARED),
+                Arguments.of(TEST_NCA_ID, "visibility=public", PUBLIC),
+                Arguments.of(TEST_NCA_ID, "visibility=private,authorized", OWN_AND_SHARED),
+                Arguments.of(TEST_NCA_ID, "visibility=private&visibility=authorized",
+                             OWN_AND_SHARED),
+                Arguments.of(TEST_NCA_ID, "", ALL),
+                Arguments.of(TEST_NCA_ID_2, "visibility=private", OWN_BY_NCA_ID_2),
+                Arguments.of(TEST_NCA_ID_2, "visibility=authorized", List.of()),
+                Arguments.of(TEST_NCA_ID_2, "", concat(OWN_BY_NCA_ID_2, PUBLIC)));
+    }
+
+    // The result is for the account in the path, not the caller's, and has exactly the
+    // invocable versions of the cross-account function listing for the same query.
+    @ParameterizedTest
+    @MethodSource("listingArgs")
+    void shouldListTheInvocableVersionsOfTheCrossAccountFunctionListing(
+            String ncaId,
+            String query,
+            List<InvocableFunctionDto> expected) {
+        var token = adminJwt();
+
+        var response = listInvocableFunctions(token, ncaId, query);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().functions())
+                .containsExactlyInAnyOrderElementsOf(expected)
+                .containsExactlyInAnyOrderElementsOf(invocableVersionsOfListing(token, ncaId,
+                                                                                query));
+    }
+
+    @Test
+    void shouldRejectAnInvalidVisibility() {
+        var response = listInvocableFunctions(adminJwt(), TEST_NCA_ID, "visibility=invalid");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     void shouldRejectAnUnknownAccount() {
-        var token = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_ADMIN_SUBJECT,
-                                                    List.of(ADMIN_SCOPE_LIST_FUNCTIONS), 100);
-
-        var response = listInvocableFunctions(token, "test-unknown-nca-id", "");
+        var response = listInvocableFunctions(adminJwt(), "test-unknown-nca-id", "");
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    private static String jwt(List<String> scopes) {
+        return MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_ADMIN_SUBJECT, scopes, 100);
+    }
+
+    private static String adminJwt() {
+        return jwt(List.of(ADMIN_SCOPE_LIST_FUNCTIONS));
+    }
+
     private ResponseEntity<ListInvocableFunctionsResponse> listInvocableFunctions(
-            String token,
+            @Nullable String bearer,
             String ncaId,
             String query) {
-        var uri = INVOCABLE_FUNCTIONS_URI.formatted(ncaId) + (query.isEmpty() ? "" : "?" + query);
-        var request = RequestEntity.get(URI.create(uri))
-                .header("Authorization", "Bearer " + token)
-                .build();
-        return testRestTemplate.exchange(request, ListInvocableFunctionsResponse.class);
+        return get(withQuery(INVOCABLE_FUNCTIONS_URI.formatted(ncaId), query), bearer,
+                   ListInvocableFunctionsResponse.class);
+    }
+
+    // The function and version ids of the versions in an invocable status in the cross-account
+    // function listing.
+    private List<InvocableFunctionDto> invocableVersionsOfListing(
+            String bearer,
+            String ncaId,
+            String query) {
+        var response = get(withQuery(FUNCTIONS_URI.formatted(ncaId), query), bearer,
+                           ListFunctionsResponse.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        return response.getBody().functions().stream()
+                .filter(function -> function.status() == FunctionStatusEnum.ACTIVE
+                        || function.status() == FunctionStatusEnum.DEGRADING)
+                .map(function -> new InvocableFunctionDto(function.id(), function.versionId()))
+                .toList();
+    }
+
+    private <T> ResponseEntity<T> get(String uri, @Nullable String bearer, Class<T> type) {
+        var builder = RequestEntity.get(URI.create(uri));
+        if (bearer != null) {
+            builder = builder.header("Authorization", "Bearer " + bearer);
+        }
+        return testRestTemplate.exchange(builder.build(), type);
+    }
+
+    private static String withQuery(String uri, String query) {
+        return query.isEmpty() ? uri : uri + "?" + query;
     }
 }
