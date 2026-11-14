@@ -346,3 +346,36 @@ func TestDecodeConfigLegacyLogChunkingOverrideWinsOverChartValue(t *testing.T) {
 			"the legacy BYOOLogChunking/maxBodyBytes override must set the effective log chunk size")
 	}
 }
+
+// TestDecodeConfigCanonicalPayloadSizeWinsWithinOneInput checks that the alias
+// only fills in a missing canonical spelling: a block that already spells
+// maxPayloadBytes keeps that value even next to the deprecated key.
+func TestDecodeConfigCanonicalPayloadSizeWinsWithinOneInput(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(`agent:
+  byooLogChunking:
+    maxBodyBytes: 262144
+    maxPayloadBytes: 131072
+`))
+	require.NoError(t, err)
+	assert.Equal(t, int64(131072), cfg.Agent.BYOOLogChunking.MaxPayloadBytes)
+}
+
+func TestAliasDeprecatedKeysAddsCanonicalPayloadSize(t *testing.T) {
+	aliased := aliasDeprecatedKeys([]byte(`agent:
+  BYOOLogChunking:
+    maxBodyBytes: 262144
+`))
+	assert.Contains(t, string(aliased), "maxPayloadBytes: 262144")
+	assert.Contains(t, string(aliased), "maxBodyBytes: 262144")
+}
+
+func TestAliasDeprecatedKeysLeavesOtherInputUnchanged(t *testing.T) {
+	unrelated := []byte("agent:\n  byooOtelCollector:\n    maxBodyBytes: 1\n")
+	assert.Equal(t, unrelated, aliasDeprecatedKeys(unrelated))
+
+	canonical := []byte("agent:\n  byooLogChunking:\n    maxPayloadBytes: 1\n")
+	assert.Equal(t, canonical, aliasDeprecatedKeys(canonical))
+
+	invalid := []byte("agent: [")
+	assert.Equal(t, invalid, aliasDeprecatedKeys(invalid))
+}

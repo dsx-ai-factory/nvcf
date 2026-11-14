@@ -72,14 +72,14 @@ func DecodeConfig(data []byte, extraConfigDatas ...[]byte) (cfg Config, err erro
 	if err := validateYAMLKeys(data); err != nil {
 		return cfg, fmt.Errorf("read config: %w", err)
 	}
-	if err := v.ReadConfig(bytes.NewReader(data)); err != nil {
+	if err := v.ReadConfig(bytes.NewReader(aliasDeprecatedKeys(data))); err != nil {
 		return cfg, fmt.Errorf("read config: %w", err)
 	}
 	for _, extraCfgData := range extraConfigDatas {
 		if err := validateYAMLKeys(extraCfgData); err != nil {
 			return cfg, fmt.Errorf("merge extra config: %w", err)
 		}
-		if err := v.MergeConfig(bytes.NewReader(extraCfgData)); err != nil {
+		if err := v.MergeConfig(bytes.NewReader(aliasDeprecatedKeys(extraCfgData))); err != nil {
 			return cfg, fmt.Errorf("merge extra config: %w", err)
 		}
 		if err := mergeLegacyLogChunkSize(v, extraCfgData); err != nil {
