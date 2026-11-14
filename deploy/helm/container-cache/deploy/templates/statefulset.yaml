@@ -129,6 +129,14 @@ spec:
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
+        sysctls:
+          # On first bring-up of the cache volumes every replica starts
+          # watching the freshly provisioned filesystem at once, which
+          # exhausts the common node default of 128 inotify instances per
+          # user and makes the pods log "failed to create fsnotify watcher:
+          # too many open files" until they are manually restarted.
+          - name: fs.inotify.max_user_instances
+            value: "1024"
       serviceAccountName: container-cache
     {{- with $.Values.images.secrets }}
       imagePullSecrets:
