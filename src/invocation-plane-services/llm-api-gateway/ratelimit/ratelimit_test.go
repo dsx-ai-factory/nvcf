@@ -220,6 +220,70 @@ func (s *RateLimiterTestSuite) TestBucketsRefillOverTime() {
 	s.Equal(int64(70), res3.CurrentValue)
 }
 
+// A write must keep the part of the elapsed time that has not yet become a
+// whole token. Otherwise a key written more often than once per period/limit
+// is never refilled.
+func (s *RateLimiterTestSuite) TestBucketsRefillAcrossWritesShorterThanOneToken() {
+	var (
+		rl = RateLimit{
+			Limit:  3_000_000,
+			Period: 30 * 24 * time.Hour, // 3000000-MO: one token every 864 ms
+		}
+		key = "rl:test:refill_frequent_writes"
+	)
+	limiter := s.newLimiter()
+
+	res, err := limiter.CheckLimit(s.ctx, key, rl, 3_000_000, false, "", true)
+	s.Require().NoError(err)
+	s.Equal(int64(0), res.RemainingValue())
+
+	// One hour of writes every 500 ms that charge nothing.
+	for range 7200 {
+		s.advance(500 * time.Millisecond)
+		_, err = limiter.CheckLimit(s.ctx, key, rl, 0, false, "", true)
+		s.Require().NoError(err)
+	}
+
+	// 3600000 ms * 3000000 / 2592000000 ms = 4166 tokens.
+	res2, err := limiter.CheckLimit(s.ctx, key, rl, 0, true, "", false)
+	s.Require().NoError(err)
+	s.Equal(int64(4166), res2.CurrentValue)
+}
+
+func (s *RateLimiterTestSuite) TestConsumeIfAllowedKeepsConfiguredRateUnderSteadyTraffic() {
+	rl := RateLimit{
+		Limit:  10,
+		Period: time.Minute, // one unit every 6 s
+	}
+
+	for _, interval := range []time.Duration{5400 * time.Millisecond, 5900 * time.Millisecond} {
+		s.Run(interval.String(), func() {
+			key := "rl:test:steady_" + interval.String()
+			limiter := s.newLimiter()
+
+			// Spend the initial burst, then send one unit every interval for ten minutes.
+			res, err := limiter.CheckLimit(s.ctx, key, rl, 10, false, "", false)
+			s.Require().NoError(err)
+			s.Require().True(res.Allowed())
+
+			allowed := 0
+			var elapsed time.Duration
+			for elapsed+interval <= 10*time.Minute {
+				s.advance(interval)
+				elapsed += interval
+				res, err := limiter.CheckLimit(s.ctx, key, rl, 1, false, "", false)
+				s.Require().NoError(err)
+				if res.Allowed() {
+					allowed++
+				}
+			}
+
+			// At 10 per minute, one unit refills every 6 s of elapsed time.
+			s.Equal(int(elapsed/(6*time.Second)), allowed)
+		})
+	}
+}
+
 func (s *RateLimiterTestSuite) TestBucketsRefillOverTimeDoesNotOverflowForLargeRateAndLongElapsed() {
 	var (
 		// elapsed(ms) * rate overflows int64 before /periodMs brings it back down.
