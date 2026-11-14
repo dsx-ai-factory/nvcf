@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -29,8 +30,24 @@ const (
 
 // Record names and states, as the agent writes them (internal/agent).
 const (
-	GroupRecordPrefix    = "nvsnap-criu-group-"
-	CachedirRecordPrefix = "nvsnap-cachedir-"
+	GroupRecordPrefix = "nvsnap-criu-group-"
+	// What the webhook and agents put on a restore's pods, which the
+	// restore history reads (internal/agent's TestFnstatusMatchesTheAgent
+	// keeps them the webhook's).
+	GroupLabel               = "nvsnap.io/criu-group"
+	GroupAnnotation          = "nvsnap.io/criu-group"
+	RestoreAnnotation        = "nvsnap.io/criu-restore"
+	CompanionAnnotation      = "nvsnap.io/criu-group-companion"
+	OrdinalAnnotation        = "nvsnap.io/criu-group-ordinal"
+	RestoredAnnotation       = "nvsnap.io/criu-restored"
+	ColdStartedAnnotation    = "nvsnap.io/criu-cold-started"
+	TeardownExitedAnnotation = "nvsnap.io/criu-teardown-exited"
+	// The labels that tell an instance's pods from another's in one
+	// namespace, as the agent reads them.
+	GroveScalingGroupLabel        = "grove.io/podcliquescalinggroup"
+	GroveScalingGroupReplicaLabel = "grove.io/podcliquescalinggroup-replica-index"
+	LWSGroupKeyLabel              = "leaderworkerset.sigs.k8s.io/group-key"
+	CachedirRecordPrefix          = "nvsnap-cachedir-"
 
 	StateAlias          = "alias"
 	StateCapturing      = "capturing"
@@ -149,6 +166,9 @@ type Status struct {
 	LastRestoreSecs   float64         `json:"lastRestoreSeconds,omitempty"`
 	Reason            string          `json:"reason,omitempty"`
 	Configurations    []Configuration `json:"configurations"`
+	// History is the version's restores (history.go), kept by the server
+	// across passes; Project leaves it empty.
+	History
 }
 
 // reasonMax bounds a reason in the status.
@@ -206,9 +226,10 @@ func configuration(key string, d, c map[string]string) Configuration {
 	}
 	if h := strings.Fields(d["restores"]); len(h) > 0 {
 		cfg.Restores = len(h)
-		at, secs, _ := strings.Cut(h[len(h)-1], "=")
-		cfg.LastRestoreAt = at
-		cfg.LastRestoreSeconds, _ = strconv.ParseFloat(secs, 64)
+		if s := RecordStamps(map[string]string{"restores": h[len(h)-1]}); len(s) == 1 {
+			cfg.LastRestoreAt = s[0].At.UTC().Format(time.RFC3339)
+			cfg.LastRestoreSeconds = s[0].Seconds
+		}
 	}
 	if c != nil {
 		cfg.Cachedir = cachedirRanks(c, cfg.Ranks)

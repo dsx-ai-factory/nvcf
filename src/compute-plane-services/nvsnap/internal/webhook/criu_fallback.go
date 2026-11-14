@@ -35,6 +35,11 @@ const (
 	// FallbackGPUShareFailed is the reason under which the gpushare library
 	// is left out: the workload does not start under it.
 	FallbackGPUShareFailed = "gpushare-failed"
+	// FallbackDriver is the reason of a configuration the cluster's GPU
+	// drivers keep from CRIU (the agent's driver gate): too old, or more
+	// than one major. The gpushare library is left out too: nothing is
+	// captured with it.
+	FallbackDriver = "driver"
 
 	// FallbackCapturePrefix starts the name of every cachedir capture in
 	// the checkpoint directory: cachedir-<configuration key>-<rank>.
@@ -67,8 +72,8 @@ const (
 // CRIUFallback is why a configuration falls back, and the capture of the
 // pod's rank to seed it from.
 type CRIUFallback struct {
-	// Reason is the group record state: failed, restore-failed or
-	// gpushare-failed.
+	// Reason is the group record state (failed, restore-failed or
+	// gpushare-failed), or FallbackDriver.
 	Reason string
 	// Capture is the complete cachedir capture of the pod's rank, a
 	// directory of the checkpoint directory; "" for none yet.

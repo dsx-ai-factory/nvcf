@@ -223,6 +223,9 @@ func main() {
 	flag.Int64Var(&config.CRIUGhostLimit, "criu-ghost-limit", 0,
 		"Largest deleted file, in bytes, a CRIU dump saves (criu --ghost-limit), such as an engine's CPU KV-cache tier in /dev/shm; 0 is 1 TiB.")
 
+	flag.IntVar(&config.CRIUMinDriverMajor, "criu-min-driver-major", 0,
+		"Oldest NVIDIA driver major CRIU captures and restores on; with any GPU node older, or the GPU nodes on different majors, GPU pods fall back to the cachedir. 0 is 610.")
+
 	flag.BoolVar(&config.RestoreCapturedAddress, "restore-captured-address", false,
 		"Give a restored pod its captured pod address on its loopback, translated to its new address at its edge, when no other pod uses that address, so sockets opened after the restore can use it (docs/design/RESTORE-POD-ADDRESS.md).")
 

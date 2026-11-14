@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/rootfsonly"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -108,16 +109,23 @@ func (a *Agent) criuFallbackFor(ctx context.Context, ns, uri string, ordinal int
 	if err != nil {
 		return webhook.CRIUFallback{}, false
 	}
-	key := criuGroupKey(uri, scope)
-	data, err := a.groupRecordData(ctx, key)
-	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			a.log.WithError(err).WithField("criuGroup", key).Warn("CRIU fallback: cannot read the group record")
+	key := criuGroupKeyDriver(uri, scope, a.keyDriver(ctx))
+	// The cluster's drivers keep CRIU from serving (driver_gate.go): the
+	// configuration falls back whatever its record says, or with none.
+	reason := ""
+	if why := a.driverGate(ctx); why != "" {
+		reason = webhook.FallbackDriver
+	} else {
+		data, err := a.groupRecordData(ctx, key)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				a.log.WithError(err).WithField("criuGroup", key).Warn("CRIU fallback: cannot read the group record")
+			}
+			return webhook.CRIUFallback{}, false
 		}
-		return webhook.CRIUFallback{}, false
+		a.nameRecordLater(key, ns)
+		reason = criuFallbackReason(data, time.Now(), a.currentBundle())
 	}
-	a.nameRecordLater(key, ns)
-	reason := criuFallbackReason(data, time.Now(), a.currentBundle())
 	if reason == "" {
 		return webhook.CRIUFallback{}, false
 	}
@@ -164,7 +172,7 @@ func (a *Agent) podFallbackKey(ctx context.Context, pod *corev1.Pod) (key string
 	if err != nil {
 		return "", 0, err
 	}
-	return criuGroupKey(uri, scope), ordinal, nil
+	return criuGroupKeyDriver(uri, scope, a.keyDriver(ctx)), ordinal, nil
 }
 
 // considerFallback runs the fallback's part of the agent for a pod on this
@@ -536,6 +544,7 @@ func (c *criuAutoRestorer) considerFallbackCapture(ctx context.Context, pod *cor
 // captureFallbackRank captures the pod's rank. again reports a capture
 // that may succeed on a later event (the tree was still changing).
 func (c *criuAutoRestorer) captureFallbackRank(ctx context.Context, pod *corev1.Pod) (again bool, err error) {
+	defer metrics.Active("checkpoint")()
 	key, ordinal, err := c.a.podFallbackKey(ctx, pod)
 	if err != nil {
 		return false, err

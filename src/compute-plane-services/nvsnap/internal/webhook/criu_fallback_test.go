@@ -217,3 +217,26 @@ func TestFallbackCaptureID(t *testing.T) {
 		t.Error("an invalid capture name accepted")
 	}
 }
+
+// A configuration the cluster's GPU drivers keep from CRIU goes without
+// the library too (nothing is captured with it), gets the cachedir, and
+// is not held for a capture.
+func TestCRIUFallbackDriverReader(t *testing.T) {
+	m, pod, _ := fallbackModelMutator(t, CRIUFallback{Reason: FallbackDriver}, true)
+	got := admit(t, m, pod)
+	main := got.Spec.Containers[0]
+	if strings.Contains(fbEnv(main)["LD_PRELOAD"], GPUShareLibPath) {
+		t.Error("the library was placed for a configuration the drivers keep from CRIU")
+	}
+	if v := volumeNamed(got, cacheDirVolumeName); v == nil || v.EmptyDir == nil {
+		t.Fatalf("no cachedir: %v", got.Spec.Volumes)
+	}
+	if a := got.Annotations; a[CaptureMethodAnnotation] != "cachedir" || a[FallbackReasonAnnotation] != FallbackDriver {
+		t.Errorf("annotations %v", a)
+	}
+	for _, g := range got.Spec.ReadinessGates {
+		if strings.Contains(string(g.ConditionType), "capture") {
+			t.Errorf("held for a capture: %v", got.Spec.ReadinessGates)
+		}
+	}
+}

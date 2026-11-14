@@ -352,6 +352,7 @@ func (s *Server) Run(ctx context.Context) error {
 			DynClient:  s.dynClient,
 			Namespace:  captureManifestNamespace,
 			Log:        s.log.WithField("subsys", "function-status"),
+			Restores:   newRestoreTracker(),
 		}
 		go functions.Run(ctx)
 	}

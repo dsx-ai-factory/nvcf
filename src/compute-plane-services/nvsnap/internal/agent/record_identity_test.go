@@ -16,6 +16,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/fnstatus"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // identityAgent is an agent whose cluster has namespace ns labelled as a
@@ -141,7 +143,7 @@ func TestClaimGroupRecordNamesIt(t *testing.T) {
 	a, _ := identityAgent(t, "sr-1")
 	c := &criuAutoRestorer{a: a}
 	leader := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "sr-1", Name: "p-0"}}
-	rec, err := c.claimGroupRecord(context.Background(), "k1", leader, 1)
+	rec, err := c.claimGroupRecord(context.Background(), "k1", 0, leader, 1)
 	if err != nil || rec == nil {
 		t.Fatalf("claim: %v %v", rec, err)
 	}
@@ -167,6 +169,20 @@ func TestFnstatusMatchesTheAgent(t *testing.T) {
 	} {
 		if got != want {
 			t.Errorf("fnstatus has %q, the agent %q", got, want)
+		}
+	}
+	// What the restore history reads off a restore's pods.
+	for _, p := range [][2]string{
+		{fnstatus.GroupLabel, webhook.CRIUGroupLabel}, {fnstatus.GroupAnnotation, webhook.CRIUGroupAnnotation},
+		{fnstatus.RestoreAnnotation, webhook.CRIURestoreAnnotation}, {fnstatus.CompanionAnnotation, webhook.CRIUGroupCompanionAnnotation},
+		{fnstatus.TeardownExitedAnnotation, webhook.TeardownExitedAnnotation}, {fnstatus.TeardownReleased, metrics.TeardownReleased},
+		{fnstatus.OrdinalAnnotation, webhook.CRIUGroupOrdinalAnnotation}, {fnstatus.RestoredAnnotation, webhook.CRIURestoredAnnotation},
+		{fnstatus.ColdStartedAnnotation, webhook.ColdStartedAnnotation},
+		{fnstatus.GroveScalingGroupLabel, webhook.GroveScalingGroupLabel}, {fnstatus.GroveScalingGroupReplicaLabel, webhook.GroveScalingGroupReplicaLabel},
+		{fnstatus.LWSGroupKeyLabel, lwsGroupKeyLabel},
+	} {
+		if p[0] != p[1] {
+			t.Errorf("fnstatus has %q, the agent %q", p[0], p[1])
 		}
 	}
 	for name, d := range map[string]map[string]string{

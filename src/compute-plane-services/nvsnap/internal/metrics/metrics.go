@@ -81,7 +81,7 @@ var (
 	ActiveOperations = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "active_operations",
-		Help:      "Currently active operations.",
+		Help:      "Checkpoint and restore operations running now: the agent's API calls, the instance captures it leads, its rank fallback captures, and its automatic restores of a pod.",
 	}, []string{"operation"})
 
 	CRIUDumpDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -193,9 +193,18 @@ func RegisterServer() {
 	})
 }
 
-// Handler returns the Prometheus HTTP handler for /metrics.
+// Active counts an operation running in ActiveOperations until the
+// returned function is called.
+func Active(operation string) (done func()) {
+	g := ActiveOperations.WithLabelValues(operation)
+	g.Inc()
+	return g.Dec
+}
+
+// Handler returns the Prometheus HTTP handler for /metrics. Its scrapes
+// release the lifecycle metrics' held first observations (Scraped).
 func Handler() http.Handler {
-	return promhttp.Handler()
+	return Scraped(promhttp.Handler())
 }
 
 // InstrumentRoute returns a mux middleware that records per-route request metrics.

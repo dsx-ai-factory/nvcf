@@ -57,19 +57,20 @@ where the files column says.
 | `nvsnap.io/ckpt-size` | `annCkptSize` (internal/server/manifests.go) |  |
 | `nvsnap.io/cold-start` | `ColdStartAnnotation` (internal/election/election.go) | Is stamped on a follower whose leader failed; the pod is recreated by its controller and re-admitted. |
 | `nvsnap.io/criu-capture` | `criuCaptureAnnotation` (internal/agent/criu_group.go) | Opts a multi-pod instance into the capture. |
-| `nvsnap.io/criu-cold-started` | `ColdStartedAnnotation` (internal/webhook/criu_restore.go) | Marks a placeholder whose restore failed and that the agent started cold in place, with the time it did. |
+| `nvsnap.io/criu-cold-started` | `ColdStartedAnnotation` (internal/fnstatus/fnstatus.go)<br>`ColdStartedAnnotation` (internal/webhook/criu_restore.go) | Marks a placeholder whose restore failed and that the agent started cold in place, with the time it did. |
 | `nvsnap.io/criu-companion-claimed-by` | `companionClaimAnnotation` (internal/agent/grove_replicas.go) | Names the leader (by pod UID) of the group restore that restores a companion placeholder. |
-| `nvsnap.io/criu-group` | `CRIUGroupAnnotation` (internal/webhook/criu_group.go) | Names the group record a placeholder restores from; CRIUGroupOrdinalAnnotation and CRIUGroupSizeAnnotation place it in the instance. |
-| `nvsnap.io/criu-group-companion` | `CRIUGroupCompanionAnnotation` (internal/webhook/criu_group.go) | Marks a placeholder that restores a companion of the instance: a pod without GPUs that its GPU ranks were connected to (an etcd, a NATS), captured and restored with them. |
-| `nvsnap.io/criu-group-ordinal` | `CRIUGroupOrdinalAnnotation` (internal/webhook/criu_group.go) |  |
+| `nvsnap.io/criu-group` | `CRIUGroupAnnotation` (internal/webhook/criu_group.go)<br>`CRIUGroupLabel` (internal/webhook/criu_group.go)<br>`GroupAnnotation` (internal/fnstatus/fnstatus.go)<br>`GroupLabel` (internal/fnstatus/fnstatus.go) | What the webhook and agents put on a restore's pods, which the restore history reads (internal/agent's TestFnstatusMatchesTheAgent keeps them the webhook's). |
+| `nvsnap.io/criu-group-companion` | `CRIUGroupCompanionAnnotation` (internal/webhook/criu_group.go)<br>`CompanionAnnotation` (internal/fnstatus/fnstatus.go) | Marks a placeholder that restores a companion of the instance: a pod without GPUs that its GPU ranks were connected to (an etcd, a NATS), captured and restored with them. |
+| `nvsnap.io/criu-group-ordinal` | `CRIUGroupOrdinalAnnotation` (internal/webhook/criu_group.go)<br>`OrdinalAnnotation` (internal/fnstatus/fnstatus.go) |  |
 | `nvsnap.io/criu-group-size` | `CRIUGroupSizeAnnotation` (internal/webhook/criu_group.go) |  |
-| `nvsnap.io/criu-restore` | `CRIURestoreAnnotation` (internal/webhook/criu_restore.go)<br>`criuRestoreAnnotation` (internal/rootfsonly/watcher.go) | Marks a CRIU restore placeholder (webhook.CRIURestoreAnnotation; that package imports this one). |
+| `nvsnap.io/criu-restore` | `CRIURestoreAnnotation` (internal/webhook/criu_restore.go)<br>`RestoreAnnotation` (internal/fnstatus/fnstatus.go)<br>`criuRestoreAnnotation` (internal/rootfsonly/watcher.go) | Marks a CRIU restore placeholder (webhook.CRIURestoreAnnotation; that package imports this one). |
 | `nvsnap.io/criu-restore-container` | `CRIURestoreContainerAnnotation` (internal/webhook/criu_restore.go) |  |
-| `nvsnap.io/criu-restored` | `CRIURestoredAnnotation` (internal/webhook/criu_group.go) | Marks a placeholder the agent restored into, so an agent that restarts does not restore into it again. |
-| `nvsnap.io/criu-teardown-exited` | `TeardownExitedAnnotation` (internal/webhook/criu_restore.go) | Marks a terminating restored rank whose workload has exited, for the other ranks' agents. |
+| `nvsnap.io/criu-restored` | `CRIURestoredAnnotation` (internal/webhook/criu_group.go)<br>`RestoredAnnotation` (internal/fnstatus/fnstatus.go) | Marks a placeholder the agent restored into, so an agent that restarts does not restore into it again. |
+| `nvsnap.io/criu-teardown-exited` | `TeardownExitedAnnotation` (internal/fnstatus/fnstatus.go)<br>`TeardownExitedAnnotation` (internal/webhook/criu_restore.go) | Marks a terminating restored rank whose workload has exited, for the other ranks' agents. |
 | `nvsnap.io/deadline` | `DeadlineAnnotation` (internal/election/election.go) | Is the RFC3339 time after which the reconciler treats the leader as failed even if its pod is still around. |
 | `nvsnap.io/demo-name` | `annDemoName` (internal/server/manifests.go) |  |
 | `nvsnap.io/desc` | `annDesc` (internal/server/manifests.go) |  |
+| `nvsnap.io/driver-major` | `DriverMajorAnnotation` (internal/agent/driver_gate.go) | Is the NVIDIA driver major of the agent's node, on the agent's own pod. |
 | `nvsnap.io/election-id` | `ElectionIDAnnotation` (internal/election/election.go) | On the leader pod is the id the webhook minted at admission and used as the Lease holder. |
 | `nvsnap.io/fallback-capture` | `FallbackCaptureAnnotation` (internal/webhook/criu_fallback.go) | Names the cachedir capture a fallback pod is seeded from; the agent on its node fetches it. |
 | `nvsnap.io/fallback-reason` | `FallbackReasonAnnotation` (internal/webhook/criu_fallback.go) | Is the group record state that made the pod fall back; the agent captures the cachedir of a pod that carries it. |

@@ -139,7 +139,7 @@ func TestCompanionAliasNamesItsSlot(t *testing.T) {
 		Data: map[string]string{"state": "complete", "size": "2", "checkpoint.0": "w", "checkpoint.1": "e", "companion.1": "true"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	c.writeGroupAliases(ctx, key, "fv", uris, 1, logrus.NewEntry(logrus.New()))
+	c.writeGroupAliases(ctx, key, "fv", 0, uris, 1, logrus.NewEntry(logrus.New()))
 	g, ok := a.lookupCRIUGroup(ctx, criuGroupKey("cache://etcd", "fv"))
 	if !ok || g.Key != key || !reflect.DeepEqual(g.Slots, []int{1}) || !g.Companion[1] || g.Ranks() != 1 {
 		t.Fatalf("the companion's configuration must find the record and its slot: %+v %v", g, ok)
