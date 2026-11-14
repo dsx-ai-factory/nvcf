@@ -287,6 +287,75 @@ accepts parameters regardless of the router release. In that case, a model with
 parameters gets HTTP `400` on every request until the router is upgraded or
 the parameters are removed.
 
+## Route requests by cache-affinity key
+
+The LLM API Gateway sends an `x-cache-affinity-key` with most requests. See
+[Session Stickiness](../overview/llm-gateway.md#session-stickiness). Stargate
+uses the key only for these algorithms:
+
+| Algorithm | Uses the key |
+| --- | --- |
+| `pulsar` | Yes. The key is part of the cluster ranking. |
+| `pulsar-wait-and-widen` | Yes. The affinity group is always present and defaults to the top-ranked cluster. |
+| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is set. It is unset by default. |
+| `power-of-n`, `round-robin`, `random` | No. |
+
+A plain `wait-and-widen` or `groq_multiregion` routing method ignores the key,
+unless the matching `lb-config.json` entry sets the selection count. Requests
+with the same `prompt_cache_key` can then land on different clusters and miss
+the prefix cache.
+
+To keep one key on one cluster with `wait-and-widen`, set the model's routing
+method to this expression:
+
+```text
+wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
+```
+
+With this value, requests with the same key go to one cluster. That cluster is
+full when its running requests reach `max_engine_concurrency` plus
+`max_queued`. If it stays full until 200 ms after the request arrived, the
+request can go to another cluster.
+
+### Match the engine concurrency
+
+Capacity checks use `max_engine_concurrency`, the request limit that Pylon
+publishes for each backend. Pylon takes it from the engine stats stream when
+the engine reports one. Otherwise, it uses `--max-engine-concurrency`, which
+NVCA sets from the deployment's `maxRequestConcurrency` when it is greater
+than 1. Without either value, Pylon publishes `0` and Stargate skips the
+capacity check.
+
+Set `maxRequestConcurrency` to the engine's real request capacity, for example
+the number of engine workers times vLLM `--max-num-seqs`. If the value is far
+above the engine limit, such as `1024` for an engine with `--max-num-seqs 64`,
+the cluster never counts as full. The affinity group then never widens,
+Stargate estimates zero queue delay, and requests queue inside the engine.
+
+### Find models that ignore the key
+
+For each proxy attempt, the router writes the info log `proxying request`. The
+line includes `model_id`, `requested_algorithm` (the routing method as
+received), and `request.cache_affinity_key_present`. Count the requests that
+carry a key, by model and routing method. The first filter removes terminal
+color codes from the log lines:
+
+```bash
+kubectl logs -n nvcf deployment/llm-request-router --all-pods=true --since=24h \
+  | perl -pe 's/\e\[[0-9;]*m//g' \
+  | grep 'proxying request' \
+  | grep 'request.cache_affinity_key_present=true' \
+  | grep -oE ' (model_id|requested_algorithm)=("[^"]*"|[^ ]*)' \
+  | paste -d ' ' - - | sort | uniq -c | sort -rn
+```
+
+A model ignores the key when its routing method is `power-of-n`,
+`round-robin`, or `random`. It also ignores the key when the method is
+`wait-and-widen` or `groq_multiregion` and neither the expression nor the
+matching `lb-config.json` entry sets `cache_affinity_backend_selection_count`.
+For an expression, the `effective` field of the
+`routing expression configuration built` log shows the count when it is set.
+
 ## Keep router headers trusted
 
 The gateway can send the following headers to Stargate. Derive or validate
