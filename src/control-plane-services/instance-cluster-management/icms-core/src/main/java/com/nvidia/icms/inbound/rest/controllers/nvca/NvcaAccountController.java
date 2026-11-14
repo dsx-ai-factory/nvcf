@@ -56,7 +56,7 @@ public class NvcaAccountController {
     private ClusterManagementService clusterManagementService;
 
     @PostMapping("{ncaId}/clusters")
-    @PreAuthorize("hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:cluster-management')")
     @Operation(summary = "NVCA Cluster Creation",
             description = "API to create a new NVCA cluster",
             responses = {
@@ -87,7 +87,8 @@ public class NvcaAccountController {
     }
 
     @GetMapping("{ncaId}/clusters/{clusterId}")
-    @PreAuthorize("hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:cluster-management', "
+            + "'apikey:read:cluster-management')")
     @Operation(summary = "Get NVCA Cluster",
             description = "API to get the cluster details for ncaId and clusterId",
             responses = {
@@ -113,7 +114,7 @@ public class NvcaAccountController {
     }
 
     @GetMapping("{ncaId}/clusterVersions")
-    @PreAuthorize("hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:read:cluster-management')")
     @Operation(summary = "Get NVCA version details",
             description = "API to get the NVCA version details",
             responses = {
@@ -135,7 +136,8 @@ public class NvcaAccountController {
     }
 
     @GetMapping("{ncaId}/clusters")
-    @PreAuthorize("hasAuthority('cluster-management') or hasAuthority('read:cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'read:cluster-management', "
+            + "'apikey:cluster-management', 'apikey:read:cluster-management')")
     @Operation(summary = "Get NVCA Clusters",
             description = "API to get the cluster details for given NcaId",
             responses = {
@@ -177,7 +179,7 @@ public class NvcaAccountController {
     }
 
     @DeleteMapping("{ncaId}/clusters/{clusterId}")
-    @PreAuthorize("hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:cluster-management')")
     @Operation(summary = "Delete NVCA Cluster",
             description = "API to delete the cluster for ncaId and clusterId",
             responses = {
@@ -205,7 +207,7 @@ public class NvcaAccountController {
     }
 
     @PutMapping("{ncaId}/clusters/{clusterId}")
-    @PreAuthorize("hasAuthority('cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:cluster-management')")
     @Operation(summary = "Update NVCA Cluster",
             description = "API to update the cluster for ncaId and clusterId",
             responses = {

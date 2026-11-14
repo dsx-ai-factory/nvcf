@@ -54,8 +54,14 @@ public class ApiKeyValidationResult {
     private Policy policy;
 
     public boolean isValid() {
-        return allowed && StringUtils.hasText(ncaId) && StringUtils.hasText(ownerId) &&
-                policy != null;
+        return allowed && StringUtils.hasText(ncaId) && StringUtils.hasText(ownerId)
+                && policy != null;
+    }
+
+    public boolean hasSelfHostedPolicy(String audienceServiceId) {
+        return isValid() && audienceServiceId.equals(policy.aud)
+                && policy.scopes != null && policy.resources != null
+                && policy.scopes.stream().allMatch(StringUtils::hasText);
     }
 
     @JsonIgnore
