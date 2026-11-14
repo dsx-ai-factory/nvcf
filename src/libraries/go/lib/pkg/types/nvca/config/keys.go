@@ -292,11 +292,14 @@ func aliasDeprecatedNodeKeys(node *yaml.Node, foldedKey string) bool {
 }
 
 // aliasMaxBodyBytes adds maxPayloadBytes to a log chunking mapping that spells
-// only the deprecated maxBodyBytes. A mapping that already spells
+// only the deprecated maxBodyBytes. A mapping that already carries a non-zero
 // maxPayloadBytes is left alone, so the canonical spelling keeps precedence
-// within one input.
+// within one input. The chart renders maxPayloadBytes: 0 for an unconfigured
+// payload size, which Complete() treats as unset, so that zero does not
+// shadow a legacy override folded into the same mapping.
 func aliasMaxBodyBytes(node *yaml.Node) bool {
 	var deprecated *yaml.Node
+	var canonical *yaml.Node
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		key := node.Content[i]
 		if key.Kind != yaml.ScalarNode || isMergeKey(key) {
@@ -304,7 +307,7 @@ func aliasMaxBodyBytes(node *yaml.Node) bool {
 		}
 		switch strings.ToLower(key.Value) {
 		case strings.ToLower(maxPayloadBytesKey):
-			return false
+			canonical = node.Content[i+1]
 		case foldedMaxBodyBytesKey:
 			deprecated = node.Content[i+1]
 		}
@@ -312,9 +315,26 @@ func aliasMaxBodyBytes(node *yaml.Node) bool {
 	if deprecated == nil {
 		return false
 	}
+	if canonical != nil {
+		if !isUnsetPayloadSize(canonical) {
+			return false
+		}
+		*canonical = *deprecated
+		return true
+	}
 	value := *deprecated
 	node.Content = append(node.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: maxPayloadBytesKey},
 		&value)
 	return true
+}
+
+// isUnsetPayloadSize reports whether a node is the integer 0, the value the
+// chart renders for an unconfigured payload size.
+func isUnsetPayloadSize(node *yaml.Node) bool {
+	if node.Kind != yaml.ScalarNode {
+		return false
+	}
+	n, err := strconv.ParseInt(node.Value, 0, 64)
+	return err == nil && n == 0
 }
