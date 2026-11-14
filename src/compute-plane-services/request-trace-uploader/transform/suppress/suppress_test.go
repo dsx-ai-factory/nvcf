@@ -60,10 +60,13 @@ func mustEngine(t *testing.T, cfg Config) *Engine {
 // Where the earlier uploader leaked, this one differs on purpose. A record
 // with a repeated key never reaches the rules: Decode refuses it, and the
 // line is rejected. A blank header value does not hide a later key of the
-// same name in another case, so that record is suppressed.
+// same name in another case, so that record is suppressed. A record of
+// another type that carries request headers is checked too, so a matching
+// one is suppressed instead of exported.
 var (
-	repeatedKeyCase = `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1777312801000,"event_source":"frontend","payload":{"request_id":"dup","request_id":"r20","http_request_headers":{"nvcf-ncaid":"acme"}}}`
-	blankFirstCase  = `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1777312801000,"event_source":"frontend","payload":{"request_id":"r21","http_request_headers":{"Nvcf-NcaId":"","nvcf-ncaid":"acme"}}}`
+	repeatedKeyCase      = `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1777312801000,"event_source":"frontend","payload":{"request_id":"dup","request_id":"r20","http_request_headers":{"nvcf-ncaid":"acme"}}}`
+	blankFirstCase       = `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1777312801000,"event_source":"frontend","payload":{"request_id":"r21","http_request_headers":{"Nvcf-NcaId":"","nvcf-ncaid":"acme"}}}`
+	headersOnAnotherType = `{"schema":"dynamo.request.trace.v1","event_type":"request_end","request":{"request_id":"r13"},"headers":{"nvcf-ncaid":"acme"}}`
 )
 
 // pythonCases returns the golden cases this uploader shares with the earlier
@@ -72,12 +75,12 @@ func pythonCases(t *testing.T) []goldenCase {
 	t.Helper()
 	var cases []goldenCase
 	for _, tc := range loadGolden(t) {
-		if tc.In != repeatedKeyCase && tc.In != blankFirstCase {
+		if tc.In != repeatedKeyCase && tc.In != blankFirstCase && tc.In != headersOnAnotherType {
 			cases = append(cases, tc)
 		}
 	}
-	if len(cases) != len(loadGolden(t))-2 {
-		t.Fatal("the golden set no longer holds both divergent cases")
+	if len(cases) != len(loadGolden(t))-3 {
+		t.Fatal("the golden set no longer holds every divergent case")
 	}
 	return cases
 }
@@ -89,6 +92,9 @@ func TestDivergencesFromThePythonUploader(t *testing.T) {
 	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
 	if _, outcome := engine.Apply(mustDecode(t, blankFirstCase)); outcome.Action != StripPayload || outcome.ID != "acme" {
 		t.Errorf("outcome = %+v, want the record suppressed for acme", outcome)
+	}
+	if _, outcome := engine.Apply(mustDecode(t, headersOnAnotherType)); outcome.Action != StripPayload || outcome.ID != "acme" {
+		t.Errorf("outcome = %+v, want a record of another type that carries the header suppressed for acme", outcome)
 	}
 }
 
@@ -192,16 +198,18 @@ func TestOutcomeReportsEvaluationAndHeaderPresence(t *testing.T) {
 		line          string
 		evaluated     bool
 		headerPresent bool
+		action        Action
 	}{
 		{name: "payload with header", line: `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"other"}}}`, evaluated: true, headerPresent: true},
 		{name: "payload without header", line: `{"event_type":"request_payload","payload":{"http_request_headers":{"x":"y"}}}`, evaluated: true},
-		{name: "trace record", line: `{"event_type":"request_end","headers":{"nvcf-ncaid":"acme"}}`},
+		{name: "trace record with headers", line: `{"event_type":"request_end","headers":{"nvcf-ncaid":"acme"}}`, evaluated: true, headerPresent: true, action: StripPayload},
+		{name: "trace record", line: `{"event_type":"request_end","request":{"request_id":"r1"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, outcome := engine.Apply(mustDecode(t, tt.line))
-			if outcome.Evaluated != tt.evaluated || outcome.HeaderPresent != tt.headerPresent || outcome.Action != "" {
-				t.Fatalf("outcome = %+v, want evaluated %v header %v and no action", outcome, tt.evaluated, tt.headerPresent)
+			if outcome.Evaluated != tt.evaluated || outcome.HeaderPresent != tt.headerPresent || outcome.Action != tt.action {
+				t.Fatalf("outcome = %+v, want evaluated %v header %v action %q", outcome, tt.evaluated, tt.headerPresent, tt.action)
 			}
 		})
 	}

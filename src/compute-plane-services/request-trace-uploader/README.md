@@ -217,7 +217,12 @@ Missing paths and unreadable secret files prevent readiness.
 
 Suppression runs before redaction on every record of a closed segment. A
 rule has an operator-assigned name, a header group, match values, and an
-action. The first matching rule wins.
+action. The strictest matching rule wins: `dropRecord` beats
+`stripPayload`, and among rules with the same action the first one wins.
+Rules are checked on `request_payload` records and on any record that has a
+request header field (`headers` or `payload.http_request_headers`). In
+Dynamo v1.4.0 only `request_payload` carries headers; the field check means
+a newer record type that carries them is checked too.
 
 - `REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_IDS`: comma-separated NCA ids. Each id
   is trimmed, and an `nca-<id>-nca` form is reduced to `<id>`. The list
@@ -236,8 +241,20 @@ action. The first matching rule wins.
   A name is a short lowercase token. The action is `stripPayload` or
   `dropRecord`.
 - `REQUEST_TRACE_UPLOADER_SUPPRESS_HEADERLESS`: `export` (default) or `drop`
-  for records of a type that carries no headers. In Dynamo v1.4.0 only
-  `request_payload` carries headers. It applies only while a rule exists.
+  for records that rules are not checked on, and for records of a type
+  other than `request_payload` on which no rule's header resolved. It
+  applies only while a rule exists.
+- `REQUEST_TRACE_UPLOADER_SUPPRESSION_STRICT`: a boolean, default `false`.
+  When true, a checked record on which some rule's header has no value,
+  because the header was not captured or the headers are not an object, is
+  replaced by a stub with the reason `header_unresolved` and no NCA id or
+  header values; so is a record of another type that has a `payload` field
+  of any kind but no request header field. A body outside a `payload`
+  field, or under a wrapper the uploader does not read as one, is not
+  covered: use the `drop` headerless policy to keep such records out. A
+  matching `dropRecord` rule, or the `drop` headerless policy, still drops
+  it. When false, such a record is exported unless another rule matches. A
+  value that is not a boolean stops startup.
 
 `stripPayload` replaces the record with a stub that has the same structure
 and values as the one the earlier shell exporter wrote; its JSON formatting
@@ -247,10 +264,16 @@ An unparseable rule list, an unknown action or policy, a missing or repeated
 name, a rule with no value, or NCA ids without NCA id headers stops startup
 with a non-zero exit.
 
-Counters: `records_suppressed` (`rule`, `action`), `records_evaluated`
-(`record_type`), `suppression_header_present` (`rule`), and
-`records_incomplete` (`record_type`) for payload records whose
-`payload_complete` is false. Header names and values never become
-attributes. When suppression is on and the first 100 payload records carry
-no rule header, the uploader logs one warning. It never holds or drops
-records for that.
+Counters: `records_suppressed` (`rule`, `action`: `strip_payload`,
+`drop_record`, or `strip_unresolved` for a record strict suppression
+stripped because that rule's header had no value; a record that misses
+several rules' headers counts once for each, so do not sum
+`strip_unresolved` across rules to count records), `records_evaluated`
+(`record_type`, every checked record by its type),
+`suppression_header_present` (`rule`), and `records_incomplete`
+(`record_type`) for payload records whose `payload_complete` is false.
+Header names and values never become attributes. When suppression is on
+and the first 100 payload records carry no rule header, the uploader logs
+one warning. With strict suppression on, it also logs one warning per rule
+the first time it strips a record for that rule. Without strict
+suppression, it never holds or drops records for a missing header.

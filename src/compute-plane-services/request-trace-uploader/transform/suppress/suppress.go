@@ -48,10 +48,11 @@ type Rule struct {
 	NCAID bool
 }
 
-// HeaderlessPolicy says what happens to records of a type that carries no
-// request headers, so no rule can be evaluated on them. In Dynamo v1.4.0 that
-// is every type except request_payload. It applies only while some rule is
-// configured.
+// HeaderlessPolicy says what happens to records that rules are not checked
+// on, because they are not request_payload records and have no request
+// header field (see Evaluable), and to records of another type on which no
+// rule's header resolved. In Dynamo v1.4.0 that is every type except
+// request_payload. It applies only while some rule is configured.
 type HeaderlessPolicy string
 
 const (
@@ -69,6 +70,15 @@ type Config struct {
 	// Headerless is the policy for records that carry no headers. Empty
 	// means HeaderlessExport.
 	Headerless HeaderlessPolicy
+	// Strict strips an evaluated record on which some rule's header has no
+	// value, because that rule cannot tell whether the record is one it
+	// suppresses, and a record with a payload field of any kind that no
+	// rule can check. A body outside a payload field is not covered; the
+	// drop headerless policy is the way to keep such records out. A
+	// matching dropRecord rule, or the drop headerless policy, still drops
+	// it. Off, such a record is exported unless another rule matches or the
+	// headerless policy drops it.
+	Strict bool
 }
 
 // FromIDs builds the configuration for a list of suppressed NCA ids: one
@@ -176,6 +186,9 @@ type compiledRule struct {
 type Engine struct {
 	rules          []compiledRule
 	dropHeaderless bool
+	strict         bool
+	// names lists the named rules in order.
+	names []string
 }
 
 // New validates cfg and builds an engine.
@@ -183,7 +196,7 @@ func New(cfg Config) (*Engine, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	engine := &Engine{dropHeaderless: cfg.Headerless == HeaderlessDrop}
+	engine := &Engine{dropHeaderless: cfg.Headerless == HeaderlessDrop, strict: cfg.Strict}
 	for _, rule := range cfg.Rules {
 		engine.rules = append(engine.rules, compiledRule{
 			name:    rule.Name,
@@ -192,6 +205,9 @@ func New(cfg Config) (*Engine, error) {
 			action:  rule.Action,
 			ncaID:   rule.NCAID,
 		})
+		if rule.Name != "" {
+			engine.names = append(engine.names, rule.Name)
+		}
 	}
 	return engine, nil
 }
@@ -201,8 +217,8 @@ func (e *Engine) Active() bool { return len(e.rules) > 0 }
 
 // Outcome reports what Apply did to one record.
 type Outcome struct {
-	// Evaluated reports that the record carries a request payload, so the
-	// rules were checked.
+	// Evaluated reports that the record carries a request payload or
+	// request headers, so the rules were checked.
 	Evaluated bool
 	// HeaderPresent reports that some rule's header group had a value. A
 	// deployment where this never happens cannot suppress anything.
@@ -219,6 +235,9 @@ type Outcome struct {
 	// Headerless reports that the record carries no headers and the
 	// headerless policy decided Action.
 	Headerless bool
+	// Unresolved lists, in rule order, the names of the rules whose header
+	// group had no value, when strict mode stripped the record for it.
+	Unresolved []string
 }
 
 // Apply evaluates record and returns what to export: record itself when no
@@ -231,21 +250,37 @@ func (e *Engine) Apply(record *jsonvalue.Value) (*jsonvalue.Value, Outcome) {
 		return record, outcome
 	}
 	event := EventOf(record)
-	if !CarriesPayload(event) {
-		if e.dropHeaderless {
+	if !Evaluable(event) {
+		switch {
+		case e.dropHeaderless:
 			outcome.Action = DropRecord
 			outcome.Headerless = true
 			return nil, outcome
+		case e.strict && hasPayload(event):
+			// A newer type that carries a payload but no header field: no
+			// rule can check it, and it may hold a body.
+			outcome.Evaluated = true
+			outcome.Action = StripPayload
+			outcome.Unresolved = slices.Clone(e.names)
+			return stub(record, event, unresolvedReason, ""), outcome
 		}
 		return record, outcome
 	}
 	outcome.Evaluated = true
 	sets := HeaderSets(event)
 	var matched *compiledRule
+	// unresolved reports that some rule's header group had no value, and
+	// unresolvedNames names those rules that have names.
+	var unresolved bool
+	var unresolvedNames []string
 	for i := range e.rules {
 		rule := &e.rules[i]
 		id := NormalizeID(ResolveHeader(sets, rule.headers...))
 		if id == "" {
+			unresolved = true
+			if rule.name != "" {
+				unresolvedNames = append(unresolvedNames, rule.name)
+			}
 			continue
 		}
 		outcome.HeaderPresent = true
@@ -263,12 +298,24 @@ func (e *Engine) Apply(record *jsonvalue.Value) (*jsonvalue.Value, Outcome) {
 		}
 	}
 	switch {
+	case matched == nil && e.dropHeaderless && !outcome.HeaderPresent && !CarriesPayload(event):
+		// A record of another type that has a header field but on which no
+		// rule's header resolved is as unchecked as one with no field.
+		outcome.Action = DropRecord
+		outcome.Headerless = true
+		return nil, outcome
+	case matched == nil && e.strict && unresolved:
+		outcome.Action = StripPayload
+		outcome.Unresolved = unresolvedNames
+		return stub(record, event, unresolvedReason, ""), outcome
 	case matched == nil:
 		return record, outcome
 	case matched.action == DropRecord:
 		return nil, outcome
+	case matched.ncaID:
+		return stub(record, event, ncaIDReason, outcome.ID), outcome
 	default:
-		return stub(record, event, matched, outcome.ID), outcome
+		return stub(record, event, matched.name, ""), outcome
 	}
 }
 
@@ -283,6 +330,31 @@ func EventOf(record *jsonvalue.Value) *jsonvalue.Value {
 		return event
 	}
 	return record
+}
+
+// Evaluable reports whether suppression rules apply to event: a
+// request_payload record, or any record that has a request header field,
+// whatever its value. In Dynamo v1.4.0 only request_payload carries headers;
+// checking for the fields too means a newer record type that carries them
+// is checked rather than exported unseen.
+func Evaluable(event *jsonvalue.Value) bool {
+	if CarriesPayload(event) {
+		return true
+	}
+	if event == nil || event.Kind() != jsonvalue.Object {
+		return false
+	}
+	if event.Has("headers") {
+		return true
+	}
+	payload := event.Get("payload")
+	return payload != nil && payload.Kind() == jsonvalue.Object && payload.Has("http_request_headers")
+}
+
+// hasPayload reports whether event has a payload field, of any kind, where
+// Dynamo puts request and response bodies.
+func hasPayload(event *jsonvalue.Value) bool {
+	return event != nil && event.Kind() == jsonvalue.Object && event.Has("payload")
 }
 
 // CarriesPayload reports whether event is a request_payload record.
@@ -392,18 +464,23 @@ func NormalizeID(value string) string {
 	return value[len("nca-") : len(value)-len("-nca")]
 }
 
-// ncaIDReason is the reason the NCA id rule's stub gives.
-const ncaIDReason = "nca_id"
+const (
+	// ncaIDReason is the reason the NCA id rule's stub gives.
+	ncaIDReason = "nca_id"
+	// unresolvedReason is the reason of a stub strict mode writes for a
+	// record on which some rule's header had no value.
+	unresolvedReason = "header_unresolved"
+)
 
-// stub builds the record that replaces a suppressed one. Copied keys keep
-// this order and appear only when present; a wrapped record keeps only its
-// timestamp. The NCA id rule writes the earlier uploader's stub, with the
-// matched id; any other rule gives its name as the reason and keeps no
-// header and no identifier.
-func stub(record, event *jsonvalue.Value, rule *compiledRule, id string) *jsonvalue.Value {
-	reason, headers := rule.name, jsonvalue.NewObject()
-	if rule.ncaID {
-		reason, headers = ncaIDReason, singleHeader(id)
+// stub builds the record that replaces a suppressed one, giving reason as
+// the cause. Copied keys keep this order and appear only when present; a
+// wrapped record keeps only its timestamp. With ncaID set, it is the NCA id
+// rule's stub: the earlier uploader's stub, with the matched id. Otherwise
+// it keeps no header and no identifier.
+func stub(record, event *jsonvalue.Value, reason, ncaID string) *jsonvalue.Value {
+	headers := jsonvalue.NewObject()
+	if ncaID != "" {
+		headers = singleHeader(ncaID)
 	}
 	var safeEvent *jsonvalue.Value
 	if payload := event.Get("payload"); payload != nil && payload.Kind() == jsonvalue.Object {
@@ -412,8 +489,8 @@ func stub(record, event *jsonvalue.Value, rule *compiledRule, id string) *jsonva
 		safePayload.Set("payload_drop_reason", jsonvalue.NewString(reason))
 		safePayload.Set("payload_suppressed", jsonvalue.NewBool(true))
 		safePayload.Set("suppression_reason", jsonvalue.NewString(reason))
-		if rule.ncaID {
-			safePayload.Set("nca_id", jsonvalue.NewString(id))
+		if ncaID != "" {
+			safePayload.Set("nca_id", jsonvalue.NewString(ncaID))
 		}
 		safePayload.Set("http_request_headers", headers)
 		safeEvent = copyKeys(event, "schema", "event_type", "event_time_unix_ms", "event_source")
@@ -423,8 +500,8 @@ func stub(record, event *jsonvalue.Value, rule *compiledRule, id string) *jsonva
 			"request_id", "requested_streaming", "model")
 		safeEvent.Set("payload_suppressed", jsonvalue.NewBool(true))
 		safeEvent.Set("suppression_reason", jsonvalue.NewString(reason))
-		if rule.ncaID {
-			safeEvent.Set("nca_id", jsonvalue.NewString(id))
+		if ncaID != "" {
+			safeEvent.Set("nca_id", jsonvalue.NewString(ncaID))
 		}
 		safeEvent.Set("headers", headers)
 	}
