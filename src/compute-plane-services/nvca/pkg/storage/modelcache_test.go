@@ -46,6 +46,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -58,6 +59,55 @@ import (
 	featureflagmock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
+
+// TestHandleLease_CreatesModelCacheInitNamespace covers nvbugs#7055457: nothing
+// provisions the nvca-modelcache-init namespace on the affected clusters, so
+// creating the init lease failed every time with
+// `namespaces "nvca-modelcache-init" not found` and the model cache never
+// started.
+func TestHandleLease_CreatesModelCacheInitNamespace(t *testing.T) {
+	ctx := context.Background()
+
+	// The fake client does not model namespace existence, so reject creating a
+	// namespaced object whose namespace does not exist, as the API server does.
+	existingNamespaces := sets.New[string]()
+	c := fake.NewClientBuilder().WithScheme(mgrScheme).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.CreateOption,
+		) error {
+			if ns, ok := obj.(*corev1.Namespace); ok {
+				existingNamespaces.Insert(ns.Name)
+				return cl.Create(ctx, obj, opts...)
+			}
+			if ns := obj.GetNamespace(); ns != "" && !existingNamespaces.Has(ns) {
+				return apierrors.NewNotFound(corev1.Resource("namespaces"), ns)
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	}).Build()
+
+	r := &Reconciler{Client: c, nowFunc: time.Now}
+
+	cacheHandle := "abc123handle"
+	st := &nvcav1new.StorageRequest{}
+	st.Name, st.Namespace = nvcav1new.ModelCacheRequest.Name(), "sr-0"
+	st.Spec.ICMSRequestName = "icms-req-0"
+	st.Spec.ModelCache = &nvcav1new.ModelCacheSpec{CacheHandle: cacheHandle}
+
+	_, holdsLease, err := r.handleLease(ctx, newInitLease(st))
+	require.NoError(t, err)
+	assert.True(t, holdsLease)
+
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: ModelCacheInitNamespace}, &corev1.Namespace{}))
+	require.NoError(t, c.Get(ctx, client.ObjectKey{
+		Namespace: ModelCacheInitNamespace,
+		Name:      buildInitLeaseName(cacheHandle),
+	}, &coordv1.Lease{}))
+
+	// Every reconcile re-ensures the namespace, so an existing one must not be
+	// reported as a failure.
+	require.NoError(t, r.ensureModelCacheInitNamespace(ctx))
+}
 
 func TestReconcile_ModelCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

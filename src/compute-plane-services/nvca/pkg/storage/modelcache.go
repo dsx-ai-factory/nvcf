@@ -428,6 +428,12 @@ func (r *Reconciler) doModelCacheSamba(ctx context.Context,
 		Requests: corev1.ResourceList(r.cfg.Agent.SharedStorage.Server.ContainerResources.Requests),
 		Claims:   r.cfg.Agent.SharedStorage.Server.ContainerResources.Claims,
 	}
+	// The per-handle Samba server and its backing PVC are created in the init
+	// namespace before any lease is taken, so this path has to ensure the
+	// namespace too rather than relying on the lease path having run first.
+	if err := r.ensureModelCacheInitNamespace(ctx); err != nil {
+		return reconcile.Result{}, err
+	}
 	var infraState SambaModelCacheInfraState
 	err = nvcaotel.InvokeWithSpan(ctx, modelCacheTracer, "nvca.modelcache.samba.ensure_infra",
 		func(ctx context.Context) error {
@@ -1362,6 +1368,14 @@ func (r *Reconciler) handleLease(ctx context.Context,
 	case apierrors.IsNotFound(err):
 		// The lease can be acquired.
 		log.Info("Creating lease, starting model cache initialization")
+		// The init namespace holds every cross-namespace model cache object and
+		// nothing else provisions it on the cluster, so create it before the
+		// lease rather than failing forever with
+		// `namespaces "nvca-modelcache-init" not found`.
+		if err := r.ensureModelCacheInitNamespace(ctx); err != nil {
+			log.Error(err, "Failed to ensure model cache init namespace")
+			return reconcile.Result{}, false, err
+		}
 		lease.Spec.RenewTime = &metav1.MicroTime{Time: now}
 		lease.Spec.AcquireTime = &metav1.MicroTime{Time: now}
 		if err := r.Client.Create(ctx, lease); err != nil {
@@ -1631,6 +1645,18 @@ func (r *Reconciler) sharedFSCachePopulated(ctx context.Context, rwPVCName strin
 		return nil, false, err
 	}
 	return pvc, pvc.Labels[cachePopulatedLabelKey] == cachePopulatedLabelValue, nil
+}
+
+// ensureModelCacheInitNamespace creates the hard-coded model cache init
+// namespace when it is absent. Nothing NVCA ships provisions it, so every path
+// that creates an object in it has to ensure it first; an existing namespace is
+// not an error, so this is safe to call on every reconcile.
+func (r *Reconciler) ensureModelCacheInitNamespace(ctx context.Context) error {
+	if err := r.Client.Create(ctx, NewModelCacheInitNamespace()); err != nil &&
+		!apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("ensure model cache init namespace: %w", err)
+	}
+	return nil
 }
 
 func newInitLease(st *nvcav1new.StorageRequest) *coordv1.Lease {
