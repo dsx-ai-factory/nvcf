@@ -47,7 +47,8 @@ pod that holds the request. A fixed worker callback URL
 (global.workerEndpoints.invocationServiceURL, grpcProxyWorkerConnectURL, or
 grpcproxy.workerConnectBaseURL) is shared by every replica, so the affected
 service stays single-replica (placement still applied, no-op at 1 replica, no
-PDB).
+PDB). grpc-proxy under HTTP/3 (grpcproxy.http3.enabled or workerCallbackProxy)
+is the exception: each pod prefixes the base URL with its own IP.
 
 Quorum services (Cassandra, NATS, OpenBao) get 3 replicas, anti-affinity, zone
 spread, and a PDB tolerating one disruption at any replica count.
@@ -138,13 +139,13 @@ merge:
 {{- end -}}
 
 {{/* OpenBao service PKI role allowed_domains: addons.llm.pki.allowedDomains plus
-     the worker callback proxy's frontend and grpc-proxy pod domains when they
-     are not already covered. Only called with the proxy enabled, so the LLM
-     value renders unchanged otherwise. Keep in sync with
+     the worker callback proxy's frontend, grpc-proxy pod and invocation-service
+     pod domains when they are not already covered. Only called with the proxy
+     enabled, so the LLM value renders unchanged otherwise. Keep in sync with
      openbao-migrations-env.yaml.gotmpl. */}}
 {{- define "nvcf.servicePki.allowedDomains" -}}
 {{- $domains := dig "addons" "llm" "pki" "allowedDomains" "" . | toString | trim -}}
-{{- $required := list (dig "workerCallbackProxy" "workerDomain" "" . | toString | trim | lower) "grpc-headless.nvcf.svc.cluster.local" -}}
+{{- $required := list (dig "workerCallbackProxy" "workerDomain" "" . | toString | trim | lower) "grpc-headless.nvcf.svc.cluster.local" "invocation.nvcf.svc.cluster.local" -}}
 {{- range $need := $required -}}
 {{- $covered := false -}}
 {{- range $allowed := splitList "," $domains -}}
@@ -269,6 +270,9 @@ topologySpreadConstraints:
 {{- fail (printf "highAvailability.mode must be none, preferred, or enforced, got %q" $haMode) }}
 {{- end }}
 {{- $haEnabled := or (eq $haMode "preferred") (eq $haMode "enforced") }}
+{{- /* One tag for every nvcf-openbao-migrations consumer (OpenBao, LLS HMAC
+       rotation, NVCF UI). A component tag set by the operator wins. */}}
+{{- $migrationsTag := dig "global" "openbaoMigrations" "image" "tag" "" .Values }}
 {{- $natsWorkerAuth := dig "nats" "workerAuth" "nkey" .Values | toString }}
 {{- if not (has $natsWorkerAuth (list "nkey" "token")) }}
 {{- fail (printf "nats.workerAuth must be nkey or token, got %q" $natsWorkerAuth) }}
@@ -359,66 +363,38 @@ cassandra:
 # cert-manager subchart image overrides. The helm-nvcf-cert-manager wrapper
 # passes these through to the upstream cert-manager subchart under the
 # `cert-manager` key. Explicit component repositories bypass global.image;
-# unset values retain the existing mirror and upstream solver defaults.
+# unset values retain upstream repositories and the selected chart versions.
+{{- $certManagerValues := dict }}
+{{- with .Values.global.imagePullSecrets }}
+{{- $_ := set $certManagerValues "global" (dict "imagePullSecrets" .) }}
+{{- end }}
+{{- range $component := list "controller" "webhook" "cainjector" "acmesolver" "startupapicheck" }}
+{{- $input := dig "certManager" $component "image" dict $.Values }}
+{{- if eq $component "controller" }}
+{{- $input = dig "certManager" "image" dict $.Values }}
+{{- end }}
+{{- $image := dict }}
+{{- range $key := list "repository" "tag" "digest" "pullPolicy" }}
+{{- with index $input $key }}
+{{- $_ := set $image $key . }}
+{{- end }}
+{{- end }}
+{{- if $image }}
+{{- if eq $component "controller" }}
+{{- $_ := set $certManagerValues "image" $image }}
+{{- else }}
+{{- $_ := set $certManagerValues $component (dict "image" $image) }}
+{{- end }}
+{{- end }}
+{{- end }}
 cert-manager:
-  {{- if .Values.global.imagePullSecrets }}
-  global:
-    imagePullSecrets:
-      {{- toYaml .Values.global.imagePullSecrets | nindent 6 }}
-  {{- end }}
-  image:
-    repository: {{ dig "certManager" "image" "repository" "" .Values | default (printf "%s/%s/cert-manager-controller" .Values.global.image.registry .Values.global.image.repository) | quote }}
-    {{- range $key := list "tag" "digest" "pullPolicy" }}
-    {{- with dig "certManager" "image" $key "" $.Values }}
-    {{ $key }}: {{ . | quote }}
-    {{- end }}
-    {{- end }}
-  webhook:
-    image:
-      repository: {{ dig "certManager" "webhook" "image" "repository" "" .Values | default (printf "%s/%s/cert-manager-webhook" .Values.global.image.registry .Values.global.image.repository) | quote }}
-      {{- range $key := list "tag" "digest" "pullPolicy" }}
-      {{- with dig "certManager" "webhook" "image" $key "" $.Values }}
-      {{ $key }}: {{ . | quote }}
-      {{- end }}
-      {{- end }}
-  cainjector:
-    image:
-      repository: {{ dig "certManager" "cainjector" "image" "repository" "" .Values | default (printf "%s/%s/cert-manager-cainjector" .Values.global.image.registry .Values.global.image.repository) | quote }}
-      {{- range $key := list "tag" "digest" "pullPolicy" }}
-      {{- with dig "certManager" "cainjector" "image" $key "" $.Values }}
-      {{ $key }}: {{ . | quote }}
-      {{- end }}
-      {{- end }}
-  {{- $acmeSolverRepository := dig "certManager" "acmesolver" "image" "repository" "" .Values }}
-  {{- $acmeSolverTag := dig "certManager" "acmesolver" "image" "tag" "" .Values }}
-  {{- $acmeSolverDigest := dig "certManager" "acmesolver" "image" "digest" "" .Values }}
-  {{- $acmeSolverPullPolicy := dig "certManager" "acmesolver" "image" "pullPolicy" "" .Values }}
-  {{- if or $acmeSolverRepository $acmeSolverTag $acmeSolverDigest $acmeSolverPullPolicy }}
-  acmesolver:
-    image:
-      {{- with $acmeSolverRepository }}
-      repository: {{ . }}
-      {{- end }}
-      {{- with $acmeSolverTag }}
-      tag: {{ . | quote }}
-      {{- end }}
-      {{- with $acmeSolverDigest }}
-      digest: {{ . | quote }}
-      {{- end }}
-      {{- with $acmeSolverPullPolicy }}
-      pullPolicy: {{ . }}
-      {{- end }}
-  {{- end }}
-  startupapicheck:
-    image:
-      repository: {{ dig "certManager" "startupapicheck" "image" "repository" "" .Values | default (printf "%s/%s/cert-manager-startupapicheck" .Values.global.image.registry .Values.global.image.repository) | quote }}
-      {{- range $key := list "tag" "digest" "pullPolicy" }}
-      {{- with dig "certManager" "startupapicheck" "image" $key "" $.Values }}
-      {{ $key }}: {{ . | quote }}
-      {{- end }}
-      {{- end }}
+  {{- toYaml $certManagerValues | nindent 2 }}
 
 openbao:
+  {{- with dig "openbao" "jwtPluginLifecycle" dict .Values }}
+  jwtPluginLifecycle:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- if .Values.global.imagePullSecrets }}
   global:
     imagePullSecrets:
@@ -428,8 +404,8 @@ openbao:
     image:
       registry: {{ .Values.global.image.registry }}
       repository: {{ .Values.global.image.repository }}/nvcf-openbao-migrations
-      {{- if dig "openbao" "migrations" "image" "tag" "" .Values }}
-      tag: {{ dig "openbao" "migrations" "image" "tag" "" .Values }}
+      {{- with coalesce (dig "openbao" "migrations" "image" "tag" "" .Values) $migrationsTag }}
+      tag: {{ . | quote }}
       {{- end }}
 
     # No env here. openbao-migrations-env.yaml.gotmpl is applied after this file
@@ -457,6 +433,9 @@ openbao:
     agentImage:
       registry: {{ .Values.global.image.registry }}
       repository: {{ .Values.global.image.repository }}/nvcf-openbao
+      {{- with dig "openbao" "injector" "agentImage" "tag" "" .Values }}
+      tag: {{ . | quote }}
+      {{- end }}
     {{- with include "nvcf.nodeSelector" (dict "type" "vault" "selectors" .Values.global.nodeSelectors) }}
     {{- . | nindent 4 }}
     {{- end }}
@@ -498,6 +477,9 @@ openbao:
     image:
       registry: {{ .Values.global.image.registry }}
       repository: {{ .Values.global.image.repository }}/nvcf-openbao
+      {{- with dig "openbao" "server" "image" "tag" "" .Values }}
+      tag: {{ . | quote }}
+      {{- end }}
     {{- with include "nvcf.nodeSelector" (dict "type" "vault" "selectors" .Values.global.nodeSelectors) }}
     {{- . | nindent 4 }}
     {{- end }}
@@ -527,6 +509,35 @@ openbao:
       disruptionBudget:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* Replaces the chart's whole Raft config; auto-unseal adds its seal stanza here. */}}
+      {{- with dig "openbao" "server" "ha" "raft" "config" "" .Values }}
+      raft:
+        {{- toYaml (dict "config" .) | nindent 8 }}
+      {{- end }}
+    {{- with dig "openbao" "server" "annotations" dict .Values }}
+    annotations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- /* For IRSA or workload identity: the KMS seal's credentials hang off this account. */}}
+    {{- with dig "openbao" "server" "serviceAccount" dict .Values }}
+    serviceAccount:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with dig "openbao" "server" "autoUnseal" dict .Values }}
+    {{- $autoUnsealEnabled := dig "enabled" false . }}
+    {{- if not (kindIs "bool" $autoUnsealEnabled) }}
+    {{- fail (printf "openbao.server.autoUnseal.enabled must be a YAML boolean, true or false. Quoted strings, null, and empty values are rejected. Got %q" (toString $autoUnsealEnabled)) }}
+    {{- end }}
+    autoUnseal:
+      {{- toYaml . | nindent 6 }}
+    {{- if $autoUnsealEnabled }}
+    {{- /* The chart skips the unseal Secret under auto-unseal, so drop the Shamir
+           unseal sidecar and the volume that mounts that Secret. */}}
+    extraContainers: []
+    volumes: []
+    volumeMounts: []
+    {{- end }}
+    {{- end }}
 
 nats:
   {{- $natsServerTags := dig "nats" "config" "merge" "server_tags" (list "dc:ncp" "aws-region:ncp") .Values }}
@@ -555,7 +566,7 @@ nats:
     image:
       registry: {{ dig "nats" "container" "image" "registry" "" .Values | default "docker.io" }}
       repository: {{ dig "nats" "container" "image" "repository" "" .Values | default "synadia/nats-server" }}
-      tag: {{ dig "nats" "container" "image" "tag" "" .Values | default "2.14.6-alpine3.22" | quote }}
+      tag: {{ dig "nats" "container" "image" "tag" "" .Values | default "2.14.9-alpine3.22" | quote }}
   {{- $natsReloaderRegistry := dig "nats" "reloader" "image" "registry" "" .Values }}
   {{- $natsReloaderRepository := dig "nats" "reloader" "image" "repository" "" .Values }}
   {{- $natsReloaderTag := dig "nats" "reloader" "image" "tag" "" .Values }}
@@ -611,6 +622,11 @@ nats:
   {{- $natsTopoSpread := include "nvcf.ha.topologySpreadItems" (dict "Values" .Values "instance" "nats" "class" "controlplane" "matchLabels" $natsServers) }}
   podTemplate:
     merge:
+      {{- with dig "nats" "podAnnotations" dict .Values }}
+      metadata:
+        annotations:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       spec:
         securityContext:
           {{- dig "nats" "podTemplate" "merge" "spec" "securityContext" dict .Values | toYaml | nindent 10 }}
@@ -695,6 +711,9 @@ apikeys:
   image:
     registry: {{ .Values.global.image.registry }}
     repository: {{ .Values.global.image.repository }}/nvcf-api-keys-service
+    {{- with dig "apikeys" "image" "tag" "" .Values }}
+    tag: {{ . | quote }}
+    {{- end }}
   {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
   {{- . | nindent 2 }}
   {{- end }}
@@ -724,10 +743,22 @@ apikeys:
   env:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with dig "apikeys" "podAnnotations" dict .Values }}
+  podAnnotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 
-{{- /* The nats-auth-callout chart reads flat, top-level values, so its HA keys are
-       emitted at the top level for that release only. */}}
+{{- /* The nats-auth-callout chart reads flat, top-level values, so its HA keys and
+       pod annotations are emitted at the top level for that release only. */}}
 {{- if eq .Release.Name "nats-auth-callout-service" }}
+{{- /* Logging only: the rest of serviceConfig is auth policy, or is overridden by
+       env vars the chart sets. 02-core adds the stack's own serviceConfig after
+       this file. */}}
+{{- with dig "natsAuthCalloutService" "serviceConfig" "logging" dict .Values }}
+serviceConfig:
+  logging:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- if $haEnabled }}
 replicaCount: {{ max 2 (dig "natsAuthCalloutService" "replicaCount" 1 .Values | int) }}
 {{- end }}
@@ -744,6 +775,17 @@ podDisruptionBudget:
 {{- end }}
 {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "nats-auth-callout-service" "class" "controlplane") }}
 {{- . | nindent 0 }}
+{{- end }}
+{{- with dig "natsAuthCalloutService" "podAnnotations" dict .Values }}
+{{- /* The stack sets these in token mode so a worker auth change restarts the
+       callout; an operator copy would survive a switch back to nkey and stop it. */}}
+{{- range $key, $_ := . }}
+{{- if hasPrefix "nvcf.nvidia.com/nats-worker-auth" $key }}
+{{- fail (printf "natsAuthCalloutService.podAnnotations: %s is reserved for the stack" $key) }}
+{{- end }}
+{{- end }}
+podAnnotations:
+  {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end }}
 
@@ -808,6 +850,46 @@ natsAuthCalloutService:
 {{- end }}
 {{- $_ := set $sizingValues $component $merged }}
 {{- end }}
+{{- $workerCallbackProxyEnabled := dig "workerCallbackProxy" "enabled" false .Values }}
+{{- if not (kindIs "bool" $workerCallbackProxyEnabled) }}
+{{- fail "workerCallbackProxy.enabled must be a YAML boolean, true or false" }}
+{{- end }}
+{{- /* Envoy ends the worker's TLS. This switch picks how it reaches the
+       invocation-service pod: its own TLS session on the pod's worker TLS port
+       (8443), or plain HTTP on the plaintext port (8080). */}}
+{{- $workerCallbackProxyInvocationUpstreamTls := dig "workerCallbackProxy" "invocation" "upstreamTls" "enabled" true .Values }}
+{{- if not (kindIs "bool" $workerCallbackProxyInvocationUpstreamTls) }}
+{{- fail "workerCallbackProxy.invocation.upstreamTls.enabled must be a YAML boolean, true or false" }}
+{{- end }}
+{{- $workerCallbackProxyInvocationPort := ternary 8443 8080 $workerCallbackProxyInvocationUpstreamTls }}
+{{- /* The invocation-service pod certificate Secret. The invocation-service
+       chart issues it under this name and Envoy reads its CA from the same
+       name, so one value keeps the two from drifting. */}}
+{{- $workerCallbackProxyInvocationPodSecret := "invocation-service-worker-tls" }}
+{{- /* CONNECT is a raw TCP tunnel Envoy cannot read or restrict. The stack
+       advertises only http:// targets, which workers send as forward-proxy
+       requests, so it is off unless an older worker needs it. */}}
+{{- $workerCallbackProxyInvocationConnect := dig "workerCallbackProxy" "invocation" "connect" "enabled" false .Values }}
+{{- if not (kindIs "bool" $workerCallbackProxyInvocationConnect) }}
+{{- fail "workerCallbackProxy.invocation.connect.enabled must be a YAML boolean, true or false" }}
+{{- end }}
+{{- $workerCallbackProxyDomain := "" }}
+{{- if $workerCallbackProxyEnabled }}
+{{- $workerCallbackProxyDomain = dig "workerCallbackProxy" "workerDomain" "" .Values | toString | trim | lower }}
+{{- if not $workerCallbackProxyDomain }}
+{{- fail "workerCallbackProxy.workerDomain is required when workerCallbackProxy.enabled is true, for example grpc-worker.example.com" }}
+{{- end }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$" $workerCallbackProxyDomain) }}
+{{- fail (printf "workerCallbackProxy.workerDomain must be a DNS name without a scheme or wildcard, got %q" $workerCallbackProxyDomain) }}
+{{- end }}
+{{- if or $invocationWorkerBaseURL $grpcProxyWorkerConnectBaseURL (dig "env" "WORKER_STREAM_PROPERTIES__SELF_ADDRESS" "" $sizingValues.invocation) }}
+{{- fail "workerCallbackProxy.enabled cannot be combined with global.workerEndpoints.invocationServiceURL, global.workerEndpoints.grpcProxyWorkerConnectURL, grpcproxy.workerConnectBaseURL, or invocation.env.WORKER_STREAM_PROPERTIES__SELF_ADDRESS; workers reach both services through the proxy" }}
+{{- end }}
+{{- $grpcProxyWorkerConnectBaseURL = printf "https://%s" $workerCallbackProxyDomain }}
+{{- end }}
+{{- /* Under HTTP/3 each grpc-proxy pod prefixes workerConnectBaseURL with its
+       own dashed IP, so a set base URL is still a per-pod address. */}}
+{{- $grpcProxyHttp3 := or $workerCallbackProxyEnabled (eq (dig "http3" "enabled" false $sizingValues.grpcproxy | toString) "true") }}
 {{- $llmRequestRouterGrpcPort := dig "addons" "llm" "requestRouter" "service" "grpcPort" 50071 .Values }}
 {{- $backendRouterGrpcPort := dig "addons" "llm" "requestRouter" "backendRouter" "service" "grpcPort" 50071 .Values }}
 {{- $llmEnabled := dig "addons" "llm" "enabled" false .Values }}
@@ -1005,6 +1087,10 @@ api:
   {{- end }}
   {{- if $apiRemoteConfigData }}
   remoteConfig:
+    {{- with dig "api" "remoteConfig" "workerImageTags" dict .Values }}
+    workerImageTags:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
     configData:
       {{- toYaml $apiRemoteConfigData | nindent 6 }}
   {{- end }}
@@ -1138,6 +1224,13 @@ invocation:
   {{- with include "nvcf.natsStreamReplicas" .Values }}
   {{- $_ := set $invocationEnv "NATS_PROPERTIES__REPLICAS" . }}
   {{- end }}
+  {{- if $workerCallbackProxyEnabled }}
+  {{- $_ := set $invocationEnv "WORKER_STREAM_PROPERTIES__PROXY_ADDRESS" (dig "invocationProxyURL" "" $workerEndpoints | default (printf "https://invocation.%s:10084" $workerCallbackProxyDomain)) }}
+  {{- /* The http scheme makes the worker send a forward-proxy request through
+         its TLS session to Envoy, not a CONNECT tunnel, so Envoy can open its
+         own session to the pod. The worker never sees the pod certificate. */}}
+  {{- $_ := set $invocationEnv "WORKER_STREAM_PROPERTIES__SERVICE_ADDRESS" (printf "http://invocation.nvcf.svc.cluster.local:%d" (int $workerCallbackProxyInvocationPort)) }}
+  {{- end }}
   {{- $invocationEnv = mergeOverwrite $invocationEnv (deepCopy $configuredInvocationEnv) }}
   {{- $invocationSelfAddress := index $secretsInvocationEnv "WORKER_STREAM_PROPERTIES__SELF_ADDRESS" | default (index $invocationEnv "WORKER_STREAM_PROPERTIES__SELF_ADDRESS") }}
   {{- $invocationScaled := and $haEnabled (not $invocationSelfAddress) }}
@@ -1166,6 +1259,23 @@ invocation:
   autoscaling:
     enabled: false
   {{- end }}
+  {{- if and $workerCallbackProxyEnabled $workerCallbackProxyInvocationUpstreamTls }}
+  {{- /* Envoy opens its own TLS session to this listener and verifies the pod
+         as <dashed-pod-ip>.invocation.nvcf.svc.cluster.local. */}}
+  workerTls:
+    enabled: true
+    advertise: true
+    tls:
+      secretName: {{ $workerCallbackProxyInvocationPodSecret | quote }}
+      certificate:
+        enabled: true
+        issuerRef:
+          kind: {{ dig "addons" "llm" "pki" "issuerKind" "ClusterIssuer" .Values | quote }}
+          name: {{ dig "addons" "llm" "pki" "issuerName" "nvcf-openbao-pki" .Values | quote }}
+          group: cert-manager.io
+        dnsNames:
+          - "*.invocation.nvcf.svc.cluster.local"
+  {{- end }}
   {{- if .Values.global.imagePullSecrets }}
   imagePullSecrets:
     {{- toYaml .Values.global.imagePullSecrets | nindent 4 }}
@@ -1173,6 +1283,9 @@ invocation:
   image:
     registry: {{ .Values.global.image.registry }}
     repository: {{ .Values.global.image.repository }}/nvcf-invocation-service
+    {{- with dig "invocation" "image" "tag" "" .Values }}
+    tag: {{ . | quote }}
+    {{- end }}
   {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
   {{- . | nindent 2 }}
   {{- end }}
@@ -1210,6 +1323,10 @@ invocation:
   podDisruptionBudget:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- end }}
+  {{- with dig "invocation" "podAnnotations" dict .Values }}
+  podAnnotations:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 
 {{- $configuredNvctApiRemoteConfigData := dig "nvctApi" "remoteConfig" "configData" dict .Values }}
@@ -1309,7 +1426,7 @@ eventLedger:
     registry: {{ .Values.global.image.registry }}
     repository: {{ .Values.global.image.repository }}
 
-{{- $grpcProxyScaled := and $haEnabled (not $grpcProxyWorkerConnectBaseURL) }}
+{{- $grpcProxyScaled := and $haEnabled (or $grpcProxyHttp3 (not $grpcProxyWorkerConnectBaseURL)) }}
 grpcproxy:
   fullnameOverride: grpc-proxy
   {{- $grpcProxySizing := $sizingValues.grpcproxy }}
@@ -1341,6 +1458,9 @@ grpcproxy:
   image:
     registry: {{ .Values.global.image.registry }}
     repository: {{ .Values.global.image.repository }}/nvcf-grpc-proxy
+    {{- with dig "grpcproxy" "image" "tag" "" .Values }}
+    tag: {{ . | quote }}
+    {{- end }}
   {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
   {{- . | nindent 2 }}
   {{- end }}
@@ -1362,6 +1482,28 @@ grpcproxy:
   {{- end }}
   {{- with $grpcProxyWorkerConnectBaseURL }}
   workerConnectBaseURL: {{ . | quote }}
+  {{- end }}
+  {{- if $workerCallbackProxyEnabled }}
+  {{- /* Workers reach the pod through Envoy as <dashed-pod-ip>.<workerDomain>;
+         Envoy re-encrypts to the pod and checks the grpc-headless name. */}}
+  http3:
+    enabled: true
+    tls:
+      certificate:
+        enabled: true
+        issuerRef:
+          kind: {{ dig "addons" "llm" "pki" "issuerKind" "ClusterIssuer" .Values | quote }}
+          name: {{ dig "addons" "llm" "pki" "issuerName" "nvcf-openbao-pki" .Values | quote }}
+          group: cert-manager.io
+        dnsNames:
+          - {{ printf "*.%s" $workerCallbackProxyDomain | quote }}
+          - "*.grpc-headless.nvcf.svc.cluster.local"
+  {{- else }}
+  {{- /* The replica decision above reads this block, so the chart must get it. */}}
+  {{- with dig "grpcproxy" "http3" dict .Values }}
+  http3:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- end }}
 
   env:
@@ -1396,6 +1538,72 @@ grpcproxy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- end }}
+  {{- with dig "grpcproxy" "podAnnotations" dict .Values }}
+  podAnnotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+{{- if $workerCallbackProxyEnabled }}
+
+workerCallbackProxy:
+  workerDomain: {{ $workerCallbackProxyDomain | quote }}
+  {{- with dig "workerCallbackProxy" "replicaCount" nil .Values }}
+  replicaCount: {{ if $haEnabled }}{{ max 2 (. | int) }}{{ else }}{{ . | int }}{{ end }}
+  {{- end }}
+  {{- with dig "workerCallbackProxy" "image" dict .Values }}
+  image:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with dig "workerCallbackProxy" "service" dict .Values }}
+  service:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if .Values.global.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml .Values.global.imagePullSecrets | nindent 4 }}
+  {{- end }}
+  {{- /* Envoy's frontend certificate is the one workers see. It has its own
+         issuer or Secret, independent of the pod certificates, so a public CA
+         such as Let's Encrypt can serve it. The default is the stack's OpenBao
+         issuer, which workers trust through workerCallbackCaPem. */}}
+  {{- $frontendIssuer := dig "workerCallbackProxy" "tls" "frontend" "certificate" "issuerRef" dict .Values }}
+  tls:
+    frontend:
+      {{- with dig "workerCallbackProxy" "tls" "frontend" "existingSecret" "" .Values }}
+      existingSecret: {{ . | quote }}
+      {{- end }}
+      certificate:
+        issuerRef:
+          kind: {{ dig "kind" (dig "addons" "llm" "pki" "issuerKind" "ClusterIssuer" .Values) $frontendIssuer | quote }}
+          name: {{ dig "name" (dig "addons" "llm" "pki" "issuerName" "nvcf-openbao-pki" .Values) $frontendIssuer | quote }}
+          group: {{ dig "group" "cert-manager.io" $frontendIssuer | quote }}
+  invocation:
+    port: {{ $workerCallbackProxyInvocationPort }}
+    connect:
+      enabled: {{ $workerCallbackProxyInvocationConnect }}
+    upstream:
+      tls:
+        enabled: {{ $workerCallbackProxyInvocationUpstreamTls }}
+        {{- if $workerCallbackProxyInvocationUpstreamTls }}
+        caSecret:
+          name: {{ $workerCallbackProxyInvocationPodSecret | quote }}
+          key: ca.crt
+        {{- end }}
+  {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  {{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  {{- if $haEnabled }}
+  {{- with include "nvcf.ha.affinity" (dict "Values" .Values "instance" "worker-callback-proxy" "class" "controlplane") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "worker-callback-proxy" "class" "controlplane") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  {{- end }}
+{{- end }}
 
 rateLimiter:
   {{- if .Values.global.imagePullSecrets }}
@@ -1491,6 +1699,10 @@ ess:
   podDisruptionBudget:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- end }}
+  {{- with dig "ess" "podAnnotations" dict .Values }}
+  podAnnotations:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 
 notary:
@@ -1589,11 +1801,12 @@ sis:
   lls:
     enabled: {{ dig "addons" "lls" "enabled" false .Values }}
     hmacRotation:
+      kubectlMinor: {{ dig "addons" "lls" "hmacRotation" "kubectlMinor" "" .Values | toString | default (dig "openbao" "migrations" "kubectlMinor" "" .Values) | quote }}
       image:
         registry: {{ .Values.global.image.registry }}
         repository: {{ .Values.global.image.repository }}/nvcf-openbao-migrations
-        {{- if dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values }}
-        tag: {{ dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values }}
+        {{- with coalesce (dig "addons" "lls" "hmacRotation" "image" "tag" "" .Values) $migrationsTag }}
+        tag: {{ . | quote }}
         {{- end }}
 
   env:
@@ -2255,16 +2468,11 @@ vanityGateway:
 {{- $vanityBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "vanityGateway" "backend" dict .Values)) (dict "name" "vanity-gateway" "namespace" "nvcf" "port" 8080) }}
 {{- $essBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "ess" "backend" dict .Values)) (dict "name" "ess-api" "namespace" "ess" "port" 8080) }}
 {{- $apiKeysBackend := merge (deepCopy (dig "ingress" "gatewayApi" "routes" "apiKeys" "backend" dict .Values)) (dict "name" "api-keys" "namespace" "api-keys" "port" 8080) }}
-{{/* openbao-migrations image tag: 0.19.5 is the floor. An operator may pin a
-     newer tag via addons.nvcfUi.openbaoMigrations.image.tag, but anything older
-     than the floor is ignored (the migrations job needs >= 0.19.5). */}}
-{{- $nvcfUiOpenbaoMigrationsTag := "0.19.10" }}
-{{- $nvcfUiMigrationsTagOverride := dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values }}
-{{- if and $nvcfUiMigrationsTagOverride (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiMigrationsTagOverride)) }}
+{{/* openbao-migrations image tag: the component tag, else the shared stack tag
+     (global.openbaoMigrations.image.tag). */}}
+{{- $nvcfUiOpenbaoMigrationsTag := coalesce (dig "addons" "nvcfUi" "openbaoMigrations" "image" "tag" "" .Values) $migrationsTag }}
+{{- if and $nvcfUiOpenbaoMigrationsTag (not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" $nvcfUiOpenbaoMigrationsTag)) }}
 {{- fail "addons.nvcfUi.openbaoMigrations.image.tag must be a valid OCI image tag" }}
-{{- end }}
-{{- if and $nvcfUiMigrationsTagOverride (semverCompare ">=0.19.5" $nvcfUiMigrationsTagOverride) }}
-{{- $nvcfUiOpenbaoMigrationsTag = $nvcfUiMigrationsTagOverride }}
 {{- end }}
 nvcfUi:
   fullnameOverride: nvcf-ui
@@ -2495,6 +2703,8 @@ nvcfGatewayRoutes:
     invocation:
       routeAnnotations:
         {{ dig "ingress" "gatewayApi" "routes" "invocation" "routeAnnotations" dict .Values | toYaml | nindent 8 | trim }}
+    llmApiGateway:
+      enabled: {{ dig "addons" "llm" "enabled" false .Values }}
     llmInvocation:
       enabled: {{ dig "addons" "llm" "enabled" false .Values }}
       backend:

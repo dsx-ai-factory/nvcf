@@ -14,6 +14,7 @@ test:
 	@tests/gateway-routes-hostname-policy-wiring.sh
 	@tests/gateway-routes-default-ownership.sh
 	@tests/grpc-proxy-nats-endpoint.sh
+	@tests/event-ledger-dependencies.sh
 	@tests/nats-image-overrides.sh
 	@tests/cert-manager-image-overrides.sh
 	@tests/llm-pki-openbao-migration.sh
@@ -27,6 +28,8 @@ test:
 	@tests/llm-pki-release.sh
 	@tests/check-llm-pki-issuer.sh
 	@tests/pdb-value-wiring.sh
+	@tests/pod-annotations-wiring.sh
+	@tests/openbao-auto-unseal-wiring.sh
 	@tests/invocation-env-wiring.sh
 	@tests/invocation-tracing-baggage.sh
 	@tests/image-override-wiring.sh
@@ -49,6 +52,9 @@ test:
 	@tests/nonroot-ui-migrations.sh
 	@tests/ha-value-wiring.sh
 	@tests/ha-chart-render.sh
+	@tests/worker-callback-proxy-wiring.sh
+	@tests/self-managed-111-pins.sh
+	@tests/legacy-image-keys-passthrough.sh
 
 test-published-charts:
 	@: "$${NVCF_PUBLISHED_CHART_REGISTRY:?NVCF_PUBLISHED_CHART_REGISTRY is required}"
