@@ -683,10 +683,16 @@ curl -s -H "Host: api.example.com" \
   http://localhost:10081/v1/models
 ```
 
-The gateway does not validate the key. It sends the key to
-`GET /v2/nvcf/functions?visibility=authorized,private` on
-`NVCF_CONTROL_PLANE_ENDPOINT`, and the NVCF API applies the same account and
-API key resource checks as invocation, version by version. A model whose name
+The gateway does not validate the key. It sends the key to List Invocable
+Functions, `GET /v2/nvcf/invocable/functions/versions/ids?visibility=authorized,private`,
+on `NVCF_CONTROL_PLANE_ENDPOINT`. That listing has one entry per invocable
+function version, in `ACTIVE` or `DEGRADING` status, and needs the
+`list_functions` scope. The NVCF API applies the same account and API key
+resource checks as invocation, version by version. An NVCF API that answers
+`404` for that listing predates it. The gateway then uses
+`GET /v2/nvcf/functions?visibility=authorized,private`, which needs the same
+scope, keeps only its `ACTIVE` and `DEGRADING` versions, and tries List
+Invocable Functions again after 10 minutes. A model whose name
 matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
 the function version it routes to. An entry without `functionVersionID` is
 listed when any version of its function is returned. Expiry,
@@ -707,8 +713,8 @@ The lookup never fails a request:
 | --- | --- |
 | No bearer key | Public list, no NVCF API call |
 | Key accepted | Public list plus the private models the key may access |
-| NVCF API rejects the key (`401`) | Public list |
-| Key has no `list_functions` or `list_functions_details` scope (`403`) | Public list |
+| NVCF API rejects the key (`401`) | Public list. The key is looked up again after 10 seconds. |
+| Key lacks the `list_functions` scope (`403`) | Public list. The key is looked up again after 10 seconds. |
 | NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
 | `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
 
@@ -718,8 +724,12 @@ Keyed responses carry `Cache-Control: private, no-store` and
 `403` for an unrecognized `nvapi-` key, so that key reports `forbidden`. Model
 list responses carry `Vary: Authorization`.
 
-Results are cached per key for one minute, for up to 4096 keys, and survive
-mapping reloads. A reload that changes the set of private functions refreshes
+Authorized results are cached per key for five minutes, for up to 4096 keys,
+and survive mapping reloads. Invocation checks access on every call, so a list
+that lags access changes by a few minutes is acceptable. A `401` or `403` is
+kept for 10 seconds only, so a key that gains the `list_functions` scope shows
+its private models within seconds. The gateway does not store or replay NVCF
+API responses. A reload that changes the set of private functions refreshes
 each key on its next request. Concurrent requests with the same key share one
 lookup. Each pod runs at most 16 lookups at once, each with a 5 second
 timeout, and a request never waits for a free slot. Keys without an
