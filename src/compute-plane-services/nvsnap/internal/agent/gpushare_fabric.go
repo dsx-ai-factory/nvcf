@@ -220,6 +220,9 @@ type restoreV2Group struct {
 	// SpanMS is the restore span every GPU rank of the group budgets its
 	// clocks with (groupSpanBudget); 0 outside a group restore.
 	SpanMS int64
+	// SpanLearned is whether SpanMS is the cluster's learned span, another
+	// checkpoint's, which the rank's estimate bounds (groupSpanBudget).
+	SpanLearned bool
 }
 
 // restoreSession is one pod's directory in a group restore.

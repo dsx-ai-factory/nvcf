@@ -100,8 +100,14 @@ const groupSpanUnknown int64 = -1
 // So the driver hands every rank one span: the slowest rank's last
 // (groupSpanMS > 0), or groupSpanUnknown when a rank has none, for the
 // estimate; 0 is a restore on its own, with this node's record.
-func groupSpanBudget(dir string, groupSpanMS int64) time.Duration {
+//
+// A learned span (restore_span_learned.go), another checkpoint's, only
+// shortens the wait: its budget is never more than this checkpoint's
+// estimate.
+func groupSpanBudget(dir string, groupSpanMS int64, learned bool) time.Duration {
 	switch {
+	case groupSpanMS > 0 && learned:
+		return min(spanBudget(groupSpanMS), restoreSpanEstimate(dir))
 	case groupSpanMS > 0:
 		return spanBudget(groupSpanMS)
 	case groupSpanMS < 0:
@@ -133,12 +139,12 @@ func groupRestoreSpan(spans []int64, known []bool) int64 {
 // budget, which CRIU waits out; or, through a GPU reload, the whole restore,
 // with every task left stopped for the GPU resume (groupSpanMS, see
 // groupSpanBudget).
-func restoreClockArgs(dir string, budgetSupported, throughGPU bool, groupSpanMS int64) ([]string, time.Duration) {
+func restoreClockArgs(dir string, budgetSupported, throughGPU bool, groupSpanMS int64, learned bool) ([]string, time.Duration) {
 	switch {
 	case !budgetSupported:
 		return nil, 0
 	case throughGPU:
-		b := groupSpanBudget(dir, groupSpanMS)
+		b := groupSpanBudget(dir, groupSpanMS, learned)
 		return []string{"--timens-budget", strconv.FormatInt(b.Milliseconds(), 10), "--leave-stopped", "--timens-no-wait"}, b
 	default:
 		b := restoreClockBudget(dir)
@@ -304,4 +310,15 @@ func restoredTasksToResume(procBase string, nsRef, criuNSRef int, pids, skip []i
 func clockThroughGPUSupported(criuHelp, toolUsage string) bool {
 	return criuSupportsTimensBudget(criuHelp) && strings.Contains(criuHelp, "--timens-no-wait") &&
 		strings.Contains(toolUsage, "--clock-at")
+}
+
+// hasRestoreSpan is whether this node has a restore of the checkpoint in
+// dir on record (restoreSpanFile) that restoreSpanBudget can use.
+func hasRestoreSpan(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, restoreSpanFile)) //nolint:gosec // dir is the agent's own checkpoint directory
+	if err != nil {
+		return false
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return err == nil && ms >= 0
 }
