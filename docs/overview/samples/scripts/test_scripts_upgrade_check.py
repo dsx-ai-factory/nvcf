@@ -70,6 +70,15 @@ class DownloadedChecks(unittest.TestCase):
                 result = self.run_script("wait-upgrade-workloads.py", "/control", "control", "nvcf", **{key: "1"})
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_allow_empty_marks_an_optional_namespace(self):
+        result = self.run_script("wait-upgrade-workloads.py", "/control", "control", "sis",
+                                 "ALLOW_EMPTY", EMPTY_WORKLOADS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("marked this namespace optional", result.stdout)
+        result = self.run_script("wait-upgrade-workloads.py", "/control", "control", "sis",
+                                 EMPTY_WORKLOADS="1")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_daemonset_only_namespace_is_checked(self):
         result = self.run_script("wait-upgrade-workloads.py", "/control", "control", "monitoring", DAEMONSET_ONLY="1")
         self.assertEqual(result.returncode, 0, result.stderr)

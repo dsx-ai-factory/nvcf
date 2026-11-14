@@ -61,9 +61,14 @@ class TaskImageChecks(unittest.TestCase):
                 }, hostname=hostname, repository=repository)
                 self.assertNotEqual(result.returncode, 0)
 
-    def run_probe(self, wait_status, phase="Succeeded"):
+    def run_probe(self, phase="Succeeded", imageid_wait_seconds=None,
+                  poll_state=None, **extra):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            if poll_state is not None:
+                # Seed the poll countdown the stub reads, under this call's
+                # own root (run_probe creates a fresh directory per call).
+                (root / "poll-state").write_text(str(poll_state))
             command = block_containing(RECOVERY, "TASK_PULL_SECRETS=")
             stub = r'''
 kubectl() {
@@ -73,12 +78,22 @@ kubectl() {
       cat >> "$POD_LOG"
       printf '%s\n' 'task-image-check-test'
       ;;
+    *'get pod/'*imageID*)
+      # jsonpath imageID poll: the remaining empty polls persist in $POLL_STATE
+      # because a function's env changes do not survive the $( ) subshell.
+      remaining=$(cat "$POLL_STATE" 2>/dev/null || true)
+      if [ -n "$remaining" ] && [ "$remaining" -gt 0 ]; then
+        echo $((remaining - 1)) > "$POLL_STATE"
+        : # imageID still empty; keep polling
+      else
+        printf '%s\n' 'sha256:pulled'
+      fi ;;
     *'wait '*)
       case "$*" in
-        *containerStatuses*imageID*) return "$WAIT_STATUS" ;;
         *status.phase*Succeeded*) test "$POD_PHASE" = Succeeded ;;
         *) return 99 ;;
       esac ;;
+    *'describe pod/'*) printf '%s\n' 'describe-output' ;;
     *'get pod/'*) printf '%s\n' 'node-a sha256:pulled' ;;
     *'delete pod/'*) ;;
     *) return 99 ;;
@@ -86,15 +101,17 @@ kubectl() {
 }
 '''
             env = {**os.environ, "CALL_LOG": str(root / "calls"),
-                   "POD_LOG": str(root / "pods"), "WAIT_STATUS": str(wait_status), "POD_PHASE": phase,
-                   "TASK_IMAGES": "mirror.example/init:4\nmirror.example/task:5"}
+                   "POD_LOG": str(root / "pods"), "POD_PHASE": phase,
+                   "IMAGEID_WAIT_SECONDS": str(imageid_wait_seconds or 150),
+                   "POLL_STATE": str(root / "poll-state"),
+                   "TASK_IMAGES": "mirror.example/init:4\nmirror.example/task:5", **extra}
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", stub + command],
                                     env=env, capture_output=True, text=True)
             return result, (root / "calls").read_text().splitlines(), [
                 json.loads(line) for line in (root / "pods").read_text().splitlines()]
 
-    def test_probe_uses_selected_cluster_node_credentials_and_help(self):
-        result, calls, pods = self.run_probe(0)
+    def test_probe_uses_selected_cluster_node_credentials_and_polls(self):
+        result, calls, pods = self.run_probe()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(pods), 2)
         prefix = ("--kubeconfig /absolute/path/to/compute-kubeconfig "
@@ -112,19 +129,35 @@ kubectl() {
             self.assertEqual(container["imagePullPolicy"], "Always")
             self.assertEqual(container["args"], ["--help"])
             self.assertNotIn("command", container)
-        self.assertEqual(sum("wait --for=jsonpath={.status.containerStatuses[0].imageID}" in c for c in calls), 2)
+        self.assertEqual(sum("wait --for=jsonpath" in c for c in calls), 0)
+        self.assertEqual(sum("-o jsonpath={.status.containerStatuses[0].imageID}" in c for c in calls), 2)
         self.assertEqual(sum("delete pod/task-image-check-test" in c for c in calls), 2)
 
-    def test_failed_pull_stops_before_next_image_and_preserves_probe(self):
-        result, calls, pods = self.run_probe(1)
+    def test_probe_polls_until_the_image_id_is_reported(self):
+        # One poll per pod comes back with the imageID still empty; the
+        # second pod's first query then finds it. Seeded via poll_state so
+        # the countdown lives under this call's own temporary root.
+        result, calls, pods = self.run_probe(poll_state="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(pods), 2)
+        self.assertGreaterEqual(sum("-o jsonpath={.status.containerStatuses[0].imageID}" in c for c in calls), 3)
+
+    def test_an_image_that_never_pulls_fails_before_deleting_the_probe(self):
+        # The stub keeps answering "imageID still empty" for as long as
+        # the poll state counts down, so 999 never resolves inside the
+        # 1-second deadline: the probe times out, describes the pod and
+        # exits without deleting anything.
+        result, calls, pods = self.run_probe(poll_state="999",
+                                             imageid_wait_seconds=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(pods), 1)
+        self.assertTrue(any("describe pod/" in call for call in calls))
         self.assertFalse(any("delete " in call for call in calls))
 
     def test_pulled_image_does_not_require_application_success(self):
         for phase in ("Running", "Failed"):
             with self.subTest(phase=phase):
-                result, calls, _ = self.run_probe(0, phase=phase)
+                result, calls, _ = self.run_probe(phase=phase)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(sum("delete pod/" in call for call in calls), 2)
 
