@@ -103,6 +103,16 @@ func (f *fakeFunctionIDs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			version(publicFunctionID, allowedVersionID),
 			version(unmappedFunctionID, allowedVersionID),
 		}
+	case "Bearer statuses":
+		withStatus := func(function map[string]string, status string) map[string]string {
+			function["status"] = status
+			return function
+		}
+		functions = []map[string]string{
+			withStatus(version(allowedPrivateFunctionID, allowedVersionID), "DEGRADING"),
+			withStatus(version(allowedPrivateFunctionID, otherVersionID), "INACTIVE"),
+			withStatus(version(stagingFunctionID, allowedVersionID), "DEPLOYING"),
+		}
 	case "Bearer other":
 		functions = []map[string]string{}
 	case "Bearer later":
@@ -510,6 +520,35 @@ func TestPrivateModelLookupFallsBackToTheFunctionListing(t *testing.T) {
 	require.Equal(t, privateModelsAuthorized, rec.Header().Get(PrivateModelsHeader))
 	require.EqualValues(t, 4, nvcf.calls.Load())
 	require.EqualValues(t, 2, nvcf.functionsCalls.Load())
+}
+
+// The function listing returns versions in every status. The gateway keeps
+// only the ACTIVE and DEGRADING ones, as List Invocable Functions does, so an
+// alias is listed only when it routes to a version that accepts invocations.
+func TestPrivateModelLookupFallbackKeepsOnlyInvocableVersions(t *testing.T) {
+	nvcf, endpoint := newFakeFunctionIDs(t)
+	nvcf.legacy.Store(true)
+	pinned := func(name, versionID string) config.ModelFunctionDetails {
+		return config.ModelFunctionDetails{ModelName: name, FunctionID: allowedPrivateFunctionID, FunctionVersionID: versionID}
+	}
+	mux := privateModelsMux(t, endpoint, pinned("private/team/v1", allowedVersionID), pinned("private/team/v2", otherVersionID))
+
+	rec := listModels(t, mux, "/v1/models", keyHeaders("statuses"))
+	require.Equal(t, privateModelsAuthorized, rec.Header().Get(PrivateModelsHeader))
+	require.Equal(t, []string{"acme/public", "private/team/allowed", "private/team/v1"}, listedModelIDs(t, rec))
+	require.EqualValues(t, 1, nvcf.functionsCalls.Load())
+
+	require.Equal(t, http.StatusNotFound, listModels(t, mux, "/v1/models/private/team/v2", keyHeaders("statuses")).Code)
+	require.Equal(t, http.StatusNotFound, listModels(t, mux, "/v1/models/stg/acme/model", keyHeaders("statuses")).Code)
+}
+
+func TestInvocableStatus(t *testing.T) {
+	for _, status := range []string{"", "ACTIVE", "DEGRADING", "active", "Degrading"} {
+		require.True(t, invocableStatus(status), status)
+	}
+	for _, status := range []string{"DEPLOYING", "DEGRADED", "ERROR", "INACTIVE", "DELETED", "UNKNOWN"} {
+		require.False(t, invocableStatus(status), status)
+	}
 }
 
 // A 401 or 403 is kept for privateModelLookupRetryAfter only, so a key that

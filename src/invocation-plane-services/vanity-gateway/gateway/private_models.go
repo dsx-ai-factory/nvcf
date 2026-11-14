@@ -397,9 +397,13 @@ func decodeLookupFunctions(decoder *stdjson.Decoder, index privateModelIndex, ve
 		var function struct {
 			ID        string `json:"id"`
 			VersionID string `json:"versionId"`
+			Status    string `json:"status"`
 		}
 		if err := decoder.Decode(&function); err != nil {
 			return err
+		}
+		if !invocableStatus(function.Status) {
+			continue
 		}
 		id := strings.ToLower(function.ID)
 		if _, ok := index.routes[id]; !ok {
@@ -414,6 +418,19 @@ func decodeLookupFunctions(decoder *stdjson.Decoder, index privateModelIndex, ve
 		}
 	}
 	return expectJSONDelim(decoder, ']')
+}
+
+// invocableStatus reports whether a listed function version accepts
+// invocations. List Invocable Functions returns only those versions, without a
+// status. The function listing returns every version with its status, and
+// invocation accepts only ACTIVE and DEGRADING versions.
+func invocableStatus(status string) bool {
+	switch strings.ToUpper(status) {
+	case "", "ACTIVE", "DEGRADING":
+		return true
+	default:
+		return false
+	}
 }
 
 func expectJSONDelim(decoder *stdjson.Decoder, want stdjson.Delim) error {

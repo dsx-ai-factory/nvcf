@@ -685,13 +685,14 @@ curl -s -H "Host: api.example.com" \
 
 The gateway does not validate the key. It sends the key to List Invocable
 Functions, `GET /v2/nvcf/invocable/functions/versions/ids?visibility=authorized,private`,
-on `NVCF_CONTROL_PLANE_ENDPOINT`. That listing has one entry per accessible
-function version and needs the `list_functions` scope. The NVCF API applies
-the same account and API key resource checks as invocation, version by
-version. An NVCF API that answers `404` for that listing predates it. The
-gateway then uses `GET /v2/nvcf/functions?visibility=authorized,private`,
-which needs the same scope, and tries List Invocable Functions again after
-10 minutes. A model whose name
+on `NVCF_CONTROL_PLANE_ENDPOINT`. That listing has one entry per invocable
+function version, in `ACTIVE` or `DEGRADING` status, and needs the
+`list_functions` scope. The NVCF API applies the same account and API key
+resource checks as invocation, version by version. An NVCF API that answers
+`404` for that listing predates it. The gateway then uses
+`GET /v2/nvcf/functions?visibility=authorized,private`, which needs the same
+scope, keeps only its `ACTIVE` and `DEGRADING` versions, and tries List
+Invocable Functions again after 10 minutes. A model whose name
 matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
 the function version it routes to. An entry without `functionVersionID` is
 listed when any version of its function is returned. Expiry,
