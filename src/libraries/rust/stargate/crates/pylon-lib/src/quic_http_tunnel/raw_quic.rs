@@ -88,6 +88,14 @@ impl TunnelRequestTransport for RawQuicTunnelTransport {
             .finish()
             .context("failed to finish response stream")
     }
+
+    fn response_stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+        let stopped = self.send_stream.stopped();
+        async move {
+            // A stop code, a reset, and a lost connection all end the response.
+            let _ = stopped.await;
+        }
+    }
 }
 
 pub(super) async fn handle_stream(
@@ -146,6 +154,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::super::UpstreamBackend;
     use super::super::core::{
         PylonRetryConfig, RETRY_REASON_LOCAL_CONNECT_FAILURE, UpstreamRequestError,
         build_response_headers, local_connect_failure_headers, problem_response_headers,
@@ -204,22 +213,25 @@ mod tests {
     fn raw_quic_success_headers_preserve_status_and_retry_metadata() {
         let retry = PylonRetryConfig::default();
         let mut upstream_headers = HeaderMap::new();
-        upstream_headers.insert(
-            retry.upstream_retry_header.clone(),
-            HeaderValue::from_static("true"),
-        );
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
 
-        let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .and_then(|headers| raw_quic_response_headers(status, headers))
-            .expect("raw QUIC success headers should build");
+        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .and_then(|headers| raw_quic_response_headers(status, headers))
+        .expect("raw QUIC success headers should build");
 
-        assert_eq!(header_value(&headers, "x-status"), "429");
+        assert_eq!(header_value(&headers, "x-status"), "503");
         assert_eq!(header_value(&headers, HEADER_STARGATE_RETRYABLE), "true");
         assert_eq!(
             header_value(&headers, HEADER_STARGATE_RETRY_REASON),
-            "upstream_admission_rejected"
+            "upstream_unavailable"
         );
         assert_eq!(header_value(&headers, "x-stargate-retry-after-ms"), "2000");
     }

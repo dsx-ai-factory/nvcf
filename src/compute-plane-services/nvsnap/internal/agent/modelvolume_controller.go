@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/capturehold"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/rootfsonly"
@@ -109,7 +110,7 @@ type ModelVolumeController struct {
 	CacheWarmup time.Duration
 	// RefreshDisabled turns set refresh off; RefreshCooldown is the least
 	// time between a generation's creation and the next refresh of the
-	// same set (zero: 6 hours). docs/design/helm-chart-cache-refresh.md.
+	// same set (zero: 6 hours). docs/ARCHITECTURE.md, section 7.
 	RefreshDisabled bool
 	RefreshCooldown time.Duration
 	// deltaScan is the warm-rank scan (seam for tests): new files not in
@@ -1674,7 +1675,7 @@ func (c *ModelVolumeController) servePVCReader(ctx context.Context, pod *corev1.
 // scanWarmRank measures a warm rank after Ready and the settle period,
 // marks it rank-ready so it can be listed and streamed, and when its
 // cachedir holds files the seed index did not, marks the delta and
-// proposes a refresh (docs/design/helm-chart-cache-refresh.md).
+// proposes a refresh (docs/ARCHITECTURE.md, section 7).
 func (c *ModelVolumeController) scanWarmRank(ctx context.Context, pod *corev1.Pod) {
 	if c.RefreshDisabled {
 		return
@@ -1774,8 +1775,14 @@ func (c *ModelVolumeController) scanWarmRank(ctx context.Context, pod *corev1.Po
 // files belong to startup.
 const readyGrace = 5 * time.Second
 
-// readyAt is the pod's Ready transition time, zero when unknown.
+// readyAt is the pod's Ready transition time, zero when unknown. A pod
+// held out of service until its capture is settled became ready, for the
+// files of its startup, when it became warm.
 func readyAt(pod *corev1.Pod) time.Time {
+	if capturehold.Held(pod) {
+		at, _ := capturehold.WarmSince(pod)
+		return at
+	}
 	for _, c := range pod.Status.Conditions {
 		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
 			return c.LastTransitionTime.Time

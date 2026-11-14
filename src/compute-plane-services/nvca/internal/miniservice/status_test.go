@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	nvcak8sutil "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
@@ -1566,6 +1567,116 @@ func TestGetFunctionWorkerContainerStatus(t *testing.T) {
 			}
 			assert.Equal(t, tt.wantPresent, present)
 			assert.Equal(t, tt.wantStatus, got)
+		})
+	}
+}
+
+func unscheduledPod(name, namespace string, since time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionFalse,
+				Reason:             corev1.PodReasonUnschedulable,
+				LastTransitionTime: metav1.NewTime(since),
+			}},
+		},
+	}
+}
+
+func withCreationTimestamp(pod *corev1.Pod, created time.Time) *corev1.Pod {
+	pod.CreationTimestamp = metav1.NewTime(created)
+	return pod
+}
+
+func TestPodSchedulingRequeueAfter(t *testing.T) {
+	const namespace = "sr-test"
+	const timeout = 10 * time.Minute
+	// Whole seconds, because the fake client stores condition times at second precision.
+	now := time.Date(2026, 11, 6, 23, 28, 26, 0, time.UTC)
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	runningPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: namespace},
+		Status: corev1.PodStatus{
+			Phase:     corev1.PodRunning,
+			StartTime: &metav1.Time{Time: now.Add(-time.Hour)},
+		},
+	}
+
+	tests := []struct {
+		name string
+		pods []*corev1.Pod
+		want time.Duration
+	}{
+		{
+			name: "no unscheduled pods requeues after the full timeout",
+			pods: []*corev1.Pod{runningPod},
+			want: timeout,
+		},
+		{
+			// The drain-time check requeued exactly one timeout later, but the
+			// replacement pod became unschedulable a second after that check.
+			// The follow-up must run just after its deadline, not a full
+			// timeout later.
+			name: "pod that started waiting after the previous check is rechecked at its deadline",
+			pods: []*corev1.Pod{runningPod, unscheduledPod("replacement", namespace, now.Add(-timeout+time.Second))},
+			want: time.Second + podSchedulingRequeueSlack,
+		},
+		{
+			name: "earliest deadline among unscheduled pods wins",
+			pods: []*corev1.Pod{
+				unscheduledPod("later", namespace, now.Add(-time.Minute)),
+				unscheduledPod("earlier", namespace, now.Add(-7*time.Minute)),
+			},
+			want: 3*time.Minute + podSchedulingRequeueSlack,
+		},
+		{
+			name: "pod already past its deadline is left to the status check",
+			pods: []*corev1.Pod{unscheduledPod("stuck", namespace, now.Add(-timeout-time.Minute))},
+			want: timeout,
+		},
+		{
+			name: "pods in other namespaces are ignored",
+			pods: []*corev1.Pod{unscheduledPod("elsewhere", "other", now.Add(-timeout+time.Second))},
+			want: timeout,
+		},
+		{
+			name: "pod that just became unschedulable waits the full timeout",
+			pods: []*corev1.Pod{unscheduledPod("new", namespace, now)},
+			want: timeout,
+		},
+		{
+			// The KAI scheduler rewrites the PodScheduled=False transition time on
+			// every scheduling attempt. The deadline is measured from creation, so
+			// it does not move.
+			name: "deadline is measured from creation, not a just-rewritten transition time",
+			pods: []*corev1.Pod{withCreationTimestamp(unscheduledPod("kai", namespace, now), now.Add(-7*time.Minute))},
+			want: 3*time.Minute + podSchedulingRequeueSlack,
+		},
+		{
+			name: "pod created longer ago than the timeout is left to the status check",
+			pods: []*corev1.Pod{withCreationTimestamp(unscheduledPod("kai-stuck", namespace, now), now.Add(-timeout-time.Minute))},
+			want: timeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := make([]client.Object, 0, len(tt.pods))
+			for _, p := range tt.pods {
+				objs = append(objs, p.DeepCopy())
+			}
+			r := &Reconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build(),
+				now:    func() time.Time { return now },
+			}
+			got := r.podSchedulingRequeueAfter(context.Background(), namespace, timeout)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

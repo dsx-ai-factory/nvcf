@@ -245,8 +245,10 @@ samples, so the mean dilutes one outlier sample. Lower means do not reduce it,
 and generation replacement clears it. It is absent until the first max-eligible
 mean. A backend whose fallback usage never reports cached-token details, such
 as Chat traffic without `include_usage`, or whose traffic is only near-full
-cache hits, never gets a maximum this way. Use `--do-calibration` or `--initial-input-tps` for such
-backends, because default Pulsar ranking requires a maximum (see below).
+cache hits, never gets a maximum this way. Default Pulsar falls back to the
+positive finite last mean while the aggregate maximum is absent. Use
+`--do-calibration` or `--initial-input-tps` to establish a stable maximum for
+such backends. Until then, their ranking weights can change with the mean.
 
 Pylon publishes `pylon_model_max_input_tps` when the maximum is known and removes
 the series when the model is removed or replaced with unknown maximum state.

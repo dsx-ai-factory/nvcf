@@ -88,6 +88,11 @@ rules:
   - apiGroups: ["nvsnap.io"]
     resources: ["gpurestores", "gpurestores/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # NvsnapFunction: one per function version the capture records name,
+  # kept from the records (internal/server/function_status.go).
+  - apiGroups: ["nvsnap.io"]
+    resources: ["nvsnapfunctions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -200,7 +205,9 @@ metadata:
   labels:
     {{- include "nvsnap.server.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.server.service.type }}
+  # The server's API deletes checkpoints and labels pods: it gets no
+  # address outside the cluster. server.service.type is not read.
+  type: ClusterIP
   selector:
     {{- include "nvsnap.server.selectorLabels" . | nindent 4 }}
   ports:

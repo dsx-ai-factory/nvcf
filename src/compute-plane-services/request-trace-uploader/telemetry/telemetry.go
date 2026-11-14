@@ -1,0 +1,393 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package telemetry defines the uploader's metric instruments and the small
+// interface the pipeline records them through.
+//
+// Names are backend-neutral. Every series carries one fixed backend label, set
+// once when the recorder is built, so the same dashboard serves every backend.
+// Label keys come from a bounded set and label values must be short tokens, so
+// no identifier, path or error text can become a label. How the instruments
+// are exported, and under which prefix, is the exporter's choice.
+package telemetry
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"regexp"
+	"slices"
+	"sort"
+)
+
+// Kind is the instrument type.
+type Kind int
+
+const (
+	Counter Kind = iota + 1
+	Gauge
+	Histogram
+)
+
+func (k Kind) String() string {
+	switch k {
+	case Counter:
+		return "counter"
+	case Gauge:
+		return "gauge"
+	case Histogram:
+		return "histogram"
+	default:
+		return fmt.Sprintf("kind(%d)", int(k))
+	}
+}
+
+const (
+	// BackendLabel is added by the recorder to every series. Callers never
+	// set it.
+	BackendLabel = "backend"
+	// MaxSeriesPerInstrument bounds label cardinality. Observations that would
+	// add a series past it are dropped.
+	MaxSeriesPerInstrument = 64
+)
+
+// Instrument names. The first group is the required set; the rest cover
+// faults, the spool, batching and startup cleanup.
+const (
+	Uploads              = "uploads"
+	UploadDuration       = "upload.duration"
+	SourceBytes          = "source_bytes"
+	TransportBytes       = "transport_bytes"
+	ConfirmLatency       = "confirm_latency"
+	RecordsDropped       = "records_dropped"
+	Deletions            = "deletions"
+	PendingSegments      = "pending_segments"
+	QuarantinedSegments  = "quarantined_segments"
+	QuarantineEvicted    = "quarantine_evicted"
+	LastSuccessTimestamp = "last_success_timestamp"
+	Uptime               = "uptime"
+
+	RecordsReceived   = "records_received"
+	RecordsUnreadable = "records_unreadable"
+	SubmitsAmbiguous  = "submits_ambiguous"
+	AuthFailures      = "auth_failures"
+	JobsStranded      = "jobs_stranded"
+	SegmentsEvicted   = "segments_evicted"
+	QuarantineTripped = "quarantine_tripped"
+	// QuarantineResumed counts quarantine breaker trips that ended on their
+	// own after the resume time, so intake read new segments again.
+	QuarantineResumed = "quarantine_resumed"
+	SpoolUsedBytes    = "spool_used_bytes"
+	SpoolFreeBytes    = "spool_free_bytes"
+	PendingBytes      = "pending_bytes"
+	OldestPendingAge  = "oldest_pending_age"
+	BatchSegments     = "batch_segments"
+	BatchBytes        = "batch_bytes"
+	BatchSplits       = "batch_splits"
+	// RecordsEvaluated counts records checked against suppression rules,
+	// RecordsSuppressed the records a rule acted on, and
+	// SuppressionHeaderPresent the evaluated records that carried a rule's
+	// header, matched or not. A rule is labeled by its operator-assigned
+	// name, never by a header name or value.
+	RecordsEvaluated         = "records_evaluated"
+	RecordsSuppressed        = "records_suppressed"
+	SuppressionHeaderPresent = "suppression_header_present"
+	// RecordsIncomplete counts payload records whose source says
+	// payload_complete is false.
+	RecordsIncomplete = "records_incomplete"
+	// JobStatusUnknown counts job status reads that returned a job status
+	// the core does not know. The job is treated as still running.
+	JobStatusUnknown = "job_status_unknown"
+	// SegmentsQuarantined counts segments moved to quarantine, by reason. A
+	// reason outside QuarantineReasons is counted as "unknown".
+	SegmentsQuarantined = "segments_quarantined"
+	// PrepareDuration times preparing one segment: reading it, suppression,
+	// redaction, and writing the transport. ExportLatency runs from when a
+	// segment was discovered to when its export was confirmed, once per
+	// segment. With Uploads and UploadDuration they give the rate, errors
+	// and duration of the export path.
+	PrepareDuration = "prepare_duration"
+	ExportLatency   = "export_latency"
+)
+
+// Labels are the attributes of one observation, without BackendLabel.
+type Labels = map[string]string
+
+// Instrument describes one metric.
+type Instrument struct {
+	Name string
+	Kind Kind
+	// Unit uses the UCUM codes OTLP expects: "s", "By", or "1".
+	Unit string
+	// Labels lists the label keys every observation must carry.
+	Labels []string
+	// Values enumerates the allowed values of a label key. A counter whose
+	// keys are all enumerated is preset to zero for every combination.
+	Values map[string][]string
+	// Buckets are a histogram's explicit upper bounds, chosen for its unit.
+	// Other kinds have none.
+	Buckets []float64
+}
+
+// Histogram boundaries by unit.
+var (
+	// secondsBuckets span a sub-second call to a confirmation a day later.
+	secondsBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 21600, 86400}
+	// stepBuckets span a few milliseconds for a small segment to an hour for
+	// one at the size limit on a slow volume.
+	stepBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
+	// bytesBuckets span 1 KiB to the 8 GiB a single job may carry.
+	bytesBuckets = []float64{1 << 10, 16 << 10, 256 << 10, 1 << 20, 4 << 20, 16 << 20, 64 << 20, 256 << 20, 1 << 30, 4 << 30, 8 << 30}
+	// countBuckets span one segment to the 500 files a single job may carry.
+	countBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
+)
+
+var allowedLabelKeys = map[string]bool{
+	BackendLabel:  true,
+	"table":       true,
+	"status":      true,
+	"reason":      true,
+	"record_type": true,
+	"scope":       true,
+	"stage":       true,
+	"kind":        true,
+	"rule":        true,
+	"action":      true,
+}
+
+var labelValuePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
+
+var outcome = map[string][]string{"status": {"success", "failure"}}
+
+// RecordTypes are the record_type label values of RecordsReceived: the
+// event types Dynamo v1.4.0 writes, and "unknown" for any other line.
+var RecordTypes = []string{"request_end", "request_payload", "tool_start", "tool_end", "tool_error", "unknown"}
+
+// payloadRecords is the one record type that carries a request payload in
+// Dynamo v1.4.0.
+var payloadRecords = map[string][]string{"record_type": {"request_payload"}}
+
+// SuppressionActions are the action label values of RecordsSuppressed:
+// what a matching rule did, or "strip_unresolved" for a record strict
+// suppression stripped because the rule's header had no value.
+var SuppressionActions = []string{"strip_payload", "drop_record", "strip_unresolved"}
+
+// QuarantineReasons are the reason label values of SegmentsQuarantined: the
+// reasons prepare, batching and the fault policy record, and the backend
+// fault reasons. "unknown" also counts any reason not listed here.
+var QuarantineReasons = []string{
+	"bad_records", "unreadable", "damaged", "unsupported_version", "too_large", "rejected", "retained",
+	"source_missing", "auth", "rate_limit", "timeout", "interrupted", "unavailable", "unknown",
+	"job_canceled", "not_found", "processing_failed", "upload_unconfirmed", "bad_response",
+}
+
+// The catalog keeps its own copies, so an exported value list changed later
+// cannot change it either.
+var catalog = cloneAll([]Instrument{
+	{Name: Uploads, Kind: Counter, Unit: "1", Labels: []string{"status"}, Values: outcome},
+	{Name: UploadDuration, Kind: Histogram, Unit: "s", Labels: []string{"status"}, Values: outcome, Buckets: secondsBuckets},
+	{Name: SourceBytes, Kind: Counter, Unit: "By"},
+	{Name: TransportBytes, Kind: Counter, Unit: "By"},
+	{Name: ConfirmLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
+	{Name: RecordsDropped, Kind: Counter, Unit: "1", Labels: []string{"record_type", "reason"}},
+	{Name: Deletions, Kind: Counter, Unit: "1", Labels: []string{"status"}, Values: outcome},
+	{Name: PendingSegments, Kind: Gauge, Unit: "1"},
+	{Name: QuarantinedSegments, Kind: Gauge, Unit: "1"},
+	{Name: QuarantineEvicted, Kind: Counter, Unit: "1"},
+	{Name: LastSuccessTimestamp, Kind: Gauge, Unit: "s"},
+	{Name: Uptime, Kind: Gauge, Unit: "s"},
+
+	{Name: RecordsReceived, Kind: Counter, Unit: "1", Labels: []string{"record_type"},
+		Values: map[string][]string{"record_type": RecordTypes}},
+	{Name: RecordsUnreadable, Kind: Counter, Unit: "1", Labels: []string{"reason"}},
+	{Name: SubmitsAmbiguous, Kind: Counter, Unit: "1"},
+	{Name: AuthFailures, Kind: Counter, Unit: "1", Labels: []string{"stage"}, Values: map[string][]string{"stage": {"token", "api"}}},
+	{Name: JobsStranded, Kind: Counter, Unit: "1"},
+	{Name: SegmentsEvicted, Kind: Counter, Unit: "1"},
+	{Name: QuarantineTripped, Kind: Counter, Unit: "1"},
+	{Name: QuarantineResumed, Kind: Counter, Unit: "1"},
+	{Name: SpoolUsedBytes, Kind: Gauge, Unit: "By"},
+	{Name: SpoolFreeBytes, Kind: Gauge, Unit: "By"},
+	{Name: PendingBytes, Kind: Gauge, Unit: "By"},
+	{Name: OldestPendingAge, Kind: Gauge, Unit: "s"},
+	{Name: BatchSegments, Kind: Histogram, Unit: "1", Buckets: countBuckets},
+	{Name: BatchBytes, Kind: Histogram, Unit: "By", Buckets: bytesBuckets},
+	{Name: BatchSplits, Kind: Counter, Unit: "1"},
+	{Name: RecordsEvaluated, Kind: Counter, Unit: "1", Labels: []string{"record_type"},
+		Values: map[string][]string{"record_type": RecordTypes}},
+	{Name: RecordsSuppressed, Kind: Counter, Unit: "1", Labels: []string{"rule", "action"},
+		Values: map[string][]string{"action": SuppressionActions}},
+	{Name: SuppressionHeaderPresent, Kind: Counter, Unit: "1", Labels: []string{"rule"}},
+	{Name: RecordsIncomplete, Kind: Counter, Unit: "1", Labels: []string{"record_type"}, Values: payloadRecords},
+	{Name: JobStatusUnknown, Kind: Counter, Unit: "1"},
+	{Name: SegmentsQuarantined, Kind: Counter, Unit: "1", Labels: []string{"reason"},
+		Values: map[string][]string{"reason": QuarantineReasons}},
+	{Name: PrepareDuration, Kind: Histogram, Unit: "s", Buckets: stepBuckets},
+	{Name: ExportLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
+})
+
+var byName = func() map[string]Instrument {
+	index := make(map[string]Instrument, len(catalog))
+	for _, instrument := range catalog {
+		index[instrument.Name] = instrument
+	}
+	return index
+}()
+
+// Instruments returns copies of the catalog in a stable order.
+func Instruments() []Instrument {
+	return cloneAll(catalog)
+}
+
+// Lookup returns a copy of the instrument named name.
+func Lookup(name string) (Instrument, bool) {
+	instrument, ok := byName[name]
+	return instrument.clone(), ok
+}
+
+// clone returns a copy of i that shares no slice or map with it.
+func (i Instrument) clone() Instrument {
+	i.Labels = slices.Clone(i.Labels)
+	i.Buckets = slices.Clone(i.Buckets)
+	if i.Values != nil {
+		values := make(map[string][]string, len(i.Values))
+		for key, list := range i.Values {
+			values[key] = slices.Clone(list)
+		}
+		i.Values = values
+	}
+	return i
+}
+
+func cloneAll(instruments []Instrument) []Instrument {
+	out := make([]Instrument, len(instruments))
+	for n, instrument := range instruments {
+		out[n] = instrument.clone()
+	}
+	return out
+}
+
+// Metrics records observations. Implementations must not block or fail the
+// caller: an invalid observation, or a broken exporter, is dropped.
+type Metrics interface {
+	// Add increases a counter. A zero delta presets a series.
+	Add(name string, delta float64, labels Labels)
+	// Set replaces a gauge value.
+	Set(name string, value float64, labels Labels)
+	// Observe records one histogram sample.
+	Observe(name string, value float64, labels Labels)
+}
+
+// ValidLabelValue reports whether value is a short lowercase token, the only
+// shape a label value may take. Packages that define label values at startup,
+// such as the backend name, check them with it.
+func ValidLabelValue(value string) error {
+	if !labelValuePattern.MatchString(value) {
+		return fmt.Errorf("telemetry label value %q must match %s", value, labelValuePattern)
+	}
+	return nil
+}
+
+// Validate checks one observation against the catalog. Every recorder calls
+// it, so the bounds hold for any exporter.
+func Validate(kind Kind, name string, value float64, labels Labels) error {
+	instrument, ok := byName[name]
+	if !ok {
+		return fmt.Errorf("unknown instrument %q", name)
+	}
+	if instrument.Kind != kind {
+		return fmt.Errorf("instrument %q is a %v, not a %v", name, instrument.Kind, kind)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("instrument %q value is not finite", name)
+	}
+	if kind == Counter && value < 0 {
+		return fmt.Errorf("counter %q cannot decrease", name)
+	}
+	if len(labels) != len(instrument.Labels) {
+		return fmt.Errorf("instrument %q takes labels %v", name, instrument.Labels)
+	}
+	for _, key := range instrument.Labels {
+		value, ok := labels[key]
+		if !ok {
+			return fmt.Errorf("instrument %q takes labels %v", name, instrument.Labels)
+		}
+		if !labelValuePattern.MatchString(value) {
+			return fmt.Errorf("instrument %q label %q value is not a short lowercase token", name, key)
+		}
+		if allowed, enumerated := instrument.Values[key]; enumerated && !containsString(allowed, value) {
+			return fmt.Errorf("instrument %q label %q must be one of %v", name, key, allowed)
+		}
+	}
+	return nil
+}
+
+var errSeriesLimit = errors.New("series limit reached")
+
+// presetLabels lists every label combination of a fully enumerated
+// instrument, or the empty set for one without labels.
+func presetLabels(instrument Instrument) []Labels {
+	combinations := []Labels{{}}
+	for _, key := range instrument.Labels {
+		values, enumerated := instrument.Values[key]
+		if !enumerated {
+			return nil
+		}
+		next := make([]Labels, 0, len(combinations)*len(values))
+		for _, combination := range combinations {
+			for _, value := range values {
+				labels := Labels{key: value}
+				for k, v := range combination {
+					labels[k] = v
+				}
+				next = append(next, labels)
+			}
+		}
+		combinations = next
+	}
+	return combinations
+}
+
+// Preset records zero for every counter series known before any traffic, so
+// the first export already shows them.
+func Preset(m Metrics) {
+	for _, instrument := range catalog {
+		if instrument.Kind != Counter {
+			continue
+		}
+		for _, labels := range presetLabels(instrument) {
+			m.Add(instrument.Name, 0, labels)
+		}
+	}
+}
+
+func containsString(values []string, value string) bool {
+	for _, v := range values {
+		if v == value {
+			return true
+		}
+	}
+	return false
+}
+
+func seriesKey(labels Labels) string {
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	key := ""
+	for _, k := range keys {
+		key += k + "=" + labels[k] + ","
+	}
+	return key
+}
+
+// Receiver is implemented by a component, such as a backend, that records
+// its own observations. The service hands it the shared recorder, wrapped by
+// Safe, so its series carry the same backend label and limits as the core's.
+// The instrument catalog is closed: Validate rejects any other name, so a
+// component can record only the core's instruments.
+type Receiver interface {
+	UseMetrics(Metrics)
+}

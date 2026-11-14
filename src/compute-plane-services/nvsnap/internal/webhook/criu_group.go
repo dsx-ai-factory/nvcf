@@ -21,6 +21,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/election"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 )
 
 const (
@@ -37,6 +38,10 @@ const (
 	// companion of the instance: a pod without GPUs that its GPU ranks
 	// were connected to (an etcd, a NATS), captured and restored with them.
 	CRIUGroupCompanionAnnotation = "nvsnap.io/criu-group-companion"
+	// CRIUGroupLabel carries the group record key as a label too, so
+	// nvsnap-server can watch a restore's pods by selector and keep its
+	// history (docs/design/FUNCTION-CACHE-STATUS.md, History).
+	CRIUGroupLabel = "nvsnap.io/criu-group"
 )
 
 // CRIUGroup is a complete group capture: the checkpoint of each rank, in
@@ -55,6 +60,10 @@ type CRIUGroup struct {
 	// Bundles names the node bundle version each member's pod mounted (by
 	// slot); its placeholder mounts the same. Empty for none recorded.
 	Bundles []string
+	// ColdEntrypoints holds, by slot, what each GPU rank's runtime ran
+	// ahead of its pod's args, as JSON (ColdEntrypointMeta). Empty for
+	// none recorded.
+	ColdEntrypoints []string
 	// VerifyNamespace, when set, is the only namespace that may restore
 	// from the capture: the instance stopped for it, whose restore
 	// verifies it. Empty once a restore has succeeded.
@@ -117,6 +126,13 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		return nil
 	}
 	size := len(g.Checkpoints)
+	// What became of a rank of a captured instance, for history; a
+	// companion follows its ranks.
+	admit := func(decision, reason string) {
+		if !companion {
+			metrics.CountAdmission(decision, reason)
+		}
+	}
 	var ordinal int
 	if companion {
 		if m.CRIUCompanionAdmits != nil {
@@ -128,6 +144,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	} else {
 		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) {
 			log.WithField("env", name).Info("CRIU group restore: the pod names its own instance in its configuration; it starts from the caches")
+			admit(metrics.AdmitCold, "own-instance")
 			return nil
 		}
 		ranks := m.groupSize(ctx, pod)
@@ -135,6 +152,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		if ranks != g.Ranks() || ordinal >= ranks {
 			log.WithFields(logrus.Fields{"ordinal": ordinal, "size": ranks, "captured": g.Ranks()}).
 				Info("CRIU group restore: the capture is of a different instance size; cold start")
+			admit(metrics.AdmitCold, "size-mismatch")
 			return nil
 		}
 		// Only an instance of several ranks waits for all of them; one
@@ -142,6 +160,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		if ranks > 1 && m.CRIUGroupAdmits != nil {
 			if ok, why := m.CRIUGroupAdmits(ctx, pod); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the instance cannot restore as a group; cold start")
+				admit(metrics.AdmitCold, "not-restorable-as-group")
 				return nil
 			}
 		}
@@ -150,6 +169,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		for _, id := range g.Checkpoints {
 			if m.CRIURestoreBlocked(ctx, id) {
 				log.WithField("checkpoint", id).Warn("CRIU group restore: a checkpoint of this group failed to restore before; cold start")
+				admit(metrics.AdmitCold, "checkpoint-blocked")
 				return nil
 			}
 		}
@@ -175,10 +195,17 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	if ordinal < len(g.Bundles) && g.Bundles[ordinal] != "" {
 		man.SourcePodMeta[BundleMeta] = g.Bundles[ordinal]
 	}
+	if ordinal < len(g.ColdEntrypoints) && g.ColdEntrypoints[ordinal] != "" {
+		man.SourcePodMeta[ColdEntrypointMeta] = g.ColdEntrypoints[ordinal]
+	}
 	id := g.Checkpoints[ordinal]
-	cp, err := m.criuRestorePatches(pod, id, man)
+	// A capture of one pod with no companions restores alone: nothing it
+	// waits on is a placeholder, so it runs its init containers like a
+	// lone placeholder.
+	cp, err := m.criuPlaceholderPatches(pod, id, man, len(g.Checkpoints) > 1)
 	if err != nil {
 		log.WithError(err).Warn("CRIU group restore: cannot prepare the pod; cold start")
+		admit(metrics.AdmitCold, "prepare-failed")
 		return nil
 	}
 	cp = append(cp,
@@ -186,6 +213,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupOrdinalAnnotation), Value: strconv.Itoa(ordinal)},
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupSizeAnnotation), Value: strconv.Itoa(size)},
 	)
+	cp = append(cp, newMetaPatcher(pod).label(CRIUGroupLabel, key)...)
 	if companion {
 		cp = append(cp, PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupCompanionAnnotation), Value: "true"})
 		log.WithFields(logrus.Fields{"checkpoint": id, "slot": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its instance's companion placeholder")
@@ -198,10 +226,12 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	vp, err := m.placeholderModelPatches(ctx, pod)
 	if err != nil {
 		log.WithError(err).Warn("CRIU group restore: the captured pod's model landing is not available; cold start")
+		admit(metrics.AdmitCold, "model-unavailable")
 		return nil
 	}
 	cp = append(cp, newMetaPatcher(pod).annotation(CacheURIAnnotation, uri)...)
 	log.WithFields(logrus.Fields{"checkpoint": id, "ordinal": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its rank's restore placeholder")
+	admit(metrics.AdmitRestore, "")
 	return mergePatchPlan(withPIDReserve(pod, append(cp, vp...)))
 }
 

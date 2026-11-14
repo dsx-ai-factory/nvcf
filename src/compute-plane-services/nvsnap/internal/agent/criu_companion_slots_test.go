@@ -37,7 +37,7 @@ func TestCompanionAliasNamesIdenticalSlots(t *testing.T) {
 			"companion.1": "true", "companion.2": "true", "companion.3": "true"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	a.criuRestorer().writeGroupAliases(ctx, key, "fv", uris, 1, logrus.NewEntry(logrus.New()))
+	a.criuRestorer().writeGroupAliases(ctx, key, "fv", 0, uris, 1, logrus.NewEntry(logrus.New()))
 	g, ok := a.lookupCRIUGroup(ctx, criuGroupKey("cache://frontend", "fv"))
 	if !ok || !slices.Equal(g.CompanionSlots(), []int{1, 3}) {
 		t.Fatalf("frontend alias: slots %v (%v)", g.Slots, ok)

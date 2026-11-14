@@ -1,0 +1,5 @@
+# The runbook, read by internal/agent's TestAlertRulesAreTestedAndDocumented.
+exports_files(
+    ["RUNBOOK.md"],
+    visibility = ["//src/compute-plane-services/nvsnap/internal/agent:__pkg__"],
+)

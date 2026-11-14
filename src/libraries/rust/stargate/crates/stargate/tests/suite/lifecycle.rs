@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -496,6 +497,102 @@ async fn active_canary_failure_checks_health_before_recovery() {
     case.wait_for_routing(BRINGUP_TIMEOUT).await;
     case.assert_serves("canary-health-recovered").await;
     case.shutdown().await;
+}
+
+#[tokio::test]
+async fn overloaded_canary_keeps_an_idle_model_routable_while_another_model_serves() {
+    init_crypto();
+    let topology = start_lifecycle_topology(REVERSE, StargateTopology::Single).await;
+    let busy_model = "lifecycle-overload-busy-model";
+    let idle_model = "lifecycle-overload-idle-model";
+    let backend_id = "lifecycle-overload-backend";
+    let mut registration =
+        LifecycleBackendOptions::serving(backend_id, &[busy_model, idle_model], busy_model)
+            .await
+            .with_bringup(active_canary_bringup())
+            .register(&topology, REVERSE)
+            .await;
+    let backend = &registration.backend;
+    for &http_addr in &topology.http_addrs {
+        wait_for_routing(http_addr, busy_model, BRINGUP_TIMEOUT).await;
+        wait_for_routing(http_addr, idle_model, BRINGUP_TIMEOUT).await;
+    }
+
+    // Requests for one model keep the shared backend producing output while
+    // it rejects canaries as overloaded.
+    let stop_traffic = Arc::new(AtomicBool::new(false));
+    let served = Arc::new(AtomicUsize::new(0));
+    let traffic = spawn_model_traffic(
+        topology.http_addrs[0],
+        busy_model.to_string(),
+        served.clone(),
+        stop_traffic.clone(),
+    );
+    wait_requests!(served.load(Ordering::SeqCst); reaches 1, "served busy-model requests");
+    backend.set_canary_overloaded(true);
+
+    // Requests for the idle model would skip its canaries, so watch routing
+    // instead; a demotion that a recovery canary later undoes still shows.
+    let routable =
+        format!(r#"stargate_active_inference_servers{{model="{idle_model}",routing_key=""}} 1"#);
+    let rejected_canaries = backend.canary_requests() + 10;
+    tokio::time::timeout(STATUS_TIMEOUT, async {
+        while backend.canary_requests() < rejected_canaries {
+            for handle in &topology.handles {
+                let metrics = gathered_metrics(handle);
+                assert!(
+                    metrics.lines().any(|line| line == routable),
+                    "the idle model left routing while its canaries were rejected as overloaded"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("overloaded idle-model canaries should keep running");
+    topology
+        .assert_serving(idle_model, backend_id, "overload-idle-model")
+        .await;
+
+    stop_traffic.store(true, Ordering::SeqCst);
+    traffic.await.expect("model traffic task failed");
+    registration.stop();
+    topology.shutdown().await;
+}
+
+/// Sends streaming requests for `model` one after another until stopped and
+/// counts the ones served with 200.
+fn spawn_model_traffic(
+    http_addr: SocketAddr,
+    model: String,
+    served: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let http_client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let mut request_index = 0;
+        while !stop.load(Ordering::SeqCst) {
+            request_index += 1;
+            let request = with_proxy_headers(
+                http_client.post(format!("http://{http_addr}/v1/chat/completions")),
+                &model,
+                &format!("overload-busy-model-{request_index}"),
+            )
+            .header("content-type", "application/json")
+            .json(&body);
+            if let Ok(response) = request.send().await
+                && response.status() == StatusCode::OK
+                && response.text().await.is_ok()
+            {
+                served.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    })
 }
 
 #[tokio::test]
@@ -1588,18 +1685,12 @@ async fn wait_active_count(topology: &LifecycleTopology, model: &str, count: usi
     let expected =
         format!(r#"stargate_active_inference_servers{{model="{model}",routing_key=""}} {count}"#);
     for handle in &topology.handles {
-        let registry = handle.metrics().registry();
         wait_until(
             &format!("metrics containing {expected:?}"),
             Duration::from_secs(5),
             Duration::from_millis(100),
             || async {
-                let encoder = TextEncoder::new();
-                let mut buffer = Vec::new();
-                encoder
-                    .encode(&registry.gather(), &mut buffer)
-                    .expect("encode metrics");
-                let metrics = String::from_utf8(buffer).expect("metrics must be utf8");
+                let metrics = gathered_metrics(handle);
                 metrics
                     .lines()
                     .any(|line| line == expected)
@@ -1609,6 +1700,15 @@ async fn wait_active_count(topology: &LifecycleTopology, model: &str, count: usi
         )
         .await;
     }
+}
+
+fn gathered_metrics(handle: &StargateHandle) -> String {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&handle.metrics().registry().gather(), &mut buffer)
+        .expect("encode metrics");
+    String::from_utf8(buffer).expect("metrics must be utf8")
 }
 
 async fn wait_cluster_stats(

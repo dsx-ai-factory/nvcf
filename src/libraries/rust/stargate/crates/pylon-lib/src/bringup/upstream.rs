@@ -117,8 +117,6 @@ pub(super) async fn send_canary_request(
         "messages": [{"role": "user", "content": "1+1="}],
         "max_tokens": canary_max_generation_threshold,
         "seed": 33,
-        "temperature": 0.7,
-        "top_p": 1.0,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -381,6 +379,12 @@ impl BringupError {
             Self::Http(error) => error.is_timeout() && !error.is_connect(),
             _ => false,
         }
+    }
+
+    /// Returns whether the upstream rejected the request as overloaded. 529 is
+    /// Dynamo's default status for a model whose workers are all busy.
+    pub(crate) fn is_overloaded(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if status.as_u16() == 529)
     }
 }
 

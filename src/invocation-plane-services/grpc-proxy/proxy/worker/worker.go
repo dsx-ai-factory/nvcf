@@ -19,6 +19,7 @@ package worker
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"nvcf-grpc-proxy/proxy/metrics"
 	"nvcf-grpc-proxy/proxy/pool"
 	"nvcf-grpc-proxy/proxy/rp"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +40,7 @@ import (
 )
 
 func NewWorkerConnection(requestId uuid.UUID, functionId, functionVersionId string, onActive, onInactive func()) *WorkerConnection {
+	tunnelCtx, endTunnel := context.WithCancel(context.Background())
 	return &WorkerConnection{
 		RequestId:         requestId,
 		FunctionId:        functionId,
@@ -45,9 +48,16 @@ func NewWorkerConnection(requestId uuid.UUID, functionId, functionVersionId stri
 		AttachmentId:      uuid.New(),
 		CreatedAt:         time.Now(),
 		connPopulated:     make(chan struct{}),
+		tunnelCtx:         tunnelCtx,
+		endTunnel:         endTunnel,
 		onActive:          onActive,
 		onInactive:        onInactive,
 	}
+}
+
+// TunnelContext is done once this tunnel has closed, from either side.
+func (w *WorkerConnection) TunnelContext() context.Context {
+	return w.tunnelCtx
 }
 
 // SetCloseOrigin records why this tunnel is being torn down. First writer
@@ -100,6 +110,11 @@ type WorkerConnection struct {
 	closedAt      atomic.Pointer[time.Time]
 	connSetOnce   sync.Once
 	connPopulated chan struct{}
+	// Ended when the tunnel closes. See TunnelContext.
+	tunnelCtx context.Context
+	endTunnel context.CancelFunc
+	// Set by the first RPC forwarded over this attachment. See ClaimFirstRpc.
+	rpcClaimed atomic.Bool
 	// Set only where a worker actually attaches. See EverConnected.
 	everConnected   atomic.Bool
 	handler         atomic.Pointer[httputil.ReverseProxy]
@@ -186,6 +201,13 @@ func (w *WorkerConnection) MarkEnded() bool {
 	return w.attachment.Swap(attachmentEnded) == attachmentEstablished
 }
 
+// ClaimFirstRpc reports whether the caller is the first RPC forwarded over
+// this attachment. Only that RPC is reported to the event ledger, which keeps
+// the event volume at one pair per attachment.
+func (w *WorkerConnection) ClaimFirstRpc() bool {
+	return w.rpcClaimed.CompareAndSwap(false, true)
+}
+
 func (w *WorkerConnection) WorkerClosed() bool {
 	select {
 	case <-w.connPopulated:
@@ -205,7 +227,20 @@ func (w *WorkerConnection) SetConnection(conn net.Conn) error {
 			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
 			w.SetCloseError(wrapped.FirstError())
 			w.MarkClosed(time.Now())
+			w.endTunnel()
 			w.onInactive()
+		}
+		// After an upgrade, ReverseProxy closes the client side as soon as the
+		// worker goes, which would record client_closed. Record the worker as
+		// the cause first, when a read or write shows it is gone.
+		wrapped.onPeerGone = func() {
+			// Copy the error before signalling the tunnel: client cleanup can
+			// evict this connection before onClose runs, and the eviction log
+			// would otherwise report no close error.
+			w.SetCloseError(wrapped.FirstError())
+			w.SetCloseOrigin(metrics.CloseReasonWorkerClosed)
+			w.MarkClosed(time.Now())
+			w.endTunnel()
 		}
 		dialOnce := atomic.Bool{}
 		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -282,6 +317,7 @@ func (w *WorkerConnection) Close() error {
 	w.connSetOnce.Do(func() {
 		close(w.connPopulated)
 	})
+	w.endTunnel()
 	w.handler.Store(nil)
 	var err error
 	if w.closeWorkerConn != nil {
@@ -315,6 +351,10 @@ type errBox struct{ err error }
 type CloseFuncConn struct {
 	net.Conn
 	onClose func()
+	// onPeerGone runs when a read or write fails on a connection the proxy has
+	// not closed itself: the worker ended it or stopped answering.
+	onPeerGone func()
+	closing    atomic.Bool
 	// firstErr is the first transport error seen on this connection. Recorded
 	// on Read and Write rather than in Close, because by the time Close runs
 	// the underlying cause has usually been discarded. First writer wins: the
@@ -330,6 +370,13 @@ func (c *CloseFuncConn) Read(b []byte) (int, error) {
 
 func (c *CloseFuncConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
+	// A write deadline hit after partial progress is not worker loss: the
+	// HTTP/2 transport (writeWithByteTimeout) keeps writing the remainder with
+	// a fresh deadline. Only a timeout with no progress, or any other error,
+	// is terminal.
+	if n > 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+		return n, err
+	}
 	c.recordErr(err)
 	return n, err
 }
@@ -339,6 +386,9 @@ func (c *CloseFuncConn) recordErr(err error) {
 		return
 	}
 	c.firstErr.CompareAndSwap(nil, &errBox{err: err})
+	if c.onPeerGone != nil && !c.closing.Load() {
+		c.onPeerGone()
+	}
 }
 
 // FirstError returns the first transport error seen, or nil if the connection
@@ -351,6 +401,7 @@ func (c *CloseFuncConn) FirstError() error {
 }
 
 func (c *CloseFuncConn) Close() error {
+	c.closing.Store(true)
 	c.onClose()
 	return c.Conn.Close()
 }

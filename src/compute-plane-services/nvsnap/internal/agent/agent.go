@@ -33,12 +33,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	k8sevents "k8s.io/client-go/tools/record"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
@@ -65,6 +68,13 @@ type Config struct {
 	// CRIUGhostLimit bounds, in bytes, the contents of one deleted file a
 	// dump saves (criu --ghost-limit); 0 is defaultGhostLimit.
 	CRIUGhostLimit int64
+	// CRIUMinDriverMajor is the oldest NVIDIA driver major CRIU serves on;
+	// 0 is DefaultCRIUMinDriverMajor (driver_gate.go).
+	CRIUMinDriverMajor int
+	// RestoreCapturedAddress gives a restored pod the captured pod address
+	// on its loopback, translated at its edge, when no other pod uses it
+	// (restore_address.go).
+	RestoreCapturedAddress bool
 	// CheckpointHostDir is the host filesystem path that backs CheckpointDir
 	// inside the agent container. The capture-write writer Job consumes
 	// CaptureSource.SrcPath as a host path (joined with /host), so the
@@ -173,6 +183,11 @@ type Config struct {
 	// ModelVolume enables the write-once model volume for Helm functions.
 	ModelVolume ModelVolumeConfig
 
+	// Rails is the rails tier of EnsureLocal: checkpoint copies between
+	// nodes over their RDMA NICs with bedrock-peer (rails_fetch.go). Off
+	// unless Rails.Image is set.
+	Rails RailsConfig
+
 	// Replication is the opt-in cross-cluster replication config (the L4
 	// tier). See docs/design/cross-cluster-replication.md. When
 	// Replication.ObjectStore.Provider AND HomeBucket are both non-empty,
@@ -221,7 +236,7 @@ type ObjectStoreConfig struct {
 }
 
 // ElectionConfig configures the admission election
-// (docs/design/helm-chart-cache-election.md).
+// (docs/ARCHITECTURE.md, section 7).
 type ElectionConfig struct {
 	// Enabled turns the election on. Default off until qualified.
 	Enabled bool
@@ -245,7 +260,7 @@ type ModelVolumeConfig struct {
 	HostRoot string
 	// RefreshDisabled turns cache set refresh off; RefreshCooldown is the
 	// least time between generations of one set (zero: 6 hours).
-	// docs/design/helm-chart-cache-refresh.md.
+	// docs/ARCHITECTURE.md, section 7.
 	RefreshDisabled bool
 	RefreshCooldown time.Duration
 	// ReapInterval is how often the reaper removes read-only model PVs
@@ -302,6 +317,11 @@ const DefaultWriterPullSecret = "nvsnap-agent-pull" //nolint:gosec // secret nam
 
 // Agent is the NVSNAP node agent
 type Agent struct {
+	// drivers is the cluster's GPU drivers as the agents report them
+	// (driver_gate.go).
+	drivers driverView
+	// ownDriver is this node's driver major once read; 0 before.
+	ownDriver atomic.Int64
 	// freezes are this node's members waiting at a group capture's freeze point.
 	freezes freezePoints
 	// holds are this node's member pods frozen for a group capture
@@ -322,8 +342,19 @@ type Agent struct {
 	// webhook's SpecCacheURI); nil when the webhook is off.
 	specCacheURI    func(*corev1.Pod) (string, bool)
 	criuRestoreOnce sync.Once
+	// railsRunning holds the cancelled rails fetches that may still write
+	// into their checkpoint directories, by checkpoint (rails_fetch.go).
+	railsRunning sync.Map
+	// railsFetches counts the fetches this node's rails pod runs
+	// (railsFetchStarted).
+	railsFetchMu sync.Mutex
+	railsFetches int
 	// checkpointing holds the pods being checkpointed (namespace/pod).
 	checkpointing sync.Map
+	// companionMu serializes mounting a bundle version on its companion
+	// directory with releasing and removing it (companion_tools.go), so
+	// two mounts are never stacked there and none outlives the version.
+	companionMu sync.Mutex
 
 	config     Config
 	log        *logrus.Logger
@@ -376,6 +407,21 @@ type Agent struct {
 	// enabled; populated by startRootfsCapture before the webhook
 	// server starts.
 	kubeClient kubernetes.Interface
+
+	// dynClient reads custom resources (grove_replicas.go); nil without
+	// a kube client.
+	dynClient dynamic.Interface
+
+	// groveReplicas, when set, reads a namespace's Grove scaling groups'
+	// replicas in place of the API (grove_replicas.go); for tests.
+	groveReplicas func(ctx context.Context, ns string) (map[string]int, error)
+
+	// gpuProducts caches node name -> GPU product (lifecycle_metrics.go).
+	gpuProducts sync.Map
+	// events records what pods' captures, restores and starts did on the
+	// pods (lifecycle_metrics.go); made once the kube client is.
+	eventsOnce sync.Once
+	events     k8sevents.EventRecorder
 
 	// peerLoad counts this agent's in-flight peer fetches per peer
 	// URL. Used by EnsureLocal to pick the least-loaded peer when
@@ -532,6 +578,9 @@ func New(cfg Config) (*Agent, error) {
 // Run starts the agent
 func (a *Agent) Run(ctx context.Context) error {
 	metrics.RegisterAgent()
+	// Every agent exports nvsnap_build_info, whatever its capture method,
+	// so a missing series means an agent is not scraped.
+	a.publishBuildInfo()
 	// A capture this agent was holding pods for ended with its last run.
 	a.recoverPodHolds(a.log.WithField("subsys", "pod-hold"))
 	// So did a dump it was running: replace what it may have left stopped.
@@ -737,7 +786,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err := a.startCRIUAutoRestore(ctx); err != nil {
 		a.log.WithError(err).Error("CRIU auto-restore failed to start; CRIU captures will not restore into new pods")
 	}
+	a.startCaptureInventory(ctx)
+	a.startDriverReport(ctx)
 	a.startGPUShareStoreReaper(ctx)
+	a.sweepRailsPods(ctx)
+	a.startRailsServeReaper(ctx)
 	if a.modelVolume != nil {
 		// Completes writer volumes and binds them into pending readers on
 		// this node (docs/design/helm-shared-model-volume.md).
@@ -873,7 +926,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveOperations.WithLabelValues("restore").Inc()
 	start := time.Now()
 
-	result, err := a.Restore(r.Context(), req)
+	result, err := a.restoreProbed(r.Context(), req)
 
 	metrics.ActiveOperations.WithLabelValues("restore").Dec()
 	duration := time.Since(start).Seconds()
@@ -882,7 +935,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RestoreTotal.WithLabelValues("failed", workload, "default").Inc()
 		a.log.WithError(err).Error("Restore failed")
-		http.Error(w, fmt.Sprintf("restore failed: %v", err), http.StatusInternalServerError)
+		writeRestoreFailure(w, err)
 		return
 	}
 

@@ -1,0 +1,292 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# promtool unit tests of prometheus-rules.yaml (run files/test-rules.sh).
+# Counter series start at 0, as the agent exports them (first_sight.go).
+rule_files:
+- prometheus-rules.yaml
+evaluation_interval: 1m
+tests:
+- name: a failed restore fires, with its reason; a restored one does not
+  interval: 1m
+  input_series:
+  - series: nvsnap_restore_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="criu",gpu="GB300",ranks="2-4"}
+    values: 0 0 1 1 1
+  - series: nvsnap_restore_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="restored",reason="",gpu="GB300",ranks="2-4"}
+    values: 0 1 2 3 4
+  alert_rule_test:
+  - eval_time: 1m
+    alertname: NvsnapRestoreFailed
+    exp_alerts: []
+  - eval_time: 4m
+    alertname: NvsnapRestoreFailed
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        reason: criu
+        gpu: GB300
+        ranks: 2-4
+      exp_annotations:
+        summary: An NvSnap restore failed (criu, GB300, 2-4 ranks).
+        description: A restore ran and failed in the last 30 minutes; its pods are replaced and start again. Restores on a GPU the probe found faulty are counted as gpu-fault, not here.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnaprestorefailed
+- name: a failed restore stops firing once 30 minutes have passed without another
+  interval: 1m
+  input_series:
+  - series: nvsnap_restore_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="timeout",gpu="GB300",ranks="5-8"}
+    values: 0 1x45
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: NvsnapRestoreFailed
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        reason: timeout
+        gpu: GB300
+        ranks: 5-8
+      exp_annotations:
+        summary: An NvSnap restore failed (timeout, GB300, 5-8 ranks).
+        description: A restore ran and failed in the last 30 minutes; its pods are replaced and start again. Restores on a GPU the probe found faulty are counted as gpu-fault, not here.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnaprestorefailed
+  - eval_time: 40m
+    alertname: NvsnapRestoreFailed
+    exp_alerts: []
+- name: restores that cannot run fire from the third in 30 minutes
+  interval: 1m
+  input_series:
+  - series: nvsnap_restore_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="not-run",reason="fetch",gpu="GB300",ranks="2-4"}
+    values: 0 1 2 2 2 2 3 3
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: NvsnapRestoreNotRunRepeatedly
+    exp_alerts: []
+  - eval_time: 7m
+    alertname: NvsnapRestoreNotRunRepeatedly
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        reason: fetch
+        gpu: GB300
+        ranks: 2-4
+      exp_annotations:
+        summary: NvSnap restores could not run 3 or more times in 30 minutes (fetch).
+        description: A restore that cannot run (its checkpoint could not be fetched, its placeholders never ran) is tried again with new pods; this many in a row means it is not getting anywhere.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnaprestorenotrunrepeatedly
+- name: a rank killed at the end of its grace period fires; released teardowns do not
+  interval: 1m
+  input_series:
+  - series: nvsnap_teardown_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",outcome="released",gpu="GB300",ranks="2-4"}
+    values: 0 4 8 12
+  - series: nvsnap_teardown_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",outcome="deadline",gpu="GB300",ranks="2-4"}
+    values: 0 0 0 1
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: NvsnapTeardownKilled
+    exp_alerts: []
+  - eval_time: 3m
+    alertname: NvsnapTeardownKilled
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        gpu: GB300
+        ranks: 2-4
+      exp_annotations:
+        summary: A restored NvSnap rank was killed before its peers exited (GB300, 2-4 ranks).
+        description: Its grace period ran out while the group teardown waited for every rank of the restore to exit. Its GPUs may come back only after the driver recovers them.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapteardownkilled
+- name: failed and unverified captures fire; captured and verified ones, and the workload's own failures, do not
+  interval: 1m
+  input_series:
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="workload_exited",gpu="GB300",ranks="2-4"}
+    values: 0 1 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="no_gpu_process",gpu="GB300",ranks="2-4"}
+    values: 0 1 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="captured",reason="",gpu="GB300",ranks="2-4"}
+    values: 0 1 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="verified",reason="",gpu="GB300",ranks="2-4"}
+    values: 0 0 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="unverified",reason="",gpu="GB300",ranks="2-4"}
+    values: 0 0 1
+  - series: nvsnap_capture_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="gpushare",gpu="GB300",ranks="5-8"}
+    values: 0 1 1
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: NvsnapCaptureFailed
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        outcome: unverified
+        gpu: GB300
+        ranks: 2-4
+      exp_annotations:
+        summary: An NvSnap capture ended unverified (GB300, 2-4 ranks).
+        description: 'failed: the capture itself failed. gpushare-failed: the pod never started under the GPU library. unverified: the capture restored but its pods never served. The configuration''s next
+          deployment captures again, up to its limit.'
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapcapturefailed
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        outcome: failed
+        reason: gpushare
+        gpu: GB300
+        ranks: 5-8
+      exp_annotations:
+        summary: An NvSnap capture ended failed (GB300, 5-8 ranks).
+        description: 'failed: the capture itself failed. gpushare-failed: the pod never started under the GPU library. unverified: the capture restored but its pods never served. The configuration''s next
+          deployment captures again, up to its limit.'
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapcapturefailed
+- name: no agent scraped fires after 15 minutes; one up agent keeps it quiet
+  interval: 1m
+  input_series:
+  - series: up{job="nvsnap-agent",pod="nvsnap-agent-a"}
+    values: 1 1 1 1 1 _x30
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: NvsnapAgentMetricsMissing
+    exp_alerts: []
+  - eval_time: 15m
+    alertname: NvsnapAgentMetricsMissing
+    exp_alerts: []
+  - eval_time: 30m
+    alertname: NvsnapAgentMetricsMissing
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+      exp_annotations:
+        summary: No NvSnap agent has been scraped for 15 minutes.
+        description: Prometheus has no up series of a reachable nvsnap-agent. Either NvSnap is not running or its ServiceMonitor is not being read; none of the other NvSnap alerts can fire meanwhile.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapagentmetricsmissing
+- name: an agent down for 15 minutes fires, by pod
+  interval: 1m
+  input_series:
+  - series: up{job="nvsnap-agent",pod="nvsnap-agent-a"}
+    values: 1 0x20
+  - series: up{job="nvsnap-agent",pod="nvsnap-agent-b"}
+    values: 1x20
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: NvsnapAgentDown
+    exp_alerts: []
+  - eval_time: 17m
+    alertname: NvsnapAgentDown
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        job: nvsnap-agent
+        pod: nvsnap-agent-a
+      exp_annotations:
+        summary: NvSnap agent nvsnap-agent-a has not been scraped for 15 minutes.
+        description: Pods on this node are not captured or restored, and a restored instance's teardown on it is not driven.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapagentdown
+- name: webhook errors for 10 minutes fire; successful answers do not
+  interval: 1m
+  input_series:
+  - series: nvsnap_webhook_requests_total{job="nvsnap-agent",pod="nvsnap-agent-a",code="200"}
+    values: 0+10x30
+  - series: nvsnap_webhook_requests_total{job="nvsnap-agent",pod="nvsnap-agent-a",code="500"}
+    values: 0x5 0+6x25
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: NvsnapWebhookErrors
+    exp_alerts: []
+  - eval_time: 25m
+    alertname: NvsnapWebhookErrors
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+      exp_annotations:
+        summary: The NvSnap admission webhook has answered with errors for 10 minutes.
+        description: 'The webhook fails open: pods it errors on start cold, without NvSnap (100m errors/s).'
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapwebhookerrors
+- name: ranks the webhook never mutated fire, by reason
+  interval: 1m
+  input_series:
+  - series: nvsnap_admissions_total{job="nvsnap-agent",pod="nvsnap-agent-a",decision="restore",reason="captured"}
+    values: 0 1 2
+  - series: nvsnap_admissions_total{job="nvsnap-agent",pod="nvsnap-agent-a",decision="missed",reason="webhook-failed-open"}
+    values: 0 0 1
+  alert_rule_test:
+  - eval_time: 2m
+    alertname: NvsnapAdmissionMissed
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+        reason: webhook-failed-open
+      exp_annotations:
+        summary: 'Pods of a captured instance started without NvSnap: webhook-failed-open.'
+        description: The agents found ranks of an instance the webhook never mutated (it failed open, or the pod opts out) in the last hour; those ranks start cold.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapadmissionmissed
+- name: the inventory fires when no agent leads it, and when its scans stop
+  interval: 1m
+  input_series:
+  - series: nvsnap_inventory_leader{job="nvsnap-agent",pod="nvsnap-agent-a"}
+    values: '0x60'
+  - series: nvsnap_inventory_leader{job="nvsnap-agent",pod="nvsnap-agent-b"}
+    values: _x15 1x45
+  - series: nvsnap_inventory_scan_timestamp_seconds{job="nvsnap-agent",pod="nvsnap-agent-b"}
+    values: _x15 960+60x15 1860x30
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: NvsnapInventoryStale
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+      exp_annotations:
+        summary: The NvSnap capture-record inventory has not been updated for 10 minutes.
+        description: 'No agent exports the inventory of capture records, or its scans fail: the cached-capture panels show stale or no data.'
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapinventorystale
+  - eval_time: 30m
+    alertname: NvsnapInventoryStale
+    exp_alerts: []
+  - eval_time: 55m
+    alertname: NvsnapInventoryStale
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+      exp_annotations:
+        summary: The NvSnap capture-record inventory has not been updated for 10 minutes.
+        description: 'No agent exports the inventory of capture records, or its scans fail: the cached-capture panels show stale or no data.'
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapinventorystale
+- name: a capture verifying for over 3 hours fires; abandoned ones are their own state
+  interval: 1m
+  input_series:
+  - series: nvsnap_capture_record_oldest_seconds{job="nvsnap-agent",pod="nvsnap-agent-b",state="verifying"}
+    values: 10000+60x30
+  - series: nvsnap_capture_record_oldest_seconds{job="nvsnap-agent",pod="nvsnap-agent-b",state="abandoned"}
+    values: 900000+60x30
+  alert_rule_test:
+  - eval_time: 5m
+    alertname: NvsnapCaptureStuckVerifying
+    exp_alerts: []
+  - eval_time: 30m
+    alertname: NvsnapCaptureStuckVerifying
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: nvsnap
+      exp_annotations:
+        summary: An NvSnap capture has been verifying for 3h 16m 40s.
+        description: Its namespace still runs, and no restore of it has served or failed. Until it does, only that namespace restores from it.
+        runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapcapturestuckverifying
+# Why the agent creates a series at 0 before its first event: a counter
+# first scraped at 1 has no increase, and its failure is never alerted.
+- name: a counter first scraped at 1 is not counted (internal/metrics/first_sight.go)
+  interval: 1m
+  input_series:
+  - series: nvsnap_restore_outcomes_total{job="nvsnap-agent",pod="nvsnap-agent-a",method="criu",outcome="failed",reason="criu",gpu="GB300",ranks="2-4"}
+    values: 1 1 1 1 1
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: NvsnapRestoreFailed
+    exp_alerts: []

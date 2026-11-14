@@ -43,6 +43,11 @@ pub const DEFAULT_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(30);
 /// reload lands and adds a second value.
 pub const SERVER_IDENTITY_MATERIAL: &str = "server_identity";
 
+/// Request streams a tunnel client lets its peer open on one connection. Each
+/// proxied request holds a stream until it finishes, so quinn's default of 100
+/// would cap a backend far below its advertised concurrency.
+pub const MAX_CONCURRENT_TUNNEL_STREAMS: u32 = 16_384;
+
 /// Result of attempting to activate changed TLS material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsReloadOutcome {

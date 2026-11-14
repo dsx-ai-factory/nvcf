@@ -44,10 +44,14 @@ import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.logging.log4j.util.Strings;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
 
+// Refresh-scoped so a changed sidecar image pull secret reaches new task launches
+// without a restart.
 @Service
+@RefreshScope
 @Slf4j
 public class RegistryCredentialService {
     private static final String MESG_COMMON_ERROR_PREFIX =

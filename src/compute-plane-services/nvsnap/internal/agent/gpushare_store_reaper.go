@@ -55,6 +55,10 @@ func (a *Agent) reapNode(ctx context.Context, now time.Time) {
 	a.reapGPUShareStores(pods.Items, now)
 	a.reapCheckpoints(ctx, pods.Items, now)
 	a.reapBundleVersions(pods.Items, now)
+	a.syncCompanionTools()
+	if criuIsDefault() {
+		a.criuRestorer().resolveAbandonedVerifies(ctx, now)
+	}
 }
 
 func (a *Agent) reapGPUShareStores(pods []corev1.Pod, now time.Time) {

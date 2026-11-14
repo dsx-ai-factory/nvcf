@@ -11,48 +11,20 @@
 // able to export without any additional wiring.
 //
 // It links no backend that carries NVIDIA-internal dependencies. A
-// distribution that needs one, such as Kratos Bulk Upload, imports it in its
-// own main and reuses the packages here.
+// distribution that needs one imports it in its own main and reuses the
+// packages here. Startup is runner.Run, which every such main calls, so
+// distributions differ only in their backend imports and options.
 package main
 
 import (
-	"context"
-	"errors"
-	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/runner"
 
 	_ "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/debug"
 	_ "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/objectstore"
 )
 
 func main() {
-	cfg, warnings, err := config.LoadFromEnv()
-	if err != nil {
-		slog.Error("invalid request trace uploader configuration", "error", err)
-		os.Exit(1)
-	}
-	for _, warning := range warnings {
-		slog.Warn("request trace uploader configuration fallback", "setting", warning)
-	}
-
-	slog.Info("request trace uploader starting", "backend", cfg.Backend, "compiled_backends", backend.Registered())
-
-	svc, err := service.New(cfg)
-	if err != nil {
-		slog.Error("create request trace uploader service", "error", err)
-		os.Exit(1)
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := svc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("request trace uploader stopped", "error", err)
-		os.Exit(1)
-	}
+	os.Exit(runner.Run("oss"))
 }
