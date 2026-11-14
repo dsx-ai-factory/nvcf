@@ -1087,6 +1087,10 @@ api:
   {{- end }}
   {{- if $apiRemoteConfigData }}
   remoteConfig:
+    {{- with dig "api" "remoteConfig" "workerImageTags" dict .Values }}
+    workerImageTags:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
     configData:
       {{- toYaml $apiRemoteConfigData | nindent 6 }}
   {{- end }}

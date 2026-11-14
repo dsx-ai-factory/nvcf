@@ -90,4 +90,51 @@ assert_value "$work_dir/openbao-bridge.yaml" '.openbao.jwtPluginLifecycle.mode =
 # The upgrade receipt hook uses the same alpine/k8s as the API bootstrap job.
 test "$(yq -r '.image.tag' "$stack_dir/charts/nvcf-upgrade-receipt/values.yaml")" = "1.37.0" || fail "upgrade receipt helper image is not alpine/k8s 1.37.0"
 
+# Component releases of the 1.1.1 patch, selected by the stack (the charts default to older tags).
+cat >"$test_stack_dir/environments/$environment_name.yaml" <<'YAML'
+global:
+  image:
+    registry: registry.example.com
+    repository: example/nvcf
+addons:
+  llm:
+    enabled: true
+  vanityGateway:
+    enabled: true
+YAML
+render_values 02-core.yaml.gotmpl llm-request-router "$work_dir/router.yaml"
+assert_value "$work_dir/router.yaml" '.llmRequestRouter.image.tag == "0.29.3"' "stargate (and pylon) is not 0.29.3"
+render_values 02-core.yaml.gotmpl vanity-gateway "$work_dir/vanity.yaml"
+assert_value "$work_dir/vanity.yaml" '.vanityGateway.image.tag == "1.42.2"' "vanity gateway is not 1.42.2"
+render_values 02-core.yaml.gotmpl sis "$work_dir/sis.yaml"
+assert_value "$work_dir/sis.yaml" '.sis.image.tag == "0.8.6"' "ICMS is not 0.8.6"
+render_values 02-core.yaml.gotmpl api "$work_dir/api.yaml"
+assert_value "$work_dir/api.yaml" '.api.remoteConfig.workerImageTags.llmCredentials == "1.2.3"' "worker llm credentials is not 1.2.3"
+render_values 03-observability.yaml.gotmpl function-autoscaler "$work_dir/autoscaler.yaml"
+assert_value "$work_dir/autoscaler.yaml" '.functionautoscaler.image.tag == "1.23.2"' "function autoscaler is not 1.23.2"
+
+# Operator overrides of these tags still win.
+cat >"$test_stack_dir/environments/$environment_name.yaml" <<'YAML'
+global:
+  image:
+    registry: registry.example.com
+    repository: example/nvcf
+sis:
+  image:
+    tag: 9.9.9
+functionAutoscaler:
+  image:
+    tag: 9.9.8
+api:
+  remoteConfig:
+    workerImageTags:
+      llmCredentials: 9.9.7
+YAML
+render_values 02-core.yaml.gotmpl sis "$work_dir/sis-override.yaml"
+assert_value "$work_dir/sis-override.yaml" '.sis.image.tag == "9.9.9"' "operator ICMS tag was lost"
+render_values 03-observability.yaml.gotmpl function-autoscaler "$work_dir/autoscaler-override.yaml"
+assert_value "$work_dir/autoscaler-override.yaml" '.functionautoscaler.image.tag == "9.9.8"' "operator function autoscaler tag was lost"
+render_values 02-core.yaml.gotmpl api "$work_dir/api-override.yaml"
+assert_value "$work_dir/api-override.yaml" '.api.remoteConfig.workerImageTags.llmCredentials == "9.9.7"' "operator worker llm credentials tag was lost"
+
 echo "self-managed-111-pins: ok"

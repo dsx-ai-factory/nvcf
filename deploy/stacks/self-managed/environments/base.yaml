@@ -177,6 +177,8 @@ observability:
 
 # Defaults consumed only for the control and all observability profiles.
 functionAutoscaler:
+  image:
+    tag: "1.23.2"
   # Additional application settings. Environment variables use `__` between
   # nested keys, for example SCALING__LOOKBACK_SECONDS.
   env: {}
@@ -209,6 +211,10 @@ api:
   # (NVCF_ESS_WORKER_BASE_URL) stays on essServiceURL.
   essBaseURL: ""
   remoteConfig:
+    # Worker image tags the API advertises. The API chart defaults to older
+    # worker releases, so the stack selects the ones of this release.
+    workerImageTags:
+      llmCredentials: "1.2.3"
     configData:
       nvcf:
         sidecars:
@@ -489,7 +495,7 @@ addons:
       # Keep router and Pylon on the same release. This tag also selects the
       # Pylon sidecar advertised by the API.
       image:
-        tag: "0.29.2"
+        tag: "0.29.3"
       # replicaCount defaults to the request-router chart value. Set it here
       # only when the stack needs a different topology.
       # replicaCount: 3
@@ -615,8 +621,9 @@ addons:
     enabled: false
     replicaCount: 2
     image:
-      # Optional image tag override. Leave empty to use the chart appVersion.
-      tag: ""
+      # Optional image tag override. The default is the vanity gateway release
+      # of this stack; empty would fall back to the chart appVersion.
+      tag: "1.42.2"
       pullPolicy: IfNotPresent
     config:
       mappingPath: /etc/vanity-gateway/config/config.yaml
@@ -677,6 +684,11 @@ rateLimiter:
 # false to skip it when scheduling workers through an external/production ICMS.
 icms:
   enabled: true
+
+# The SIS chart defaults to an older ICMS image; the stack selects this release.
+sis:
+  image:
+    tag: "0.8.6"
 
 # PDB knobs for control-plane services. Disabled by default.
 # Set enabled: true for any service running more than one replica.
