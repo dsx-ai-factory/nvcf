@@ -311,3 +311,96 @@ func TestDecodeConfigReportsInvalidYAMLFromDecoder(t *testing.T) {
 	assert.False(t, errors.As(err, &conflict))
 	assert.ErrorContains(t, err, "read config: ")
 }
+
+// TestDecodeConfigLegacyLogChunkingOverrideWinsOverChartValue reproduces the
+// legacy-override precedence defect named in nvbugs#6884625: the chart-
+// generated base spells the setting byooLogChunking.maxPayloadBytes, while the
+// cluster-spec override spells the same setting BYOOLogChunking.maxBodyBytes.
+// The override input must win, and the effective config must be identical on
+// every decode so the operator does not keep restarting the agent.
+func TestDecodeConfigLegacyLogChunkingOverrideWinsOverChartValue(t *testing.T) {
+	chartGenerated := []byte(`agent:
+  byooLogChunking:
+    dryRun: false
+    maxPayloadBytes: 131072
+`)
+	legacyOverride := []byte(`agent:
+  BYOOLogChunking:
+    dryRun: false
+    exporterBatchMaxSizeBytes: 1000000
+    maxBodyBytes: 262144
+`)
+	var first string
+	for i := range 20 {
+		cfg, err := DecodeConfig(chartGenerated, legacyOverride)
+		require.NoError(t, err)
+		completed := cfg.Complete()
+		encoded, err := EncodeConfig(completed)
+		require.NoError(t, err)
+		if i == 0 {
+			first = string(encoded)
+		}
+		require.Equal(t, first, string(encoded),
+			"the effective agent config must be identical on every decode")
+		require.Equal(t, int64(262144), completed.Agent.BYOOLogChunking.MaxPayloadBytes,
+			"the legacy BYOOLogChunking/maxBodyBytes override must set the effective log chunk size")
+	}
+}
+
+// TestDecodeConfigCanonicalPayloadSizeWinsWithinOneInput checks that the alias
+// only fills in a missing canonical spelling: a block that already spells
+// maxPayloadBytes keeps that value even next to the deprecated key.
+func TestDecodeConfigCanonicalPayloadSizeWinsWithinOneInput(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(`agent:
+  byooLogChunking:
+    maxBodyBytes: 262144
+    maxPayloadBytes: 131072
+`))
+	require.NoError(t, err)
+	assert.Equal(t, int64(131072), cfg.Agent.BYOOLogChunking.MaxPayloadBytes)
+}
+
+func TestAliasDeprecatedKeysAddsCanonicalPayloadSize(t *testing.T) {
+	aliased := aliasDeprecatedKeys([]byte(`agent:
+  BYOOLogChunking:
+    maxBodyBytes: 262144
+`))
+	assert.Contains(t, string(aliased), "maxPayloadBytes: 262144")
+	assert.Contains(t, string(aliased), "maxBodyBytes: 262144")
+}
+
+func TestAliasDeprecatedKeysLeavesOtherInputUnchanged(t *testing.T) {
+	unrelated := []byte("agent:\n  byooOtelCollector:\n    maxBodyBytes: 1\n")
+	assert.Equal(t, unrelated, aliasDeprecatedKeys(unrelated))
+
+	canonical := []byte("agent:\n  byooLogChunking:\n    maxPayloadBytes: 1\n")
+	assert.Equal(t, canonical, aliasDeprecatedKeys(canonical))
+
+	invalid := []byte("agent: [")
+	assert.Equal(t, invalid, aliasDeprecatedKeys(invalid))
+}
+
+// TestDecodeConfigChartFoldedLegacyOverrideKeepsPayloadSize feeds DecodeConfig the
+// agent-config-merge payload this checkout's chart renders for the nvbugs#6884625
+// legacy override: the uppercase agent.BYOOLogChunking block is folded onto the
+// chart's own byooLogChunking spelling, so the deprecated maxBodyBytes: 262144 sits
+// next to the chart default maxPayloadBytes: 0.
+//
+// aliasMaxBodyBytes stops as soon as any maxPayloadBytes key is present, so the
+// explicit zero default suppresses the alias and the decoded config carries the
+// chart default instead of the operator's override.
+func TestDecodeConfigChartFoldedLegacyOverrideKeepsPayloadSize(t *testing.T) {
+	chartFolded := []byte(`agent:
+  byooLogChunking:
+    dryRun: false
+    exporterBatchMaxSizeBytes: 1000000
+    maxBodyBytes: 262144
+    maxPayloadBytes: 0
+`)
+
+	cfg, err := DecodeConfig(chartFolded)
+	require.NoError(t, err)
+	assert.Equal(t, int64(262144), cfg.Agent.BYOOLogChunking.MaxBodyBytes)
+	assert.Equal(t, int64(262144), cfg.Agent.BYOOLogChunking.MaxPayloadBytes,
+		"the legacy maxBodyBytes override must survive the chart default maxPayloadBytes: 0")
+}
