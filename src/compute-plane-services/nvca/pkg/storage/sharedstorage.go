@@ -210,8 +210,8 @@ func (r *Reconciler) doSharedStorageSMB(ctx context.Context,
 		for _, obj := range objsToCreate {
 			if err := r.applyControlled(ctx, st, obj); err != nil && !k8serrors.IsAlreadyExists(err) {
 				log.Error(err, "failed to create shared-storage object", "name", obj.GetName())
-				// If the error is forbidden, fail
-				if k8serrors.IsForbidden(err) || k8serrors.IsInvalid(err) {
+				// If the API server permanently rejected the object, fail
+				if nvcak8sutil.IsPermanentK8sRejection(err) {
 					rerr = failSharedStorageObjectCreate(stCopy, obj, err)
 					goto done
 				}
@@ -311,8 +311,8 @@ func (r *Reconciler) doSharedStorageSMB(ctx context.Context,
 		for _, obj := range objsToCreate {
 			if err := r.applyControlled(ctx, st, obj); err != nil && !k8serrors.IsAlreadyExists(err) {
 				log.Error(err, "failed to create shared-storage object", "name", obj.GetName())
-				// If the error is forbidden, fail
-				if k8serrors.IsForbidden(err) || k8serrors.IsInvalid(err) {
+				// If the API server permanently rejected the object, fail
+				if nvcak8sutil.IsPermanentK8sRejection(err) {
 					rerr = failSharedStorageObjectCreate(stCopy, obj, err)
 					goto done
 				}
@@ -367,7 +367,7 @@ func (r *Reconciler) doSharedStorageSMB(ctx context.Context,
 							phaseOp.AccessMode,
 							phaseOp.Capacity)
 						if err := r.applyControlled(ctx, st, pvc); err != nil && !k8serrors.IsAlreadyExists(err) {
-							if k8serrors.IsForbidden(err) || k8serrors.IsInvalid(err) {
+							if nvcak8sutil.IsPermanentK8sRejection(err) {
 								rerr = failSharedStorageObjectCreate(stCopy, pvc, err)
 								goto done
 							}

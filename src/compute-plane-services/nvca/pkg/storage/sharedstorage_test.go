@@ -1372,3 +1372,54 @@ func TestDoSharedStorageSMB_CreatingPVCRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestDoSharedStorageSMB_PodCreatePermanentlyRejected(t *testing.T) {
+	ctx := newTestContext()
+
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "request entity too large",
+			err:  apierrors.NewRequestEntityTooLargeError("limit is 3145728"),
+		},
+		{
+			name: "bad request",
+			err:  apierrors.NewBadRequest("pod nvcf-smb-server has an invalid resource quantity"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-permanent-" + strings.ReplaceAll(tt.name, " ", "-")},
+			}
+			stReq := &nvcav1new.StorageRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "shared-storage",
+					Namespace: namespace.Name,
+					Labels:    map[string]string{"function-version-id": "test-function"},
+				},
+				Spec: nvcav1new.StorageRequestSpec{
+					Type: nvcav1new.SharedStorageRequest,
+					SharedStorage: &nvcav1new.SharedStorageSpec{
+						SMBContainerImage: "smb:latest",
+						Size:              resource.MustParse("1Gi"),
+					},
+				},
+				Status: nvcav1new.StorageRequestStatus{Phase: nvcav1new.StoragePending},
+			}
+			stCopy := stReq.DeepCopy()
+			r := &Reconciler{Client: newPodCreateErrorClient(tt.err, namespace), fff: &featureflagmock.Fetcher{}}
+
+			_, err := r.doSharedStorageSMB(ctx, stReq, stCopy)
+			require.Error(t, err)
+			assert.Equal(t, nvcav1new.StorageFailed, stCopy.Status.Phase,
+				"a permanent API rejection of the SMB pod must fail the request, not be retried forever")
+			assert.True(t, isTerminal(err), "a permanent API rejection must not be retried")
+			cond := meta.FindStatusCondition(stCopy.Status.Conditions, ConditionTypeSharedStorageResourcesCreated)
+			require.NotNil(t, cond, "the rejection must reach the StorageRequest, not only the agent log")
+			assert.Equal(t, ConditionReasonAdmissionRejected, cond.Reason)
+			assert.Contains(t, cond.Message, SMBServerPodName)
+		})
+	}
+}

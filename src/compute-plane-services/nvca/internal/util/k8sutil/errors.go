@@ -17,7 +17,11 @@ limitations under the License.
 
 package k8sutil
 
-import "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8serr"
+import (
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8serr"
+)
 
 // IsTransientK8sError returns true for Kubernetes API errors that are expected
 // to resolve on retry without human intervention: k8serr.IsTransient, which
@@ -25,6 +29,17 @@ import "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/
 // this package.
 func IsTransientK8sError(err error) bool {
 	return k8serr.IsTransient(err)
+}
+
+// IsPermanentK8sRejection returns true for Kubernetes API rejections that
+// retrying cannot fix because the submitted object itself must change:
+// schema or admission validation failures, authorization denials, malformed
+// requests and objects that are too large.
+func IsPermanentK8sRejection(err error) bool {
+	return apierrors.IsInvalid(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsRequestEntityTooLargeError(err)
 }
 
 // AnyNonTransientK8sError returns the first non-transient error from the slice,
