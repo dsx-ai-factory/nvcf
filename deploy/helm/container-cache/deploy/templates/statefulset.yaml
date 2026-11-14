@@ -126,6 +126,11 @@ spec:
           volumeMounts:
             - name: certs
               mountPath: /certs
+      # fs.inotify.max_user_instances is accounted per (uid, user namespace).
+      # Every cache pod runs as uid 1000, so without a user namespace of its
+      # own the sysctl below is a budget shared by every replica on the node
+      # and later replicas still exhaust it on first bring-up.
+      hostUsers: false
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
