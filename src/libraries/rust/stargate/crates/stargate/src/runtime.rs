@@ -661,6 +661,7 @@ mod tests {
                     tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
                     quic_insecure: true,
                     tunnel_protocol: Default::default(),
+                    reverse_tunnel_liveness: Default::default(),
                     direct_quic_connections: 1,
                 },
                 retry: Default::default(),

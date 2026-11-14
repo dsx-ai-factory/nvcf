@@ -22,7 +22,9 @@ use stargate::auth::OpenAuthenticator;
 use stargate::discovery::{
     Discovery, DnsDiscovery, HeadlessDnsDiscovery, HeadlessDnsDiscoveryConfig, SelfOnlyDiscovery,
 };
-use stargate::proxy::{ProxyRetryConfig, ProxyTransportConfig, QuicTunnelConfig};
+use stargate::proxy::{
+    ProxyRetryConfig, ProxyTransportConfig, QuicTunnelConfig, ReverseTunnelLiveness,
+};
 use stargate::runtime::{
     BoundStargateListeners, ReverseTunnelConfig, StargateRuntime, StargateRuntimeConfig,
     WarmupConfig,
@@ -146,9 +148,26 @@ pub(super) fn proxy_transport_config_from_args(args: &Args) -> Result<ProxyTrans
             quic_insecure: args.quic_insecure,
             tunnel_protocol: args.tunnel_protocol,
             direct_quic_connections: args.direct_quic_connections,
+            reverse_tunnel_liveness: reverse_tunnel_liveness_from_args(args)?,
         },
         retry,
     })
+}
+
+/// Reads the reverse tunnel QUIC keep-alive and idle timeout, rejecting a
+/// keep-alive that would not fire before the idle timeout closes the tunnel.
+fn reverse_tunnel_liveness_from_args(args: &Args) -> Result<ReverseTunnelLiveness> {
+    let liveness = ReverseTunnelLiveness {
+        keep_alive_interval: Duration::from_millis(args.reverse_tunnel_keep_alive_interval_ms),
+        max_idle_timeout: Duration::from_millis(args.reverse_tunnel_max_idle_timeout_ms),
+    };
+    if liveness.keep_alive_interval >= liveness.max_idle_timeout {
+        bail!(
+            "--reverse-tunnel-keep-alive-interval-ms must be less than \
+             --reverse-tunnel-max-idle-timeout-ms"
+        );
+    }
+    Ok(liveness)
 }
 
 pub(super) fn bind_reverse_tunnel_from_args(args: &Args) -> Result<Option<ReverseTunnelConfig>> {

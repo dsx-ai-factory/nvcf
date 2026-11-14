@@ -285,6 +285,12 @@ struct Args {
     /// Timeout waiting for a reverse tunnel connection after registration.
     #[arg(long, default_value_t = 10000, value_name = "MS")]
     reverse_tunnel_connect_timeout_ms: u64,
+    /// QUIC keep-alive interval Stargate sends on reverse tunnels; must be below the max idle timeout.
+    #[arg(long, default_value_t = 5000, value_parser = parse_nonzero_millis, value_name = "MS")]
+    reverse_tunnel_keep_alive_interval_ms: u64,
+    /// QUIC max idle timeout for reverse tunnels; bounds how long a Pylon that vanished without closing its tunnel keeps receiving requests.
+    #[arg(long, default_value_t = 15000, value_parser = parse_nonzero_millis, value_name = "MS")]
+    reverse_tunnel_max_idle_timeout_ms: u64,
     /// Tunnel protocol used for proxied request streams; must match pylon.
     #[arg(long, default_value_t = TunnelTransportProtocol::RawQuic, value_name = "PROTOCOL")]
     tunnel_protocol: TunnelTransportProtocol,
@@ -479,7 +485,7 @@ mod tests {
     use std::time::Duration;
 
     use parking_lot::Mutex;
-    use stargate::proxy::{ProxyRetryConfig, ProxyTransportConfig};
+    use stargate::proxy::{ProxyRetryConfig, ProxyTransportConfig, ReverseTunnelLiveness};
     use stargate_tls::ServerTlsIdentity;
 
     use super::startup::{
@@ -602,6 +608,46 @@ mod tests {
         assert_eq!(config.quic.direct_quic_connections, 3);
         assert_eq!(config.quic.tunnel_protocol, TunnelTransportProtocol::Http3);
         assert!(config.quic.quic_insecure);
+    }
+
+    #[test]
+    fn reverse_tunnel_liveness_defaults_and_overrides_parse() {
+        assert_eq!(
+            proxy_transport(&parse_args(""))
+                .quic
+                .reverse_tunnel_liveness,
+            ReverseTunnelLiveness {
+                keep_alive_interval: Duration::from_secs(5),
+                max_idle_timeout: Duration::from_secs(15),
+            }
+        );
+        let args = parse_args(
+            "--reverse-tunnel-keep-alive-interval-ms 250 \
+             --reverse-tunnel-max-idle-timeout-ms 1000",
+        );
+        assert_eq!(
+            proxy_transport(&args).quic.reverse_tunnel_liveness,
+            ReverseTunnelLiveness {
+                keep_alive_interval: Duration::from_millis(250),
+                max_idle_timeout: Duration::from_millis(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_tunnel_liveness_rejects_zero_and_late_keep_alive() {
+        assert_parse_error(
+            "--reverse-tunnel-keep-alive-interval-ms 0",
+            "greater than 0",
+        );
+        assert_parse_error("--reverse-tunnel-max-idle-timeout-ms 0", "greater than 0");
+        let args = parse_args(
+            "--reverse-tunnel-keep-alive-interval-ms 1000 \
+             --reverse-tunnel-max-idle-timeout-ms 1000",
+        );
+        let err = proxy_transport_config_from_args(&args)
+            .expect_err("keep-alive at the idle timeout cannot keep the tunnel open");
+        assert_error_contains(&err, "must be less than");
     }
 
     fn make_discovery_with_resolver(

@@ -49,6 +49,34 @@ pub struct QuicTunnelConfig {
     pub tls_reload_interval: Duration,
     pub quic_insecure: bool,
     pub tunnel_protocol: TunnelTransportProtocol,
+    /// QUIC liveness settings applied to the reverse tunnel listener.
+    pub reverse_tunnel_liveness: ReverseTunnelLiveness,
+}
+
+/// QUIC liveness settings for reverse tunnels accepted from Pylon.
+///
+/// QUIC peers use the smaller of their two idle timeouts, so the Stargate value
+/// bounds how long a Pylon that vanished without closing its tunnel keeps
+/// receiving requests. Stargate also sends the keep-alive itself, so quiet but
+/// healthy tunnels stay open under the shorter timeout whatever the Pylon sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReverseTunnelLiveness {
+    pub keep_alive_interval: Duration,
+    pub max_idle_timeout: Duration,
+}
+
+impl ReverseTunnelLiveness {
+    pub const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+}
+
+impl Default for ReverseTunnelLiveness {
+    fn default() -> Self {
+        Self {
+            keep_alive_interval: Self::DEFAULT_KEEP_ALIVE_INTERVAL,
+            max_idle_timeout: Self::DEFAULT_MAX_IDLE_TIMEOUT,
+        }
+    }
 }
 
 pub struct StreamingResponse {

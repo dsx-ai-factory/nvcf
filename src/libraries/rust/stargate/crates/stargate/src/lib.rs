@@ -81,7 +81,7 @@ pub mod telemetry {
 
 pub mod proxy {
     pub use crate::http_proxy::{ProxyRetryConfig, ProxyTransportConfig};
-    pub use crate::tunnel::QuicTunnelConfig;
+    pub use crate::tunnel::{QuicTunnelConfig, ReverseTunnelLiveness};
 }
 
 pub mod registration {

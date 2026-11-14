@@ -13,12 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use quinn::ClientConfig;
 use tracing::info;
 
 use stargate_protocol::TunnelTransportProtocol;
 use stargate_tls::ServerTlsIdentity;
+
+use super::ReverseTunnelLiveness;
 
 pub(super) fn build_client_config(
     cert_pem: Option<&[u8]>,
@@ -33,12 +37,28 @@ pub(super) fn build_client_config(
     )
 }
 
+/// Builds the reverse listener's QUIC server config.
+///
+/// Every server config for the reverse listener, including the ones rebuilt on
+/// TLS reload, goes through here so the liveness settings survive rotation.
 pub(super) fn build_server_config(
     tls_identity: &ServerTlsIdentity,
     tunnel_protocol: TunnelTransportProtocol,
+    liveness: ReverseTunnelLiveness,
 ) -> Result<quinn::ServerConfig> {
     if matches!(tls_identity, ServerTlsIdentity::SelfSigned) {
         info!("no TLS cert/key provided, generating self-signed certificate");
     }
-    stargate_tls::build_quic_server_config(tls_identity, tunnel_protocol.alpn_protocols())
+    let mut config =
+        stargate_tls::build_quic_server_config(tls_identity, tunnel_protocol.alpn_protocols())?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        liveness
+            .max_idle_timeout
+            .try_into()
+            .context("reverse tunnel max idle timeout must fit QUIC transport parameters")?,
+    ));
+    transport.keep_alive_interval(Some(liveness.keep_alive_interval));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
