@@ -28,6 +28,51 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+// TestIsTransientCSIMountPathErrors pins the NVMesh first-provision CSI mount
+// failures reported in nvbugs#6471949: kubelet surfaces them as plain strings
+// while mkfs.xfs runs on a freshly provisioned container-cache volume, they
+// clear on retry once the filesystem exists, and so must be requeued quietly
+// rather than escalated as hard reconcile failures. Permanent CSI rejections
+// must stay non-transient.
+func TestIsTransientCSIMountPathErrors(t *testing.T) {
+	const vol = "pvc-cc401d5b-7bb2-400b-9e10-8f15c5c50efd"
+
+	deadline := fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+		"rpc error: code = DeadlineExceeded desc = context deadline exceeded", vol)
+	busy := fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+		"rpc error: code = Internal desc = mkfs failed 1  mkfs.xfs: cannot open "+
+		"/dev/nvmesh/csi-cc401d5b-7bb2-400b: Device or resource busy", vol)
+
+	tests := []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{name: "mount device deadline exceeded", err: deadline, transient: true},
+		{name: "wrapped mount device deadline exceeded", err: fmt.Errorf("mounting cache volume: %w", deadline), transient: true},
+		{name: "mkfs device or resource busy", err: busy, transient: true},
+		{name: "wrapped mkfs device or resource busy", err: fmt.Errorf("mounting cache volume: %w", busy), transient: true},
+		{
+			name: "invalid argument",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = InvalidArgument desc = volume capability not supported", vol),
+			transient: false,
+		},
+		{
+			name: "permission denied",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = PermissionDenied desc = not authorized", vol),
+			transient: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.transient, IsTransient(tt.err))
+		})
+	}
+}
+
 func TestIsTransient(t *testing.T) {
 	gr := schema.GroupResource{Group: "test", Resource: "things"}
 
@@ -132,6 +177,59 @@ func TestIsTransient(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.transient, IsTransient(tt.err))
+		})
+	}
+}
+
+// TestIsTransientNVMeshFirstProvisionMountErrors covers the errors the NVMesh
+// CSI node plugin surfaces through kubelet while it creates the XFS filesystem
+// on a freshly provisioned container-cache volume (nvbugs#6471949). They are
+// expected and transient - the volume comes up clean once mkfs finishes - so
+// this classifier must not report them as hard failures, which is what makes a
+// caller surface them as reconcile failures instead of a quiet requeue.
+func TestIsTransientNVMeshFirstProvisionMountErrors(t *testing.T) {
+	const vol = "pvc-cc401d5b-7bb2-400b-9e10-8f15c5c50efd"
+
+	deadlineErr := fmt.Errorf(
+		"MountVolume.MountDevice failed for volume %q: "+
+			"rpc error: code = DeadlineExceeded desc = context deadline exceeded", vol)
+
+	busyErr := fmt.Errorf(
+		"MountVolume.MountDevice failed for volume %q: "+
+			"rpc error: code = Internal desc = mkfs failed 1  mkfs.xfs: cannot open "+
+			"/dev/nvmesh/csi-cc401d5b-7bb2-400b: Device or resource busy", vol)
+
+	// Same message seen one wrapping level deeper, as a caller propagates it.
+	wrappedBusyErr := fmt.Errorf("mounting model cache volume: %w", busyErr)
+
+	assert.True(t, IsTransient(deadlineErr),
+		"NVMesh first-provision MountDevice DeadlineExceeded must be transient, got hard failure")
+	assert.True(t, IsTransient(busyErr),
+		"NVMesh mkfs.xfs 'Device or resource busy' during filesystem creation must be transient, got hard failure")
+	assert.True(t, IsTransient(wrappedBusyErr),
+		"wrapped NVMesh mkfs.xfs 'Device or resource busy' must be transient, got hard failure")
+
+	// Edge cases that must stay non-transient: a permanent CSI rejection and a
+	// capability mismatch never resolve on retry.
+	permanentErrs := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "invalid argument",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = InvalidArgument desc = volume capability not supported", vol),
+		},
+		{
+			name: "permission denied",
+			err: fmt.Errorf("MountVolume.MountDevice failed for volume %q: "+
+				"rpc error: code = PermissionDenied desc = not authorized", vol),
+		},
+	}
+	for _, tt := range permanentErrs {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.False(t, IsTransient(tt.err),
+				"permanent CSI error must not be suppressed as transient")
 		})
 	}
 }

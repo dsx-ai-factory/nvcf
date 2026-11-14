@@ -126,9 +126,30 @@ spec:
           volumeMounts:
             - name: certs
               mountPath: /certs
+      {{- if (.Values.inotify).enabled }}
+      # fs.inotify.max_user_instances is accounted per (uid, user namespace).
+      # Every cache pod runs as uid 1000, so without a user namespace of its
+      # own the sysctl below is a budget shared by every replica on the node
+      # and later replicas still exhaust it on first bring-up.
+      hostUsers: false
+      {{- end }}
       securityContext:
         runAsUser: 1000
         runAsGroup: 1000
+      {{- if (.Values.inotify).enabled }}
+        sysctls:
+          # On first bring-up of the cache volumes every replica starts
+          # watching the freshly provisioned filesystem at once, which
+          # exhausts the common node default of 128 inotify instances per
+          # user and makes the pods log "failed to create fsnotify watcher:
+          # too many open files" until they are manually restarted.
+          # This sysctl is not on the Kubernetes safe list: the kubelet admits
+          # it only with --allowed-unsafe-sysctls. Clusters that have not
+          # opted in must set inotify.enabled=false, otherwise the pod is
+          # rejected with SysctlForbidden.
+          - name: fs.inotify.max_user_instances
+            value: {{ (.Values.inotify).maxUserInstances | default 1024 | quote }}
+      {{- end }}
       serviceAccountName: container-cache
     {{- with $.Values.images.secrets }}
       imagePullSecrets:

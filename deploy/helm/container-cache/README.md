@@ -337,6 +337,8 @@ CRI-O requires a separate listening port per registry (unlike containerd which u
 | `vault.vaultAddress` | `https://vault.example.com` | Vault server URL |
 | `vault.certLocation` | `""` | URL to download CA cert (vault mode) |
 | `vault.intermediateCertTTL` | `336h` | Lifetime requested for the Vault-issued signing intermediate (Vault duration format; 336h is 14 days) |
+| `inotify.enabled` | `true` | Request `fs.inotify.max_user_instances` on the cache pod (together with `hostUsers: false`, so the budget is the pod's own). This sysctl is not on the Kubernetes safe list, so the kubelet must be started with `--allowed-unsafe-sysctls fs.inotify.max_user_instances`; set this to `false` on clusters that have not opted in, otherwise the pods are rejected with `SysctlForbidden` |
+| `inotify.maxUserInstances` | `1024` | Value requested for `fs.inotify.max_user_instances` when `inotify.enabled=true` |
 
 When `vault.enabled=false`, the bundled TLS certificates from the `images.certificates` image are used. The proxy dynamically generates leaf certificates signed by the bundled intermediate CA.
 
