@@ -166,16 +166,20 @@ func TestLoadStrictRejectsUnknownSettings(t *testing.T) {
 // added or removed here must be added or removed there too.
 func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 	want := []string{
-		EnvAttemptTimeout, EnvAuditPrefix, EnvBackend, EnvDebugVerbosity,
-		EnvDrainTimeout, EnvHealthAddr, EnvMaxJobAge, EnvMaxRetries,
+		EnvAttemptTimeout, EnvAuditPrefix, EnvAuthMaxBackoff, EnvBackend,
+		EnvBatchMaxBytes, EnvBatchMaxSegments, EnvCreateBurst,
+		EnvCreatesPerMinute, EnvDebugVerbosity, EnvDrainTimeout,
+		EnvHealthAddr, EnvMaxJobAge, EnvMaxRetries,
 		EnvObjectStoreBucket, EnvObjectStoreDryRun, EnvObjectStoreEndpoint,
 		EnvObjectStoreKeyPrefix, EnvObjectStorePathStyle, EnvObjectStoreRegion,
 		EnvOperationTimeout, EnvQuarantineDir, EnvQuarantineResume,
 		EnvQuarantineTrip, EnvRedactMultimodal,
-		EnvRetryInitialBackoff, EnvRetryMaximumBackoff, EnvRetryMultiplier,
-		EnvScanInterval, EnvSecretsFile, EnvSegmentPrefix, EnvSourceDir,
+		EnvRetryAfterMax, EnvRetryInitialBackoff, EnvRetryMaximumBackoff,
+		EnvRetryMultiplier, EnvScanInterval, EnvSecretsFile,
+		EnvSegmentPrefix, EnvSegmentScopeFailures, EnvSourceDir,
 		EnvStateDir, EnvStatusInterval, EnvSuppressHeaderless,
-		EnvSuppressionRules, EnvSuppressionStrict, EnvSuppressNCAHeaders, EnvSuppressNCAIDs,
+		EnvSuppressionRules, EnvSuppressionStrict, EnvSuppressNCAHeaders,
+		EnvSuppressNCAIDs, EnvUnconfirmedResends,
 	}
 	var got []string
 	for name := range knownSettings() {
