@@ -16,10 +16,17 @@
  */
 package com.nvidia.icms.outbound.apikeys;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.Scheduler;
+import com.github.benmanes.caffeine.cache.Ticker;
 import com.nvidia.icms.errors.IcmsAuthenticationException;
 import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResult;
-import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationRequest;
+import com.nvidia.icms.outbound.exception.ApiKeysException;
+import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -30,32 +37,66 @@ public class ApiKeysService {
 
     public static final String API_KEY_FAILURE_ERROR = "Invalid authentication token";
 
-    private final ApiKeysRequestHandler requestHandler;
-    private final String policyName;
-    private final String requestPropertyName;
+    private final ApiKeysClient apiKeysClient;
+    private final String audienceServiceId;
+    private final LoadingCache<String, ApiKeyValidationResult> apiKeysCache;
+    private final Cache<String, ApiKeyValidationResult> apiKeysBackupCache;
 
+    @Autowired
     public ApiKeysService(
-            ApiKeysRequestHandler requestHandler,
-            @Value("${icms.api-keys.package-name}") String packageName,
-            @Value("${icms.api-keys.policy-name}") String policyName,
-            @Value("${icms.api-keys.request-property-name:apiKey}") String requestPropertyName) {
-        this.requestHandler = requestHandler;
-        this.policyName = String.format("%s.%s", packageName, policyName);
-        this.requestPropertyName = requestPropertyName;
+            ApiKeysClient apiKeysClient,
+            @Value("${icms.api-keys.audience-service-id:}") String audienceServiceId) {
+        this(apiKeysClient, audienceServiceId, Ticker.systemTicker());
     }
 
-    // TODO: Cache authz result instead of always calling ApiKeys
-    public ApiKeyValidationResult fetchValidationResult(String apiKey) {
-        ApiKeyValidationRequest request = ApiKeyValidationRequest.builder()
-                .jsonField(requestPropertyName, apiKey)
+    ApiKeysService(ApiKeysClient apiKeysClient, String audienceServiceId, Ticker ticker) {
+        this.apiKeysClient = apiKeysClient;
+        this.audienceServiceId = audienceServiceId;
+        this.apiKeysCache = Caffeine.newBuilder()
+                .maximumSize(512).expireAfterWrite(Duration.ofMinutes(1))
+                .ticker(ticker)
+                .scheduler(Scheduler.systemScheduler())
+                .build(this::loadValidationResult);
+        this.apiKeysBackupCache = Caffeine.newBuilder()
+                .maximumSize(512).expireAfterWrite(Duration.ofMinutes(60))
+                .ticker(ticker)
+                .scheduler(Scheduler.systemScheduler())
                 .build();
-        ApiKeyValidationResult policyResult =
-                requestHandler.getUserAccessDetails(policyName, request);
+    }
 
-        if (!policyResult.isValid()) {
-            log.warn("ApiKey validation failure: Invalid authz result, response: {}", policyResult);
+    public ApiKeyValidationResult fetchValidationResult(String apiKey) {
+        return apiKeysCache.get(apiKey);
+    }
+
+    private ApiKeyValidationResult loadValidationResult(String apiKey) {
+        ApiKeyValidationResult policyResult;
+        try {
+            policyResult = apiKeysClient.fetchApiKeyValidationResult(apiKey);
+        } catch (ApiKeysException e) {
+            if (!e.isRetryable()) {
+                apiKeysBackupCache.invalidate(apiKey);
+                throw e;
+            }
+            var cached = apiKeysBackupCache.getIfPresent(apiKey);
+            if (cached == null) {
+                log.warn("API Keys is unavailable and no cached validation result exists");
+                throw e;
+            }
+            log.warn("Using cached API key validation result while API Keys is unavailable");
+            return cached;
+        } catch (IcmsAuthenticationException e) {
+            apiKeysBackupCache.invalidate(apiKey);
+            throw e;
+        }
+
+        if (policyResult == null || (audienceServiceId.isEmpty()
+                ? !policyResult.isValid()
+                : !policyResult.hasSelfHostedPolicy(audienceServiceId))) {
+            apiKeysBackupCache.invalidate(apiKey);
+            log.warn("ApiKey validation failure: Invalid authz result");
             throw new IcmsAuthenticationException(API_KEY_FAILURE_ERROR);
         }
+        apiKeysBackupCache.put(apiKey, policyResult);
         return policyResult;
     }
 }
