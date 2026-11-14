@@ -121,4 +121,70 @@ assert_per_pod_inotify_headroom() {
 assert_per_pod_inotify_headroom "${DEFAULT_FILE}" "default values"
 assert_per_pod_inotify_headroom "${PVC_FILE}" "persistent cache volumes"
 
+# nvbugs#6471949 asked, in its own words, "whether an fd/inotify limit bump
+# or startup-ordering fix avoids the manual pod restart". The bump this chart
+# renders is a pod securityContext sysctl, fs.inotify.max_user_instances.
+#
+# Kubernetes admits only the sysctls on its documented safe list without
+# cluster-side opt-in: kernel.shm_rmid_forced, net.ipv4.ip_local_port_range,
+# net.ipv4.tcp_syncookies, net.ipv4.ping_group_range,
+# net.ipv4.ip_unprivileged_port_start, net.ipv4.ip_local_reserved_ports and the
+# net.ipv4.tcp_keepalive_* family. Every other namespaced sysctl is "unsafe":
+# the kubelet accepts it only when started with --allowed-unsafe-sysctls and
+# otherwise refuses to admit the pod (reason SysctlForbidden).
+#
+# fs.inotify.max_user_instances is not on that list, and this chart renders it
+# unconditionally with no values knob to turn it off, so on a cluster whose
+# kubelets have not opted in there is no way to install this chart at all --
+# operators are left with the pre-fix behaviour the report describes (pods
+# logging "failed to create fsnotify watcher: too many open files" until they
+# are manually restarted). Require that the mitigation be deployable: either
+# the rendered sysctls are all safe ones, or values can disable them.
+
+is_safe_sysctl() {
+  case "$1" in
+    kernel.shm_rmid_forced|net.ipv4.ip_local_port_range|net.ipv4.tcp_syncookies|net.ipv4.ping_group_range|net.ipv4.ip_unprivileged_port_start|net.ipv4.ip_local_reserved_ports|net.ipv4.tcp_keepalive_time|net.ipv4.tcp_keepalive_intvl|net.ipv4.tcp_keepalive_probes|net.ipv4.tcp_fin_timeout) return 0 ;;
+  esac
+  return 1
+}
+
+sysctl_names() {
+  yq -r 'select(.kind == "StatefulSet") | ((.spec.template.spec.securityContext.sysctls // []) | map(.name) | join(" "))' "$1"
+}
+
+unsafe_sysctl_names() {
+  local name out=""
+  for name in $(sysctl_names "$1"); do
+    if [ "${name}" = "null" ]; then continue; fi
+    if ! is_safe_sysctl "${name}"; then
+      out="${out}${name} "
+    fi
+  done
+  echo "${out}"
+}
+
+UNSAFE="$(unsafe_sysctl_names "${PVC_FILE}")"
+if [ -z "${UNSAFE// /}" ]; then
+  echo "OK: persistent cache volumes: rendered sysctls are all on the Kubernetes safe list"
+else
+  OPT_OUT_FILE="$(mktemp)"
+  opted_out=""
+  for override in inotify.enabled=false sysctls.enabled=false securityContext.sysctls=null podSecurityContext.sysctls=null inotify.maxUserInstances=; do
+    if ! helm template c ./deploy --set persistentVolumeClaim.storageClassName=nvcf-sc --set replicaCount=3 --set "${override}" > "${OPT_OUT_FILE}" 2>/dev/null; then
+      continue
+    fi
+    if [ -z "$(unsafe_sysctl_names "${OPT_OUT_FILE}" | tr -d ' ')" ]; then
+      opted_out="${override}"
+      break
+    fi
+  done
+  rm -f "${OPT_OUT_FILE}"
+  if [ -n "${opted_out}" ]; then
+    echo "OK: persistent cache volumes: unsafe sysctls can be disabled with --set ${opted_out}"
+  else
+    echo "FAILED: persistent cache volumes: the rendered StatefulSet requests unsafe sysctl(s) [${UNSAFE% }] that a kubelet admits only with --allowed-unsafe-sysctls, and no values override turns them off, so on a cluster that does not opt in the pod is rejected (SysctlForbidden) and the inotify bump nvbugs#6471949 asks for cannot be deployed at all" >&2
+    exit 1
+  fi
+fi
+
 echo "PASS: container-cache fsnotify limit render tests"
