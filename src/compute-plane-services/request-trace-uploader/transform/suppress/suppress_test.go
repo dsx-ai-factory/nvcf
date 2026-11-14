@@ -10,8 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 )
+
+// ncaHeaders is the header list the earlier Python uploader read the NCA id
+// from, in its order. The reference cases in testdata/python.json assume it.
+var ncaHeaders = []string{"nvcf-ncaid", "nvcf-nca-id"}
 
 // goldenCase holds what the earlier Python uploader produced for one line:
 // the NCA id it resolved and, when suppressed, the stub it wrote.
@@ -35,9 +39,9 @@ func loadGolden(t *testing.T) []goldenCase {
 	return cases
 }
 
-func mustDecode(t *testing.T, line string) *compat.Value {
+func mustDecode(t *testing.T, line string) *jsonvalue.Value {
 	t.Helper()
-	value, err := compat.Decode([]byte(line))
+	value, err := jsonvalue.Decode([]byte(line))
 	if err != nil {
 		t.Fatalf("Decode(%s) error = %v", line, err)
 	}
@@ -79,28 +83,55 @@ func pythonCases(t *testing.T) []goldenCase {
 }
 
 func TestDivergencesFromThePythonUploader(t *testing.T) {
-	if _, err := compat.Decode([]byte(repeatedKeyCase)); err == nil {
+	if _, err := jsonvalue.Decode([]byte(repeatedKeyCase)); err == nil {
 		t.Error("Decode(repeated key) error = nil, want it refused")
 	}
-	engine := mustEngine(t, FromIDs([]string{"acme"}))
+	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
 	if _, outcome := engine.Apply(mustDecode(t, blankFirstCase)); outcome.Action != StripPayload || outcome.ID != "acme" {
 		t.Errorf("outcome = %+v, want the record suppressed for acme", outcome)
 	}
 }
 
-func TestStubMatchesPythonUploaderByteForByte(t *testing.T) {
+// plainValueChanges lists the reference cases, by request id, where reading
+// header values as plain values resolves a different id than the earlier
+// Python uploader did: a boolean is no longer read as "True", and a zero is
+// a value instead of falling through to the next header.
+var plainValueChanges = map[string]string{
+	`"request_id":"r22"`: "",
+	`"request_id":"r23"`: "0",
+}
+
+func plainValueChange(line string) (string, bool) {
+	for key, id := range plainValueChanges {
+		if strings.Contains(line, key) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// TestStubMatchesPythonUploader checks that the stub has the earlier Python
+// uploader's keys, key order and values. Its bytes are plain JSON, so
+// formatting such as non-ASCII escapes may differ.
+func TestStubMatchesPythonUploader(t *testing.T) {
 	for _, tc := range pythonCases(t) {
 		t.Run(tc.In, func(t *testing.T) {
-			engine := mustEngine(t, FromIDs(strings.Split(tc.IDs, ",")))
+			engine := mustEngine(t, FromIDs(strings.Split(tc.IDs, ","), ncaHeaders...))
 			record := mustDecode(t, tc.In)
-			before := string(compat.Encode(record))
+			before := string(jsonvalue.Encode(record))
 
 			got, outcome := engine.Apply(record)
+			if _, changed := plainValueChange(tc.In); changed {
+				if outcome.Action != "" || got != record {
+					t.Fatalf("outcome = %+v, want the record passed through", outcome)
+				}
+				return
+			}
 			if tc.Out == nil {
 				if outcome.Action != "" || got != record {
 					t.Fatalf("outcome = %+v, want the record passed through", outcome)
 				}
-				if after := string(compat.Encode(record)); after != before {
+				if after := string(jsonvalue.Encode(record)); after != before {
 					t.Fatalf("record changed to %s", after)
 				}
 				return
@@ -108,8 +139,8 @@ func TestStubMatchesPythonUploaderByteForByte(t *testing.T) {
 			if outcome.Action != StripPayload || outcome.ID != tc.NCAID {
 				t.Fatalf("outcome = %+v, want stripPayload with id %q", outcome, tc.NCAID)
 			}
-			if encoded := string(compat.Encode(got)); encoded != *tc.Out {
-				t.Errorf("stub = %s\nwant   %s", encoded, *tc.Out)
+			if want := mustDecode(t, *tc.Out); !jsonvalue.Equal(got, want) {
+				t.Errorf("stub = %s\nwant   %s", jsonvalue.Encode(got), *tc.Out)
 			}
 		})
 	}
@@ -120,16 +151,20 @@ func TestResolveIDMatchesPythonUploader(t *testing.T) {
 		event := EventOf(mustDecode(t, tc.In))
 		got := ""
 		if CarriesPayload(event) {
-			got = NormalizeID(ResolveHeader(HeaderSets(event), DefaultHeaders...))
+			got = NormalizeID(ResolveHeader(HeaderSets(event), ncaHeaders...))
 		}
-		if got != tc.NCAID {
-			t.Errorf("%s: id = %q, want %q", tc.In, got, tc.NCAID)
+		want := tc.NCAID
+		if id, changed := plainValueChange(tc.In); changed {
+			want = id
+		}
+		if got != want {
+			t.Errorf("%s: id = %q, want %q", tc.In, got, want)
 		}
 	}
 }
 
 func TestDropRecordRuleDropsTheRecord(t *testing.T) {
-	engine := mustEngine(t, Config{Rules: []Rule{{Headers: DefaultHeaders, Values: []string{"acme"}, Action: DropRecord}}})
+	engine := mustEngine(t, Config{Rules: []Rule{{Headers: ncaHeaders, Values: []string{"acme"}, Action: DropRecord}}})
 	record := mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"nca-acme-nca"}}}`)
 
 	got, outcome := engine.Apply(record)
@@ -141,7 +176,7 @@ func TestDropRecordRuleDropsTheRecord(t *testing.T) {
 func TestFirstMatchingRuleWins(t *testing.T) {
 	engine := mustEngine(t, Config{Rules: []Rule{
 		{Headers: []string{"x-tenant"}, Values: []string{"t1"}, Action: DropRecord},
-		{Headers: DefaultHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
+		{Headers: ncaHeaders, Values: []string{"acme"}, Action: StripPayload, NCAID: true},
 	}})
 	record := mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"nvcf-ncaid":"acme","x-tenant":"t1"}}}`)
 
@@ -151,7 +186,7 @@ func TestFirstMatchingRuleWins(t *testing.T) {
 }
 
 func TestOutcomeReportsEvaluationAndHeaderPresence(t *testing.T) {
-	engine := mustEngine(t, FromIDs([]string{"acme"}))
+	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
 	tests := []struct {
 		name          string
 		line          string
@@ -207,12 +242,12 @@ func TestConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "none", cfg: Config{}},
-		{name: "from ids", cfg: FromIDs([]string{"a", "b"})},
-		{name: "unknown action", cfg: Config{Rules: []Rule{{Headers: DefaultHeaders, Values: []string{"a"}, Action: "bashStub"}}}, wantErr: true},
+		{name: "from ids", cfg: FromIDs([]string{"a", "b"}, ncaHeaders...)},
+		{name: "unknown action", cfg: Config{Rules: []Rule{{Headers: ncaHeaders, Values: []string{"a"}, Action: "bashStub"}}}, wantErr: true},
 		{name: "no headers", cfg: Config{Rules: []Rule{{Values: []string{"a"}, Action: StripPayload}}}, wantErr: true},
 		{name: "blank header", cfg: Config{Rules: []Rule{{Headers: []string{""}, Values: []string{"a"}, Action: StripPayload}}}, wantErr: true},
 		{name: "upper-case header", cfg: Config{Rules: []Rule{{Headers: []string{"NVCF-NCAID"}, Values: []string{"a"}, Action: StripPayload}}}, wantErr: true},
-		{name: "no values", cfg: Config{Rules: []Rule{{Headers: DefaultHeaders, Values: []string{" "}, Action: StripPayload}}}, wantErr: true},
+		{name: "no values", cfg: Config{Rules: []Rule{{Headers: ncaHeaders, Values: []string{" "}, Action: StripPayload}}}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -226,10 +261,59 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestStubIsPlainJSON(t *testing.T) {
+	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
+	record := mustDecode(t, "{\"timestamp\":1.5e3,\"event\":{\"event_type\":\"request_payload\",\"payload\":{\"model\":\"caf\u00e9 \u2603\",\"http_request_headers\":{\"nvcf-ncaid\":\"acme\"}}}}")
+	got, _ := engine.Apply(record)
+	want := "{\"timestamp\":1.5e3,\"event\":{\"event_type\":\"request_payload\",\"payload\":{\"model\":\"caf\u00e9 \u2603\",\"payload_complete\":false," +
+		"\"payload_drop_reason\":\"nca_id\",\"payload_suppressed\":true,\"suppression_reason\":\"nca_id\",\"nca_id\":\"acme\",\"http_request_headers\":{\"nvcf-ncaid\":\"acme\"}}}}"
+	if encoded := string(jsonvalue.Encode(got)); encoded != want {
+		t.Fatalf("stub = %s\nwant   %s", encoded, want)
+	}
+}
+
+func TestFromIDsReadsTheGivenHeadersInOrder(t *testing.T) {
+	cfg := FromIDs([]string{"acme"}, "x-org-id", "nvcf-ncaid")
+	if len(cfg.Rules) != 1 || !slices.Equal(cfg.Rules[0].Headers, []string{"x-org-id", "nvcf-ncaid"}) {
+		t.Fatalf("rules = %+v, want one rule on x-org-id then nvcf-ncaid", cfg.Rules)
+	}
+	engine := mustEngine(t, cfg)
+	tests := []struct {
+		name    string
+		headers string
+		want    Action
+	}{
+		{name: "second header is read when the first is absent", headers: `"nvcf-ncaid":"nca-acme-nca"`, want: StripPayload},
+		{name: "first header decides when present", headers: `"x-org-id":"other","nvcf-ncaid":"acme"`},
+		{name: "a header outside the list is not read", headers: `"nvcf-nca-id":"acme"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, outcome := engine.Apply(mustDecode(t, payloadHeaders(tt.headers)))
+			if outcome.Action != tt.want {
+				t.Fatalf("outcome = %+v, want action %q", outcome, tt.want)
+			}
+		})
+	}
+}
+
+func TestFromIDsHasNoBuiltInHeaders(t *testing.T) {
+	if cfg := FromIDs(nil); len(cfg.Rules) != 0 {
+		t.Fatalf("FromIDs(nil) = %+v, want suppression off", cfg)
+	}
+	cfg := FromIDs([]string{"acme"})
+	if len(cfg.Rules) != 1 || len(cfg.Rules[0].Headers) != 0 {
+		t.Fatalf("FromIDs without headers = %+v, want one rule with no header", cfg.Rules)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want a rule with no header rejected")
+	}
+}
+
 // A blank value under the first matching key does not hide a later key with
 // a value.
 func TestResolveHeaderSkipsABlankKey(t *testing.T) {
-	engine := mustEngine(t, FromIDs([]string{"acme"}))
+	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
 	record := mustDecode(t, `{"event_type":"request_payload","payload":{"http_request_headers":{"NVCF-NCAID":"","nvcf-ncaid":"acme"}}}`)
 	if _, outcome := engine.Apply(record); outcome.Action != StripPayload {
 		t.Fatalf("outcome = %+v, want the record suppressed", outcome)
@@ -239,7 +323,7 @@ func TestResolveHeaderSkipsABlankKey(t *testing.T) {
 // Only an object under "event" wraps a record; a bare record that also has
 // an "event" field is still evaluated.
 func TestEventOfUnwrapsOnlyAnObject(t *testing.T) {
-	engine := mustEngine(t, FromIDs([]string{"acme"}))
+	engine := mustEngine(t, FromIDs([]string{"acme"}, ncaHeaders...))
 	record := mustDecode(t, `{"event_type":"request_payload","event":"x","payload":{"http_request_headers":{"nvcf-ncaid":"acme"}}}`)
 	if _, outcome := engine.Apply(record); outcome.Action != StripPayload {
 		t.Fatalf("outcome = %+v, want the bare record suppressed", outcome)
@@ -248,7 +332,7 @@ func TestEventOfUnwrapsOnlyAnObject(t *testing.T) {
 
 func TestValidateRejectsAHeaderNameThatIsNotAToken(t *testing.T) {
 	for _, name := range []string{"nvcf-ncaid ", " nvcf-ncaid", "nvcf ncaid", "nvcf-ncaid:", "x-tenant\t", "\u00e9"} {
-		cfg := Config{Rules: []Rule{{Headers: []string{name}, Values: []string{"a"}, Action: DropRecord}}}
+		cfg := Config{Rules: []Rule{{Name: "r", Headers: []string{name}, Values: []string{"a"}, Action: DropRecord}}}
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("Validate(header %q) error = nil, want an error", name)
 		}
@@ -259,7 +343,7 @@ func TestValidateRejectsAHeaderNameThatIsNotAToken(t *testing.T) {
 // so an id with nested affixes still matches the same header value.
 func TestFromIDsNormalizesEachIDOnce(t *testing.T) {
 	const id = "nca-nca-acme-nca-nca"
-	engine := mustEngine(t, FromIDs([]string{" " + id + " "}))
+	engine := mustEngine(t, FromIDs([]string{" " + id + " "}, "nvcf-ncaid"))
 	record := mustDecode(t, `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1,"payload":{"request_id":"r","http_request_headers":{"nvcf-ncaid":"`+id+`"}}}`)
 	if _, outcome := engine.Apply(record); outcome.Action != StripPayload || outcome.ID != "nca-acme-nca" {
 		t.Fatalf("outcome = %+v, want stripPayload with id nca-acme-nca", outcome)
@@ -282,14 +366,14 @@ func TestFromIDsIgnoresIDsThatNormalizeToNothing(t *testing.T) {
 // The stub replaces a record so that none of its body leaves; an identity
 // field that holds an object or a list is left out instead of copied.
 func TestStubKeepsOnlyPlainIdentityValues(t *testing.T) {
-	engine := mustEngine(t, FromIDs([]string{"acme"}))
+	engine := mustEngine(t, FromIDs([]string{"acme"}, "nvcf-ncaid"))
 	record := mustDecode(t, `{"schema":"dynamo.request.trace.v1","event_type":"request_payload","event_time_unix_ms":1,"payload":{"request_id":{"secret":"hidden-text"},"model":["m","hidden-text"],"endpoint":"/v1/chat","http_request_headers":{"nvcf-ncaid":"acme"}}}`)
 	got, outcome := engine.Apply(record)
 	if outcome.Action != StripPayload {
 		t.Fatalf("outcome = %+v, want stripPayload", outcome)
 	}
 	payload := got.Get("payload")
-	encoded := string(compat.Encode(got))
+	encoded := string(jsonvalue.Encode(got))
 	if payload.Has("request_id") || payload.Has("model") || strings.Contains(encoded, "hidden-text") || !payload.Has("endpoint") {
 		t.Fatalf("stub = %s, want endpoint kept and no object or list identity values", encoded)
 	}
