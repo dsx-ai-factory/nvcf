@@ -135,8 +135,8 @@ Only these algorithms use `x-cache-affinity-key`:
 
 Aliases in `routing_methods.json` follow the rule of their algorithm, such as
 `groq-multiregion` for `wait-and-widen` and `pulsar-multiregion` for
-`pulsar-wait-and-widen`. Without an affinity group, requests with the same key can go to different
-clusters and miss the engine prefix cache.
+`pulsar-wait-and-widen`. Without an affinity group, requests with the same key
+can go to different clusters and miss the engine prefix cache.
 
 To keep one key on one cluster with `wait-and-widen`, use this routing
 expression:
