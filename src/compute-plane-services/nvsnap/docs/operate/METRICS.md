@@ -102,7 +102,10 @@ What is measured:
   webhook admitted count, and only those that became Ready while the agent
   watched (an agent restart does not count running pods again).
 - **Restore phases**: per rank, on its node: `criu`, `gpu` (GPU state reload
-  and resume), `rank` (the node's whole restore). Per instance: `group`
+  and resume), `clock_wait` (the part of `gpu` the rank waited for its
+  clocks to reach the dump: a budget larger than the restore,
+  [design](../design/RESTORE-CLOCK-GPU-RELOAD.md)), `rank` (the node's whole
+  restore). Per instance: `group`
   (placeholders running to every rank restored) and `ready` (restored to the
   pod Ready).
 - **Restore outcomes**: `restored`, `failed` (ran and failed), `not-run`
