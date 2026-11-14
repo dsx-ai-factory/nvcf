@@ -511,14 +511,43 @@ const prewarmChunkBytes = 256 << 20
 // the NVCA model cache.
 const nvcaModelVolumeName = "model-data"
 
-// modelServedFromClusterCache reports whether the pod's model volume is a
-// claim rather than pod-local storage.
+// modelServedFromClusterCache reports whether the pod's model is already
+// served from a claim rather than pod-local storage: either NVCA's own
+// "model-data" volume, or - for a chart that names its claim differently,
+// e.g. the Dynamo worker's "model-cache" at /opt/models (nvbugs#6942082) -
+// any claim-backed mount the pod's own HF_HOME/NIM_CACHE_PATH points at.
+// Keying on the env rather than on a volume name is what makes this work
+// for a chart free to call its claim anything it likes.
 func modelServedFromClusterCache(pod *corev1.Pod) bool {
+	claims := map[string]bool{}
 	for i := range pod.Spec.Volumes {
 		v := &pod.Spec.Volumes[i]
-		if v.Name == nvcaModelVolumeName && v.PersistentVolumeClaim != nil {
+		if v.PersistentVolumeClaim == nil {
+			continue
+		}
+		if v.Name == nvcaModelVolumeName {
 			return true
+		}
+		claims[v.Name] = true
+	}
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
+		for _, e := range c.Env {
+			if e.Value == "" || (e.Name != "HF_HOME" && e.Name != "NIM_CACHE_PATH") {
+				continue
+			}
+			for _, vm := range c.VolumeMounts {
+				if claims[vm.Name] && pathUnder(e.Value, vm.MountPath) {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+// pathUnder reports whether p is dir or a path below it.
+func pathUnder(p, dir string) bool {
+	p, dir = filepath.Clean(p), filepath.Clean(dir)
+	return p == dir || strings.HasPrefix(p, dir+string(filepath.Separator))
 }
