@@ -110,8 +110,10 @@ render_values 02-core.yaml.gotmpl sis "$work_dir/sis.yaml"
 assert_value "$work_dir/sis.yaml" '.sis.image.tag == "0.8.6"' "ICMS is not 0.8.6"
 render_values 02-core.yaml.gotmpl api "$work_dir/api.yaml"
 assert_value "$work_dir/api.yaml" '.api.remoteConfig.workerImageTags.llmCredentials == "1.2.3"' "worker llm credentials is not 1.2.3"
+# The function autoscaler image comes from its chart (a stack default breaks
+# observability-autoscaler.sh); the chart pin carries the 1.1.1 release.
 render_values 03-observability.yaml.gotmpl function-autoscaler "$work_dir/autoscaler.yaml"
-assert_value "$work_dir/autoscaler.yaml" '.functionautoscaler.image.tag == "1.23.2"' "function autoscaler is not 1.23.2"
+test -z "$(yq -r '.functionautoscaler.image.tag // ""' "$work_dir/autoscaler.yaml")" || fail "the stack must leave the function autoscaler image tag to the chart"
 
 # Operator overrides of these tags still win.
 cat >"$test_stack_dir/environments/$environment_name.yaml" <<'YAML'
