@@ -130,21 +130,21 @@ selection when routing should not depend on backend load statistics.
 | `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. |
 | `power-of-n`, `round-robin`, `random` | No. |
 
-Aliases, such as `groq-multiregion`, follow their algorithm. Without an
-affinity group, requests with the same key can go to different clusters and
-miss the prefix cache.
+Legacy names, such as `groq-multiregion` for `wait-and-widen`, follow their
+algorithm. Without an affinity group, requests with the same key can go to
+different clusters and miss the prefix cache.
 
-To keep one key on one cluster with `wait-and-widen`:
+For example, this `wait-and-widen` expression keeps one key on one cluster:
 
 ```text
 wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
 ```
 
 The affine cluster is full when its active requests reach
-`max_engine_concurrency` plus `max_queued`. If it stays full for 200 ms, the
-request can go to another cluster. If `max_engine_concurrency` is `0`
-(unknown) or above the engine's real capacity, the cluster never counts as
-full, and requests queue inside the engine. See
+`max_engine_concurrency` plus `max_queued`. In this example, if it stays full
+for 200 ms, the request can go to another cluster. If `max_engine_concurrency`
+is `0` (unknown) or above the engine's real capacity, the cluster never counts
+as full, and requests queue inside the engine. See
 [Runtime stats interface](runtime-stats-interface.md#concurrency-fallback).
 
 ### Audit key use

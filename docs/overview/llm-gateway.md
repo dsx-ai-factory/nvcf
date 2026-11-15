@@ -705,8 +705,8 @@ sequenceDiagram
 
 Sticky routing only affects backend selection when the LLM request router is
 configured with a cache-affinity-aware routing method for the target model.
-Plain `wait-and-widen` and `groq_multiregion` ignore the key. See
-[Function Configuration](#function-configuration).
+Plain `wait-and-widen`, or its legacy name `groq_multiregion`, ignores the key.
+See [Function Configuration](#function-configuration).
 
 ### Last-Cluster Hints
 
