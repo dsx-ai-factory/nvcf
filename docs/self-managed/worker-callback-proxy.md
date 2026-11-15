@@ -137,6 +137,21 @@ groups or network controls allow both ports from the compute cluster's egress
 addresses. A gRPC call that times out with `DEADLINE_EXCEEDED` while HTTP works
 often means the UDP port is closed or the name does not reach the proxy.
 
+On AWS, a load balancer health check that probes the UDP gRPC port over TCP
+cannot succeed, because that port accepts only UDP. If the load balancer reports
+the proxy targets unhealthy, point the health check at the TCP port instead, for
+example with these entries in `workerCallbackProxy.service.annotations`:
+
+```yaml
+workerCallbackProxy:
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: tcp
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10084"
+```
+
+Check the target health in your load balancer after the Service is created.
+
 Read the address after the Service has one:
 
 ```bash
@@ -246,11 +261,14 @@ invoke a function.
 
    ```bash
    openssl s_client -connect invocation.<workerDomain>:10084 \
-     -servername invocation.<workerDomain> -CAfile worker-callback-ca.pem </dev/null
+     -servername invocation.<workerDomain> \
+     -verify_hostname invocation.<workerDomain> \
+     -CAfile worker-callback-ca.pem </dev/null
    ```
 
-   The certificate subject must cover `*.<workerDomain>`, and the output must
-   end with `Verify return code: 0 (ok)`.
+   `-servername` only sends the name. `-verify_hostname` checks it against the
+   certificate's DNS names, which must include `*.<workerDomain>`. The output
+   must end with `Verify return code: 0 (ok)`.
 
 3. Invoke a real HTTP function and a real gRPC function several times. The
    gRPC call exercises UDP 443, which a TCP check cannot test. See

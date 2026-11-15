@@ -235,11 +235,11 @@ alternatives:
 
 | Callback path | How you set it | `invocation-service` and `grpc-proxy` under HA |
 | --- | --- | --- |
-| A fixed callback URL | `global.workerEndpoints.invocationServiceURL`, `global.workerEndpoints.grpcProxyWorkerConnectURL`, `grpcproxy.workerConnectBaseURL`, or `WORKER_STREAM_PROPERTIES__SELF_ADDRESS` in `invocation.env` | A single replica each |
+| A fixed callback URL | For `invocation-service`: `global.workerEndpoints.invocationServiceURL` or `WORKER_STREAM_PROPERTIES__SELF_ADDRESS` in `invocation.env`. For `grpc-proxy`: `global.workerEndpoints.grpcProxyWorkerConnectURL` or `grpcproxy.workerConnectBaseURL`. | A single replica of each service whose URL is set |
 | The [Worker Callback Proxy](./worker-callback-proxy.md) | `workerCallbackProxy.enabled: true`, off by default | Two or more replicas each |
 
 Moving from a fixed URL to the proxy changes a multi-cluster install from a
-single replica to multiple replicas for both services. Clear the fixed URL
+single replica to multiple replicas for each service that had a fixed URL. Clear the fixed URL
 settings first, because the stack refuses to render when the proxy is enabled
 together with any of them, then follow the proxy page for the worker domain
 DNS, the worker CA and validation. An upgrade alone does not make this change:
