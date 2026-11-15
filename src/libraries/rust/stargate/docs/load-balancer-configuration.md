@@ -159,8 +159,8 @@ fields:
 - `request.cache_affinity_key_present`: a request span field.
 
 A keyed request ignores the key when its algorithm does not use it, as listed
-above. For `wait-and-widen`, look for the selection count in
-`requested_algorithm` or in the model's `lb-config.json` entry.
+above. For `wait-and-widen`, check that `requested_algorithm` sets
+`cache_affinity_backend_selection_count`.
 
 ## `power-of-n`
 
