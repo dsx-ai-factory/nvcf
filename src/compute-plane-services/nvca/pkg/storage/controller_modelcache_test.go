@@ -24,9 +24,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
@@ -85,4 +88,45 @@ func TestEnsureCacheMountOptionsConfigMap_NameOverride(t *testing.T) {
 	key := client.ObjectKey{Name: "custom-cm", Namespace: ModelCacheInitNamespace}
 	require.NoError(t, c.Get(ctx, key, cm))
 	assert.Equal(t, NVMeshCacheMountOptions, cm.Data[NVMeshStorageClassProvisioner])
+}
+
+// TestEnsureCacheMountOptionsConfigMapCreatesInitNamespace covers nvbugs#7055457:
+// on the affected clusters nothing provisions nvca-modelcache-init, so seeding
+// the mount option ConfigMap at agent start-up failed with
+// `namespaces "nvca-modelcache-init" not found` and the defaults were never
+// written.
+func TestEnsureCacheMountOptionsConfigMapCreatesInitNamespace(t *testing.T) {
+	ctx := context.Background()
+	sch := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(sch))
+
+	// The fake client does not model namespace existence, so reject creating a
+	// namespaced object whose namespace does not exist, as the API server does.
+	existingNamespaces := sets.New[string]()
+	c := fake.NewClientBuilder().WithScheme(sch).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			opts ...client.CreateOption,
+		) error {
+			if ns, ok := obj.(*corev1.Namespace); ok {
+				existingNamespaces.Insert(ns.Name)
+				return cl.Create(ctx, obj, opts...)
+			}
+			if ns := obj.GetNamespace(); ns != "" && !existingNamespaces.Has(ns) {
+				return apierrors.NewNotFound(corev1.Resource("namespaces"), ns)
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	}).Build()
+
+	require.NoError(t, EnsureCacheMountOptionsConfigMap(ctx, c, ""))
+
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: ModelCacheInitNamespace}, &corev1.Namespace{}))
+	cm := &corev1.ConfigMap{}
+	key := client.ObjectKey{Name: DefaultCacheMountOptionsConfigMapName, Namespace: ModelCacheInitNamespace}
+	require.NoError(t, c.Get(ctx, key, cm))
+	assert.Equal(t, NVMeshCacheMountOptions, cm.Data[NVMeshStorageClassProvisioner])
+
+	// Start-up runs again on every restart, so an existing namespace is not an
+	// error.
+	require.NoError(t, EnsureCacheMountOptionsConfigMap(ctx, c, ""))
 }

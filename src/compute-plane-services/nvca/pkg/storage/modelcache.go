@@ -1652,7 +1652,13 @@ func (r *Reconciler) sharedFSCachePopulated(ctx context.Context, rwPVCName strin
 // that creates an object in it has to ensure it first; an existing namespace is
 // not an error, so this is safe to call on every reconcile.
 func (r *Reconciler) ensureModelCacheInitNamespace(ctx context.Context) error {
-	if err := r.Client.Create(ctx, NewModelCacheInitNamespace()); err != nil &&
+	return ensureModelCacheInitNamespace(ctx, r.Client)
+}
+
+// ensureModelCacheInitNamespace is the single entry point for every writer into
+// ModelCacheInitNamespace, including ones that hold only a client.Client.
+func ensureModelCacheInitNamespace(ctx context.Context, c client.Client) error {
+	if err := c.Create(ctx, NewModelCacheInitNamespace()); err != nil &&
 		!apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("ensure model cache init namespace: %w", err)
 	}
