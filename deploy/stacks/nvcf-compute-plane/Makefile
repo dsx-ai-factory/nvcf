@@ -60,7 +60,7 @@ include Makefile.dist
 -include helmfile-docker.mk
 
 # --- Development-Only Targets ---
-.PHONY: dist clean-dist ensure-helm ensure-helmfile ensure-binaries render-local test-observability-profile test-register-cluster test-kube-context test-compare-golden test-nats-reloader-alignment test-nats-server-source test-nvca-entrypoints test-nvca-default-ownership test-nvca-callback-ca test-local generate-golden
+.PHONY: dist clean-dist ensure-helm ensure-helmfile ensure-binaries render-local test-observability-profile test-register-cluster test-kube-context test-compare-golden test-nats-reloader-alignment test-nats-server-source test-nvca-entrypoints test-nvca-default-ownership test-nvca-callback-ca test-compute-111-pins test-local generate-golden
 
 # --- Binary Management (Development Only) ---
 ensure-helm:
@@ -197,10 +197,14 @@ test-compare-golden:
 test-nats-reloader-alignment:
 	@tests/nats-reloader-alignment.sh
 
+.PHONY: test-compute-111-pins
+test-compute-111-pins:
+	@tests/compute-111-pins.sh
+
 test-nats-server-source:
 	@tests/nats-server-source.sh
 
-test-local: test-observability-profile test-register-cluster test-kube-context test-nvca-default-ownership test-collector-images test-nvca-callback-ca test-compare-golden test-nats-reloader-alignment test-nats-server-source test-nvca-entrypoints
+test-local: test-compute-111-pins test-observability-profile test-register-cluster test-kube-context test-nvca-default-ownership test-collector-images test-nvca-callback-ca test-compare-golden test-nats-reloader-alignment test-nats-server-source test-nvca-entrypoints
 	@tests/verify-golden.sh "$(GOLDEN_LOCAL_DIR)" "$(DIST_DIR)/out"
 
 generate-golden: render-local
