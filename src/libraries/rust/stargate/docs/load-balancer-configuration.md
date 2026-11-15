@@ -124,60 +124,43 @@ selection when routing should not depend on backend load statistics.
 
 ## Algorithms that use the cache-affinity key
 
-Only these algorithms use `x-cache-affinity-key`:
-
-| Algorithm | Uses the key |
+| Algorithm | Uses `x-cache-affinity-key` |
 | --- | --- |
-| `pulsar` | Yes. The key is part of the rendezvous ranking. |
-| `pulsar-wait-and-widen` | Yes. The affinity group is always present and has at least the top-ranked cluster. |
-| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. It is unset by default. |
+| `pulsar`, `pulsar-wait-and-widen` | Yes. |
+| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. |
 | `power-of-n`, `round-robin`, `random` | No. |
 
-Aliases in `routing_methods.json` follow the rule of their algorithm, such as
-`groq-multiregion` for `wait-and-widen` and `pulsar-multiregion` for
-`pulsar-wait-and-widen`. Without an affinity group, requests with the same key
-can go to different clusters and miss the engine prefix cache.
+Aliases, such as `groq-multiregion`, follow their algorithm. Without an
+affinity group, requests with the same key can go to different clusters and
+miss the prefix cache.
 
-To keep one key on one cluster with `wait-and-widen`, use this routing
-expression:
+To keep one key on one cluster with `wait-and-widen`:
 
 ```text
 wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
 ```
 
-Requests with the same key go to one affine cluster while it has capacity. A
-cluster is full when its active requests reach its `max_engine_concurrency`
-plus `max_queued`. A cluster that reports `0`, meaning unknown, is never full.
-If the affine cluster stays full until 200 ms after the request arrived, the
-request can go to another cluster.
-
-`max_engine_concurrency` comes from the engine stats stream or from the Pylon
-fallback. See
+The affine cluster is full when its active requests reach
+`max_engine_concurrency` plus `max_queued`. If it stays full for 200 ms, the
+request can go to another cluster. If `max_engine_concurrency` is `0`
+(unknown) or above the engine's real capacity, the cluster never counts as
+full, and requests queue inside the engine. See
 [Runtime stats interface](runtime-stats-interface.md#concurrency-fallback).
-If the value is far above the engine's real capacity, the affine cluster never
-counts as full. The affinity group then never widens, and requests queue inside
-the engine.
 
 ### Audit key use
 
-For each proxy attempt, Stargate writes the info log `proxying request`.
-Retries write it again. These fields show whether a model routes keyed
-requests with an algorithm that uses the key:
+The info log `proxying request`, written once per proxy attempt, has these
+fields:
 
-- `model_id`: the routed model.
-- `requested_algorithm`: the `x-routing-method` value as received, including
-  expression parameters. It is empty when the request has no header.
-- `routing_algorithm`: the canonical name of the algorithm that routed the
-  request.
-- `request.cache_affinity_key_present`: `true` when the request has
-  `x-cache-affinity-key`. This is a field of the request span. The text log
-  format appends it to the line.
+- `model_id`
+- `requested_algorithm`: the `x-routing-method` value, empty without the
+  header.
+- `routing_algorithm`: the canonical algorithm name.
+- `request.cache_affinity_key_present`: a request span field.
 
-A keyed request ignores the key when its algorithm is `power-of-n`,
-`round-robin`, or `random`. It also ignores the key when the algorithm is
-`wait-and-widen` and neither the expression in `requested_algorithm` nor the
-model's `lb-config.json` entry sets `cache_affinity_backend_selection_count`
-above `0`.
+A keyed request ignores the key when its algorithm does not use it, as listed
+above. For `wait-and-widen`, look for the selection count in
+`requested_algorithm` or in the model's `lb-config.json` entry.
 
 ## `power-of-n`
 

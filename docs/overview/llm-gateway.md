@@ -104,21 +104,15 @@ tuning parameters, see
 [LLM Request Router Load Balancing](../self-managed/llm-request-router-load-balancing.md).
 
 [Session stickiness](#session-stickiness) needs a routing method that uses the
-cache-affinity key: `pulsar`, `pulsar-wait-and-widen`, or `wait-and-widen` with
-`cache_affinity_backend_selection_count`. Plain `wait-and-widen` and
-`groq_multiregion` ignore the key. For example:
+cache-affinity key, such as:
 
 ```text
 wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
 ```
 
 Set the deployment's `maxRequestConcurrency` to the engine's real request
-capacity, for example the number of engine workers times vLLM `--max-num-seqs`.
-The router uses it as the engine limit when the engine does not report one.
-NVCA passes only a value greater than 1, so an unset value or 1 leaves the
-limit unknown. If the limit is unknown or too high, a cluster never counts as
-full, and requests with the same key queue inside the engine instead of going
-to another cluster. See
+capacity, such as engine workers times vLLM `--max-num-seqs`. If it is unset,
+`1`, or too high, the router cannot tell when a cluster is full. See
 [Algorithms that use the cache-affinity key](https://github.com/NVIDIA/nvcf/blob/main/src/libraries/rust/stargate/docs/load-balancer-configuration.md#algorithms-that-use-the-cache-affinity-key).
 
 `llmConfig.tokenRateLimit` applies a per-model token limit. Use one or more comma-separated limits in `<value>-<unit>` format, where `<value>` is a positive integer and `<unit>` is one of `S` (seconds), `M` (minutes), `H` (hours), `D` (days), `W` (weeks), or `MO` (30 days). A single limit is one token budget over one time window, such as `1000-S`. The budget refills continuously over the window rather than resetting at a fixed time, so `3000000-MO` returns about 100000 tokens per day. A combined limit is multiple token budgets over distinct time windows, such as `1000-S,5000-M,100000-H,500000-D,1000000-W`; do not repeat a unit in the same value.
@@ -712,8 +706,7 @@ sequenceDiagram
 Sticky routing only affects backend selection when the LLM request router is
 configured with a cache-affinity-aware routing method for the target model.
 Plain `wait-and-widen` and `groq_multiregion` ignore the key. See
-[Function Configuration](#function-configuration) for the methods that use it
-and a working expression.
+[Function Configuration](#function-configuration).
 
 ### Last-Cluster Hints
 
