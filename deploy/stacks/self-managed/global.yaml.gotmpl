@@ -806,6 +806,9 @@ podDisruptionBudget:
 {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "nats-auth-callout-service" "class" "controlplane") }}
 {{- . | nindent 0 }}
 {{- end }}
+{{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
+{{- . | nindent 0 }}
+{{- end }}
 {{- with dig "natsAuthCalloutService" "podAnnotations" dict .Values }}
 {{- /* The stack sets these in token mode so a worker auth change restarts the
        callout; an operator copy would survive a switch back to nkey and stop it. */}}
@@ -1362,6 +1365,9 @@ nvctApi:
   {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "nvct-api" "class" "controlplane") }}
   {{- . | nindent 2 }}
   {{- end }}
+  {{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
+  {{- . | nindent 2 }}
+  {{- end }}
   {{- if $haEnabled }}
   {{- with include "nvcf.ha.replicaSafePodDisruptionBudget" .Values }}
   podDisruptionBudget:
@@ -1465,21 +1471,23 @@ grpcproxy:
   {{- with include "nvcf.nodeSelector" (dict "type" "controlplane" "selectors" .Values.global.nodeSelectors) }}
   {{- . | nindent 2 }}
   {{- end }}
-  {{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
-  {{- . | nindent 2 }}
-  {{- end }}
-  {{- if $haEnabled }}
-  {{- $grpcAffinity := include "nvcf.ha.affinity" (dict "Values" .Values "instance" "grpc-proxy" "class" "controlplane") }}
-  {{- $grpcTopologySpread := include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "grpc-proxy" "class" "controlplane") }}
+  {{- /* The chart reads the Deployment's tolerations from deployment.tolerations. */}}
+  {{- $grpcTolerations := include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
+  {{- if or $haEnabled $grpcTolerations }}
   deployment:
-    {{- with $grpcAffinity }}
+    {{- with $grpcTolerations }}
     {{- . | nindent 4 }}
     {{- end }}
-    {{- with $grpcTopologySpread }}
+    {{- if $haEnabled }}
+    {{- with include "nvcf.ha.affinity" (dict "Values" .Values "instance" "grpc-proxy" "class" "controlplane") }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "grpc-proxy" "class" "controlplane") }}
     {{- . | nindent 4 }}
     {{- end }}
     autoscaling:
       {{- toYaml $grpcProxyAutoscaling | nindent 6 }}
+    {{- end }}
   {{- end }}
   {{- with $grpcProxyWorkerConnectBaseURL }}
   workerConnectBaseURL: {{ . | quote }}
@@ -1627,6 +1635,9 @@ rateLimiter:
   {{- . | nindent 2 }}
   {{- end }}
   {{- with include "nvcf.ha.topologySpreadConstraints" (dict "Values" .Values "instance" "ratelimiter" "class" "controlplane") }}
+  {{- . | nindent 2 }}
+  {{- end }}
+  {{- with include "nvcf.tolerations" (dict "type" "controlplane" "tolerations" .Values.global.tolerations) }}
   {{- . | nindent 2 }}
   {{- end }}
   {{- if .Values.global.observability.tracing.enabled }}
