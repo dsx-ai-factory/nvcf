@@ -130,17 +130,27 @@ cluster through the load balancer:
 Set `workerCallbackProxy.service.type: LoadBalancer`, and add the annotations
 your platform needs for a private load balancer through
 `workerCallbackProxy.service.annotations`. If the platform selects the load
-balancer implementation by class, set `workerCallbackProxy.service.loadBalancerClass`.
-The stack passes the whole `workerCallbackProxy.service` block to the chart. Confirm that your load balancer type
-forwards both a TCP and a UDP listener from one Service, and that the security
-groups or network controls allow both ports from the compute cluster's egress
-addresses. A gRPC call that times out with `DEADLINE_EXCEEDED` while HTTP works
+balancer implementation by class, set
+`workerCallbackProxy.service.loadBalancerClass`. The stack passes the whole
+`workerCallbackProxy.service` block to the chart.
+
+Confirm that your load balancer type forwards both a TCP and a UDP listener from
+one Service, and that the security groups or network controls allow both ports
+from the compute cluster's egress addresses. A gRPC call that times out with `DEADLINE_EXCEEDED` while HTTP works
 often means the UDP port is closed or the name does not reach the proxy.
 
 On AWS, a load balancer health check that probes the UDP gRPC port over TCP
-cannot succeed, because that port accepts only UDP. If the load balancer reports
-the proxy targets unhealthy, point the health check at the TCP port instead, for
-example with these entries in `workerCallbackProxy.service.annotations`:
+cannot succeed, because that port accepts only UDP. The AWS Load Balancer
+Controller checks the traffic port by default. If the load balancer reports the
+proxy targets unhealthy, point the health check at the TCP port instead, with
+these entries in `workerCallbackProxy.service.annotations`. The port to name
+depends on the load balancer's target type
+(`service.beta.kubernetes.io/aws-load-balancer-nlb-target-type`):
+
+| Target type | `aws-load-balancer-healthcheck-port` | Why |
+| --- | --- | --- |
+| `ip` | `"10084"` | The controller probes the pod port. |
+| `instance` | `invocation-tcp` | The controller resolves the Service port name to its allocated node port. |
 
 ```yaml
 workerCallbackProxy:
@@ -150,7 +160,11 @@ workerCallbackProxy:
       service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "10084"
 ```
 
-Check the target health in your load balancer after the Service is created.
+The example is for `ip` targets. The Service's target port is the named port
+`invocation-tcp`, so use the numeric `10084` only with `ip` targets.
+
+Check the target health in your load balancer after the Service is created, and
+confirm that both an HTTP and a gRPC invocation succeed.
 
 Read the address after the Service has one:
 
@@ -165,15 +179,15 @@ address.
 ### Why not a nip.io style name
 
 A wildcard DNS service such as nip.io maps a name to an IP address written in
-that name. The callback name already starts with an IP address, the control-plane
-pod's, so the name does not reach the proxy. For example, with a worker domain
-of `54-174-166-4.nip.io`, the callback name
-`10-243-34-212.54-174-166-4.nip.io` resolved to `10.243.34.212`, the pod IP,
-which the compute cluster cannot reach, and gRPC invocations failed with
-`DEADLINE_EXCEEDED`. A domain generated from the Gateway address, as an
-installer might for the ingress domain, has the same problem and would point at
-the Gateway in any case. Use a real DNS name and map the wildcard to the proxy
-address yourself.
+that name. The callback name already starts with an IP address, the
+control-plane pod's, so such a service does not send it to the proxy. For
+example, with a worker domain of `203-0-113-10.nip.io`, the callback name
+`10-0-0-12.203-0-113-10.nip.io` resolves to `10.0.0.12`, the pod IP, which the
+compute cluster cannot reach, and gRPC invocations fail with
+`DEADLINE_EXCEEDED`. A domain built from the Gateway address, such as one you
+might use for the ingress domain, has the same problem and would point at the
+Gateway in any case. Use a DNS name that you control, and map the wildcard to
+the proxy address yourself.
 
 ### Resolve `*.<workerDomain>` on an EKS compute cluster
 
