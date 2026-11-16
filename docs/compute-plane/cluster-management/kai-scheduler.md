@@ -138,20 +138,40 @@ From KAI v0.18, the chart turns GPU sharing on unless `global.gpuSharingMode`
 is set. NVCF workloads request whole GPUs, so set it to `Disabled`.
 
 The preempt, consolidation, and reclaim actions are disabled so that KAI never
-evicts running NVCF workloads to place other workloads. Reclaim needs the most care. Because NVCF queues have
-unlimited quotas, quota-based reclaim never takes from them. With KAI's default
-`allow-consolidating-reclaim`, however, reclaim can still move running NVCF Pods
-to other nodes to make room for another queue's pending gang. Workloads that
-create their own queues, such as Dynamo, make this possible.
+evicts running NVCF workloads to place other workloads. Reclaim needs the most
+care. Because NVCF queues have unlimited quotas, quota-based reclaim never takes
+from them. With KAI's default `allow-consolidating-reclaim`, however, reclaim
+can still move running NVCF Pods to other nodes to make room for another
+queue's pending gang. Workloads that create their own queues, such as Dynamo,
+make this possible.
+
+KAI's stale-gang eviction stays enabled. It evicts the remaining Pods of a gang
+that stays below its minimum size for longer than the staleness grace period
+(60 seconds by default). For Dynamo workloads, Grove's KAI backend owns this
+decision, and Dynamo 1.5 and later require turning the eviction off. On clusters
+that run Dynamo, add `default-staleness-grace-period: "-1s"` under
+`scheduler.args`. When the compute plane stack installs KAI, it sets this
+whenever the Dynamo operator add-on is enabled.
 
 If other teams on a shared cluster rely on reclaim to enforce their queue
-quotas, replace `reclaim.enabled: false` in the values above with the following.
-NVCF Pods are then never moved, and quota-based reclaim between the other queues
-still works:
+quotas, use the following `scheduler` block instead of the one in the values
+above. It keeps reclaim enabled but turns off `allow-consolidating-reclaim`, so
+reclaim no longer moves running NVCF Pods, and quota-based reclaim between the
+other queues still works:
 
 ```yaml
 scheduler:
+  placementStrategy: binpack
+  plugins:
+    nodeplacement:
+      arguments:
+        gpu: binpack
+        cpu: spread
   actions:
+    preempt:
+      enabled: false
+    consolidation:
+      enabled: false
     reclaim:
       enabled: true
   args:
