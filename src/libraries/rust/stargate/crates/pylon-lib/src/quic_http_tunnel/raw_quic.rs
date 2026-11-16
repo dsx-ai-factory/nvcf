@@ -25,8 +25,9 @@ use super::core::{
     forward_tunnel_request, next_body_len, request_body_buffer, serve_bidi_streams,
 };
 
-// A longer wait is aborted during shutdown anyway.
-const RESPONSE_DELIVERY_TIMEOUT: Duration = crate::registration::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+// Bounds the wait after every response, not only during shutdown, where the
+// drain deadline can end it sooner.
+const RESPONSE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub(super) async fn handle_raw_quic_connection(
     incoming: quinn::Incoming,
