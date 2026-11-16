@@ -756,7 +756,6 @@ ingress:
       # to keep it off while the add-on is on, for example when callers reach
       # the gateway in-cluster.
       llmInvocation:
-        # enabled: false
         routeAnnotations: {}
       vanityGateway:
         # Defaults to vanity.<global.domain>. Set a non-empty list to override.

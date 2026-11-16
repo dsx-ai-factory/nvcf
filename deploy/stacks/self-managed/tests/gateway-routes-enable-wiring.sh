@@ -163,8 +163,9 @@ assert_route_enabled llmApiGateway true "$llm_values"
 assert_route_enabled llmInvocation true "$llm_values"
 
 # ---------------------------------------------------------------------------
-# 4. LLM add-on on, both routes turned off by the environment, for example
-#    when callers reach the gateway in-cluster.
+# 4. LLM add-on on, one route turned off by the environment, for example
+#    when callers reach the gateway in-cluster. The other stays on, so a flag
+#    read from the wrong route fails here.
 # ---------------------------------------------------------------------------
 write_env <<'EOF'
 global:
@@ -179,23 +180,25 @@ ingress:
     routes:
       llmApiGateway:
         enabled: false
-      llmInvocation:
-        enabled: false
 EOF
 
 llm_off_values="$work_dir/ingress-llm-off-values.yaml"
 render_ingress_values "$llm_off_values"
 assert_route_enabled llmApiGateway false "$llm_off_values"
-assert_route_enabled llmInvocation false "$llm_off_values"
+assert_route_enabled llmInvocation true "$llm_off_values"
 
 # ---------------------------------------------------------------------------
 # 5. LLM add-on off: enabling a route cannot turn it on without its backend.
+#    A quoted "false" counts as off, as it does for the add-on's releases.
 # ---------------------------------------------------------------------------
 write_env <<'EOF'
 global:
   image:
     registry: nvcr.io
     repository: test/nvcf
+addons:
+  llm:
+    enabled: "false"
 ingress:
   gatewayApi:
     routes:
