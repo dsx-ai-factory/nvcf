@@ -751,7 +751,12 @@ ingress:
         routeAnnotations: {}
       invocation:
         routeAnnotations: {}
+      # The LLM routes, llm.<domain> (llmApiGateway) and llm.invocation.<domain>
+      # (llmInvocation), follow addons.llm.enabled. Set enabled: false on either
+      # to keep it off while the add-on is on, for example when callers reach
+      # the gateway in-cluster.
       llmInvocation:
+        # enabled: false
         routeAnnotations: {}
       vanityGateway:
         # Defaults to vanity.<global.domain>. Set a non-empty list to override.
