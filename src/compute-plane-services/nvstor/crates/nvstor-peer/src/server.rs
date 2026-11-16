@@ -30,8 +30,8 @@ use nvstor_rdma::transport::RdmaTransport;
 use crate::export::DirExport;
 use crate::sessions::{self, FetcherCap};
 
-/// Default cap on concurrently served fetchers; see `docs/peer-copy.md`
-/// for why 8.
+/// Default cap on concurrently served fetchers; see
+/// `docs/peer-copy-internals.md`, "The cap", for why 4.
 pub const DEFAULT_MAX_FETCHERS: usize = 4;
 
 #[derive(Clone, Debug)]
