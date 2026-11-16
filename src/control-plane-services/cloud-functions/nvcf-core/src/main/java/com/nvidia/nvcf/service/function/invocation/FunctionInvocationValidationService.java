@@ -17,6 +17,7 @@
 package com.nvidia.nvcf.service.function.invocation;
 
 
+import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.DEGRADING;
 import static com.nvidia.nvcf.service.apikeys.ApiKeysService.isApiKeyAuth;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.authorizedFunctionMatch;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.privateFunctionMatch;
@@ -112,7 +113,8 @@ public class FunctionInvocationValidationService {
                     if (function.getFunctionStatus() == FunctionStatus.DEGRADED) {
                         hasDegraded.set(true);
                     }
-                    return FunctionStatus.INVOCABLE_STATUSES.contains(function.getFunctionStatus());
+                    return function.getFunctionStatus() == FunctionStatus.ACTIVE
+                            || function.getFunctionStatus() == DEGRADING;
                 })
                 .map(function -> {
                     var fId = function.getFunctionId();

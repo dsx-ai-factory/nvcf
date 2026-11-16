@@ -17,7 +17,6 @@
 package com.nvidia.nvcf.rest.function.invocation;
 
 import static com.nvidia.nvcf.configuration.notary.NotaryAuthManagerConfiguration.VALIDITY;
-import static com.nvidia.nvcf.persistence.function.entity.FunctionStatus.INVOCABLE_STATUSES;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.authorizedFunctionMatch;
 import static com.nvidia.nvcf.service.function.FunctionPredicateUtils.privateFunctionMatch;
 import static java.lang.String.format;
@@ -29,6 +28,7 @@ import com.nvidia.nvcf.rest.function.invocation.dto.InvocationTokenResponse;
 import com.nvidia.nvcf.rest.function.invocation.dto.ListInvocableFunctionsResponse;
 import com.nvidia.nvcf.rest.function.invocation.dto.MultiFunctionsInvocationTokenRequest;
 import com.nvidia.nvcf.rest.function.management.dto.BasicFunctionDto;
+import com.nvidia.nvcf.rest.function.management.dto.FunctionStatusEnum;
 import com.nvidia.nvcf.rest.function.management.dto.VisibilityEnum;
 import com.nvidia.nvcf.service.function.FunctionManagementService;
 import com.nvidia.nvcf.service.function.invocation.FunctionInvocationValidationService;
@@ -58,24 +58,22 @@ public class FunctionInvocationFacade {
 
     /**
      * Lists the function and version ids of the invocable functions for the bearer token: the
-     * function versions in an invocable status that pass the same account and API key checks
-     * as invocation, version by version.
+     * function versions that the function listing returns for the same bearer token, in ACTIVE
+     * or DEGRADING status.
      */
     public ListInvocableFunctionsResponse listInvocableFunctions(
             String ncaId,
             Authentication authentication,
             Set<VisibilityEnum> visibilities) {
         var functions = functionManagementService
-                .lookupFunctions(ncaId,
-                                 function -> privateFunctionMatch(ncaId, authentication, function),
-                                 function -> authorizedFunctionMatch(ncaId,
-                                                                     authentication,
-                                                                     function),
-                                 visibilities)
+                .getFunctions(ncaId,
+                              function -> privateFunctionMatch(ncaId, authentication, function),
+                              function -> authorizedFunctionMatch(ncaId, authentication, function),
+                              visibilities)
                 .stream()
-                .filter(function -> INVOCABLE_STATUSES.contains(function.getFunctionStatus()))
-                .map(function -> new InvocableFunctionDto(function.getFunctionId(),
-                                                          function.getFunctionVersionId()))
+                .filter(function -> function.status() == FunctionStatusEnum.ACTIVE
+                        || function.status() == FunctionStatusEnum.DEGRADING)
+                .map(function -> new InvocableFunctionDto(function.id(), function.versionId()))
                 .toList();
         return new ListInvocableFunctionsResponse(functions);
     }
