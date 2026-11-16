@@ -111,8 +111,9 @@ wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affin
 ```
 
 Set the deployment's `maxRequestConcurrency` to the engine's real request
-capacity, such as engine workers times vLLM `--max-num-seqs`. If it is unset,
-`1`, or too high, the router cannot tell when a cluster is full. See
+capacity, such as engine workers times vLLM `--max-num-seqs`. If it is unset or
+`1`, the router cannot tell when a cluster is full. If it is too high, the
+router finds a full cluster only after requests queue inside the engine. See
 [Algorithms that use the cache-affinity key](https://github.com/NVIDIA/nvcf/blob/main/src/libraries/rust/stargate/docs/load-balancer-configuration.md#algorithms-that-use-the-cache-affinity-key).
 
 `llmConfig.tokenRateLimit` applies a per-model token limit. Use one or more comma-separated limits in `<value>-<unit>` format, where `<value>` is a positive integer and `<unit>` is one of `S` (seconds), `M` (minutes), `H` (hours), `D` (days), `W` (weeks), or `MO` (30 days). A single limit is one token budget over one time window, such as `1000-S`. The budget refills continuously over the window rather than resetting at a fixed time, so `3000000-MO` returns about 100000 tokens per day. A combined limit is multiple token budgets over distinct time windows, such as `1000-S,5000-M,100000-H,500000-D,1000000-W`; do not repeat a unit in the same value.

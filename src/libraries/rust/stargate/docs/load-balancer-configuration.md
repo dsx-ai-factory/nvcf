@@ -143,8 +143,9 @@ wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affin
 The affine cluster is full when its active requests reach
 `max_engine_concurrency` plus `max_queued`. In this example, if it stays full
 for 200 ms, the request can go to another cluster. If `max_engine_concurrency`
-is `0` (unknown) or above the engine's real capacity, the cluster never counts
-as full, and requests queue inside the engine. See
+is `0` (unknown), the cluster never counts as full. If it is above the engine's
+real capacity, the cluster counts as full only after requests queue inside the
+engine. See
 [Runtime stats interface](runtime-stats-interface.md#concurrency-fallback).
 
 ### Audit key use
