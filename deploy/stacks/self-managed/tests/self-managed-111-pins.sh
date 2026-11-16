@@ -112,6 +112,7 @@ render_values 02-core.yaml.gotmpl api "$work_dir/api.yaml"
 assert_value "$work_dir/api.yaml" '.api.remoteConfig.workerImageTags.llmCredentials == "1.2.3"' "worker llm credentials is not 1.2.3"
 # The function autoscaler image comes from its chart (a stack default breaks
 # observability-autoscaler.sh); the chart pin carries the 1.1.1 release.
+test "$(chart_version 03-observability.yaml.gotmpl function-autoscaler)" = "0.8.1" || fail "function-autoscaler chart is not 0.8.1 (appVersion 1.23.2)"
 render_values 03-observability.yaml.gotmpl function-autoscaler "$work_dir/autoscaler.yaml"
 test -z "$(yq -r '.functionautoscaler.image.tag // ""' "$work_dir/autoscaler.yaml")" || fail "the stack must leave the function autoscaler image tag to the chart"
 
