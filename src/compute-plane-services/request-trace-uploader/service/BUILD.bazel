@@ -32,6 +32,7 @@ go_library(
         "//src/compute-plane-services/request-trace-uploader/segment",
         "//src/compute-plane-services/request-trace-uploader/telemetry",
         "//src/compute-plane-services/request-trace-uploader/transform",
+        "//src/compute-plane-services/request-trace-uploader/transform/redact",
         "//src/compute-plane-services/request-trace-uploader/transform/suppress",
     ],
 )
