@@ -157,7 +157,8 @@ If other teams on a shared cluster rely on reclaim to enforce their queue
 quotas, use the following `scheduler` block instead of the one in the values
 above. It keeps reclaim enabled but turns off `allow-consolidating-reclaim`, so
 reclaim no longer moves running NVCF Pods, and quota-based reclaim between the
-other queues still works:
+other queues still works. On clusters that run Dynamo, keep both arguments by
+uncommenting the staleness setting:
 
 ```yaml
 scheduler:
@@ -176,6 +177,8 @@ scheduler:
       enabled: true
   args:
     allow-consolidating-reclaim: "false"
+    # Required on clusters that run Dynamo:
+    # default-staleness-grace-period: "-1s"
 ```
 
 For a new installation, replace `<kai-version>` with the `version` of the
