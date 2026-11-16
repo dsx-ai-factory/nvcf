@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/service"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
@@ -30,7 +31,7 @@ func exportOnce(t *testing.T, extra map[string]string, lines ...string) []string
 	spool := uploadertest.NewSpool(t, config.DefaultSegmentPrefix)
 	spool.Roll(uploadertest.NewSegment().Member(lines...).Bytes())
 	spool.Roll(uploadertest.NewSegment().Member(uploadertest.RequestEnd("active", 1)).Bytes())
-	exporter := newCapture(t, resubmitSafeFake())
+	exporter := newCapture(t, backendtest.NewFake())
 	uploader, err := service.NewUploader(loadEnv(t, spoolEnv(t, spool.Dir, extra)), exporter, service.Options{})
 	if err != nil {
 		t.Fatalf("NewUploader() error = %v", err)
@@ -64,7 +65,7 @@ func TestAuditPrefixSegmentsAreExportedToo(t *testing.T) {
 	audit.WriteAt(0, uploadertest.NewSegment().Member(uploadertest.RequestEnd("audit", 1)).Bytes())
 	audit.WriteAt(1, uploadertest.NewSegment().Member(uploadertest.RequestEnd("audit-active", 1)).Bytes())
 
-	exporter := newCapture(t, resubmitSafeFake())
+	exporter := newCapture(t, backendtest.NewFake())
 	cfg := loadEnv(t, spoolEnv(t, spool.Dir, map[string]string{config.EnvAuditPrefix: "request-audit"}))
 	uploader, err := service.NewUploader(cfg, exporter, service.Options{})
 	if err != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	k8sevents "k8s.io/client-go/tools/record"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
@@ -114,12 +115,13 @@ func TestRanksOf(t *testing.T) {
 	}
 }
 
-// The record keeps its capture's last restores, newest last.
+// The record keeps its capture's last restores, newest last, each naming
+// its rank 0's pod.
 func TestRecordRestoreHistory(t *testing.T) {
 	d := map[string]string{"checkpoint.0": "c0"}
 	at := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
 	for i := 0; i < groupRestoresMax+2; i++ {
-		if !recordRestoreHistory(d, "c0", at.Add(time.Duration(i)*time.Minute), time.Duration(30+i)*time.Second) {
+		if !recordRestoreHistory(d, "c0", at.Add(time.Duration(i)*time.Minute), time.Duration(30+i)*time.Second, types.UID("pod-"+strconv.Itoa(i))) {
 			t.Fatal("a restore of the record's capture not recorded")
 		}
 	}
@@ -127,10 +129,10 @@ func TestRecordRestoreHistory(t *testing.T) {
 	if len(got) != groupRestoresMax {
 		t.Fatalf("%d restores kept, want %d", len(got), groupRestoresMax)
 	}
-	if got[len(got)-1] != "2026-11-02T10:11:00Z=41.0" || got[0] != "2026-11-02T10:02:00Z=32.0" {
+	if got[len(got)-1] != "2026-11-02T10:11:00Z=41.0=pod-11" || got[0] != "2026-11-02T10:02:00Z=32.0=pod-2" {
 		t.Fatalf("kept %v, want the last %d, newest last", got, groupRestoresMax)
 	}
-	if recordRestoreHistory(d, "other", at, time.Second) {
+	if recordRestoreHistory(d, "other", at, time.Second, "pod-x") {
 		t.Fatal("a restore of another capture recorded")
 	}
 }

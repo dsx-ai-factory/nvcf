@@ -649,7 +649,7 @@ func TestRecordRefusal(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
 	leader := ready(enginePod(0))
 	refuse := func(why string) {
-		c.recordRefusal(context.Background(), key, fnScope(t, a), []string{"cache://cfg"}, 1, leader, why, log)
+		c.recordRefusal(context.Background(), key, fnScope(t, a), 0, []string{"cache://cfg"}, 1, leader, why, log)
 	}
 	refuse("preflight: engine-0: MPTCP")
 	d := getRecord(t, a, criuGroupConfigMapName(key))
@@ -677,7 +677,7 @@ func TestRecordRefusalLeavesAnotherCapture(t *testing.T) {
 	a2, _ := fallbackAgent(t, record(criuGroupConfigMapName(key), map[string]string{
 		"state": criuGroupStateCapturing, "captures": "1", "startedAt": time.Now().UTC().Format(time.RFC3339), groupAgentBundleKey: fbBundle}))
 	c := &criuAutoRestorer{a: a2}
-	c.recordRefusal(context.Background(), key, fnScope(t, a2), []string{"cache://cfg"}, 1, ready(enginePod(0)), "preflight: x", logrus.NewEntry(logrus.New()))
+	c.recordRefusal(context.Background(), key, fnScope(t, a2), 0, []string{"cache://cfg"}, 1, ready(enginePod(0)), "preflight: x", logrus.NewEntry(logrus.New()))
 	if d := getRecord(t, a2, criuGroupConfigMapName(key)); d["state"] != criuGroupStateCapturing {
 		t.Errorf("another agent's capture was overwritten: %v", d)
 	}
@@ -692,7 +692,7 @@ func TestRecordRefusalWithCompanionFallsBack(t *testing.T) {
 	scope := fnScope(t, a)
 	uris := []string{"cache://cfg", "cache://kv"}
 	key := criuGroupKey(instanceConfigURIOf(uris), scope)
-	c.recordRefusal(context.Background(), key, scope, uris, 1, ready(enginePod(0)), "preflight: kv-0: MPTCP", logrus.NewEntry(logrus.New()))
+	c.recordRefusal(context.Background(), key, scope, 0, uris, 1, ready(enginePod(0)), "preflight: kv-0: MPTCP", logrus.NewEntry(logrus.New()))
 	if d := getRecord(t, a, criuGroupConfigMapName(key)); d["state"] != criuGroupStateFailed {
 		t.Fatalf("instance record %v", d)
 	}

@@ -409,8 +409,9 @@ func (r *Reconciler) doStatusAggressive(
 			})
 			log.Info(message, "pendingObjects", collectObjectIDs(ctx, r.Client.Scheme(), statuses, filterPending))
 
-			// Requeue at least once after the scheduling timeout has passed in case no progress is made.
-			res.RequeueAfter = getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig)
+			// Requeue when the next unscheduled pod reaches the scheduling timeout in case no progress is made.
+			res.RequeueAfter = r.podSchedulingRequeueAfter(ctx, ms.Spec.Namespace,
+				getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig))
 		}
 		if err := errors.Join(serrs...); err != nil {
 			log.Error(err, "Errors were encountered while checking object status")
@@ -592,8 +593,9 @@ func (r *Reconciler) doStatusByWorkerReadiness(
 		})
 		log.V(1).Info(message)
 
-		// Requeue at least once after the scheduling timeout has passed in case no progress is made.
-		res.RequeueAfter = getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig)
+		// Requeue when the next unscheduled pod reaches the scheduling timeout in case no progress is made.
+		res.RequeueAfter = r.podSchedulingRequeueAfter(ctx, ms.Spec.Namespace,
+			getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig))
 	}
 	if err := errors.Join(serrs...); err != nil {
 		log.Error(err, "Errors were encountered while checking object status")
@@ -974,6 +976,50 @@ func getPodSchedulingTimeout(ctx context.Context, req *nvcav2beta1.ICMSRequest, 
 		}
 	}
 	return schedulingTimeout
+}
+
+// podSchedulingRequeueSlack is added to a pod's scheduling deadline so the
+// requeued status check runs after the pod has crossed the timeout.
+const podSchedulingRequeueSlack = time.Second
+
+// podSchedulingRequeueAfter returns how long to wait for the next status check
+// so it runs once the earliest unscheduled pod in namespace reaches
+// schedulingTimeout. Each pod's timeout is measured from its own launch time,
+// which can be later than this check. Requeueing a fixed schedulingTimeout
+// from now could land just before that pod's deadline and delay detecting it by
+// another full timeout. Pods already past their deadline are left to the status
+// check itself. The result never exceeds schedulingTimeout.
+func (r *Reconciler) podSchedulingRequeueAfter(ctx context.Context, namespace string, schedulingTimeout time.Duration) time.Duration {
+	pods, err := r.listPods(ctx, namespace)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list pods to schedule the next status check",
+			"namespace", namespace)
+		return schedulingTimeout
+	}
+	now := r.now()
+	requeueAfter := schedulingTimeout
+	for _, pod := range pods {
+		switch pod.Status.Phase {
+		case corev1.PodPending, corev1.PodUnknown, "":
+		default:
+			continue
+		}
+		if nvcak8sutil.IsPodScheduled(pod.Status) {
+			continue
+		}
+		launched, ok := nvcak8sutil.PodLaunchTime(pod)
+		if !ok {
+			continue
+		}
+		untilDeadline := launched.Add(schedulingTimeout).Sub(now)
+		if untilDeadline <= 0 {
+			continue
+		}
+		if wait := untilDeadline + podSchedulingRequeueSlack; wait < requeueAfter {
+			requeueAfter = wait
+		}
+	}
+	return requeueAfter
 }
 
 func isTaskUtilsContainerExitedSuccessfully(pod *corev1.Pod) bool {

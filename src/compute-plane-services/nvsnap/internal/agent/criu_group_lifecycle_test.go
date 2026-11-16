@@ -171,11 +171,11 @@ func TestFailGroup_RestoreFailureBlocksAndAllowsRecapture(t *testing.T) {
 	}
 	// The next Ready instance takes the record over, once.
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
-	first, err := c.claimGroupRecord(ctx, "k1", &p, 2)
+	first, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
 	if err != nil || first == nil || first.Data["captures"] != "2" || first.Data["state"] != "capturing" {
 		t.Fatalf("takeover = %v, %v", first, err)
 	}
-	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
 		t.Errorf("a second claim while capturing = %v, %v; want none", again, err)
 	}
 }
@@ -196,7 +196,7 @@ func TestClaimGroupRecord_FailedCaptureWaitsForAnotherRelease(t *testing.T) {
 	}
 	release("a1")
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
-	first, err := c.claimGroupRecord(ctx, "k2", &p, 2)
+	first, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
 	if err != nil || first == nil || first.Data[groupAgentBundleKey] != "a1" {
 		t.Fatalf("first claim = %v, %v; want one naming release a1", first, err)
 	}
@@ -204,11 +204,11 @@ func TestClaimGroupRecord_FailedCaptureWaitsForAnotherRelease(t *testing.T) {
 	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Update(ctx, first, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if again, err := c.claimGroupRecord(ctx, "k2", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2); err != nil || again != nil {
 		t.Fatalf("the release a capture failed under claimed it again = %v, %v", again, err)
 	}
 	release("b1")
-	next, err := c.claimGroupRecord(ctx, "k2", &p, 2)
+	next, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
 	if err != nil || next == nil || next.Data["captures"] != "2" || next.Data[groupAgentBundleKey] != "b1" ||
 		next.Data["previousReason"] != "inet: Unsupported proto 262" {
 		t.Fatalf("another release's claim = %v, %v; want the second capture under b1", next, err)
@@ -737,7 +737,7 @@ func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
 	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "undeployed"})
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
 	p.Namespace = "fn"
-	claimed, err := c.claimGroupRecord(ctx, "k1", &p, 2)
+	claimed, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
 	if err != nil || claimed == nil {
 		t.Fatalf("claim = %v, %v; want the record taken over", claimed, err)
 	}
@@ -745,7 +745,7 @@ func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
 		t.Errorf("record = %v, want a second capture under way", claimed.Data)
 	}
 	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn"})
-	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
 		t.Errorf("claim = %v, %v; a record still verified in its namespace is not taken over", again, err)
 	}
 }

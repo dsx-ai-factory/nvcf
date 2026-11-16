@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"nvcf-grpc-proxy/proxy/metrics"
 	"nvcf-grpc-proxy/proxy/worker"
 )
 
@@ -59,7 +60,13 @@ func (s *StreamDirector) serveReportedRpc(upstream http.Handler, wc *worker.Work
 	defer func() {
 		// Also runs while an aborted copy panics with http.ErrAbortHandler,
 		// which then carries on unwinding.
-		s.eventLedger.Publish(r.Context(), newRpcFinished(wc, rpc, !completed, time.Now()))
+		aborted := !completed
+		// An upgraded connection's copy returns normally however it ends, so
+		// ask the tunnel. Anything but the client leaving cut the session short.
+		if ended := wc.CloseOrigin(); rpc.hijacked && ended != "" && ended != metrics.CloseReasonClientClosed {
+			aborted = true
+		}
+		s.eventLedger.Publish(r.Context(), newRpcFinished(wc, rpc, aborted, time.Now()))
 	}()
 	upstream.ServeHTTP(rpc, r)
 	completed = true

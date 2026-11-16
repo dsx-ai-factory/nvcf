@@ -160,3 +160,34 @@ func TestLoadStrictRejectsUnknownSettings(t *testing.T) {
 		t.Fatalf("LoadStrict() error = %v, want the misspelled setting named", err)
 	}
 }
+
+// The uploader reads only these settings, all of them generic or for a
+// backend this module links. README.md lists the same names; a setting
+// added or removed here must be added or removed there too.
+func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
+	want := []string{
+		EnvAttemptTimeout, EnvAuditPrefix, EnvAuthMaxBackoff, EnvBackend,
+		EnvBatchMaxBytes, EnvBatchMaxSegments, EnvCreateBurst,
+		EnvCreatesPerMinute, EnvDebugVerbosity, EnvDrainTimeout,
+		EnvHealthAddr, EnvMaxJobAge, EnvMaxRetries,
+		EnvObjectStoreBucket, EnvObjectStoreDryRun, EnvObjectStoreEndpoint,
+		EnvObjectStoreKeyPrefix, EnvObjectStorePathStyle, EnvObjectStoreRegion,
+		EnvOperationTimeout, EnvQuarantineDir, EnvQuarantineResume,
+		EnvQuarantineTrip, EnvRedactMultimodal,
+		EnvRetryAfterMax, EnvRetryInitialBackoff, EnvRetryMaximumBackoff,
+		EnvRetryMultiplier, EnvScanInterval, EnvSecretsFile,
+		EnvSegmentPrefix, EnvSegmentScopeFailures, EnvSourceDir,
+		EnvStateDir, EnvStatusInterval, EnvSuppressHeaderless,
+		EnvSuppressionRules, EnvSuppressionStrict, EnvSuppressNCAHeaders,
+		EnvSuppressNCAIDs, EnvUnconfirmedResends,
+	}
+	var got []string
+	for name := range knownSettings() {
+		got = append(got, name)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("settings Load reads:\n got  %v\n want %v", got, want)
+	}
+}

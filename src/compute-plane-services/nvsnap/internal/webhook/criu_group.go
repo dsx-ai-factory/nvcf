@@ -38,6 +38,10 @@ const (
 	// companion of the instance: a pod without GPUs that its GPU ranks
 	// were connected to (an etcd, a NATS), captured and restored with them.
 	CRIUGroupCompanionAnnotation = "nvsnap.io/criu-group-companion"
+	// CRIUGroupLabel carries the group record key as a label too, so
+	// nvsnap-server can watch a restore's pods by selector and keep its
+	// history (docs/design/FUNCTION-CACHE-STATUS.md, History).
+	CRIUGroupLabel = "nvsnap.io/criu-group"
 )
 
 // CRIUGroup is a complete group capture: the checkpoint of each rank, in
@@ -209,6 +213,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupOrdinalAnnotation), Value: strconv.Itoa(ordinal)},
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupSizeAnnotation), Value: strconv.Itoa(size)},
 	)
+	cp = append(cp, newMetaPatcher(pod).label(CRIUGroupLabel, key)...)
 	if companion {
 		cp = append(cp, PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupCompanionAnnotation), Value: "true"})
 		log.WithFields(logrus.Fields{"checkpoint": id, "slot": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its instance's companion placeholder")

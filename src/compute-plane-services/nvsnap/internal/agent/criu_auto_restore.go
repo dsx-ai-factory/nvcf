@@ -254,6 +254,7 @@ func (c *criuAutoRestorer) prefetch(ctx context.Context, pod *corev1.Pod) {
 }
 
 func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid types.UID, id, container, groupKey string) {
+	defer metrics.Active("restore")()
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": ns + "/" + pod, "checkpoint": id, "container": container})
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
@@ -261,6 +262,11 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	t0 := time.Now()
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid}}
 	err := func() error {
+		if why := c.driverMismatch(rctx, groupKey); why != "" {
+			// Not run, and not held against the capture: the replacement is
+			// admitted under the cluster's drivers as they are now.
+			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
+		}
 		_, err := a.restoreProbed(rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
@@ -285,7 +291,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		took, now := time.Since(t0), time.Now()
 		record(func(d map[string]string) bool {
 			changed := recordRestored(d, id, string(uid)+"/"+container)
-			return recordRestoreHistory(d, id, now, took) || changed
+			return recordRestoreHistory(d, id, now, took, uid) || changed
 		})
 		return
 	}

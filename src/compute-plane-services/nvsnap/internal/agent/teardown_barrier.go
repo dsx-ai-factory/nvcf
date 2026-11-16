@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -135,10 +136,31 @@ func teardownExited(dir string) bool {
 	return err == nil
 }
 
-// liftTeardownHold removes the hold (a link is removed, not followed).
+// teardownGone reports whether the work dir itself is gone: the pod's
+// volumes were torn down.
+func teardownGone(dir string) bool {
+	_, err := os.Stat(dir)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// errTeardownDirGone: the hold was not lifted, the work dir went with it
+// (the kubelet killed the pod and removed its volumes).
+var errTeardownDirGone = errors.New("the rank's work volume is gone")
+
+// liftHold is liftTeardownHold; a test makes it fail.
+var liftHold = liftTeardownHold
+
+// liftTeardownHold removes the hold (a link is removed, not followed). A
+// hold already gone with the work dir is errTeardownDirGone, not a lift.
 func liftTeardownHold(dir string) error {
-	if err := os.Remove(filepath.Join(dir, webhook.TeardownHoldFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	err := os.Remove(filepath.Join(dir, webhook.TeardownHoldFile))
+	switch {
+	case err == nil:
+		return nil
+	case !errors.Is(err, fs.ErrNotExist):
 		return err
+	case teardownGone(dir):
+		return errTeardownDirGone
 	}
 	return nil
 }
@@ -196,6 +218,21 @@ func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, l
 	t0 := time.Now()
 	tick := time.NewTicker(teardownPoll)
 	defer tick.Stop()
+	// The pod was killed at the end of its grace period, its peers not all
+	// exited, when the hold this driver found ended without it lifting it:
+	// still on at the deadline, or gone with the pod's volumes (the kubelet
+	// removes the work dir once it has killed the pod; only this driver
+	// lifts a hold). Not for a rank first driven past its deadline: a
+	// restarted agent would count it again, or count one it never drove.
+	drove := teardownHeld(dir) && t0.Before(deadline)
+	lifted, liftFailed := false, false
+	defer func() {
+		if drove && !lifted && ctx.Err() == nil && (teardownHeld(dir) || teardownGone(dir)) {
+			metrics.ObserveTeardown(metrics.TeardownDeadline, c.a.podGPU(ctx, pod), c.instanceRanks(ctx, pod), 0)
+			log.WithField("held", time.Since(t0).Round(time.Millisecond).String()).Warn("group teardown: the grace period ran out before every rank exited; the pod is killed")
+			c.a.podEvent(pod, true, eventTeardownDeadline, "the grace period ran out before every rank of the restore exited; the pod is killed")
+		}
+	}()
 	for teardownHeld(dir) && time.Now().Before(deadline) {
 		exited := teardownExited(dir)
 		if exited && !reported {
@@ -216,12 +253,25 @@ func (c *criuAutoRestorer) driveTeardown(ctx context.Context, pod *corev1.Pod, l
 		if exited && reported {
 			pods, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{})
 			if err == nil && teardownReleased(pod, pods.Items, true) {
-				if err := liftTeardownHold(dir); err != nil {
-					log.WithError(err).Warn("group teardown: cannot lift the hold; the pod goes at the end of its grace period")
+				if err := liftHold(dir); errors.Is(err, errTeardownDirGone) {
+					// The pod was killed while the peers were listed: a
+					// deadline, which the deferred check records.
+					return
+				} else if err != nil {
+					// Tried again next tick: the pod is held at worst to its
+					// deadline, and only a hold still on then is a deadline.
+					if !liftFailed {
+						log.WithError(err).Warn("group teardown: cannot lift the hold; trying again until the grace period ends")
+					}
+					liftFailed = true
+				} else {
+					lifted = true
+					took := time.Since(deleteRequested(pod).Time)
+					metrics.ObserveTeardown(metrics.TeardownReleased, c.a.podGPU(ctx, pod), c.instanceRanks(ctx, pod), took)
+					log.WithFields(logrus.Fields{"held": time.Since(t0).Round(time.Millisecond).String(), "teardownSeconds": int(took.Seconds())}).
+						Info("group teardown: every rank has exited; the rank's pod may go")
 					return
 				}
-				log.WithField("held", time.Since(t0).Round(time.Millisecond).String()).Info("group teardown: every rank has exited; the rank's pod may go")
-				return
 			}
 		}
 		select {

@@ -117,7 +117,12 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 		a.log.WithError(err).WithField("namespace", ns).Warn("CRIU group restore: cannot read the namespace's scope; cold start")
 		return webhook.CRIUGroup{}, false
 	}
-	key := criuGroupKey(uri, scope)
+	if why := a.driverGate(ctx); why != "" {
+		// No restore under these drivers (driver_gate.go): GPU ranks fall
+		// back to the cachedir, companions start cold.
+		return webhook.CRIUGroup{}, false
+	}
+	key := criuGroupKeyDriver(uri, scope, a.keyDriver(ctx))
 	g, ok := a.lookupCRIUGroup(ctx, key)
 	if ok {
 		a.nameRecordLater(key, ns)

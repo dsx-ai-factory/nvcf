@@ -283,6 +283,46 @@ func (s *Store) MarkPrepared(id, backendName string, transports map[string]journ
 	})
 }
 
+// Reprepare sends a prepared segment whose transports were never put in a
+// batch back to Discovered and removes the transports, so it is prepared
+// again, for example under a changed record-handling policy. A segment with
+// any destination in a batch is refused: that work may already be sent.
+func (s *Store) Reprepare(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seg, ok := s.segments[id]
+	if !ok {
+		return fmt.Errorf("%w: segment %s", journal.ErrNotFound, shortID(id))
+	}
+	if seg.State != journal.StatePrepared {
+		return fmt.Errorf("%w: segment %s is %s, not prepared", journal.ErrInvalidTransition, shortID(id), seg.State)
+	}
+	for _, dest := range seg.Destinations {
+		if dest.State != journal.StatePrepared || dest.BatchID != "" {
+			return fmt.Errorf("%w: segment %s is in a batch", journal.ErrInvalidTransition, shortID(id))
+		}
+	}
+	return s.resetSegmentLocked(id)
+}
+
+// CountFaults counts one failure toward the quarantine threshold of each
+// segment. A segment that is no longer in the journal is skipped.
+func (s *Store) CountFaults(ids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errs []error
+	for _, id := range ids {
+		if _, ok := s.segments[id]; !ok {
+			continue
+		}
+		errs = append(errs, s.updateSegmentLocked(id, func(seg *journal.Segment) error {
+			seg.Faults++
+			return nil
+		}))
+	}
+	return errors.Join(errs...)
+}
+
 // MarkEmpty records that a segment held no records.
 func (s *Store) MarkEmpty(id string) error {
 	return s.updateSegment(id, func(seg *journal.Segment) error {

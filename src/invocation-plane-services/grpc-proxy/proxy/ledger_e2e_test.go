@@ -23,10 +23,12 @@ package proxy
 import (
 	"context"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -46,6 +48,7 @@ type e2eEnv struct {
 	director  *StreamDirector
 	publisher *eventledger.Publisher
 	received  func() []map[string]any
+	addr      string
 	client    echo.EchoClient
 	conn      *grpc.ClientConn
 }
@@ -63,7 +66,7 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
-	return &e2eEnv{director: director, publisher: publisher, received: received, client: echo.NewEchoClient(conn), conn: conn}
+	return &e2eEnv{director: director, publisher: publisher, received: received, addr: addr, client: echo.NewEchoClient(conn), conn: conn}
 }
 
 // attachWorker waits for the session's work to be dispatched, then attaches
@@ -71,13 +74,20 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 // ID and the proxy end of the tunnel.
 func (e *e2eEnv) attachWorker(t *testing.T) (uuid.UUID, net.Conn) {
 	t.Helper()
+	server := grpc.NewServer()
+	server.RegisterService(&echo.Echo_ServiceDesc, &echo.Server{})
+	t.Cleanup(server.Stop)
+	return e.attachWorkerServing(t, server.Serve)
+}
+
+// attachWorkerServing is attachWorker for a worker that runs serve.
+func (e *e2eEnv) attachWorkerServing(t *testing.T, serve func(net.Listener) error) (uuid.UUID, net.Conn) {
+	t.Helper()
 	e.waitFor(t, eventTypeWorkDispatched)
 	info := e.director.workerAuth.Get(testWorkerToken).Value()
 	listener, addr := bindEphemeral(t)
-	server := grpc.NewServer()
-	server.RegisterService(&echo.Echo_ServiceDesc, &echo.Server{})
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(server.Stop)
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() { _ = serve(listener) }()
 	tunnel, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	require.NoError(t, e.director.RegisterWorker(t.Context(), testWorkerToken, info, tunnel))
@@ -278,6 +288,72 @@ func TestLedgerE2ETunnelLossMidStream(t *testing.T) {
 
 			finished := assertSession(t, e.finish(t), requestId, tc.cause, echo.Echo_EchoMessageStreaming_FullMethodName)
 			assert.Equal(t, true, finished["incomplete"])
+		})
+	}
+}
+
+// After a WebSocket upgrade the proxy copies raw bytes, and that copy ends the
+// same way whoever closes. The session must still say who did.
+func TestLedgerE2EWebSocketSessionEnd(t *testing.T) {
+	tests := []struct {
+		name       string
+		end        func(ws *websocket.Conn, tunnel net.Conn)
+		cause      string
+		incomplete bool
+	}{
+		{
+			name:       "worker connection drops",
+			end:        func(_ *websocket.Conn, tunnel net.Conn) { _ = tunnel.Close() },
+			cause:      metrics.CloseReasonWorkerClosed,
+			incomplete: true,
+		},
+		{
+			name:  "client closes",
+			end:   func(ws *websocket.Conn, _ net.Conn) { _ = ws.Close() },
+			cause: metrics.CloseReasonClientClosed,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newE2EEnv(t)
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			worker := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				for {
+					kind, message, err := conn.ReadMessage()
+					if err != nil || conn.WriteMessage(kind, message) != nil {
+						return
+					}
+				}
+			})}
+			t.Cleanup(func() { _ = worker.Close() })
+			header := http.Header{}
+			header.Add("Sec-WebSocket-Protocol", "authorization.client-token")
+			header.Add("Sec-WebSocket-Protocol", "function-id."+testFunctionId)
+			dials := make(chan *websocket.Conn, 1)
+			go func() {
+				ws, _, _ := websocket.DefaultDialer.Dial("ws://"+e.addr+"/ws", header)
+				dials <- ws
+			}()
+			requestId, tunnel := e.attachWorkerServing(t, worker.Serve)
+			var ws *websocket.Conn
+			select {
+			case ws = <-dials:
+			case <-time.After(e2eWait):
+				t.Fatal("the WebSocket dial did not finish")
+			}
+			require.NotNil(t, ws, "the WebSocket dial failed")
+			require.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte("hello")))
+			_, _, err := ws.ReadMessage()
+			require.NoError(t, err)
+
+			tc.end(ws, tunnel)
+			finished := assertSession(t, e.finish(t), requestId, tc.cause, "/ws")
+			assert.Equal(t, tc.incomplete, finished["incomplete"])
 		})
 	}
 }

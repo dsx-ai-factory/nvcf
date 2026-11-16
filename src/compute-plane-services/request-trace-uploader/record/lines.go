@@ -92,7 +92,7 @@ func OpenLines(path string, opts LineOptions) (*Lines, error) {
 	if maxLine == 0 {
 		maxLine = DefaultMaxLineBytes
 	}
-	file, err := openRegular(path)
+	file, err := OpenRegular(path)
 	if err != nil {
 		return nil, fmt.Errorf("open segment: %w", err)
 	}
@@ -310,10 +310,11 @@ func (l *Lines) Err() error { return l.err }
 // Close releases the segment.
 func (l *Lines) Close() error { return l.src.close() }
 
-// openRegular opens path for reading if it is a regular file. It does not
+// OpenRegular opens path for reading if it is a regular file. It does not
 // follow a final symlink and does not block on a pipe, and it checks the
-// type of what it opened, so a file swapped after a scan is refused.
-func openRegular(path string) (*os.File, error) {
+// type of what it opened, so a file swapped after a scan is refused. Every
+// read of a discovered segment opens it this way.
+func OpenRegular(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		return nil, err

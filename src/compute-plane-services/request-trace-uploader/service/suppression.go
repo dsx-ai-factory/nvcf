@@ -27,15 +27,20 @@ var actionLabels = map[suppress.Action]string{
 	suppress.DropRecord:   "drop_record",
 }
 
+// unresolvedAction labels records_suppressed for records strict suppression
+// stripped because the rule's header had no value.
+const unresolvedAction = "strip_unresolved"
+
 // suppressionRules maps each named rule to its action label. Counters carry
 // only the operator-assigned rule name, never a header name or value.
 type suppressionRules struct {
 	order  []string
 	action map[string]string
+	strict bool
 }
 
 func newSuppressionRules(cfg suppress.Config) (suppressionRules, error) {
-	rules := suppressionRules{action: map[string]string{}}
+	rules := suppressionRules{action: map[string]string{}, strict: cfg.Strict}
 	for _, rule := range cfg.Rules {
 		if rule.Name == "" {
 			continue
@@ -61,12 +66,17 @@ func (r suppressionRules) preset(m telemetry.Metrics) {
 	for _, name := range r.order {
 		m.Add(telemetry.RecordsSuppressed, 0, telemetry.Labels{"rule": name, "action": r.action[name]})
 		m.Add(telemetry.SuppressionHeaderPresent, 0, telemetry.Labels{"rule": name})
+		if r.strict {
+			m.Add(telemetry.RecordsSuppressed, 0, telemetry.Labels{"rule": name, "action": unresolvedAction})
+		}
 	}
 }
 
 func (u *Uploader) recordPrepared(result transform.Result) {
 	payload := telemetry.Labels{"record_type": payloadRecordType}
-	u.metrics.Add(telemetry.RecordsEvaluated, float64(result.Evaluated), payload)
+	for recordType, count := range result.EvaluatedByType {
+		u.metrics.Add(telemetry.RecordsEvaluated, float64(count), telemetry.Labels{"record_type": recordType})
+	}
 	u.metrics.Add(telemetry.RecordsIncomplete, float64(result.Incomplete), payload)
 	for name, count := range result.Rules {
 		action, ok := u.rules.action[name]
@@ -75,6 +85,9 @@ func (u *Uploader) recordPrepared(result transform.Result) {
 		}
 		u.metrics.Add(telemetry.SuppressionHeaderPresent, float64(count.HeaderPresent), telemetry.Labels{"rule": name})
 		u.metrics.Add(telemetry.RecordsSuppressed, float64(count.Matched), telemetry.Labels{"rule": name, "action": action})
+		if count.Unresolved > 0 {
+			u.metrics.Add(telemetry.RecordsSuppressed, float64(count.Unresolved), telemetry.Labels{"rule": name, "action": unresolvedAction})
+		}
 	}
 	for recordType, count := range result.HeaderlessDropped {
 		u.metrics.Add(telemetry.RecordsDropped, float64(count), telemetry.Labels{"record_type": recordType, "reason": headerlessReason})
@@ -93,10 +106,12 @@ type headerWatch struct {
 	evaluated int
 	// unseen holds the rules whose header no record has carried yet.
 	unseen map[string]bool
+	// stripped holds the rules strict suppression has warned about once.
+	stripped map[string]bool
 }
 
 func newHeaderWatch(active bool, threshold int, rules []string) *headerWatch {
-	w := &headerWatch{threshold: threshold, unseen: map[string]bool{}}
+	w := &headerWatch{threshold: threshold, unseen: map[string]bool{}, stripped: map[string]bool{}}
 	if active {
 		for _, rule := range rules {
 			w.unseen[rule] = true
@@ -108,6 +123,13 @@ func newHeaderWatch(active bool, threshold int, rules []string) *headerWatch {
 func (w *headerWatch) observe(result transform.Result) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	for _, name := range slices.Sorted(maps.Keys(result.Rules)) {
+		if result.Rules[name].Unresolved > 0 && !w.stripped[name] {
+			w.stripped[name] = true
+			slog.Warn("strict suppression stripped payload records that lack this rule's header; check that the producer captures the rule headers",
+				"rule", name)
+		}
+	}
 	if len(w.unseen) == 0 {
 		return
 	}

@@ -46,6 +46,11 @@ const (
 	ActionResubmit Action = "resubmit"
 	// ActionRetain keeps the item and waits for an operator.
 	ActionRetain Action = "retain"
+	// ActionResendOnce sends a job's work again as a new job, but only once:
+	// the job failed in a way that may still have landed, so the resend is
+	// counted as a possible duplicate, and a second such failure is kept
+	// for an operator.
+	ActionResendOnce Action = "resend_once"
 )
 
 // Failure is one failed call for one item.
@@ -56,8 +61,9 @@ type Failure struct {
 	Fault backend.Fault
 	// JobID reports whether a job id is known for the item.
 	JobID bool
-	// Attempts counts the item's failed attempts so far, including this
-	// one, as the journal records them.
+	// Attempts counts the item's failures so far that were not of the whole
+	// backend, including this one, as the journal records them. A failure
+	// while the backend is held is not counted.
 	Attempts int
 }
 
@@ -161,12 +167,13 @@ func (p *Policy) Breaker() *Breaker { return p.breaker }
 //  2. A submit that returned a job id keeps polling that job.
 //  3. An auth fault holds, so auth never splits a batch or quarantines
 //     anything.
-//  4. An ambiguous job keeps polling. An ambiguous submit with no job id
-//     follows Config.AmbiguousWithoutID, unless the backend is resubmit safe,
-//     where it is an ordinary retryable fault. With resubmit, an upload the
-//     destination could not confirm is sent again until the item has gone
-//     unconfirmed more than Config.UnconfirmedResends times, then
-//     quarantined; any other uncertain submit is sent again with no limit.
+//  4. An uncertain job failure is sent again once as a new job. An
+//     uncertain submit with no job id follows Config.AmbiguousWithoutID,
+//     unless the backend is resubmit safe, where it is an ordinary
+//     retryable fault. With resubmit, an upload the destination could not
+//     confirm is sent again until the item has gone unconfirmed more than
+//     Config.UnconfirmedResends times, then quarantined; any other
+//     uncertain submit is sent again with no limit.
 //  5. Backend scope holds.
 //  6. Segment scope quarantines when terminal or after
 //     Config.SegmentScopeFailures attempts, and retries otherwise.
@@ -213,7 +220,7 @@ func (p *Policy) action(now time.Time, caps backend.Capabilities, f Failure, fau
 	case auth:
 		return ActionHold
 	case fault.Class == backend.ClassUncertain && f.Stage == StageJob:
-		return ActionPoll
+		return ActionResendOnce
 	case fault.Class == backend.ClassUncertain && !caps.ResubmitSafe:
 		if p.cfg.AmbiguousWithoutID == AmbiguousRetain {
 			return ActionRetain

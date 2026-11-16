@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend/backendtest"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 )
 
@@ -41,16 +40,6 @@ func (c *capture) Submit(ctx context.Context, request backend.SubmitRequest) (st
 		c.mu.Unlock()
 	}
 	return c.Client.Submit(ctx, request)
-}
-
-// resubmitSafeFake is the generic fake with the capability every backend of
-// this pipeline must declare.
-func resubmitSafeFake() *backendtest.Fake {
-	fake := backendtest.NewFake()
-	caps := fake.Capabilities()
-	caps.ResubmitSafe = true
-	fake.SetCapabilities(caps)
-	return fake
 }
 
 func (c *capture) exported() []string {
