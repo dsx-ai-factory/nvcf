@@ -16,6 +16,24 @@ stacks. Stack, chart and image versions do not need matching version numbers.
 
 {/*docs-version-sync:END compatibility-matrix*/}
 
+### Declared compatibility (version catalog)
+
+The version catalog declares which stack releases are compatible with each
+other. The declarations for the current edition:
+
+| Stack | Release | Works with |
+| --- | --- | --- |
+| Self-managed (control plane) | `1.0.10` | Compute plane `1.0.5`, Observability `1.0.0` |
+| Compute plane | `1.0.5` | Self-managed `1.0.10`, Observability `1.0.0` |
+| Observability | `1.0.0` | Compute plane `1.0.5`, Self-managed `1.0.10` |
+
+Source: the `compatibility` entries in
+[`docs/version-catalog/main.yaml`](https://github.com/dsx-ai-factory/nvcf/blob/main/docs/version-catalog/main.yaml).
+The generated
+block above records the selected releases for this edition; this table records
+the declared cross-stack compatibility an operator needs when choosing
+releases. Future editions update it with their catalog.
+
 ## Compatibility and maintenance policy
 
 Later patch or minor releases can be used when their stack compatibility and
