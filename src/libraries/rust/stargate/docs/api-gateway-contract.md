@@ -277,7 +277,7 @@ The two waits run one after the other, so a single attempt can wait for their
 sum before its first output, and each retry can wait that long again.
 
 When a reverse-tunnel Pylon gets SIGTERM, it closes its registrations, accepts
-new tunnel streams for 2 s more, waits for in-flight requests, and keeps a raw
+new tunnel streams for up to 2 s more, waits for in-flight requests, and keeps a raw
 QUIC tunnel open up to 1 s after its last request.
 `--pylon-shutdown-drain-timeout-ms` (default 90000) bounds all of these,
 counted from the signal. Pylon then needs up to 5 s more to stop, so set the

@@ -260,8 +260,8 @@ struct Args {
     )]
     pylon_output_chunk_timeout_ms: u64,
     /// Longest wait for in-flight requests after SIGTERM, counted from the
-    /// signal. It also bounds the 2 s window that still accepts tunnel streams
-    /// and the final tunnel wait. Pylon needs up to 5 s more to stop, so set it
+    /// signal. It also bounds the window of up to 2 s that still accepts tunnel
+    /// streams and the final tunnel wait. Pylon needs up to 5 s more to stop, so set it
     /// at least 5 s below the worker pod termination grace period
     #[arg(
         long,
