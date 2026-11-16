@@ -33,6 +33,7 @@ import static com.nvidia.nvcf.util.NvcfConstants.ADMIN_SCOPE_LIST_FUNCTIONS_DETA
 import static com.nvidia.nvcf.util.TestConstants.SCOPE_INVOKE_FUNCTION;
 import static com.nvidia.nvcf.util.TestConstants.SCOPE_LIST_FUNCTIONS;
 import static com.nvidia.nvcf.util.TestConstants.TEST_ADMIN_SUBJECT;
+import static com.nvidia.nvcf.util.TestConstants.TEST_AUTHORIZED_NCA_ID_1;
 import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID;
 import static com.nvidia.nvcf.util.TestConstants.TEST_NCA_ID_2;
 import static com.nvidia.nvcf.util.TestConstants.TEST_OWNER_ID;
@@ -55,6 +56,9 @@ import com.nvidia.nvcf.util.MockEssServer;
 import jakarta.annotation.Nullable;
 import java.net.URI;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.AfterAll;
@@ -72,7 +76,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.resttestclient.TestRestTemplate;
 import org.springframework.boot.resttestclient.autoconfigure.AutoConfigureTestRestTemplate;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.RequestEntity;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.ContextConfiguration;
@@ -90,6 +96,9 @@ class XAccountFunctionInvocationControllerTest {
     private static final String INVOCABLE_FUNCTIONS_URI =
             "/v2/nvcf/accounts/%s/invocable/functions/versions/ids";
     private static final String FUNCTIONS_URI = "/v2/nvcf/accounts/%s/functions";
+    private static final ParameterizedTypeReference<Map<String, List<Map<String, String>>>>
+            JSON_BODY = new ParameterizedTypeReference<>() {
+            };
 
     @Autowired
     private TestRestTemplate testRestTemplate;
@@ -156,6 +165,9 @@ class XAccountFunctionInvocationControllerTest {
     Stream<Arguments> scopeArgs() {
         return Stream.of(
                 Arguments.of(List.of(ADMIN_SCOPE_LIST_FUNCTIONS), HttpStatus.OK),
+                Arguments.of(List.of(ADMIN_SCOPE_LIST_FUNCTIONS,
+                                     ADMIN_SCOPE_LIST_FUNCTIONS_DETAILS),
+                             HttpStatus.OK),
                 Arguments.of(List.of(ADMIN_SCOPE_LIST_FUNCTIONS_DETAILS), HttpStatus.FORBIDDEN),
                 Arguments.of(List.of(SCOPE_LIST_FUNCTIONS), HttpStatus.FORBIDDEN),
                 Arguments.of(List.of(SCOPE_INVOKE_FUNCTION), HttpStatus.FORBIDDEN),
@@ -177,27 +189,73 @@ class XAccountFunctionInvocationControllerTest {
                 .containsExactlyInAnyOrderElementsOf(OWN_AND_SHARED);
     }
 
-    @Test
-    void shouldRejectAnApiKey() {
-        setResponse(TEST_NCA_ID, TEST_OWNER_ID,
-                    List.of(new Resource("account-functions", "*"),
-                            new Resource("authorized-functions", "*")),
-                    List.of(SCOPE_LIST_FUNCTIONS));
-
-        var response = listInvocableFunctions("nvapi-stg-some-key", TEST_NCA_ID, "");
-
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+    Stream<Arguments> rejectedBearerArgs() {
+        return Stream.of(
+                Arguments.of("no bearer token", (Supplier<String>) () -> null,
+                             HttpStatus.UNAUTHORIZED),
+                Arguments.of("malformed token", (Supplier<String>) () -> "invalid",
+                             HttpStatus.UNAUTHORIZED),
+                Arguments.of("expired JWT",
+                             (Supplier<String>) () -> MOCK_OAUTH2_TOKEN_SERVER.getJwt(
+                                     TEST_ADMIN_SUBJECT, List.of(ADMIN_SCOPE_LIST_FUNCTIONS),
+                                     -3600),
+                             HttpStatus.UNAUTHORIZED),
+                // API keys never carry the admin scope, even for the account in the path.
+                Arguments.of("API key of the account in the path",
+                             (Supplier<String>) () -> {
+                                 setResponse(TEST_NCA_ID, TEST_OWNER_ID,
+                                             List.of(new Resource("account-functions", "*"),
+                                                     new Resource("authorized-functions", "*")),
+                                             List.of(SCOPE_LIST_FUNCTIONS));
+                                 return "nvapi-stg-some-key";
+                             },
+                             HttpStatus.FORBIDDEN));
     }
 
-    @Test
-    void shouldRejectARequestWithoutABearerToken() {
-        var response = listInvocableFunctions(null, TEST_NCA_ID, "");
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("rejectedBearerArgs")
+    void shouldRejectABearerTokenThatCannotList(
+            String description,
+            Supplier<String> bearer,
+            HttpStatus expectedStatus) {
+        var response = listInvocableFunctions(bearer.get(), TEST_NCA_ID, "");
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(response.getStatusCode()).isEqualTo(expectedStatus);
+    }
+
+    // The response has only the function and version id of each version, with no details.
+    @Test
+    void shouldReturnOnlyFunctionAndVersionIds() {
+        var response = exchangeJson(TEST_NCA_ID, "");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getHeaders().getContentType()).isNotNull();
+        assertThat(response.getHeaders().getContentType()
+                           .isCompatibleWith(MediaType.APPLICATION_JSON)).isTrue();
+        assertThat(response.getBody()).isNotNull().containsOnlyKeys("functions");
+        var functions = response.getBody().get("functions");
+        assertThat(functions).allSatisfy(function -> assertThat(function)
+                .containsOnlyKeys("id", "versionId"));
+        assertThat(functions.stream()
+                           .map(function -> new InvocableFunctionDto(
+                                   UUID.fromString(function.get("id")),
+                                   UUID.fromString(function.get("versionId"))))
+                           .toList())
+                .containsExactlyInAnyOrderElementsOf(ALL);
+    }
+
+    // An account without invocable function versions gets an empty list, not an error.
+    @Test
+    void shouldReturnAnEmptyListWithoutInvocableVersions() {
+        var response = exchangeJson(TEST_AUTHORIZED_NCA_ID_1, "visibility=private,authorized");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull().containsOnlyKeys("functions");
+        assertThat(response.getBody().get("functions")).isEmpty();
     }
 
     // A version is listed only in a status that accepts invocations, whether the account owns
-    // it, it is shared with the account, or it is public.
+    // it, it is shared with the account at the version or the function level, or it is public.
     @ParameterizedTest
     @EnumSource(FunctionStatus.class)
     void shouldListAVersionOnlyInAnInvocableStatus(FunctionStatus status) {
@@ -224,7 +282,10 @@ class XAccountFunctionInvocationControllerTest {
                 Arguments.of(TEST_NCA_ID, "", ALL),
                 Arguments.of(TEST_NCA_ID_2, "visibility=private", OWN_BY_NCA_ID_2),
                 Arguments.of(TEST_NCA_ID_2, "visibility=authorized", List.of()),
-                Arguments.of(TEST_NCA_ID_2, "", concat(OWN_BY_NCA_ID_2, PUBLIC)));
+                Arguments.of(TEST_NCA_ID_2, "", concat(OWN_BY_NCA_ID_2, PUBLIC)),
+                // An account that owns no functions and has none shared with it.
+                Arguments.of(TEST_AUTHORIZED_NCA_ID_1, "visibility=private,authorized", List.of()),
+                Arguments.of(TEST_AUTHORIZED_NCA_ID_1, "", PUBLIC));
     }
 
     // The result is for the account in the path, not the caller's, and has exactly the
@@ -273,8 +334,17 @@ class XAccountFunctionInvocationControllerTest {
             @Nullable String bearer,
             String ncaId,
             String query) {
-        return get(withQuery(INVOCABLE_FUNCTIONS_URI.formatted(ncaId), query), bearer,
-                   ListInvocableFunctionsResponse.class);
+        return testRestTemplate.exchange(
+                request(withQuery(INVOCABLE_FUNCTIONS_URI.formatted(ncaId), query), bearer),
+                ListInvocableFunctionsResponse.class);
+    }
+
+    private ResponseEntity<Map<String, List<Map<String, String>>>> exchangeJson(
+            String ncaId,
+            String query) {
+        return testRestTemplate.exchange(
+                request(withQuery(INVOCABLE_FUNCTIONS_URI.formatted(ncaId), query), adminJwt()),
+                JSON_BODY);
     }
 
     // The function and version ids of the versions in an invocable status in the cross-account
@@ -283,8 +353,9 @@ class XAccountFunctionInvocationControllerTest {
             String bearer,
             String ncaId,
             String query) {
-        var response = get(withQuery(FUNCTIONS_URI.formatted(ncaId), query), bearer,
-                           ListFunctionsResponse.class);
+        var response = testRestTemplate.exchange(
+                request(withQuery(FUNCTIONS_URI.formatted(ncaId), query), bearer),
+                ListFunctionsResponse.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isNotNull();
         return response.getBody().functions().stream()
@@ -294,12 +365,12 @@ class XAccountFunctionInvocationControllerTest {
                 .toList();
     }
 
-    private <T> ResponseEntity<T> get(String uri, @Nullable String bearer, Class<T> type) {
+    private static RequestEntity<Void> request(String uri, @Nullable String bearer) {
         var builder = RequestEntity.get(URI.create(uri));
         if (bearer != null) {
             builder = builder.header("Authorization", "Bearer " + bearer);
         }
-        return testRestTemplate.exchange(builder.build(), type);
+        return builder.build();
     }
 
     private static String withQuery(String uri, String query) {

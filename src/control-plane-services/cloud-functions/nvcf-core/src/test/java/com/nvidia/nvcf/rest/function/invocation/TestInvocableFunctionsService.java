@@ -38,11 +38,13 @@ import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_3;
 import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_4;
 import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_5;
 
+import com.nvidia.nvcf.persistence.function.FunctionsRepository;
 import com.nvidia.nvcf.persistence.function.entity.FunctionStatus;
 import com.nvidia.nvcf.rest.account.TestAccountService;
 import com.nvidia.nvcf.rest.azp.TestAuthorizedPartiesService;
 import com.nvidia.nvcf.rest.azp.dto.AuthorizedPartyDto;
 import com.nvidia.nvcf.rest.function.invocation.dto.InvocableFunctionDto;
+import com.nvidia.nvcf.service.function.FunctionLookupService;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -54,7 +56,7 @@ import org.springframework.stereotype.Service;
 /**
  * Creates the function versions for the tests of the invocable functions endpoints: versions in
  * every status that TEST_NCA_ID owns, that TEST_NCA_ID_2 shares with it at the version and the
- * function level, and that are public.
+ * function level, that TEST_NCA_ID_2 does not share, and that are public.
  */
 @Service
 @RequiredArgsConstructor
@@ -91,27 +93,49 @@ public class TestInvocableFunctionsService {
             UUID.fromString("7c2f0b1e-0000-4000-8000-000000000004");
     private static final UUID STATUS_PUBLIC_VERSION_ID =
             UUID.fromString("7c2f0b1e-0000-4000-8000-000000000203");
+    private static final UUID STATUS_FUNCTION_SHARED_FUNCTION_ID =
+            UUID.fromString("7c2f0b1e-0000-4000-8000-000000000005");
+    private static final UUID STATUS_FUNCTION_SHARED_VERSION_ID =
+            UUID.fromString("7c2f0b1e-0000-4000-8000-000000000204");
 
     // The invocable versions, in ACTIVE or DEGRADING status, of each kind for TEST_NCA_ID.
     public static final List<InvocableFunctionDto> OWN = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
-            new InvocableFunctionDto(TEST_FUNCTION_ID, TEST_VERSION_ID_3));
+            version(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
+            version(TEST_FUNCTION_ID, TEST_VERSION_ID_3));
     public static final List<InvocableFunctionDto> SHARED = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
-            new InvocableFunctionDto(SHARED_FUNCTION_ID, SHARED_DEGRADING_VERSION_ID));
+            version(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
+            version(SHARED_FUNCTION_ID, SHARED_DEGRADING_VERSION_ID));
     public static final List<InvocableFunctionDto> PUBLIC = List.of(
-            new InvocableFunctionDto(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_1));
+            version(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_1));
     public static final List<InvocableFunctionDto> OWN_AND_SHARED = concat(OWN, SHARED);
     public static final List<InvocableFunctionDto> ALL = concat(OWN, SHARED, PUBLIC);
 
     // The invocable versions that TEST_NCA_ID_2 owns.
     public static final List<InvocableFunctionDto> OWN_BY_NCA_ID_2 = List.of(
-            new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
-            new InvocableFunctionDto(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5),
-            new InvocableFunctionDto(SHARED_FUNCTION_ID, SHARED_DEGRADING_VERSION_ID));
+            version(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
+            version(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5),
+            version(SHARED_FUNCTION_ID, SHARED_DEGRADING_VERSION_ID));
+
+    // Every version that createFunctionVersions creates, whatever its status and owner.
+    public static final List<InvocableFunctionDto> FIXTURE_VERSIONS = List.of(
+            version(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_1),
+            version(TEST_PUBLIC_FUNCTION_ID_1, TEST_PUBLIC_FUNCTION_VERSION_ID_2),
+            version(TEST_FUNCTION_ID, TEST_VERSION_ID_1),
+            version(TEST_FUNCTION_ID, TEST_VERSION_ID_3),
+            version(TEST_FUNCTION_ID_3, TEST_VERSION_ID_4),
+            version(TEST_FUNCTION_ID_3, DEPLOYING_VERSION_ID),
+            version(TEST_FUNCTION_ID_3, ERROR_VERSION_ID),
+            version(TEST_FUNCTION_ID_3, DEGRADED_VERSION_ID),
+            version(TEST_FUNCTION_ID_2, TEST_VERSION_ID_2),
+            version(TEST_FUNCTION_ID_2, TEST_VERSION_ID_5),
+            version(TEST_FUNCTION_ID_2, SHARED_DEGRADED_VERSION_ID),
+            version(SHARED_FUNCTION_ID, SHARED_DEGRADING_VERSION_ID),
+            version(SHARED_FUNCTION_ID, SHARED_INACTIVE_VERSION_ID));
 
     private final TestAccountService testAccountService;
     private final TestAuthorizedPartiesService testAuthPartiesService;
+    private final FunctionLookupService functionLookupService;
+    private final FunctionsRepository functionsRepository;
 
     public void createFunctionVersions() {
         testAccountService.createAccountAndAssociateClients(TEST_PUBLIC_FUNCTION_NCA_ID, null);
@@ -143,7 +167,8 @@ public class TestInvocableFunctionsService {
 
     /**
      * Creates a version in the status that TEST_NCA_ID owns, one that TEST_NCA_ID_2 shares with
-     * it, and a public one.
+     * it at the version level, one that TEST_NCA_ID_2 shares with it at the function level, and
+     * a public one.
      *
      * @return the function and version ids of the versions
      */
@@ -152,20 +177,32 @@ public class TestInvocableFunctionsService {
         create(STATUS_SHARED_FUNCTION_ID, STATUS_SHARED_VERSION_ID, TEST_NCA_ID_2, status);
         share(TEST_NCA_ID_2, STATUS_SHARED_FUNCTION_ID, Optional.of(STATUS_SHARED_VERSION_ID),
               TEST_NCA_ID);
+        create(STATUS_FUNCTION_SHARED_FUNCTION_ID, STATUS_FUNCTION_SHARED_VERSION_ID,
+               TEST_NCA_ID_2, status);
+        share(TEST_NCA_ID_2, STATUS_FUNCTION_SHARED_FUNCTION_ID, Optional.empty(), TEST_NCA_ID);
         create(STATUS_PUBLIC_FUNCTION_ID, STATUS_PUBLIC_VERSION_ID, TEST_PUBLIC_FUNCTION_NCA_ID,
                status);
         share(TEST_PUBLIC_FUNCTION_NCA_ID, STATUS_PUBLIC_FUNCTION_ID, Optional.empty(),
               AUTHORIZED_WILDCARD_ACCOUNT);
         return List.of(
-                new InvocableFunctionDto(STATUS_FUNCTION_ID, STATUS_VERSION_ID),
-                new InvocableFunctionDto(STATUS_SHARED_FUNCTION_ID, STATUS_SHARED_VERSION_ID),
-                new InvocableFunctionDto(STATUS_PUBLIC_FUNCTION_ID, STATUS_PUBLIC_VERSION_ID));
+                version(STATUS_FUNCTION_ID, STATUS_VERSION_ID),
+                version(STATUS_SHARED_FUNCTION_ID, STATUS_SHARED_VERSION_ID),
+                version(STATUS_FUNCTION_SHARED_FUNCTION_ID, STATUS_FUNCTION_SHARED_VERSION_ID),
+                version(STATUS_PUBLIC_FUNCTION_ID, STATUS_PUBLIC_VERSION_ID));
     }
 
     public void share(String ownerNcaId, UUID functionId, Optional<UUID> versionId, String ncaId) {
         testAuthPartiesService.associateAuthParties(
                 ownerNcaId, functionId, versionId,
                 Set.of(AuthorizedPartyDto.builder().ncaId(ncaId).build()));
+    }
+
+    // Changes only the status of an existing version, keeping its authorized parties.
+    public void setStatus(InvocableFunctionDto version, FunctionStatus status) {
+        var function = functionLookupService
+                .lookupUsingFunctionIdAndVersionIdOrThrow(version.id(), version.versionId());
+        function.setFunctionStatus(status);
+        functionsRepository.save(function);
     }
 
     // The function versions themselves are deleted with the rest of the test data.
@@ -176,6 +213,10 @@ public class TestInvocableFunctionsService {
     @SafeVarargs
     public static List<InvocableFunctionDto> concat(List<InvocableFunctionDto>... lists) {
         return Stream.of(lists).flatMap(List::stream).toList();
+    }
+
+    private static InvocableFunctionDto version(UUID id, UUID versionId) {
+        return new InvocableFunctionDto(id, versionId);
     }
 
     private void create(UUID id, UUID versionId, String ncaId, FunctionStatus status) {
