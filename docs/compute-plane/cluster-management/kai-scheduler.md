@@ -145,20 +145,29 @@ can still move running NVCF Pods to other nodes to make room for another
 queue's pending gang. Workloads that create their own queues, such as Dynamo,
 make this possible.
 
-KAI's stale-gang eviction stays enabled. It evicts the remaining Pods of a gang
-that stays below its minimum size for longer than the staleness grace period
-(60 seconds by default). For Dynamo workloads, Grove's KAI backend owns this
-decision, and Dynamo 1.5 and later require turning the eviction off. On clusters
-that run Dynamo, add `default-staleness-grace-period: "-1s"` under
-`scheduler.args`. When the compute plane stack installs KAI, it sets this
-whenever the Dynamo operator add-on is enabled.
+KAI's `stalegangeviction` action stays enabled. It evicts the remaining Pods of
+a gang that stays below its minimum size for longer than the staleness grace
+period (60 seconds by default). Grove's `kai-scheduler`
+backend, which Grove enables by default from v0.1.0-alpha.13, owns this
+decision for Grove workloads, including Dynamo's. Where that backend is active,
+add `default-staleness-grace-period: "-1s"` under `scheduler.args`, as the
+Dynamo 1.5 upgrade notes require. Keep the default when KAI runs without Grove
+or when Grove's `kai-scheduler` backend is disabled. When the compute plane
+stack installs KAI, it sets this whenever the Grove operator add-on is enabled.
+
+The setting changes the scheduler-wide default, so it applies to every PodGroup
+that does not set its own grace period, including PodGroups owned by other
+teams on a shared cluster. Such a gang keeps its running Pods for as long as it
+stays below its minimum size. A workload that needs stale-gang eviction can set
+its own grace period with the `kai.scheduler/staleness-grace-period` annotation
+on its Pods, its parent resource, or its PodGroup.
 
 If other teams on a shared cluster rely on reclaim to enforce their queue
 quotas, use the following `scheduler` block instead of the one in the values
 above. It keeps reclaim enabled but turns off `allow-consolidating-reclaim`, so
 reclaim no longer moves running NVCF Pods, and quota-based reclaim between the
-other queues still works. On clusters that run Dynamo, keep both arguments by
-uncommenting the staleness setting:
+other queues still works. Where Grove's `kai-scheduler` backend is active, keep
+both arguments by uncommenting the staleness setting:
 
 ```yaml
 scheduler:
@@ -177,7 +186,7 @@ scheduler:
       enabled: true
   args:
     allow-consolidating-reclaim: "false"
-    # Required on clusters that run Dynamo:
+    # Required where Grove's kai-scheduler backend is active:
     # default-staleness-grace-period: "-1s"
 ```
 

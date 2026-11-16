@@ -178,10 +178,11 @@ releases:
           {{- include "kaiScheduler.spreadReplicas" "binder" | nindent 10 }}
 
         scheduler:
-          {{- if dig "dynamoOperator" "enabled" false .Values.addons }}
-          # Grove's KAI backend owns PodGroup termination for Dynamo workloads.
+          {{- if dig "groveOperator" "enabled" false .Values.addons }}
+          # Grove's kai-scheduler backend (on by default since v0.1.0-alpha.13)
+          # owns PodGroup termination for Grove workloads, including Dynamo's.
           # Disable KAI's independent stale PodGroup eviction, as the Dynamo 1.5+
-          # upgrade guide requires.
+          # upgrade notes require. Without Grove, KAI keeps its default cleanup.
           args:
             default-staleness-grace-period: "-1s"
           {{- end }}
@@ -461,8 +462,9 @@ releases:
     # Minimum 1.4.0: earlier releases speak the legacy Grove ClusterTopology
     # API, which no longer exists once Grove is on v0.1.0-alpha.12-rc1+
     # (NVIDIA/nvcf#1269). From 1.5 the DynamoCheckpoint CRD is gone, so NVCA
-    # must not list it as an extra type (see 02-nvca.yaml.gotmpl), and KAI's
-    # stale PodGroup eviction is turned off (see the kai-scheduler release).
+    # must not list it as an extra type (see 02-nvca.yaml.gotmpl). Dynamo
+    # needs Grove, which turns off KAI's stale PodGroup eviction (see the
+    # kai-scheduler release).
     condition: addons.dynamoOperator.enabled
     chart: nvidia-ai-dynamo/dynamo-platform
     version: 1.6.2
