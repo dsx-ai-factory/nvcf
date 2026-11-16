@@ -4,6 +4,7 @@ include Makefile.dist
 .PHONY: test test-published-charts test-nats-chart
 test:
 	@tests/custom-observability-environment.sh
+	@tests/release-inventory-coverage.sh
 	@tests/llm-gateway-auth-transport.sh
 	@tests/llm-router-worker-address.sh
 	@tests/llm-router-split-cluster.sh
