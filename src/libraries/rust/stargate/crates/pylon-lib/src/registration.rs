@@ -40,6 +40,8 @@ const REVERSE_TUNNEL_ACCEPT_WINDOW: Duration = Duration::from_secs(2);
 // them on and drops them when the tunnel closes, so a drained tunnel stays open
 // this long after its last request.
 const REVERSE_TUNNEL_CLOSE_LINGER: Duration = Duration::from_secs(1);
-/// Default bound on the wait for in-flight requests when Pylon shuts down. It
-/// must fit in the worker pod termination grace period.
+/// Default bound on the wait for in-flight requests when Pylon shuts down.
+/// Pylon needs up to 5 s more to stop, so the worker pod termination grace
+/// period must be at least this bound plus 5 s, which is longer than the
+/// Kubernetes default of 30 s.
 pub const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
