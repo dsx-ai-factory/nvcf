@@ -133,6 +133,29 @@ class UpgradeGuide111Checks(unittest.TestCase):
                     block = re.search(r"```bash\n(.*?)```", step, re.DOTALL).group(1)
                     self.assertIn("set -euo pipefail", block)
 
+    def test_nats_drain_checks_every_memory_stream_including_replicated_ones(self):
+        for baseline, path in GUIDES.items():
+            with self.subTest(baseline=baseline):
+                match = re.search(r"jq -se '(.*?)' \\\n", path.read_text(), re.DOTALL)
+                self.assertIsNotNone(match)
+                # HA modes replicate every memory stream, so a single-replica filter selects nothing.
+                self.assertNotIn("== 1) |", match.group(1))
+                self.assertIn("No memory streams found", match.group(1))
+
+    def test_a_stalled_rollout_has_a_generic_troubleshooting_fix(self):
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                text = self.text(baseline)
+                self.assertIn("### A release stays failed after a stalled rollout", text)
+                self.assertIn("helmfile.d/02-core.yaml.gotmpl --selector name=<release> sync", text)
+                self.assertNotIn("4 CPU", text)
+
+    def test_the_bridge_step_links_a_documented_jwt_canary(self):
+        runbook = (DOCS / "self-managed/runbooks/openbao-jwt-plugin-upgrade.md").read_text()
+        self.assertIn("### JWT canary", runbook)
+        self.assertIn("jwt_canary()", runbook)
+        self.assertIn("openbao-jwt-plugin-upgrade.md#jwt-canary", self.text("1.1.0"))
+
     def test_the_104_guide_has_no_hostname_policy_step(self):
         text = self.text("1.0.4")
         self.assertNotIn("apply-hostname-policy", text)
