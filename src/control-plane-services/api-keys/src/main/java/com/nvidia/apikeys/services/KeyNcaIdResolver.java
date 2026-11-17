@@ -39,7 +39,8 @@ public class KeyNcaIdResolver {
         var details = StringUtils.trimToNull(ncaIdInDetails);
         if (StringUtils.isNotBlank(column) && StringUtils.isNotBlank(details)
                 && !column.equals(details)) {
-            throw new IllegalStateException("Key NCA ID does not match its stored details");
+            throw new IllegalStateException(
+                    "NCA ID value in the column does not match with the corresponding value in the details");
         }
         if (StringUtils.isNotBlank(column)) {
             return column;

@@ -51,6 +51,9 @@ class KeyNcaIdResolverTest {
     void resolve_failsWhenColumnAndDetailsDiffer() {
         var key = KeyVo.builder().ncaId("column-nca").ncaIdInDetails("details-nca").build();
 
-        assertThrows(IllegalStateException.class, () -> resolver.resolve(key));
+        var exception = assertThrows(IllegalStateException.class, () -> resolver.resolve(key));
+        assertEquals(
+                "NCA ID value in the column does not match with the corresponding value in the details",
+                exception.getMessage());
     }
 }
