@@ -136,6 +136,15 @@ models behind one Pylon also share the budget, because Pylon gets one
 `--max-engine-concurrency` for all names. Queue sizes, input sizes, and
 priority queue estimates stay per model.
 
+Every name in one capacity domain should report the same
+`max_engine_concurrency`: the request capacity of the whole hardware/cache
+cluster that the domain's Pylons front. Admission compares the shared running
+count with the requested name's own limit. An engine stats stream can report
+a limit per model; if names in one domain report different limits, a name
+with a lower limit is rejected while load on the other names stays above it.
+Models that run on separate hardware need separate domains: register them
+through separate Pylons, each with its own `--cluster-id`.
+
 Stargate enforces this budget. Pylon still counts each name separately for its
 own queue estimate; that estimate can only be lower than Stargate's, so Pylon's
 queue mismatch check does not reject more requests.
