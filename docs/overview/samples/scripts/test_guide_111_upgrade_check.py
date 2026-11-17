@@ -124,6 +124,15 @@ class UpgradeGuide111Checks(unittest.TestCase):
                 self.assertLess(control, compute.start())
                 self.assertNotIn("Upgrade the existing compute plane", text)
 
+    def test_step_one_block_sets_strict_shell_options_when_the_text_requires_them(self):
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                text = self.text(baseline)
+                step = section(text, "## 1. Set deployment values")
+                if "set -euo pipefail" in step.split("```", 1)[0]:
+                    block = re.search(r"```bash\n(.*?)```", step, re.DOTALL).group(1)
+                    self.assertIn("set -euo pipefail", block)
+
     def test_the_104_guide_has_no_hostname_policy_step(self):
         text = self.text("1.0.4")
         self.assertNotIn("apply-hostname-policy", text)
