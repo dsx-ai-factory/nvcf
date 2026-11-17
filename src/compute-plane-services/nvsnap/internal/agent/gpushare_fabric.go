@@ -71,6 +71,13 @@ const (
 	fabricPollInterval = 200 * time.Millisecond
 )
 
+// fabricMemberTimeout bounds one request to a member's agent. A reply is a
+// local file read or write on the member's node (milliseconds); the bound
+// keeps a member that accepts a connection and never answers from holding
+// the driver past the vote deadline (2 min) by more than this. A variable
+// for tests.
+var fabricMemberTimeout = 10 * time.Second
+
 var fabricSessionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 // validFabricSession reports whether s can name a session directory.
@@ -545,20 +552,12 @@ func driveFabric(ctx context.Context, members []fabricMember, done func(i int) b
 		}
 		lostOne := len(running) < len(members)
 
-		states := make(map[int]fabricState, len(running))
-		for _, i := range running {
-			st, ok, err := members[i].State(ctx)
-			if err != nil {
-				log.WithError(err).WithField("member", members[i].Name()).Debug("gpushare fabric: state")
-				continue
-			}
-			if ok {
-				states[i] = st
-			}
-		}
+		states := memberStates(ctx, members, running, log)
 
 		if opts.Vote && !out.Went {
-			if (lostOne || (opts.LostOther != nil && opts.LostOther())) && !aborted {
+			// A go being delivered is never replaced by an abort: a member
+			// that has it may already be suspending (fabricVoter.drive).
+			if !vote.goPending() && (lostOne || (opts.LostOther != nil && opts.LostOther())) && !aborted {
 				aborted = true
 				log.Warn("gpushare fabric: a member ended before the quiesce vote passed; aborting the vote")
 			}
@@ -570,7 +569,7 @@ func driveFabric(ctx context.Context, members []fabricMember, done func(i int) b
 					}
 				}
 			}
-			if !aborted && opts.VoteDeadline > 0 && !firstVote.IsZero() && time.Since(firstVote) > opts.VoteDeadline {
+			if !aborted && !vote.goPending() && opts.VoteDeadline > 0 && !firstVote.IsZero() && time.Since(firstVote) > opts.VoteDeadline {
 				aborted = true
 				log.WithFields(logrus.Fields{"deadline": opts.VoteDeadline.String(), "attempts": vote.decided + 1}).
 					Warn("gpushare fabric: the GPU work did not quiesce on every node in time; aborting the vote, the members roll back")
@@ -677,8 +676,14 @@ type fabricVoter struct {
 	abortSent map[int]int // member -> highest attempt it has the abort for
 }
 
+// goPending reports whether a go verdict is being delivered: some members
+// may have it already.
+func (v *fabricVoter) goPending() bool { return v.pending != nil && v.pending.value == "go" }
+
 func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running []int, states map[int]fabricState, aborted bool, out *fabricOutcome, log *logrus.Entry) {
-	if aborted {
+	// A go reaches every member, even past the deadline: a member that has it
+	// may be suspending, and an abort to the others would split the capture.
+	if aborted && !v.goPending() {
 		// An abort answers each member's own attempt as it votes.
 		for _, i := range running {
 			st, ok := states[i]
@@ -730,6 +735,38 @@ func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running
 	log.WithFields(logrus.Fields{"attempt": v.attempt, "verdict": p.value}).Info("gpushare fabric: quiesce vote")
 }
 
+// memberStates asks the running members for their state in parallel, each
+// request bounded by fabricMemberTimeout, so a member that does not answer
+// delays a poll by one timeout, not one per member. A member that fails or
+// has no session is left out.
+func memberStates(ctx context.Context, members []fabricMember, running []int, log *logrus.Entry) map[int]fabricState {
+	type res struct {
+		i  int
+		st fabricState
+		ok bool
+	}
+	ch := make(chan res, len(running))
+	for _, i := range running {
+		go func(i int) {
+			rctx, cancel := context.WithTimeout(ctx, fabricMemberTimeout)
+			defer cancel()
+			st, ok, err := members[i].State(rctx)
+			if err != nil {
+				log.WithError(err).WithField("member", members[i].Name()).Debug("gpushare fabric: state")
+				ok = false
+			}
+			ch <- res{i, st, ok}
+		}(i)
+	}
+	states := make(map[int]fabricState, len(running))
+	for range running {
+		if r := <-ch; r.ok {
+			states[r.i] = r.st
+		}
+	}
+	return states
+}
+
 // httpFabricMember reaches a member's session on its node's agent.
 type httpFabricMember struct {
 	client           *http.Client
@@ -769,6 +806,8 @@ func (m *httpFabricMember) State(ctx context.Context) (fabricState, bool, error)
 }
 
 func (m *httpFabricMember) send(ctx context.Context, u string, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, fabricMemberTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
