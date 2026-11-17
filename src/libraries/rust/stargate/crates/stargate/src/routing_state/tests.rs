@@ -3742,6 +3742,72 @@ async fn alias_names_on_one_backend_free_engine_slots_when_load_ends() {
     }
 }
 
+// A name that leaves the domain must take its running count with it, or
+// every name in the domain stays full until Stargate restarts.
+#[tokio::test]
+async fn capacity_domain_drops_the_share_of_a_departed_name() {
+    let stats = |num_running_queries| ModelStats {
+        last_mean_input_tps: 100.0,
+        max_engine_concurrency: 8,
+        num_running_queries,
+        ..ModelStats::default()
+    };
+
+    for (case, alias_on_own_backend) in [
+        ("alias no longer advertised", false),
+        ("backend serving alias ends", true),
+    ] {
+        let scenario = RegistrationScenario::new(Some("rk-alias"));
+        let base = scenario.start_in("inst-base", "shared-engine", 8888);
+        let mut base_update = scenario.update(&base, "base", Active, stats(1));
+        let alias_backend = if alias_on_own_backend {
+            let alias = scenario.start_in("inst-alias", "shared-engine", 8889);
+            let alias_update = scenario.update(&alias, "alias", Active, stats(1));
+            scenario.publish_connected(&alias, &alias_update).await;
+            Some(alias)
+        } else {
+            base_update.models.insert(
+                "alias".to_string(),
+                InferenceServerModelRegistration {
+                    stats: Some(stats(1)),
+                    status: Active as i32,
+                },
+            );
+            None
+        };
+        scenario.publish_connected(&base, &base_update).await;
+        assert_eq!(
+            scenario
+                .only_cluster("base")
+                .await
+                .stats
+                .num_running_queries,
+            2,
+            "{case}: both names count"
+        );
+
+        match alias_backend {
+            Some(alias) => {
+                scenario.state.end_registration(alias).await;
+            }
+            None => {
+                let base_only = scenario.update(&base, "base", Active, stats(1));
+                scenario.publish_connected(&base, &base_only).await;
+            }
+        }
+
+        assert_eq!(
+            scenario
+                .only_cluster("base")
+                .await
+                .stats
+                .num_running_queries,
+            1,
+            "{case}: alias share left the domain"
+        );
+    }
+}
+
 // One request is always running while the writer moves it between "routed,
 // not yet reported" and "reported", so a concurrent read must never be 0.
 #[test]
