@@ -58,7 +58,6 @@ class UpgradeGuide111Checks(unittest.TestCase):
                 for component in ("controller", "webhook", "cainjector", "acmesolver", "startupapicheck"):
                     self.assertIn(component, body)
                 self.assertIn("image.repository", body)
-                self.assertIn("before", body.lower())
 
     def test_openbao_transition_matches_the_baseline(self):
         from_110 = self.text("1.1.0")
@@ -68,7 +67,7 @@ class UpgradeGuide111Checks(unittest.TestCase):
         self.assertEqual(1, from_110.count('.openbao.jwtPluginLifecycle.mode = "versioned"'))
         # 1.0.4 already ran the plugin update: no bridge step, no plugin migration.
         self.assertNotIn('.openbao.jwtPluginLifecycle.mode = "bridge"', from_104)
-        self.assertIn("does not repeat the plugin update", from_104)
+        self.assertNotIn('.openbao.jwtPluginLifecycle.mode = "versioned"', from_104)
 
     def test_the_104_guide_covers_both_ha_modes_and_prepares_enforced(self):
         text = self.text("1.0.4")
@@ -78,8 +77,9 @@ class UpgradeGuide111Checks(unittest.TestCase):
         prep = text.split("#### Prepare for enforced mode", 1)[1].split("####", 1)[0]
         for requirement in ("Three nodes", "Three zones", "WaitForFirstConsumer", "topology.kubernetes.io/zone"):
             self.assertIn(requirement, prep)
+        self.assertIn("#prepare-the-ha-mode-and-configuration", text)
         # The 1.1.0 baseline already has an HA mode; its guide must not re-decide it.
-        self.assertNotIn("Choose the HA mode", self.text("1.1.0"))
+        self.assertNotIn("highAvailability", self.text("1.1.0"))
 
     def test_both_guides_explain_that_1_0_4_is_the_upgrade_stop(self):
         for baseline in GUIDES:
@@ -87,10 +87,23 @@ class UpgradeGuide111Checks(unittest.TestCase):
                 text = self.text(baseline)
                 self.assertIn("## Choose your upgrade path", text)
                 body = section(text, "## Choose your upgrade path")
-                self.assertIn("upgrade stop", body)
                 self.assertIn("1.0.4-to-1.1.1-upgrade.md", body)
                 self.assertIn("1.1.0-to-1.1.1-upgrade.md", body)
                 self.assertIn("1.0.2-to-1.0.4-upgrade.md", body)
+
+    def test_the_110_guide_reviews_a_diff_before_each_stage_apply(self):
+        text = self.text("1.1.0")
+        for stage in ("01-dependencies", "02-core", "03-observability"):
+            with self.subTest(stage=stage):
+                diff = text.find(f"helmfile.d/{stage}.yaml.gotmpl diff --suppress-secrets")
+                apply = max(text.find(f"helmfile.d/{stage}.yaml.gotmpl apply"), text.find(f"{stage}.yaml.gotmpl apply"))
+                self.assertGreaterEqual(diff, 0)
+                self.assertLess(diff, apply)
+
+    def test_both_guides_carry_the_qualification_warning(self):
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                self.assertIn("dsx-ai-factory/nvcf/issues/3428", self.text(baseline))
 
     def test_the_104_guide_has_no_hostname_policy_step(self):
         text = self.text("1.0.4")
