@@ -34,6 +34,9 @@ const (
 	gpushareEvidenceEvents = 20
 	// gpushareEventMessageMax bounds each event's message.
 	gpushareEventMessageMax = 256
+	// gpushareEvidenceFieldMax bounds each other field when the evidence
+	// is still too large without events.
+	gpushareEvidenceFieldMax = 1 << 10
 	// gpushareLogTailLines and gpushareLogTailMax bound the failed run's
 	// log the agent logs.
 	gpushareLogTailLines = 200
@@ -54,6 +57,8 @@ type gpushareEvidence struct {
 	GracePeriodS  *int64   `json:"terminationGracePeriodSeconds,omitempty"`
 	Events        []string `json:"events,omitempty"`
 	EventsDropped int      `json:"eventsDropped,omitempty"`
+	// bounded: encode has cut the fields to gpushareEvidenceFieldMax.
+	bounded bool
 }
 
 // newGPUShareEvidence is the evidence of container of pod, failed in its
@@ -122,21 +127,34 @@ func describeProbe(kind string, p *corev1.Probe) string {
 }
 
 // encode is the evidence as the record keeps it, within
-// gpushareEvidenceMax: the oldest events go first, then every event.
+// gpushareEvidenceMax: the oldest events go first, then every event; then
+// the remaining fields are bounded (a probe's HTTP path has no limit), and
+// last the probes go. Fields are cut, never the JSON, which stays valid.
 func (e gpushareEvidence) encode() string {
 	for {
 		b, err := json.Marshal(e)
 		if err != nil {
 			return ""
 		}
-		if len(b) <= gpushareEvidenceMax || len(e.Events) == 0 {
-			if len(b) > gpushareEvidenceMax {
-				return truncateMiddle(string(b), gpushareEvidenceMax)
-			}
+		switch {
+		case len(b) <= gpushareEvidenceMax:
 			return string(b)
+		case len(e.Events) > 0:
+			e.Events = e.Events[1:]
+			e.EventsDropped++
+		case !e.bounded:
+			e.bounded = true
+			e.Pod = truncateMiddle(e.Pod, gpushareEvidenceFieldMax)
+			e.Container = truncateMiddle(e.Container, gpushareEvidenceFieldMax)
+			e.LastState = truncateMiddle(e.LastState, gpushareEvidenceFieldMax)
+			for i := range e.Probes {
+				e.Probes[i] = truncateMiddle(e.Probes[i], gpushareEvidenceFieldMax)
+			}
+		case len(e.Probes) > 0:
+			e.Probes = nil
+		default:
+			return ""
 		}
-		e.Events = e.Events[1:]
-		e.EventsDropped++
 	}
 }
 
@@ -169,16 +187,29 @@ func (a *Agent) logFailedRunTail(ctx context.Context, pod *corev1.Pod, container
 	// The kubelet cuts LimitBytes from the start of the tail; the end, where
 	// a failure says why, is kept here instead. The limit only bounds the
 	// read.
-	lines, limit := int64(gpushareLogTailLines), int64(gpushareLogTailReadMax)
-	b, err := a.kubeClient.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-		Container: container, Previous: true, TailLines: &lines, LimitBytes: &limit,
-	}).DoRaw(lctx)
+	b, err := a.kubeClient.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, failedRunLogOptions(pod, container)).DoRaw(lctx)
 	l := log.WithField("container", container)
 	if err != nil {
 		l.WithError(err).Info("gpushare: cannot read the failed run's log")
 		return
 	}
 	l.WithField("logTail", lastBytes(string(b), gpushareLogTailMax)).Warn("gpushare: the end of the failed run's log, before the pod is replaced")
+}
+
+// failedRunLogOptions reads the log of the run lastFailure chose: the
+// container's current run when that run has terminated with a failure
+// (the kubelet has not restarted it), else its previous one.
+func failedRunLogOptions(pod *corev1.Pod, container string) *corev1.PodLogOptions {
+	lines, limit := int64(gpushareLogTailLines), int64(gpushareLogTailReadMax)
+	previous := true
+	for i := range pod.Status.ContainerStatuses {
+		if cs := &pod.Status.ContainerStatuses[i]; cs.Name == container {
+			if cur := cs.State.Terminated; cur != nil && (cur.ExitCode != 0 || cur.Signal != 0) {
+				previous = false
+			}
+		}
+	}
+	return &corev1.PodLogOptions{Container: container, Previous: previous, TailLines: &lines, LimitBytes: &limit}
 }
 
 // keepEvidence puts a failed pod's evidence on marked record data d; none

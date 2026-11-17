@@ -160,3 +160,53 @@ func TestDescribeProbe(t *testing.T) {
 		}
 	}
 }
+
+// A probe path with no length limit, full of characters JSON escapes,
+// still leaves valid JSON within the bound once every event is gone: the
+// fields are cut, never the JSON.
+func TestGPUShareEvidence_OversizedEscapedProbeStaysValidJSON(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "fn"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "inference",
+		LivenessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/" + strings.Repeat("<&>", 20000), Port: intstr.FromInt(8000)}}},
+	}}}}
+	enc := newGPUShareEvidence(pod, "inference", &corev1.ContainerStateTerminated{ExitCode: 137}, nil).encode()
+	if enc == "" || len(enc) > gpushareEvidenceMax {
+		t.Fatalf("encoded %d bytes, want 1..%d", len(enc), gpushareEvidenceMax)
+	}
+	var back gpushareEvidence
+	if err := json.Unmarshal([]byte(enc), &back); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+	if back.Pod != "fn/p" || len(back.Probes) != 1 {
+		t.Errorf("decoded %+v", back)
+	}
+}
+
+// The log read is of the run lastFailure chose: the current run when it
+// has terminated with a failure, else the previous one.
+func TestFailedRunLogOptions(t *testing.T) {
+	status := func(cur *corev1.ContainerStateTerminated) *corev1.Pod {
+		return &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "inference", RestartCount: 1,
+			State:                corev1.ContainerState{Terminated: cur},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+		}}}}
+	}
+	for name, tc := range map[string]struct {
+		cur          *corev1.ContainerStateTerminated
+		wantPrevious bool
+	}{
+		"current run failed":      {&corev1.ContainerStateTerminated{ExitCode: 137}, false},
+		"current run running":     {nil, true},
+		"current run exited zero": {&corev1.ContainerStateTerminated{ExitCode: 0}, true},
+	} {
+		o := failedRunLogOptions(status(tc.cur), "inference")
+		if o.Previous != tc.wantPrevious {
+			t.Errorf("%s: Previous %v, want %v", name, o.Previous, tc.wantPrevious)
+		}
+		if o.Container != "inference" || *o.TailLines != gpushareLogTailLines {
+			t.Errorf("%s: options %+v", name, o)
+		}
+	}
+}
