@@ -12,9 +12,12 @@ import (
 const (
 	// DefaultMinFreeBytes leaves room for Dynamo to finish its active
 	// segment while the uploader stops preparing.
-	DefaultMinFreeBytes          = int64(512) << 20
-	DefaultPrepareAhead          = 16
+	DefaultMinFreeBytes = int64(512) << 20
+	DefaultPrepareAhead = 16
+	// Deletion is a near-full backstop: an alert well below the high
+	// watermark and a runbook are the main path.
 	DefaultHighWatermark         = 0.85
+	DefaultLowWatermark          = 0.75
 	DefaultQuarantineMaxFraction = 0.2
 	DefaultQuarantineMaxAge      = 7 * 24 * time.Hour
 )
@@ -40,17 +43,25 @@ const (
 type Config struct {
 	// MinFreeBytes is the least free space preparing leaves. Before a
 	// transport is written, free space must be at least the larger of twice
-	// the transport estimate and this floor.
+	// the transport estimate and this floor. The floor is at most half the
+	// free share the high watermark leaves of the spool, the smaller of the
+	// filesystem and the budget, so a small spool that relief brings back
+	// to the watermark can prepare again.
 	MinFreeBytes int64
 	// PrepareAhead bounds the prepared segments waiting for a batch. It must
 	// be at least the batch size, so a full batch can form.
 	PrepareAhead int
-	// HighWatermark is the used fraction of the spool's filesystem above
-	// which preparing pauses and Policy applies. The whole filesystem
-	// counts, so the spool needs a volume of its own (see the package doc).
+	// HighWatermark is the used fraction of the spool above which preparing
+	// pauses and Policy applies. It applies to the spool's filesystem and,
+	// when the guard has one, its budget; the fuller one counts (see the
+	// package doc).
 	HighWatermark float64
-	Policy        Policy
-	// QuarantineMaxFraction bounds quarantine to a fraction of the spool.
+	// LowWatermark is the used fraction Policy frees the spool down to once
+	// it is above HighWatermark. It must be above 0 and below HighWatermark.
+	LowWatermark float64
+	Policy       Policy
+	// QuarantineMaxFraction bounds quarantine to a fraction of the spool:
+	// its budget when that is smaller than the filesystem.
 	QuarantineMaxFraction float64
 	// QuarantineMaxAge bounds how long a quarantined entry is kept.
 	QuarantineMaxAge time.Duration
@@ -62,6 +73,7 @@ func DefaultConfig() Config {
 		MinFreeBytes:          DefaultMinFreeBytes,
 		PrepareAhead:          DefaultPrepareAhead,
 		HighWatermark:         DefaultHighWatermark,
+		LowWatermark:          DefaultLowWatermark,
 		Policy:                PolicyQuarantineThenOldest,
 		QuarantineMaxFraction: DefaultQuarantineMaxFraction,
 		QuarantineMaxAge:      DefaultQuarantineMaxAge,
@@ -79,6 +91,9 @@ func (c Config) Validate() error {
 	}
 	if !(c.HighWatermark > 0 && c.HighWatermark < 1) {
 		errs = append(errs, fmt.Errorf("disk guard high watermark must be between 0 and 1, got %v", c.HighWatermark))
+	}
+	if !(c.LowWatermark > 0 && c.LowWatermark < c.HighWatermark) {
+		errs = append(errs, fmt.Errorf("disk guard low watermark must be above 0 and below the high watermark %v, got %v", c.HighWatermark, c.LowWatermark))
 	}
 	switch c.Policy {
 	case PolicyQuarantineThenOldest, PolicyOldest, PolicyNone:

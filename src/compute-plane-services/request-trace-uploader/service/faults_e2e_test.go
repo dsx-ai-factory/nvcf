@@ -4,11 +4,14 @@
 package service_test
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +52,23 @@ func journalBatches(t *testing.T, spool *uploadertest.Spool) []journal.Batch {
 	}
 	defer store.Close()
 	return store.Batches()
+}
+
+// journalSegments opens the journal after the uploader released it and
+// lists every segment entry.
+func journalSegments(t *testing.T, spool *uploadertest.Spool) []journal.Segment {
+	t.Helper()
+	store, err := journalfs.Open(context.Background(), journalfs.Config{
+		SpoolDir: spool.Dir,
+		StateDir: filepath.Join(spool.Dir, "request-trace-uploader-state"),
+		Holder:   "inspector",
+		LockWait: time.Second,
+	}, journalfs.Options{})
+	if err != nil {
+		t.Fatalf("open journal: %v", err)
+	}
+	defer store.Close()
+	return store.Segments()
 }
 
 // readOnly makes dir unwritable until restore is called or the test ends.
@@ -659,6 +679,56 @@ func TestHeldFailuresDoNotCountTowardTheSegmentThreshold(t *testing.T) {
 	}
 }
 
+// A job failure that names no scope, reported while an earlier fault holds
+// the whole backend, says nothing about the segment either, so it does not
+// count toward the segment's quarantine threshold. Without a hold it counts.
+func TestAnUnscopedJobFailureCountsOnlyWhenTheBackendIsNotHeld(t *testing.T) {
+	cases := []struct {
+		name       string
+		second     backendtest.SubmitStep
+		wantFaults int
+	}{
+		{"during a hold", backendtest.SubmitStep{Outcome: backendtest.Refuse, Err: &backend.Fault{Class: backend.ClassRetryable, Scope: backend.ScopeBackend, Reason: backend.ReasonUnavailable}}, 0},
+		{"without a hold", backendtest.SubmitStep{}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spool, closed := spoolWith(t,
+				[]string{uploadertest.RequestEnd("a", 1)},
+				[]string{uploadertest.RequestEnd("b", 2)},
+			)
+			fake := backendtest.NewFake()
+			fake.Script(
+				backendtest.SubmitStep{Statuses: []backendtest.StatusStep{{
+					Status: backend.StatusFailed,
+					Err:    &backend.Fault{Class: backend.ClassRetryable, Scope: backend.ScopeUnknown, Reason: backend.ReasonUnavailable},
+				}}},
+				tc.second,
+			)
+			faults := fastFaults()
+			// A hold lasts past the poll that reads the failed job.
+			faults.Transient = retry.Backoff{Base: time.Minute, Max: time.Minute}
+			uploader := newUploader(t, spool, fake, service.Options{Faults: faults}, map[string]string{config.EnvBatchMaxSegments: "1"})
+			_ = uploader.Pass(context.Background())
+			if err := uploader.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			if got := fake.SubmitCalls(); got != 2 {
+				t.Fatalf("submits = %d, want one per segment", got)
+			}
+			segments := journalSegments(t, spool)
+			i := slices.IndexFunc(segments, func(seg journal.Segment) bool { return seg.Name == filepath.Base(closed[0]) })
+			if i < 0 {
+				t.Fatal("segment a is missing from the journal")
+			}
+			if got := segments[i].Faults; got != tc.wantFaults {
+				t.Fatalf("segment a faults = %d, want %d", got, tc.wantFaults)
+			}
+		})
+	}
+}
+
 // The segment failure count lives in the journal, so a restart does not give
 // a failing segment a fresh threshold.
 func TestSegmentFailuresCountAcrossARestart(t *testing.T) {
@@ -710,5 +780,46 @@ func TestFailedJobsCountAcrossNewBatchesAndRestarts(t *testing.T) {
 	}
 	if state != journal.StateQuarantined || fake.SubmitCalls() != faults.SegmentScopeFailures {
 		t.Fatalf("state = %q after %d failed jobs with a restart after each, want quarantined at the %dth", state, fake.SubmitCalls(), faults.SegmentScopeFailures)
+	}
+}
+
+// A record over the configured size is not parsed: its raw bytes go to the
+// local reject file and it is counted, and the rest of the segment is still
+// exported.
+func TestARecordOverTheSizeLimitIsRejectedUnparsed(t *testing.T) {
+	big := `{"event_type":"request_end","pad":"` + strings.Repeat("a", 3<<19) + `"}`
+	spool, _ := spoolWith(t, []string{big, uploadertest.RequestEnd("b", 1)})
+	exporter := newCapture(t, backendtest.NewFake())
+	metrics := newMetrics(t)
+	uploader := newUploader(t, spool, exporter, service.Options{Metrics: metrics}, map[string]string{config.EnvRecordMaxBytes: "1048576"})
+
+	if err := uploader.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass() error = %v", err)
+	}
+	if got, _ := metrics.Value(telemetry.RecordsUnreadable, telemetry.Labels{"reason": "line_too_long"}); got != 1 {
+		t.Errorf("records_unreadable{line_too_long} = %v, want 1", got)
+	}
+	if got := len(exporter.exported()); got != 1 {
+		t.Errorf("exported %d records, want only the record under the limit", got)
+	}
+	artifacts, err := filepath.Glob(filepath.Join(spool.Dir, "request-trace-uploader-quarantine", "rejects", "*.jsonl.gz"))
+	if err != nil || len(artifacts) != 1 {
+		t.Fatalf("reject artifacts = %v, %v; want one", artifacts, err)
+	}
+	file, err := os.Open(artifacts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	reader, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != big+"\n" {
+		t.Errorf("reject artifact holds %d bytes, want the %d-byte record unchanged", len(kept), len(big)+1)
 	}
 }

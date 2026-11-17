@@ -108,6 +108,16 @@ const (
 	// and duration of the export path.
 	PrepareDuration = "prepare_duration"
 	ExportLatency   = "export_latency"
+	// BackendCalls and BackendCallDuration count and time each HTTP call a
+	// backend makes through a transport from TransportReceiver, by
+	// operation and status class (2xx to 5xx, or error when no response
+	// came back): the rate, errors and duration of the calls behind one
+	// submit or status read.
+	BackendCalls        = "backend_calls"
+	BackendCallDuration = "backend_call.duration"
+	// PrepareMemoryWaits counts prepares that waited for room in the memory
+	// that concurrent prepares share for long lines.
+	PrepareMemoryWaits = "prepare_memory_waits"
 )
 
 // Labels are the attributes of one observation, without BackendLabel.
@@ -148,6 +158,7 @@ var allowedLabelKeys = map[string]bool{
 	"status":      true,
 	"reason":      true,
 	"record_type": true,
+	"operation":   true,
 	"scope":       true,
 	"stage":       true,
 	"kind":        true,
@@ -158,6 +169,9 @@ var allowedLabelKeys = map[string]bool{
 var labelValuePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
 var outcome = map[string][]string{"status": {"success", "failure"}}
+
+// HTTPStatusClasses are the status label values of BackendCalls.
+var HTTPStatusClasses = []string{"1xx", "2xx", "3xx", "4xx", "5xx", "error"}
 
 // RecordTypes are the record_type label values of RecordsReceived: the
 // event types Dynamo v1.4.0 writes, and "unknown" for any other line.
@@ -220,10 +234,15 @@ var catalog = cloneAll([]Instrument{
 	{Name: SuppressionHeaderPresent, Kind: Counter, Unit: "1", Labels: []string{"rule"}},
 	{Name: RecordsIncomplete, Kind: Counter, Unit: "1", Labels: []string{"record_type"}, Values: payloadRecords},
 	{Name: JobStatusUnknown, Kind: Counter, Unit: "1"},
+	{Name: BackendCalls, Kind: Counter, Unit: "1", Labels: []string{"operation", "status"},
+		Values: map[string][]string{"status": HTTPStatusClasses}},
+	{Name: BackendCallDuration, Kind: Histogram, Unit: "s", Labels: []string{"operation", "status"},
+		Values: map[string][]string{"status": HTTPStatusClasses}, Buckets: stepBuckets},
 	{Name: SegmentsQuarantined, Kind: Counter, Unit: "1", Labels: []string{"reason"},
 		Values: map[string][]string{"reason": QuarantineReasons}},
 	{Name: PrepareDuration, Kind: Histogram, Unit: "s", Buckets: stepBuckets},
 	{Name: ExportLatency, Kind: Histogram, Unit: "s", Buckets: secondsBuckets},
+	{Name: PrepareMemoryWaits, Kind: Counter, Unit: "1"},
 })
 
 var byName = func() map[string]Instrument {

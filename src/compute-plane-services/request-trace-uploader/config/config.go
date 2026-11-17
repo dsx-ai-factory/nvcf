@@ -129,6 +129,19 @@ type Config struct {
 	Batch BatchPolicy
 	// Faults tunes fault handling.
 	Faults FaultPolicy
+	// Spool bounds spool use: when data is deleted to keep the spool from
+	// filling, and how much free space preparing leaves.
+	Spool SpoolPolicy
+	// SpoolBudgetBytes is the spool's own size, such as its emptyDir size
+	// limit. Zero, also the value when its setting is unset, measures
+	// fullness on the spool's filesystem only.
+	SpoolBudgetBytes int64
+	// RecordMaxBytes is the most bytes one source record may have. Zero, as
+	// in a Config built by hand, uses DefaultRecordMaxBytes.
+	RecordMaxBytes int64
+	// Prepare bounds preparing segments in parallel. The zero value, as in a
+	// Config built by hand, prepares one segment at a time.
+	Prepare PreparePolicy
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -154,6 +167,10 @@ type ObjectStorePolicy struct {
 	// exists to exercise config, key computation, and hostname namespacing
 	// without a destination, the same role debug plays for the read path.
 	DryRun bool
+	// ResponseTimeout bounds the wait for a store's answer once a request,
+	// body included, is sent. Zero, as in a Config built by hand, uses
+	// DefaultObjectStoreResponseTimeout; it never means no bound.
+	ResponseTimeout time.Duration
 }
 
 // RetryPolicy bounds each remote operation. AttemptTimeout bounds each backend
@@ -238,6 +255,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		PathStyle: boolValue(lookup, EnvObjectStorePathStyle, false, &warnings),
 		DryRun:    boolValue(lookup, EnvObjectStoreDryRun, false, &warnings),
 	}
+	objectStore.ResponseTimeout, err = strictDuration(lookup, EnvObjectStoreResponseTimeout, DefaultObjectStoreResponseTimeout, 10*time.Second, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
 	debugVerbosity := debugVerbosityValue(lookup, EnvDebugVerbosity, &warnings)
 	suppression, err := suppressionValue(lookup)
 	if err != nil {
@@ -279,6 +300,22 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 	if err != nil {
 		return Config{}, nil, err
 	}
+	spool, err := spoolPolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	spoolBudget, err := spoolBudgetValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	recordMaxBytes, err := strictBytes(lookup, EnvRecordMaxBytes, DefaultRecordMaxBytes, minRecordMaxBytes, maxRecordMaxBytes)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	prepare, err := preparePolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -310,6 +347,10 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		QuarantineResume: quarantineResume,
 		Batch:            batchPolicy,
 		Faults:           faultPolicy,
+		Spool:            spool,
+		SpoolBudgetBytes: spoolBudget,
+		RecordMaxBytes:   recordMaxBytes,
+		Prepare:          prepare,
 	}, warnings, nil
 }
 

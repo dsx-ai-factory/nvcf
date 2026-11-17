@@ -4,6 +4,7 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,16 +16,22 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/batch"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/format"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/cleanup"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/health"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/linebudget"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/retry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/record"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform"
 )
@@ -43,6 +50,17 @@ const lockMargin = 10 * time.Second
 const (
 	// PointPrepared follows the record of a prepared segment.
 	PointPrepared = "prepared"
+	// PointPreparingAlongside follows the record that a segment's prepare
+	// started while an earlier segment's prepare is still running. Only
+	// more than one prepare worker reaches it.
+	PointPreparingAlongside = "preparing-alongside"
+	// PointPrepareAheadWait comes when intake is at the prepare-ahead bound
+	// during a backlog, before it looks whether the submitter will record
+	// another batch.
+	PointPrepareAheadWait = "prepare-ahead-wait"
+	// PointBacklogRoundEnded follows each round of full-batch submits that
+	// runs beside intake during a backlog.
+	PointBacklogRoundEnded = "backlog-round-ended"
 	// PointBatchRecorded follows the record of a batch, before the backend
 	// is called.
 	PointBatchRecorded = "batch-recorded"
@@ -63,12 +81,17 @@ const (
 	// PointReopened follows the reopening of a segment that a run that did
 	// not export finished, before it is prepared again.
 	PointReopened = "reopened"
+	// PointEvicted follows the record of an evicted segment, before its
+	// files are deleted.
+	PointEvicted = "evicted"
 )
 
 // Options tunes an Uploader beyond its configuration.
 type Options struct {
 	// Metrics receives the pipeline's observations. Nil records nothing.
 	Metrics telemetry.Metrics
+	// Tracer starts the pipeline's spans. Nil starts none.
+	Tracer trace.Tracer
 	// HeaderCheckRecords overrides DefaultHeaderCheckRecords.
 	HeaderCheckRecords int
 	// Faults replaces the whole fault handling config, including the
@@ -82,6 +105,7 @@ type Options struct {
 	// name.
 	Holder string
 	// Point, when set, is called at each named point. Only tests set it.
+	// It may be called from intake and a submit at the same time.
 	Point func(name string)
 	// Now, when set, replaces the clock that ages jobs. Only tests set it.
 	Now func() time.Time
@@ -99,6 +123,7 @@ type Options struct {
 // journal: a saved job id is polled, never submitted again.
 type Uploader struct {
 	cfg      config.Config
+	tracer   trace.Tracer
 	client   backend.Client
 	caps     backend.Capabilities
 	name     string
@@ -139,13 +164,24 @@ type Uploader struct {
 	cleanupMu sync.Mutex
 	// fingerprints is used by intake only.
 	fingerprints map[fileIdentity]string
+	// backlog runs full-batch submits beside intake. Intake sets it before
+	// it starts them and clears it after they end; nil outside a scan.
+	// Submits read it under the submit lock, which intake does not hold, so
+	// it is atomic and each use loads it once.
+	backlog atomic.Pointer[backlogSubmits]
 	// stateMu guards the maps below, which several stages share.
 	stateMu    sync.Mutex
 	solo       map[string]bool
 	lastPolled map[string]time.Time
 	// unsaved holds job ids the journal could not record yet, by batch.
-	unsaved  map[string]string
+	unsaved map[string]string
+	// unsent holds batches that were recorded but never sent and whose
+	// release the journal refused.
+	unsent   map[string]bool
 	draining atomic.Bool
+	// evictDue is set by the spool check when segments must be evicted.
+	// Intake evicts at its next segment boundary, never mid-prepare.
+	evictDue atomic.Bool
 }
 
 // NewUploader builds the pipeline around an already-built backend. It
@@ -162,10 +198,34 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = discardMetrics{}
+	}
+	metrics = telemetry.Safe(metrics)
+	if cfg.Prepare.Workers < 0 || cfg.Prepare.MemoryBytes < 0 {
+		return nil, fmt.Errorf("prepare workers %d and memory bytes %d must not be negative", cfg.Prepare.Workers, cfg.Prepare.MemoryBytes)
+	}
+	// Zero, as in a Config built by hand, takes the default.
+	memory := cfg.Prepare.MemoryBytes
+	if memory == 0 {
+		memory = config.DefaultPrepareMemoryBytes
+	}
+	budget, err := linebudget.New(memory, linebudget.Options{OnWait: func() {
+		metrics.Add(telemetry.PrepareMemoryWaits, 1, nil)
+	}})
+	if err != nil {
+		return nil, err
+	}
 	prepareConfig := transform.DefaultConfig()
 	prepareConfig.Suppression = cfg.Suppression
 	prepareConfig.Redact = !cfg.SkipRedaction
-	preparer, err := transform.New(prepareConfig)
+	// A longer record is drained to the reject file without being held or
+	// parsed, so one huge line cannot exhaust the pod's memory.
+	prepareConfig.RawLineMax = cmp.Or(cfg.RecordMaxBytes, config.DefaultRecordMaxBytes)
+	preparer, err := transform.NewWithOptions(prepareConfig, transform.Options{
+		LineMemory: func(ctx context.Context) record.LineMemory { return budget.Lease(ctx) },
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -202,14 +262,12 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if err != nil {
 		return nil, err
 	}
-	metrics := opts.Metrics
-	if metrics == nil {
-		metrics = discardMetrics{}
-	}
-	metrics = telemetry.Safe(metrics)
 	telemetry.Preset(metrics)
 	rules.preset(metrics)
 	metrics.Add(telemetry.RecordsDropped, 0, unsupportedVersionLabels())
+	for _, r := range unreadableReasons {
+		metrics.Add(telemetry.RecordsUnreadable, 0, telemetry.Labels{"reason": r.reason})
+	}
 	if receiver, ok := client.(telemetry.Receiver); ok {
 		receiver.UseMetrics(metrics)
 	}
@@ -231,8 +289,13 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 	if now == nil {
 		now = time.Now
 	}
-	return &Uploader{
+	tracer := opts.Tracer
+	if tracer == nil {
+		tracer = noop.NewTracerProvider().Tracer("")
+	}
+	u := &Uploader{
 		cfg:          cfg,
+		tracer:       tracer,
 		client:       client,
 		caps:         caps,
 		batchConfig:  batchConfig,
@@ -257,7 +320,12 @@ func NewUploader(cfg config.Config, client backend.Client, opts Options) (*Uploa
 		solo:         map[string]bool{},
 		lastPolled:   map[string]time.Time{},
 		unsaved:      map[string]string{},
-	}, nil
+		unsent:       map[string]bool{},
+	}
+	if receiver, ok := client.(telemetry.TransportReceiver); ok {
+		receiver.UseTransport(u.wrapTransport)
+	}
+	return u, nil
 }
 
 // Handler returns the health endpoints.
@@ -267,6 +335,9 @@ func (u *Uploader) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", u.health.Ready)
 	return mux
 }
+
+// syncDir syncs a directory startup creates. Tests replace it.
+var syncDir = atomicfile.SyncDir
 
 // errNotReady stops startup without stopping the process: the uploader stays
 // live and not ready until it is told to stop.
@@ -331,7 +402,7 @@ func (u *Uploader) Run(ctx context.Context) error {
 	// It also runs once when the first scan has submitted what it found.
 	scanned := make(chan struct{})
 	var loops sync.WaitGroup
-	loops.Add(2)
+	loops.Add(3)
 	go func() {
 		defer loops.Done()
 		u.loop(work, stop, u.cfg.ScanInterval, u.scan, nil, func() { close(scanned) })
@@ -339,6 +410,12 @@ func (u *Uploader) Run(ctx context.Context) error {
 	go func() {
 		defer loops.Done()
 		u.loop(work, stop, u.pollInterval(), u.Poll, scanned, nil)
+	}()
+	// The spool check runs on its own interval, so a long prepare or submit
+	// never delays it.
+	go func() {
+		defer loops.Done()
+		u.loop(work, stop, u.spoolCheckInterval(), u.checkSpool, nil, nil)
 	}()
 
 	select {
@@ -389,6 +466,13 @@ func (u *Uploader) loop(ctx context.Context, stop <-chan struct{}, every time.Du
 	}
 }
 
+func (u *Uploader) spoolCheckInterval() time.Duration {
+	if u.cfg.Spool.CheckInterval > 0 {
+		return u.cfg.Spool.CheckInterval
+	}
+	return config.DefaultSpoolCheckInterval
+}
+
 func (u *Uploader) pollInterval() time.Duration {
 	if u.cfg.StatusInterval > 0 {
 		return u.cfg.StatusInterval
@@ -405,17 +489,20 @@ func (u *Uploader) start(ctx context.Context) error {
 }
 
 func (u *Uploader) open(ctx context.Context) error {
-	for _, directory := range []string{u.cfg.StateDir, u.cfg.QuarantineDir} {
-		if err := os.MkdirAll(directory, 0o750); err != nil {
-			return fmt.Errorf("create uploader directory: %w", err)
+	for _, dir := range []struct{ path, setting string }{
+		{u.cfg.StateDir, config.EnvStateDir},
+		{u.cfg.QuarantineDir, config.EnvQuarantineDir},
+	} {
+		if err := atomicfile.MkdirDurable(dir.path, syncDir); err != nil {
+			return fmt.Errorf("create the %s directory: %w", dir.setting, err)
 		}
 	}
 	secret, err := os.Open(u.cfg.SecretsFile)
 	if err != nil {
-		return fmt.Errorf("open uploader secret file: %w", err)
+		return fmt.Errorf("open uploader secret file: %w", atomicfile.Pathless(err))
 	}
 	if err := secret.Close(); err != nil {
-		return fmt.Errorf("close uploader secret file: %w", err)
+		return fmt.Errorf("close uploader secret file: %w", atomicfile.Pathless(err))
 	}
 
 	store, err := journalfs.Open(ctx, journalfs.Config{
@@ -447,15 +534,24 @@ func (u *Uploader) open(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Zero uses the default; a negative interval is a bad setting, never a
+	// fallback.
+	if u.cfg.Spool.CheckInterval < 0 {
+		return fmt.Errorf("spool check interval must not be negative, got %v", u.cfg.Spool.CheckInterval)
+	}
 	// Prepare-ahead must let a full batch form. It is raised to a batch
 	// size set above the default, which is expected and not worth a
 	// warning.
-	guardConfig, _ := diskguard.DefaultConfig().Resolve(u.batchConfig.MaxSegments)
+	guardConfig, _ := spoolGuardConfig(u.cfg.Spool).Resolve(u.batchConfig.MaxSegments)
 	volume := u.volume
 	if volume == nil {
 		volume = diskguard.StatVolume(u.cfg.SourceDir)
 	}
-	u.guard, err = diskguard.New(guardConfig, volume, u.quarantine, spoolSegments{u: u}, diskguard.Options{Counter: counterFor(u.metrics), Gauges: gaugesFor(u.metrics)})
+	guardOptions := diskguard.Options{Counter: counterFor(u.metrics), Gauges: gaugesFor(u.metrics)}
+	if u.cfg.SpoolBudgetBytes > 0 {
+		guardOptions.Budget = diskguard.SpoolBudget(u.cfg.SpoolBudgetBytes, u.cfg.SourceDir, u.cfg.StateDir, u.cfg.QuarantineDir)
+	}
+	u.guard, err = diskguard.New(guardConfig, volume, u.quarantine, spoolSegments{u: u}, guardOptions)
 	return err
 }
 

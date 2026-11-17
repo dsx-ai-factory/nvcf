@@ -26,14 +26,29 @@ volume, so every step survives a restart.
    live and not ready until an operator acts.
 2. Intake: each closed segment is fingerprinted (SHA-256) and recorded
    before it is read. The highest indexed segment is never read or deleted.
+   Up to `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS` segments are prepared at
+   once (default one). Results are recorded in spool order whatever order
+   they finish in, and a crash mid-prepare leaves each unfinished segment to
+   be prepared again from its source. Lines longer than 16 MiB share
+   `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES` at five times their size:
+   a prepare whose line does not fit waits, counted in
+   `prepare_memory_waits`, and the line that started first never waits, so
+   one line larger than the budget is still read. Each prepare also uses a
+   fixed amount for buffers and shorter lines, which depends on the format
+   writer.
 3. Record handling: suppression, then redaction, then the backend's format
    writer. A backend chooses its transport format by implementing
    `format.Factory` on its client; a backend that takes gzip JSON lines on
-   one destination gets the default writer.
+   one destination gets the default writer. An unsent transport prepared
+   under other record settings, or under an earlier redaction version, is
+   prepared again from its source.
 4. Batching: prepared segments are grouped per destination within the
-   backend's file and byte limits, and lanes are flushed every pass. A batch
-   is recorded before the backend is called, and a returned job id is saved
-   before the error is looked at.
+   backend's file and byte limits, and lanes are flushed every pass. While
+   intake is preparing a backlog, each batch that fills up is submitted at
+   once, beside intake, so uploads overlap preparing; a batch that is not
+   full waits for the end of the pass. A batch is recorded before the
+   backend is called, and a returned job id is saved before the error is
+   looked at.
 5. Polling: one loop polls every open job on the status interval. A job is
    pending, succeeded, failed or not found. A job with a saved id is polled,
    never submitted again under that id. A job still pending, or whose status
@@ -50,26 +65,55 @@ volume, so every step survives a restart.
    name that no longer holds a regular file is kept. A backend that does not
    export, such as `debug` or a dry run, never deletes a source; after a
    restart under a backend that exports, that source is prepared and sent
-   again.
+   again. A cleanup round reads the spool's highest index once per segment
+   family, not once per deletion.
 7. Shutdown: on SIGTERM the uploader lets work in progress finish, scans
    the spool one last time so a segment that closed after the last scan is
    not left behind, submits what is prepared, polls once more, and releases
    the spool, all within the drain timeout. What is left stays in
    the journal for the next start.
-8. Spool bounds: on every scan pass, quarantine entries older than 7 days
-   are deleted, then the oldest entries until quarantine is under 20% of the
-   spool. If the spool is still above 85% full, the oldest closed segments
-   that are in no batch are deleted. A segment in a batch that may have been
-   sent, and the active segment, are never deleted. Preparing pauses while
-   the spool is above 85%, while free space is under 512 MiB or twice the
-   next segment's size, or while 16 prepared segments, or the batch
-   segment setting if larger, wait for a batch;
-   prepared work is still sent. Every deletion is counted in
-   `segments_evicted` or `quarantine_evicted`. Fullness is measured on the
-   whole filesystem that holds the spool, so the spool needs a volume of
-   its own: on a disk shared with other data, such as an emptyDir on the
-   node's disk, that data counts too, and segments could be deleted
-   without bringing usage below the watermark.
+8. Spool bounds: every 10 seconds, apart from scan passes so a long prepare
+   or upload never delays it, the uploader measures the spool, updates the
+   spool gauges, and deletes quarantine entries older than 7 days, then the
+   oldest entries until quarantine is under 20% of the spool. A reject
+   artifact still being written is left alone, but counts toward that share.
+   If the spool is still above the high watermark (85% by default), segments
+   are not deleted then: intake deletes them at its next segment boundary or
+   when it ends, once every running prepare is recorded, or at the start of
+   the next pass, so no segment is deleted while one is being prepared. The
+   eviction policy deletes data until the spool is down to the low watermark
+   (75% by default): by default quarantine first, then the oldest closed
+   segments that are in no batch. Between the two watermarks nothing is
+   deleted, so deletion is a backstop for a nearly full spool. A segment in
+   a batch that may have been sent, and the active segment, are never
+   deleted. Preparing pauses while the spool is above the high watermark,
+   while free space is under 512 MiB or twice the next segment's size, or
+   while 16 prepared segments, or the batch segment setting if larger, wait
+   for a batch; prepared work is still sent. Segments being prepared count
+   toward free space. While full batches are sent during a backlog, intake
+   waits at that bound for the next batch instead of stopping. Every
+   deletion is counted in `segments_evicted` or `quarantine_evicted`.
+   On a small spool the free-space floor is lower: at most half of what
+   the high watermark leaves free, 7.5% of the spool at the default 85%, so
+   a spool that relief brings back down can prepare again. Below about
+   3.3 GiB, 15% is under 512 MiB (154 MiB on a 1 GiB spool), and at the
+   high watermark it is all the room left for Dynamo's active segment and
+   the transport being written: if they outgrow it, an emptyDir goes over
+   its size limit and the kubelet evicts the pod. Fullness is measured on
+   the whole filesystem that holds the spool. On a disk shared with other
+   data, such as an emptyDir on the node's disk, that data counts too and
+   the emptyDir's size limit is not seen, so the pod can be evicted for
+   going over the limit before the spool looks full. Set
+   `REQUEST_TRACE_UPLOADER_SPOOL_BUDGET_BYTES` to the spool's emptyDir
+   `sizeLimit` or its PVC size: the space the files and directories under
+   the source, state and quarantine directories take on disk, counted in
+   blocks as the kubelet counts an emptyDir, is then measured against that
+   budget as well.
+   Deletion starts when either the budget or the filesystem is above its
+   high watermark and frees each of those down to its own low watermark;
+   one only between its watermarks sets nothing. Free space is the least
+   of the two, and quarantine's share and the floor are of the smaller.
+   The spool and quarantine settings below change these bounds.
 
 Faults follow `internal/retry`: auth failures and outages hold every submit
 without moving a segment; a segment fault quarantines that segment after a
@@ -82,8 +126,9 @@ segments again, counts `quarantine_resumed`, and starts a fresh run, so a
 fault that is still there trips the breaker again. A success ends a run
 but does not close a tripped breaker. A backend that records its own metrics implements
 `telemetry.Receiver` and gets the shared recorder. This binary exports
-metrics over OTLP when an endpoint is set (see Metrics below); a distribution
-can pass its own recorder in `service.Options.Metrics`.
+metrics, logs and traces over OTLP, each when its endpoint is set (see
+Metrics, Logs and Traces below); a distribution can pass its own recorder
+in `service.Options.Metrics` and its own tracer in `service.Options.Tracer`.
 
 ## Metrics
 
@@ -123,11 +168,73 @@ Rate, errors and duration of the export path:
   Dynamo v1.4.0 event type, or `unknown` for an unparseable line, an older
   release's record, or an event type this build does not know.
 
-`prepare_duration` buckets run from 5 ms to 1 hour; the other durations run
-from 50 ms to 24 hours. Metrics are pushed every 60
-seconds and once more after the shutdown drain, for up to 5 seconds, so the
-pod's grace period must cover the drain timeout plus 5 seconds. A failed
-export never blocks an upload or changes readiness.
+- `backend_calls` (`operation`, `status`) and `backend_call.duration`
+  (`operation`, `status`), seconds: each HTTP call a backend makes through
+  the transport the core hands it (see Traces), by the operation the
+  backend names and the status class (`2xx` to `5xx`, or `error` when no
+  response came back).
+
+`prepare_duration` and `backend_call.duration` buckets run from 5 ms to 1
+hour; the other durations run from 50 ms to 24 hours. Metrics are pushed
+every 60 seconds and once more after the shutdown drain. A failed export
+never blocks an upload or changes readiness.
+
+## Logs
+
+Every log line is one JSON object on stderr. When they are known, each line
+carries the workload's identity: `function_id` and `function_version_id`
+from `NVCF_FUNCTION_ID` and `NVCF_FUNCTION_VERSION_ID`, or from
+`nvcf.function.id` and `nvcf.function.version.id` in
+`OTEL_RESOURCE_ATTRIBUTES`, and `pod` and `cluster` from `k8s.pod.name` and
+`k8s.cluster.name` there. Lines name segments and batches by their local
+number or short id. They never carry credentials, record payloads, NCA ids,
+request ids, remote job ids or local file paths; a backend fault is logged by its
+class, scope and reason.
+
+The same records also go to the collector over OTLP when its endpoint is
+set, with the shared resource instead of the identity fields. The resource
+carries the same identity: `nvcf.function.id` and
+`nvcf.function.version.id` from the NVCF function variables when they are
+set, as on the local lines, and the rest of `OTEL_RESOURCE_ATTRIBUTES`:
+
+- `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` and `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`:
+  as for metrics. Unset turns OTLP logs off; the JSON lines stay.
+
+## Traces
+
+Spans go to the collector over OTLP when its endpoint is set:
+
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+  `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`: as for metrics. Unset turns traces
+  off.
+
+The pipeline makes one span per step: `request-trace-uploader.prepare` for
+one segment, `request-trace-uploader.submit` for one backend submit, and
+`request-trace-uploader.poll` for one job status read. With more than one
+prepare worker, a prepare span ends when its result is recorded, in spool
+order, so it can include time spent waiting for an earlier segment. Spans
+carry only `backend`, an outcome `status`, and a fault's `class`, `scope`
+and `reason`; a failure sets the error status with the reason as its
+description and never records error text. Every span is sampled.
+
+A backend that calls its destination over HTTP implements
+`telemetry.TransportReceiver` and wraps each HTTP client's transport with
+the function it receives, naming the operation, such as `submit` or
+`status`. Each call is then a `request-trace-uploader.backend_call` client
+span, a child of the step that made it, carries the W3C trace context, and
+is counted in `backend_calls` and `backend_call.duration`. The `objectstore`
+backend routes every store call through it, as operation `upload`, keeping
+its redirect check and TLS settings. Batch and queue sizes are fixed, so an
+`OTEL_BSP_*` or `OTEL_BLRP_*` variable cannot change them.
+
+## Shutdown
+
+After the shutdown drain, spans, metrics and logs are exported once more,
+together within 5 seconds, so the pod's grace period must cover the drain
+timeout plus 5 seconds. Each OTLP signal is configured on its own: an
+endpoint without its protocol stops startup, and each signal's export runs
+in the background, so a collector that is down costs telemetry, never an
+upload or readiness.
 
 The `backend` package defines the export destination contract and a registry.
 Submit and status are separate operations so a slow confirmation cannot block
@@ -178,6 +285,27 @@ Optional, with defaults:
 - `REQUEST_TRACE_UPLOADER_QUARANTINE_RESUME`: how long intake stays stopped
   after a trip before it reads new segments again; default `1h`, from `1m`
   to `24h`
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_MAX_AGE`: how long a quarantined entry
+  is kept; default `168h` (7 days), from `1m` to `720h` (30 days)
+- `REQUEST_TRACE_UPLOADER_QUARANTINE_MAX_FRACTION`: the largest share of the
+  spool quarantine may hold; default `0.2`, above `0` and at most `1`
+- `REQUEST_TRACE_UPLOADER_SPOOL_CHECK_INTERVAL`: how often the spool is
+  measured and quarantine bounded, apart from scans; default `10s`, from `1s`
+  to `1h`
+- `REQUEST_TRACE_UPLOADER_SPOOL_HIGH_WATERMARK`: the used share of the spool
+  above which preparing pauses and the eviction policy deletes data; default
+  `0.85`, above `0` and below `1`
+- `REQUEST_TRACE_UPLOADER_SPOOL_LOW_WATERMARK`: the used share the eviction
+  policy frees the spool down to; default `0.75`, above `0` and below the
+  high watermark. Set it too when lowering the high watermark to `0.75` or
+  below.
+- `REQUEST_TRACE_UPLOADER_SPOOL_EVICTION_POLICY`: what is deleted above the
+  high watermark: `quarantine-then-oldest` (default), `oldest` (closed
+  segments only, quarantine kept), or `none` (nothing deleted; preparing
+  pauses until space frees up)
+- `REQUEST_TRACE_UPLOADER_SPOOL_MIN_FREE_BYTES`: free space preparing leaves
+  for the writer; default `536870912` (512 MiB), from `0` to
+  `1099511627776` (1 TiB)
 - `REQUEST_TRACE_UPLOADER_STATUS_INTERVAL`: how often every open job is
   polled, whatever the backend; default `30s`, from `1s` to `1h`
 - `REQUEST_TRACE_UPLOADER_BATCH_MAX_SEGMENTS`: the most segments in one
@@ -215,6 +343,23 @@ Optional, with defaults:
   default `30m`, from `1m` to `24h`
 - `REQUEST_TRACE_UPLOADER_RETRY_AFTER_MAX`: the longest a destination's
   Retry-After may hold uploads; default `30m`, from `1m` to `24h`
+- `REQUEST_TRACE_UPLOADER_SPOOL_BUDGET_BYTES`: the spool's own size, as
+  whole bytes with no unit, from `1073741824` (1 GiB) to
+  `1125899906842624` (1 PiB); default none, and `0` is none too. Set it
+  from the spool's emptyDir `sizeLimit` or its PVC size. The spool bounds
+  then count the space the spool takes on disk, in blocks as the kubelet
+  counts an emptyDir, against it as well as the filesystem; see step 8 of
+  How it works. Without it only the filesystem counts.
+- `REQUEST_TRACE_UPLOADER_RECORD_MAX_BYTES`: the most bytes one source
+  record (one line) may have, as whole bytes with no unit; default
+  `268435456` (256 MiB), from `1048576` (1 MiB) to `536870912` (512 MiB). A
+  longer record is not parsed: its raw bytes go to the local reject file and
+  it is counted as `records_unreadable` with reason `line_too_long`.
+- `REQUEST_TRACE_UPLOADER_PREPARE_WORKERS`: how many segments are prepared
+  at once; default `1`, from `1` to `16`. Each worker can use one core.
+- `REQUEST_TRACE_UPLOADER_PREPARE_MEMORY_BYTES`: memory that lines longer
+  than 16 MiB share across workers, in bytes; default `1073741824`
+  (1 GiB), from `67108864` (64 MiB) to `68719476736` (64 GiB)
 
 Time settings are Go durations with a unit, such as `30s`, `5m` or `1h`. A
 bare number, a negative value, zero where zero is not allowed, or a value
@@ -232,6 +377,11 @@ Used only by one backend:
   addressing, which most stores other than AWS need; default `false`
 - `REQUEST_TRACE_UPLOADER_OBJECTSTORE_DRY_RUN`: log what would be uploaded,
   send nothing and need no credentials; default `false`
+- `REQUEST_TRACE_UPLOADER_OBJECTSTORE_RESPONSE_TIMEOUT`: how long to wait
+  for the store's answer once a request, body included, is sent; default
+  `5m`, from `10s` to `1h`. It applies to each request, never cuts an upload
+  on a slow link, and ends a wait on a store that took the object and never
+  answers.
 - `REQUEST_TRACE_UPLOADER_DEBUG_VERBOSITY`: `basic` (default) or `detailed`
   logging for `debug`
 
@@ -270,7 +420,8 @@ a newer record type that carries them is checked too.
   decides. Names are trimmed and lower-cased. The uploader has no built-in
   list, so this is required while `REQUEST_TRACE_UPLOADER_SUPPRESS_NCA_IDS`
   has an id; the deployment supplies the default, for example
-  `nvcf-ncaid,nvcf-nca-id`. A blank or repeated name stops startup.
+  `nvcf-ncaid,nvcf-nca-id`. A blank, repeated or invalid header name stops
+  startup, even while no NCA id is set.
 - `REQUEST_TRACE_UPLOADER_SUPPRESSION_RULES`: further rules as a JSON list,
   evaluated after the NCA id rule, for example
   `[{"name":"tenants","headers":["x-tenant"],"values":["t1"],"action":"dropRecord"}]`.
@@ -313,3 +464,13 @@ and the first 100 payload records carry no rule header, the uploader logs
 one warning. With strict suppression on, it also logs one warning per rule
 the first time it strips a record for that rule. Without strict
 suppression, it never holds or drops records for a missing header.
+
+When a restart brings new suppression or redaction settings, a segment not
+yet sent everywhere is prepared again from its source under the new
+settings. With two destinations, one that already confirmed the segment gets
+it again, which can duplicate its rows and is counted in
+`submits_ambiguous`. A submit that may have landed is retried as it was, so
+its destination can still get the segment under the old settings. The
+segment's other destinations wait until that submit is done and are then
+prepared again. A segment whose source is gone is quarantined instead of
+sent under the old settings.

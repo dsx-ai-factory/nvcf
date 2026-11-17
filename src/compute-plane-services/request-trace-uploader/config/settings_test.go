@@ -27,6 +27,12 @@ func TestLoadDefaultsForPipelineSettings(t *testing.T) {
 	if cfg.QuarantineTrip != 5 || cfg.QuarantineResume != time.Hour {
 		t.Fatalf("quarantine trip %d resume %v, want 5 and 1 h", cfg.QuarantineTrip, cfg.QuarantineResume)
 	}
+	if cfg.RecordMaxBytes != 256<<20 {
+		t.Fatalf("record max bytes = %d, want the design's 256 MiB", cfg.RecordMaxBytes)
+	}
+	if cfg.ObjectStore.ResponseTimeout != 5*time.Minute {
+		t.Fatalf("objectstore response timeout = %v, want 5m", cfg.ObjectStore.ResponseTimeout)
+	}
 	if got := cfg.Prefixes(); !slices.Equal(got, []string{DefaultSegmentPrefix}) {
 		t.Fatalf("Prefixes() = %v, want only the segment prefix", got)
 	}
@@ -40,6 +46,9 @@ func TestLoadParsesPipelineSettings(t *testing.T) {
 		EnvMaxJobAge:        "24h",
 		EnvQuarantineTrip:   " 2 ",
 		EnvQuarantineResume: "1m",
+		EnvRecordMaxBytes:   " 1048576 ",
+
+		EnvObjectStoreResponseTimeout: "90s",
 	})))
 	if err != nil || len(warnings) != 0 {
 		t.Fatalf("Load() error = %v warnings = %v", err, warnings)
@@ -49,6 +58,12 @@ func TestLoadParsesPipelineSettings(t *testing.T) {
 	}
 	if cfg.QuarantineTrip != 2 || cfg.QuarantineResume != time.Minute {
 		t.Fatalf("got quarantine trip %d resume %v, want 2 and 1 m", cfg.QuarantineTrip, cfg.QuarantineResume)
+	}
+	if cfg.RecordMaxBytes != 1<<20 {
+		t.Fatalf("record max bytes = %d, want 1 MiB", cfg.RecordMaxBytes)
+	}
+	if cfg.ObjectStore.ResponseTimeout != 90*time.Second {
+		t.Fatalf("objectstore response timeout = %v, want 90s", cfg.ObjectStore.ResponseTimeout)
 	}
 	if got := cfg.Prefixes(); !slices.Equal(got, []string{DefaultSegmentPrefix, "request-audit"}) {
 		t.Fatalf("Prefixes() = %v, want both families", got)
@@ -79,6 +94,19 @@ func TestLoadRejectsInvalidPipelineSettings(t *testing.T) {
 		"quarantine resume zero":         {EnvQuarantineResume: "0s"},
 		"quarantine resume without unit": {EnvQuarantineResume: "3600"},
 		"quarantine resume too long":     {EnvQuarantineResume: "25h"},
+		"record max zero":                {EnvRecordMaxBytes: "0"},
+		"record max negative":            {EnvRecordMaxBytes: "-1"},
+		"record max with a unit":         {EnvRecordMaxBytes: "256MiB"},
+		"record max fractional":          {EnvRecordMaxBytes: "1048576.5"},
+		"record max not a number":        {EnvRecordMaxBytes: "large"},
+		"record max under 1 MiB":         {EnvRecordMaxBytes: "1048575"},
+		"record max over 512 MiB":        {EnvRecordMaxBytes: "536870913"},
+		"response timeout without unit":  {EnvObjectStoreResponseTimeout: "300"},
+		"response timeout zero":          {EnvObjectStoreResponseTimeout: "0s"},
+		"response timeout negative":      {EnvObjectStoreResponseTimeout: "-1m"},
+		"response timeout under 10s":     {EnvObjectStoreResponseTimeout: "9s"},
+		"response timeout over 1h":       {EnvObjectStoreResponseTimeout: "61m"},
+		"response timeout not a time":    {EnvObjectStoreResponseTimeout: "soon"},
 	}
 	for name, env := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -172,11 +200,16 @@ func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 		EnvHealthAddr, EnvMaxJobAge, EnvMaxRetries,
 		EnvObjectStoreBucket, EnvObjectStoreDryRun, EnvObjectStoreEndpoint,
 		EnvObjectStoreKeyPrefix, EnvObjectStorePathStyle, EnvObjectStoreRegion,
-		EnvOperationTimeout, EnvQuarantineDir, EnvQuarantineResume,
-		EnvQuarantineTrip, EnvRedactMultimodal,
+		EnvObjectStoreResponseTimeout,
+		EnvOperationTimeout, EnvPrepareMemoryBytes, EnvPrepareWorkers,
+		EnvQuarantineDir, EnvQuarantineMaxAge, EnvQuarantineMaxFraction,
+		EnvQuarantineResume, EnvQuarantineTrip, EnvRecordMaxBytes,
+		EnvRedactMultimodal,
 		EnvRetryAfterMax, EnvRetryInitialBackoff, EnvRetryMaximumBackoff,
 		EnvRetryMultiplier, EnvScanInterval, EnvSecretsFile,
 		EnvSegmentPrefix, EnvSegmentScopeFailures, EnvSourceDir,
+		EnvSpoolBudgetBytes, EnvSpoolCheckInterval, EnvSpoolEvictionPolicy,
+		EnvSpoolHighWatermark, EnvSpoolLowWatermark, EnvSpoolMinFreeBytes,
 		EnvStateDir, EnvStatusInterval, EnvSuppressHeaderless,
 		EnvSuppressionRules, EnvSuppressionStrict, EnvSuppressNCAHeaders,
 		EnvSuppressNCAIDs, EnvUnconfirmedResends,
@@ -189,5 +222,24 @@ func TestStrictModeAcceptsExactlyTheDocumentedSettings(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Fatalf("settings Load reads:\n got  %v\n want %v", got, want)
+	}
+}
+
+// Errors name the setting, never its value.
+func TestAuditPrefixErrorsDoNotQuoteTheValue(t *testing.T) {
+	for name, value := range map[string]string{
+		"separator": "secret-audit/x",
+		"equal":     DefaultSegmentPrefix,
+		"extends":   DefaultSegmentPrefix + ".secret-audit",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := Load(mapLookup(requiredEnv(map[string]string{EnvAuditPrefix: value})))
+			if err == nil {
+				t.Fatal("Load() error = nil, want a startup error")
+			}
+			if !strings.Contains(err.Error(), EnvAuditPrefix) || strings.Contains(err.Error(), value) {
+				t.Fatalf("Load() error = %q, want it to name %s and not quote the value", err, EnvAuditPrefix)
+			}
+		})
 	}
 }

@@ -6,6 +6,7 @@
 package objectstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,6 +24,8 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 )
 
 // maxObjectBytes is the S3 single-PutObject limit. A segment past this size
@@ -38,6 +42,7 @@ type Client struct {
 	// s3 is nil in dry-run mode: Submit logs the computed bucket, key, and
 	// size instead of calling the store.
 	s3     *s3.Client
+	calls  *swappableTransport
 	bucket string
 	prefix string
 	// source namespaces the object key by uploader instance. Without it, two
@@ -80,11 +85,6 @@ type credentials struct {
 func New(cfg config.Config) (backend.Client, error) {
 	return newClient(cfg, nil)
 }
-
-// responseHeaderTimeout bounds the wait for the response headers once a
-// request, body included, is sent. It is per request, not a total deadline
-// for a submit or the SDK's retries. A var so a test can shorten it.
-var responseHeaderTimeout = 5 * time.Minute
 
 // newClient builds the backend with an optional transport override, so a test
 // can point it at an httptest.Server whose TLS certificate the default
@@ -139,13 +139,19 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 	if cfg.ObjectStore.Endpoint != "" {
 		options.BaseEndpoint = aws.String(cfg.ObjectStore.Endpoint)
 	}
+	// The base transport is never nil, so a client works on its own, before
+	// or without UseTransport, and the core's wrapper keeps the bound.
+	transport = boundedTransport(transport, cmp.Or(cfg.ObjectStore.ResponseTimeout, config.DefaultObjectStoreResponseTimeout))
+	calls := &swappableTransport{base: transport}
+	calls.current.Store(&transport)
 	options.HTTPClient = &http.Client{
-		Transport:     boundedTransport(transport),
+		Transport:     calls,
 		CheckRedirect: rejectNonHTTPSRedirect,
 	}
 
 	return &Client{
 		s3:     s3.New(options),
+		calls:  calls,
 		bucket: cfg.ObjectStore.Bucket,
 		prefix: cfg.ObjectStore.KeyPrefix,
 		source: source,
@@ -153,12 +159,14 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 }
 
 // boundedTransport returns transport, or Go's default one when nil, with the
-// wait for the response headers bounded by responseHeaderTimeout. The clock
+// wait for the response headers bounded by timeout, the objectstore response
+// timeout setting. It is per request, not a total deadline for a submit or
+// the SDK's retries. The clock
 // starts once the request, body included, is sent, so it never cuts an
 // upload on a slow link; it ends a wait on a store that took the object and
 // never answers, which would otherwise hold every later submit. A transport
 // that is not an *http.Transport is used as given.
-func boundedTransport(transport http.RoundTripper) http.RoundTripper {
+func boundedTransport(transport http.RoundTripper, timeout time.Duration) http.RoundTripper {
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
@@ -167,8 +175,31 @@ func boundedTransport(transport http.RoundTripper) http.RoundTripper {
 		return transport
 	}
 	bounded := base.Clone()
-	bounded.ResponseHeaderTimeout = responseHeaderTimeout
+	bounded.ResponseHeaderTimeout = timeout
 	return bounded
+}
+
+// UseTransport routes every store call through the core's transport, so
+// each call is a child span with the trace context and is counted, under
+// the operation name "upload". The redirect check and TLS settings stay. A
+// dry run makes no calls, so it ignores the wrapper.
+func (c *Client) UseTransport(wrap telemetry.TransportWrapper) {
+	if c.calls == nil {
+		return
+	}
+	wrapped := wrap("upload", c.calls.base)
+	c.calls.current.Store(&wrapped)
+}
+
+// swappableTransport is the store client's transport, which UseTransport
+// can replace after the client is built.
+type swappableTransport struct {
+	base    http.RoundTripper
+	current atomic.Pointer[http.RoundTripper]
+}
+
+func (t *swappableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return (*t.current.Load()).RoundTrip(req)
 }
 
 // rejectNonHTTPSRedirect replaces http.Client's default redirect policy.
@@ -187,7 +218,8 @@ func rejectNonHTTPSRedirect(req *http.Request, via []*http.Request) error {
 func loadCredentials(path string) (credentials, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", err)
+		// The runner logs this error at startup; logs never carry paths.
+		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", atomicfile.Pathless(err))
 	}
 	var creds credentials
 	if err := json.Unmarshal(data, &creds); err != nil {

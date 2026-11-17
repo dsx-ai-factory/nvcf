@@ -83,10 +83,16 @@ func TestNewRequiresCredentials(t *testing.T) {
 	}
 }
 
+// The runner logs this error at startup, and logs never carry paths.
 func TestNewRejectsUnreadableSecretsFile(t *testing.T) {
-	cfg := baseConfig(filepath.Join(t.TempDir(), "missing.json"), "https://127.0.0.1:0")
-	if _, err := New(cfg); err == nil {
+	dir := t.TempDir()
+	cfg := baseConfig(filepath.Join(dir, "missing.json"), "https://127.0.0.1:0")
+	_, err := New(cfg)
+	if err == nil {
 		t.Fatal("New() error = nil, want a read error")
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("New() error = %q, want no path", err)
 	}
 }
 
@@ -478,9 +484,6 @@ func TestSubmitUploadsAFilesOnlyRequest(t *testing.T) {
 // a large object on a slow link is never cut.
 func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 	withHostname(t, "pod-a")
-	original := responseHeaderTimeout
-	responseHeaderTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { responseHeaderTimeout = original })
 	release := make(chan struct{})
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -490,6 +493,7 @@ func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 	defer close(release)
 
 	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), server.URL)
+	cfg.ObjectStore.ResponseTimeout = 200 * time.Millisecond
 	client, err := newClient(cfg, server.Client().Transport)
 	if err != nil {
 		t.Fatalf("newClient() error = %v", err)
@@ -499,5 +503,50 @@ func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
 	_, err = client.Submit(ctx, backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")})
 	if err == nil || ctx.Err() != nil || !strings.Contains(err.Error(), "awaiting response headers") {
 		t.Fatalf("Submit() error = %v, context error = %v; want the bounded wait for the answer to end it", err, ctx.Err())
+	}
+}
+
+// A client from New works on its own, without the core's UseTransport: a
+// failed store call is an error, never a panic.
+func TestAClientFromNewWorksWithoutUseTransport(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), "https://127.0.0.1:1")
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Submit panicked: %v", r)
+		}
+	}()
+	if _, err := client.Submit(context.Background(), backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")}); err == nil {
+		t.Fatal("Submit() to a closed port succeeded")
+	}
+}
+
+// A Config built by hand, with no response timeout, still bounds the wait for
+// the store's answer: zero uses the default and never means no bound.
+func TestAConfigBuiltByHandStillBoundsTheWaitForAnAnswer(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b"}`), "https://127.0.0.1:0")
+	built, err := newClient(cfg, nil)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+	httpClient, ok := built.(*Client).s3.Options().HTTPClient.(*http.Client)
+	if !ok {
+		t.Fatalf("HTTP client is %T, want *http.Client", built.(*Client).s3.Options().HTTPClient)
+	}
+	swap, ok := httpClient.Transport.(*swappableTransport)
+	if !ok {
+		t.Fatalf("transport is %T, want *swappableTransport", httpClient.Transport)
+	}
+	transport, ok := swap.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base transport is %T, want *http.Transport", swap.base)
+	}
+	if got := transport.ResponseHeaderTimeout; got != config.DefaultObjectStoreResponseTimeout {
+		t.Fatalf("response header timeout = %v, want the default %v", got, config.DefaultObjectStoreResponseTimeout)
 	}
 }
