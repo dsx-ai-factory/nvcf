@@ -38,7 +38,7 @@ class AuthzServiceTest {
 
     private static final String NVCF_SERVICE_ID = "nvidia-cloud-functions-ncp-service-id-aketm";
     private static final String NVCT_SERVICE_ID = "nvidia-cloud-tasks-ncp-service-id-nvcttasks";
-    private static final String ICMS_SERVICE_ID = "nvidia-instance-cluster-management-ncp-service-id";
+    private static final String ICMS_SERVICE_ID = "icms-api";
 
     @Spy
     private NakProperties nakPropertiesSpy = NakProperties.builder()
@@ -55,7 +55,7 @@ class AuthzServiceTest {
         var response = jsonMapper.readValue("""
                 {"owner_id":"owner-1","authorizations":{"policies":[
                   {"aud":"nvidia-cloud-functions-ncp-service-id-aketm","scopes":["list_functions"]},
-                  {"aud":"nvidia-instance-cluster-management-ncp-service-id",
+                   {"aud":"icms-api",
                    "scopes":["cluster_listing"],
                    "resources":[{"type":"account-clusters","id":"*"}]}
                 ]}}

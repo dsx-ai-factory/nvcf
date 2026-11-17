@@ -20,17 +20,19 @@ import com.nvidia.boot.exceptions.BootResponseException;
 import com.nvidia.boot.exceptions.UpstreamException;
 import com.nvidia.icms.configuration.staticclientauth.FixedBearerExchangeFilterFunction;
 import com.nvidia.icms.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientApiKeysProperties;
-import com.nvidia.icms.errors.IcmsAuthenticationException;
 import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationRequest;
-import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResult;
 import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResponse;
+import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResult;
 import com.nvidia.icms.outbound.exception.ApiKeysException;
 import com.nvidia.icms.util.IcmsOAuth2ClientUtils;
 import com.nvidia.icms.util.IcmsOAuth2ClientUtils.ManagedHttpResources;
+import java.time.Duration;
 import java.util.Optional;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
@@ -38,16 +40,23 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
-import tools.jackson.databind.ObjectMapper;
+import reactor.util.retry.Retry;
+import reactor.util.retry.RetryBackoffSpec;
+import tools.jackson.databind.json.JsonMapper;
 
 @Component
 @RefreshScope
+@Slf4j
 public class ApiKeysClient {
 
     private static final String CLIENT_REGISTRATION_ID = "api-keys";
+    private static final RetryBackoffSpec RETRY_SPEC = Retry.backoff(2, Duration.ofMillis(200))
+            .jitter(0.75)
+            .filter(UpstreamException.class::isInstance)
+            .onRetryExhaustedThrow((spec, signal) -> signal.failure());
 
     private final WebClient webClient;
-    private final ObjectMapper jsonMapper;
+    private final JsonMapper jsonMapper;
     private final String evaluationUri;
     private final String requestPropertyName;
     private final boolean selfHosted;
@@ -63,11 +72,11 @@ public class ApiKeysClient {
             @Value("${spring.security.oauth2.client.registration.api-keys.scope}") String scope,
             @Value("${spring.security.oauth2.client.provider.api-keys.token-uri}") String tokenUri,
             Optional<StaticClientApiKeysProperties> staticClientApiKeysProperties,
-            ObjectMapper objectMapper,
+            JsonMapper jsonMapper,
             @Qualifier("apiKeysHttpResources") ManagedHttpResources httpResources,
             WebClient.Builder webClientBuilder) { // Prototype-scoped - Safe to mutate.
 
-        this.jsonMapper = objectMapper;
+        this.jsonMapper = jsonMapper;
         this.evaluationUri = "/v1/namespaces/%s/evaluations/%s.%s"
                 .formatted(namespace, packageName, policyName);
         this.requestPropertyName = requestPropertyName;
@@ -78,26 +87,16 @@ public class ApiKeysClient {
                 .orElseGet(() -> IcmsOAuth2ClientUtils.getOAuth2ExchangeFilter(
                         webClientBuilder, CLIENT_REGISTRATION_ID, tokenUri,
                         clientId, clientSecret, scope));
-        this.webClient = webClientBuilder
+        var builder = webClientBuilder
                 .baseUrl(apiKeysBaseUrl)
                 .clientConnector(httpResources.connector())
                 .filter(IcmsOAuth2ClientUtils.getRetryableFilter(CLIENT_REGISTRATION_ID))
-                .filter(authFilter)
-                .filter(staticClientApiKeysProperties.isPresent()
-                        ? ExchangeFilterFunction.ofResponseProcessor(response -> {
-                            int status = response.statusCode().value();
-                            if (status == 400 || status == 401 || status == 403 || status == 404) {
-                                return Mono.error(new IcmsAuthenticationException(
-                                        ApiKeysService.API_KEY_FAILURE_ERROR));
-                            }
-                            if (response.statusCode().isError()) {
-                                return Mono.error(new ApiKeysException(
-                                        "ApiKeys service error: " + response.statusCode(), true));
-                            }
-                            return Mono.just(response);
-                        })
-                        : IcmsOAuth2ClientUtils.getResponseFilterProcessor(CLIENT_REGISTRATION_ID))
-                .build();
+                .filter(authFilter);
+        this.webClient = builder.build();
+    }
+
+    public boolean isSelfHosted() {
+        return selfHosted;
     }
 
     public ApiKeyValidationResult fetchApiKeyValidationResult(String apiKey) {
@@ -108,15 +107,22 @@ public class ApiKeysClient {
                     .bodyValue(ApiKeyValidationRequest.builder()
                             .jsonField(requestPropertyName, apiKey).build())
                     .retrieve()
+                    .onStatus(HttpStatusCode::is4xxClientError, rejected -> {
+                        log.warn("4xx error from API Keys for {}: {}", evaluationUri,
+                                rejected.statusCode());
+                        return rejected.createException();
+                    })
+                    .onStatus(HttpStatusCode::is5xxServerError, rejected -> {
+                        log.warn("5xx error from API Keys for {}: {}", evaluationUri,
+                                rejected.statusCode());
+                        return Mono.error(new UpstreamException("API Keys returned 5xx error"));
+                    })
                     .bodyToMono(ApiKeyValidationResponse.class)
+                    .retryWhen(RETRY_SPEC)
                     .block();
             return parseResponse(response);
 
         } catch (WebClientResponseException e) {
-            int status = e.getStatusCode().value();
-            if (selfHosted && (status == 400 || status == 401 || status == 403 || status == 404)) {
-                throw new IcmsAuthenticationException(ApiKeysService.API_KEY_FAILURE_ERROR);
-            }
             throw new ApiKeysException("ApiKeys service error: " + e.getStatusCode(), e,
                     e.getStatusCode().is5xxServerError());
 
@@ -127,8 +133,6 @@ public class ApiKeysClient {
                     !(e.getCause() instanceof BootResponseException cause
                             && cause.getStatusCode().is4xxClientError()));
         } catch (ApiKeysException e) {
-            throw e;
-        } catch (IcmsAuthenticationException e) {
             throw e;
         } catch (Exception e) {
             throw new ApiKeysException("Unknown error from ApiKeys service.", e);

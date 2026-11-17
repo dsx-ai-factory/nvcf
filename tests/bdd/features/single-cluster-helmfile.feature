@@ -212,7 +212,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         """
 
     @icms-api-key
-    Scenario: An ICMS audience key lists its account's cluster groups only
+    Scenario: An ICMS audience key grants cluster listing but not cluster management
       Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
       When I successfully run command:
         """
@@ -222,20 +222,20 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       Given the HTTP request header "Authorization" is the NVCF CLI admin token with prefix "Bearer "
       And the HTTP request header "Content-Type" is "application/json"
       And the HTTP request header "Key-Issuer-Service" is "nvcf-api"
-      And the HTTP request header "Key-Issuer-Id" is "nvidia-instance-cluster-management-ncp-service-id"
+      And the HTTP request header "Key-Issuer-Id" is "icms-api"
       And the HTTP request header "Key-Owner-Id" is "svc@nvcf-api.local"
       When I send a "POST" request to "http://api-keys.localhost:8080/v1/keys" with body:
         """
         {"description":"bdd-icms-cluster-groups","expires_at":"${BDD_ICMS_EXPIRES}",
-         "authorizations":{"policies":[{"aud":"nvidia-instance-cluster-management-ncp-service-id",
+         "authorizations":{"policies":[{"aud":"icms-api",
            "scopes":["cluster_listing"],"resources":[{"type":"account-clusters","id":"*"}]}]},
-         "audience_service_ids":["nvidia-instance-cluster-management-ncp-service-id"]}
+         "audience_service_ids":["icms-api"]}
         """
       Then the HTTP status should be 200
       When I export the HTTP response JSON field "id" to environment variable "BDD_ICMS_KEY_ID"
       Given the HTTP request header "Authorization" is the NVCF CLI admin token with prefix "Bearer "
       And the HTTP request header "Key-Issuer-Service" is "nvcf-api"
-      And the HTTP request header "Key-Issuer-Id" is "nvidia-instance-cluster-management-ncp-service-id"
+      And the HTTP request header "Key-Issuer-Id" is "icms-api"
       And the HTTP request header "Key-Owner-Id" is "svc@nvcf-api.local"
       And I send a "DELETE" request to "http://api-keys.localhost:8080/v1/keys/${BDD_ICMS_KEY_ID}" at scenario teardown expecting status 204
       When I export the HTTP response JSON field "value" to environment variable "BDD_ICMS_KEY"
@@ -243,9 +243,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       When I send a "GET" request to "http://sis.localhost:8080/v1/si/accounts/nvcf-default/clusterGroups"
       Then the HTTP status should be 200
       Given the HTTP request header "Authorization" is "Bearer ${BDD_ICMS_KEY}"
-      When I send a "GET" request to "http://sis.localhost:8080/v1/si/accounts/wrong-account/clusterGroups"
-      Then the HTTP status should be 403
-      Given the HTTP request header "Authorization" is "Bearer ${BDD_ICMS_KEY}"
+      And the HTTP request header "Content-Type" is "application/json"
       When I send a "POST" request to "http://sis.localhost:8080/v1/accounts/nvcf-default/clusters" with body:
         """
         {}

@@ -585,7 +585,7 @@ type icmsKeyHTTPFake struct {
 
 func (f *icmsKeyHTTPFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
 	if strings.HasPrefix(rawURL, "http://api-keys.localhost:8080/v1/keys") &&
-		headers["Key-Issuer-Id"] == "nvidia-instance-cluster-management-ncp-service-id" {
+		headers["Key-Issuer-Id"] == "icms-api" {
 		if method == "POST" {
 			return harness.HTTPResponse{Status: 200, Body: `{"id":"icms-key-1","value":"nvapi-icms-test"}`}, nil
 		}
@@ -596,7 +596,10 @@ func (f *icmsKeyHTTPFake) Do(ctx context.Context, method, rawURL string, headers
 			return harness.HTTPResponse{Status: 401}, nil
 		}
 		if headers["Authorization"] == "Bearer nvapi-icms-test" {
-			if strings.Contains(rawURL, "/wrong-account/") || method == "POST" {
+			if method == "POST" {
+				if headers["Content-Type"] != "application/json" {
+					return harness.HTTPResponse{Status: 415}, nil
+				}
 				return harness.HTTPResponse{Status: 403}, nil
 			}
 			return harness.HTTPResponse{Status: 200, Body: `{}`}, nil

@@ -36,7 +36,7 @@ SERVICE_ACCOUNT_NAME="api-keys-api"
 NVCT_SERVICE_ID="nvidia-cloud-tasks-ncp-service-id-nvcttasks"
 
 EVENT_LEDGER_SERVICE_ID="nvidia-event-ledger-ncp-service-id-ckozoh6f"
-ICMS_SERVICE_ID="nvidia-instance-cluster-management-ncp-service-id"
+ICMS_SERVICE_ID="icms-api"
 
 #-------------------------------------------
 # Set defaults for secret paths and policies
@@ -90,19 +90,20 @@ SVC_VALUE=$(base64_encode '[
   {"serviceId":"nvidia-cloud-functions-ncp-service-id-aketm","serviceName":"nvcf-api","audienceServiceIds":["nvidia-cloud-functions-ncp-service-id-aketm","'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
   {"serviceId":"'"${NVCT_SERVICE_ID}"'","serviceName":"nvct-api","audienceServiceIds":["'"${NVCT_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
   {"serviceId":"'"${EVENT_LEDGER_SERVICE_ID}"'","serviceName":"event-ledger","audienceServiceIds":["'"${EVENT_LEDGER_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3},
-  {"serviceId":"'"${ICMS_SERVICE_ID}"'","serviceName":"sis-api","audienceServiceIds":["'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3}
+  {"serviceId":"'"${ICMS_SERVICE_ID}"'","serviceName":"icms-api","audienceServiceIds":["'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3}
 ]')
 write_secrets_kv "${VAULT_SECRET_BASE_PATH}/kv" "registrations/services" "services=$SVC_VALUE" true
 
 # ICMS evaluates API keys with an API Keys audience token. The signing mount
-# exists here, after setup_sis has provisioned the SIS auth role.
-SIS_SERVICE_ACCOUNT_NAME="sis-api"
-SIS_SERVICE_ACCOUNT_NAMESPACE="sis"
-jwt_secret_role=$(generate_jwt_secret_role "${SERVICE_ACCOUNT_NAMESPACE}" "api-keys" "${SIS_SERVICE_ACCOUNT_NAME}" "pdp-evaluate")
-create_secret_jwt_role "${VAULT_SECRET_BASE_PATH}/jwt" "${SIS_SERVICE_ACCOUNT_NAME}" "${jwt_secret_role}"
-policy=$(generate_acl_policy "${VAULT_SECRET_BASE_PATH}/jwt/sign/${SIS_SERVICE_ACCOUNT_NAME}" "create,update,read")
-policy_name="${VAULT_POLICY_BASE_PATH}-jwt-sign-${SIS_SERVICE_ACCOUNT_NAME}-rw"
+# exists here, after setup_sis has provisioned the ICMS auth role.
+ICMS_SIGNING_ROLE="icms-api"
+ICMS_SERVICE_ACCOUNT_NAME="sis-api"
+ICMS_SERVICE_ACCOUNT_NAMESPACE="sis"
+jwt_secret_role=$(generate_jwt_secret_role "${SERVICE_ACCOUNT_NAMESPACE}" "api-keys" "${ICMS_SIGNING_ROLE}" "pdp-evaluate")
+create_secret_jwt_role "${VAULT_SECRET_BASE_PATH}/jwt" "${ICMS_SIGNING_ROLE}" "${jwt_secret_role}"
+policy=$(generate_acl_policy "${VAULT_SECRET_BASE_PATH}/jwt/sign/${ICMS_SIGNING_ROLE}" "create,update,read")
+policy_name="${VAULT_POLICY_BASE_PATH}-jwt-sign-${ICMS_SIGNING_ROLE}-rw"
 write_policy "${policy_name}" "${policy}"
-sis_policies=$(merge_jwt_role_policies "${SIS_SERVICE_ACCOUNT_NAME}" "${policy_name}")
-sis_auth_role=$(generate_jwt_auth_role "${SIS_SERVICE_ACCOUNT_NAME}" "${SIS_SERVICE_ACCOUNT_NAMESPACE}" "${sis_policies}")
-create_auth_jwt_role "${SIS_SERVICE_ACCOUNT_NAME}" "${sis_auth_role}"
+icms_policies=$(merge_jwt_role_policies "${ICMS_SERVICE_ACCOUNT_NAME}" "${policy_name}" true)
+icms_auth_role=$(generate_jwt_auth_role "${ICMS_SERVICE_ACCOUNT_NAME}" "${ICMS_SERVICE_ACCOUNT_NAMESPACE}" "${icms_policies}")
+create_auth_jwt_role "${ICMS_SERVICE_ACCOUNT_NAME}" "${icms_auth_role}"

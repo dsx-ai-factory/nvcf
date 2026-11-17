@@ -27,7 +27,6 @@ import com.nvidia.icms.outbound.exception.ApiKeysException;
 import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 @Slf4j
@@ -36,22 +35,19 @@ import org.springframework.stereotype.Service;
 public class ApiKeysService {
 
     public static final String API_KEY_FAILURE_ERROR = "Invalid authentication token";
+    public static final String ICMS_AUDIENCE_SERVICE_ID = "icms-api";
 
     private final ApiKeysClient apiKeysClient;
-    private final String audienceServiceId;
     private final LoadingCache<String, ApiKeyValidationResult> apiKeysCache;
     private final Cache<String, ApiKeyValidationResult> apiKeysBackupCache;
 
     @Autowired
-    public ApiKeysService(
-            ApiKeysClient apiKeysClient,
-            @Value("${icms.api-keys.audience-service-id:}") String audienceServiceId) {
-        this(apiKeysClient, audienceServiceId, Ticker.systemTicker());
+    public ApiKeysService(ApiKeysClient apiKeysClient) {
+        this(apiKeysClient, Ticker.systemTicker());
     }
 
-    ApiKeysService(ApiKeysClient apiKeysClient, String audienceServiceId, Ticker ticker) {
+    ApiKeysService(ApiKeysClient apiKeysClient, Ticker ticker) {
         this.apiKeysClient = apiKeysClient;
-        this.audienceServiceId = audienceServiceId;
         this.apiKeysCache = Caffeine.newBuilder()
                 .maximumSize(512).expireAfterWrite(Duration.ofMinutes(1))
                 .ticker(ticker)
@@ -89,9 +85,9 @@ public class ApiKeysService {
             throw e;
         }
 
-        if (policyResult == null || (audienceServiceId.isEmpty()
-                ? !policyResult.isValid()
-                : !policyResult.hasSelfHostedPolicy(audienceServiceId))) {
+        if (policyResult == null || !policyResult.isValid()
+                || (apiKeysClient.isSelfHosted()
+                        && !policyResult.hasSelfHostedPolicy(ICMS_AUDIENCE_SERVICE_ID))) {
             apiKeysBackupCache.invalidate(apiKey);
             log.warn("ApiKey validation failure: Invalid authz result");
             throw new IcmsAuthenticationException(API_KEY_FAILURE_ERROR);

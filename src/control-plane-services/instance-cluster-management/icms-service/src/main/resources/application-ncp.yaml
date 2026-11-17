@@ -111,8 +111,7 @@ logging:
 icms:
   api-keys:
     url: http://api-keys.api-keys.svc.cluster.local:8080
-    namespace: nvcfsis
-    audience-service-id: nvidia-instance-cluster-management-ncp-service-id
+    namespace: icms
     package-name: apikey
     policy-name: allow
     request-property-name: apiKey

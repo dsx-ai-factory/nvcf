@@ -114,7 +114,8 @@ public class NvcaAccountController {
     }
 
     @GetMapping("{ncaId}/clusterVersions")
-    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:read:cluster-management')")
+    @PreAuthorize("hasAnyAuthority('cluster-management', 'apikey:cluster-management', "
+            + "'apikey:read:cluster-management')")
     @Operation(summary = "Get NVCA version details",
             description = "API to get the NVCA version details",
             responses = {

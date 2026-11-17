@@ -22,6 +22,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.equalToJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.exactly;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -30,7 +31,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.nvidia.icms.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientApiKeysProperties;
-import com.nvidia.icms.errors.IcmsAuthenticationException;
 import com.nvidia.icms.outbound.exception.ApiKeysException;
 import com.nvidia.icms.util.IcmsOAuth2ClientUtils;
 import com.nvidia.icms.util.IcmsOAuth2ClientUtils.ManagedHttpResources;
@@ -38,6 +38,8 @@ import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.reactive.function.client.WebClient;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -63,17 +65,17 @@ class ApiKeysClientIntegrationTest {
     void staticTokenIsUsedForPolicyEvaluation() {
         var properties = new StaticClientApiKeysProperties();
         properties.setToken("static-api-keys-token");
-        var path = "/v1/namespaces/nvcfsis/evaluations/apikey.allow";
+        var path = "/v1/namespaces/icms/evaluations/apikey.allow";
         server.stubFor(post(urlPathEqualTo(path)).willReturn(aResponse().withStatus(200)
                 .withHeader("Content-Type", "application/json")
                 .withBody("""
-                        {"namespace":"nvcfsis","rule_name":"apikey.allow",
+                        {"namespace":"icms","rule_name":"apikey.allow",
                          "result":{"allowed":true,"ncaId":"account-1","ownerId":"owner-1",
                            "policy":{"aud":"icms-audience","scopes":["cluster_listing"],
                                      "resources":[]}}}
                         """)));
 
-        var client = new ApiKeysClient(server.baseUrl(), "nvcfsis", "apikey", "allow",
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
                 "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
                 Optional.of(properties),
                 new JsonMapper(), resources, WebClient.builder());
@@ -82,34 +84,38 @@ class ApiKeysClientIntegrationTest {
         assertTrue(result.isValid());
         server.verify(postRequestedFor(urlPathEqualTo(path))
                 .withHeader("Authorization", equalTo("Bearer static-api-keys-token"))
-                .withRequestBody(equalToJson(""" 
+                .withRequestBody(equalToJson("""
                         {"input":{"apiKey":"nvapi-example"}}
                         """)));
     }
 
-    @Test
-    void unknownKeyReturnsAuthenticationFailure() {
+    @ParameterizedTest
+    @ValueSource(ints = {400, 401, 403, 404})
+    void clientErrorsRemainDistinctAndAreNotRetried(int status) {
         var properties = new StaticClientApiKeysProperties();
         properties.setToken("static-api-keys-token");
-        var path = "/v1/namespaces/nvcfsis/evaluations/apikey.allow";
+        var path = "/v1/namespaces/icms/evaluations/apikey.allow";
         server.stubFor(post(urlPathEqualTo(path))
-                .willReturn(aResponse().withStatus(404).withBody("key not found")));
-        var client = new ApiKeysClient(server.baseUrl(), "nvcfsis", "apikey", "allow",
+                .willReturn(aResponse().withStatus(status).withBody("key not found")));
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
                 "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
                 Optional.of(properties),
                 new JsonMapper(), resources, WebClient.builder());
 
-        assertThrows(IcmsAuthenticationException.class, () ->
+        ApiKeysException exception = assertThrows(ApiKeysException.class, () ->
                 client.fetchApiKeyValidationResult("nvapi-invalid"));
+        assertFalse(exception.isRetryable());
+        assertTrue(exception.getMessage().contains(Integer.toString(status)));
+        server.verify(exactly(1), postRequestedFor(urlPathEqualTo(path)));
     }
 
     @Test
     void unavailableServiceReturnsRetryableFailure() {
         var properties = new StaticClientApiKeysProperties();
         properties.setToken("static-api-keys-token");
-        server.stubFor(post(urlPathEqualTo("/v1/namespaces/nvcfsis/evaluations/apikey.allow"))
+        server.stubFor(post(urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow"))
                 .willReturn(aResponse().withStatus(503)));
-        var client = new ApiKeysClient(server.baseUrl(), "nvcfsis", "apikey", "allow",
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
                 "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
                 Optional.of(properties),
                 new JsonMapper(), resources, WebClient.builder());
@@ -117,20 +123,39 @@ class ApiKeysClientIntegrationTest {
         ApiKeysException exception = assertThrows(ApiKeysException.class, () ->
                 client.fetchApiKeyValidationResult("nvapi-example"));
         assertTrue(exception.isRetryable());
+        server.verify(exactly(3), postRequestedFor(
+                urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow")));
+    }
+
+    @Test
+    void unprocessableEvaluationIsNotRetryable() {
+        var properties = new StaticClientApiKeysProperties();
+        properties.setToken("static-api-keys-token");
+        server.stubFor(post(urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow"))
+                .willReturn(aResponse().withStatus(422).withBody("invalid evaluation input")));
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
+                "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
+                Optional.of(properties), new JsonMapper(), resources, WebClient.builder());
+
+        ApiKeysException exception = assertThrows(ApiKeysException.class, () ->
+                client.fetchApiKeyValidationResult("nvapi-example"));
+        assertFalse(exception.isRetryable());
+        server.verify(exactly(1), postRequestedFor(
+                urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow")));
     }
 
     @Test
     void deniedPolicyIsReturnedForServiceValidation() {
         var properties = new StaticClientApiKeysProperties();
         properties.setToken("static-api-keys-token");
-        server.stubFor(post(urlPathEqualTo("/v1/namespaces/nvcfsis/evaluations/apikey.allow"))
+        server.stubFor(post(urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow"))
                 .willReturn(aResponse().withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("""
-                                {"namespace":"nvcfsis","rule_name":"apikey.allow",
+                                {"namespace":"icms","rule_name":"apikey.allow",
                                  "result":{"allowed":false}}
                                 """)));
-        var client = new ApiKeysClient(server.baseUrl(), "nvcfsis", "apikey", "allow",
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
                 "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
                 Optional.of(properties),
                 new JsonMapper(), resources, WebClient.builder());
@@ -142,11 +167,11 @@ class ApiKeysClientIntegrationTest {
     void absentPolicyResultIsNotRetryable() {
         var properties = new StaticClientApiKeysProperties();
         properties.setToken("static-api-keys-token");
-        server.stubFor(post(urlPathEqualTo("/v1/namespaces/nvcfsis/evaluations/apikey.allow"))
+        server.stubFor(post(urlPathEqualTo("/v1/namespaces/icms/evaluations/apikey.allow"))
                 .willReturn(aResponse().withStatus(200)
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"namespace\":\"nvcfsis\",\"rule_name\":\"apikey.allow\"}")));
-        var client = new ApiKeysClient(server.baseUrl(), "nvcfsis", "apikey", "allow",
+                        .withBody("{\"namespace\":\"icms\",\"rule_name\":\"apikey.allow\"}")));
+        var client = new ApiKeysClient(server.baseUrl(), "icms", "apikey", "allow",
                 "apiKey", "unused", "unused", "pdp-evaluate", server.baseUrl() + "/token",
                 Optional.of(properties),
                 new JsonMapper(), resources, WebClient.builder());

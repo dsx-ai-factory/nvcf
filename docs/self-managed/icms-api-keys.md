@@ -1,13 +1,13 @@
 # ICMS API keys
 
 Self-managed ICMS (`sis`) accepts `Bearer nvapi-*` keys issued with an ICMS
-policy. API Keys evaluates the key under namespace `nvcfsis` with rule
+policy. API Keys evaluates the key under namespace `icms` with rule
 `apikey.allow` and the `apiKey` request field. The ICMS audience is
-`nvidia-instance-cluster-management-ncp-service-id`. A key issued only for
-Cloud Functions or Cloud Tasks cannot authorize ICMS calls.
+`icms-api`. A key issued only for Cloud Functions or Cloud Tasks cannot
+authorize ICMS calls.
 
-The stack registers the audience in API Keys and gives `sis-api` an
-OpenBao-signed service token for outbound evaluation. Deploy matching API Keys,
+The stack registers the audience in API Keys and gives the ICMS service account
+an OpenBao-signed service token for outbound evaluation. Deploy matching API Keys,
 OpenBao migrations, ICMS image, and ICMS chart releases before enabling the
 ICMS API-key feature flag. The stack orders API Keys before ICMS.
 
@@ -15,11 +15,11 @@ ICMS API-key feature flag. The stack orders API Keys before ICMS.
 
 An operator with permission to create API keys can call the API Keys service.
 Authenticate as for other self-managed API Keys operations and supply the
-same issuer and owner headers used for the key's issuing service. For an ICMS
-key, set `Key-Issuer-Id` to the ICMS audience above and include that audience
-in `audience_service_ids`. For a Cloud Functions-issued key that also calls
-ICMS, include both audiences and both policies. The Cloud Functions issuing
-service registration permits the ICMS audience.
+same issuer and owner headers used for the key's issuing service. For a key
+issued by ICMS, set `Key-Issuer-Id` to `icms-api` and include that audience in
+`audience_service_ids`. For a Cloud Functions-issued key that also calls ICMS,
+use the Cloud Functions issuer ID and include both audiences and both policies.
+The Cloud Functions issuing service registration permits the ICMS audience.
 
 For example, a policy granting cluster listing scopes is:
 
@@ -27,7 +27,7 @@ For example, a policy granting cluster listing scopes is:
 {
   "policies": [
     {
-      "aud": "nvidia-instance-cluster-management-ncp-service-id",
+      "aud": "icms-api",
       "scopes": ["cluster_listing", "read:cluster-management"],
       "resources": [{"type": "account-clusters", "id": "*"}]
     }
