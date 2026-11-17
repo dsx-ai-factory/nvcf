@@ -160,14 +160,21 @@ that does not set its own grace period, including PodGroups owned by other
 teams on a shared cluster. Such a gang keeps its running Pods for as long as it
 stays below its minimum size. A workload that needs stale-gang eviction can set
 its own grace period with the `kai.scheduler/staleness-grace-period` annotation
-on its Pods, its parent resource, or its PodGroup.
+on its Pods or its parent resource. KAI's podgrouper copies the annotation into
+the PodGroup it creates. For a PodGroup that the workload creates itself with
+`kai.scheduler/skip-podgrouper`, set `spec.stalenessGracePeriod` on the
+PodGroup instead.
 
 If other teams on a shared cluster rely on reclaim to enforce their queue
 quotas, use the following `scheduler` block instead of the one in the values
 above. It keeps reclaim enabled but turns off `allow-consolidating-reclaim`, so
 reclaim no longer moves running NVCF Pods, and quota-based reclaim between the
-other queues still works. Where Grove's `kai-scheduler` backend is active, keep
-both arguments by uncommenting the staleness setting:
+other queues still works. This relies on the `proportion` plugin's
+`queuePriorityInQuotaReclaim` argument staying at its default of `false`. When
+it is enabled, a queue with a higher priority can reclaim in-quota resources
+from a lower-priority queue, which includes evicting preemptible NVCF Pods.
+Where Grove's `kai-scheduler` backend is active, keep both arguments by
+uncommenting the staleness setting:
 
 ```yaml
 scheduler:
