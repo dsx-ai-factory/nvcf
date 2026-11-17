@@ -44,6 +44,10 @@ const (
 	// processConfigWhole is the field of a container recorded as one
 	// digest of all its fields (compactContainer).
 	processConfigWhole = "*"
+	// processConfigEnvOrder is the field holding the order of a
+	// container's env declarations, recorded when a value references
+	// another variable.
+	processConfigEnvOrder = "envOrder"
 	// processConfigAnnotationMax bounds the annotation (a pod's
 	// annotations may total 256 KiB); past it, each container is one
 	// digest.
@@ -101,7 +105,13 @@ func ProcessConfig(pod *corev1.Pod) string {
 		if len(c.EnvFrom) > 0 {
 			addJSON("envFrom", c.EnvFrom)
 		}
+		var order []string
+		refs := false
 		for _, e := range c.Env {
+			if !placementEnv(e.Name) {
+				order = append(order, e.Name)
+				refs = refs || strings.Contains(e.Value, "$(")
+			}
 			switch {
 			case placementEnv(e.Name):
 			case e.ValueFrom != nil:
@@ -116,6 +126,13 @@ func ProcessConfig(pod *corev1.Pod) string {
 				}
 				add("env/"+e.Name, v)
 			}
+		}
+		// Kubernetes expands $(NAME) only from variables declared before
+		// it, so with a reference the declaration order is configuration
+		// too. Only then: a container without one keeps the fingerprint
+		// it had.
+		if refs {
+			add(processConfigEnvOrder, strings.Join(order, ","))
 		}
 		byContainer[c.Name] = items
 	}
@@ -162,10 +179,15 @@ func splitProcessConfig(pc string) (version string, byContainer map[string][]str
 	return f[0], m
 }
 
+// isCompact reports whether a container's items are one digest of them all.
+func isCompact(name string, items []string) bool {
+	return len(items) == 1 && strings.HasPrefix(items[0], name+"/"+processConfigWhole+"=")
+}
+
 // compactContainer turns a container's items into one digest of them all,
 // "<container>/*=<digest>"; items already compact stay as they are.
 func compactContainer(name string, items []string) []string {
-	if len(items) == 1 && strings.HasPrefix(items[0], name+"/"+processConfigWhole+"=") {
+	if isCompact(name, items) {
 		return items
 	}
 	s := append([]string(nil), items...)
@@ -220,8 +242,10 @@ func ProcessConfigChanges(recorded, current string) []string {
 			out = append(out, name+" (no such container)")
 			continue
 		}
-		if len(ritems) == 1 && strings.HasPrefix(ritems[0], name+"/"+processConfigWhole+"=") {
-			if compactContainer(name, citems)[0] != ritems[0] {
+		// One side compact (a pod past the annotation bound compacts every
+		// container): compare both as one digest.
+		if isCompact(name, ritems) || isCompact(name, citems) {
+			if compactContainer(name, citems)[0] != compactContainer(name, ritems)[0] {
 				out = append(out, name+": the process configuration (recorded as one digest)")
 			}
 			continue
@@ -265,19 +289,31 @@ func describeField(k string) string {
 }
 
 // processConfigPatches stamps a pod with its process configuration as
-// received, unless it has one (a pod is admitted once). Every pod, not
-// only GPU ones: a group capture takes the instance's companions (an
-// etcd, a frontend) too.
+// received. Every pod, not only GPU ones: a group capture takes the
+// instance's companions (an etcd, a frontend) too. The webhook sees a pod
+// once (no reinvocation), so a stamp the pod already has came with it (a
+// template that copied another pod's annotations): it is replaced when it
+// does not match the spec, so a capture never records another
+// configuration than the one it runs.
 func (m *Mutator) processConfigPatches(pod *corev1.Pod) []PatchOp {
 	if !m.CRIUCapture {
 		return nil
 	}
-	if _, has := pod.Annotations[ProcessConfigAnnotation]; has {
+	pc := ProcessConfig(pod)
+	supplied, has := pod.Annotations[ProcessConfigAnnotation]
+	if has && supplied == pc {
 		return nil
 	}
-	pc := ProcessConfig(pod)
 	if pc == "" {
+		if has {
+			return []PatchOp{{Op: "remove", Path: "/metadata/annotations/" + jsonPointerEscape(ProcessConfigAnnotation)}}
+		}
 		return nil
+	}
+	if has {
+		m.logger().WithField("pod", pod.Namespace+"/"+pod.Name).
+			Warn("the pod came with a process-config stamp that does not match its spec; replacing it")
+		return []PatchOp{{Op: "replace", Path: "/metadata/annotations/" + jsonPointerEscape(ProcessConfigAnnotation), Value: pc}}
 	}
 	return newMetaPatcher(pod).annotation(ProcessConfigAnnotation, pc)
 }

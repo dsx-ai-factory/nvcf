@@ -240,3 +240,95 @@ func TestCRIUGroupRestore_CompanionProcessConfig(t *testing.T) {
 		}
 	}
 }
+
+// Kubernetes expands $(NAME) only from variables declared before it, so
+// reordering a variable and one that references it changes the process:
+// the restore starts cold. A container whose values reference nothing
+// keeps the fingerprint it had (no order item), so existing records still
+// match.
+func TestProcessConfigChanges_DependentEnvOrder(t *testing.T) {
+	withEnv := func(env ...corev1.EnvVar) *corev1.Pod {
+		p := configuredWorker("sr-a", "x")
+		p.Spec.Containers[1].Env = env
+		return p
+	}
+	base := corev1.EnvVar{Name: "DYN_BASE", Value: "alpha"}
+	derived := corev1.EnvVar{Name: "DYN_DERIVED", Value: "$(DYN_BASE)"}
+	rec := ProcessConfigOf(ProcessConfig(withEnv(base, derived)), "main")
+	c := ProcessConfigChanges(rec, ProcessConfig(withEnv(derived, base)))
+	if !reflect.DeepEqual(c, []string{"main: " + processConfigEnvOrder}) {
+		t.Errorf("reordered dependent env: changes %v, want the env order", c)
+	}
+	plain := corev1.EnvVar{Name: "DYN_OTHER", Value: "beta"}
+	pc := ProcessConfig(withEnv(base, plain))
+	if strings.Contains(pc, processConfigEnvOrder) {
+		t.Errorf("an env order without references: %s", pc)
+	}
+	if c := ProcessConfigChanges(ProcessConfigOf(pc, "main"), ProcessConfig(withEnv(plain, base))); c != nil {
+		t.Errorf("reordered independent env: changes %v, want none", c)
+	}
+}
+
+// A sidecar that grows past the annotation bound compacts every container;
+// the unchanged main container still matches its detailed record, and a
+// changed one still does not.
+func TestProcessConfigChanges_SidecarGrowthCompactsMain(t *testing.T) {
+	rec := ProcessConfigOf(ProcessConfig(configuredWorker("sr-a", "x")), "main")
+	grown := func(edit func(*corev1.Pod)) string {
+		p := configuredWorker("sr-a", "x")
+		for i := 0; i < 600; i++ {
+			p.Spec.Containers[0].Env = append(p.Spec.Containers[0].Env, corev1.EnvVar{Name: "SIDECAR_SETTING_" + strings.Repeat("Z", 40) + strings.Repeat("Q", i%50) + string(rune('A'+i%26)), Value: "v"})
+		}
+		if edit != nil {
+			edit(p)
+		}
+		return ProcessConfig(p)
+	}
+	cur := grown(nil)
+	if !strings.Contains(cur, "main/*=") {
+		t.Fatalf("main not compacted: %.200s", cur)
+	}
+	if c := ProcessConfigChanges(rec, cur); c != nil {
+		t.Errorf("unchanged main after sidecar growth: changes %v, want none", c)
+	}
+	if c := ProcessConfigChanges(rec, grown(func(p *corev1.Pod) { p.Spec.Containers[1].Args[1] = "other" })); len(c) != 1 || !strings.Contains(c[0], "one digest") {
+		t.Errorf("changed main after sidecar growth: changes %v", c)
+	}
+}
+
+// A pod that arrives with a process-config stamp for another spec (a
+// template that copied an old pod's annotations) is stamped with its own:
+// a capture must not record the old configuration for the new process. A
+// matching stamp is left as it is.
+func TestMutate_ReplacesAStaleSuppliedStamp(t *testing.T) {
+	m, _ := groupMutator(t, CRIUGroup{}, "")
+	m.CRIUGroups = nil
+	m.CRIUCapture = true
+	old := ProcessConfig(lwsRank("0"))
+	pod := lwsRank("0")
+	pod.Spec.Containers[0].Args = append(pod.Spec.Containers[0].Args, "--changed")
+	want := ProcessConfig(pod)
+	if want == old {
+		t.Fatal("the edit did not change the configuration")
+	}
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[ProcessConfigAnnotation] = old
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := applyPatches(t, pod, patches).Annotations[ProcessConfigAnnotation]; got != want {
+		t.Errorf("stamp %q, want the spec's %q", got, want)
+	}
+	pod = lwsRank("0")
+	if pod.Annotations == nil {
+		pod.Annotations = map[string]string{}
+	}
+	pod.Annotations[ProcessConfigAnnotation] = old
+	patches, _ = m.Mutate(context.Background(), pod)
+	if got := applyPatches(t, pod, patches).Annotations[ProcessConfigAnnotation]; got != old {
+		t.Errorf("matching stamp became %q", got)
+	}
+}
