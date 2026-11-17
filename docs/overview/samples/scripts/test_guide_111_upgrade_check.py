@@ -100,6 +100,14 @@ class UpgradeGuide111Checks(unittest.TestCase):
                 self.assertGreaterEqual(diff, 0)
                 self.assertLess(diff, apply)
 
+    def test_no_command_block_runs_a_diff_and_the_apply_together(self):
+        for baseline in ("1.1.0",):
+            with self.subTest(baseline=baseline):
+                blocks = re.findall(r"```bash\n(.*?)```", self.text(baseline), re.DOTALL)
+                for block in blocks:
+                    if "helmfile.d/" in block and " apply" in block:
+                        self.assertNotIn(" diff ", block)
+
     def test_both_guides_carry_the_qualification_warning(self):
         for baseline in GUIDES:
             with self.subTest(baseline=baseline):
