@@ -107,6 +107,24 @@ func (g CRIUGroup) CompanionSlots() []int {
 	return out
 }
 
+// matchingSlots returns the slots whose recorded process configuration
+// matches pc (a slot with none recorded matches), and, when none does,
+// what differs from the first.
+func matchingSlots(slots []int, recorded []string, pc string) (match []int, changed []string) {
+	for _, s := range slots {
+		var c []string
+		if s < len(recorded) {
+			c = ProcessConfigChanges(recorded[s], pc)
+		}
+		if len(c) == 0 {
+			match = append(match, s)
+		} else if changed == nil {
+			changed = c
+		}
+	}
+	return match, changed
+}
+
 // criuGroupRestorePatches admits pod as its member's restore placeholder
 // when a group capture of its configuration exists, else returns nil: a
 // GPU rank by its ordinal in its instance, a companion by the slot its own
@@ -146,14 +164,15 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 				return nil
 			}
 		}
-		// Before a slot is claimed; the slots are identical companions,
-		// one template's replicas, so the first speaks for all.
-		if s := slots[0]; s < len(g.ProcessConfigs) {
-			if changed := ProcessConfigChanges(g.ProcessConfigs[s], ProcessConfig(pod)); len(changed) > 0 {
-				log.WithFields(logrus.Fields{"slot": s, "changed": strings.Join(changed, ", ")}).
-					Info("CRIU group restore: the companion's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
-				return nil
-			}
+		// Before a slot is claimed, and only slots whose checkpoint has the
+		// pod's configuration: companions that share a cache URI can
+		// differ in fields it leaves out.
+		var changed []string
+		slots, changed = matchingSlots(slots, g.ProcessConfigs, ProcessConfig(pod))
+		if len(slots) == 0 {
+			log.WithField("changed", strings.Join(changed, ", ")).
+				Info("CRIU group restore: the companion's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
+			return nil
 		}
 	} else {
 		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) {

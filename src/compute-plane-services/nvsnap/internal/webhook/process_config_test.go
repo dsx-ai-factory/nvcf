@@ -332,3 +332,29 @@ func TestMutate_ReplacesAStaleSuppliedStamp(t *testing.T) {
 		t.Errorf("matching stamp became %q", got)
 	}
 }
+
+// Companions that share a cache URI can differ in configuration: the pod
+// gets a slot whose checkpoint has its own, and starts cold when none has.
+// Before the fix only the first slot was compared, and any slot claimed.
+func TestCRIUGroupRestore_CompanionSlotMatchesItsConfig(t *testing.T) {
+	frontend := func(temp string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "frontend-x", Namespace: "fn"},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "frontend", Image: "dynamo", Command: []string{"python3", "-m", "dynamo.frontend"},
+				Env: []corev1.EnvVar{{Name: "DYN_ROUTER_TEMPERATURE", Value: temp}}}}}}
+	}
+	rec := func(temp string) string { return ProcessConfigOf(ProcessConfig(frontend(temp)), "frontend") }
+	g := CRIUGroup{Checkpoints: []string{"r0__1", "f__1", "f__2"}, Nodes: []string{"n0", "n1", "n2"}, Companion: []bool{false, true, true},
+		Containers: []string{"engine", "frontend", "frontend"}, ProcessConfigs: []string{"", rec("0.5"), rec("0.0")}, Slots: []int{1, 2}}
+	for temp, want := range map[string]string{"0.0": "2", "0.5": "1", "0.9": ""} {
+		m, _ := groupMutator(t, g, "")
+		pod := frontend(temp)
+		patches := m.criuGroupRestorePatches(context.Background(), pod)
+		got := ""
+		if patches != nil {
+			got = applyPatches(t, pod, patches).Annotations[CRIUGroupOrdinalAnnotation]
+		}
+		if got != want {
+			t.Errorf("DYN_ROUTER_TEMPERATURE=%s: slot %q, want %q", temp, got, want)
+		}
+	}
+}
