@@ -37,6 +37,7 @@ const (
 	eventTypeAttachmentClosed      = "GrpcProxy.Attachment.Closed"
 	eventTypeRpcStarted            = "GrpcProxy.Rpc.Started"
 	eventTypeRpcFinished           = "GrpcProxy.Rpc.Finished"
+	eventTypeSessionEnded          = "GrpcProxy.Session.Ended"
 
 	// Auth, rate limit and rejoin lookup failures are not published: their
 	// callers are unverified or rejected, and every attempt would add a row.
@@ -46,7 +47,7 @@ const (
 
 // Pre-initialized so the series exist at zero before the first publish.
 func init() {
-	for _, eventType := range []string{eventTypeWorkDispatched, eventTypeAttachmentEstablished, eventTypeAttachmentSetupFailed, eventTypeAttachmentClosed, eventTypeRpcStarted, eventTypeRpcFinished} {
+	for _, eventType := range []string{eventTypeWorkDispatched, eventTypeAttachmentEstablished, eventTypeAttachmentSetupFailed, eventTypeAttachmentClosed, eventTypeRpcStarted, eventTypeRpcFinished, eventTypeSessionEnded} {
 		for _, result := range []string{"sent", "failed", "dropped"} {
 			metrics.EventLedgerPublishCounter.WithLabelValues(eventType, result)
 		}
@@ -208,4 +209,10 @@ func newRpcFinished(wc *worker.WorkerConnection, rpc *rpcObserver, aborted bool,
 	}
 	data.Incomplete = aborted || (rpc.protocol == rpcProtocolGRPC && data.StatusCode == nil)
 	return newLedgerEvent(eventTypeRpcFinished, at, wc.RequestId, wc.FunctionId, wc.FunctionVersionId, wc.CallerNcaId, data)
+}
+
+// newSessionEnded reports that the session wc belonged to can no longer be
+// rejoined.
+func newSessionEnded(wc *worker.WorkerConnection, at time.Time) cloudevents.Event {
+	return newLedgerEvent(eventTypeSessionEnded, at, wc.RequestId, wc.FunctionId, wc.FunctionVersionId, wc.CallerNcaId, header(wc.RequestId))
 }

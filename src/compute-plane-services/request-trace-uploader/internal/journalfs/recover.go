@@ -41,9 +41,12 @@ type RecoverOptions struct {
 //     backend. A receipt is never read by another backend.
 //   - A segment found Preparing goes back to Discovered and its partial
 //     transports are removed.
+//   - An evicted segment's transports are removed: Evict records Done
+//     before it deletes them, so a crash or a failed delete can leave them.
 //   - A batch found Submitting with no receipt may have committed, so it
-//     becomes Ambiguous and is resubmitted, counted. A batch with a receipt
-//     is polled, never resubmitted.
+//     becomes Ambiguous, counted. The caller resubmits it or, when it
+//     retains ambiguous submits, parks it for an operator. A batch with a
+//     receipt is polled, never resubmitted.
 func (s *Store) Recover(opts RecoverOptions) (journal.Plan, error) {
 	if opts.Backend == "" {
 		return journal.Plan{}, errors.New("recover journal: the running backend name is required")
@@ -118,6 +121,10 @@ func (s *Store) Recover(opts RecoverOptions) (journal.Plan, error) {
 			plan.PreparesReset++
 		case journal.StateDiscovered:
 			errs = append(errs, s.removeTransportsLocked(seg.ID, nil))
+		case journal.StateDone:
+			if seg.Reason == journal.ReasonEvicted {
+				errs = append(errs, s.removeTransportsLocked(seg.ID, transportPaths(seg)))
+			}
 		}
 	}
 

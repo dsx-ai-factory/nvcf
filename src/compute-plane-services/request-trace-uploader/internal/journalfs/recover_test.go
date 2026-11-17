@@ -268,6 +268,77 @@ func TestCleanupStepsAndRecoveryOfAnInterruptedCleanup(t *testing.T) {
 	}
 }
 
+// Only a segment finished without an export goes back to Discovered: an
+// uploaded tombstone is never reopened, so it is never sent twice.
+func TestReopenSendsBackOnlyASegmentFinishedWithoutAnExport(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 2, "primary")
+	createBatch(t, store, batchFor("b1", "primary", ids, transports))
+	if err := store.SetReceipt("b1", journal.Receipt{Backend: "fake", ID: "job-1"}); err != nil {
+		t.Fatalf("SetReceipt: %v", err)
+	}
+	if err := store.ConfirmBatch("b1"); err != nil {
+		t.Fatalf("ConfirmBatch: %v", err)
+	}
+	for _, id := range ids {
+		if err := store.BeginCleaning(id); err != nil {
+			t.Fatalf("BeginCleaning: %v", err)
+		}
+	}
+	if err := store.FinishCleaning(ids[0]); err != nil {
+		t.Fatalf("FinishCleaning: %v", err)
+	}
+	if err := store.FinishNotExported(ids[1]); err != nil {
+		t.Fatalf("FinishNotExported: %v", err)
+	}
+
+	if _, err := store.Reopen(ids[0]); !errors.Is(err, journal.ErrInvalidTransition) {
+		t.Fatalf("Reopen of an uploaded segment error = %v, want ErrInvalidTransition", err)
+	}
+	mustState(t, store, ids[0], journal.StateDone)
+	if _, err := store.Reopen(ids[1]); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+
+	store = h.restart(store)
+	seg := mustState(t, store, ids[1], journal.StateDiscovered)
+	if seg.Reason != "" || seg.Backend != "" || len(seg.Destinations) != 0 || !seg.DoneAt.IsZero() {
+		t.Fatalf("reopened entry = %+v, want no reason, backend, destinations or done time", seg)
+	}
+}
+
+// A reopened segment is discovered again when it is reopened, so its export
+// latency starts there and leaves out the time spent before the run that
+// exports.
+func TestReopenStartsTheSegmentsExportClockAgain(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	createBatch(t, store, batchFor("b1", "primary", ids, transports))
+	if err := store.SetReceipt("b1", journal.Receipt{Backend: "fake", ID: "job-1"}); err != nil {
+		t.Fatalf("SetReceipt: %v", err)
+	}
+	if err := store.ConfirmBatch("b1"); err != nil {
+		t.Fatalf("ConfirmBatch: %v", err)
+	}
+	if err := store.BeginCleaning(ids[0]); err != nil {
+		t.Fatalf("BeginCleaning: %v", err)
+	}
+	if err := store.FinishNotExported(ids[0]); err != nil {
+		t.Fatalf("FinishNotExported: %v", err)
+	}
+
+	h.clock.Advance(6 * time.Hour)
+	reopened, err := store.Reopen(ids[0])
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if want := h.clock.Now(); !reopened.DiscoveredAt.Equal(want) {
+		t.Fatalf("DiscoveredAt = %v, want the reopen time %v", reopened.DiscoveredAt, want)
+	}
+}
+
 func TestEmptyAndEvictedSegmentsEndDone(t *testing.T) {
 	h := newHarness(t)
 	store := h.open()
@@ -297,6 +368,43 @@ func TestEmptyAndEvictedSegmentsEndDone(t *testing.T) {
 	}
 	if err := store.Evict("missing"); !errors.Is(err, journal.ErrNotFound) {
 		t.Fatalf("Evict of unknown id error = %v, want ErrNotFound", err)
+	}
+}
+
+// Evict records Done before it deletes the files, so a crash or a failed
+// delete in between leaves the transports. The next start removes them.
+func TestRecoverRemovesTheTransportsOfAnEvictedSegment(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	store = h.restart(store)
+	recoverFake(t, store)
+
+	mustState(t, store, ids[0], journal.StateDone)
+	if exists(transports[0]["primary"].Path) {
+		t.Fatal("transport of an evicted segment kept after recovery")
+	}
+}
+
+// A tombstone is the last record of its transports, so they go first.
+func TestSweepRemovesAnEvictedSegmentsTransportsWithItsTombstone(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, transports := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	h.clock.Advance(25 * time.Hour)
+	if removed, err := store.Sweep(); err != nil || removed != 1 {
+		t.Fatalf("Sweep after the TTL = %d, %v; want the tombstone removed", removed, err)
+	}
+	if exists(transports[0]["primary"].Path) {
+		t.Fatal("transport of an evicted segment outlived its tombstone")
 	}
 }
 

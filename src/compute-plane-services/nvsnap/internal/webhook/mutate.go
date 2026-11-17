@@ -638,7 +638,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	// gpushare placement is independent of every other decision below and
 	// rides along with whichever patches they return.
-	if !isFallback || fallback.Reason != FallbackGPUShareFailed {
+	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)

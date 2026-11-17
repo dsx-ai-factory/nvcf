@@ -244,6 +244,17 @@ func (f *FunctionInvoker) InvokeStatefulFunction(ctx context.Context, conn net.C
 	}
 }
 
+// SessionResumable reports whether a session can still be rejoined. Its worker
+// keeps a registration while the session lives and deletes it once it stops
+// waiting for the client to come back.
+func (f *FunctionInvoker) SessionResumable(ctx context.Context, requestId uuid.UUID) (bool, error) {
+	_, err := f.requestRegistration.LookupStatefulSession(ctx, requestId)
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func generateWorkerToken() string {
 	return lo.RandomString(64, lo.AlphanumericCharset)
 }

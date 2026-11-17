@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 )
 
 // The scanners below match exactly what the earlier uploader's Python
@@ -61,7 +61,7 @@ func mediaSpans(text string) []span {
 			}
 		}
 	}
-	if len(text) < base64RunMinChars || compat.CodePoints(text) < base64RunMinChars {
+	if len(text) < base64RunMinChars || jsonvalue.CodePoints(text) < base64RunMinChars {
 		return spans
 	}
 	runs := make([]span, 0)
@@ -112,7 +112,7 @@ func isHex(c byte) bool {
 // hasBase64Classes. A run must not follow a base64 character, even one
 // before start, and stops at end. Gaps shorter than the minimum are skipped.
 func base64Runs(text string, start, end int) []span {
-	if end-start < base64RunMinChars || compat.CodePoints(text[start:end]) < base64RunMinChars {
+	if end-start < base64RunMinChars || jsonvalue.CodePoints(text[start:end]) < base64RunMinChars {
 		return nil
 	}
 	var runs []span
@@ -136,12 +136,24 @@ func base64Runs(text string, start, end int) []span {
 		for pad := 0; pad < 2 && runEnd < end && text[runEnd] == '='; pad++ {
 			runEnd++
 		}
-		if hasBase64Classes(text, runStart, runEnd) {
+		if isBase64Media(text, runStart, runEnd) {
 			runs = append(runs, span{start: runStart, end: runEnd, kind: "inline"})
 		}
 		i = runEnd
 	}
 	return runs
+}
+
+// isBase64Media reports base64 of media in text[start:end]: its characters
+// look like base64 of media, or it decodes to known media magic bytes.
+// Uncompressed audio of speech is mostly near-silent samples, whose 0xFF and
+// 0x00 bytes encode to "/" and "A" densely enough to fail the class check.
+func isBase64Media(text string, start, end int) bool {
+	if hasBase64Classes(text, start, end) {
+		return true
+	}
+	_, ok := sniffMIME(text[start:min(start+64, end)])
+	return ok
 }
 
 // hasBase64Classes reports whether text[start:end] mixes upper case, lower
@@ -161,7 +173,7 @@ func hasBase64Classes(text string, start, end int) bool {
 			digit = true
 		}
 	}
-	return separators*16 <= compat.CodePoints(text[start:end]) && upper && lower && digit
+	return separators*16 <= jsonvalue.CodePoints(text[start:end]) && upper && lower && digit
 }
 
 // isBase64String reports a full match of
@@ -378,7 +390,7 @@ func matchToken(text string, i int, subtype bool) (int, bool) {
 			}
 			break
 		}
-		r, size := compat.DecodeRune(text[i:])
+		r, size := jsonvalue.DecodeRune(text[i:])
 		if r != 0x130 && r != 0x131 && r != 0x17f && r != 0x212a {
 			break
 		}
@@ -410,8 +422,8 @@ func matchUnquoted(text string, i int) int {
 		if c == ';' || c == ',' || c == '"' || c == '\\' {
 			break
 		}
-		r, size := compat.DecodeRune(text[i:])
-		if compat.IsSpace(r) {
+		r, size := jsonvalue.DecodeRune(text[i:])
+		if isPySpace(r) {
 			break
 		}
 		i += size
@@ -509,8 +521,8 @@ func (s *headerScanner) urlBody(i int) (int, bool) {
 		if c < 0x80 && strings.IndexByte("\"'<>()[]{}`", c) >= 0 {
 			break
 		}
-		r, size := compat.DecodeRune(text[i:])
-		if compat.IsSpace(r) {
+		r, size := jsonvalue.DecodeRune(text[i:])
+		if isPySpace(r) {
 			break
 		}
 		i += size
@@ -521,11 +533,25 @@ func (s *headerScanner) urlBody(i int) (int, bool) {
 	return i, i > start
 }
 
+// isPySpace reports Python's str.isspace(), which is also what Python's
+// regular expression \s matches: Go's white space plus the four ASCII
+// separator controls. Media detection keeps the earlier uploader's
+// boundaries, so markers and their hashes stay the same.
+func isPySpace(r rune) bool {
+	return unicode.IsSpace(r) || (r >= 0x1c && r <= 0x1f)
+}
+
+// pyStrip trims leading and trailing characters for which isPySpace is
+// true, as Python's str.strip() does.
+func pyStrip(s string) string {
+	return strings.TrimFunc(s, isPySpace)
+}
+
 // hasBase64Flag reports a bare ";base64" parameter. A value such as
 // name=base64.pdf is not the flag.
 func hasBase64Flag(params string) bool {
 	for _, param := range strings.Split(params, ";") {
-		if asciiLower(compat.PyStrip(param)) == "base64" {
+		if asciiLower(pyStrip(param)) == "base64" {
 			return true
 		}
 	}
@@ -570,7 +596,7 @@ func pyLower(s string) string {
 	var runes []rune
 	var widths []int
 	for i := 0; i < len(s); {
-		r, size := compat.DecodeRune(s[i:])
+		r, size := jsonvalue.DecodeRune(s[i:])
 		runes = append(runes, r)
 		widths = append(widths, size)
 		i += size
@@ -634,7 +660,7 @@ func isAlnum(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); {
-		r, size := compat.DecodeRune(s[i:])
+		r, size := jsonvalue.DecodeRune(s[i:])
 		i += size
 		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
 			return false

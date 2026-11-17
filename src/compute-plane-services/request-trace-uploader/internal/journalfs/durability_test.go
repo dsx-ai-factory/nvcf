@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
 )
@@ -78,6 +80,31 @@ func TestNewStateDirectoriesAreLinkedDurably(t *testing.T) {
 	}
 }
 
+// A state directory whose link sync failed is linked again by the next
+// Open, which finds the directory already there.
+func TestOpenRetriesTheStateDirectoryLinkThatFailedToSync(t *testing.T) {
+	h := newHarness(t)
+	failSpool := hooks{beforeSyncDir: func(dir string) error {
+		if dir == h.cfg.SpoolDir {
+			return errCrash
+		}
+		return nil
+	}}
+	if _, err := openWithHooks(h, failSpool); !errors.Is(err, errCrash) {
+		t.Fatalf("Open error = %v, want the directory sync failure", err)
+	}
+
+	var events []recorded
+	store, err := openWithHooks(h, hooks{event: func(kind, path string) { events = append(events, recorded{kind, path}) }})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if indexOfEvent(events, "sync-dir", h.cfg.SpoolDir) < 0 {
+		t.Fatalf("second Open did not sync the spool, where the state directory is linked: %v", events)
+	}
+}
+
 func TestFenceLinksItsDirectoryBeforeMovingFilesIntoIt(t *testing.T) {
 	h := newHarness(t)
 	store := h.open()
@@ -100,7 +127,14 @@ func TestFenceLinksItsDirectoryBeforeMovingFilesIntoIt(t *testing.T) {
 	linked := indexOfEvent(events, "sync-dir", unreadable)
 	moved := indexOfEvent(events, "rename", filepath.Join(fence, info.Name))
 	fenceSynced := indexOfEvent(events, "sync-dir", fence)
-	spoolSynced := indexOfEvent(events, "sync-dir", h.cfg.SpoolDir)
+	// Open also syncs the spool, where the state directory is linked, so
+	// look for the fence's spool sync after the move.
+	spoolSynced := -1
+	if moved >= 0 {
+		if i := indexOfEvent(events[moved:], "sync-dir", h.cfg.SpoolDir); i >= 0 {
+			spoolSynced = moved + i
+		}
+	}
 	if linked < 0 || moved < 0 || fenceSynced < 0 || spoolSynced < 0 {
 		t.Fatalf("fence steps missing: %v", events)
 	}
@@ -200,4 +234,55 @@ func TestARecordRenamedIntoPlaceIsKeptWhenTheDirectorySyncFails(t *testing.T) {
 			t.Fatal("segment on disk is missing from memory")
 		}
 	})
+}
+
+// Directory sync errors reach the startup log, so they carry no paths.
+func TestDirectorySyncErrorsCarryNoPaths(t *testing.T) {
+	err := syncDir(filepath.Join(t.TempDir(), "missing-dir"))
+	if err == nil || strings.Contains(err.Error(), "missing-dir") {
+		t.Fatalf("syncDir() = %v, want an error with no path", err)
+	}
+}
+
+// An evicted segment's tombstone is the last record of its transports, so
+// their removal is synced before the tombstone goes.
+func TestSweepSyncsAnEvictedSegmentsTransportRemovalsBeforeTheTombstone(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, _ := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	h.clock.Advance(25 * time.Hour)
+	events := record(store)
+
+	if removed, err := store.Sweep(); err != nil || removed != 1 {
+		t.Fatalf("Sweep = %d, %v; want the tombstone removed", removed, err)
+	}
+	transports := indexOfEvent(*events, "sync-dir", store.TransportDir())
+	tombstone := indexOfEvent(*events, "sync-dir", filepath.Join(h.cfg.StateDir, "segments"))
+	if transports < 0 || tombstone < 0 || transports > tombstone {
+		t.Fatalf("sweep steps = %v, want the transport directory synced before the tombstone's", *events)
+	}
+}
+
+func TestSweepKeepsAnEvictedTombstoneWhenItsTransportRemovalIsNotSynced(t *testing.T) {
+	h := newHarness(t)
+	store := h.open()
+	ids, _ := preparedSegments(t, h, store, 1, "primary")
+	if err := store.Evict(ids[0]); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	h.clock.Advance(25 * time.Hour)
+	store.hooks.beforeSyncDir = func(dir string) error {
+		if dir == store.TransportDir() {
+			return errCrash
+		}
+		return nil
+	}
+
+	if _, err := store.Sweep(); !errors.Is(err, errCrash) {
+		t.Fatalf("Sweep error = %v, want the transport directory sync failure", err)
+	}
+	mustState(t, store, ids[0], journal.StateDone)
 }

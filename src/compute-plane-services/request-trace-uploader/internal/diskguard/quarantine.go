@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
 )
 
 // ErrDeletedNotSynced reports data that was deleted but whose directory
@@ -33,6 +35,10 @@ var (
 // kept per segment. They count against the quarantine bound and outlive the
 // source.
 const RejectsDirName = "rejects"
+
+// rejectTempSuffix ends the name of a reject artifact still being written;
+// transform.RejectFile writes under such a name and renames it when done.
+const rejectTempSuffix = ".tmp"
 
 // Quarantine is the quarantine directory on the spool volume:
 //
@@ -62,8 +68,8 @@ func (q *Quarantine) RejectsDir() string {
 // power loss never keeps a removal without the moved file. When a move fails,
 // the moves already made are synced before the error returns. A file never
 // replaces one already in the entry: a name already taken gets a numbered
-// suffix. A path already gone is skipped, so an interrupted Admit can be
-// repeated.
+// suffix. A path already gone is skipped, and so is a source directory that
+// is gone, so an interrupted Admit can be repeated.
 func (q *Quarantine) Admit(id string, paths ...string) error {
 	if !validEntryName(id) {
 		return fmt.Errorf("quarantine id %q is not a plain name", id)
@@ -84,8 +90,13 @@ func (q *Quarantine) Admit(id string, paths ...string) error {
 			sources = append(sources, dir)
 		}
 	}
-	for _, dir := range append([]string{entry}, sources...) {
-		if err := syncDir(dir); err != nil {
+	if err := syncDir(entry); err != nil {
+		return errors.Join(moveErr, err)
+	}
+	for _, dir := range sources {
+		// A source directory removed since its file left has no removal
+		// left to make durable.
+		if err := syncDir(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return errors.Join(moveErr, err)
 		}
 	}
@@ -117,8 +128,8 @@ func moveInto(path, dir string) error {
 }
 
 // Entries lists every quarantined segment and every reject artifact, with
-// its size and modification time. A quarantine that does not exist yet is
-// empty.
+// its size and modification time. A reject artifact still being written is
+// marked Busy. A quarantine that does not exist yet is empty.
 func (q *Quarantine) Entries() ([]Candidate, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -143,9 +154,9 @@ func (q *Quarantine) Entries() ([]Candidate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("stat quarantine entry: %w", err)
 		}
-		size, err := treeSize(filepath.Join(q.dir, item.Name()))
+		size, err := treeSize(filepath.Join(q.dir, item.Name()), map[fileID]bool{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
 		entries = append(entries, Candidate{Key: item.Name(), Bytes: size, ModTime: info.ModTime()})
 	}
@@ -163,11 +174,18 @@ func (q *Quarantine) rejects() ([]Candidate, error) {
 		if err != nil {
 			return nil, fmt.Errorf("stat reject artifact: %w", err)
 		}
-		size, err := treeSize(filepath.Join(q.RejectsDir(), item.Name()))
+		size, err := treeSize(filepath.Join(q.RejectsDir(), item.Name()), map[fileID]bool{})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("measure quarantine entry: %w", err)
 		}
-		entries = append(entries, Candidate{Key: RejectsDirName + "/" + item.Name(), Bytes: size, ModTime: info.ModTime()})
+		entries = append(entries, Candidate{
+			Key:     RejectsDirName + "/" + item.Name(),
+			Bytes:   size,
+			ModTime: info.ModTime(),
+			// A reject artifact is written under a temporary name and renamed
+			// once complete, so a temporary one may still be written.
+			Busy: strings.HasSuffix(item.Name(), rejectTempSuffix),
+		})
 	}
 	return entries, nil
 }
@@ -194,33 +212,22 @@ func (q *Quarantine) Remove(key string) error {
 	return nil
 }
 
-// linkDurable creates entry and any missing parents, then syncs the parent
-// of each, top down. The entry and the quarantine directory that holds it
-// are linked on every call, even when they exist, so a retry after a failed
-// sync still makes them durable. An entry that is not a real directory, such
-// as a link, is refused: files moved through it would leave the quarantine.
+// linkDurable creates entry and any missing parents with
+// atomicfile.MkdirDurable. The entry and the quarantine directory that holds
+// it are linked on every call, even when they exist, so a retry after a
+// failed sync still makes them durable. An entry that is not a real
+// directory, such as a link, is refused: files moved through it would leave
+// the quarantine.
 func linkDurable(entry string) error {
-	link := []string{entry, filepath.Dir(entry)}
-	for d := filepath.Dir(filepath.Dir(entry)); filepath.Dir(d) != d; d = filepath.Dir(d) {
-		if _, err := os.Stat(d); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat quarantine directory: %w", err)
+	for _, dir := range []string{filepath.Dir(entry), entry} {
+		if err := atomicfile.MkdirDurable(dir, syncDir); err != nil {
+			return fmt.Errorf("create quarantine directory: %w", err)
 		}
-		link = append(link, d)
-	}
-	if err := os.MkdirAll(entry, 0o750); err != nil {
-		return fmt.Errorf("create quarantine directory: %w", err)
 	}
 	if info, err := os.Lstat(entry); err != nil {
-		return fmt.Errorf("stat quarantine entry: %w", err)
+		return fmt.Errorf("stat quarantine entry: %w", atomicfile.Pathless(err))
 	} else if !info.IsDir() {
 		return errors.New("quarantine entry exists and is not a directory")
-	}
-	for i := len(link) - 1; i >= 0; i-- {
-		if err := syncDir(filepath.Dir(link[i])); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -229,36 +236,49 @@ func validEntryName(name string) bool {
 	return name != "" && name != "." && name != ".." && name != RejectsDirName && !strings.ContainsAny(name, `/\`)
 }
 
-func treeSize(root string) (int64, error) {
+// treeSize adds up the space root and everything under it take on disk,
+// as the kubelet counts an emptyDir: files, directories and links, with a
+// file seen under another name counted once. A file or directory that is
+// gone by the time the walk reaches it, such as one deleted meanwhile,
+// holds nothing.
+func treeSize(root string, seen map[fileID]bool) (int64, error) {
 	var size int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		if d.Type().IsRegular() {
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			size += info.Size()
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
 		}
+		if err != nil {
+			return err
+		}
+		bytes, id, linked := diskUsage(info)
+		if linked {
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
+		}
+		size += bytes
 		return nil
 	})
-	if err != nil {
-		return 0, fmt.Errorf("measure quarantine entry: %w", err)
-	}
-	return size, nil
+	return size, err
 }
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("open directory for sync: %w", err)
+		return fmt.Errorf("open directory for sync: %w", atomicfile.Pathless(err))
 	}
 	syncErr := syncFile(d)
 	closeErr := d.Close()
 	if err := errors.Join(syncErr, closeErr); err != nil {
-		return fmt.Errorf("sync directory: %w", err)
+		return fmt.Errorf("sync directory: %w", atomicfile.Pathless(err))
 	}
 	if onSync != nil {
 		onSync(dir)

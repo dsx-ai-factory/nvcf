@@ -5,15 +5,20 @@ package redact
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/compat"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/jsonvalue"
 )
 
 // golden holds what the earlier Python uploader produced: the redacted
@@ -61,6 +66,9 @@ var divergentRecords = map[string]string{"audio format final sigma": "audio/wav"
 
 var markerMIME = regexp.MustCompile(`"mime":(null|"(?:[^"\\]|\\.)*")`)
 
+// TestRecordMatchesPythonUploader checks that redaction finds the same media
+// and writes the same markers as the earlier Python uploader. The record is
+// compared by keys, key order and values; its bytes are plain JSON.
 func TestRecordMatchesPythonUploader(t *testing.T) {
 	found := 0
 	for _, tc := range loadGolden(t).Records {
@@ -68,34 +76,41 @@ func TestRecordMatchesPythonUploader(t *testing.T) {
 			found++
 		}
 		t.Run(tc.Name, func(t *testing.T) {
-			record, err := compat.Decode([]byte(tc.In))
+			record, err := jsonvalue.Decode([]byte(tc.In))
+			if strings.Contains(tc.In, "NaN") {
+				if err == nil {
+					t.Fatal("Decode() accepted NaN, which is not JSON")
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			before := string(compat.Encode(record))
+			before := string(jsonvalue.Encode(record))
 			got, count := Record(record)
 			if count != tc.Count {
 				t.Fatalf("count = %d, want %d", count, tc.Count)
 			}
-			encoded := string(compat.Encode(got))
+			encoded := string(jsonvalue.Encode(got))
 			if tc.Out == nil {
 				if encoded != before {
 					t.Fatalf("record changed with nothing redacted:\n%s", encoded)
 				}
 				return
 			}
+			expected := *tc.Out
 			if mime, ok := divergentRecords[tc.Name]; ok {
-				want := markerMIME.ReplaceAllLiteralString(*tc.Out, `"mime":"`+mime+`"`)
-				if want == *tc.Out {
+				expected = markerMIME.ReplaceAllLiteralString(*tc.Out, `"mime":"`+mime+`"`)
+				if expected == *tc.Out {
 					t.Fatal("expected output equals the earlier uploader's; remove it from divergentRecords")
 				}
-				if encoded != want {
-					t.Errorf("redacted =\n%s\nwant\n%s", encoded, want)
-				}
-				return
 			}
-			if encoded != *tc.Out {
-				t.Errorf("redacted =\n%s\nwant\n%s", encoded, *tc.Out)
+			want, err := jsonvalue.Decode([]byte(expected))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !jsonvalue.Equal(got, want) {
+				t.Errorf("redacted =\n%s\nwant\n%s", encoded, expected)
 			}
 		})
 	}
@@ -177,7 +192,7 @@ func TestLargeRecordIsRedactedQuickly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, err := compat.Decode(line)
+	record, err := jsonvalue.Decode(line)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +204,7 @@ func TestLargeRecordIsRedactedQuickly(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("count = %d, want 2", count)
 	}
-	if size := len(compat.Encode(got)); size > 4096 {
+	if size := len(jsonvalue.Encode(got)); size > 4096 {
 		t.Errorf("redacted record is %d bytes, want the media replaced", size)
 	}
 	if elapsed > 10*time.Second {
@@ -246,17 +261,47 @@ func TestDataURLScanIsLinear(t *testing.T) {
 	}
 }
 
+func TestRedactedRecordIsPlainJSON(t *testing.T) {
+	png := "data:image/png;base64," + base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...))
+	record, err := jsonvalue.Decode([]byte("{\"score\":1.50,\"content\":\"caf\u00e9 " + png + "\"}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, count := Record(record)
+	encoded := string(jsonvalue.Encode(got))
+	if count != 1 || !strings.HasPrefix(encoded, "{\"score\":1.50,\"content\":\"caf\u00e9 [redacted:multimodal kind=data_url mime=image/png bytes=") {
+		t.Fatalf("redacted = %s, want UTF-8 text, the source number and an inline token", encoded)
+	}
+}
+
+// TestPyStripMatchesPython uses expected values from Python's str.strip().
+func TestPyStripMatchesPython(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{in: " a ", want: "a"},
+		{in: "\t\n x \r\u000b\f", want: "x"},
+		{in: "\u001c\u001d\u001e\u001fy\u0085", want: "y"},
+		{in: "\u00a0z\u2028\u3000", want: "z"},
+		{in: "\u200bq\u200b", want: "\u200bq\u200b"},
+		{in: "", want: ""},
+	}
+	for _, tt := range tests {
+		if got := pyStrip(tt.in); got != tt.want {
+			t.Errorf("pyStrip(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // White space after the comma of a base64 data URL does not hide the media.
 func TestDataURLWithSpaceAfterTheCommaIsRedacted(t *testing.T) {
 	png := base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{7, 99, 201}, 300)...))
 	for _, url := range []string{"data:image/png;base64, " + png, "data:image/png;base64,\t" + png} {
-		record, err := compat.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + strings.ReplaceAll(url, "\t", `\t`) + `"}]}}}`))
+		record, err := jsonvalue.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + strings.ReplaceAll(url, "\t", `\t`) + `"}]}}}`))
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, count := Record(record)
-		if count != 1 || strings.Contains(string(compat.Encode(got)), png[:40]) {
-			t.Errorf("count = %d, want the data URL redacted: %.80s", count, compat.Encode(got))
+		if count != 1 || strings.Contains(string(jsonvalue.Encode(got)), png[:40]) {
+			t.Errorf("count = %d, want the data URL redacted: %.80s", count, jsonvalue.Encode(got))
 		}
 	}
 }
@@ -276,12 +321,12 @@ func TestMIMEHintThatIsNotAMediaTypeIsNotKept(t *testing.T) {
 	}
 	for name, in := range tests {
 		t.Run(name, func(t *testing.T) {
-			record, err := compat.Decode([]byte(in))
+			record, err := jsonvalue.Decode([]byte(in))
 			if err != nil {
 				t.Fatal(err)
 			}
 			got, count := Record(record)
-			encoded := string(compat.Encode(got))
+			encoded := string(jsonvalue.Encode(got))
 			if count < 1 {
 				t.Fatalf("count = %d, want the media redacted: %s", count, encoded)
 			}
@@ -300,12 +345,12 @@ func TestMIMEHintThatIsAMediaTypeIsKept(t *testing.T) {
 		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + data + `"}}`: "image/png",
 	}
 	for in, want := range tests {
-		record, err := compat.Decode([]byte(in))
+		record, err := jsonvalue.Decode([]byte(in))
 		if err != nil {
 			t.Fatal(err)
 		}
 		got, _ := Record(record)
-		if encoded := string(compat.Encode(got)); !strings.Contains(encoded, `"mime":"`+want+`"`) {
+		if encoded := string(jsonvalue.Encode(got)); !strings.Contains(encoded, `"mime":"`+want+`"`) {
 			t.Errorf("redacted = %s, want mime %q", encoded, want)
 		}
 	}
@@ -319,12 +364,12 @@ func TestDataURLMIMEThatIsNotAMediaTypeIsNotKept(t *testing.T) {
 	const secret = "hiddentextinthemimetype"
 	png := base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{7, 99, 201}, 300)...))
 	url := "data:image/" + strings.Repeat("x", 300) + secret + ";base64," + png
-	record, err := compat.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + url + `"}]}}}`))
+	record, err := jsonvalue.Decode([]byte(`{"payload":{"request":{"messages":[{"role":"user","content":"` + url + `"}]}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, count := Record(record)
-	encoded := string(compat.Encode(got))
+	encoded := string(jsonvalue.Encode(got))
 	if count != 1 || strings.Contains(encoded, secret) || strings.Contains(encoded, png[:40]) || !strings.Contains(encoded, `"mime":null`) {
 		t.Errorf("count = %d, redacted = %.300s; want the media replaced, mime null and no MIME text kept", count, encoded)
 	}
@@ -340,12 +385,12 @@ func TestObjectEntriesInMultiModalDataAreRedacted(t *testing.T) {
 	}
 	for name, in := range tests {
 		t.Run(name, func(t *testing.T) {
-			record, err := compat.Decode([]byte(in))
+			record, err := jsonvalue.Decode([]byte(in))
 			if err != nil {
 				t.Fatal(err)
 			}
 			got, count := Record(record)
-			if encoded := string(compat.Encode(got)); count != 1 || strings.Contains(encoded, data[:40]) {
+			if encoded := string(jsonvalue.Encode(got)); count != 1 || strings.Contains(encoded, data[:40]) {
 				t.Errorf("count = %d, redacted = %s; want the entry's data replaced by a marker", count, encoded)
 			}
 		})
@@ -356,7 +401,7 @@ func TestObjectEntriesInMultiModalDataAreRedacted(t *testing.T) {
 // as suppression reads it, so the part count goes on its own payload.
 func TestRedactedPartCountGoesOnABareRecordsPayload(t *testing.T) {
 	png := base64.StdEncoding.EncodeToString(append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{7, 99, 201}, 300)...))
-	record, err := compat.Decode([]byte(`{"event_type":"request_payload","event":{"note":"x"},"payload":{"content":"data:image/png;base64,` + png + `"}}`))
+	record, err := jsonvalue.Decode([]byte(`{"event_type":"request_payload","event":{"note":"x"},"payload":{"content":"data:image/png;base64,` + png + `"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,6 +410,135 @@ func TestRedactedPartCountGoesOnABareRecordsPayload(t *testing.T) {
 		t.Fatalf("count = %d, want 1", count)
 	}
 	if parts := got.Get("payload").Get("multimodal_redacted_parts"); parts == nil || got.Get("event").Has("multimodal_redacted_parts") {
-		t.Fatalf("redacted = %s, want the count on payload, not on event", compat.Encode(got))
+		t.Fatalf("redacted = %s, want the count on payload, not on event", jsonvalue.Encode(got))
+	}
+}
+
+// quietWAV is a 16-bit mono WAV of near-silent speech: samples within a few
+// steps of zero, whose 0xFF and 0x00 bytes make base64 dense in "/" and "A".
+// Its header is the canonical 44 bytes, so [44:] is the samples.
+func quietWAV(t *testing.T, frames, seed int) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	write := func(v any) {
+		if err := binary.Write(&b, binary.LittleEndian, v); err != nil {
+			t.Fatalf("write the WAV fixture: %v", err)
+		}
+	}
+	b.WriteString("RIFF")
+	write(uint32(36 + 2*frames))
+	b.WriteString("WAVEfmt ")
+	write(struct {
+		Size                      uint32
+		Format, Channels          uint16
+		SampleRate, ByteRate      uint32
+		BlockAlign, BitsPerSample uint16
+	}{16, 1, 1, 16000, 32000, 2, 16})
+	b.WriteString("data")
+	write(uint32(2 * frames))
+	for i := range frames {
+		write(int16((i*7+seed)%61 - 30))
+	}
+	if got, want := b.Len(), 44+2*frames; got != want {
+		t.Fatalf("WAV fixture is %d bytes, want %d", got, want)
+	}
+	return b.Bytes()
+}
+
+// floatList writes values as JSON floats, each with a fraction or exponent
+// so it decodes as a float, as the earlier uploader's list of floats did.
+func floatList(values []float64) string {
+	parts := make([]string, len(values))
+	for i, v := range values {
+		text := strconv.FormatFloat(v, 'g', -1, 64)
+		if !strings.ContainsAny(text, ".e") {
+			text += ".0"
+		}
+		parts[i] = text
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+func expectMarker(value, kind, mime string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf(`{"redacted":"multimodal","kind":%q,"mime":%q,"bytes":%d,"sha256":%q}`, kind, mime, len(value), hex.EncodeToString(sum[:]))
+}
+
+func expectToken(value, kind, mime string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("[redacted:multimodal kind=%s mime=%s bytes=%d sha256=%s]", kind, mime, len(value), hex.EncodeToString(sum[:]))
+}
+
+// Quiet uncompressed audio fails the character-class check that keeps URL
+// paths and identifier lists, and decoded samples are numbers, not strings;
+// the earlier uploader's version 3 catches both. The cases and the expected
+// markers are that uploader's own test.
+func TestQuietUncompressedAudioAndDecodedSamplesAreRedacted(t *testing.T) {
+	wav := base64.StdEncoding.EncodeToString(quietWAV(t, 8000, 1))
+	wavInText := base64.StdEncoding.EncodeToString(quietWAV(t, 8000, 2))
+	wavURLSafe := base64.URLEncoding.EncodeToString(quietWAV(t, 8000, 3))
+	aiff := base64.StdEncoding.EncodeToString(append([]byte("FORM\x00\x00\x3e\x8cAIFFCOMM"), quietWAV(t, 8000, 4)[44:]...))
+	samples := make([]float64, 4000)
+	clip := make([]float64, 4000)
+	for i := range samples {
+		samples[i] = float64((i*13)%200-100) / 1000
+		clip[i] = float64((i*11)%300-150) / 1000
+	}
+	request := `{"model":"omni","recording":"` + wav + `","voice_note":{"bytes":"` + wavURLSafe + `","codec":"pcm_s16le"},"aiff":"` + aiff +
+		`","multi_modal_data":{"audio":[` + floatList(samples) + `,16000]},"mm_data":{"audio":` + floatList(clip) +
+		`},"messages":[{"role":"user","content":"Transcribe ` + wavInText + ` please."}]}`
+	record, err := jsonvalue.Decode([]byte(`{"event_type":"request_payload","payload":{"request":` + request + `}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, count := Record(record)
+
+	// The earlier uploader's markers of the two sample lists: their JSON, as
+	// it writes it, is 25561 and 25566 characters long.
+	samplesMarker := `{"redacted":"multimodal","kind":"inline","mime":null,"bytes":25561,"sha256":"77e8fd8bc89ccf5ab3f8cae638d137008709e0d5b7bd35cd92a1162014e9acb0"}`
+	clipMarker := `{"redacted":"multimodal","kind":"inline","mime":null,"bytes":25566,"sha256":"7a158d155dc705e1f127cbe89dbf8db133bbafef2a33415433424c3452db32b5"}`
+	want := `{"model":"omni","recording":` + expectMarker(wav, "inline", "audio/wav") +
+		`,"voice_note":{"bytes":` + expectMarker(wavURLSafe, "inline", "audio/wav") + `,"codec":"pcm_s16le"}` +
+		`,"aiff":` + expectMarker(aiff, "inline", "audio/aiff") +
+		`,"multi_modal_data":{"audio":[` + samplesMarker + `,16000]},"mm_data":{"audio":` + clipMarker + `}` +
+		`,"messages":[{"role":"user","content":"Transcribe ` + expectToken(wavInText, "inline", "audio/wav") + ` please."}]}`
+	gotRequest := string(jsonvalue.Encode(got.Get("payload").Get("request")))
+	if count != 6 || gotRequest != want {
+		t.Fatalf("count = %d, request =\n%.600s\nwant 6 parts and\n%.600s", count, gotRequest, want)
+	}
+	if parts, ok := got.Get("payload").Get("multimodal_redacted_parts").IntDigits(); !ok || parts != "6" {
+		t.Fatalf("multimodal_redacted_parts = %q, want 6", parts)
+	}
+}
+
+// Version 3 knows the magic bytes of more audio formats, so their markers
+// name the type and their base64 is media whatever its characters.
+func TestSniffMIMEKnowsTheVersion3AudioFormats(t *testing.T) {
+	tests := map[string]struct {
+		prefix string
+		want   string
+	}{
+		"AIFF":           {"FORM\x00\x00\x00\x00AIFF", "audio/aiff"},
+		"AIFF-C":         {"FORM\x00\x00\x00\x00AIFC", "audio/aiff"},
+		"MP3 frame":      {"\xff\xfb\x90\x64", "audio/mpeg"},
+		"MP3 MPEG-2":     {"\xff\xf3\x90\x64", "audio/mpeg"},
+		"MP3 MPEG-2.5":   {"\xff\xf2\x90\x64", "audio/mpeg"},
+		"AAC ADTS":       {"\xff\xf1\x50\x80", "audio/aac"},
+		"AAC ADTS MPEG2": {"\xff\xf9\x50\x80", "audio/aac"},
+		"CAF":            {"caff\x00\x01\x00\x00", "audio/x-caf"},
+		"AU":             {".snd\x00\x00\x00\x18", "audio/basic"},
+		"AMR":            {"#!AMR\n", "audio/amr"},
+		"M4A":            {"\x00\x00\x00\x20ftypM4A ", "audio/mp4"},
+		"MP4":            {"\x00\x00\x00\x20ftypisom", "video/mp4"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			raw := append([]byte(tc.prefix), bytes.Repeat([]byte{0x11, 0x22, 0x33}, 16)...)
+			got, ok := sniffMIME(base64.StdEncoding.EncodeToString(raw))
+			if !ok || got != tc.want {
+				t.Fatalf("sniffMIME = %q, %v; want %q", got, ok, tc.want)
+			}
+		})
 	}
 }

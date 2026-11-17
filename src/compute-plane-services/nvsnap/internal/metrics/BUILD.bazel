@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "metrics",
     srcs = [
+        "first_sight.go",
         "lifecycle.go",
         "metrics.go",
     ],
@@ -18,9 +19,12 @@ go_library(
 go_test(
     name = "metrics_test",
     srcs = [
+        "first_sight_test.go",
         "lifecycle_test.go",
+        "main_test.go",
         "register_test.go",
     ],
+    data = ["//src/compute-plane-services/nvsnap/deploy:helm/nvsnap/templates/agent-servicemonitor.yaml"],
     embed = [":metrics"],
     deps = ["@com_github_prometheus_client_golang//prometheus"],
 )

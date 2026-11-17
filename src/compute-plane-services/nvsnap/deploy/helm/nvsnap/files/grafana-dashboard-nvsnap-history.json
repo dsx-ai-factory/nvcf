@@ -1,6 +1,7 @@
 {
-  "title": "nvSnap capture and restore history",
   "uid": "nvsnap-history",
+  "title": "nvSnap capture and restore history",
+  "description": "NvSnap captures, restores, scale-up, teardown and the cached captures, from the agents' metrics (docs/operate/METRICS.md; alerts: docs/operate/RUNBOOK.md).",
   "tags": [
     "nvsnap"
   ],
@@ -8,30 +9,53 @@
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "graphTooltip": 1,
-  "refresh": "5m",
   "time": {
     "from": "now-7d",
     "to": "now"
   },
-  "timepicker": {},
+  "refresh": "5m",
   "annotations": {
     "list": []
   },
-  "description": "Captures, restores and pod starts over time, from the agents' lifecycle metrics (docs/operate/METRICS.md).",
+  "links": [],
   "templating": {
     "list": [
       {
         "type": "datasource",
         "name": "datasource",
-        "label": "Datasource",
+        "label": "Prometheus",
         "query": "prometheus",
-        "hide": 0,
+        "current": {},
+        "hide": 0
+      },
+      {
+        "type": "query",
+        "name": "cluster",
+        "label": "Cluster",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(nvsnap_build_info, cluster)",
+          "refId": "cluster"
+        },
+        "definition": "label_values(nvsnap_build_info, cluster)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
         "current": {
-          "selected": false,
-          "text": "Prometheus",
-          "value": "Prometheus"
-        }
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "hide": 0,
+        "sort": 1
       },
       {
         "type": "query",
@@ -42,10 +66,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(nvsnap_pod_ready_seconds_count, gpu)",
+          "query": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, gpu)",
           "refId": "gpu"
         },
-        "definition": "label_values(nvsnap_pod_ready_seconds_count, gpu)",
+        "definition": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, gpu)",
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
@@ -59,7 +83,8 @@
           ]
         },
         "refresh": 2,
-        "hide": 0
+        "hide": 0,
+        "sort": 1
       },
       {
         "type": "query",
@@ -70,10 +95,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(nvsnap_pod_ready_seconds_count, ranks)",
+          "query": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, ranks)",
           "refId": "ranks"
         },
-        "definition": "label_values(nvsnap_pod_ready_seconds_count, ranks)",
+        "definition": "label_values({__name__=~\"nvsnap_restore_outcomes_total|nvsnap_capture_outcomes_total|nvsnap_pod_ready_seconds_count\"}, ranks)",
         "includeAll": true,
         "multi": true,
         "allValue": ".*",
@@ -87,14 +112,15 @@
           ]
         },
         "refresh": 2,
-        "hide": 0
+        "hide": 0,
+        "sort": 1
       }
     ]
   },
   "panels": [
     {
       "type": "row",
-      "title": "Pod start: restored vs cachedir vs cold",
+      "title": "At a glance (the selected time range)",
       "id": 1,
       "collapsed": false,
       "panels": [],
@@ -106,38 +132,51 @@
       }
     },
     {
-      "type": "timeseries",
-      "title": "Pod creation to Ready, p50",
-      "description": "A GPU pod's time from creation to Ready, by how it started. Cold pods are the baseline.",
+      "type": "stat",
+      "title": "Restores",
+      "description": "Instances restored from a capture.",
       "id": 2,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 4,
+        "w": 3,
         "x": 0,
         "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
           "calcs": [
-            "mean",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi"
-        }
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       },
       "targets": [
         {
@@ -145,45 +184,63 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, method) (rate(nvsnap_pod_ready_seconds_bucket{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
-          "legendFormat": "{{method}}",
-          "refId": "A"
+          "expr": "sum(increase(nvsnap_restore_outcomes_total{outcome=\"restored\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
         }
       ]
     },
     {
-      "type": "timeseries",
-      "title": "Pod creation to Ready, p95",
-      "description": "",
+      "type": "stat",
+      "title": "Restores failed or not run",
+      "description": "Restores that failed, or could not run and were tried again.",
       "id": 3,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
+        "h": 4,
+        "w": 3,
+        "x": 3,
         "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
           "calcs": [
-            "mean",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         },
-        "tooltip": {
-          "mode": "multi"
-        }
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
       },
       "targets": [
         {
@@ -191,30 +248,414 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(nvsnap_pod_ready_seconds_bucket{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
-          "legendFormat": "{{method}}",
-          "refId": "A"
+          "expr": "sum(increase(nvsnap_restore_outcomes_total{outcome=~\"failed|not-run\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
         }
       ]
     },
     {
-      "type": "timeseries",
-      "title": "Pod starts by method",
-      "description": "",
+      "type": "stat",
+      "title": "Scale-up p50, restored",
+      "description": "Restored GPU pods, scheduled to Ready.",
       "id": 4,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 9
+        "h": 4,
+        "w": 3,
+        "x": 6,
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(nvsnap_pod_start_seconds_bucket{method=\"criu\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])))",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Scale-up p50, cold",
+      "description": "Cold-started GPU pods, scheduled to Ready: the baseline.",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 9,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(nvsnap_pod_start_seconds_bucket{method=\"cold\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])))",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Teardowns killed",
+      "description": "Restored ranks killed at the end of their grace period before every rank of their restore exited.",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(nvsnap_teardown_outcomes_total{outcome=\"deadline\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Captures failed",
+      "description": "Captures that failed, never started under the GPU library, or restored without serving.",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 15,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(nvsnap_capture_outcomes_total{outcome=~\"failed|gpushare-failed|unverified\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range])) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Verified captures cached",
+      "description": "Capture records restores can use (state complete), now.",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(max by (cluster, bundle) (nvsnap_capture_records{state=\"complete\", cluster=~\"$cluster\"}))",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "NvSnap alerts firing",
+      "description": "NvSnap alerts firing now (docs/operate/RUNBOOK.md).",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(ALERTS{alertname=~\"Nvsnap.*\", alertstate=\"firing\", cluster=~\"$cluster\"}) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Scale-up: scheduled to Ready, by how the pod started",
+      "id": 10,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scheduled to Ready, p50",
+      "description": "A GPU pod's time from being scheduled (given its GPUs) to Ready: the scale-up time. criu: restored; cachedir: seeded from a cache; cold: the baseline.",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
         },
         "overrides": []
       },
@@ -224,7 +665,8 @@
           "placement": "bottom",
           "calcs": [
             "mean",
-            "max"
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -237,7 +679,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (method) (increase(nvsnap_pod_ready_seconds_count{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range]))",
+          "expr": "histogram_quantile(0.5, sum by (le, method) (rate(nvsnap_pod_start_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
           "legendFormat": "{{method}}",
           "refId": "A"
         }
@@ -245,273 +687,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Admissions by decision and reason",
-      "description": "The webhook's decision for a GPU pod of a captured configuration, and why it started cold or fell back.",
-      "id": 5,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 9
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (decision, reason) (increase(nvsnap_admissions_total[$__range]))",
-          "legendFormat": "{{decision}} {{reason}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "row",
-      "title": "Restore",
-      "id": 6,
-      "collapsed": false,
-      "panels": [],
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 17
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Restore phases (CRIU), p50",
-      "description": "Per rank: criu, gpu (GPU state reload and resume), rank (the node's whole restore). Per instance: group, ready (restored to Ready).",
-      "id": 7,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.5, sum by (le, phase) (rate(nvsnap_restore_phase_seconds_bucket{method=\"criu\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
-          "legendFormat": "{{phase}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Restore phases (CRIU), p95",
-      "description": "",
-      "id": 8,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(nvsnap_restore_phase_seconds_bucket{method=\"criu\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
-          "legendFormat": "{{phase}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Restore outcomes",
-      "description": "",
-      "id": 9,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 26
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (outcome, reason) (increase(nvsnap_restore_outcomes_total{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range]))",
-          "legendFormat": "{{outcome}} {{reason}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Checkpoint fetch to a node, p50 by source",
-      "description": "",
-      "id": 10,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 26
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.5, sum by (le, source) (rate(nvsnap_restore_fetch_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "{{source}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (source, result) (increase(nvsnap_restore_fetches_total[$__range]))",
-          "legendFormat": "{{source}} {{result}} (count)",
-          "refId": "B"
-        }
-      ]
-    },
-    {
-      "type": "row",
-      "title": "Capture",
-      "id": 11,
-      "collapsed": false,
-      "panels": [],
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 34
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Capture outcomes",
-      "description": "captured, verified, unverified, failed, refused (preflight), gpushare-failed; reason is the failure's class.",
+      "title": "Scheduled to Ready, p95",
+      "description": "As p50, the slowest 5%.",
       "id": 12,
       "datasource": {
         "type": "prometheus",
@@ -520,54 +697,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 35
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (method, outcome, reason) (increase(nvsnap_capture_outcomes_total{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__range]))",
-          "legendFormat": "{{method}} {{outcome}} {{reason}}",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Capture phases, p50",
-      "description": "Per rank: dump, snapshot, rank. Per instance: group, verify (capture start to its restored pods serving).",
-      "id": 13,
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
         "x": 12,
-        "y": 35
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -581,7 +712,8 @@
           "placement": "bottom",
           "calcs": [
             "mean",
-            "max"
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -594,17 +726,17 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, method, phase) (rate(nvsnap_capture_phase_seconds_bucket{gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
-          "legendFormat": "{{method}} {{phase}}",
+          "expr": "histogram_quantile(0.95, sum by (le, method) (rate(nvsnap_pod_start_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{method}}",
           "refId": "A"
         }
       ]
     },
     {
       "type": "timeseries",
-      "title": "Capture size by part, p50",
-      "description": "",
-      "id": 14,
+      "title": "Creation to Ready, p50",
+      "description": "From the pod's creation, so with the time it waited for GPUs (a restore's pods wait for the instance they replace to go).",
+      "id": 13,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -613,7 +745,596 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, method) (rate(nvsnap_pod_ready_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pod starts by method",
+      "description": "GPU pods that became Ready, by how they started.",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (method) (increase(nvsnap_pod_ready_seconds_count{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__interval]))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Restore",
+      "id": 15,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Restore outcomes",
+      "description": "restored; failed (ran and failed); not-run (could not run, tried again); refused; gpu-fault (a GPU the probe found faulty).",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome, reason) (increase(nvsnap_restore_outcomes_total{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__interval]))",
+          "legendFormat": "{{outcome}} {{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Restore phases, p50",
+      "description": "criu: process restore; gpu: GPU state reload and resume; rank: a node's whole restore; group: placeholders running to every rank restored; ready: restored to Ready.",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, phase) (rate(nvsnap_restore_phase_seconds_bucket{method=\"criu\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Restore phases, p95",
+      "description": "As p50, the slowest 5%.",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(nvsnap_restore_phase_seconds_bucket{method=\"criu\", cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{phase}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint fetch to a node",
+      "description": "p50 time by where the bytes came from (left axis), and failed fetches (bars, right axis). A checkpoint already on the node is no fetch.",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "failed fetches"
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "bars"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 60
+              }
+            ]
+          }
+        ]
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, source) (rate(nvsnap_restore_fetch_seconds_bucket{cluster=~\"$cluster\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{source}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (source) (increase(nvsnap_restore_fetches_total{result=\"failed\", cluster=~\"$cluster\"}[$__interval]))",
+          "legendFormat": "failed {{source}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Teardown of restored instances",
+      "id": 20,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Delete to every rank exited, p50 and p95",
+      "description": "A released restored rank's time from its delete to every rank of its restore having exited (mostly the engine's own graceful shutdown).",
+      "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, ranks) (rate(nvsnap_teardown_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{ranks}} ranks",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, ranks) (rate(nvsnap_teardown_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{ranks}} ranks",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Teardown outcomes",
+      "description": "released: every rank exited, then the pod went. deadline: the grace period ran out first and the pod was killed (NvsnapTeardownKilled).",
+      "id": 22,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome) (increase(nvsnap_teardown_outcomes_total{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Capture",
+      "id": 23,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Capture outcomes",
+      "description": "captured; verified (its restored pods served); unverified; failed; refused; gpushare-failed; abandoned (its namespace went before it was verified).",
+      "id": 24,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (method, outcome, reason) (increase(nvsnap_capture_outcomes_total{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__interval]))",
+          "legendFormat": "{{method}} {{outcome}} {{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Capture phases, p50",
+      "description": "dump, snapshot and rank per node; group (the driver's dump of every member) and verify (capture start to its restored pods serving) per instance.",
+      "id": 25,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, method, phase) (rate(nvsnap_capture_phase_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{method}} {{phase}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Capture size by part, p50",
+      "description": "A rank's capture by part: gpu (GPU state), memory (process images), rootfs (rootfs diff), cachedir.",
+      "id": 26,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
@@ -627,7 +1348,8 @@
           "placement": "bottom",
           "calcs": [
             "mean",
-            "max"
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -640,7 +1362,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, method, part) (rate(nvsnap_capture_bytes_bucket{gpu=~\"$gpu\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, method, part) (rate(nvsnap_capture_bytes_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\"}[$__rate_interval])))",
           "legendFormat": "{{method}} {{part}}",
           "refId": "A"
         }
@@ -648,9 +1370,9 @@
     },
     {
       "type": "timeseries",
-      "title": "Agent bundle",
-      "description": "Agents per bundle version: compare the panels above across a rollout.",
-      "id": 15,
+      "title": "Capture phases, p95",
+      "description": "As p50, the slowest 5%.",
+      "id": 27,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -659,11 +1381,11 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 43
+        "y": 57
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -673,7 +1395,8 @@
           "placement": "bottom",
           "calcs": [
             "mean",
-            "max"
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -686,8 +1409,528 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count by (version) (nvsnap_build_info)",
+          "expr": "histogram_quantile(0.95, sum by (le, method, phase) (rate(nvsnap_capture_phase_seconds_bucket{cluster=~\"$cluster\", gpu=~\"$gpu\", ranks=~\"$ranks\"}[$__rate_interval])))",
+          "legendFormat": "{{method}} {{phase}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Cached captures (the capture records)",
+      "id": 28,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 65
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Capture records by state",
+      "description": "complete: verified, restores use it. verifying: restored once to be verified. abandoned: its namespace went first. failed, gpushare-failed, restore-failed: not used. alias: names another record.",
+      "id": 29,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (state) (max by (cluster, state, bundle) (nvsnap_capture_records{cluster=~\"$cluster\"}))",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Capture records by agent bundle",
+      "description": "Records by the agent release that captured them (aliases left out).",
+      "id": 30,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (bundle) (max by (cluster, state, bundle) (nvsnap_capture_records{state!=\"alias\", cluster=~\"$cluster\"}))",
+          "legendFormat": "{{bundle}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Oldest record by state",
+      "description": "Age of the oldest record in each state. A capture verifying for hours is stuck (NvsnapCaptureStuckVerifying).",
+      "id": 31,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 74
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (state) (nvsnap_capture_record_oldest_seconds{cluster=~\"$cluster\"})",
+          "legendFormat": "{{state}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Verified captures not restored since",
+      "description": "Complete records that no restore has used since their verification: cached, but not paying off.",
+      "id": 32,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 74
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (cluster) (nvsnap_capture_records_unrestored{cluster=~\"$cluster\"})",
+          "legendFormat": "{{cluster}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Agents and webhook",
+      "id": 33,
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 82
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Agents scraped",
+      "description": "nvsnap-agent pods Prometheus reaches, of those it knows (NvsnapAgentDown, NvsnapAgentMetricsMissing).",
+      "id": 34,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 83
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (cluster) (up{job=\"nvsnap-agent\", cluster=~\"$cluster\"})",
+          "legendFormat": "up {{cluster}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count by (cluster) (up{job=\"nvsnap-agent\", cluster=~\"$cluster\"})",
+          "legendFormat": "known {{cluster}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent bundle",
+      "description": "Agents by the bundle version they serve.",
+      "id": 35,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 83
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count by (version) (nvsnap_build_info{cluster=~\"$cluster\"})",
           "legendFormat": "{{version}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Inventory scan age",
+      "description": "Seconds since the inventory leader last scanned the capture records (NvsnapInventoryStale past 600).",
+      "id": 36,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 83
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - max by (cluster) (nvsnap_inventory_scan_timestamp_seconds{cluster=~\"$cluster\"} > 0)",
+          "legendFormat": "{{cluster}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Webhook answers by status",
+      "description": "Admission requests the agents' webhook answered. It fails open: errors start pods cold.",
+      "id": 37,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 91
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (code) (rate(nvsnap_webhook_requests_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "{{code}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Webhook latency, p95",
+      "description": "Time the webhook took to answer.",
+      "id": 38,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 91
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nvsnap_webhook_request_seconds_bucket{cluster=~\"$cluster\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admissions by decision and reason",
+      "description": "restore, fallback (to a cache), cold, and missed (ranks the webhook never mutated).",
+      "id": 39,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 91
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "drawStyle": "bars",
+            "fillOpacity": 60
+          }
+        },
+        "overrides": []
+      },
+      "interval": "2m",
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (decision, reason) (increase(nvsnap_admissions_total{cluster=~\"$cluster\"}[$__interval]))",
+          "legendFormat": "{{decision}} {{reason}}",
           "refId": "A"
         }
       ]
