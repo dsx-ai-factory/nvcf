@@ -40,7 +40,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -218,6 +217,9 @@ func gpushareGroupInfo(req CheckpointRequest) *GPUShareGroupInfo {
 type restoreV2Group struct {
 	Session, InetAddrMap string
 	Namespace, Pod       string
+	// SpanMS is the restore span every GPU rank of the group budgets its
+	// clocks with (groupSpanBudget); 0 outside a group restore.
+	SpanMS int64
 }
 
 // restoreSession is one pod's directory in a group restore.
@@ -895,35 +897,20 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			return finished[i]
 		}}
 	}
-	// Once the GPU ranks stop, the rest of the instance stops with them:
-	// every member pod is held (pod_hold.go), a rank's engine container
-	// excepted while it saves its GPU memory. The members are released
-	// from the freeze point only once all are held.
-	holdsDone := make(chan struct{})
-	var holding atomic.Bool
-	onGo := sync.OnceFunc(func() {
-		holding.Store(true)
-		go func() {
-			defer close(holdsDone)
-			holdMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
-		}()
-	})
+	// The instance stops with its GPU ranks (instanceHold): their pods are
+	// held when the vote goes, the companions' once every member waits at
+	// the freeze point. The members are released from it only once all are
+	// held.
+	hold := newInstanceHold(ctx, fabricHTTPClient, session, req.Members, bases, log)
 	defer func() {
-		// A hold still on its way would land after this release and keep
-		// its pod frozen: let every hold land, or fail, first.
-		if holding.Load() {
-			<-holdsDone
-		}
+		hold.wait()
+		hold.cancel()
 		releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
 	}()
 	freezeDone := make(chan struct{})
 	go func() {
 		defer close(freezeDone)
-		if driveGroupFreeze(ctx, fabricHTTPClient, session, "", freezeMembers, 200*time.Millisecond, log, holdsDone) {
-			// Dumped, the members wait stopped until all are: none
-			// resumes to talk to one not dumped yet.
-			driveGroupFreeze(ctx, fabricHTTPClient, session, "post", freezeMembers, 100*time.Millisecond, log, nil)
-		}
+		driveInstanceFreeze(ctx, fabricHTTPClient, session, freezeMembers, hold, log)
 	}()
 	// A companion that ends before the vote passed loses the capture: the
 	// GPU ranks must not suspend for it.
@@ -937,7 +924,7 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		}
 		return false
 	}
-	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: onGo}, log)
+	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: hold.steps().onGo}, log)
 	wg.Wait()
 	<-freezeDone
 

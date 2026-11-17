@@ -63,14 +63,14 @@ func TestRestoreClockArgs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, restoreClockFile), []byte("4000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if args, _ := restoreClockArgs(dir, false, true); args != nil {
+	if args, _ := restoreClockArgs(dir, false, true, 0); args != nil {
 		t.Errorf("without --timens-budget: %v", args)
 	}
-	args, b := restoreClockArgs(dir, true, false)
+	args, b := restoreClockArgs(dir, true, false, 0)
 	if b != 5*time.Second+restoreClockSlack || strings.Join(args, " ") != "--timens-budget "+strconv.FormatInt(b.Milliseconds(), 10) {
 		t.Errorf("CRIU only: %v %s", args, b)
 	}
-	args, b = restoreClockArgs(dir, true, true)
+	args, b = restoreClockArgs(dir, true, true, 0)
 	want := "--timens-budget " + strconv.FormatInt(b.Milliseconds(), 10) + " --leave-stopped --timens-no-wait"
 	if b != 88*time.Second+restoreClockSlack || strings.Join(args, " ") != want {
 		t.Errorf("through the GPU reload: %v %s, want %q", args, b, want)
@@ -237,5 +237,59 @@ func TestRestoredTasksToResume_NestedNamespace(t *testing.T) {
 	}
 	if _, err := restoredTasksToResume(base, 6001, 5000, []int{100099}, nil); err == nil {
 		t.Fatal("a missing task did not fail")
+	}
+}
+
+// A group restore gives every GPU rank one budget, so the ranks resume
+// together: a rank whose node has no restore of its checkpoint yet would
+// otherwise wait out the estimate while the others resume on their own
+// last span, and hold them, their network locked, for the difference
+// (61 s on a 4-node Kimi-K3 instance, whose leader exited before the
+// unlock).
+func TestGroupRestoreSpanBudget(t *testing.T) {
+	dir := t.TempDir()
+	writeSized(t, filepath.Join(dir, "pages-1.img"), 3<<30)
+	writeSized(t, filepath.Join(dir, "gpushare", "chunks", "a"), 32<<30)
+	estimate := time.Second + restoreClockSlack + 2*time.Second + restoreGPUSlack
+	if err := recordRestoreSpan(dir, 40*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := groupSpanBudget(dir, 0), 44*time.Second+restoreClockSlack; got != want {
+		t.Errorf("not a group: %s, want this node's record %s", got, want)
+	}
+	if got, want := groupSpanBudget(dir, 100_000), 110*time.Second+restoreClockSlack; got != want {
+		t.Errorf("group span: %s, want %s", got, want)
+	}
+	if got := groupSpanBudget(dir, groupSpanUnknown); got != estimate {
+		t.Errorf("a rank without a record: %s, want every rank on the estimate %s", got, estimate)
+	}
+	if got := groupSpanBudget(dir, int64(10*time.Hour/time.Millisecond)); got != restoreClockMax {
+		t.Errorf("group span past the bound: %s", got)
+	}
+	_, b := restoreClockArgs(dir, true, true, 100_000)
+	if b != 110*time.Second+restoreClockSlack {
+		t.Errorf("restoreClockArgs ignores the group span: %s", b)
+	}
+	if _, b := restoreClockArgs(dir, true, false, 100_000); b == 110*time.Second+restoreClockSlack {
+		t.Errorf("CRIU-only budget took the group's GPU span")
+	}
+}
+
+// The group span is the slowest rank's last restore, or unknown when a
+// rank has none on its node.
+func TestGroupRestoreSpan(t *testing.T) {
+	for _, c := range []struct {
+		spans []int64
+		known []bool
+		want  int64
+	}{
+		{[]int64{40_000, 41_500, 40_900}, []bool{true, true, true}, 41_500},
+		{[]int64{40_000, 0, 40_900}, []bool{true, false, true}, groupSpanUnknown},
+		{[]int64{40_000}, []bool{true}, 40_000},
+		{nil, nil, groupSpanUnknown},
+	} {
+		if got := groupRestoreSpan(c.spans, c.known); got != c.want {
+			t.Errorf("%v %v: %d, want %d", c.spans, c.known, got, c.want)
+		}
 	}
 }

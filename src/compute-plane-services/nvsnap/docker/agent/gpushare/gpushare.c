@@ -324,6 +324,10 @@ struct imp {
      * again at "quiesce" by the fabric handle or a dup of the fd. */
     CUmemFabricHandle fh;
     int ufd;                             /* 0 = none */
+    /* The exporter, found at "quiesce", says this is a multicast object:
+     * not restorable as an import (see do_quiesce). Kept so that every
+     * later "quiesce" refuses too, not only the one that found it. */
+    int mc;
 };
 
 /* A mapping of an imported allocation. */
@@ -417,9 +421,11 @@ struct mcobj {
     unsigned long long key;              /* id at the creator */
     CUdevice devs[MAX_DEV];              /* added by this process */
     int ndev;
-    int app_released, released, dead;    /* dead: app done with it */
+    int app_released, released, dead;    /* dead: app done with it (importers only) */
+    int own;                             /* cur_h is ours: re-created or re-imported after the app released it */
     int fab;                             /* imported as a fabric handle */
     CUmemFabricHandle fh;                /* from another node: its handle */
+    int ufd;                             /* creator not found yet: a dup of the fd (0 = none) */
 };
 /* Memory this process bound to a multicast object. */
 struct mcbind {
@@ -583,6 +589,7 @@ static CUresult mc_recreate(struct mcobj *m)
     if (r != CUDA_SUCCESS) return r;
     m->cur_h = h;
     m->released = 0;
+    m->own = m->app_released;
     return CUDA_SUCCESS;
 }
 
@@ -974,6 +981,20 @@ static void resolve_import(struct imp *im)
     im->key = key;
     if (im->ufd) close(im->ufd);
     im->ufd = 0;
+    im->mc = mc;
+}
+
+/* The same for a multicast object imported before its creator registered
+ * the export (see imp_to_mc). */
+static void resolve_mc(struct mcobj *m)
+{
+    unsigned long long key = 0;
+    int mc = 0;
+    m->peer = find_exporter("whose", m->ufd, &key, &mc);
+    if (!m->peer) return;
+    m->key = key;
+    close(m->ufd);
+    m->ufd = 0;
 }
 
 /* Is the multicast object still in use by the app (mu held)? */
@@ -1113,8 +1134,17 @@ static void do_quiesce(char *reply, size_t n)
         return;
     }
     reply[0] = 0;
-    for (int i = 0; i < n_imps; i++)
+    for (int i = 0; i < n_imps; i++) {
         if (!imps[i].peer && !imps[i].released && imp_live(i)) resolve_import(&imps[i]);
+        /* A multicast object the app joins is tracked as one (imp_to_mc):
+         * remapped as an import, its mapping would wait for every device
+         * of the group, this one included, and never return. */
+        if (imps[i].mc && !imps[i].released && imp_live(i) && !reply[0])
+            snprintf(reply, n, "err import of handle %llu is multicast object %llu of pid %d, which this process "
+                     "never joined", (unsigned long long)imps[i].app_h, imps[i].key, imps[i].peer);
+    }
+    for (int i = 0; i < n_mcs; i++)
+        if (!mcs[i].creator && !mcs[i].peer && mcs[i].ufd && !mcs[i].dead && mc_live(i)) resolve_mc(&mcs[i]);
     if (r != CUDA_SUCCESS)
         snprintf(reply, n, "err synchronize: %s", errstr(r));
     else if (n_legacy)
@@ -1225,6 +1255,10 @@ static void do_release(char *reply, size_t n, const char *args)
             if ((r = REAL(r_unmap, "cuMemUnmap")(maps[i].va, maps[i].size)) == CUDA_SUCCESS) maps[i].down = 1;
             nm++;
         }
+    for (int i = 0; i < n_mcs; i++) {
+        if (mcs[i].ufd) close(mcs[i].ufd);  /* as below */
+        mcs[i].ufd = 0;
+    }
     for (int i = 0; r == CUDA_SUCCESS && i < n_imps; i++) {
         if (imps[i].ufd) close(imps[i].ufd);  /* would pin the exporter's memory */
         imps[i].ufd = 0;
@@ -1246,13 +1280,29 @@ static void do_release(char *reply, size_t n, const char *args)
         r = REAL(r_mc_unbind, "cuMulticastUnbind")(mcs[b->mc].cur_h, b->dev, b->mcoff, b->size);
         if (r == CUDA_SUCCESS) b->unbound = 1;
     }
+    /* A creator cannot tell whether its object is still used once the app
+     * has let go of it here: by importers in other processes, or by this
+     * one through its own export (an entry with peer = our pid). It stays
+     * restorable, and is re-created when an importer asks (export_id). */
     for (int i = 0; r == CUDA_SUCCESS && i < n_mcs; i++) {
         if (mcs[i].dead || mcs[i].released) continue;
-        if (!mc_live(i)) { mcs[i].dead = 1; continue; }
+        int live = mc_live(i);
+        if (!live && !mcs[i].creator) {
+            /* The app let go of this importer and no longer maps or binds
+             * it. A handle we re-imported for it (own) is ours to release;
+             * only then is it dead, so a failed release rolls back as is. */
+            if (mcs[i].own) {
+                what = "release multicast";
+                if ((r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h)) != CUDA_SUCCESS) continue;
+                mcs[i].own = 0;
+            }
+            mcs[i].dead = 1;
+            continue;
+        }
         what = "release multicast";
-        if (!mcs[i].app_released) r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h);
-        if (r == CUDA_SUCCESS) mcs[i].released = 1;
-        nmc++;
+        if (!mcs[i].app_released || mcs[i].own) r = REAL(r_release, "cuMemRelease")(mcs[i].cur_h);
+        if (r == CUDA_SUCCESS) mcs[i].released = 1, mcs[i].own = 0;
+        nmc += live;
     }
     size_t nb = 0;
     double t0 = secs();
@@ -1623,6 +1673,7 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
     for (int i = 0; i < n_mcs; i++) {
         struct mcobj *m = &mcs[i];
         if (m->dead || !m->released) continue;  /* a creator may be re-created by a peer's request */
+        if (m->creator && !mc_live(i)) continue;  /* only importers use it: re-created when one asks */
         nmc++;
         if (m->creator) {
             if ((r = mc_recreate(m)) != CUDA_SUCCESS) {
@@ -1647,6 +1698,7 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
         }
         m->cur_h = h;
         m->released = 0;
+        m->own = m->app_released;
     }
     tmc = secs() - t;
     snprintf(reply, n, "ok remapped %d mapping(s), %d freed by their exporter, %d multicast object(s), "
@@ -3056,16 +3108,19 @@ static CUresult w_mc_create(CUmemGenericAllocationHandle *h, const CUmulticastOb
     return r;
 }
 
-/* A fabric handle imported from another node is not known to be a
- * multicast object until the app joins it: track it as one from then on
- * (mu held). */
+/* An import whose exporter was not found is not known to be a multicast
+ * object until the app joins or binds it: a fabric handle from another
+ * node, or an fd imported before its creator registered the export (seen
+ * with vLLM 0.31 at TP=2). Track it as one from then on (mu held). */
 static int imp_to_mc(CUmemGenericAllocationHandle h)
 {
     int i = find_imp(h);
-    if (i < 0 || !imps[i].fab || imps[i].peer) return -1;
+    if (i < 0 || imps[i].peer) return -1;
     for (int j = 0; j < n_maps; j++)
         if (maps[j].imp == i) return -1;
-    PUSH(mcs, ((struct mcobj){ .app_h = imps[i].app_h, .cur_h = imps[i].cur_h, .fab = 1, .fh = imps[i].fh }));
+    PUSH(mcs, ((struct mcobj){ .app_h = imps[i].app_h, .cur_h = imps[i].cur_h, .fab = imps[i].fab,
+                               .fh = imps[i].fh, .ufd = imps[i].ufd }));
+    imps[i].ufd = 0;  /* the multicast object's now */
     imps[i].app_h = imps[i].cur_h = 0;  /* no longer an import */
     imps[i].app_released = 1;
     return n_mcs - 1;

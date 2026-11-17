@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -47,7 +48,73 @@ const (
 
 	essAssertionTokenPathEnv = "ESS_ASSERTION_TOKEN_PATH"
 	essAssertionTokenPath    = common.EssConfigDir + "/jwt.token"
+
+	// Kubernetes signals the inference server and Pylon at the same time on
+	// pod deletion. The inference server's preStop pause keeps it serving
+	// while Pylon stops. A Pylon that reads llmWorkerDrainTimeoutEnv drains
+	// for up to that timeout and then shuts down within
+	// llmWorkerShutdownAllowance, so it is done before the pause ends. The
+	// pod's grace period then leaves the inference server
+	// llmInferenceExitAllowance to exit.
+	llmWorkerDrainTimeoutEnv     = "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS"
+	defaultLLMInferenceStopPause = 60 * time.Second
+	llmWorkerShutdownAllowance   = 5 * time.Second
+	llmInferenceExitAllowance    = 60 * time.Second
 )
+
+// llmShutdown is the shutdown timing of an LLM container function pod, all
+// derived from the inference stop pause.
+type llmShutdown struct {
+	pause time.Duration
+	drain time.Duration
+}
+
+func newLLMShutdown(configuredPause time.Duration) llmShutdown {
+	pause := configuredPause.Truncate(time.Second)
+	if pause <= 0 {
+		pause = defaultLLMInferenceStopPause
+	}
+	return llmShutdown{
+		pause: pause,
+		drain: max(pause-llmWorkerShutdownAllowance, 0),
+	}
+}
+
+// minGraceSeconds is the shortest pod grace period that lets the inference
+// server finish the pause and then exit. It adds whole seconds, which cannot
+// overflow for any pause a time.Duration can hold.
+func (s llmShutdown) minGraceSeconds() int64 {
+	return int64(s.pause/time.Second) + int64(llmInferenceExitAllowance/time.Second)
+}
+
+// inferenceLifecycle delays the inference server's stop signal so it keeps
+// serving requests that Pylon is still draining.
+func (s llmShutdown) inferenceLifecycle() *corev1.Lifecycle {
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"sleep", strconv.Itoa(int(s.pause / time.Second))},
+			},
+		},
+	}
+}
+
+// holdTelemetrySidecars delays the stop signal of the BYOO collector and
+// fluent-bit by the same pause, so they keep shipping the inference server's
+// logs and telemetry while it serves. Their images have no sleep binary, so
+// this uses the kubelet's sleep action (stable since Kubernetes 1.34).
+func (s llmShutdown) holdTelemetrySidecars(pod *corev1.Pod) {
+	for i := range pod.Spec.Containers {
+		switch pod.Spec.Containers[i].Name {
+		case common.ByooOTelCollectorPodNameBase, common.FluentbitContainerName:
+			pod.Spec.Containers[i].Lifecycle = &corev1.Lifecycle{
+				PreStop: &corev1.LifecycleHandler{
+					Sleep: &corev1.SleepAction{Seconds: int64(s.pause / time.Second)},
+				},
+			}
+		}
+	}
+}
 
 func normalizeLLMRequestRouterAddressEnvAliases(envSet map[string]string) {
 	llmRequestRouterAddress := envSet[llmRequestRouterAddressEnv]
@@ -116,6 +183,14 @@ func newLLMRouterClientContainer(
 		llmEnvSet[llmRequestRouterAddressEnv] = llmRequestRouterAddress
 	}
 	normalizeLLMRequestRouterAddressEnvAliases(llmEnvSet)
+	// The drain must end before the inference preStop pause does, so the
+	// platform value replaces any value from the function's environment. Helm
+	// functions run Pylon in a separate pod with no pause, so they keep
+	// Pylon's default drain behavior.
+	if !isHelm {
+		drain := newLLMShutdown(tcfg.LLMInferenceStopPause.Duration).drain
+		llmEnvSet[llmWorkerDrainTimeoutEnv] = strconv.FormatInt(drain.Milliseconds(), 10)
+	}
 
 	envs := common.MapToEnv(llmEnvSet)
 	envs = append(envs,

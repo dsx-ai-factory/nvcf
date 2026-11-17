@@ -51,11 +51,15 @@ overrides for all five images; empty tags inherit the vendored appVersion.
 OpenBao and Cassandra accept separate `registry`, `repository` and `tag` fields.
 Their tag fields also accept `tag@sha256:digest` references.
 
-CI renders defaults and ordinary overrides for all four charts, including
-hooks, init containers, injected agents and the ACME solver argument:
+CI checks image coverage for every tracked chart. A chart either declares
+an image index and passes, or is listed in `chart-image-exclusions.yaml`. For
+covered charts it renders defaults, every CI values scenario and ordinary
+overrides, including hooks, init containers, injected agents and the ACME
+solver argument:
 
 ```sh
-NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestImageCatalogCharts$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
 ```
 
 The release inventory scanner also reads indirect image settings such as the
@@ -104,6 +108,11 @@ Generated blocks live only in these four trees. The native Release Notes tab
 reads `fern/changelog/`. Existing frozen copies (`docs/<stack>-<version>/`)
 remain historical archives and are never regenerated. New editions create a
 branch, not a new source directory. See [the release and rollback workflow](../../docs/dev/docs-editions.md).
+
+The current catalog uses the `stack-package-downloads-fail-fast` renderer so
+a download or extraction failure stops the documented fail-fast shell. The
+original `stack-package-downloads` renderer retains the exact output expected
+by approved historical editions.
 
 `docs/overview/umbrella-releases.md` owns the generated `stack-package-downloads`
 block. It places each selected package in the sibling directory expected by

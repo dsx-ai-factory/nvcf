@@ -127,7 +127,7 @@ const (
 	// CacheRankDeltaAnnotation marks a warm rank whose cachedir holds
 	// files the seeded set did not have; the bytes and a fingerprint of
 	// the new paths ride along. Any such rank proposes a set refresh
-	// (docs/design/helm-chart-cache-refresh.md).
+	// (docs/ARCHITECTURE.md, section 7).
 	CacheRankDeltaAnnotation            = "nvsnap.io/cache-rank-delta"
 	CacheRankDeltaBytesAnnotation       = "nvsnap.io/cache-rank-delta-bytes"
 	CacheRankDeltaFingerprintAnnotation = "nvsnap.io/cache-rank-delta-fingerprint"

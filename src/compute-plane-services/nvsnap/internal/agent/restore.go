@@ -161,6 +161,10 @@ type RestoreRequest struct {
 	// driver reports every pod restored.
 	GPUShareFabricSession string `json:"gpushareFabricSession,omitempty"`
 	InetAddrMap           string `json:"inetAddrMap,omitempty"`
+	// GroupRestoreSpanMS is the restore span the driver hands every GPU
+	// rank of a group restore, for one clock budget (groupSpanBudget):
+	// the slowest rank's last restore, or -1 when a rank has none.
+	GroupRestoreSpanMS int64 `json:"groupRestoreSpanMs,omitempty"`
 
 	// PlaceholderContainerName picks the container in a multi-container
 	// placeholder pod; empty takes the first one.
@@ -486,6 +490,7 @@ func (a *Agent) Restore(ctx context.Context, req RestoreRequest) (*RestoreResult
 		return a.restoreV2(ctx, &metadata, checkpointDir, placeholderInfo, startTime, restoreV2Group{
 			Session: req.GPUShareFabricSession, InetAddrMap: req.InetAddrMap,
 			Namespace: req.PlaceholderNamespace, Pod: req.PlaceholderPodName,
+			SpanMS: req.GroupRestoreSpanMS,
 		}, log)
 	}
 

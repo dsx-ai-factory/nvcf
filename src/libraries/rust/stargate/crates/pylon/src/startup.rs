@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +32,6 @@ use pylon_lib::{
     start_metrics_server, start_model_lifecycle, start_quic_http_tunnel,
     start_stats_collector_with_engine_stats, stats_aggregator_update_channel,
 };
-use reqwest::header::HeaderName;
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_protocol::BackendConnectivity;
 use stargate_runtime::wait_for_termination_signal;
@@ -420,8 +418,10 @@ impl RunningPylon {
             tunnel,
             ..
         } = self;
+        // Requests that arrive during the registration drain need admitted
+        // model generations, so the model lifecycle stops only after it.
+        registration_client.shutdown().await;
         tokio::join!(
-            registration_client.shutdown(),
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
@@ -675,6 +675,7 @@ fn registration_config_from_plan(
         tunnel_protocol: args.tunnel_protocol,
         forwarding,
         auth_token_provider: plan.auth_token_provider.clone(),
+        shutdown_drain_timeout: Duration::from_millis(args.pylon_shutdown_drain_timeout_ms),
     }
 }
 
@@ -769,14 +770,6 @@ pub(crate) fn pylon_retry_config_from_args(args: &Args) -> Result<PylonRetryConf
         retryable_upstream_status_codes: parse_retryable_status_codes(
             &args.pylon_retryable_upstream_status_codes,
         )?,
-        require_upstream_retry_header: args.pylon_require_upstream_retry_header,
-        upstream_retry_header: HeaderName::from_str(args.pylon_upstream_retry_header.trim())
-            .with_context(|| {
-                format!(
-                    "invalid pylon upstream retry header: {}",
-                    args.pylon_upstream_retry_header
-                )
-            })?,
         propagate_retry_after: args.pylon_propagate_retry_after,
         local_connect_failures_retryable: args.pylon_local_connect_failures_retryable,
     })
@@ -1624,6 +1617,10 @@ mod tests {
         assert_eq!(config.inference_server_url, "quic://127.0.0.1:4567");
         assert_eq!(config.min_update_interval, Duration::from_millis(250));
         assert!(!config.reverse_tunnel);
+        assert_eq!(
+            config.shutdown_drain_timeout,
+            pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+        );
     }
 
     #[test]
@@ -1659,6 +1656,8 @@ mod tests {
             "789",
             "--auth-token",
             "token-from-cli",
+            "--pylon-shutdown-drain-timeout-ms",
+            "55000",
         ]);
         let forwarding = test_forwarding(&plan);
         let metrics = forwarding.metrics.clone().unwrap();
@@ -1688,6 +1687,7 @@ mod tests {
         );
         assert!(config.quic_insecure);
         assert_eq!(config.tunnel_protocol, TunnelTransportProtocol::Http3);
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(55));
         assert!(Arc::ptr_eq(
             config.forwarding.metrics.as_ref().unwrap(),
             &metrics

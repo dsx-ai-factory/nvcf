@@ -4,12 +4,14 @@
 package agent
 
 // Pod holds. A group capture stops the whole instance at one moment
-// (criu_group.go): once its GPU ranks are quiesced, every container of
-// every member pod is frozen, so nothing of the instance keeps time while
-// the ranks save their GPU memory and the members are dumped. An etcd
-// that kept running would expire the ranks' leases; a sidecar that kept
-// running would count the frozen engine as failed and kill it (a Dynamo
-// gang-health watchdog gives up after about 15 s).
+// (criu_group.go), in two steps (instanceHold, group_freeze.go): once its
+// GPU ranks are quiesced, their pods are frozen but for the containers
+// that save their GPU memory, so a sidecar does not count a suspending
+// engine as failed and kill it (a Dynamo gang-health watchdog gives up
+// after about 15 s); once the ranks are suspended, at the freeze point,
+// the companions' pods are frozen too, so an etcd does not keep counting
+// and expire the stopped ranks' leases. A companion frozen any earlier is
+// gone for the engines that still run their save.
 //
 // A hold freezes a pod's containers through their cgroup v2 freezers,
 // except the one a GPU rank's agent is saving (it runs until its dump). A

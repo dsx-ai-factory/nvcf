@@ -178,7 +178,7 @@ func (m *Mutator) cacheVolumePatches(ctx context.Context, pod *corev1.Pod, main 
 		patches = append(patches, mp.annotation(modelvolume.CacheOrdinalAnnotation, strconv.Itoa(ordinal))...)
 		// The same group identity a capture pod carries, so a warm rank can
 		// be measured, listed and streamed by the agents when the set is
-		// refreshed (docs/design/helm-chart-cache-refresh.md).
+		// refreshed (docs/ARCHITECTURE.md, section 7).
 		patches = append(patches, mp.label(modelvolume.CacheKeyLabel, modelvolume.Key(uri))...)
 		patches = append(patches, mp.annotation(modelvolume.CacheGroupSizeAnnotation, strconv.Itoa(m.groupSize(ctx, pod)))...)
 		patches = append(patches, mp.annotation(modelvolume.CacheSeedGenerationAnnotation, strconv.Itoa(st.Generation))...)

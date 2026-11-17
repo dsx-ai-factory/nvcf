@@ -108,6 +108,12 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get"]
+  # A Grove scaling group's replica count: one of several replicas shares
+  # its companions with the others, so it is neither captured nor
+  # restored as a group (grove_replicas.go).
+  - apiGroups: ["grove.io"]
+    resources: ["podcliquescalinggroups"]
+    verbs: ["list"]
   # An instance's companions (instance companion capture): the pods its
   # GPU ranks hold connections to, directly or through a Service.
   - apiGroups: [""]

@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "fnstatus",
-    srcs = ["fnstatus.go"],
+    srcs = [
+        "fnstatus.go",
+        "history.go",
+    ],
     importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/fnstatus",
     visibility = ["//src/compute-plane-services/nvsnap:__subpackages__"],
     deps = [
@@ -13,7 +16,10 @@ go_library(
 
 go_test(
     name = "fnstatus_test",
-    srcs = ["fnstatus_test.go"],
+    srcs = [
+        "fnstatus_test.go",
+        "history_test.go",
+    ],
     embed = [":fnstatus"],
     deps = [
         "@io_k8s_api//core/v1:core",

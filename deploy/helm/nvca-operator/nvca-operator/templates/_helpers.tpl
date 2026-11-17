@@ -270,8 +270,16 @@ configuration spells one key more than one way.
 {{- $_ := set $download "chunkSizeBytes" (int64 .chunkSizeBytes) -}}
 {{- end -}}
 {{- end -}}
+{{- $workload := dict -}}
 {{- if $download }}
-{{- $_ := set $config "workload" (dict "workerInitDownload" $download) -}}
+{{- $_ := set $workload "workerInitDownload" $download -}}
+{{- end -}}
+{{- /* worker.llmInferenceStopPause renders under workload.llmInferenceStopPause; empty keeps the agent's default. */ -}}
+{{- with $worker.llmInferenceStopPause }}
+{{- $_ := set $workload "llmInferenceStopPause" . -}}
+{{- end -}}
+{{- if $workload }}
+{{- $_ := set $config "workload" $workload -}}
 {{- end -}}
 {{- $agentConfig := .Values.agentConfig | default dict -}}
 {{- $mergeConfigData := $agentConfig.mergeConfig | default "" -}}

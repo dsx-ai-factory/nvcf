@@ -218,11 +218,13 @@ func (a *Agent) coldStartTarget(ctx context.Context, pod *corev1.Pod, container 
 
 // idleColdStartMarker returns the marker of a NUL-separated command line
 // that is the idle program given a workload to start (nvsnap-idle
-// --cold-start MARKER -- ...). Only the webhook's own marker path counts:
-// the agent writes it as root.
+// --cold-start MARKER -- ...). The program blanks the workload's arguments
+// while it idles, so only "--" may show what follows it; the webhook passes
+// "--" only with a workload, which the program refuses to start without.
+// Only the webhook's own marker path counts: the agent writes it as root.
 func idleColdStartMarker(cmdline []byte) (string, bool) {
 	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
-	if len(args) >= 5 && args[0] == webhook.IdleBin && args[1] == "--cold-start" && args[2] == webhook.ColdStartMarker && args[3] == "--" {
+	if len(args) >= 4 && args[0] == webhook.IdleBin && args[1] == "--cold-start" && args[2] == webhook.ColdStartMarker && args[3] == "--" {
 		return args[2], true
 	}
 	return "", false

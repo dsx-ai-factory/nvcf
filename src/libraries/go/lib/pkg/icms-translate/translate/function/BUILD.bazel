@@ -50,6 +50,7 @@ go_library(
 go_test(
     name = "function_test",
     srcs = [
+        "llm_shutdown_test.go",
         "llm_test.go",
         "lls_test.go",
         "translate_tolerations_test.go",

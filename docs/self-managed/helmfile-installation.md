@@ -752,6 +752,15 @@ api.accountBootstrap.registryCredentials): ACR (Azure), ECR (AWS), NVCR
 
 </Note>
 
+The API chart's account-bootstrap hook Job runs on install and upgrade and
+creates the default NVCF account with these registry credentials if it does not
+exist. If the account is provisioned another way, set
+`api.accountBootstrap.enabled: false` in `environments/<environment>.yaml` to
+skip the Job. The value must be a YAML boolean. This also removes the
+`nvcf-api-account-bootstrap` ServiceAccount, which the token steps in
+[Update NVCF Account Quota Limits](./runbooks/update-nvcf-account-quota-limits.md)
+use.
+
 #### Generating Base64-encoded Registry Credentials
 
 Registry credentials must be base64-encoded in the format `username:password`. For detailed instructions on setting up credentials for specific registries (including IAM user creation for ECR), see [third-party-registries-self-hosted](./third-party-registries.md).
@@ -1129,6 +1138,51 @@ By default, the route host is `vanity.<domain>` and the backend is
 `addons.vanityGateway.mappingConfig`. If your deployment needs custom vanity
 hosts, use the route hostname overrides supported by your stack package and
 create matching DNS records.
+
+Model API request bodies default to 25 MiB (26214400 bytes). Set
+`addons.vanityGateway.config.maxRequestSizeBytes` to a positive integer in
+bytes to change the limit. For example, allow 64 MiB:
+
+```yaml
+addons:
+  vanityGateway:
+    enabled: true
+    config:
+      maxRequestSizeBytes: 67108864
+```
+
+The gateway holds a model API request body in memory while it routes the
+request, unless the body is larger than 64 KiB, its first 64 KiB contain
+`model` and `stream` (decision routes: `model`), and the model's route
+forwards the body unchanged. Then it holds only that prefix and forwards the
+rest as it arrives. LLM Gateway routes and shadow models always hold the
+full body and add more copies. In one in-process test, a single 64 MiB
+request held in full raised gateway heap use by about
+224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
+900 MiB with one shadow model. Treat these numbers as examples, not limits.
+When raising this limit, also raise
+`addons.vanityGateway.resources.limits.memory`. Size it from a load test at
+your expected concurrency, with headroom. The chart's default memory limit is
+`512Mi`.
+
+Models with `functionType: LLM` are served through the LLM Gateway, which
+rejects request bodies over 50 MiB (52428800 bytes) by default. The stack does
+not change that limit, so a Vanity Gateway limit above 50 MiB does not help
+these models.
+
+The stack passes this value to the chart's
+`vanityGateway.config.maxRequestSizeBytes`, which sets the service environment
+variable `MAX_REQUEST_SIZE_BYTES`. Invalid or non-positive values are rejected.
+The limit covers model API POST routes, including image endpoints. Generic
+vanity pass-through routes and private-model lookup response limits are unchanged.
+
+`helmfile apply` updates the gateway ConfigMap, but running pods keep the old
+environment until they restart. A change to pod resources, such as the memory
+limit, restarts them. Otherwise, restart them yourself:
+
+```bash
+kubectl rollout restart deployment/vanity-gateway -n nvcf
+```
 
 After confirming your stack package includes the `vanity-gateway` release,
 preview and apply the service plus gateway routes:

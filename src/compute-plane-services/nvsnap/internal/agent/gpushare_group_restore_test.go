@@ -33,6 +33,8 @@ type groupRestoreHarness struct {
 	srv      *httptest.Server
 	ckpts    map[string]*CheckpointMetadata
 	failCkpt string
+	// spans are the checkpoints' restore-span-ms on their nodes.
+	spans map[string]string
 
 	mu       sync.Mutex
 	requests []RestoreRequest
@@ -60,7 +62,12 @@ func newGroupRestoreHarness(t *testing.T, ckpts map[string]*CheckpointMetadata) 
 		w.WriteHeader(http.StatusNoContent)
 	}).Methods("POST")
 	r.HandleFunc("/v1/checkpoints/{id}/file", func(w http.ResponseWriter, r *http.Request) {
-		md, ok := h.ckpts[mux.Vars(r)["id"]]
+		id := mux.Vars(r)["id"]
+		if span, ok := h.spans[id]; ok && r.URL.Query().Get("path") == restoreSpanFile {
+			_, _ = w.Write([]byte(span))
+			return
+		}
+		md, ok := h.ckpts[id]
 		if !ok || r.URL.Query().Get("path") != "metadata.json" {
 			http.Error(w, "file not found", http.StatusNotFound)
 			return
@@ -296,5 +303,55 @@ func TestGroupRestore_FailedRankSkipsCompanions(t *testing.T) {
 	defer h.mu.Unlock()
 	if _, ok := h.companionAt["etcd"]; ok {
 		t.Error("the companion was restored although its GPU rank failed")
+	}
+}
+
+// Every GPU rank gets the slowest rank's last restore span, or "unknown"
+// when a rank's node has none, so that the ranks budget their clocks alike
+// and resume together; the companions keep their own.
+func TestGroupRestore_OneClockSpanForTheRanks(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		spans map[string]string
+		want  int64
+	}{
+		{"every rank restored before", map[string]string{"c0": "40000\n", "c1": "41500\n", "e": "900\n"}, 41500},
+		{"a rank new to its node", map[string]string{"c0": "40000\n", "e": "900\n"}, groupSpanUnknown},
+		{"a span that does not parse", map[string]string{"c0": "40000\n", "c1": "soon\n"}, groupSpanUnknown},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ckpts := map[string]*CheckpointMetadata{
+				"c0": {SourcePodIP: "10.0.0.1", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 0, Size: 3}},
+				"c1": {SourcePodIP: "10.0.0.2", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 1, Size: 3}},
+				"e":  {SourcePodIP: "10.0.0.5", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 2, Size: 3, Companion: true}},
+			}
+			h := newGroupRestoreHarness(t, ckpts)
+			h.spans = c.spans
+			groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "new-1": "10.1.0.11", "etcd": "10.1.0.15"})
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			req := GroupRestoreRequest{Members: []GroupRestoreMember{
+				{CheckpointID: "c0", PlaceholderNamespace: "llm", PlaceholderPodName: "new-0"},
+				{CheckpointID: "c1", PlaceholderNamespace: "llm", PlaceholderPodName: "new-1"},
+				{CheckpointID: "e", PlaceholderNamespace: "llm", PlaceholderPodName: "etcd"},
+			}}
+			if _, err := h.a.groupRestore(ctx, req, quietFabricLog()); err != nil {
+				t.Fatalf("group restore: %v", err)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if len(h.requests) != 3 {
+				t.Fatalf("%d restores, want 3", len(h.requests))
+			}
+			for _, r := range h.requests {
+				want := c.want
+				if r.CheckpointID == "e" {
+					want = 0
+				}
+				if r.GroupRestoreSpanMS != want {
+					t.Errorf("%s: span %d, want %d", r.CheckpointID, r.GroupRestoreSpanMS, want)
+				}
+			}
+		})
 	}
 }

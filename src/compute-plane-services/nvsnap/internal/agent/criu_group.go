@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -115,6 +116,9 @@ const (
 	// taken down the engine it suspended (kimi-k3, 2026-10-08).
 	criuCaptureAnnotation = "nvsnap.io/criu-capture"
 )
+
+// groupWarmupWait is the warmup captureGroup waits; tests shorten it.
+var groupWarmupWait = criuGroupWarmup
 
 func criuGroupConfigMapName(key string) string { return criuGroupConfigMapPrefix + key }
 
@@ -371,6 +375,15 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 		// pod that never becomes warm holds no other rank of its instance.
 		return false
 	}
+	if why := c.a.driverGate(ctx); why != "" {
+		// Admitted before the drivers changed (driver_gate.go): no CRIU
+		// capture under these drivers.
+		if _, logged := c.attempted.LoadOrStore("driver-gate/"+string(pod.UID), struct{}{}); !logged {
+			c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "reason": why}).
+				Info("CRIU group capture: skipped; the cluster's drivers keep CRIU from serving")
+		}
+		return false
+	}
 	if !rootfsonly.IsPodReady(pod) {
 		return true // not warm yet: nothing is decided
 	}
@@ -409,7 +422,7 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 	if size == 1 {
 		// One pod: its record is known now, so a captured configuration
 		// is not waited on again.
-		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKey(uri, scope)), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) {
+		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) {
 			return false
 		}
 	}
@@ -431,21 +444,49 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 	return true
 }
 
+// sharedCompanionsBlockCapture reports whether leader's instance must not
+// be captured now because its namespace's Grove instances share their
+// companions (skip), and whether to try again later (again): when their
+// count cannot be read yet.
+func (c *criuAutoRestorer) sharedCompanionsBlockCapture(ctx context.Context, leader *corev1.Pod, pods []corev1.Pod, log *logrus.Entry) (again, skip bool) {
+	why, err := c.a.sharedCompanionsReason(ctx, leader, pods)
+	if err != nil {
+		log.WithError(err).Info("CRIU group capture: waiting to read the namespace's scaling groups")
+		return true, true
+	}
+	if why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false, true
+	}
+	return false, false
+}
+
 // captureGroup captures leader's instance. retry is true when the
 // instance was not ready for it yet.
 func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod, scope string, size int) (retry bool) {
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": leader.Namespace + "/" + leader.Name, "size": size})
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
+	// One read of the drivers for the gate and for every key and record
+	// of this capture.
+	view := a.clusterDriver(ctx)
+	if why := view.Gate(a.criuMinDriverMajor()); why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the cluster's drivers keep CRIU from serving")
+		return false
+	}
+	drv := view.Major()
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(criuGroupWarmup):
+	case <-time.After(groupWarmupWait):
 	}
 	pods, err := a.kubeClient.CoreV1().Pods(leader.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods")
 		return true
+	}
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
+		return again
 	}
 	// A rank the webhook never mutated is never one of the instance's ranks
 	// below: say so once, rather than wait for it as "not ready"
@@ -477,10 +518,33 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 	}
 	companions, companionContainers, err := a.discoverCompanions(ctx, ranks, log)
-	if err != nil {
-		log.WithError(err).Warn("CRIU group capture: skipped; a companion of the instance cannot be captured")
+	if errors.Is(err, errAgentNotYet) {
+		// As agentsSettled below: an agent rollout ends. Bounded: an agent
+		// that does not come (a node it cannot run on for a reason the
+		// placement does not show) must not hold the instance.
+		first, _ := c.agentWaitSince.LoadOrStore(leader.UID, time.Now())
+		if time.Since(first.(time.Time)) < agentArrivalWait {
+			log.WithError(err).Info("CRIU group capture: waiting for the node agents to settle")
+			return true
+		}
+		c.observeRefusal(ctx, "", leader, len(ranks), fmt.Sprintf("no nvsnap agent came after %s: %v", agentArrivalWait, err), log)
 		return false
 	}
+	c.agentWaitSince.Delete(leader.UID)
+	var noAgent *companionWithoutAgentError
+	if errors.As(err, &noAgent) {
+		// Decided before anything waits on that node's agent, which does
+		// not exist, so the instance's held pods serve at once. Counted
+		// for this instance only: no record.
+		c.observeRefusal(ctx, "", leader, len(ranks), noAgent.Error(), log)
+		return false
+	}
+	if err != nil {
+		// Labelled by the ranks' configuration: the instance's own key
+		// takes its companions too.
+		return c.companionsUnknown(ctx, criuGroupKeyDriver(instanceConfigURI(ranks), scope, drv), leader, len(ranks), err, log)
+	}
+	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
 		if webhook.DynamoComponent(r) && len(companions) == 0 {
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
@@ -504,10 +568,10 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		uris = append(uris, u)
 	}
-	key := criuGroupKey(instanceConfigURIOf(uris), scope)
+	key := criuGroupKeyDriver(instanceConfigURIOf(uris), scope, drv)
 	log = log.WithField("criuGroup", key)
 	if prev, gerr := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); gerr == nil && !c.groupRecaptures(ctx, prev.Data) {
-		c.writeGroupAliases(ctx, key, scope, uris, len(ranks), log)
+		c.writeGroupAliases(ctx, key, scope, drv, uris, len(ranks), log)
 		log.WithFields(logrus.Fields{"state": prev.Data["state"], "captures": prev.Data["captures"], "source": prev.Data["source"]}).
 			Info("CRIU group capture: skipped; the configuration's record says it is captured, being captured, or out of attempts")
 		return false
@@ -551,11 +615,20 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 	}
 	if b := blocking(findings); len(b) > 0 {
+		if c.companionBundlesPending(leader, companions, b, time.Now()) {
+			log.Info("CRIU group capture: waiting for a companion's node bundle to be fetched and mounted on its node")
+			return true
+		}
 		log.WithField("blocking", len(b)).Warn("CRIU group capture: skipped; the preflight found what would fail it")
 		if why := configurationRefusal(b); why != "" {
-			c.recordRefusal(ctx, key, scope, uris, len(ranks), leader, why, log)
+			c.recordRefusal(ctx, key, scope, drv, uris, len(ranks), leader, why, log)
 		}
 		return false
+	}
+	// Again just before the instance is held: the namespace's scaling
+	// groups may have grown while the instance warmed up.
+	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
+		return again
 	}
 	// Held for the capture before it is claimed: a member already
 	// released into service (its hold expired) is not stopped for it.
@@ -570,7 +643,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		c.unholdForCapture(ctx, members, log)
 		return true
 	}
-	record, err := c.claimGroupRecord(ctx, key, leader, len(uris))
+	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris))
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot claim the group record")
 		// Not captured yet: the members are held as before, by the limit
@@ -658,7 +731,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}); uerr != nil {
 		log.WithError(uerr).Error("CRIU group capture: cannot update the group record")
 	} else if data["state"] == criuGroupStateVerifying {
-		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, uris, len(ranks), log)
+		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, drv, uris, len(ranks), log)
 		nodes := make([]string, len(members))
 		for i, m := range members {
 			nodes[i] = m.Spec.NodeName
@@ -672,6 +745,35 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		// record).
 		c.deleteInstance(context.WithoutCancel(ctx), members, log)
 	}
+	return false
+}
+
+// companionMaxFailures bounds the attempts to tell an instance's
+// companions: each follows the last by a pod event and criuGroupWarmup.
+const companionMaxFailures = 5
+
+// companionsUnknown handles an instance whose companions could not be
+// told (err): a node's agent that did not answer, a pod that was
+// restarting. Such a failure passes, so the capture is tried again on a
+// later event of the leader (again true); one that keeps failing is
+// counted as a refusal, with its reason, in the metric, the summary line
+// and an event on the pod, rather than leave the instance uncaptured with
+// nothing but a log line to say so. No record is written: without its
+// companions the instance's configuration, its record's key, is not known.
+func (c *criuAutoRestorer) companionsUnknown(ctx context.Context, key string, leader *corev1.Pod, ranks int, err error, log *logrus.Entry) (again bool) {
+	n := 1
+	if v, ok := c.companionFailures.Load(leader.UID); ok {
+		n = v.(int) + 1
+	}
+	c.companionFailures.Store(leader.UID, n)
+	if n < companionMaxFailures {
+		log.WithError(err).WithField("attempt", n).Warn("CRIU group capture: the instance's companions cannot be told yet; trying again")
+		return true
+	}
+	c.companionFailures.Delete(leader.UID)
+	why := fmt.Sprintf("a companion of the instance cannot be captured (%d attempts): %v", n, err)
+	log.WithError(err).Warn("CRIU group capture: skipped; " + why)
+	c.observeRefusal(ctx, key, leader, ranks, why, log)
 	return false
 }
 
@@ -737,7 +839,7 @@ func ranksAgreePerTemplate(ranks []*corev1.Pod) error {
 // configuration find the instance's record from its own configuration, as
 // admission looks it up. A real record already under a rank's key (a
 // uniform instance of that configuration) is left alone.
-func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope string, uris []string, ranks int, log *logrus.Entry) {
+func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope string, drv int, uris []string, ranks int, log *logrus.Entry) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	// A companion is admitted by its own configuration alone: its alias
 	// names its slot, or the slots of every companion of that
@@ -749,7 +851,7 @@ func (c *criuAutoRestorer) writeGroupAliases(ctx context.Context, key, scope str
 	}
 	done := map[string]bool{key: true}
 	for i, uri := range uris {
-		akey := criuGroupKey(uri, scope)
+		akey := criuGroupKeyDriver(uri, scope, drv)
 		if done[akey] {
 			continue
 		}
@@ -838,11 +940,15 @@ func (c *criuAutoRestorer) namespaceGone(ctx context.Context, name string) bool 
 // claimGroupRecord makes the agent the capturer of key: it creates the
 // record, or takes over one that may be captured again. It returns nil
 // when another agent holds it.
-func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, leader *corev1.Pod, size int) (*corev1.ConfigMap, error) {
+func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, drv int, leader *corev1.Pod, size int) (*corev1.ConfigMap, error) {
 	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
 	data := map[string]string{"state": criuGroupStateCapturing, "size": strconv.Itoa(size), "captures": "1",
 		"source": leader.Namespace + "/" + leader.Name, "startedAt": time.Now().UTC().Format(time.RFC3339),
 		groupAgentBundleKey: c.a.currentBundle()}
+	if drv > 0 {
+		// The driver its key was made with (driver_gate.go).
+		data[recordDriverKey] = strconv.Itoa(drv)
+	}
 	record := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName(key), Labels: map[string]string{"app.kubernetes.io/managed-by": "nvsnap"}},
 		Data:       data,
@@ -889,8 +995,8 @@ func (c *criuAutoRestorer) claimGroupRecord(ctx context.Context, key string, lea
 // capture's record, it gets the aliases admission looks it up by: an
 // instance with companions is keyed by all its members, its pods by their
 // own configuration.
-func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string, uris []string, ranks int, leader *corev1.Pod, why string, log *logrus.Entry) {
-	record, err := c.claimGroupRecord(ctx, key, leader, len(uris))
+func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string, drv int, uris []string, ranks int, leader *corev1.Pod, why string, log *logrus.Entry) {
+	record, err := c.claimGroupRecord(ctx, key, drv, leader, len(uris))
 	if err != nil {
 		log.WithError(err).Warn("CRIU group capture: cannot record the preflight's refusal")
 		return
@@ -908,7 +1014,7 @@ func (c *criuAutoRestorer) recordRefusal(ctx context.Context, key, scope string,
 		log.WithError(err).Warn("CRIU group capture: cannot record the preflight's refusal")
 		return
 	}
-	c.writeGroupAliases(ctx, key, scope, uris, ranks, log)
+	c.writeGroupAliases(ctx, key, scope, drv, uris, ranks, log)
 	log.Warn("CRIU group capture: recorded as failed; the preflight refuses every capture of this configuration under this agent version")
 	c.observeRefusal(ctx, key, leader, ranks, why, log)
 }
@@ -955,6 +1061,7 @@ func recordOf(d map[string]string, id string) bool {
 // are replaced by a restore instead (captureGroup). stopped reports that
 // a failed capture got as far as stopping the instance.
 func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, companions []*corev1.Pod, companionContainers map[string]string, log *logrus.Entry) (results []*CheckpointResult, stopped bool, err error) {
+	defer metrics.Active("checkpoint")()
 	capture := time.Now().UTC().Format("20060102T150405.000000000")
 	reqs := make([]CheckpointRequest, 0, len(ranks)+len(companions))
 	for _, p := range ranks {
@@ -1042,6 +1149,9 @@ func isGroupPlaceholder(pod *corev1.Pod) bool {
 }
 
 func (c *criuAutoRestorer) considerGroupRestore(ctx context.Context, pod *corev1.Pod) {
+	if pod.DeletionTimestamp != nil {
+		return // a leader on its way out restores nothing, and ends nothing
+	}
 	key, size, ok := criuGroupRestoreLeader(pod)
 	if !ok {
 		return
@@ -1052,9 +1162,31 @@ func (c *criuAutoRestorer) considerGroupRestore(ctx context.Context, pod *corev1
 	go c.restoreGroup(ctx, pod, key, size)
 }
 
+// mayRestoreShared reports whether leader's group restore may go on as
+// far as shared companions go (grove_replicas.go). When the namespace runs
+// several Grove instances, the restore ends as not run, so its ranks start
+// cold rather than hold their GPUs waiting. When their count cannot be
+// read yet, it is tried again on the leader's next event.
+func (c *criuAutoRestorer) mayRestoreShared(ctx context.Context, leader *corev1.Pod, key string, log *logrus.Entry) bool {
+	why, err := c.a.sharedCompanionsReason(ctx, leader, nil)
+	if err != nil {
+		log.WithError(err).Warn("CRIU group restore: trying again on the leader's next event")
+		c.attempted.Delete("restore/" + string(leader.UID))
+		return false
+	}
+	if why != "" {
+		c.failGroup(ctx, leader, key, false, errors.New(why), log)
+		return false
+	}
+	return true
+}
+
 func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod, key string, size int) {
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"criuGroup": key, "pod": leader.Namespace + "/" + leader.Name, "size": size})
+	if !c.mayRestoreShared(ctx, leader, key, log) {
+		return
+	}
 	t0 := time.Now()
 	var ranks []*corev1.Pod
 	var waitErr error
@@ -1072,6 +1204,14 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			})
 			if waitErr == nil {
 				break
+			}
+			// A placeholder on a node no agent will run on is never
+			// restored (a pod without GPUs on a CPU node): the restore does
+			// not run, and the instance starts cold now rather than after
+			// the wait.
+			if stray := c.placeholderWithoutAgent(ctx, pods.Items, leader, key); stray != nil {
+				c.failGroup(ctx, leader, key, false, stray, log)
+				return
 			}
 		} else {
 			waitErr = err
@@ -1101,6 +1241,14 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			return
 		}
 	}
+	// A capture is restored only under the driver it was taken with, on
+	// every rank's node (driver_gate.go). Not run, and not held against the
+	// capture: the replacements are admitted under the drivers as they are
+	// now.
+	if why := c.groupDriverMismatch(ctx, key, ranks); why != "" {
+		c.failGroup(ctx, leader, key, false, fmt.Errorf("%w: %s", errCheckpointUnavailable, why), log)
+		return
+	}
 	// failGroup deletes the pods after it has blocked their checkpoints. Were
 	// the driver to delete them first, their replacements could be admitted
 	// as placeholders of the same checkpoints and wait for a restore that
@@ -1114,6 +1262,26 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			PlaceholderContainerName: p.Annotations[webhook.CRIURestoreContainerAnnotation],
 			ReservePIDs:              true,
 		}
+	}
+	// Placeholders an earlier agent admitted for a scaling group of
+	// several replicas start cold instead: each replica's restore would
+	// restore the companions they share (grove_replicas.go).
+	if !c.mayRestoreShared(ctx, leader, key, log) {
+		return
+	}
+	// A companion is restored by one group restore only. Losing it to
+	// another live leader ends this leader's restore as not run: its ranks
+	// start again, and the claimed companions are spared
+	// (groupPlaceholders).
+	if err := claimCompanions(ctx, a.kubeClient, ranks, leader); err != nil {
+		var claimed errCompanionClaimed
+		if errors.As(err, &claimed) {
+			c.failGroup(ctx, leader, key, false, err, log)
+			return
+		}
+		log.WithError(err).Warn("CRIU group restore: cannot claim the companions yet; trying again on the leader's next event")
+		c.attempted.Delete("restore/" + string(leader.UID))
+		return
 	}
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
@@ -1137,7 +1305,7 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			// The pods this restore made: the restored-pod watch acts on a
 			// rank only when its group record names it.
 			changed := recordRestored(d, id, strings.Join(uids, ","))
-			return recordRestoreHistory(d, id, now, took) || changed
+			return recordRestoreHistory(d, id, now, took, ranks[0].UID) || changed
 		}); uerr != nil && !apierrors.IsNotFound(uerr) {
 			log.WithError(uerr).Warn("CRIU group restore: cannot record the restored pods; their engines are not watched")
 		}
@@ -1147,6 +1315,35 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 		return // the agent stops before the restore ran
 	}
 	c.failGroup(ctx, leader, key, errors.As(err, new(*groupRestoreFailure)), err, log)
+}
+
+// placeholderWithoutAgent is why a placeholder of leader's instance (group
+// key) cannot be restored where it was scheduled: a node no nvsnap agent
+// runs on or will (withoutAgent). nil when there is none, or when it cannot
+// tell (the wait decides then).
+func (c *criuAutoRestorer) placeholderWithoutAgent(ctx context.Context, pods []corev1.Pod, leader *corev1.Pod, key string) error {
+	var agents map[string]bool
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil || p.Spec.NodeName == "" || p.Annotations[webhook.CRIUGroupAnnotation] != key ||
+			p.Annotations[webhook.CRIURestoreAnnotation] == "" || !groupMember(leader, p) {
+			continue
+		}
+		if agents == nil {
+			var err error
+			if agents, err = c.a.agentNodeNames(ctx); err != nil {
+				return nil
+			}
+		}
+		if agents[p.Spec.NodeName] {
+			continue
+		}
+		var none *companionWithoutAgentError
+		if err := c.a.withoutAgent(ctx, p); errors.As(err, &none) {
+			return fmt.Errorf("%w: placeholder %s: %w", errCheckpointUnavailable, p.Name, err)
+		}
+	}
+	return nil
 }
 
 // replaceColliding deletes the target pods of an address collision so their
@@ -1324,8 +1521,16 @@ func (c *criuAutoRestorer) endGroup(ctx context.Context, leader *corev1.Pod, key
 		log.WithError(cause).Error("CRIU group restore failed; its capture was verified, so it is kept and the replacements restore from it again")
 	}
 	for _, p := range members {
-		if err := c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID); err != nil {
-			log.WithError(err).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
+		var del error
+		if isCompanion(p) {
+			// Another leader may claim it between the list above and the
+			// delete (grove_replicas.go).
+			del = deleteCompanionUnlessClaimed(ctx, c.a.kubeClient, p, leader, log)
+		} else {
+			del = c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID)
+		}
+		if del != nil {
+			log.WithError(del).WithField("placeholder", p.Name).Error("CRIU group restore: could not delete the placeholder")
 		}
 	}
 }
@@ -1427,7 +1632,8 @@ func groupPlaceholders(pods []corev1.Pod, leader *corev1.Pod, key string, includ
 	for i := range pods {
 		p := &pods[i]
 		if p.DeletionTimestamp == nil && p.Annotations[webhook.CRIUGroupAnnotation] == key &&
-			(includeRestored || p.Annotations[webhook.CRIURestoredAnnotation] == "") && groupMember(leader, p) {
+			(includeRestored || p.Annotations[webhook.CRIURestoredAnnotation] == "") && groupMember(leader, p) &&
+			!claimedByAnother(p, leader, pods) {
 			out = append(out, p)
 		}
 	}
@@ -1444,9 +1650,32 @@ const (
 	groupReasonMax      = 16 << 10
 )
 
-// memberFailure is one member's part of a group's failure.
+// memberFailure is one member's part of a group's failure: the start of
+// its error (what failed) and its end (why: a tool's error comes last,
+// after its command line and progress). A failed gpushare resume's error
+// was cut after the progress, losing the cause (2026-11-06).
 func memberFailure(name, err string) string {
-	return name + ": " + truncate(err, groupMemberErrorMax)
+	return name + ": " + truncateMiddle(err, groupMemberErrorMax)
+}
+
+// truncateMiddle bounds s to n bytes, keeping its first third and its end,
+// with "…" between them.
+func truncateMiddle(s string, n int) string {
+	const gap = " … "
+	if len(s) <= n || n <= 3*len(gap) {
+		return truncate(s, n)
+	}
+	// Both cuts move inward to rune boundaries, so a multibyte rune at
+	// either is left out whole, never split.
+	head := n / 3
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	from := len(s) - (n - n/3 - len(gap))
+	for from < len(s) && !utf8.RuneStart(s[from]) {
+		from++
+	}
+	return s[:head] + gap + s[from:]
 }
 
 // membersFailed is the failure of a group operation (what, in session)

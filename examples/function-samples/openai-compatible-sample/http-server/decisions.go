@@ -124,12 +124,15 @@ func handleSystemOne(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDecisionRoute(w http.ResponseWriter, r *http.Request, systemOne bool) {
+	if logRequests {
+		logDecisionRequest(r)
+	}
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeDecisionError(w, systemOne, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, decisionMaxRequestBytes))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, requestBodyLimit(r, decisionMaxRequestBytes)))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {

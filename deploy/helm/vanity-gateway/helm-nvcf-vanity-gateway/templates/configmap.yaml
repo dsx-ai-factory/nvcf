@@ -29,6 +29,7 @@ data:
   PRIVATE_MODEL_NAME_REGEX_PATTERN: {{ .Values.vanityGateway.config.privateModelNameRegexPattern | quote }}
   AWS_REGION: {{ .Values.vanityGateway.config.awsRegion | quote }}
   SHADOW_MAX_CONCURRENT: {{ .Values.vanityGateway.config.shadowMaxConcurrent | quote }}
+  MAX_REQUEST_SIZE_BYTES: {{ .Values.vanityGateway.config.maxRequestSizeBytes | int64 | quote }}
 ---
 apiVersion: v1
 kind: ConfigMap

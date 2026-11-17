@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -139,6 +140,16 @@ func (a *Agent) startRootfsCapture(ctx context.Context, cfg RootfsCaptureConfig)
 	// cascade-fetch path (EnsureCaptureLocal) can read the per-capture
 	// ConfigMaps + resolve peer node InternalIPs without rebuilding it.
 	a.kubeClient = kubeClient
+	// Custom resources the agent reads (Grove scaling groups,
+	// grove_replicas.go); without it they read as unreadable, which fails
+	// closed.
+	if kcfg, cerr := loadKubeConfig(); cerr == nil {
+		if dyn, derr := dynamic.NewForConfig(withClientLimits(kcfg)); derr == nil {
+			a.dynClient = dyn
+		} else {
+			a.log.WithError(derr).Warn("rootfsonly: dynamic client; Grove scaling groups unreadable")
+		}
+	}
 
 	backend, err := buildAgentBackend(cfg, kubeClient, a)
 	if err != nil {

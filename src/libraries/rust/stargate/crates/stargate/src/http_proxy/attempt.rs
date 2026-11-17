@@ -22,7 +22,7 @@ use axum::response::Response;
 use stargate_protocol::tunnel_contract::{
     HEADER_INFERENCE_SERVER_ID as HEADER_CHOSEN_INFERENCE_SERVER_ID, HEADER_STARGATE_ERROR_CODE,
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE, RETRY_REASON_LOCAL_CONNECT_FAILURE,
-    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE,
+    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE, RETRY_REASON_UPSTREAM_OVERLOADED,
 };
 use tracing::{Instrument, Span, field, info, warn};
 
@@ -32,7 +32,8 @@ use super::ProxyAppState;
 use super::retry::{
     FinalRetryDisposition, RetryDecision, UpstreamRetry, decide_proxy_error_retry,
     decide_upstream_response_retry, header_str, is_internal_capacity_rejection,
-    retry_budget_has_remaining, should_release_queue_mismatch_reservation,
+    is_model_server_error_reason, retry_budget_has_remaining,
+    should_release_queue_mismatch_reservation,
 };
 use super::routing::overloaded_response;
 use super::run::{ProxyRequestRun, SelectedClusterRun};
@@ -59,6 +60,7 @@ pub(super) struct ProxyAttemptCounters {
     pub(super) attempt: u32,
     connect_retries: u32,
     request_retries: u32,
+    has_non_overload_retry: bool,
 }
 
 pub(super) enum ProxyAttemptOutcome {
@@ -248,6 +250,13 @@ impl ProxyRequestRun<'_> {
             }
             RetryDecision::Retry(retry) => retry,
         };
+        if let UpstreamRetry::AlternateCluster(reason) = &retry
+            && is_model_server_error_reason(reason)
+            && !self.has_untried_cluster(&chosen.cluster_id).await
+        {
+            let disposition = FinalRetryDisposition::Exhausted(reason.clone());
+            return finish_attempt(self, chosen, disposition, Ok(upstream));
+        }
         let (outcome, retry_reason, message) = match retry {
             UpstreamRetry::AlternateBackend(reason) => (
                 ProxyAttemptOutcome::RetryAlternateBackend(chosen.inference_server_id.clone()),
@@ -261,6 +270,9 @@ impl ProxyRequestRun<'_> {
             ),
         };
         self.attempt_counters.request_retries += 1;
+        if retry_reason != RETRY_REASON_UPSTREAM_OVERLOADED {
+            self.attempt_counters.has_non_overload_retry = true;
+        }
         self.record_retry(&retry_reason);
         warn!(
             inference_server_id = %chosen.inference_server_id,
@@ -398,6 +410,14 @@ fn finish_attempt(
     if let Some(retry_reason) = disposition.retry_reason() {
         Span::current().record("proxy.retry_reason", retry_reason);
     }
+    // When every instance this request tried was overloaded, the client gets
+    // the router's overload answer, as for an overloaded single backend.
+    let every_attempt_overloaded = matches!(disposition, FinalRetryDisposition::Exhausted(_))
+        && !run.attempt_counters.has_non_overload_retry
+        && upstream.as_ref().is_ok_and(|response| {
+            header_str(&response.headers, HEADER_STARGATE_RETRY_REASON)
+                == Some(RETRY_REASON_UPSTREAM_OVERLOADED)
+        });
     let upstream = match disposition {
         FinalRetryDisposition::PassThrough | FinalRetryDisposition::ReplayIncomplete(_) => upstream,
         FinalRetryDisposition::AmbiguousDelivery => {
@@ -412,9 +432,10 @@ fn finish_attempt(
         }
         FinalRetryDisposition::PayloadTooLarge(_) => Err(StatusCode::PAYLOAD_TOO_LARGE),
     };
-    let capacity_rejected = upstream
-        .as_ref()
-        .is_ok_and(|response| is_internal_capacity_rejection(response.status, &response.headers));
+    let capacity_rejected = every_attempt_overloaded
+        || upstream.as_ref().is_ok_and(|response| {
+            is_internal_capacity_rejection(response.status, &response.headers)
+        });
     let status = if capacity_rejected {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -829,7 +850,16 @@ mod tests {
         status: StatusCode,
         headers: HeaderMap,
     ) -> ProxyAttemptOutcome {
-        let app = test_proxy_app_state();
+        finish_response_on(&test_proxy_app_state(), false, disposition, status, headers)
+    }
+
+    fn finish_response_on(
+        app: &ProxyAppState,
+        has_non_overload_retry: bool,
+        disposition: FinalRetryDisposition,
+        status: StatusCode,
+        headers: HeaderMap,
+    ) -> ProxyAttemptOutcome {
         let target = RoutingTargetKey::new(None, "model-a");
         let request = PreparedProxyRequest {
             lb_resolution: app
@@ -857,7 +887,8 @@ mod tests {
             replay_body: ReplayableRequestBody::new(&HeaderMap::new(), Body::empty(), 1024)
                 .unwrap(),
         };
-        let run = ProxyRequestRun::new(&app, request);
+        let mut run = ProxyRequestRun::new(app, request);
+        run.attempt_counters.has_non_overload_retry = has_non_overload_retry;
         let chosen = RoutedInferenceServerSnapshot {
             registration: test_registration_generation(RegistrationIdentity {
                 inference_server_id: "backend-a".to_string(),
@@ -1064,5 +1095,56 @@ mod tests {
         };
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(!response.headers().contains_key(HEADER_STARGATE_ERROR_CODE));
+    }
+
+    #[tokio::test]
+    async fn exhausted_model_server_errors_answer_by_what_the_request_tried() {
+        // (label, status and retry reason of the last response, whether an
+        // earlier attempt failed another way, client status, client error code)
+        #[rustfmt::skip] // one case per line
+        let cases = [
+            ("every_attempt_overloaded", 529, "upstream_overloaded", false, 503, Some("overloaded_error")),
+            ("overloaded_after_another_error", 529, "upstream_overloaded", true, 529, None),
+            ("unavailable", 503, "upstream_unavailable", false, 503, None),
+            ("model_unregistered", 404, "upstream_model_unregistered", false, 404, None),
+        ];
+        for (label, status, reason, has_non_overload_retry, client_status, error_code) in cases {
+            let app = test_proxy_app_state();
+            let headers = HeaderMap::from_iter([
+                (
+                    HeaderName::from_static(HEADER_STARGATE_RETRYABLE),
+                    HeaderValue::from_static("true"),
+                ),
+                (
+                    HeaderName::from_static(HEADER_STARGATE_RETRY_REASON),
+                    HeaderValue::from_static(reason),
+                ),
+            ]);
+            let ProxyAttemptOutcome::ReturnFinal(response) = finish_response_on(
+                &app,
+                has_non_overload_retry,
+                FinalRetryDisposition::Exhausted(reason.to_string()),
+                StatusCode::from_u16(status).unwrap(),
+                headers,
+            ) else {
+                panic!("{label}: expected a final response")
+            };
+            assert_eq!(response.status().as_u16(), client_status, "{label}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_STARGATE_ERROR_CODE)
+                    .map(|code| code.to_str().unwrap()),
+                error_code,
+                "{label}"
+            );
+            assert_eq!(
+                app.metrics
+                    .proxy_retry_exhausted_total(None, "model-a", reason)
+                    .get(),
+                1,
+                "{label}"
+            );
+        }
     }
 }

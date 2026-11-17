@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -373,4 +374,145 @@ func TestClientCloseAfterAttachPublishesClosed(t *testing.T) {
 	closed := ofType(received(), eventTypeAttachmentClosed)[0]
 	assert.Equal(t, "nca-1", closed["ncaid"])
 	assert.Equal(t, metrics.CloseReasonClientClosed, closed["data"].(map[string]any)["cause"])
+}
+
+// resumableInvoker answers whether a session can still be rejoined, as the
+// real invoker does from the worker's registration.
+type resumableInvoker struct {
+	FunctionInvokerFunc
+	resumable atomic.Bool
+	lookups   atomic.Int64
+}
+
+func (r *resumableInvoker) SessionResumable(context.Context, uuid.UUID) (bool, error) {
+	r.lookups.Add(1)
+	return r.resumable.Load(), nil
+}
+
+func newWatchingDirector(t *testing.T, publisher *eventledger.Publisher) (*StreamDirector, *resumableInvoker) {
+	t.Helper()
+	director := newEventDirector(t, publisher)
+	director.sessionEndPoll = 5 * time.Millisecond
+	invoker := &resumableInvoker{FunctionInvokerFunc: director.functionInvoker.(FunctionInvokerFunc)}
+	invoker.resumable.Store(true)
+	director.functionInvoker = invoker
+	return director, invoker
+}
+
+// attachThenLeave attaches a worker to a new session and then has its client
+// leave.
+func attachThenLeave(t *testing.T, director *StreamDirector) *worker.WorkerConnection {
+	t.Helper()
+	client, _ := net.Pipe()
+	tracking := worker.NewConnectionTrackingConn(client)
+	wc, err := director.getAndInitWorkerConnection(t.Context(), tracking, "client-auth", testFunctionId, "", nil)
+	require.NoError(t, err)
+	info := director.workerAuth.Get(testWorkerToken).Value()
+	workerLink, _ := net.Pipe()
+	require.NoError(t, director.RegisterWorker(t.Context(), testWorkerToken, info, workerLink))
+	require.NoError(t, tracking.Close())
+	return wc
+}
+
+func TestSessionEndedOnceTheSessionCannotBeRejoined(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	wc := attachThenLeave(t, director)
+
+	// While the worker still waits for the client, the session has not ended.
+	require.Eventually(t, func() bool { return invoker.lookups.Load() >= 3 }, 5*time.Second, time.Millisecond)
+	assert.Empty(t, ofType(received(), eventTypeSessionEnded))
+
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	lookups := invoker.lookups.Load()
+	assert.Never(t, func() bool { return invoker.lookups.Load() > lookups }, 50*time.Millisecond, 5*time.Millisecond,
+		"kept watching after the session ended")
+	publisher.Close()
+
+	ended := single(t, received(), eventTypeSessionEnded)
+	assert.Equal(t, wc.RequestId.String(), ended["resourceid"])
+	assert.Equal(t, "nca-1", ended["ncaid"])
+	assert.Equal(t, testFunctionVersionId, ended["functionversionid"])
+	assert.Equal(t, map[string]any{"schema_version": float64(1), "request_id": wc.RequestId.String()}, ended["data"])
+}
+
+func TestSessionEndNotWatchedWithoutALedger(t *testing.T) {
+	director, invoker := newWatchingDirector(t, nil)
+	attachThenLeave(t, director)
+	assert.Never(t, func() bool { return invoker.lookups.Load() > 0 }, 100*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestSessionEndWatchStopsOnClose(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	attachThenLeave(t, director)
+	require.Eventually(t, func() bool { return invoker.lookups.Load() > 0 }, 5*time.Second, time.Millisecond)
+
+	require.NoError(t, director.Close())
+	// One lookup may already be in flight.
+	lookups := invoker.lookups.Load()
+	assert.Never(t, func() bool { return invoker.lookups.Load() > lookups+1 }, 100*time.Millisecond, 5*time.Millisecond)
+	publisher.Close()
+	assert.Empty(t, ofType(received(), eventTypeSessionEnded))
+}
+
+func TestSessionEndNotReportedWhileRegistrationNotYetPublished(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionRegistrationGrace = time.Hour
+	invoker.resumable.Store(false)
+	attachThenLeave(t, director)
+
+	require.Eventually(t, func() bool { return invoker.lookups.Load() >= 5 }, 5*time.Second, time.Millisecond)
+	assert.Empty(t, ofType(received(), eventTypeSessionEnded), "an unpublished registration is not an ended session")
+
+	// Once seen, its removal does end the session.
+	invoker.resumable.Store(true)
+	lookups := invoker.lookups.Load()
+	require.Eventually(t, func() bool { return invoker.lookups.Load() > lookups+1 }, 5*time.Second, time.Millisecond)
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+}
+
+func TestSessionEndReportedWhenRegistrationNeverAppears(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionRegistrationGrace = 30 * time.Millisecond
+	invoker.resumable.Store(false)
+	attachThenLeave(t, director)
+
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+}
+
+func TestSessionEndWatchRenewedByLaterDeparture(t *testing.T) {
+	publisher, received := newRecordingLedger(t)
+	director, invoker := newWatchingDirector(t, publisher)
+	director.sessionEndWatchLimit = 150 * time.Millisecond
+	wc := attachThenLeave(t, director)
+
+	// The client keeps rejoining and leaving, each departure renewing the one
+	// watcher, so it outlives the original deadline.
+	for range 8 {
+		time.Sleep(50 * time.Millisecond)
+		director.watchSessionEnd(wc)
+	}
+	_, running := director.sessionWatches.Load(wc.RequestId)
+	assert.True(t, running, "watch expired despite later departures")
+
+	// The session then ends while that watcher is still the one watching.
+	invoker.resumable.Store(false)
+	require.Eventually(t, func() bool {
+		return len(ofType(received(), eventTypeSessionEnded)) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	publisher.Close()
+	assert.Len(t, ofType(received(), eventTypeSessionEnded), 1, "one watcher per request id")
 }

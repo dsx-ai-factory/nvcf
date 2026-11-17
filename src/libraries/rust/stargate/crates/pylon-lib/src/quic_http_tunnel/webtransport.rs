@@ -155,6 +155,14 @@ impl TunnelRequestTransport for WebTransportTunnelTransport<'_> {
         stargate_protocol::finish_webtransport_http_stream(self.send_stream)
             .context("failed to finish WebTransport response stream")
     }
+
+    fn response_stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+        let stopped = self.send_stream.stopped();
+        async move {
+            // A stop code, a reset, and a lost connection all end the response.
+            let _ = stopped.await;
+        }
+    }
 }
 
 async fn handle_webtransport_http_stream(
@@ -264,6 +272,7 @@ mod tests {
         HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     };
 
+    use super::super::UpstreamBackend;
     use super::super::core::{PylonRetryConfig, build_response_headers};
 
     fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -277,25 +286,28 @@ mod tests {
     fn webtransport_success_head_keeps_retry_metadata() {
         let retry = PylonRetryConfig::default();
         let mut upstream_headers = HeaderMap::new();
-        upstream_headers.insert(
-            retry.upstream_retry_header.clone(),
-            HeaderValue::from_static("true"),
-        );
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
 
-        let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .expect("WebTransport success headers should build");
+        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .expect("WebTransport success headers should build");
         let head = webtransport_response_head(status, headers);
 
-        assert_eq!(head.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(head.status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             header_value(&head.headers, HEADER_STARGATE_RETRYABLE),
             "true"
         );
         assert_eq!(
             header_value(&head.headers, HEADER_STARGATE_RETRY_REASON),
-            "upstream_admission_rejected"
+            "upstream_unavailable"
         );
         assert_eq!(
             header_value(&head.headers, "x-stargate-retry-after-ms"),

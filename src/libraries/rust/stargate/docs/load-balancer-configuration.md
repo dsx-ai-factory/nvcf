@@ -116,11 +116,52 @@ Choose based on the routing goal and available backend statistics:
 | --- | --- | --- |
 | Compare a small random sample using TTFT or another load signal. | `power-of-n` | Signals required by the configured comparator. |
 | Minimize estimated time to first token across heterogeneous or remote clusters while controlling which TTFT bands are eligible. | `wait-and-widen` | Forwarded health RTT and model statistics. Valid `last_mean_input_tps` is needed when queued or request input work is nonzero. |
-| Keep the same prefix on a stable, capacity-weighted cluster. | `pulsar` | Positive finite `max_input_tps` for every participating cluster by default. |
+| Keep the same prefix on a stable, capacity-weighted cluster. | `pulsar` | Positive finite `max_input_tps`, or `last_mean_input_tps` when the maximum is absent. |
 | Keep Pulsar affinity when possible, then widen through the Pulsar ranking when the primary is full or cannot meet queue policy. | `pulsar-wait-and-widen` | Pulsar capacity plus the RTT and queue statistics used by `wait-and-widen`. |
 
 Use `round-robin` for deterministic cycling and `random` for uniform random
 selection when routing should not depend on backend load statistics.
+
+## Algorithms that use the cache-affinity key
+
+| Algorithm | Uses `x-cache-affinity-key` |
+| --- | --- |
+| `pulsar`, `pulsar-wait-and-widen` | Yes. |
+| `wait-and-widen` | Only when `cache_affinity_backend_selection_count` is above `0`. |
+| `power-of-n`, `round-robin`, `random` | No. |
+
+Legacy names, such as `groq-multiregion` for `wait-and-widen`, follow their
+algorithm. Without an affinity group, requests with the same key can go to
+different clusters and miss the prefix cache.
+
+For example, this `wait-and-widen` expression keeps one key on one cluster:
+
+```text
+wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
+```
+
+The affine cluster is full when its active requests reach
+`max_engine_concurrency` plus `max_queued`. In this example, if it stays full
+for 200 ms, the request can go to another cluster. If `max_engine_concurrency`
+is `0` (unknown), the cluster never counts as full. If it is above the engine's
+real capacity, the cluster counts as full only after requests queue inside the
+engine. See
+[Runtime stats interface](runtime-stats-interface.md#concurrency-fallback).
+
+### Audit key use
+
+The info log `proxying request`, written once per proxy attempt, has these
+fields:
+
+- `model_id`
+- `requested_algorithm`: the `x-routing-method` value, empty without the
+  header.
+- `routing_algorithm`: the canonical algorithm name.
+- `request.cache_affinity_key_present`: a request span field.
+
+A keyed request ignores the key when its algorithm does not use it, as listed
+above. For `wait-and-widen`, check that `requested_algorithm` sets
+`cache_affinity_backend_selection_count`.
 
 ## `power-of-n`
 
@@ -261,34 +302,48 @@ Example with a 200 ms affinity wait and a 10 percent prefill estimate:
 key, model ID, cache affinity key, and cluster ID. The weight is the cluster's
 positive finite `max_input_tps` by default. Pylon retains this maximum for the
 model generation. Lower live throughput does not reduce the weight or change
-the base ranking. A new maximum, membership change, or generation replacement
+the base ranking while the maximum is present. Without an aggregate maximum,
+clusters use positive finite `last_mean_input_tps` instead. This includes older
+producers and relays, and current Pylons before a max-eligible sample arrives
+or whose request stats never establish a maximum. A new maximum, membership
+change, or generation replacement
 can change the ranking.
 
 Both Pulsar variants accept `rendezvous_weight`:
 
 | Value | Behavior |
 |---|---|
-| `max-input-tps` | Default. Use the generation maximum. Missing or invalid maximum data makes the cluster ineligible; there is no fallback to the mean. |
+| `max-input-tps` | Default. Use the aggregate generation maximum; fall back to the last mean when it is absent. Cluster aggregation treats a missing or invalid backend maximum as absent. |
 | `last-mean-input-tps` | Explicit legacy mode. Use the last valid mean, which can change during traffic. |
 
 Queue and prefill estimates continue to use `last_mean_input_tps` in either mode.
 See [multi-backend clusters](multi-backend-clusters.md) for how a shared-engine
 cluster aggregates the maximum.
 
-Upgrade all Pylons and any registration relays, including
-`stargate-k8s-router`, before enabling maximum-based Stargates. Older relays
-decode and re-encode registrations without preserving the new field. Older
-Pylons omit it and make that cluster ineligible in the new
-default mode. Use explicit `last-mean-input-tps` during a mixed-version rollout
-if Pylons cannot be upgraded first.
+Stargate can upgrade before Pylons and registration relays, including
+`stargate-k8s-router`: missing maximum data retains mean-based routing.
+Older relays decode and re-encode registrations without preserving the new
+field. Upgrade those relays and Pylons to enable stable maximum-based weights.
+Existing function versions retain the Pylon image captured at creation.
+Replacing pods or redeploying the same version does not apply a new image.
+After updating the control plane, create and deploy a new function version.
+See [LLM function enablement](../../../../../docs/self-managed/llm-function-enablement.md).
+Mean-based fallback weights can change during traffic until then.
+The fallback also applies to current Pylons without an established maximum.
+For shared clusters, one backend with missing or invalid maximum data clears
+the aggregate maximum, so the whole cluster uses its summed mean. This can
+change its weight relative to clusters with a known maximum. A fallback mean
+can count cached prompt tokens as prefill and inflate the weight relative to
+peers with calibrated maxima. The selected request span records
+`selected_inst.pulsar_weight_source`: `max-input-tps`,
+`last-mean-input-tps-fallback`, or explicit `last-mean-input-tps`. Use it with
+`selected_cluster.id` to identify traffic using fallback weights.
 
 `rendezvous_weight` is a field of a detailed algorithm configuration object.
 The top-level `default`, an algorithm name in `models` or `request_algorithms`,
-and the built-in defaults always use `max-input-tps`. For a mixed-version
-rollout, give each Pulsar entry in `models` and `request_algorithms` a detailed
-object that sets `last-mean-input-tps`. If `default` is `pulsar` or
-`pulsar-wait-and-widen`, also list every Pulsar-routed model under `models`, or
-move `default` to another algorithm.
+and the built-in defaults use `max-input-tps` with the same missing-data
+fallback. To keep mean-based weights after maximum telemetry becomes
+available, set `last-mean-input-tps` in each detailed Pulsar configuration.
 
 Retries walk the same ranking after excluding failed clusters. When
 `consider_kv_free_tokens` is enabled, a ranked candidate is skipped when it

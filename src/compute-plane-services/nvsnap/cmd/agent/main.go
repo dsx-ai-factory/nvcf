@@ -178,7 +178,7 @@ func main() {
 	// once the rox PVC binds; kubelet may stall in
 	// ContainerCreating in the meantime).
 	// One-downloader-per-hash admission election for chart-shaped model
-	// workloads (docs/design/helm-chart-cache-election.md). Needs L2.
+	// workloads (docs/ARCHITECTURE.md, section 7). Needs L2.
 	flag.BoolVar(&config.Election.Enabled, "election", false,
 		"Elect one capture leader per cache hash at admission and gate the other model workers until the capture is promoted (needs L2)")
 	flag.DurationVar(&config.Election.Deadline, "election-deadline", 0,
@@ -222,6 +222,9 @@ func main() {
 
 	flag.Int64Var(&config.CRIUGhostLimit, "criu-ghost-limit", 0,
 		"Largest deleted file, in bytes, a CRIU dump saves (criu --ghost-limit), such as an engine's CPU KV-cache tier in /dev/shm; 0 is 1 TiB.")
+
+	flag.IntVar(&config.CRIUMinDriverMajor, "criu-min-driver-major", 0,
+		"Oldest NVIDIA driver major CRIU captures and restores on; with any GPU node older, or the GPU nodes on different majors, GPU pods fall back to the cachedir. 0 is 610.")
 
 	flag.BoolVar(&config.RestoreCapturedAddress, "restore-captured-address", false,
 		"Give a restored pod its captured pod address on its loopback, translated to its new address at its edge, when no other pod uses that address, so sockets opened after the restore can use it (docs/design/RESTORE-POD-ADDRESS.md).")

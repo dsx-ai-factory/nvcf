@@ -66,6 +66,8 @@ tokenization are not gateway-owned surfaces.
 When a request is forwarded to Stargate, the gateway emits routing headers for
 the selected function/model and estimated prompt size, including
 `x-routing-key`, `x-model`, `x-input-tokens`, and `x-token-estimate`.
+On every route it removes `Authorization`, `X-Api-Key`, `Proxy-Authorization`,
+and `Cookie`, because caller credentials authorize NVCF, not the model server.
 
 For OpenAI-compatible multi-turn stickiness, chat completions and responses
 accept `prompt_cache_key` and return the selected session value in

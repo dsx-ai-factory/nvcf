@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# NvSnap alerts, in Prometheus rule-file form: templates/prometheus-rules.yaml
+# renders these groups into a PrometheusRule, and prometheus-rules.test.yaml
+# unit-tests them (files/test-rules.sh runs promtool). Each alert's runbook
+# entry is docs/operate/RUNBOOK.md#<alert name, lower case>.
+#
+# Severity: every alert is "info" until the service's on-call decides which
+# page (an open question for SRE, not a choice made here).
+#
+# The counters are created at zero before their first event
+# (internal/metrics/first_sight.go), so increase() counts every event,
+# a node's first one included.
+groups:
+  - name: nvsnap.agents
+    rules:
+      # No agent scraped at all: every other alert here would stay silent.
+      - alert: NvsnapAgentMetricsMissing
+        expr: absent(up{job="nvsnap-agent"} == 1)
+        for: 15m
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: No NvSnap agent has been scraped for 15 minutes.
+          description: >-
+            Prometheus has no up series of a reachable nvsnap-agent. Either
+            NvSnap is not running or its ServiceMonitor is not being read;
+            none of the other NvSnap alerts can fire meanwhile.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapagentmetricsmissing
+      - alert: NvsnapAgentDown
+        expr: up{job="nvsnap-agent"} == 0
+        for: 15m
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: NvSnap agent {{ $labels.pod }} has not been scraped for 15 minutes.
+          description: >-
+            Pods on this node are not captured or restored, and a restored
+            instance's teardown on it is not driven.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapagentdown
+      - alert: NvsnapWebhookErrors
+        expr: sum(rate(nvsnap_webhook_requests_total{code!~"2.."}[10m])) > 0
+        for: 10m
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: The NvSnap admission webhook has answered with errors for 10 minutes.
+          description: >-
+            The webhook fails open: pods it errors on start cold, without
+            NvSnap ({{ $value | humanize }} errors/s).
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapwebhookerrors
+      - alert: NvsnapAdmissionMissed
+        expr: sum by (reason) (increase(nvsnap_admissions_total{decision="missed"}[1h])) > 0
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: "Pods of a captured instance started without NvSnap: {{ $labels.reason }}."
+          description: >-
+            The agents found ranks of an instance the webhook never mutated
+            (it failed open, or the pod opts out) in the last hour; those
+            ranks start cold.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapadmissionmissed
+
+  - name: nvsnap.restores
+    rules:
+      - alert: NvsnapRestoreFailed
+        expr: sum by (reason, gpu, ranks) (increase(nvsnap_restore_outcomes_total{outcome="failed"}[30m])) > 0
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: "An NvSnap restore failed ({{ $labels.reason }}, {{ $labels.gpu }}, {{ $labels.ranks }} ranks)."
+          description: >-
+            A restore ran and failed in the last 30 minutes; its pods are
+            replaced and start again. Restores on a GPU the probe found
+            faulty are counted as gpu-fault, not here.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnaprestorefailed
+      - alert: NvsnapRestoreNotRunRepeatedly
+        expr: sum by (reason, gpu, ranks) (increase(nvsnap_restore_outcomes_total{outcome="not-run"}[30m])) >= 3
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: "NvSnap restores could not run 3 or more times in 30 minutes ({{ $labels.reason }})."
+          description: >-
+            A restore that cannot run (its checkpoint could not be fetched,
+            its placeholders never ran) is tried again with new pods; this
+            many in a row means it is not getting anywhere.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnaprestorenotrunrepeatedly
+      # The 10-minute teardown hang (IMEX loss once the leader exits) ends
+      # here: a restored rank killed at the end of its grace period.
+      - alert: NvsnapTeardownKilled
+        expr: sum by (gpu, ranks) (increase(nvsnap_teardown_outcomes_total{outcome="deadline"}[30m])) > 0
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: "A restored NvSnap rank was killed before its peers exited ({{ $labels.gpu }}, {{ $labels.ranks }} ranks)."
+          description: >-
+            Its grace period ran out while the group teardown waited for
+            every rank of the restore to exit. Its GPUs may come back only
+            after the driver recovers them.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapteardownkilled
+
+  - name: nvsnap.captures
+    rules:
+      - alert: NvsnapCaptureFailed
+        # workload_exited and no_gpu_process are the workload's own doing
+        # (it ended during the capture, or had nothing on the GPU).
+        expr: sum by (outcome, reason, gpu, ranks) (increase(nvsnap_capture_outcomes_total{outcome=~"failed|gpushare-failed|unverified", reason!~"workload_exited|no_gpu_process"}[1h])) > 0
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: "An NvSnap capture ended {{ $labels.outcome }} ({{ $labels.gpu }}, {{ $labels.ranks }} ranks)."
+          description: >-
+            failed: the capture itself failed. gpushare-failed: the pod never
+            started under the GPU library. unverified: the capture restored
+            but its pods never served. The configuration's next deployment
+            captures again, up to its limit.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapcapturefailed
+
+  - name: nvsnap.inventory
+    rules:
+      # Fires on missing data too: no agent holds the inventory Lease, or
+      # none exports its scan time.
+      - alert: NvsnapInventoryStale
+        expr: (time() - max(nvsnap_inventory_scan_timestamp_seconds) > 600) or absent(nvsnap_inventory_leader == 1)
+        for: 10m
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: The NvSnap capture-record inventory has not been updated for 10 minutes.
+          description: >-
+            No agent exports the inventory of capture records, or its scans
+            fail: the cached-capture panels show stale or no data.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapinventorystale
+      # A capture's verifying restore follows its capture at once, and its
+      # pods serve within restoredServeDeadline (20 min); a namespace that
+      # goes first marks it abandoned. Verifying for 3 hours is stuck.
+      - alert: NvsnapCaptureStuckVerifying
+        expr: max(nvsnap_capture_record_oldest_seconds{state="verifying"}) > 3 * 3600
+        for: 15m
+        labels:
+          severity: info
+          service: nvsnap
+        annotations:
+          summary: An NvSnap capture has been verifying for {{ $value | humanizeDuration }}.
+          description: >-
+            Its namespace still runs, and no restore of it has served or
+            failed. Until it does, only that namespace restores from it.
+          runbook_url: https://github.com/NVIDIA/nvcf/blob/main/src/compute-plane-services/nvsnap/docs/operate/RUNBOOK.md#nvsnapcapturestuckverifying

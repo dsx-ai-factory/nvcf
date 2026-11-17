@@ -29,9 +29,9 @@ use stargate_protocol::common::{connection_header_names, is_hop_by_hop_header};
 use stargate_protocol::tunnel_contract::{
     HEADER_MODEL, HEADER_STARGATE_ERROR_CODE, HEADER_STARGATE_EXPECTED_QUEUE_MS,
     HEADER_STARGATE_RETRY_AFTER_MS, HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
-    HEADER_STARGATE_UPSTREAM_RETRYABLE, RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED,
-    RETRY_REASON_QUEUE_ESTIMATE_MISMATCH, RETRY_REASON_UPSTREAM_ADMISSION_REJECTED,
-    is_internal_control_header,
+    RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED, RETRY_REASON_QUEUE_ESTIMATE_MISMATCH,
+    RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
+    RETRY_REASON_UPSTREAM_UNAVAILABLE, is_internal_control_header,
 };
 use stargate_telemetry::{
     inject_trace_context, parent_context_from_headers, traceparent_from_headers,
@@ -85,8 +85,6 @@ pub(super) const WEBTRANSPORT_STREAM_HEADER_TIMEOUT: Duration = Duration::from_s
 #[derive(Clone, Debug)]
 pub struct PylonRetryConfig {
     pub retryable_upstream_status_codes: Vec<StatusCode>,
-    pub require_upstream_retry_header: bool,
-    pub upstream_retry_header: HeaderName,
     pub propagate_retry_after: bool,
     pub local_connect_failures_retryable: bool,
 }
@@ -95,11 +93,9 @@ impl Default for PylonRetryConfig {
     fn default() -> Self {
         Self {
             retryable_upstream_status_codes: vec![
-                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::from_u16(529).expect("529 is a valid HTTP status code"),
                 StatusCode::SERVICE_UNAVAILABLE,
             ],
-            require_upstream_retry_header: true,
-            upstream_retry_header: HeaderName::from_static(HEADER_STARGATE_UPSTREAM_RETRYABLE),
             propagate_retry_after: true,
             local_connect_failures_retryable: false,
         }
@@ -580,6 +576,10 @@ pub(super) trait TunnelRequestTransport: ResponseBodyEventSink {
     async fn send_response_head(&mut self, status: StatusCode, headers: HeaderMap) -> Result<()>;
 
     async fn finish_response(&mut self) -> Result<()>;
+
+    /// Completes when nobody will read the response: the tunnel peer stopped or
+    /// reset the stream, or the connection is gone.
+    fn response_stopped(&self) -> impl Future<Output = ()> + Send + 'static;
 }
 
 async fn send_complete_response(
@@ -619,6 +619,7 @@ async fn relay_upstream_response(
         status,
         response.headers(),
         &app.retry,
+        app.upstream_backend,
         app.metrics.as_deref(),
         &app.inference_server_id,
     )
@@ -869,20 +870,31 @@ pub(super) async fn forward_tunnel_request(
     let priority = lifecycle
         .as_ref()
         .and_then(|lifecycle| lifecycle.required.priority);
-    let response = match send_upstream_request(
-        app,
-        lifecycle.as_mut(),
-        UpstreamRequestParts {
-            method,
-            path_and_query: &path_and_query,
-            headers: &request_headers,
-            body: body_bytes,
-            health_request,
-            priority,
-        },
-    )
-    .await
-    {
+    // A queued or reasoning backend can write nothing for minutes, so a failed write
+    // is too late to notice an abandoned request. Watch for the stop directly.
+    let response_stopped = transport.response_stopped();
+    tokio::pin!(response_stopped);
+    let upstream_result = tokio::select! {
+        result = send_upstream_request(
+            app,
+            lifecycle.as_mut(),
+            UpstreamRequestParts {
+                method,
+                path_and_query: &path_and_query,
+                headers: &request_headers,
+                body: body_bytes,
+                health_request,
+                priority,
+            },
+        ) => result,
+        () = &mut response_stopped => {
+            if let Some(lifecycle) = lifecycle.as_mut() {
+                lifecycle.cancel();
+            }
+            return Err(anyhow!("tunnel peer stopped the response stream"));
+        }
+    };
+    let response = match upstream_result {
         Ok(response) => response,
         Err(error) if matches!(&error, UpstreamRequestError::Send(source) if source.is_connect()) =>
         {
@@ -907,8 +919,13 @@ pub(super) async fn forward_tunnel_request(
         }
     };
 
-    let outcome = match relay_upstream_response(app, lifecycle.as_mut(), response, transport).await
-    {
+    let relay_result = tokio::select! {
+        result = relay_upstream_response(app, lifecycle.as_mut(), response, transport) => result,
+        () = &mut response_stopped => Err(ResponseRelayError::Downstream(anyhow!(
+            "tunnel peer stopped the response stream"
+        ))),
+    };
+    let outcome = match relay_result {
         Ok(outcome) => outcome,
         Err(ResponseRelayError::Upstream(error)) => {
             if let Some(lifecycle) = lifecycle.as_mut() {
@@ -982,7 +999,7 @@ async fn send_upstream_request(
     let mut upstream_headers = HeaderMap::with_capacity(request_headers.len());
     let connection_headers = connection_header_names(request_headers);
     for (name, value) in request_headers {
-        if should_forward_header(name, &app.retry) && !connection_headers.contains(name) {
+        if should_forward_header(name) && !connection_headers.contains(name) {
             upstream_headers.append(name, value.clone());
         }
     }
@@ -1247,21 +1264,16 @@ pub(super) fn build_response_headers(
     status: StatusCode,
     response_headers: &HeaderMap,
     retry: &PylonRetryConfig,
+    upstream_backend: UpstreamBackend,
     metrics: Option<&PylonMetrics>,
     inference_server_id: &str,
 ) -> Result<HeaderMap> {
     let mut header_frame = HeaderMap::new();
-    let upstream_retry_header_present = response_headers
-        .get(&retry.upstream_retry_header)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    let status_retryable = retry.retryable_upstream_status_codes.contains(&status);
-    let retryable =
-        status_retryable && (!retry.require_upstream_retry_header || upstream_retry_header_present);
-    let reason = if retryable {
-        RETRY_REASON_UPSTREAM_ADMISSION_REJECTED
-    } else if status_retryable {
-        "missing_upstream_retry_header"
+    let backend_error_reason =
+        backend_error_retry_reason(status, response_headers, retry, upstream_backend);
+    let retryable = backend_error_reason.is_some();
+    let reason = if let Some(reason) = backend_error_reason {
+        reason
     } else if !status.is_success() {
         "upstream_nonretryable_status"
     } else {
@@ -1272,7 +1284,6 @@ pub(super) fn build_response_headers(
         upstream.status = status.as_u16(),
         tunnel.retryable = retryable,
         tunnel.retry_reason = reason,
-        upstream.retry_header_present = upstream_retry_header_present,
         "classified upstream response"
     );
     if !status.is_success() {
@@ -1280,11 +1291,7 @@ pub(super) fn build_response_headers(
     }
 
     if retryable {
-        insert_retry_metadata(
-            &mut header_frame,
-            true,
-            RETRY_REASON_UPSTREAM_ADMISSION_REJECTED,
-        );
+        insert_retry_metadata(&mut header_frame, true, reason);
         if retry.propagate_retry_after
             && let Some(retry_after_ms) = retry_after_millis(response_headers)
         {
@@ -1297,11 +1304,36 @@ pub(super) fn build_response_headers(
     }
     let connection_headers = connection_header_names(response_headers);
     for (name, value) in response_headers {
-        if should_forward_response_header(name, retry) && !connection_headers.contains(name) {
+        if should_forward_response_header(name) && !connection_headers.contains(name) {
             header_frame.append(name, value.clone());
         }
     }
     Ok(header_frame)
+}
+
+/// The response head is classified before any output is relayed, so these
+/// model server refusals are safe to retry on another instance.
+fn backend_error_retry_reason(
+    status: StatusCode,
+    response_headers: &HeaderMap,
+    retry: &PylonRetryConfig,
+    upstream_backend: UpstreamBackend,
+) -> Option<&'static str> {
+    let listed = retry.retryable_upstream_status_codes.contains(&status);
+    match status.as_u16() {
+        529 if listed => Some(RETRY_REASON_UPSTREAM_OVERLOADED),
+        // Dynamo answers an empty 404 once the model has left its registry; a
+        // 404 with a body is the model server's own answer to the request.
+        404 if upstream_backend == UpstreamBackend::Dynamo
+            && response_headers
+                .get(CONTENT_LENGTH)
+                .is_some_and(|value| value.as_bytes() == b"0") =>
+        {
+            Some(RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED)
+        }
+        _ if listed => Some(RETRY_REASON_UPSTREAM_UNAVAILABLE),
+        _ => None,
+    }
 }
 
 fn retry_after_millis(response_headers: &HeaderMap) -> Option<u64> {
@@ -1455,8 +1487,8 @@ pub(super) fn join_base_path(base: &str, path_and_query: &str) -> Result<url::Ur
     .context("join upstream path failed")
 }
 
-pub(super) fn should_forward_header(name: &HeaderName, retry: &PylonRetryConfig) -> bool {
-    !is_tunnel_control_header(name, retry)
+pub(super) fn should_forward_header(name: &HeaderName) -> bool {
+    !is_tunnel_control_header(name)
         && !backend::dynamo::is_stripped_engine_header(name)
         && !matches!(
             name.as_str(),
@@ -1464,15 +1496,13 @@ pub(super) fn should_forward_header(name: &HeaderName, retry: &PylonRetryConfig)
         )
 }
 
-pub(super) fn should_forward_response_header(name: &HeaderName, retry: &PylonRetryConfig) -> bool {
-    !is_tunnel_control_header(name, retry) && name != CONTENT_LENGTH
+pub(super) fn should_forward_response_header(name: &HeaderName) -> bool {
+    !is_tunnel_control_header(name) && name != CONTENT_LENGTH
 }
 
-fn is_tunnel_control_header(name: &HeaderName, retry: &PylonRetryConfig) -> bool {
+fn is_tunnel_control_header(name: &HeaderName) -> bool {
     // HeaderName is normalized, so this policy stays allocation-free on both hot paths.
-    name == retry.upstream_retry_header
-        || is_hop_by_hop_header(name)
-        || is_internal_control_header(name)
+    is_hop_by_hop_header(name) || is_internal_control_header(name)
 }
 
 #[cfg(test)]
@@ -1482,7 +1512,9 @@ mod tests {
     use axum::response::Response as AxumResponse;
     use axum::routing::post;
     use stargate_proto::pb::InferenceServerStatus;
-    use stargate_protocol::tunnel_contract::{HEADER_INPUT_TOKENS, HEADER_REQUEST_ID};
+    use stargate_protocol::tunnel_contract::{
+        HEADER_INPUT_TOKENS, HEADER_REQUEST_ID, HEADER_STARGATE_UPSTREAM_RETRYABLE,
+    };
 
     use crate::test_support::TestHttpServer;
 
@@ -1587,12 +1619,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.text().await.unwrap(), "ok");
-        let forwarded =
-            build_response_headers(StatusCode::OK, &headers, &app.retry, None, "header-test")
-                .unwrap();
+        let forwarded = build_response_headers(
+            StatusCode::OK,
+            &headers,
+            &app.retry,
+            app.upstream_backend,
+            None,
+            "header-test",
+        )
+        .unwrap();
         assert_eq!(forwarded.len(), 1);
         assert_eq!(forwarded["x-end-to-end"], "preserved");
         server.shutdown().await;
+    }
+
+    #[test]
+    fn backend_errors_before_output_are_marked_retryable() {
+        use UpstreamBackend::{Dynamo, Passthrough};
+        const DEFAULT: &[u16] = &[529, 503];
+        const WITH_429: &[u16] = &[529, 503, 429];
+        const WITHOUT_529: &[u16] = &[503];
+        const EMPTY: &[u16] = &[];
+        // (label, backend mode, retryable status list, status, content-length,
+        // backend sends x-stargate-upstream-retryable (no effect), expected
+        // retry reason)
+        #[rustfmt::skip] // one case per line
+        let cases = [
+            ("overloaded", Dynamo, DEFAULT, 529, Some("120"), false, Some("upstream_overloaded")),
+            ("passthrough_overloaded", Passthrough, DEFAULT, 529, Some("120"), false, Some("upstream_overloaded")),
+            ("not_ready", Dynamo, DEFAULT, 503, Some("80"), false, Some("upstream_unavailable")),
+            ("not_ready_with_header", Dynamo, DEFAULT, 503, Some("80"), true, Some("upstream_unavailable")),
+            ("model_unregistered", Dynamo, DEFAULT, 404, Some("0"), false, Some("upstream_model_unregistered")),
+            ("passthrough_empty_404", Passthrough, DEFAULT, 404, Some("0"), false, None),
+            ("model_not_found", Dynamo, DEFAULT, 404, Some("63"), false, None),
+            ("chunked_404", Dynamo, DEFAULT, 404, None, false, None),
+            ("server_error", Dynamo, DEFAULT, 500, Some("90"), false, None),
+            ("bad_gateway", Dynamo, DEFAULT, 502, Some("20"), false, None),
+            ("gateway_timeout", Dynamo, DEFAULT, 504, Some("20"), false, None),
+            ("rate_limited", Dynamo, DEFAULT, 429, Some("20"), false, None),
+            ("rate_limited_with_header", Dynamo, DEFAULT, 429, Some("20"), true, None),
+            ("bad_request", Dynamo, DEFAULT, 400, Some("20"), false, None),
+            ("ok", Dynamo, DEFAULT, 200, Some("20"), false, None),
+            ("listed_429", Dynamo, WITH_429, 429, Some("20"), false, Some("upstream_unavailable")),
+            ("empty_list_overloaded", Dynamo, EMPTY, 529, Some("120"), false, None),
+            ("empty_list_not_ready", Dynamo, EMPTY, 503, Some("80"), false, None),
+            ("empty_list_model_unregistered", Dynamo, EMPTY, 404, Some("0"), false, Some("upstream_model_unregistered")),
+            ("unlisted_529", Dynamo, WITHOUT_529, 529, Some("120"), false, None),
+            ("listed_503_without_529", Dynamo, WITHOUT_529, 503, Some("80"), false, Some("upstream_unavailable")),
+        ];
+        for (label, upstream_backend, list, status, content_length, has_header, expected_reason) in
+            cases
+        {
+            let mut upstream = HeaderMap::new();
+            if let Some(content_length) = content_length {
+                upstream.insert(CONTENT_LENGTH, HeaderValue::from_static(content_length));
+            }
+            if has_header {
+                upstream.insert(
+                    HEADER_STARGATE_UPSTREAM_RETRYABLE,
+                    HeaderValue::from_static("true"),
+                );
+            }
+            let retry = PylonRetryConfig {
+                retryable_upstream_status_codes: list
+                    .iter()
+                    .map(|code| StatusCode::from_u16(*code).unwrap())
+                    .collect(),
+                ..PylonRetryConfig::default()
+            };
+            let metrics = PylonMetrics::new().expect("metrics should initialize");
+            let forwarded = build_response_headers(
+                StatusCode::from_u16(status).unwrap(),
+                &upstream,
+                &retry,
+                upstream_backend,
+                Some(&metrics),
+                "inst-a",
+            )
+            .unwrap();
+            let header = |name| forwarded.get(name).map(|value| value.to_str().unwrap());
+            assert_eq!(
+                header(HEADER_STARGATE_RETRY_REASON),
+                expected_reason,
+                "{label}"
+            );
+            assert_eq!(
+                header(HEADER_STARGATE_RETRYABLE),
+                expected_reason.map(|_| "true"),
+                "{label}"
+            );
+            assert_eq!(header(HEADER_STARGATE_UPSTREAM_RETRYABLE), None, "{label}");
+            let sample = match expected_reason {
+                Some(reason) => format!(
+                    r#"pylon_retryable_responses_total{{inference_server_id="inst-a",reason="{reason}",status="{status}"}} 1"#
+                ),
+                None if status >= 400 => r#"pylon_nonretryable_failures_total{inference_server_id="inst-a",reason="upstream_nonretryable_status"} 1"#.to_string(),
+                None => continue,
+            };
+            let metrics = metrics.gather_text().expect("metrics should encode");
+            assert!(metrics.contains(&sample), "{label}:\n{metrics}");
+        }
     }
 
     #[tokio::test]
@@ -2068,6 +2194,10 @@ mod tests {
                 return Err(anyhow!("client stopped before response completion"));
             }
             Ok(())
+        }
+
+        fn response_stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+            std::future::pending()
         }
     }
 

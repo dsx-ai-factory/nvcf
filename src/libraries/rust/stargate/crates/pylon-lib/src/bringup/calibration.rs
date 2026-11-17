@@ -198,8 +198,6 @@ pub(super) async fn send_calibration_batch(
             "messages": [{"role": "user", "content": calibration_prompt(prompt_units)}],
             "max_tokens": 1,
             "seed": 33,
-            "temperature": 0.7,
-            "top_p": 1.0,
             "stream": false,
         });
         async move {

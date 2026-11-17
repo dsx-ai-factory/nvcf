@@ -31,6 +31,56 @@ cargo fmt --all -- --check
 For other Rust changes, select the affected workspace packages with `-p`.
 For documentation changes, check whitespace and link targets.
 
+## Compatibility contract
+
+Support every stable release published in the past 90 days, using UTC release
+publication timestamps. For relevant changes targeting the default branch, CI
+checks schemas against every supported release from the upstream GitHub release
+inventory, including later backports and the oldest by publication date. Add
+older versions still deployed or needed for rollback to `compatibility_retained_releases.json` before
+they age out. Entries do not expire automatically; remove one only after verified
+migration and closure of its rollback window. Missing release metadata fails CI.
+
+Stargate, Pylon, registration relays, and gateways upgrade independently.
+Preserve registration, discovery, tunnel, HTTP, stats, and configuration
+contracts in both upgrade and rollback directions. Do not add exceptions to
+the protobuf breaking-change check. Deprecate fields and RPCs while keeping
+them functional; use a separately versioned protocol for incompatible changes.
+
+An additive protobuf change can still break routing. Missing new telemetry
+must retain the existing policy's behavior. Gate new requirements behind an
+explicit opt-in or negotiated capability, with a tested legacy mode. Verify
+that relays preserve the new fields before enabling a dependent policy.
+
+Run these from this directory, with Buf installed:
+
+```sh
+scripts/check_buf_breaking.sh origin/main
+python3 -m unittest discover -s scripts -p 'test_check_buf_breaking.py'
+python3 -m unittest discover -s scripts -p 'test_select_compatibility_baseline.py'
+cargo test --locked -p stargate --test compatibility -- --test-threads=1
+```
+
+For maintenance work, use that maintenance branch instead of `origin/main`.
+
+CI checks Stargate schemas against the target base on all branches. The full
+release matrix runs only when targeting the default branch: an older maintenance
+branch need not contain optional fields added in newer releases.
+Gateway server and client copies are checked against the target base only;
+historical gateway release coverage needs separate qualification.
+The Bazel routing test uses frozen released stats fixtures on every branch.
+Compatibility checks run separately from subtree detection and build jobs;
+unrelated docs and Java changes do not contact release services. Extend the
+compatibility test when changing a contract. Cover old-only, new-only, and mixed backends, absent optional stats,
+and streaming completion. Require both backends to serve in the mixed state.
+The test decodes released stats and re-encodes registrations with the current
+client. Backend replacement exercises a return to older stats on the current
+Stargate; historical binaries, relays, and consumer rollback need separate
+tests. Preserve released fixtures. Document the supported policy modes,
+upgrade order, and how existing function launch
+specifications and running Pylons receive an image update. An agent or chart
+upgrade alone does not prove that running function Pylons changed.
+
 ## Mandatory Pull Request validation
 
 Before marking a Pull Request ready or merging, run at least one local, AWS,

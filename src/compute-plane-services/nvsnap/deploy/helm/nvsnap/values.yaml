@@ -102,6 +102,15 @@ agent:
   # saves it whole, so the checkpoint grows by that much. Empty is 1 TiB.
   criuGhostLimit: ""
 
+  # Oldest NVIDIA driver major CRIU captures and restores on. Each agent
+  # reports its node's driver; when any GPU node's is older, or the GPU
+  # nodes run more than one major, GPU pods fall back to the cachedir
+  # instead (fallback reason "driver"). Driver 580 cannot restore the
+  # multicast memory tensor-parallel engines use on NVSwitch systems
+  # (docs/design/GPUSHARE.md). A cluster whose workloads keep multicast
+  # off can lower it. Empty is 610.
+  criuMinDriverMajor: ""
+
   # Give a restored pod the pod address it had when it was captured, on its
   # loopback and translated to its new address at its edge, so sockets the
   # engine opens after the restore can still use it (NCCL opens peer
@@ -131,7 +140,7 @@ agent:
   podCacheDir: "/opt/nvsnap"
 
   # One downloader per cache hash for chart-shaped model workloads
-  # (docs/design/helm-chart-cache-election.md). At admission the
+  # (docs/ARCHITECTURE.md, section 7). At admission the
   # webhook composes the cache hash of every GPU pod that names a model;
   # if a promoted capture exists the pod restores from it, otherwise one
   # pod is elected to capture and the rest are held by a scheduling gate
@@ -173,7 +182,7 @@ agent:
     # captures and caches.
     tenantLabel: ""
 
-  # Compile cache set refresh (docs/design/helm-chart-cache-refresh.md),
+  # Compile cache set refresh (docs/ARCHITECTURE.md, section 7),
   # off by default. When on, a warm rank whose cachedir gained files before
   # it reported Ready (what the next start pays for) proposes a refresh;
   # one agent collects a new generation of the set from the warm ranks and
@@ -181,7 +190,7 @@ agent:
   # refreshCooldown is the least time between generations of one set; a
   # superseded generation with no reader bound is retired about an hour
   # after it is replaced. Turn on per cluster when a measured case needs
-  # it (docs/design/helm-chart-cache-refresh.md records its one run).
+  # it (docs/results/HELM-CHART-CACHE-2026-09.md records its one run).
   cacheVolume:
     refresh: false
     refreshCooldown: 6h
@@ -508,6 +517,22 @@ agent:
         prometheus.agent/servicemonitor-discover: "true"
         nvcf.nvidia.com/observability-target: "true"
       interval: 30s
+    # The NvSnap alerts (files/prometheus-rules.yaml; runbook
+    # docs/operate/RUNBOOK.md) as a Prometheus Operator PrometheusRule.
+    # enabled, namespace and labels work as serviceMonitor's: labels are
+    # what the cluster's Prometheus selects rules by. The default suits a
+    # kube-prometheus-stack Prometheus installed as release prometheus-agent
+    # that evaluates the rules and remote-writes their ALERTS series; where
+    # alerts are routed, and at what severity, is the service on-call's
+    # decision (every alert is "info" until then). A cluster whose
+    # collector evaluates no PrometheusRules (an OpenTelemetry collector,
+    # deploy/stacks/observability) gets no NvSnap alerts from this: load
+    # files/prometheus-rules.yaml into its rule evaluator instead.
+    prometheusRule:
+      enabled: auto
+      namespace: monitoring
+      labels:
+        release: prometheus-agent
     # A Grafana dashboard of the history, as a ConfigMap labelled for the
     # Grafana dashboard sidecar (grafana_dashboard: "1").
     dashboard:
