@@ -59,7 +59,7 @@ flowchart TB
 | Extra pods and volumes for this data | SMB server pod, data PVC, SMB CSI volumes | None |
 | Needs the SMB CSI driver | Yes | No, for this path |
 | File paths seen by the workload | `/var/secrets`, `/var/run/nvcf/info` | The same |
-| How an update reaches the workload | Direct write to the shared mount (not measured) | After the kubelet syncs, about 20 to 80 seconds |
+| How an update reaches the workload | Direct write to the shared mount (not measured) | After the kubelet syncs, observed at 20 to 82 seconds |
 | Still on SMB in this milestone | `/var/task`, model cache | `/var/task`, model cache |
 
 The two backends are selected independently, so operators move one step at a time and can
@@ -130,7 +130,9 @@ and the operator chart values.
 NVCA creates, per function instance, and attaches them to the `StorageRequest` ownership
 lifecycle:
 
-- a runtime Secret, holding the rendered runtime data under the key `secrets.json`;
+- a runtime Secret with two keys, `secrets.json` and `accounts-secrets.json`, one per ESS
+  template that writes under `/var/secrets` today. The BYOO collector reads
+  `/var/secrets/accounts-secrets.json` by default, so native mode has to deliver it;
 - a metadata Secret, holding the metadata credential under the key `self`;
 - a ServiceAccount for the utility workload and a Role that grants only `get` and
   `patch` on those two Secrets through `resourceNames`;
@@ -140,7 +142,8 @@ lifecycle:
 Names are proposed as `<storagerequest>-runtime` and `<storagerequest>-metadata`. This is a
 decision to confirm.
 
-Size budgets: 768 KiB decoded per key and 900 KiB decoded for all keys of one Secret.
+Size budgets: 768 KiB decoded per key and 900 KiB decoded for all keys of one Secret, so the
+two runtime keys share the 900 KiB.
 The Kubernetes API accepts at most 1,048,576 bytes of data per Secret, so the budgets
 leave about 124 KiB of headroom. Writers reject a value over budget before calling the API.
 
@@ -159,8 +162,9 @@ leave about 124 KiB of headroom. Writers reject a value over budget before calli
 ### Readers and mounts
 
 - Instance workloads receive the Secrets as **projected volumes, read-only, mounted as whole
-  directories**. The files appear at `/var/secrets/secrets.json` and
-  `/var/run/nvcf/info/self`, so existing paths stay compatible.
+  directories**. The files appear at `/var/secrets/secrets.json`,
+  `/var/secrets/accounts-secrets.json` and `/var/run/nvcf/info/self`, so existing paths stay
+  compatible.
 - `subPath` mounts are not allowed. A `subPath` file never receives updates (measured below).
 - NVCA applies a typed mount plan, built from `StorageRequest.Status.SharedStorage`, to Pods
   and pod templates in Deployments, ReplicaSets, StatefulSets, Jobs and CronJobs, including
@@ -188,7 +192,7 @@ sequenceDiagram
   W->>CP: request metadata credentials
   CP-->>W: token + expiration (3 h)
   W->>API: patch metadata Secret key (about 10 ms)
-  Note over API,K: kubelet pod sync, typically 20 to 80 s
+  Note over API,K: kubelet pod sync, observed 20 to 82 s
   K->>R: rewrite projected file (atomic symlink swap)
   R->>R: re-read the file on each use
   Note over W: next refresh at 80 percent of lifetime plus jitter
@@ -205,6 +209,9 @@ Two experiments on a local k3d compute cluster, 23 updates in total. The API pat
 | Same, Secret near the size budget (about 690 KB) | 3 | 68 s | 77 s | 82 s |
 | Writer and reader sidecars in one pod, varied phase | 12 | 19.7 s | 44.8 s | 69.0 s |
 
+These are observations from one local cluster, not an upper bound. The 120 second budget is a
+design allowance, not a measured maximum.
+
 Secret size did not change the delay. File replacement is atomic: the kubelet swaps a
 `..data` symlink, so a reader never sees a partial file.
 
@@ -219,9 +226,11 @@ Secret size did not change the delay. File replacement is atomic: the kubelet sw
 4. **Metadata credentials.** The worker refreshes at 80% of the reported lifetime plus up to
    60 seconds of jitter, retrying every minute after a failure
    (`src/libraries/go/worker/token/token.go`). The new value reaches the workload about
-   0.8 x lifetime + jitter + propagation delay after issue. This is safe when
-   `0.2 x lifetime - 60 s` exceeds the propagation budget. The server reports a lifetime of
-   3 hours, which leaves a margin of about 36 minutes. The token's own `exp` is set by the
+   0.8 x lifetime + jitter + propagation delay after issue, plus 60 seconds for every failed
+   refresh attempt before it succeeds. With N failed attempts this is safe when
+   `0.2 x lifetime - 60 s (jitter) - 120 s (propagation budget) - 60 s x N` is positive. The
+   server reports a lifetime of 3 hours, which allows about 33 failed attempts (about 33
+   minutes of failures) before the old token can expire. The token's own `exp` is set by the
    notary service and has not been verified: see Open items. Validation must check the
    real margin before native mode is enabled.
 
@@ -241,14 +250,19 @@ Secret size did not change the delay. File replacement is atomic: the kubelet sw
   new requests.
 - `secretBackend` and `sharedDataBackend` are independent, so `k8s-native` secrets can run
   with SMB-backed task data and model cache.
-- Rollback returns `secretBackend` to `smb`. The rollout guide describes it for both
+- Rollback returns `secretBackend` to `smb` for new requests. An existing `k8s-native` request
+  keeps its backend, so to return a function to SMB, redeploy it: the new deployment creates a
+  new `StorageRequest` under the restored setting, the utility pod writes the files to the SMB
+  volumes as it does today, and the old request and its Secrets are removed with it. Migrating
+  a live request in place is not designed here. The rollout guide describes the steps for both
   SMB backends.
 - Mixed versions need a defined behavior, for example a new ESS agent with an older NVCA. The
   ESS agent keeps supporting `destination`, so an older NVCA is unaffected.
 
 ## Known limitation and workaround
 
-Updates take up to about 80 seconds to appear. For deployments that need faster
+Updates were observed to take 20 to 82 seconds to appear. That is an observed range, not a
+maximum. For deployments that need faster
 propagation, the cluster operator can lower the kubelet `syncFrequency`. That setting is
 node-level, adds sync load, and was not tested for this document, so treat it as optional
 tuning and verify it on your own cluster.
@@ -263,12 +277,15 @@ tuning and verify it on your own cluster.
 ## Open items
 
 - Verify the real `exp` of the signed metadata token on a running function worker.
-- Audit which components read `/var/run/nvcf/info/self` and `/var/secrets/secrets.json`, and
-  confirm that none cache the content.
+- Audit which components read `/var/run/nvcf/info/self`, `/var/secrets/secrets.json` and
+  `/var/secrets/accounts-secrets.json` (including the BYOO collector), and confirm that none
+  cache the content.
 - Confirm the Secret naming scheme.
 - Decide how a workload waits for initial population.
 - Collect encryption-at-rest evidence for a non-local cluster.
 - Define mixed-version behavior across ESS agent, worker and NVCA.
+- Confirm against NVCA's reconcile behavior that redeploying a function is enough to return it
+  to SMB, and write the rollout guide.
 
 ## Source references
 
