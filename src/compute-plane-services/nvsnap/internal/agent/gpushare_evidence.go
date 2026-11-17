@@ -21,8 +21,12 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 )
 
 const (
@@ -168,7 +172,13 @@ func (a *Agent) gpushareFailureEvidence(ctx context.Context, pod *corev1.Pod, lo
 	}
 	var evs []corev1.Event
 	ectx, cancel := context.WithTimeout(ctx, gpushareEvidenceTimeout)
+	ectx, span := tracing.Tracer().Start(ectx, "gpushare.evidence.events", trace.WithSpanKind(trace.SpanKindClient))
 	list, err := a.kubeClient.CoreV1().Events(pod.Namespace).List(ectx, metav1.ListOptions{FieldSelector: "involvedObject.uid=" + string(pod.UID)})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "list the pod's events")
+	}
+	span.End()
 	cancel()
 	if err != nil {
 		log.WithError(err).Info("gpushare: cannot read the failed pod's events; its evidence goes without them")
@@ -184,12 +194,16 @@ func (a *Agent) gpushareFailureEvidence(ctx context.Context, pod *corev1.Pod, lo
 func (a *Agent) logFailedRunTail(ctx context.Context, pod *corev1.Pod, container string, log *logrus.Entry) {
 	lctx, cancel := context.WithTimeout(ctx, gpushareEvidenceTimeout)
 	defer cancel()
+	lctx, span := tracing.Tracer().Start(lctx, "gpushare.evidence.log_tail", trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
 	// The kubelet cuts LimitBytes from the start of the tail; the end, where
 	// a failure says why, is kept here instead. The limit only bounds the
 	// read.
 	b, err := a.kubeClient.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, failedRunLogOptions(pod, container)).DoRaw(lctx)
 	l := log.WithField("container", container)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "read the failed run's log")
 		l.WithError(err).Info("gpushare: cannot read the failed run's log")
 		return
 	}
