@@ -465,6 +465,12 @@ navigation:
   - section: Upgrade Notes
     skip-slug: true
     contents:
+    - page: 1.0.4 to 1.1.1 Upgrade
+      path: ../docs/overview/release-notes/1.0.4-to-1.1.1-upgrade.md
+      slug: 1-0-4-to-1-1-1-upgrade
+    - page: 1.1.0 to 1.1.1 Upgrade
+      path: ../docs/overview/release-notes/1.1.0-to-1.1.1-upgrade.md
+      slug: 1-1-0-to-1-1-1-upgrade
     - page: 1.0.1 to 1.1.0 Upgrade
       path: ../docs/overview/release-notes/1.0.1-to-1.1.0-upgrade.md
       slug: 1-0-1-to-1-1-0-upgrade
