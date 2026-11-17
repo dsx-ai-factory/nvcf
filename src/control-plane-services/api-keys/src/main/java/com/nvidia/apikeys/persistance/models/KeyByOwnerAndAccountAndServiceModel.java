@@ -63,9 +63,11 @@ public class KeyByOwnerAndAccountAndServiceModel {
     @PrimaryKeyColumn(name = COLUMN_OWNER_ID, ordinal = 2, type = PrimaryKeyType.PARTITIONED)
     private String ownerId;
 
+    @NonNull
     @PrimaryKeyColumn(name = COLUMN_ISSUER_SERVICE_ID, ordinal = 3, type = PrimaryKeyType.CLUSTERED)
     private String issuerServiceId;
 
+    @NonNull
     @PrimaryKeyColumn(name = COLUMN_KEY_ID, ordinal = 4, type = PrimaryKeyType.CLUSTERED)
     private String keyId;
 
