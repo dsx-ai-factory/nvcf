@@ -113,6 +113,17 @@ class UpgradeGuide111Checks(unittest.TestCase):
             with self.subTest(baseline=baseline):
                 self.assertIn("dsx-ai-factory/nvcf/issues/3428", self.text(baseline))
 
+    def test_both_guides_upgrade_the_control_plane_before_the_compute_plane(self):
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                text = self.text(baseline)
+                control = text.index("## 4. Apply control-plane stages in order") if baseline == "1.0.4" \
+                    else text.index("## 3. Apply control-plane stages in order")
+                compute = re.search(r"^## \d+\. Upgrade each compute cluster", text, re.M)
+                self.assertIsNotNone(compute)
+                self.assertLess(control, compute.start())
+                self.assertNotIn("Upgrade the existing compute plane", text)
+
     def test_the_104_guide_has_no_hostname_policy_step(self):
         text = self.text("1.0.4")
         self.assertNotIn("apply-hostname-policy", text)
