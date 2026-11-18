@@ -78,6 +78,10 @@ class UpgradeGuide111Checks(unittest.TestCase):
         for requirement in ("Three nodes", "Three zones", "WaitForFirstConsumer", "topology.kubernetes.io/zone"):
             self.assertIn(requirement, prep)
         self.assertIn("#prepare-the-ha-mode-and-configuration", text)
+        # The copy-paste sample must carry the documented default, not the stricter mode.
+        sample = re.search(r"```yaml\nhighAvailability:\n  mode: (\w+)", text)
+        self.assertIsNotNone(sample)
+        self.assertEqual("preferred", sample.group(1))
         # The 1.1.0 baseline already has an HA mode; its guide must not re-decide it.
         self.assertNotIn("highAvailability", self.text("1.1.0"))
 
@@ -99,6 +103,31 @@ class UpgradeGuide111Checks(unittest.TestCase):
                 apply = max(text.find(f"helmfile.d/{stage}.yaml.gotmpl apply"), text.find(f"{stage}.yaml.gotmpl apply"))
                 self.assertGreaterEqual(diff, 0)
                 self.assertLess(diff, apply)
+
+    def helmfile_commands(self, baseline):
+        """Yield (verb, stage file, selector) for each helmfile command, in guide order."""
+        text = re.sub(r"\\\n\s*", " ", self.text(baseline))
+        for line in text.splitlines():
+            if "helmfile.d/" not in line or "--allow-no-matching-release" in line and "-f " not in line:
+                continue
+            stage = re.search(r"helmfile\.d/(\S+?)\.yaml\.gotmpl", line)
+            verb = re.search(r"\b(diff|apply)\b", line)
+            if stage and verb and ("control_helmfile" in line):
+                selector = re.search(r"--selector (\S+)", line)
+                yield verb.group(1), stage.group(1), selector.group(1) if selector else ""
+
+    def test_every_stage_apply_is_preceded_by_a_diff_of_the_same_release_set(self):
+        for baseline in GUIDES:
+            with self.subTest(baseline=baseline):
+                seen = set()
+                applies = 0
+                for verb, stage, selector in self.helmfile_commands(baseline):
+                    if verb == "diff":
+                        seen.add((stage, selector))
+                    elif stage != "04-upgrade-receipt":  # the receipt stage only records a ConfigMap
+                        applies += 1
+                        self.assertIn((stage, selector), seen, f"{stage} {selector} apply has no earlier diff")
+                self.assertGreaterEqual(applies, 3)
 
     def test_no_command_block_runs_a_diff_and_the_apply_together(self):
         for baseline in ("1.1.0",):
