@@ -23,7 +23,11 @@ SPDX-License-Identifier: Apache-2.0
 #include <errno.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/kcmp.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2157,13 +2161,19 @@ static void rdma_files(int *open, int *mapped)
     if (f) fclose(f);
 }
 
-static void do_mx(char *reply, size_t n, const char *op)
+static unsigned ucx_ver[3];
+static int ucx_loaded(void);
+
+/* Run fn(op, fd, host EXTRA) from src in this process's Python ("mx",
+ * "nixl"); EXTRA is more arguments, from this file only. */
+static void do_py(char *reply, size_t n, const char *src, size_t srclen, const char *fn, const char *op,
+                  const char *extra)
 {
     int (*is_init)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "Py_IsInitialized");
     int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
     void (*release)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "PyGILState_Release");
     int (*run)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "PyRun_SimpleString");
-    char out[168] = "err no result", code[sizeof(mx_py) + 400];
+    char out[320] = "err no result";
     const char *host = !strncmp(op, "resume ", 7) ? op + 7 : "";
     int p[2], fds, maps;
     /* HOST goes into Python source: an IP address or DNS name only (a
@@ -2176,17 +2186,21 @@ static void do_mx(char *reply, size_t n, const char *op)
     if (!is_init || !ensure || !release || !run || !is_init()) {
         snprintf(out, sizeof(out), "ok no Python");
     } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
-        snprintf(reply, n, "err launches are held: mx pause goes before quiesce, mx resume after open");
+        snprintf(reply, n, "err launches are held: %s pause goes before quiesce, %s resume after open", fn, fn);
         return;
     } else if (pipe2(p, O_CLOEXEC) != 0) {
         snprintf(reply, n, "err pipe: %s", strerror(errno));
         return;
     } else {
-        snprintf(code, sizeof(code), "%s_nvsnap_mx('%s', %d, '%s')\ndel _nvsnap_mx\n", mx_py,
-                 *op == 'p' ? "pause" : "resume", p[1], host);
+        size_t len = srclen + 400;
+        char *code = malloc(len);
+        if (!code) { close(p[0]); close(p[1]); snprintf(reply, n, "err out of memory"); return; }
+        snprintf(code, len, "%s_nvsnap_%s('%s', %d, '%s'%s)\ndel _nvsnap_%s\n", src, fn,
+                 *op == 'p' ? "pause" : "resume", p[1], host, extra, fn);
         int g = ensure();
         int r = run(code);
         release(g);
+        free(code);
         close(p[1]);
         ssize_t k = read(p[0], out, sizeof(out) - 1);
         close(p[0]);
@@ -2194,14 +2208,260 @@ static void do_mx(char *reply, size_t n, const char *op)
         else if (r) snprintf(out, sizeof(out), "err Python raised (see stderr)");
     }
     rdma_files(&fds, &maps);
-    /* RDMA left after a pause (NCCL or NIXL outside ModelExpress, say)
-     * fails the dump: fail the pause instead. */
+    /* RDMA left after a pause (NCCL, say) fails the dump: fail the pause
+     * instead. */
     if (*op == 'p' && (fds || maps) && !strncmp(out, "ok ", 3))
         snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped (%s): CRIU cannot dump them",
                  fds, maps, out + 3);
     else
         snprintf(reply, n, "%s; %d RDMA device file(s) open, %d mapped", out, fds, maps);
 }
+
+/* ── NIXL KV transfer (vLLM disaggregated prefill/decode) ────────────── */
+
+/* vLLM's NixlConnector (pull mode) moves KV between prefill and decode
+ * engines over NIXL/UCX, and over RDMA holds what CRIU cannot dump. vLLM
+ * creates its NIXL agent once and has no call to drop it, so "nixl pause"
+ * does it from outside, through vLLM's own functions: in the engine-core
+ * process it stops taking new requests, waits (up to 60 s) until no KV
+ * transfer is in flight, stops the handshake listener and shuts down the
+ * connector on every TP worker (which frees the NIXL agent and its memory
+ * registrations); in a TP worker process it waits until the engine has
+ * done so. If that fails, or a worker still has RDMA device files open
+ * afterwards (NCCL, say), the engine resumes. "nixl resume [HOST]"
+ * creates the connectors again on the same KV memory under a new engine
+ * id, so peers handshake with it afresh instead of using the queue pairs
+ * and keys they cached, restarts the listener (on HOST, the pod's new IP,
+ * when given) and takes requests again. Requests that reached a paused
+ * decode engine are prefilled locally if the pause outlasted a third of
+ * prefill's hold on their KV (kv_lease_duration): the prefill side may have
+ * reused those blocks. Only the pull connector with KV in GPU memory is
+ * handled. Not while launches are held, as for "mx". */
+static const char nixl_py[] =
+    "def _nvsnap_nixl(op, fd, host, ucx):\n"
+    "    import os, queue, sys, threading, time, uuid\n"
+    "\n"
+    "    def conn():\n"
+    "        st = sys.modules.get('vllm.distributed.kv_transfer.kv_transfer_state')\n"
+    "        if st is None or not st.has_kv_transfer_group():\n"
+    "            return None\n"
+    "        from vllm.distributed.kv_transfer.kv_connector.v1.nixl import connector as m\n"
+    "        c = st.get_kv_transfer_group()\n"
+    "        if not isinstance(c, m.NixlBaseConnector):\n"
+    "            return None\n"
+    "        if not isinstance(c, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(c).__name__)\n"
+    "        return c\n"
+    "\n"
+    "    def w_busy(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        w = get_kv_transfer_group().connector_worker\n"
+    "        return 0 if w is None else (len(w._recving_transfers) + len(w._reqs_to_send)\n"
+    "                                    + len(w._handshake_futures))\n"
+    "\n"
+    "    def w_release(_w):\n"
+    "        import gc\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        w = c.connector_worker\n"
+    "        if w is None:\n"
+    "            return 0\n"
+    "        if w.use_host_buffer:\n"
+    "            raise RuntimeError('KV in a host buffer is not handled')\n"
+    "        c._nvsnap_kv, c._nvsnap_cls = w.device_kv_caches, type(w)\n"
+    "        try:\n"
+    "            w._handshake_initiation_executor.shutdown(wait=True)\n"
+    "            w._finish_shutdown()\n"
+    "        finally:\n"
+    "            # Dropped even after a failed shutdown, so every worker comes back\n"
+    "            # under the same new engine id; \"released\" is set only once the\n"
+    "            # agent is freed, which is what a waiting TP worker checks.\n"
+    "            c.connector_worker = None\n"
+    "            del w\n"
+    "            gc.collect()\n"
+    "            c._nvsnap_state = 'released'\n"
+    "        return 1\n"
+    "\n"
+    "    def w_rdma(_w):\n"
+    "        n = 0\n"
+    "        for f in os.listdir('/proc/self/fd'):\n"
+    "            try:\n"
+    "                n += os.readlink('/proc/self/fd/' + f).startswith('/dev/infiniband/')\n"
+    "            except OSError:\n"
+    "                pass\n"
+    "        with open('/proc/self/maps') as m:\n"
+    "            return os.getpid(), n, sum(' /dev/infiniband/' in l for l in m)\n"
+    "\n"
+    "    def w_released(_w):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        return getattr(get_kv_transfer_group(), '_nvsnap_state', None) == 'released'\n"
+    "\n"
+    "    def w_resume(_w, engine_id):\n"
+    "        from vllm.distributed.kv_transfer import get_kv_transfer_group\n"
+    "        c = get_kv_transfer_group()\n"
+    "        if c.connector_worker is not None:  # never released: release it, so all match\n"
+    "            w_release(_w)\n"
+    "        c.kv_transfer_config.engine_id = c.engine_id = engine_id\n"
+    "        w = c._nvsnap_cls(c._vllm_config, engine_id, c.kv_cache_config)\n"
+    "        w.register_kv_caches(c._nvsnap_kv)\n"
+    "        c.connector_worker = w\n"
+    "        del c._nvsnap_kv, c._nvsnap_cls\n"
+    "        c._nvsnap_state = 'up'\n"
+    "        return 1\n"
+    "\n"
+    "    def engine():\n"
+    "        core = sys.modules.get('vllm.v1.engine.core')\n"
+    "        f = sys._current_frames().get(threading.main_thread().ident)\n"
+    "        while core is not None and f is not None:\n"
+    "            if isinstance(f.f_locals.get('self'), core.EngineCoreProc):\n"
+    "                return f.f_locals['self']\n"
+    "            f = f.f_back\n"
+    "        return None\n"
+    "\n"
+    "    def on_main(e, fn, timeout):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        deadline = time.monotonic() + timeout\n"
+    "        while True:\n"
+    "            box, cancelled = queue.Queue(), threading.Event()\n"
+    "\n"
+    "            def cb(_e=None):\n"
+    "                if not cancelled.is_set():\n"
+    "                    try:\n"
+    "                        box.put(fn(e))\n"
+    "                    except BaseException as x:\n"
+    "                        box.put((True, x))\n"
+    "            e._idle_state_callbacks.append(cb)\n"
+    "            e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "            try:\n"
+    "                done, res = box.get(timeout=max(0.1, deadline - time.monotonic()))\n"
+    "            except queue.Empty:\n"
+    "                cancelled.set()\n"
+    "                raise TimeoutError('the engine did not go idle in %d s' % timeout)\n"
+    "            if isinstance(res, BaseException):\n"
+    "                raise res\n"
+    "            if done:\n"
+    "                return res\n"
+    "            if time.monotonic() > deadline:\n"
+    "                raise TimeoutError('KV transfers still in flight after %d s: %r' % (timeout, res))\n"
+    "            time.sleep(0.2)\n"
+    "\n"
+    "    def stop_listener(s):\n"
+    "        t = s._nixl_handshake_listener_t\n"
+    "        if t is not None:\n"
+    "            s._stop_event.set()\n"
+    "            t.join(5)\n"
+    "            if t.is_alive():\n"
+    "                raise RuntimeError('the NIXL handshake listener did not stop in 5 s')\n"
+    "            s._stop_event = threading.Event()\n"
+    "            s._nixl_handshake_listener_t = None\n"
+    "\n"
+    "    def e_resume(e):\n"
+    "        from vllm.v1.engine import EngineCoreRequestType\n"
+    "        from vllm.v1.request import RequestStatus\n"
+    "        st = e.__dict__.get('_nvsnap_nixl')  # dropped only once resumed: a failure can be retried\n"
+    "        if st is None:\n"
+    "            return True, 'not paused'\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        s = kc.connector_scheduler\n"
+    "        new_id = None\n"
+    "        if any(e.model_executor.collective_rpc(w_released)):\n"
+    "            new_id = str(uuid.uuid4())\n"
+    "            e.model_executor.collective_rpc(w_resume, args=(new_id,))\n"
+    "            e.vllm_config.kv_transfer_config.engine_id = kc.engine_id = s.engine_id = new_id\n"
+    "        if host:\n"
+    "            s.side_channel_host = os.environ['VLLM_NIXL_SIDE_CHANNEL_HOST'] = host\n"
+    "        if new_id or host or s._nixl_handshake_listener_t is None:\n"
+    "            stop_listener(s)\n"
+    "            meta = {}\n"
+    "            for d in e.model_executor.get_kv_connector_handshake_metadata():\n"
+    "                meta.update(d or {})\n"
+    "            kc.set_xfer_handshake_metadata_pp_aware(meta)\n"
+    "        # Wall-clock time: the monotonic clock does not carry across a restore.\n"
+    "        n = 0\n"
+    "        if time.time() - st['at'] > s._kv_lease_duration / 3:\n"
+    "            for r in list(e.scheduler.requests.values()):\n"
+    "                p = r.kv_transfer_params\n"
+    "                if r.status == RequestStatus.WAITING and p and p.get('do_remote_prefill'):\n"
+    "                    p['do_remote_prefill'] = False\n"
+    "                    n += 1\n"
+    "        e.scheduler.set_pause_state(st['prev'])\n"
+    "        del e._nvsnap_nixl\n"
+    "        e.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))\n"
+    "        return True, ('resumed as engine %s, side channel %s:%s, %d request(s) prefilled here'\n"
+    "                      % (new_id or kc.engine_id, s.side_channel_host, s.side_channel_port, n))\n"
+    "\n"
+    "    # Restored into another pod, only UCX 1.22 reads its routes again (see\n"
+    "    # ucs_netlink_route_exists in gpushare.c): refuse the pause for another.\n"
+    "    def ucx_ok():\n"
+    "        if op == 'pause' and ucx and not ucx.startswith('1.22.'):\n"
+    "            raise RuntimeError('UCX %s is not 1.22: restored into another pod, it would keep the old '\n"
+    "                               'pod\\'s routes, and NIXL would reach no peer' % ucx)\n"
+    "        return ', UCX ' + ucx if op == 'pause' and ucx else ''\n"
+    "\n"
+    "    def run():\n"
+    "        e = engine()\n"
+    "        if e is None:\n"
+    "            c = conn()\n"
+    "            if c is None:\n"
+    "                return 'ok no NIXL KV connector'\n"
+    "            v = ucx_ok()\n"
+    "            pause = op == 'pause'\n"
+    "            deadline = time.monotonic() + 90\n"
+    "            while (getattr(c, '_nvsnap_state', None) == 'released') != pause:\n"
+    "                if time.monotonic() > deadline:\n"
+    "                    raise TimeoutError('the engine did not %s this worker\\'s NIXL connector'\n"
+    "                                       % ('release' if pause else 're-create'))\n"
+    "                time.sleep(0.2)\n"
+    "            return 'ok TP worker: NIXL connector %s%s' % ('released' if pause else 'up', v)\n"
+    "        kc = e.scheduler.get_kv_connector()\n"
+    "        m = sys.modules.get('vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector')\n"
+    "        if kc is None or m is None or not isinstance(kc, m.NixlBaseConnector):\n"
+    "            return 'ok no NIXL KV connector'\n"
+    "        if not isinstance(kc, m.NixlPullConnector):\n"
+    "            raise RuntimeError('%s is not handled, only NixlPullConnector' % type(kc).__name__)\n"
+    "        v = ucx_ok()\n"
+    "        if op == 'resume':\n"
+    "            return 'ok ' + on_main(e, e_resume, 60)\n"
+    "        if '_nvsnap_nixl' in e.__dict__:\n"
+    "            return 'ok already paused'\n"
+    "        from vllm.v1.core.sched.interface import PauseState\n"
+    "        prev = e.scheduler.pause_state\n"
+    "        e._nvsnap_nixl = {'prev': prev, 'at': time.time()}\n"
+    "        if prev == PauseState.UNPAUSED:\n"
+    "            e.scheduler.set_pause_state(PauseState.PAUSED_NEW)\n"
+    "\n"
+    "        def step(e):\n"
+    "            busy = e.model_executor.collective_rpc(w_busy)\n"
+    "            if any(busy):\n"
+    "                return False, busy\n"
+    "            stop_listener(e.scheduler.get_kv_connector().connector_scheduler)\n"
+    "            e._nvsnap_nixl['released'] = True\n"
+    "            n = sum(e.model_executor.collective_rpc(w_release))\n"
+    "            # RDMA left in any worker (NCCL, say) would fail the dump: fail\n"
+    "            # here, so the engine resumes itself.\n"
+    "            left = [r for r in e.model_executor.collective_rpc(w_rdma) if r[1] or r[2]]\n"
+    "            if left:\n"
+    "                raise RuntimeError('RDMA device files still open after the release (pid, open, '\n"
+    "                                   'mapped): %s' % left)\n"
+    "            return True, n\n"
+    "        try:\n"
+    "            n = on_main(e, step, 60)\n"
+    "        except BaseException:\n"
+    "            try:\n"
+    "                on_main(e, e_resume, 30)\n"
+    "            except BaseException:\n"
+    "                st = e.__dict__.get('_nvsnap_nixl')\n"
+    "                if st and not st.get('released'):  # nothing released: just unpause\n"
+    "                    del e._nvsnap_nixl\n"
+    "                    e.scheduler.set_pause_state(st['prev'])\n"
+    "            raise\n"
+    "        return 'ok engine paused, NIXL connector released on %d worker(s)%s' % (n, v)\n"
+    "\n"
+    "    try:\n"
+    "        rep = run()\n"
+    "    except BaseException as x:\n"
+    "        rep = 'err %s: %s' % (type(x).__name__, x)\n"
+    "    os.write(fd, rep.encode()[:300])\n";
 
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
  * reads at most GPUSHARE_REPLY_MAX bytes of it (nvsnap-gpu-suspend.c). */
@@ -2226,7 +2486,13 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
-    else if (!strncmp(buf, "mx ", 3)) { do_mx(rep, sizeof(rep), buf + 3); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3, ""); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "nixl ", 5)) {
+        char ucx[32] = ", ''";
+        if (ucx_loaded()) snprintf(ucx, sizeof(ucx), ", '%u.%u.%u'", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+        do_py(rep, sizeof(rep), nixl_py, sizeof(nixl_py), "nixl", buf + 5, ucx);
+        msg_send(s, rep, -1);
+    }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);
@@ -2348,6 +2614,192 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
     }
     fclose(fp);
     return found;
+}
+
+/* ── UCX route checks after a restore into another pod ───────────────── */
+
+/* UCX checks that a RoCE device can reach a peer against the routing
+ * table, which it reads once per process (ucs_netlink_init_routing_table_cache
+ * in UCX 1.22) and never again. A process restored into another pod keeps
+ * the old pod's table, in which the new pod's interfaces have no routes, so
+ * UCX finds no device that reaches anything (NIXL: NIXL_ERR_BACKEND). UCX's
+ * RoCE transport calls the three functions below in libucs through the
+ * dynamic linker, so they are defined here: while the process is in the
+ * network namespace it was in at the first call (when UCX read its table),
+ * they call UCX's; in another one, they read the routes again on each call
+ * and match them as UCX does: every table (policy rules, as in pods whose
+ * RoCE interfaces have their own tables, are ignored), longest prefix on the
+ * interface. Only for UCX 1.22, whose signatures these are; other versions
+ * keep UCX's table. */
+
+struct ucx_find { const char *stem; char path[512]; };
+
+static int ucx_find_cb(struct dl_phdr_info *info, size_t size, void *arg)
+{
+    struct ucx_find *f = arg;
+    const char *b = strrchr(info->dlpi_name, '/');
+    size_t n = strlen(f->stem);
+    (void)size;
+    b = b ? b + 1 : info->dlpi_name;
+    if (strncmp(b, f->stem, n) || (b[n] != '-' && b[n] != '.')) return 0;
+    snprintf(f->path, sizeof(f->path), "%s", info->dlpi_name);
+    return 1;
+}
+
+/* NAME in the loaded UCX library STEM ("libucs", "libucp"; NIXL bundles
+ * them as libucs-<hash>.so and loads them RTLD_LOCAL). */
+static void *ucx_sym(const char *stem, const char *name)
+{
+    struct ucx_find f = { stem, "" };
+    void *h, *p;
+    if (!real_dlsym) init_real_dlsym();
+    if (!dl_iterate_phdr(ucx_find_cb, &f) || !(h = dlopen(f.path, RTLD_LAZY | RTLD_NOLOAD))) return NULL;
+    p = real_dlsym(h, name);
+    dlclose(h);
+    return p;
+}
+
+/* 1 with the version of the UCX loaded in this process in ucx_ver; 0 if
+ * none is (yet). */
+static int ucx_loaded(void)
+{
+    static int found;
+    if (!__atomic_load_n(&found, __ATOMIC_ACQUIRE)) {
+        unsigned v[3];
+        void (*get)(unsigned *, unsigned *, unsigned *) =
+            (void (*)(unsigned *, unsigned *, unsigned *))ucx_sym("libucp", "ucp_get_version");
+        if (!get) return 0;
+        get(&v[0], &v[1], &v[2]);
+        memcpy(ucx_ver, v, sizeof(v));
+        __atomic_store_n(&found, 1, __ATOMIC_RELEASE);
+    }
+    return 1;
+}
+
+static int ucx_122(void) { return ucx_loaded() && ucx_ver[0] == 1 && ucx_ver[1] == 22; }
+
+static unsigned long first_netns;
+
+/* 1 when the kernel answers: the process left the network namespace UCX
+ * read its routes in. */
+static int kernel_routes(void)
+{
+    static int said;
+    unsigned long want = 0;
+    struct stat st;
+    if (stat("/proc/self/ns/net", &st)) return 0;
+    if (__atomic_compare_exchange_n(&first_netns, &want, (unsigned long)st.st_ino, 0, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_SEQ_CST) || want == st.st_ino)
+        return 0;
+    int k = ucx_122();
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST)) {
+        if (k) logf_("network namespace changed since UCX read its routes: UCX route checks read the routes again");
+        else logf_("network namespace changed since UCX read its routes, but UCX %u.%u.%u is not 1.22: "
+                   "UCX keeps the old routes, and RoCE peers may look unreachable", ucx_ver[0], ucx_ver[1], ucx_ver[2]);
+    }
+    return k;
+}
+
+struct rt { int oif, type, len, family; unsigned char dst[16]; };
+
+/* The routes of address family FAM in every table, as UCX reads them
+ * (RTM_GETROUTE dump; a route without an interface or a destination it
+ * needs is left out): up to N into RT. Their count, or -1. */
+static int rt_dump(int fam, struct rt *rt, int n)
+{
+    struct { struct nlmsghdr h; struct rtmsg r; } req = {
+        { NLMSG_LENGTH(sizeof(struct rtmsg)), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0 },
+        { .rtm_family = (unsigned char)fam } };
+    char buf[16384] __attribute__((aligned(8)));
+    struct timeval tv = { 1, 0 };
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE), k = 0, done = 0;
+    if (fd < 0) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (send(fd, &req, req.h.nlmsg_len, 0) != (ssize_t)req.h.nlmsg_len) done = 1, k = -1;
+    while (!done) {
+        ssize_t got = recv(fd, buf, sizeof(buf), 0);
+        int left = (int)got;
+        if (got <= 0) { k = -1; break; }
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_type == NLMSG_ERROR) k = -1;
+                done = 1;
+                break;
+            }
+            if (h->nlmsg_type != RTM_NEWROUTE || k >= n) continue;
+            struct rtmsg *m = NLMSG_DATA(h);
+            struct rt e = { -1, m->rtm_type, m->rtm_dst_len, m->rtm_family, { 0 } };
+            int alen = RTM_PAYLOAD(h), dst = 0;
+            for (struct rtattr *x = RTM_RTA(m); RTA_OK(x, alen); x = RTA_NEXT(x, alen)) {
+                if (x->rta_type == RTA_OIF && RTA_PAYLOAD(x) >= sizeof(int)) memcpy(&e.oif, RTA_DATA(x), sizeof(int));
+                else if (x->rta_type == RTA_DST && RTA_PAYLOAD(x) <= sizeof(e.dst)) {
+                    memcpy(e.dst, RTA_DATA(x), RTA_PAYLOAD(x));
+                    dst = 1;
+                }
+            }
+            if (e.oif != -1 && (!e.len || dst)) rt[k++] = e;
+        }
+    }
+    close(fd);
+    return k;
+}
+
+/* The longest prefix among the routes that hold SA, out of interface OIF
+ * (any when < 0) and of type TYPE (any when 0); its interface in *DEV.
+ * -1 if none. */
+static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
+{
+    struct rt rt[1024];
+    const unsigned char *a = sa->sa_family == AF_INET ? (const unsigned char *)&((const struct sockaddr_in *)sa)->sin_addr
+                           : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+                           : NULL;
+    int bits = sa->sa_family == AF_INET ? 32 : 128, best = -1, n;
+    if (!a || (n = rt_dump(sa->sa_family, rt, 1024)) < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        const struct rt *e = &rt[i];
+        int full = e->len / 8, rem = e->len % 8;
+        if ((oif >= 0 && e->oif != oif) || (type && e->type != type) || e->len > bits || e->len <= best) continue;
+        if (memcmp(a, e->dst, full) || (rem && ((a[full] ^ e->dst[full]) & (0xff << (8 - rem)) & 0xff))) continue;
+        best = e->len;
+        *dev = e->oif;
+    }
+    return best;
+}
+
+int ucs_netlink_route_exists(int if_index, const struct sockaddr *sa_remote, int *netmask_len_p)
+{
+    static int (*real)(int, const struct sockaddr *, int *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *, int *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote, netmask_len_p) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    if (netmask_len_p) *netmask_len_p = len;
+    return len > -1;
+}
+
+int ucs_netlink_is_best_route(int if_index, const struct sockaddr *sa_remote)
+{
+    static int (*real)(int, const struct sockaddr *);
+    int len, dev;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(int, const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(if_index, sa_remote) : 0;
+    }
+    len = rt_len(sa_remote, if_index, 0, &dev);
+    return len > -1 && rt_len(sa_remote, -1, 0, &dev) == len;
+}
+
+int ucs_netlink_get_local_route_ndev_index(const struct sockaddr *sa_remote)
+{
+    static int (*real)(const struct sockaddr *);
+    int dev = -1;
+    if (!kernel_routes()) {
+        if (!real) real = (int (*)(const struct sockaddr *))ucx_sym("libucs", __func__);
+        return real ? real(sa_remote) : -1;
+    }
+    return rt_len(sa_remote, -1, RTN_LOCAL, &dev) > -1 ? dev : -1;
 }
 
 /* ── Wrappers ─────────────────────────────────────────────────────────── */
@@ -3622,11 +4074,28 @@ GATED_M(cuLaunchHostFunc, (CUstream st, CUhostFn fn, void *u), (st, fn, u))
 
 static void *wrapper_for(const char *name, void *real);
 
+/* A process that uses the GPU but allocates nothing itself (vLLM's engine
+ * core at TP > 1: its workers own the GPU memory) still needs a control
+ * socket for "nixl", which runs in its Python. Every CUDA user looks up
+ * driver entry points first. Only with NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1
+ * (set for workloads opted in to nixl): with a socket, such a process takes
+ * part in every suspend (hold, quiesce, release, load), where it is
+ * otherwise skipped. */
+static void ctl_on_cuda_use(void)
+{
+    static pid_t tried;  /* once per process: a failure is logged once */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVSNAP_GPUSHARE_CTL_ON_CUDA_USE"); on = e && *e == '1'; }
+    pid_t me = getpid();
+    if (on && __atomic_exchange_n(&tried, me, __ATOMIC_RELAXED) != me) start_ctl();
+}
+
 static CUresult w_gpa2(const char *sym, void **pfn, int ver, cuuint64_t flags,
                        CUdriverProcAddressQueryResult *st)
 {
     CUresult r = REAL(r_gpa2, "cuGetProcAddress_v2")(sym, pfn, ver, flags, st);
     if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    ctl_on_cuda_use();
     return r;
 }
 
@@ -3634,6 +4103,7 @@ static CUresult w_gpa1(const char *sym, void **pfn, int ver, cuuint64_t flags)
 {
     CUresult r = REAL(r_gpa1, "cuGetProcAddress")(sym, pfn, ver, flags);
     if (r == CUDA_SUCCESS && *pfn) *pfn = wrapper_for(sym, *pfn);
+    ctl_on_cuda_use();
     return r;
 }
 

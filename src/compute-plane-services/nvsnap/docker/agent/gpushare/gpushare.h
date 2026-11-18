@@ -50,6 +50,13 @@ SPDX-License-Identifier: Apache-2.0
  *   mx resume HOST  the same, advertising HOST (MX_WORKER_HOST) to peers:
  *            after a restore into another pod, that pod's address.
  *            Both need ModelExpress >= 0.7 (an earlier one: "err").
+ *   nixl pause  (before quiesce)  vLLM's NIXL KV connector (pull mode):
+ *            the engine takes no new requests, waits for KV transfers in
+ *            flight and shuts the connector down on every TP worker,
+ *            dropping its NIXL/RDMA state. A TP worker process waits for
+ *            that. On failure the engine resumes.
+ *   nixl resume [HOST]  (after open)  the connectors come back under a new
+ *            engine id; the handshake listener restarts (on HOST if given).
  *
  * Shared memory is tracked whether it is passed as a POSIX fd or, with an
  * IMEX channel, as a fabric handle (identified by "whosefab", hex). An

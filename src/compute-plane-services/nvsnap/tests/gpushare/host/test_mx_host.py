@@ -51,6 +51,12 @@ STUB_FN(cuCheckpointProcessRestore)
 STUB_FN(cuCheckpointProcessUnlock)
 STUB_FN(cuCheckpointProcessGetState)
 STUB_FN(cuCheckpointProcessGetRestoreThreadId)
+CUresult cuGetProcAddress_v2(const char *s, void **p, int v, unsigned long long f, void *q)
+{
+    (void)s; (void)v; (void)f; (void)q;
+    *p = (void *)cuInit;
+    return 0;
+}
 """
 
 # A worker with a fake ModelExpress 0.7 loader (one paused context). An

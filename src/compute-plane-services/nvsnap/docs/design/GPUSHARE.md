@@ -40,7 +40,11 @@ tests for amd64 and arm64 with warnings as errors.
 ## How it works
 
 Each process that loads the shim runs a control thread on the abstract socket
-`@nvsnap-gpushare.<pid>`. `nvsnap-gpu-suspend` sends it these commands
+`@nvsnap-gpushare.<pid>`, from its first export, import, IPC or host-memory
+call. With `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` it starts at the process's first
+use of CUDA (its first driver entry-point lookup) instead, even if the process
+never allocates GPU memory itself, as vLLM's engine core at TP > 1 does not;
+`nixl-pause` needs that (set it for the workloads that use it). `nvsnap-gpu-suspend` sends it these commands
 (`gpushare.h`):
 
 | Command | Who | What it does |
@@ -381,9 +385,9 @@ Limits of the move:
   registrations in a NIC context, queue pairs connected to peers) would not
   survive a restore anyway. The capture preflight blocks such a capture and
   the instance runs on and starts cold (ARCHITECTURE.md, "Who is captured";
-  MPTCP support: #2926). This covers NCCL over InfiniBand or RoCE, and NIXL
-  KV transfer over RDMA. A workload that has released its RDMA devices by
-  capture time is not blocked.
+  MPTCP support: #2926). This covers NCCL over InfiniBand or RoCE, and
+  NIXL KV transfer over RDMA (disaggregated prefill/decode). A workload that
+  has released its RDMA devices by capture time is not blocked.
 - ModelExpress (>= 0.7) peer-to-peer over RDMA is the exception:
   `nvsnap-gpu-suspend mx-pause`, before the preflight and the suspend, makes
   ModelExpress stop serving its weights and drop its NIXL/RDMA state, and
@@ -394,6 +398,31 @@ Limits of the move:
   name the captured pod, which other pods cannot reach. `mx-pause` fails while any RDMA device file is
   still open or mapped, so RDMA outside ModelExpress still blocks the
   capture. A process without ModelExpress or Python answers `ok`.
+- vLLM's NIXL KV connector (`NixlConnector` in pull mode, KV in GPU
+  memory) can release its RDMA devices with `nixl-pause`, but the agent does
+  not call it yet, so these workloads are still refused.
+  `nvsnap-gpu-suspend nixl-pause`, before the suspend, makes the engine take
+  no new requests, waits up to 60 s for KV transfers in flight, stops the
+  handshake listener and shuts the connector down on every TP worker, which
+  drops its NIXL agent and RDMA state. `nixl-resume`, after `open`, creates
+  the connectors again on the same KV memory under a new engine id (peers
+  cache a remote engine's agent and keys by engine id, so a restored engine
+  must look new to them) and restarts the listener, on `--host` when given,
+  as for `mx-resume`. Requests that reached a paused decode engine are
+  prefilled there if the pause outlasted a third of prefill's hold on their
+  KV (`kv_lease_duration`, 30 s by default), since prefill may have reused
+  those blocks. `nixl-pause` fails while any RDMA device file is left: the
+  engine checks every worker after the release and resumes itself, and the
+  tool resumes every pid on any failure. At TP > 1 the engine-core process allocates no GPU
+  memory, so the pod needs `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1` (see "How it
+  works"); without it the workers time out waiting for the engine and the
+  pause is refused. At TP > 1 in a pod with RDMA NICs, NCCL opens
+  the RDMA devices even when every rank is on one node, and keeps them open
+  until the process exits (destroying all its communicators does not close
+  them), so `nixl-pause` refuses such a pod until gpushare handles RDMA
+  devices itself. A process holding both ModelExpress and NIXL KV
+  RDMA state is not handled yet: whichever pause runs first fails its RDMA
+  check, since the other still holds RDMA devices.
 
 ## Validation
 
