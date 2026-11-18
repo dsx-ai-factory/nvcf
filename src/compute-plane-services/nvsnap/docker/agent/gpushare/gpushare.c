@@ -668,7 +668,10 @@ static int peer_ok(int s, int pid)
     return 0;
 }
 
-/* One request/reply to another process's control thread. */
+/* One request/reply to another process's control thread. Each control
+ * thread serves one request at a time, so every step is bounded:
+ * SO_SNDTIMEO also bounds connect(), which otherwise waits forever once the
+ * peer's accept queue is full. */
 static int request(int pid, const char *txt, int fd_in, char *reply, size_t n, int *fd_out)
 {
     struct sockaddr_un a;
@@ -676,6 +679,7 @@ static int request(int pid, const char *txt, int fd_in, char *reply, size_t n, i
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     struct timeval tv = { 30, 0 };
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int rc = (s >= 0 && connect(s, (struct sockaddr *)&a, len) == 0 && peer_ok(s, pid) &&
               msg_send(s, txt, fd_in) == 0 && msg_recv(s, reply, n, fd_out) == 0) ? 0 : -1;
     if (s >= 0) close(s);
@@ -2206,7 +2210,12 @@ static int find_exporter(const char *req, int fd, unsigned long long *key, int *
     while (!found && fgets(line, sizeof(line), fp)) {
         char *p = strstr(line, "@nvsnap-gpushare.");
         int pid;
-        if (!p || sscanf(p + 1, GPUSHARE_SOCK_FMT, &pid) != 1 || pid == me) continue;
+        unsigned long flags = 0;
+        /* Only the listening socket (__SO_ACCEPTCON): a connection to it
+         * shows its name too, and a peer that does not accept must cost one
+         * timeout, not one per queued connection. */
+        if (!p || sscanf(line, "%*s %*x %*x %lx", &flags) != 1 || !(flags & 0x10000)) continue;
+        if (sscanf(p + 1, GPUSHARE_SOCK_FMT, &pid) != 1 || pid == me) continue;
         snprintf(name, sizeof(name), GPUSHARE_SOCK_FMT, pid);
         if (strncmp(p + 1, name, strlen(name)) || (p[1 + strlen(name)] != '\n' && p[1 + strlen(name)] != 0))
             continue;

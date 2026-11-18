@@ -666,9 +666,20 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
     socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + n;
     int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (s < 0) return -1;
+    /* "release"/"load" move the saved GPU memory: allow for slow disks.
+     * "open" waits at most 2 s for the state lock: a pid silent for longer
+     * is stuck or dying, and the restore should fail now. The send timeout
+     * also bounds connect(), which waits while pid's accept queue is full. */
+    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
+    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(s, (struct sockaddr *)&a, len) != 0) {
+        int e = errno;
         close(s);
-        return 1;
+        if (e != EAGAIN) return 1;  /* no control socket */
+        printf("pid=%d %s: err control socket not accepting (%s)\n", pid, cmd, strerror(e));
+        return -1;
     }
     /* An abstract name can be bound by anyone in the network namespace:
      * talk only to pid itself (so this tool must run in its pid namespace). */
@@ -680,12 +691,6 @@ static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet
                pid, cmd, pid, pid, cl == sizeof(cr) ? cr.pid : -1);
         return -1;
     }
-    /* "release"/"load" move the saved GPU memory: allow for slow disks.
-     * "open" waits at most 2 s for the state lock: a pid silent for longer
-     * is stuck or dying, and the restore should fail now. */
-    int slow = !strncmp(cmd, "release", 7) || !strncmp(cmd, "load", 4);
-    struct timeval tv = { slow ? 3600 : !strcmp(cmd, "open") ? 10 : 120, 0 };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     char rep[GPUSHARE_REPLY_MAX] = "err no reply (timeout)";
     if (send(s, cmd, strlen(cmd) + 1, MSG_NOSIGNAL) < 0) snprintf(rep, sizeof(rep), "err send: %s", strerror(errno));
     else {

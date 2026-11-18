@@ -65,5 +65,5 @@ jobs:
           docker cp "$cid:/usr/local/cuda/include/cuda.h" "$hdr/cuda.h"
           docker rm "$cid" >/dev/null
           # A test that skips (no gcc or cuda.h) still exits 0: fail on it here.
-          CUDA_INC="$hdr" python3 -I "$nvsnap/tests/gpushare/host/test_quiesce_deadline.py" 2>&1 | tee "$hdr/out"
+          CUDA_INC="$hdr" python3 -I -m unittest discover -v -s "$nvsnap/tests/gpushare/host" -p 'test_*.py' 2>&1 | tee "$hdr/out"
           if grep -q "skipped" "$hdr/out"; then echo "host tests skipped" >&2; exit 1; fi
