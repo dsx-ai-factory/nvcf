@@ -594,6 +594,15 @@ assert_yaml_value "$work_dir/collector-replicas-manifests.yaml" \
   'select(.kind == "OpenTelemetryCollector") | .spec.replicas' 2 \
   'collector CR replicas override'
 
+# Without a stack-owned collector, collector.replicas is not checked.
+assert_equal "$(profile_releases_csv control \
+  --state-values-set=observability.components.collector.mode=disabled \
+  --state-values-set=observability.components.targetAllocator.mode=disabled \
+  --state-values-set=observability.components.discoveryRbac.mode=disabled \
+  --state-values-set=collector.replicas=0)" \
+  'default-monitors,opentelemetry-operator,prometheus-operator-crds,victoria-metrics' \
+  'collector.replicas ignored without a stack-owned collector'
+
 # Every supported external authentication mode must pass validation and retain
 # the external collector endpoint. Autoscaler-specific auth values are covered
 # by the self-managed observability test.

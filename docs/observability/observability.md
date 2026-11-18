@@ -165,8 +165,9 @@ Monitoring](../compute-plane/cluster-management/monitoring.md).
 
 The collector runs one replica by default. Set `collector.replicas` to run
 more. When the Target Allocator is installed (the default), it assigns each
-scrape target to one replica at a time, so a collector restart pauses only
-part of the targets, and it moves a removed replica's targets to the others.
+scrape target to one replica at a time. A collector restart pauses the targets
+assigned to that replica, and the Target Allocator moves a removed replica's
+targets to the others.
 Without the Target Allocator, every replica runs the full scrape
 configuration.
 

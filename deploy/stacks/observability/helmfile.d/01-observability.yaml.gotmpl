@@ -68,7 +68,7 @@ environments:
 {{- end }}
 {{- $collectorReplicas := toString (dig "collector" "replicas" 1 .Values) }}
 {{- if and (eq $collectorMode "install") (not (regexMatch "^[1-9][0-9]*$" $collectorReplicas)) }}
-{{- fail "collector.replicas must be an integer of at least 1; use observability.components.collector.mode=disabled to run no collector" }}
+{{- fail "collector.replicas must be an integer of at least 1" }}
 {{- end }}
 {{- $observabilityNamespace := dig "observability" "namespace" "monitoring" .Values }}
 {{- $prometheusOperatorCrdsEnabled := eq $prometheusOperatorCrdsMode "install" }}
