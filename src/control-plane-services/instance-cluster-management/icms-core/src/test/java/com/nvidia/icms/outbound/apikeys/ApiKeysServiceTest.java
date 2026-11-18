@@ -56,7 +56,6 @@ class ApiKeysServiceTest {
                 .ncaId("dummy_nca_id")
                 .ownerId("dummy_owner_id")
                 .policy(ApiKeyValidationResult.Policy.builder()
-                                .aud("icms-api")
                                 .product("dummy_product")
                                 .resources(List.of(ApiKeyValidationResult.Resource.builder()
                                                            .id("ea946155-893c-43b6-920d-3f4410534a80")
@@ -91,27 +90,6 @@ class ApiKeysServiceTest {
                              () -> apiKeysService.fetchValidationResult("dummy_api_key"));
 
         assertEquals("Invalid authentication token", exception.getMessage());
-    }
-
-    @Test
-    void fetchApiKeyValidationResult_wrongAudience_throwsException() {
-        when(apiKeysClient.isSelfHosted()).thenReturn(true);
-        var wrongAudience = getPolicyResult();
-        wrongAudience.getPolicy().setAud("other-audience");
-        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
-                .thenReturn(wrongAudience);
-
-        assertThrows(IcmsAuthenticationException.class,
-                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
-    }
-
-    @Test
-    void fetchApiKeyValidationResult_selfHostedAudience_acceptsValidPolicy() {
-        when(apiKeysClient.isSelfHosted()).thenReturn(true);
-        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
-                .thenReturn(getPolicyResult());
-
-        assertTrue(apiKeysService.fetchValidationResult("dummy_api_key").isAllowed());
     }
 
     @Test
@@ -222,45 +200,11 @@ class ApiKeysServiceTest {
     }
 
     @Test
-    void wrongAudienceEvictsPreviouslyValidBackupBeforeOutage() {
-        when(apiKeysClient.isSelfHosted()).thenReturn(true);
-        var wrongAudience = getPolicyResult();
-        wrongAudience.getPolicy().setAud("other-audience");
-        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
-                .thenReturn(getPolicyResult())
-                .thenReturn(wrongAudience)
-                .thenThrow(new ApiKeysException("API Keys unavailable", true));
-
-        apiKeysService.fetchValidationResult("dummy_api_key");
-        now.addAndGet(TimeUnit.MINUTES.toNanos(1));
-
-        assertThrows(IcmsAuthenticationException.class,
-                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
-        assertThrows(ApiKeysException.class,
-                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
-        verify(apiKeysClient, times(3)).fetchApiKeyValidationResult("dummy_api_key");
-    }
-
-    @Test
     void invalidResponsesAreNeverCached() {
         var invalid = getPolicyResult();
         invalid.setAllowed(false);
         when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
                 .thenReturn(invalid)
-                .thenThrow(new ApiKeysException("API Keys unavailable", true));
-
-        assertThrows(IcmsAuthenticationException.class,
-                () -> apiKeysService.fetchValidationResult("dummy_api_key"));
-        assertThrows(ApiKeysException.class, () -> apiKeysService.fetchValidationResult("dummy_api_key"));
-    }
-
-    @Test
-    void wrongAudienceIsNeverCached() {
-        when(apiKeysClient.isSelfHosted()).thenReturn(true);
-        var wrongAudience = getPolicyResult();
-        wrongAudience.getPolicy().setAud("other-audience");
-        when(apiKeysClient.fetchApiKeyValidationResult("dummy_api_key"))
-                .thenReturn(wrongAudience)
                 .thenThrow(new ApiKeysException("API Keys unavailable", true));
 
         assertThrows(IcmsAuthenticationException.class,

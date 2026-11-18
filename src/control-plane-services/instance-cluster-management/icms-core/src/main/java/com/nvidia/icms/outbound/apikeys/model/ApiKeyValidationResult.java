@@ -58,12 +58,6 @@ public class ApiKeyValidationResult {
                 && policy != null;
     }
 
-    public boolean hasSelfHostedPolicy(String audienceServiceId) {
-        return isValid() && audienceServiceId.equals(policy.aud)
-                && policy.scopes != null && policy.resources != null
-                && policy.scopes.stream().allMatch(StringUtils::hasText);
-    }
-
     @JsonIgnore
     public OAuth2AuthenticatedPrincipal getOAuth2Principal() {
         Map<String, Object> resourcesAttribute = Map.of(POLICY_RESULT_ATTRIBUTE, this);
@@ -79,9 +73,6 @@ public class ApiKeyValidationResult {
     @NoArgsConstructor
     @Builder
     public static class Policy {
-
-        @JsonProperty("aud")
-        private String aud;
 
         @JsonProperty("resources")
         @JsonSetter(nulls = Nulls.AS_EMPTY)

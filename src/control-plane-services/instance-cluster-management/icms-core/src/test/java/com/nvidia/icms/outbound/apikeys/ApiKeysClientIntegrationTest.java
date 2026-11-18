@@ -71,7 +71,7 @@ class ApiKeysClientIntegrationTest {
                 .withBody("""
                         {"namespace":"icms","rule_name":"apikey.allow",
                          "result":{"allowed":true,"ncaId":"account-1","ownerId":"owner-1",
-                           "policy":{"aud":"icms-audience","scopes":["cluster_listing"],
+                           "policy":{"aud":"icms-api","scopes":["cluster_listing"],
                                      "resources":[]}}}
                         """)));
 

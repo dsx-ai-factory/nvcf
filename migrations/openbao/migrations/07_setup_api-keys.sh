@@ -93,17 +93,3 @@ SVC_VALUE=$(base64_encode '[
   {"serviceId":"'"${ICMS_SERVICE_ID}"'","serviceName":"icms-api","audienceServiceIds":["'"${ICMS_SERVICE_ID}"'"],"maxApiKeysPerUser":8,"maxApiKeyTtlDays":365,"maxAuthzSizeChars":2048,"minAuthzUpdateIntervalSeconds":3}
 ]')
 write_secrets_kv "${VAULT_SECRET_BASE_PATH}/kv" "registrations/services" "services=$SVC_VALUE" true
-
-# ICMS evaluates API keys with an API Keys audience token. The signing mount
-# exists here, after setup_sis has provisioned the ICMS auth role.
-ICMS_SIGNING_ROLE="icms-api"
-ICMS_SERVICE_ACCOUNT_NAME="sis-api"
-ICMS_SERVICE_ACCOUNT_NAMESPACE="sis"
-jwt_secret_role=$(generate_jwt_secret_role "${SERVICE_ACCOUNT_NAMESPACE}" "api-keys" "${ICMS_SIGNING_ROLE}" "pdp-evaluate")
-create_secret_jwt_role "${VAULT_SECRET_BASE_PATH}/jwt" "${ICMS_SIGNING_ROLE}" "${jwt_secret_role}"
-policy=$(generate_acl_policy "${VAULT_SECRET_BASE_PATH}/jwt/sign/${ICMS_SIGNING_ROLE}" "create,update,read")
-policy_name="${VAULT_POLICY_BASE_PATH}-jwt-sign-${ICMS_SIGNING_ROLE}-rw"
-write_policy "${policy_name}" "${policy}"
-icms_policies=$(merge_jwt_role_policies "${ICMS_SERVICE_ACCOUNT_NAME}" "${policy_name}" true)
-icms_auth_role=$(generate_jwt_auth_role "${ICMS_SERVICE_ACCOUNT_NAME}" "${ICMS_SERVICE_ACCOUNT_NAMESPACE}" "${icms_policies}")
-create_auth_jwt_role "${ICMS_SERVICE_ACCOUNT_NAME}" "${icms_auth_role}"

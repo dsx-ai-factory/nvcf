@@ -51,7 +51,7 @@ class InstanceApiKeySubjectTest {
     void actionRoutesUseApiKeyOwnerAsCustomer() {
         var key = ApiKeyValidationResult.builder().allowed(true).ownerId("nvcf-api")
                 .ncaId("account-1").policy(ApiKeyValidationResult.Policy.builder()
-                        .aud("icms-audience").scopes(List.of("instance-request"))
+                        .scopes(List.of("instance-request"))
                         .resources(List.of()).build()).build();
         var principal = key.getOAuth2Principal();
         SecurityContextHolder.getContext().setAuthentication(

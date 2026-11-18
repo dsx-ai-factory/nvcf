@@ -59,7 +59,6 @@ public class ApiKeysClient {
     private final JsonMapper jsonMapper;
     private final String evaluationUri;
     private final String requestPropertyName;
-    private final boolean selfHosted;
 
     public ApiKeysClient(
             @Value("${icms.api-keys.url}") String apiKeysBaseUrl,
@@ -80,7 +79,6 @@ public class ApiKeysClient {
         this.evaluationUri = "/v1/namespaces/%s/evaluations/%s.%s"
                 .formatted(namespace, packageName, policyName);
         this.requestPropertyName = requestPropertyName;
-        this.selfHosted = staticClientApiKeysProperties.isPresent();
 
         ExchangeFilterFunction authFilter = staticClientApiKeysProperties
                 .map(p -> (ExchangeFilterFunction) new FixedBearerExchangeFilterFunction(p::getToken))
@@ -93,10 +91,6 @@ public class ApiKeysClient {
                 .filter(IcmsOAuth2ClientUtils.getRetryableFilter(CLIENT_REGISTRATION_ID))
                 .filter(authFilter);
         this.webClient = builder.build();
-    }
-
-    public boolean isSelfHosted() {
-        return selfHosted;
     }
 
     public ApiKeyValidationResult fetchApiKeyValidationResult(String apiKey) {

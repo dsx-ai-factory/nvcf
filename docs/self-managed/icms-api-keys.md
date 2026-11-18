@@ -41,9 +41,9 @@ Use the resulting key as `Authorization: Bearer <key>` when calling ICMS.
 
 ICMS caches successful key evaluations for one minute. If API Keys is
 unavailable, it can reuse a previously validated result for the same key for
-up to 60 minutes. Rejected keys and policies for another audience are not
-cached. Revocations can therefore take up to one minute to take effect during
-normal operation and up to 60 minutes during an API Keys outage.
+up to 60 minutes. Rejected keys are not cached. Revocations can therefore take
+up to one minute to take effect during normal operation and up to 60 minutes
+during an API Keys outage.
 
 ## Permissions
 

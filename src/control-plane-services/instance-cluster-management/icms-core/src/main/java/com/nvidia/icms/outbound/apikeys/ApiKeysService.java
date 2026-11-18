@@ -35,7 +35,6 @@ import org.springframework.stereotype.Service;
 public class ApiKeysService {
 
     public static final String API_KEY_FAILURE_ERROR = "Invalid authentication token";
-    public static final String ICMS_AUDIENCE_SERVICE_ID = "icms-api";
 
     private final ApiKeysClient apiKeysClient;
     private final LoadingCache<String, ApiKeyValidationResult> apiKeysCache;
@@ -85,9 +84,7 @@ public class ApiKeysService {
             throw e;
         }
 
-        if (policyResult == null || !policyResult.isValid()
-                || (apiKeysClient.isSelfHosted()
-                        && !policyResult.hasSelfHostedPolicy(ICMS_AUDIENCE_SERVICE_ID))) {
+        if (policyResult == null || !policyResult.isValid()) {
             apiKeysBackupCache.invalidate(apiKey);
             log.warn("ApiKey validation failure: Invalid authz result");
             throw new IcmsAuthenticationException(API_KEY_FAILURE_ERROR);
