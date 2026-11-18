@@ -32,6 +32,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | global.image.repository         | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM} |
       And I prepare self-managed secrets file "deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml" from template "deploy/stacks/self-managed/secrets/secrets.yaml.template" using the current NGC registry credential
 
+    @capacity-install
     Scenario: Operator validates the authored Helmfile environment renders
       When I successfully run command "make -C deploy/stacks/self-managed template HELMFILE_ENV=local-bdd"
 
@@ -66,7 +67,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | nvca-operator    |
         | cert-manager     |
 
-    @llm-gateway
+    @llm-gateway @capacity-install
     Scenario: Operator installs the control plane through the local Helmfile environment
       When I successfully run command "make -C deploy/stacks/self-managed install HELMFILE_ENV=local-bdd"
 
@@ -127,7 +128,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       # pull secrets, and Helmfile control-plane releases. The
       # @nvca-registration scenario is not a standalone tag target.
 
-    @nvca-registration
+    @nvca-registration @capacity-install
     Scenario: Operator registers the local cluster and installs the NVCA operator
       When I successfully run command:
         """
@@ -257,7 +258,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
     # This scenario intentionally has no Background. It depends on the
     # earlier control-plane install and NVCA registration scenario in
     # this feature run, and is not a standalone tag target.
-    @function-lifecycle
+    @function-lifecycle @capacity-install
     Scenario: Operator invokes the Load Tester Supreme sample function through default and vanity endpoints
       Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
 
@@ -320,6 +321,29 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
       # Remove the deployment: the local sizing cannot hold every
       # scenario's deployment at once.
+      And I successfully undeploy the function selected by NVCF CLI
+
+    # Reuse the function undeployed above. The timeout is shorter than the
+    # default heartbeat interval, so replacement capacity must arrive promptly.
+    @function-lifecycle @capacity-recovery
+    Scenario: Operator reuses released capacity for the same function
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully deploy the function selected by NVCF CLI with options:
+        | option          | value           |
+        | --gpu           | H100            |
+        | --instance-type | NCP.GPU.H100_1x  |
+        | --backend       | ncp-local       |
+        | --regions       | us-west-1       |
+        | --min-instances | 1               |
+        | --max-instances | 1               |
+        | --timeout       | 180             |
+
+      When I successfully invoke the function selected by NVCF CLI over HTTP with timeout "120" seconds and poll duration "5" seconds:
+        """
+        {"message":"bdd-echo","repeats":1}
+        """
+      Then the command output should contain "bdd-echo"
       And I successfully undeploy the function selected by NVCF CLI
 
     @function-lifecycle @helm-function

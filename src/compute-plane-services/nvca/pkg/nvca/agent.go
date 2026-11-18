@@ -89,6 +89,8 @@ const (
 
 	ICMSRequestAckMaxGoroutines                   = 20
 	ICMSInstanceRequestStatusUpdatesMaxGoroutines = 20
+
+	heartbeatCapacityCheckKey = "capacity-check"
 )
 
 // Controller tick types.
@@ -384,6 +386,9 @@ type Agent struct {
 	natsSecretsFetcher nvcaauth.NATSSecretsFetcher
 	backendk8scache    *BackendK8sCache
 	backendHealthCache health.StatusCache
+
+	// Accessed only by the heartbeat worker. Failed requests must not advance this snapshot.
+	lastReportedGPUUsage map[types.GPUName]types.GPUResource
 
 	// gpuRegistration coordinates GPU availability, ICMS registration, and
 	// queue readiness when GracefulNoGPU is enabled. It also serializes all
@@ -1570,11 +1575,16 @@ func (a *Agent) apply(ctx context.Context, ev *core.Event) {
 		case EventTickRenewICMSCredentials:
 			err = a.RenewICMSQueueCreds(ctx)
 		case EventTickUpdateHeartbeat:
-			err = a.PutNVCAStatusUpdate(ctx)
+			err = a.putNVCAStatusUpdate(ctx, ev.ObjectMetaKey == heartbeatCapacityCheckKey)
 		case EventTickSyncSQSQueue:
 			err = a.queueManager.SyncQueues(ctx)
 		case EventTickSyncICMSRequestStatus:
 			err = a.PostICMSInstanceRequestStatusUpdates(ctx)
+			// Status posts run asynchronously. Recheck on each tick so either ordering of
+			// pod deletion and termination reporting eventually publishes released capacity.
+			if q := a.resourceEventWorkerQueues[EventTickUpdateHeartbeat]; q != nil {
+				q.Add(heartbeatCapacityCheckKey)
+			}
 		case EventTickSyncICMSRequests:
 			err = a.backendk8scache.SyncAllICMSRequests(ctx)
 		case EventTickAcknowledgeRequest:
@@ -1618,6 +1628,29 @@ func (a *Agent) newBYOOFederationChecker() *byoofederation.Checker {
 }
 
 func (a *Agent) PutNVCAStatusUpdate(ctx context.Context) error {
+	return a.putNVCAStatusUpdate(ctx, false)
+}
+
+func (a *Agent) putNVCAStatusUpdate(ctx context.Context, capacityOnly bool) error {
+	// Capacity can change while the health cache is still warm. Read allocation from
+	// the backend, which retains it until the workload is gone and termination is reported.
+	gpuUsage, err := a.backendk8scache.getGPUUsageStats(ctx)
+	if err != nil {
+		return err
+	}
+	if capacityOnly {
+		increased := false
+		for name, resource := range gpuUsage {
+			if resource.Available() > a.lastReportedGPUUsage[name].Available() {
+				increased = true
+				break
+			}
+		}
+		if !increased {
+			return nil
+		}
+	}
+
 	a.backendk8scache.UpdateSchedulerWorkloadMetrics(ctx)
 
 	agentHealth, err := a.backendHealthCache.RefreshStatus(ctx)
@@ -1627,7 +1660,7 @@ func (a *Agent) PutNVCAStatusUpdate(ctx context.Context) error {
 	req := &types.HealthStatusRequest{
 		UpgradeStatus:       a.backendk8scache.getNVCAUpgradeStatus(ctx),
 		Status:              agentHealth.Status,
-		GPUUsage:            agentHealth.GPUUsage,
+		GPUUsage:            gpuUsage,
 		ClusterOwnerNCAID:   a.NCAId,
 		NVCAAgentVersion:    a.NVCAAgentVersion,
 		NVCAOperatorVersion: a.NVCAOperatorVersion,
@@ -1641,6 +1674,7 @@ func (a *Agent) PutNVCAStatusUpdate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	a.lastReportedGPUUsage = maps.Clone(gpuUsage)
 
 	// Handle response action from ICMS with CLI flag overrides.
 	log := core.GetLogger(ctx).WithFields(logrus.Fields{

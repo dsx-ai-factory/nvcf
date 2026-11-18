@@ -821,7 +821,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
-	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 13)
 	for _, key := range []string{"early", "late"} {
 		if !requestBody.seen[key] {
 			t.Errorf("vanity request body scenario never sent the %s-field request", key)
@@ -3223,6 +3223,41 @@ func TestSingleClusterUpOneClick(t *testing.T) {
 		t.Skip("live run skipped under -short")
 	}
 	runLiveFeature(t, "single-cluster-up-oneclick.feature")
+}
+
+const capacityRecoveryTags = "@capacity-install,@capacity-recovery"
+
+func TestCapacityRecoveryTagsSelectInstallationAndReuse(t *testing.T) {
+	var selected []string
+	var output strings.Builder
+	status := godog.TestSuite{
+		Name: "capacity-recovery-selection",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			ctx.Before(func(ctx context.Context, scenario *godog.Scenario) (context.Context, error) {
+				selected = append(selected, scenario.Name)
+				return ctx, fmt.Errorf("selection probe: skip execution")
+			})
+		},
+		Options: &godog.Options{
+			Format: "progress",
+			Paths:  []string{mustResolveFeaturePath(t, "single-cluster-helmfile.feature")},
+			Tags:   capacityRecoveryTags,
+			Output: &output,
+		},
+	}.Run()
+	if status != 1 || len(selected) != 5 {
+		t.Fatalf("expected five installation and reuse scenarios, got status=%d scenarios=%v\n%s",
+			status, selected, output.String())
+	}
+}
+
+// TestSingleClusterCapacityRecovery installs the full local stack and verifies
+// that a function can reuse released capacity before the next periodic heartbeat.
+func TestSingleClusterCapacityRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	runLiveFeatureTags(t, "single-cluster-helmfile.feature", capacityRecoveryTags)
 }
 
 // TestSingleClusterHelmfile is the live entry point for the helmfile

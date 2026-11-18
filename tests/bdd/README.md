@@ -129,6 +129,11 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   SAMPLE_LLM_DECISIONS_IMAGE=<optional-image-reference-enables-decision-routes> \
   go test -run '^TestSingleClusterHelmfile$' -timeout 90m -v
 
+# Full local installation plus container-function capacity reuse. Requires the
+# NGC variables above; Helm function and task sample charts are not needed.
+NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
+  go test -run '^TestSingleClusterCapacityRecovery$' -timeout 90m -v
+
 # Single-cluster HA Helmfile feature: installs the control plane with
 # highAvailability.mode preferred and checks that nvcf-api runs 2 Ready
 # replicas on distinct nodes with a PDB and a surge-first rollout strategy.
