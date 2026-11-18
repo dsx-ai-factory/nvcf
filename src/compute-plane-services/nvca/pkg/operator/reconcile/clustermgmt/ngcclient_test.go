@@ -1068,6 +1068,27 @@ func TestCaseInsensitiveClusterConfigMap(t *testing.T) {
 					AgentNodeSelectorLabelValueConfig: "gpu-pool",
 				},
 			},
+			{
+				name: "exact canonical case wins over case variants",
+				jsonData: `{
+					"nvcaworkercontainerrestartcounttofailinstance": "8",
+					"NVCAWorkerContainerRestartCountToFailInstance": "5",
+					"NVCAWORKERCONTAINERRESTARTCOUNTTOFAILINSTANCE": "9"
+				}`,
+				expected: CaseInsensitiveClusterConfigMap{
+					NVCAWorkerContainerRestartCountToFailInstanceConfig: "5",
+				},
+			},
+			{
+				name: "case variants without the canonical spelling resolve in sorted key order",
+				jsonData: `{
+					"nvcaworkercontainerrestartcounttofailinstance": "8",
+					"NVCAWORKERCONTAINERRESTARTCOUNTTOFAILINSTANCE": "9"
+				}`,
+				expected: CaseInsensitiveClusterConfigMap{
+					NVCAWorkerContainerRestartCountToFailInstanceConfig: "8",
+				},
+			},
 		}
 
 		for _, tc := range testCases {
