@@ -66,6 +66,10 @@ environments:
 {{- if and (eq $targetAllocatorMode "install") (eq $discoveryRbacMode "disabled") }}
 {{- fail "observability.components.discoveryRbac.mode cannot be disabled when the Target Allocator is installed; use existing for externally managed RBAC" }}
 {{- end }}
+{{- $collectorReplicas := int (dig "collector" "replicas" 1 .Values) }}
+{{- if lt $collectorReplicas 1 }}
+{{- fail "collector.replicas must be an integer of at least 1; use observability.components.collector.mode=disabled to run no collector" }}
+{{- end }}
 {{- $observabilityNamespace := dig "observability" "namespace" "monitoring" .Values }}
 {{- $prometheusOperatorCrdsEnabled := eq $prometheusOperatorCrdsMode "install" }}
 {{- $opentelemetryOperatorEnabled := eq $opentelemetryOperatorMode "install" }}
@@ -289,7 +293,7 @@ releases:
     values:
       - collectorName: {{ dig "collector" "collectorName" "nvcf-observability" .Values | quote }}
         image: {{ dig "collector" "image" "" .Values | quote }}
-        replicas: {{ dig "collector" "replicas" 1 .Values }}
+        replicas: {{ $collectorReplicas }}
         {{- if .Values.global.imagePullSecrets }}
         imagePullSecrets:
           {{- toYaml .Values.global.imagePullSecrets | nindent 10 }}
