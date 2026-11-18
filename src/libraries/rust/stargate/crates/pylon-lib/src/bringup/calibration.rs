@@ -64,10 +64,10 @@ pub(crate) async fn run_calibration(
                 .then_some(&prompt_tokens_missing),
         )
         .await;
-        // With a fallback rate, a 529 ends the ramp like a step timeout and keeps
-        // the window measured so far.
+        // With a fallback rate, a busy reply ends the ramp like a step timeout and
+        // keeps the window measured so far.
         let upstream_overloaded = config.fallback_input_tps.is_some()
-            && result.as_ref().is_err_and(BringupError::is_overloaded);
+            && result.as_ref().is_err_and(BringupError::is_busy);
         let outcome = if upstream_overloaded {
             Ok(CalibrationStepOutcome::Saturated)
         } else {

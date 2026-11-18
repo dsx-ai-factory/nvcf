@@ -49,8 +49,9 @@ pub struct CalibrationConfig {
     pub calibration_prompt_units: usize,
     pub calibration_max_concurrency: usize,
     pub calibration_timeout: Duration,
-    /// Makes calibration best effort: a 529 ends the ramp, input counts come from
-    /// response usage, and a model whose calibration fails starts at this rate.
+    /// Makes calibration best effort: a 429, 503, or 529 ends the ramp, input
+    /// counts come from response usage, and a model whose calibration fails
+    /// starts at this rate.
     pub fallback_input_tps: Option<f64>,
 }
 
@@ -906,8 +907,8 @@ mod tests {
         stats.shutdown().await;
     }
 
-    /// Completes `completions` calibration requests, then answers 529 like Dynamo.
-    async fn spawn_overloading_server(completions: usize) -> TestHttpServer {
+    /// Completes `completions` calibration requests, then answers `status`.
+    async fn spawn_overloading_server(completions: usize, status: u16) -> TestHttpServer {
         let remaining = Arc::new(AtomicUsize::new(completions));
         TestHttpServer::spawn(Router::new().route(
             "/v1/chat/completions",
@@ -924,11 +925,11 @@ mod tests {
                             .into_response();
                     }
                     (
-                        StatusCode::from_u16(529).expect("test status is valid"),
+                        StatusCode::from_u16(status).expect("test status is valid"),
                         Json(serde_json::json!({
                             "message": "Service temporarily overloaded",
                             "type": "Overloaded",
-                            "code": 529
+                            "code": status
                         })),
                     )
                         .into_response()
@@ -962,7 +963,7 @@ mod tests {
             ),
         )
         .await
-        .expect("a 529 should end the calibration");
+        .expect("a busy reply should end the calibration");
         let input_tps = stats
             .control()
             .flush_and_snapshot(&generation)
@@ -976,11 +977,13 @@ mod tests {
 
     #[tokio::test]
     async fn overload_ends_a_fallback_calibration() {
-        for (label, completions, is_measured) in [
-            ("529 after completed requests", 3, true),
-            ("529 before any completed request", 0, false),
+        for (label, completions, status, is_measured) in [
+            ("529 after completed requests", 3, 529, true),
+            ("503 after completed requests", 3, 503, true),
+            ("429 after completed requests", 3, 429, true),
+            ("529 before any completed request", 0, 529, false),
         ] {
-            let server = spawn_overloading_server(completions).await;
+            let server = spawn_overloading_server(completions, status).await;
 
             let (result, input_tps) = run_test_calibration(server.as_str(), Some(100.0)).await;
 
@@ -999,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn overload_still_fails_a_calibration_without_a_fallback() {
-        let server = spawn_overloading_server(3).await;
+        let server = spawn_overloading_server(3, 529).await;
 
         let (result, _) = run_test_calibration(server.as_str(), None).await;
 

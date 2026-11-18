@@ -393,6 +393,12 @@ impl BringupError {
     pub(crate) fn is_overloaded(&self) -> bool {
         matches!(self, Self::Api { status, .. } if status.as_u16() == 529)
     }
+
+    /// Returns whether the upstream rejected the request because it is busy:
+    /// 529 from Dynamo, or 429 or 503 from an engine whose queue is full.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if matches!(status.as_u16(), 429 | 503 | 529))
+    }
 }
 
 #[derive(Debug, Deserialize)]
