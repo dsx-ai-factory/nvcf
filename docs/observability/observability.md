@@ -163,6 +163,11 @@ The shared collector discovers targets only in its Kubernetes cluster. In a
 split deployment, configure compute-plane collection separately. See [Cluster
 Monitoring](../compute-plane/cluster-management/monitoring.md).
 
+The collector runs one replica by default. Set `collector.replicas` to run
+more. The Target Allocator splits scrape targets across the replicas and each
+target keeps one collector, so a collector restart interrupts only that
+replica's share of targets.
+
 ### Logging
 
 Log Format:
