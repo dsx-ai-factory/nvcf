@@ -44,6 +44,12 @@ SPDX-License-Identifier: Apache-2.0
  *   resume hold  the same, but the gate stays closed until "open": across
  *            nodes, only once every node has bound its multicast memory.
  *   open     (after "resume hold")  reopen the launch gate.
+ *   mx pause  (before quiesce)  ModelExpress stops serving its weights to
+ *            peers and drops its NIXL/RDMA state, which CRIU cannot dump.
+ *   mx resume (after open)  it registers them again and republishes.
+ *   mx resume HOST  the same, advertising HOST (MX_WORKER_HOST) to peers:
+ *            after a restore into another pod, that pod's address.
+ *            Both need ModelExpress >= 0.7 (an earlier one: "err").
  *
  * Shared memory is tracked whether it is passed as a POSIX fd or, with an
  * IMEX channel, as a fabric handle (identified by "whosefab", hex). An

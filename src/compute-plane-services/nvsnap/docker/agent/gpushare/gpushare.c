@@ -2084,6 +2084,125 @@ static void do_ipcget(unsigned long long base, int s)
     msg_send(s, rep, -1);
 }
 
+/* ── ModelExpress ─────────────────────────────────────────────────────── */
+
+/* ModelExpress (a vLLM weight loader) serves the loaded weights to peers
+ * over NIXL/UCX, and holds RDMA state CRIU cannot dump (uverbs device files,
+ * memory registrations of the GPU memory "release" frees, queue pairs to
+ * peers). Its lifecycle module drops that state (pause_serving) and, once
+ * the weights are back, registers them again and republishes under a new
+ * worker id (resume_serving), but nothing in vLLM calls them. "mx pause"
+ * (before quiesce) and "mx resume" (after open) do, in this process's own
+ * Python. Not while launches are held: a Python thread waiting in the gate
+ * holds the GIL. Needs ModelExpress >= 0.7: earlier releases keep no load
+ * context once loaded, so there is nothing to pause. The reply counts the RDMA device files still open or
+ * mapped: CRIU fails on any.
+ *
+ * "mx resume HOST": ModelExpress publishes MX_WORKER_HOST, else the
+ * address its sockets route from, as the address peers pull from. After a
+ * restore into another pod both are the captured pod's address, which the
+ * restored process keeps; only the caller knows the new one. HOST becomes
+ * MX_WORKER_HOST, which ModelExpress reads again on every publish. */
+static const char mx_py[] =
+    "def _nvsnap_mx(op, fd, host):\n"
+    "    import gc, os, sys\n"
+    "    try:\n"
+    "        if host:\n"
+    "            os.environ['MX_WORKER_HOST'] = host\n"
+    "        L = sys.modules.get('modelexpress.engines.vllm.loader')\n"
+    "        if L is None:\n"
+    "            rep = 'ok no ModelExpress loader'\n"
+    "        else:\n"
+    "            if not hasattr(L, '_loader_registry'):\n"
+    "                raise RuntimeError('needs ModelExpress >= 0.7 '\n"
+    "                                   '(earlier releases drop the load context after loading)')\n"
+    "            from modelexpress import lifecycle\n"
+    "            n = bad = 0\n"
+    "            for dev, ld in list(L._loader_registry.items()):\n"
+    "                ctx = getattr(ld, '_ctx', None)\n"
+    "                if ctx is None or not ctx.p2p_enabled:\n"
+    "                    continue\n"
+    "                if op == 'pause' and (ctx.nixl_manager or ctx.mx_client):\n"
+    "                    lifecycle.pause_serving(ctx)\n"
+    "                    L._nixl_managers.pop(dev, None)\n"
+    "                    n += 1\n"
+    "                elif op == 'resume' and ctx.nixl_manager is None:\n"
+    "                    lifecycle.resume_serving(ctx, None)\n"
+    "                    if ctx.nixl_manager is None:\n"
+    "                        bad += 1\n"
+    "                    else:\n"
+    "                        L._nixl_managers[dev] = ctx.nixl_manager\n"
+    "                        n += 1\n"
+    "            gc.collect()\n"
+    "            rep = ('err %d of %d not registered again (see the log)' % (bad, n + bad) if bad\n"
+    "                   else 'ok %sd %d ModelExpress worker(s)' % (op, n))\n"
+    "    except BaseException as e:\n"
+    "        rep = 'err %s: %s' % (type(e).__name__, e)\n"
+    "    os.write(fd, rep.encode()[:160])\n";
+
+/* RDMA device files this process has open, and mappings of them. */
+static void rdma_files(int *open, int *mapped)
+{
+    char p[300], l[256];
+    *open = *mapped = 0;
+    DIR *d = opendir("/proc/self/fd");
+    for (struct dirent *e; d && (e = readdir(d));) {
+        snprintf(p, sizeof(p), "/proc/self/fd/%s", e->d_name);
+        ssize_t k = readlink(p, l, sizeof(l) - 1);
+        if (k > 0) l[k] = 0, *open += !strncmp(l, "/dev/infiniband/", 16);
+    }
+    if (d) closedir(d);
+    FILE *f = fopen("/proc/self/maps", "r");
+    while (f && fgets(p, sizeof(p), f)) *mapped += strstr(p, " /dev/infiniband/") != NULL;
+    if (f) fclose(f);
+}
+
+static void do_mx(char *reply, size_t n, const char *op)
+{
+    int (*is_init)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "Py_IsInitialized");
+    int (*ensure)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "PyGILState_Ensure");
+    void (*release)(int) = (void (*)(int))dlsym(RTLD_DEFAULT, "PyGILState_Release");
+    int (*run)(const char *) = (int (*)(const char *))dlsym(RTLD_DEFAULT, "PyRun_SimpleString");
+    char out[168] = "err no result", code[sizeof(mx_py) + 400];
+    const char *host = !strncmp(op, "resume ", 7) ? op + 7 : "";
+    int p[2], fds, maps;
+    /* HOST goes into Python source: an IP address or DNS name only (a
+     * request is at most 255 bytes). */
+    if (strcmp(op, "pause") && strcmp(op, "resume") &&
+        (!*host || strlen(host) > 200 || host[strspn(host, "0123456789abcdefghijklmnopqrstuvwxyz"
+                                                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ.:-")])) {
+        snprintf(reply, n, "err unknown command"); return;
+    }
+    if (!is_init || !ensure || !release || !run || !is_init()) {
+        snprintf(out, sizeof(out), "ok no Python");
+    } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
+        snprintf(reply, n, "err launches are held: mx pause goes before quiesce, mx resume after open");
+        return;
+    } else if (pipe2(p, O_CLOEXEC) != 0) {
+        snprintf(reply, n, "err pipe: %s", strerror(errno));
+        return;
+    } else {
+        snprintf(code, sizeof(code), "%s_nvsnap_mx('%s', %d, '%s')\ndel _nvsnap_mx\n", mx_py,
+                 *op == 'p' ? "pause" : "resume", p[1], host);
+        int g = ensure();
+        int r = run(code);
+        release(g);
+        close(p[1]);
+        ssize_t k = read(p[0], out, sizeof(out) - 1);
+        close(p[0]);
+        if (k > 0) out[k] = 0;
+        else if (r) snprintf(out, sizeof(out), "err Python raised (see stderr)");
+    }
+    rdma_files(&fds, &maps);
+    /* RDMA left after a pause (NCCL or NIXL outside ModelExpress, say)
+     * fails the dump: fail the pause instead. */
+    if (*op == 'p' && (fds || maps) && !strncmp(out, "ok ", 3))
+        snprintf(reply, n, "err %d RDMA device file(s) still open, %d mapped (%s): CRIU cannot dump them",
+                 fds, maps, out + 3);
+    else
+        snprintf(reply, n, "%s; %d RDMA device file(s) open, %d mapped", out, fds, maps);
+}
+
 /* A reply's longest form ("ok remapped ...", do_remap) fits: the tool
  * reads at most GPUSHARE_REPLY_MAX bytes of it (nvsnap-gpu-suspend.c). */
 static void serve(int s)
@@ -2107,6 +2226,7 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strncmp(buf, "mx ", 3)) { do_mx(rep, sizeof(rep), buf + 3); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);

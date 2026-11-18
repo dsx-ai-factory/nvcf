@@ -379,12 +379,21 @@ Limits of the move:
   `rdma_cm`) or an MPTCP socket at capture cannot be captured; CRIU cannot
   dump them (checkpoint-restore/criu#267), and RDMA state (memory
   registrations in a NIC context, queue pairs connected to peers) would not
-  survive a restore anyway. gpushare does not touch RDMA. The capture
-  preflight blocks such a capture and the instance runs on and starts cold
-  (ARCHITECTURE.md, "Who is captured"; MPTCP support: #2926). This covers,
-  for example, ModelExpress peer-to-peer over RDMA (NIXL/UCX) and NCCL over
-  InfiniBand or RoCE. A workload that has released its RDMA devices by
+  survive a restore anyway. The capture preflight blocks such a capture and
+  the instance runs on and starts cold (ARCHITECTURE.md, "Who is captured";
+  MPTCP support: #2926). This covers NCCL over InfiniBand or RoCE, and NIXL
+  KV transfer over RDMA. A workload that has released its RDMA devices by
   capture time is not blocked.
+- ModelExpress (>= 0.7) peer-to-peer over RDMA is the exception:
+  `nvsnap-gpu-suspend mx-pause`, before the preflight and the suspend, makes
+  ModelExpress stop serving its weights and drop its NIXL/RDMA state, and
+  `mx-resume`, after `open`, registers the weights again and republishes
+  them under a new worker id. After a restore into another pod, the agent
+  passes that pod's IP with `--host`: ModelExpress advertises
+  `MX_WORKER_HOST`, else the address its sockets route from, and both still
+  name the captured pod, which other pods cannot reach. `mx-pause` fails while any RDMA device file is
+  still open or mapped, so RDMA outside ModelExpress still blocks the
+  capture. A process without ModelExpress or Python answers `ok`.
 
 ## Validation
 
