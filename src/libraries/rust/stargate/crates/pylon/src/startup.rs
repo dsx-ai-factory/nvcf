@@ -2294,7 +2294,7 @@ mod tests {
             .await
             .expect("pylon startup task should not panic")
             .expect("pylon startup should succeed")
-            .shutdown()
+            .shutdown(ShutdownCause::Signal)
             .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
