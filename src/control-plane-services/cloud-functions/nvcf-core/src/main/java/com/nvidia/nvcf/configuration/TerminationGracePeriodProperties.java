@@ -20,13 +20,16 @@ import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.context.annotation.Configuration;
 
 @Data
+@RefreshScope
 @Configuration
 @ConfigurationProperties(prefix = "nvcf.llm.termination-grace-period")
 public class TerminationGracePeriodProperties {
 
+    // When a function has no stored duration, the minimum is sent at launch.
     private Duration min = Duration.ofMinutes(1);
     private Duration max = Duration.ofMinutes(5);
 
