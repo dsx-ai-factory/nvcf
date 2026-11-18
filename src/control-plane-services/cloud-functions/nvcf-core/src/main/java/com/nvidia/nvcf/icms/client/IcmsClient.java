@@ -38,6 +38,7 @@ import com.nvidia.boot.exceptions.NotFoundException;
 import com.nvidia.boot.exceptions.UpstreamException;
 import com.nvidia.boot.registries.service.registry.client.ngc.NgcRegistryUtils;
 import com.nvidia.boot.registries.service.registry.dto.ArtifactTypeEnum;
+import com.nvidia.nvcf.configuration.TerminationGracePeriodProperties;
 import com.nvidia.nvcf.configuration.nats.NatsConfiguration.NatsProperties;
 import com.nvidia.nvcf.configuration.staticclientauth.FixedBearerExchangeFilterFunction;
 import com.nvidia.nvcf.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientIcmsProperties;
@@ -51,6 +52,7 @@ import com.nvidia.nvcf.persistence.function.entity.FunctionType;
 import com.nvidia.nvcf.persistence.function.entity.GpuSpecificationEntity;
 import com.nvidia.nvcf.persistence.function.entity.Protocol;
 import com.nvidia.nvcf.rest.function.deployment.dto.InstanceUsageTypeEnum;
+import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.registry.dto.ProvisionedByEnum;
 import com.nvidia.nvcf.service.function.FunctionMapperService;
 import com.nvidia.nvcf.service.registry.RegistryArtifactValidationService;
@@ -174,6 +176,7 @@ public class IcmsClient {
     private final JsonMapper jsonMapper;
     private final GrpcTokenService grpcTokenService;
     private final FunctionMapperService functionMapperService;
+    private final TerminationGracePeriodProperties terminationGracePeriodProperties;
     private final NatsProperties natsProperties;
     private final TelemetryService telemetryService;
     private final RegistryArtifactValidationService registryArtifactValidationService;
@@ -230,6 +233,7 @@ public class IcmsClient {
             JsonMapper jsonMapper,
             GrpcTokenService grpcTokenService,
             FunctionMapperService functionMapperService,
+            TerminationGracePeriodProperties terminationGracePeriodProperties,
             NatsProperties natsProperties,
             TelemetryService telemetryService,
             RegistryArtifactValidationService registryArtifactValidationService,
@@ -253,6 +257,7 @@ public class IcmsClient {
         this.jsonMapper = jsonMapper;
         this.grpcTokenService = grpcTokenService;
         this.functionMapperService = functionMapperService;
+        this.terminationGracePeriodProperties = terminationGracePeriodProperties;
         this.telemetryService = telemetryService;
         this.essFqdn = essFqdn;
         this.sendLegacyCredProps = sendLegacyCredProps;
@@ -393,6 +398,7 @@ public class IcmsClient {
         // for container-based it should be null
         var configuration = isNotBlank(function.getHelmChart()) ? gpuSpec.getConfiguration() : null;
         var models = getFunctionModels(function);
+        var terminationGracePeriod = terminationGracePeriod(function);
         var response = service.createInstance(backend, gpu, instanceType, ncaId,
                                               rawAvailabilityZones, count,
                                               getInferenceContainer(function), helmChart, env,
@@ -413,6 +419,7 @@ public class IcmsClient {
                                               regions,
                                               attributes,
                                               function.getFunctionType(),
+                                              terminationGracePeriod,
                                               telemetries,
                                               helmValidationPolicy);
         if (response == null || response.getRequestId() == null) {
@@ -484,6 +491,11 @@ public class IcmsClient {
                     Pair.of("LLM_CREDENTIAL_MANAGER_IMAGE", llmCredentialManagerImage),
                     Pair.of("LLM_ROUTER_CLIENT_IMAGE", llmRouterClientImage),
                     Pair.of("LLM_REQUEST_ROUTER_ADDRESS", llmRequestRouterAddress)));
+            var terminationGracePeriod = terminationGracePeriod(function);
+            if (terminationGracePeriod != null) {
+                envStream = Stream.concat(envStream, Stream.of(
+                        Pair.of("TERMINATION_GRACE_PERIOD", terminationGracePeriod)));
+            }
         }
         if (function.getFunctionType() == FunctionType.STREAMING) {
             envStream = Stream.concat(envStream,
@@ -514,6 +526,17 @@ public class IcmsClient {
                 .map(pair -> pair.getFirst() + "=" + encodeEnvironmentValue(pair.getSecond()))
                 .collect(Collectors.joining("\n"));
         return Base64.getEncoder().encodeToString(env.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String terminationGracePeriod(FunctionEntity function) {
+        if (function.getFunctionType() != FunctionType.LLM) {
+            return null;
+        }
+        LlmInvocationConfigDto config = functionMapperService.toLlmInvocationConfigDto(
+                function.getLlmConfig());
+        var duration = config == null ? null : config.terminationGracePeriodDuration();
+        return (duration == null ? terminationGracePeriodProperties.getMin()
+                : duration).toString();
     }
 
     // The worker reads one KEY=value entry per line and unquotes Go double-quoted values, so a
