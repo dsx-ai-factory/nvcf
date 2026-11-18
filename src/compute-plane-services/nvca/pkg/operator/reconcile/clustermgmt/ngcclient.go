@@ -33,6 +33,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 	cmnhttp "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/http"
 	cmnsecret "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/secret"
+	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -563,8 +564,11 @@ func withAgentConfigMapper() clusterMapper {
 				return fmt.Errorf("failed to parse container restart count to fail instance: %w", err)
 			}
 			if count < 0 {
-				core.GetLogger(ctx).Warnf("ignoring negative %s %d, using the NVCA default",
-					NVCAWorkerContainerRestartCountToFailInstanceConfig, count)
+				core.GetLogger(ctx).WithFields(logrus.Fields{
+					"cluster_id": src.ID,
+					"config_key": NVCAWorkerContainerRestartCountToFailInstanceConfig,
+					"value":      count,
+				}).Warn("ignoring negative cluster configuration override for the worker restart threshold")
 				count = 0
 			}
 			workerContainerRestartCountToFailInstance = int32(count)
