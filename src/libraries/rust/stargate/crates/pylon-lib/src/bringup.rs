@@ -32,7 +32,7 @@ const DEFAULT_CANARY_MAX_GENERATION_THRESHOLD: u32 = 16;
 const DEFAULT_CALIBRATION_REQUESTS: usize = 5;
 const DEFAULT_CALIBRATION_PROMPT_UNITS: usize = 4096;
 const DEFAULT_CALIBRATION_MAX_CONCURRENCY: usize = 4;
-const DEFAULT_CALIBRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CALIBRATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct BringupConfig {

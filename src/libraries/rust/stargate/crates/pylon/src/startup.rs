@@ -43,6 +43,8 @@ use super::{Args, OutputTokenCalibrationMode};
 type TaskExit = std::result::Result<(), JoinError>;
 
 const DEFAULT_STARTUP_HEALTH_WAIT: Duration = Duration::from_secs(60);
+const DEFAULT_CALIBRATION_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
 const INFERENCE_READY_TIMEOUT_ENV: &str = "INFERENCE_READY_TIMEOUT";
 
 pub(super) async fn run(args: Args) -> Result<()> {
@@ -803,12 +805,21 @@ fn model_initialization_from_args(args: &Args) -> Result<ModelInitialization> {
             args.calibration_requests > 0,
             "--do-calibration requires --calibration-requests greater than zero"
         );
+        // Without a seed, a ramp that measures nothing stops Pylon, so a slow
+        // first step gets the longer limit.
+        let calibration_timeout_ms =
+            args.bringup_calibration_timeout_ms
+                .unwrap_or(if args.initial_input_tps.is_some() {
+                    DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS
+                } else {
+                    DEFAULT_CALIBRATION_TIMEOUT_MS
+                });
         return Ok(ModelInitialization::Calibration(CalibrationConfig {
             health_timeout: Duration::from_millis(args.bringup_canary_timeout_ms),
             calibration_requests: args.calibration_requests,
             calibration_prompt_units: args.calibration_prompt_units,
             calibration_max_concurrency: args.calibration_max_concurrency,
-            calibration_timeout: Duration::from_millis(args.bringup_calibration_timeout_ms),
+            calibration_timeout: Duration::from_millis(calibration_timeout_ms),
             fallback_input_tps: args.initial_input_tps,
         }));
     }
@@ -900,6 +911,49 @@ mod tests {
         let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
             .expect("startup plan should build");
         (args, plan)
+    }
+
+    #[test]
+    fn calibration_step_limit_defaults_to_five_seconds_only_with_a_seed() {
+        for (label, extra, expected) in [
+            ("seed", &["--initial-input-tps", "100"][..], 5_000),
+            ("no seed", &[][..], 30_000),
+            (
+                "seed, explicit",
+                &[
+                    "--initial-input-tps",
+                    "100",
+                    "--bringup-calibration-timeout-ms",
+                    "1000",
+                ][..],
+                1_000,
+            ),
+            (
+                "no seed, explicit",
+                &["--bringup-calibration-timeout-ms", "1000"][..],
+                1_000,
+            ),
+        ] {
+            let mut argv = vec![
+                "pylon",
+                "--upstream-http-base-url",
+                "http://127.0.0.1:8090/",
+                "--do-calibration",
+            ];
+            argv.extend_from_slice(extra);
+            let args = <Args as Parser>::try_parse_from(argv).expect(label);
+
+            let Ok(ModelInitialization::Calibration(config)) =
+                model_initialization_from_args(&args)
+            else {
+                panic!("{label}: expected a calibration plan");
+            };
+            assert_eq!(
+                config.calibration_timeout,
+                Duration::from_millis(expected),
+                "{label}"
+            );
+        }
     }
 
     fn runtime_args(

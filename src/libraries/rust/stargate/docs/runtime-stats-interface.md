@@ -277,10 +277,12 @@ ignored. Pylon logs the current stats at timeout without reinjecting them.
 Later valid runtime samples continue updating either unpinned distribution.
 
 With both `--do-calibration` and `--initial-input-tps`, Pylon calibrates each
-model, one at a time, including models discovered later. A 529 response ends a
-model's ramp like a load-step timeout (`--bringup-calibration-timeout-ms`, 5
-seconds by default), and ramp requests count input tokens from the response
-`usage.prompt_tokens`. If those responses have no `usage.prompt_tokens`, Pylon
+model, one at a time, including models discovered later. A 429, 503, or 529
+response ends a model's ramp like a load-step timeout, and ramp requests count
+input tokens from the response `usage.prompt_tokens`. The load-step timeout
+(`--bringup-calibration-timeout-ms`) defaults to 5 seconds in this mode and to
+30 seconds with calibration alone, where a ramp that measures nothing stops
+Pylon. If those responses have no `usage.prompt_tokens`, Pylon
 logs a warning and counts prompt characters instead, as calibration alone does.
 If a model's calibration fails or measures no input rate,
 Pylon logs a warning and starts that model at the `--initial-input-tps` value.

@@ -121,14 +121,14 @@ struct Args {
     /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while requests for any model name on this Pylon make progress does not mark the model unavailable; this assumes the names share workers, as aliases do
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     bringup_canary_timeout_ms: u64,
-    /// Time limit in milliseconds for each calibration load step. A step that takes longer ends the model's ramp
+    /// Time limit in milliseconds for each calibration load step. A step that takes longer ends the model's ramp. Defaults to 5000 with --initial-input-tps and 30000 without it
     #[arg(
         long,
-        default_value_t = 5000,
         env = "PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(1..),
         value_name = "MS"
     )]
-    bringup_calibration_timeout_ms: u64,
+    bringup_calibration_timeout_ms: Option<u64>,
     /// Upstream HTTP path to poll for KV-cache stats. Omit to disable KV metric polling
     #[arg(long, value_name = "PATH")]
     kv_cache_stats_path: Option<String>,
@@ -396,11 +396,12 @@ mod tests {
     }
 
     #[test]
-    fn calibration_defaults_to_off_with_a_five_second_step_limit() {
+    fn calibration_defaults_to_off_and_rejects_a_zero_step_limit() {
         let args = parse_args("");
 
         assert!(!args.do_calibration);
-        assert_eq!(args.bringup_calibration_timeout_ms, 5000);
+        assert_eq!(args.bringup_calibration_timeout_ms, None);
+        assert!(try_parse_argv(&["--bringup-calibration-timeout-ms", "0"]).is_err());
     }
 
     #[test]
