@@ -3297,6 +3297,40 @@ func TestNewAgentConfig_CRTolerationsTakePrecedence(t *testing.T) {
 	assert.Equal(t, crTolerations, cfg.Agent.Tolerations)
 }
 
+func TestMergeAgentConfigs_WorkerContainerRestartThreshold(t *testing.T) {
+	tests := []struct {
+		name          string
+		clusterSource nvcaoptypes.ClusterSource
+		specValue     int32
+		helmValue     int32
+		want          int32
+	}{
+		{name: "ngc-managed falls back to the helm value", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, helmValue: 8, want: 8},
+		{name: "ngc-managed explicit value wins", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, specValue: 5, helmValue: 8, want: 5},
+		{name: "ngc-managed with neither set stays unset", clusterSource: nvcaoptypes.ClusterSourceNGCManaged, want: 0},
+		{name: "helm-managed uses the helm value", clusterSource: nvcaoptypes.ClusterSourceHelmManaged, specValue: 5, helmValue: 8, want: 8},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bc := &BackendK8sCache{
+				nvcfWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartCountToFailInstance: tt.helmValue},
+			}
+			nb := &nvidiaiov1.NVCFBackend{
+				Spec: nvidiaiov1.NVCFBackendSpec{
+					NVCFBackendSpecT: nvidiaiov1.NVCFBackendSpecT{
+						ClusterSource: tt.clusterSource,
+						AgentConfig: nvidiaiov1.AgentConfig{
+							NVCFWorkerConfig: nvidiaiov1.NVCFWorkerConfig{WorkerContainerRestartCountToFailInstance: tt.specValue},
+						},
+					},
+				},
+			}
+			got := bc.mergeAgentConfigs(nb).NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestSetupNVCADeployment_AppliesAgentTolerations(t *testing.T) {
 	ctx := newTestContext()
 	clients := mockKubeClientsForIntegrationTests()

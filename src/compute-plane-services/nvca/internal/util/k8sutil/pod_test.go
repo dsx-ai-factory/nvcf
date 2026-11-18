@@ -1420,8 +1420,11 @@ func TestIsContainerInRestartLoopWorkerThreshold(t *testing.T) {
 	}
 	helmUtilsPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: common.UtilsPodName, Namespace: "sr-helm-fn"},
-		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}}},
-		Status:     corev1.PodStatus{StartTime: startTime},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: common.InitContainerName}},
+			Containers:     []corev1.Container{{Name: common.UtilsContainerName}, {Name: common.ESSContainerName}},
+		},
+		Status: corev1.PodStatus{StartTime: startTime},
 	}
 	crashed := func(name string, restarts int32) corev1.ContainerStatus {
 		return corev1.ContainerStatus{
@@ -1452,7 +1455,9 @@ func TestIsContainerInRestartLoopWorkerThreshold(t *testing.T) {
 		{name: "raised threshold fails the worker at its limit", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: 5, restarts: 5, want: true},
 		{name: "lowered threshold fails the worker at one restart", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: 1, restarts: 1, want: true},
 		{name: "raised threshold applies to the LLM worker", pod: llmWorkerPod, container: function.LLMWorkerContainerName, threshold: 5, restarts: 4, want: false},
-		{name: "raised threshold applies to the Helm utils Pod", pod: helmUtilsPod, container: "worker", threshold: 5, restarts: 4, want: false},
+		{name: "raised threshold applies to the Helm utils Pod worker", pod: helmUtilsPod, container: common.UtilsContainerName, threshold: 5, restarts: 4, want: false},
+		{name: "ESS sidecar in the Helm utils Pod keeps three", pod: helmUtilsPod, container: common.ESSContainerName, threshold: 5, restarts: 3, want: true},
+		{name: "init container in the Helm utils Pod keeps three", pod: helmUtilsPod, container: common.InitContainerName, threshold: 5, restarts: 3, want: true},
 		{name: "inference container keeps three with a raised worker threshold", pod: containerFunctionPod, container: "inference", threshold: 5, restarts: 3, want: true},
 		{name: "inference container keeps three with a lowered worker threshold", pod: containerFunctionPod, container: "inference", threshold: 1, restarts: 2, want: false},
 		{name: "utils container without the instance ID is not the worker", pod: userUtilsPod, container: common.UtilsContainerName, threshold: 5, restarts: 3, want: true},

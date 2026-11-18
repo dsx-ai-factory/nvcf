@@ -64,11 +64,12 @@ func IsUtilsPod(pod *corev1.Pod) bool {
 	return false
 }
 
-// isWorkerContainer reports whether the named container is the NVCA worker: any container of the static "utils"
-// Pod for Helm functions, or the worker container that carries the instance ID for container functions.
+// isWorkerContainer reports whether the named container is the NVCA worker: the "utils" container of the static
+// "utils" Pod for Helm functions, or the worker container that carries the instance ID for container functions.
+// Sidecars such as ESS in the Helm "utils" Pod are not the worker.
 func isWorkerContainer(pod *corev1.Pod, containerName string) bool {
 	if pod.Name == common.UtilsPodName && IsMiniServiceNamespaceName(pod.Namespace) {
-		return true
+		return containerName == common.UtilsContainerName
 	}
 	if containerName != common.UtilsContainerName && containerName != function.LLMWorkerContainerName {
 		return false

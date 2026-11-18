@@ -1979,6 +1979,10 @@ func (bc *BackendK8sCache) mergeAgentConfigs(nb *nvidiaiov1.NVCFBackend) nvidiai
 	if nb.Spec.ClusterSource == nvcaoptypes.ClusterSourceNGCManaged {
 		// NGC-managed: Use NGC-provided worker config
 		config.NVCFWorkerConfig = nb.Spec.AgentConfig.NVCFWorkerConfig
+		// An explicit NGC value wins; otherwise honor the helm-supplied operator value.
+		if config.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance <= 0 {
+			config.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance = bc.nvcfWorkerConfig.WorkerContainerRestartCountToFailInstance
+		}
 	} else {
 		// Helm-managed: Use local worker config
 		config.NVCFWorkerConfig = bc.nvcfWorkerConfig
