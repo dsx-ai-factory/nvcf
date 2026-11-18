@@ -713,6 +713,9 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 
 func TestSingleClusterHAFeatureFileWiresToSteps(t *testing.T) {
 	const installCommand = "make -C deploy/stacks/self-managed install HELMFILE_ENV=local-bdd-ha"
+	const serviceRoutingCommand = `/bin/bash -o pipefail -c 'kubectl --context k3d-ncp-local get services` +
+		` openbao-server openbao-server-active openbao-server-standby --namespace vault-system -o json` +
+		` | jq -c '\''[.items[] | {name: .metadata.name, publishNotReadyAddresses: (.spec.publishNotReadyAddresses // false)}]'\'''`
 	const placementCommand = "/bin/bash -c 'kubectl --context k3d-ncp-local get pods --namespace nvcf" +
 		" -l app.kubernetes.io/instance=api,app.kubernetes.io/name=helm-nvcf-api,!app.kubernetes.io/component -o json" +
 		" | bash tests/bdd/scripts/assert-ha-placement.sh 2'"
@@ -733,6 +736,14 @@ func TestSingleClusterHAFeatureFileWiresToSteps(t *testing.T) {
 		},
 		placementCommand: {ExitCode: 0, Stdout: "ha-placement=ok replicas=2 nodes=2\n"},
 	})
+	runner.results[serviceRoutingCommand] = harness.Result{
+		ExitCode: 0,
+		Stdout:   `[{"name":"openbao-server","publishNotReadyAddresses":false},{"name":"openbao-server-active","publishNotReadyAddresses":false},{"name":"openbao-server-standby","publishNotReadyAddresses":false}]`,
+	}
+	runner.results["kubectl get service/openbao-server-internal --namespace vault-system --context k3d-ncp-local -o yaml"] = harness.Result{
+		ExitCode: 0,
+		Stdout:   "apiVersion: v1\nkind: Service\nmetadata:\n  name: openbao-server-internal\nspec:\n  clusterIP: None\n  publishNotReadyAddresses: true\n",
+	}
 	suite := newWiringSuite(t, runner)
 	seedHelmfileLocalBDDFixture(t, suite.Config.RepoRoot)
 	seedStackSecretsTemplate(t, suite.Config.RepoRoot)

@@ -11,7 +11,8 @@ Feature: Install a local single-cluster NVCF stack with high availability enable
   # need a pinned helm-nvcf-api chart that carries the HA hooks; older published
   # charts ignore those values. Draining nodes to prove the PDB
   # blocks the last eviction is intentionally out of scope here because it
-  # would disrupt the shared stack.
+  # would disrupt the shared stack. OpenBao client Services exclude NotReady
+  # members; its headless Service retains peer discovery during bootstrap.
 
   Background:
     Given these environment variables are set:
@@ -66,6 +67,23 @@ Feature: Install a local single-cluster NVCF stack with high availability enable
       """
       spec:
         minAvailable: 1
+      """
+
+    # Kubernetes may omit false boolean fields from stored Service objects.
+    When I successfully run command:
+      """
+      /bin/bash -o pipefail -c 'kubectl --context k3d-ncp-local get services openbao-server openbao-server-active openbao-server-standby --namespace vault-system -o json | jq -c '\''[.items[] | {name: .metadata.name, publishNotReadyAddresses: (.spec.publishNotReadyAddresses // false)}]'\'''
+      """
+    Then the json output should contain rows:
+      | name                   | publishNotReadyAddresses |
+      | openbao-server         | false                    |
+      | openbao-server-active  | false                    |
+      | openbao-server-standby  | false                    |
+    And Kubernetes resource "service/openbao-server-internal" in namespace "vault-system" using context "k3d-ncp-local" should contain:
+      """
+      spec:
+        clusterIP: None
+        publishNotReadyAddresses: true
       """
 
     # Soft hostname anti-affinity must still land each replica on its own node.
