@@ -559,19 +559,22 @@ func withAgentConfigMapper() clusterMapper {
 
 		var workerContainerRestartCountToFailInstance int32
 		if countStr := src.ClusterConfigurations[NVCAWorkerContainerRestartCountToFailInstanceConfig]; countStr != "" {
+			// An invalid value is ignored rather than returned as an error, so it does not block the other cluster
+			// settings from being reconciled.
+			log := core.GetLogger(ctx).WithFields(logrus.Fields{
+				"cluster_id": src.ID,
+				"config_key": NVCAWorkerContainerRestartCountToFailInstanceConfig,
+				"value":      countStr,
+			})
 			count, err := strconv.ParseInt(countStr, 10, 32)
-			if err != nil {
-				return fmt.Errorf("failed to parse container restart count to fail instance: %w", err)
+			switch {
+			case err != nil:
+				log.WithError(err).Warn("ignoring invalid cluster configuration override for the worker restart threshold")
+			case count < 0:
+				log.Warn("ignoring negative cluster configuration override for the worker restart threshold")
+			default:
+				workerContainerRestartCountToFailInstance = int32(count)
 			}
-			if count < 0 {
-				core.GetLogger(ctx).WithFields(logrus.Fields{
-					"cluster_id": src.ID,
-					"config_key": NVCAWorkerContainerRestartCountToFailInstanceConfig,
-					"value":      count,
-				}).Warn("ignoring negative cluster configuration override for the worker restart threshold")
-				count = 0
-			}
-			workerContainerRestartCountToFailInstance = int32(count)
 		}
 
 		// Map NVCFWorkerConfig

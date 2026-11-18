@@ -941,21 +941,20 @@ func TestWithAgentConfigMapper(t *testing.T) {
 		assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance)
 	})
 
-	t.Run("returns error for invalid container restart count to fail instance", func(t *testing.T) {
-		for value, wantErr := range map[string]string{
-			"five":        "failed to parse container restart count to fail instance",
-			"99999999999": "failed to parse container restart count to fail instance",
-		} {
+	t.Run("ignores invalid container restart count to fail instance and maps other settings", func(t *testing.T) {
+		for _, value := range []string{"five", "99999999999"} {
 			src := &clusterDTO{
 				ClusterConfigurations: CaseInsensitiveClusterConfigMap{
 					NVCAWorkerContainerRestartCountToFailInstanceConfig: value,
+					AgentPriorityClassNameConfig:                        "high-priority",
 				},
 			}
 			dest := &Cluster{NVCFBackend: &nvidiaiov1.NVCFBackend{}}
 
 			err := withAgentConfigMapper()(ctx, nvidiaiov1.EnvTypeProd, src, dest)
-			require.Error(t, err, value)
-			assert.Contains(t, err.Error(), wantErr, value)
+			require.NoError(t, err, value)
+			assert.Equal(t, int32(0), dest.NVCFBackend.Spec.AgentConfig.NVCFWorkerConfig.WorkerContainerRestartCountToFailInstance, value)
+			assert.Equal(t, "high-priority", dest.NVCFBackend.Spec.AgentConfig.DeploymentConfig.PriorityClassName, value)
 		}
 	})
 
