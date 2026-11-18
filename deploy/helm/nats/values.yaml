@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CI indexes the prefilled image settings below. Helm consumes those settings
-# directly; override them with ordinary values files.
+# CI indexes the image settings below. A chart does not choose an image
+# source: registry and repository come from the stack base.yaml or a values
+# file, and the chart fails to render without them. This chart still prefills
+# them and is pending-fix in tools/docs-version-sync/chart-image-exclusions.yaml.
 thirdPartyImages:
   natsServer: nats.container.image
   natsReloader: nats.reloader.image

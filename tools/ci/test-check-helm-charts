@@ -269,6 +269,42 @@ else
 fi
 rm -rf "${fake_values_dir}" "${fake_chart_root}"
 
+# A chart with an HTTPS dependency repository registers it before the build,
+# in a run-owned Helm repository config, so a fresh checkout needs no manual
+# "helm repo add" and the caller's Helm config is untouched.
+make_fake_tree
+printf 'dependencies:\n  - {name: nats, repository: "https://charts.example/nats"}\n' \
+    >>"${fake_chart_root}/deploy/helm/openbao/helm/Chart.yaml"
+stub_dir="$(mktemp -d)"
+helm_log="$(mktemp)"
+cat >"${stub_dir}/helm" <<'STUB'
+#!/usr/bin/env bash
+echo "$* config=${HELM_REPOSITORY_CONFIG:-unset}" >>"${FAKE_HELM_LOG}"
+exit 0
+STUB
+chmod +x "${stub_dir}/helm"
+set +e
+out="$(FAKE_HELM_LOG="${helm_log}" HELM_REPOSITORY_CONFIG=/caller/repositories.yaml PATH="${stub_dir}:${PATH}" bash "${script}" \
+    --values-dir "${fake_values_dir}" --repo-root "${fake_chart_root}" --map "${real_map}" 2>&1)"
+rc=$?
+set -e
+expect "https dependency run succeeds" 0 "${fake_chart_count} scenarios linted and rendered"
+first_add="$(grep -n '^repo add --force-update .* https://charts.example/nats ' "${helm_log}" | head -1 | cut -d: -f1 || true)"
+first_build="$(grep -n '^dependency build ' "${helm_log}" | head -1 | cut -d: -f1 || true)"
+if [ -n "${first_add}" ] && [ -n "${first_build}" ] && [ "${first_add}" -lt "${first_build}" ]; then
+    printf 'ok   https dependency repository registered before the build\n'
+else
+    printf 'FAIL https dependency repository not registered before the build:\n%s\n' "$(cat "${helm_log}")"
+    fail=1
+fi
+if grep -q 'config=/caller/repositories.yaml\|config=unset' "${helm_log}"; then
+    printf 'FAIL helm ran with the caller repository config:\n%s\n' "$(cat "${helm_log}")"
+    fail=1
+else
+    printf 'ok   helm repository config isolated to the run\n'
+fi
+rm -rf "${stub_dir}" "${helm_log}" "${fake_values_dir}" "${fake_chart_root}"
+
 # A chart with several scenarios fetches its dependencies once.
 make_fake_tree
 multi="$(yq -r '[.scenarios[].chart] | group_by(.) | map(select(length > 1)) | .[0][0] // ""' "${real_map}")"

@@ -150,6 +150,15 @@ fi
 created_dirs=()
 fetched_archives=()
 
+# HTTPS dependency repositories (the NATS chart, for example) must be
+# registered before helm dependency build can fetch them. Register them in a
+# run-owned repository config and cache, so a fresh checkout needs no manual
+# "helm repo add" and the caller's Helm config is never changed. OCI and
+# file:// dependencies need no registration.
+helm_repository_home="$(mktemp -d)"
+export HELM_REPOSITORY_CONFIG="${helm_repository_home}/repositories.yaml"
+export HELM_REPOSITORY_CACHE="${helm_repository_home}/cache"
+
 archives_in() {  # archives_in <chart dir> -> one archive path per line
     find "$1/charts" -maxdepth 1 -type f -name '*.tgz' 2>/dev/null | sort
 }
@@ -173,6 +182,7 @@ cleanup() {
     for path in ${created_dirs[@]+"${created_dirs[@]}"}; do
         rm -rf "${path}"
     done
+    rm -rf "${helm_repository_home}"
 }
 trap cleanup EXIT
 
@@ -233,6 +243,18 @@ check_rendered_objects() {  # check_rendered_objects <stem> <rendered file>
     ' "${rendered}"
 }
 
+# register_https_repositories <chart dir>: add each HTTPS dependency repository
+# under a run-local name. --force-update lets a later chart reuse a name at a
+# different URL.
+register_https_repositories() {
+    local chart_dir="$1" url index=0
+    while IFS= read -r url; do
+        [ -n "${url}" ] || continue
+        helm repo add --force-update "check-helm-charts-${index}" "${url}" || return 1
+        index=$((index + 1))
+    done < <(yq -r '.dependencies[]?.repository // "" | select(test("^https://"))' "${chart_dir}/Chart.yaml")
+}
+
 render_and_check() {  # render_and_check <stem> <chart dir> <values file>
     local stem="$1" chart_dir="$2" values_file="$3" rendered
     rendered="$(mktemp)"
@@ -269,7 +291,9 @@ for i in "${!entry_charts[@]}"; do
         else
             created_dirs+=("${chart_dir}/charts")
         fi
-        run_step "${stem}: helm dependency build" \
+        run_step "${stem}: helm repo add" \
+            register_https_repositories "${chart_dir}" || chart_failed=1
+        [ "${chart_failed}" -ne 0 ] || run_step "${stem}: helm dependency build" \
             helm dependency build "${chart_dir}" || chart_failed=1
         # Record after a failed fetch too. helm can leave a partial download
         # behind on error.
