@@ -30,25 +30,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/configs"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/health"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/progress"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/secrets"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/types"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-task/internal/upload"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metering"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metrics"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/nvct"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proto/nvct"
-	sharedTypes "github.com/NVIDIA/nvcf/src/libraries/go/worker/types"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/configs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/health"
+	taskmetrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/progress"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/secrets"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/upload"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metering"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/nvct"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proto/nvct"
+	sharedTypes "github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
 )
 
 type NVCTWorker struct {
@@ -74,9 +78,13 @@ func NewNVCTWorker(ctx context.Context, zapLogger *logs.ZapLogger, config config
 		config.HealthPort = configs.DefaultHealthPort
 	}
 
-	otelUrl, err := url.Parse(config.OTELExporterOTLPEndpoint)
+	otlpHost, otlpInsecure, err := otlpTraceTarget(config.OTELExporterOTLPEndpoint)
 	if err != nil {
 		return nil, sharedTypes.NewInternalError(err)
+	}
+	if otlpHost == "" {
+		zap.L().Info("OTEL_EXPORTER_OTLP_ENDPOINT is not set, tracing is disabled",
+			zap.String("task_id", config.TaskId))
 	}
 
 	workerHealth := health.New()
@@ -179,9 +187,9 @@ func NewNVCTWorker(ctx context.Context, zapLogger *logs.ZapLogger, config config
 				ServiceName: "gdn-nvct-worker-service",
 				Version:     utils.Version,
 				Tracing: tracing.OTELConfig{
-					Enabled:     true,
-					Endpoint:    otelUrl.Host,
-					Insecure:    otelUrl.Scheme == "http",
+					Enabled:     otlpHost != "",
+					Endpoint:    otlpHost,
+					Insecure:    otlpInsecure,
 					AccessToken: config.TracingAccessToken,
 					Attributes: tracing.Attributes{
 						Extra: map[string]string{
@@ -203,11 +211,20 @@ func NewNVCTWorker(ctx context.Context, zapLogger *logs.ZapLogger, config config
 			// only running a healthcheck server
 			servers.WithRegisterServer(func(*grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/v1/health/live"),
-			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": workerHealth}),
+			servers.WithAdditionalHTTPHandlers(additionalHTTPHandlers(workerHealth)),
 		),
 	}
 
 	return w, nil
+}
+
+func additionalHTTPHandlers(ready http.Handler) map[string]http.Handler {
+	handler := version.HandlerFor("nvcf-worker-task", version.Version, version.GitHash)
+	handler = promhttp.InstrumentHandlerDuration(taskmetrics.InfoRequestDuration, handler)
+	return map[string]http.Handler{
+		"/v1/health/ready": ready,
+		"/info":            otelhttp.NewHandler(handler, "nvcf-worker-task.info"),
+	}
 }
 
 // Setup NVCT worker.
@@ -520,4 +537,22 @@ func (w *NVCTWorker) waitForTaskReady(ctx context.Context, timeout time.Duration
 			}
 		}
 	}
+}
+
+// otlpTraceTarget parses OTEL_EXPORTER_OTLP_ENDPOINT into the host and
+// transport security for the OTLP gRPC trace exporter. An empty or unset
+// endpoint returns an empty host, which means tracing is disabled.
+func otlpTraceTarget(endpoint string) (host string, insecure bool, err error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", false, nil
+	}
+	otelURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", false, err
+	}
+	if otelURL.Host == "" {
+		return "", false, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be a URL with a host, such as http://otel-collector:4317")
+	}
+	return otelURL.Host, otelURL.Scheme == "http", nil
 }

@@ -13,10 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-module github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/common
+module github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/common
 
-go 1.23.0
-
-toolchain go1.23.6
+go 1.26.10
 
 require github.com/google/uuid v1.6.0

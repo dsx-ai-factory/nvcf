@@ -26,13 +26,16 @@ import (
 
 	echo "github.com/labstack/echo/v4"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
 )
 
 const (
 	contextKeyRequestContext = "nvcf.request_context"
 	contextKeyRequestID      = "nvcf.request_id"
 	contextKeyRateLimitCtx   = "nvcf.rate_limit_context"
+	// contextKeyBackendErrorRelayed marks a backend error written unchanged,
+	// so headers the gateway normally owns are left as the backend sent them.
+	contextKeyBackendErrorRelayed = "nvcf.backend_error_relayed"
 )
 
 type GatewayContext struct {
@@ -52,7 +55,18 @@ func NewGatewayContext(ectx echo.Context) *GatewayContext {
 	}
 }
 
+// Bind decodes the request into i. A request without a Content-Type is bound
+// as JSON, as requestContentType reads it, on a copy so the forwarded headers
+// stay as the client sent them.
 func (c *GatewayContext) Bind(i any) error {
+	req := c.Request()
+	if req.Header.Get(echo.HeaderContentType) != "" {
+		return c.Echo().Binder.Bind(i, c)
+	}
+	jsonReq := req.Clone(req.Context())
+	jsonReq.Header.Set(echo.HeaderContentType, requestContentType(req))
+	c.SetRequest(jsonReq)
+	defer c.SetRequest(req)
 	return c.Echo().Binder.Bind(i, c)
 }
 

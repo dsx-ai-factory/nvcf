@@ -36,10 +36,12 @@ pub use snapshots::{RoutedClusterSnapshot, RoutedInferenceServerSnapshot};
 pub(crate) use snapshots::{RoutingTargetSnapshot, SelectedRoutedCluster};
 
 pub(crate) use keys::RegistrationIdentity;
+pub use registration::DEFAULT_DEREGISTERED_MODEL_GRACE;
 #[cfg(test)]
 pub(crate) use registration::test_registration_generation;
 pub(crate) use registration::{RegistrationGeneration, RunningRegistration};
 pub(crate) use reservations::RoutingReservation;
+pub use reservations::apply_reservation;
 
 #[cfg(test)]
 use snapshots::RoutingTargetState;
@@ -51,6 +53,15 @@ pub struct StargateState {
 }
 
 impl StargateState {
+    pub(crate) fn forget_load_balancer_instance(
+        &self,
+        target: &RoutingTargetKey,
+        definition: &crate::load_balancer::LoadBalancerDefinition,
+    ) {
+        self.routing
+            .forget_load_balancer_instance(target, definition);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -60,6 +71,12 @@ impl StargateState {
             registrations: registration::RegistrationRegistry::default(),
             routing: clusters::RoutingLifecycle::new(Some(metrics)),
         }
+    }
+
+    /// How long a model stays known (`503`, not `404`) after its last backend leaves; zero disables.
+    pub fn with_deregistered_model_grace(mut self, grace: Duration) -> Self {
+        self.registrations = registration::RegistrationRegistry::new(grace);
+        self
     }
 
     pub(crate) fn begin_registration(
@@ -72,7 +89,7 @@ impl StargateState {
     /// Ends `running` and removes its routes. Returns the model ids that were
     /// routable through this registration so callers can report routing impact.
     pub(crate) async fn end_registration(&self, running: RunningRegistration) -> BTreeSet<String> {
-        let Some(ended) = self.registrations.end_registration(running) else {
+        let Some(ended) = self.registrations.end_registration(running, Instant::now()) else {
             return BTreeSet::new();
         };
 
@@ -90,12 +107,35 @@ impl StargateState {
         model_ids
     }
 
+    /// Applies an update as if it had just been received.
+    #[cfg(test)]
     pub(crate) async fn apply_registration_update(
         &self,
         running: &RunningRegistration,
         update: &InferenceServerRegistration,
         reverse_connected: bool,
         rtt: Option<Duration>,
+    ) {
+        self.apply_received_registration_update(
+            running,
+            update,
+            reverse_connected,
+            rtt,
+            Instant::now(),
+        )
+        .await;
+    }
+
+    /// Applies an update received from the registration stream at
+    /// `received_at`. Reservations compare that receipt time, not the later
+    /// apply time, with their soft expiry.
+    pub(crate) async fn apply_received_registration_update(
+        &self,
+        running: &RunningRegistration,
+        update: &InferenceServerRegistration,
+        reverse_connected: bool,
+        rtt: Option<Duration>,
+        received_at: Instant,
     ) {
         let registration = running.generation();
         let identity = &registration.identity;
@@ -104,9 +144,11 @@ impl StargateState {
         // Publish the full heartbeat membership before per-target awaits while
         // retaining the cleanup union until every routing mutation commits.
         let current_models: BTreeSet<String> = update.models.keys().cloned().collect();
-        let removed_models = self
-            .registrations
-            .begin_advertised_model_update(running, current_models);
+        let removed_models = self.registrations.begin_advertised_model_update(
+            running,
+            current_models,
+            Instant::now(),
+        );
         let removed_targets: HashSet<RoutingTargetKey> = removed_models
             .iter()
             .map(|model_id| RoutingTargetKey::new(routing_key.clone(), model_id))
@@ -156,7 +198,8 @@ impl StargateState {
                             current_rtt,
                             Instant::now(),
                             effective_status,
-                        ),
+                        )
+                        .with_update_received_at(received_at),
                     )
                     .await;
             } else {
@@ -192,7 +235,8 @@ impl StargateState {
     }
 
     pub fn has_registered_model_for_target(&self, target: &RoutingTargetKey) -> bool {
-        self.registrations.has_registered_model_for_target(target)
+        self.registrations
+            .has_registered_model_for_target(target, Instant::now())
     }
 
     pub async fn list_active_models(

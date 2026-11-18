@@ -16,7 +16,7 @@ go_library(
         "templates/config-vm-container.yaml.tmpl",
         "templates/config-vm-helm.yaml.tmpl",
     ],
-    importpath = "github.com/NVIDIA/nvcf/src/compute-plane-services/byoo-otel-collector/internal/otelconfig",
+    importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/byoo-otel-collector/internal/otelconfig",
     visibility = ["//src/compute-plane-services/byoo-otel-collector:__subpackages__"],
     deps = [
         "//src/compute-plane-services/byoo-otel-collector/internal/logger",
@@ -36,6 +36,7 @@ go_test(
     name = "otelconfig_test",
     srcs = [
         "embed_config_test.go",
+        "federation_test.go",
         "otelconfig_test.go",
         "render_test.go",
     ],
@@ -52,6 +53,7 @@ go_test(
     deps = [
         "//src/compute-plane-services/byoo-otel-collector/internal/logger",
         "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
         "@in_gopkg_yaml_v3//:yaml_v3",
     ],
 )

@@ -20,10 +20,8 @@ use pylon_lib::{
     EngineStatsStreamMode, ModelDiscoveryProvider, TunnelTransportProtocol, UpstreamBackend,
 };
 use stargate_protocol::BackendConnectivity;
-use stargate_protocol::tunnel_contract::HEADER_STARGATE_UPSTREAM_RETRYABLE;
 
-const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "429,503";
-const DEFAULT_PYLON_UPSTREAM_RETRY_HEADER: &str = HEADER_STARGATE_UPSTREAM_RETRYABLE;
+const DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES: &str = "529,503";
 const DEFAULT_OTEL_SERVICE_NAME: &str = "pylon";
 
 mod startup;
@@ -89,13 +87,14 @@ struct Args {
     /// Upstream health path probed ahead of the built-in defaults; repeat to try several in order
     #[arg(long = "upstream-health-path", value_name = "PATH")]
     upstream_health_paths: Vec<String>,
-    /// How long startup retries the upstream health probe before exiting. `0` probes once
-    #[arg(long, default_value_t = 60000, value_name = "MS")]
-    upstream_health_wait_ms: u64,
-    /// Run local input-TPS calibration before contacting Stargate. Use only when this is the cluster's sole Pylon
-    #[arg(long, default_value_t = false)]
+    /// How long startup retries the upstream health probe before exiting. `0` probes once.
+    /// Defaults to INFERENCE_READY_TIMEOUT when set, otherwise 60000
+    #[arg(long, value_name = "MS")]
+    upstream_health_wait_ms: Option<u64>,
+    /// Run local input-TPS calibration before contacting Stargate. Use only when this is the cluster's sole Pylon. With --initial-input-tps, a 529 ends a model's ramp, and a model whose calibration fails starts at that rate
+    #[arg(long, default_value_t = false, env = "PYLON_DO_CALIBRATION")]
     do_calibration: bool,
-    /// Bootstrap input TPS for every configured model instead of running calibration
+    /// Bootstrap input TPS for every configured model. With --do-calibration, used only for a model whose calibration fails or measures nothing
     #[arg(long, value_name = "TPS")]
     initial_input_tps: Option<f64>,
     /// Force exact usage in streaming Chat Completions requests sent upstream
@@ -107,8 +106,8 @@ struct Args {
     /// Interval between active canary requests in milliseconds. Models with request progress within the interval skip the canary. `0` disables active canaries
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     active_canary_interval_ms: u64,
-    /// Treat canary responses that generate this many tokens as runaway generation
-    #[arg(long, default_value_t = 237, value_name = "TOKENS")]
+    /// Canary `max_tokens`. Generating more tokens than this is runaway generation; exact usage overrides the output estimate
+    #[arg(long, default_value_t = 16, value_name = "TOKENS")]
     canary_max_generation_threshold: u32,
     /// Initial calibration request count; doubles after each completed load step
     #[arg(long, default_value_t = 5, value_name = "N")]
@@ -119,12 +118,17 @@ struct Args {
     /// Maximum concurrent requests used during calibration
     #[arg(long, default_value_t = 4, value_name = "N")]
     calibration_max_concurrency: usize,
-    /// Timeout for canary requests in milliseconds. An active canary that times out while other requests make progress does not mark the model unavailable
+    /// Timeout for canary requests in milliseconds. A canary that times out or gets an overload reply while requests for any model name on this Pylon make progress does not mark the model unavailable; this assumes the names share workers, as aliases do
     #[arg(long, default_value_t = 5000, value_name = "MS")]
     bringup_canary_timeout_ms: u64,
-    /// Timeout for calibration requests in milliseconds
-    #[arg(long, default_value_t = 30000, value_name = "MS")]
-    bringup_calibration_timeout_ms: u64,
+    /// Time limit in milliseconds for each calibration load step. A step that takes longer ends the model's ramp. Defaults to 5000 with --initial-input-tps and 30000 without it
+    #[arg(
+        long,
+        env = "PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        value_name = "MS"
+    )]
+    bringup_calibration_timeout_ms: Option<u64>,
     /// Upstream HTTP path to poll for KV-cache stats. Omit to disable KV metric polling
     #[arg(long, value_name = "PATH")]
     kv_cache_stats_path: Option<String>,
@@ -166,7 +170,10 @@ struct Args {
         value_name = "NAME"
     )]
     otel_service_name: String,
-    /// Comma-separated upstream HTTP statuses that can be marked retryable
+    /// Comma-separated upstream HTTP statuses that Pylon marks retryable, for
+    /// every response with that status. An empty value turns these retries
+    /// off. The dynamo backend mode also marks a 404 with content-length 0;
+    /// this list does not control that rule.
     #[arg(
         long,
         default_value = DEFAULT_PYLON_RETRYABLE_UPSTREAM_STATUS_CODES,
@@ -174,22 +181,6 @@ struct Args {
         value_name = "CODES"
     )]
     pylon_retryable_upstream_status_codes: String,
-    /// Require the upstream retry header before marking retryable statuses retryable
-    #[arg(
-        long,
-        action = clap::ArgAction::Set,
-        default_value_t = true,
-        env = "PYLON_REQUIRE_UPSTREAM_RETRY_HEADER"
-    )]
-    pylon_require_upstream_retry_header: bool,
-    /// Upstream response header that authorizes retrying retryable status codes
-    #[arg(
-        long,
-        default_value = DEFAULT_PYLON_UPSTREAM_RETRY_HEADER,
-        env = "PYLON_UPSTREAM_RETRY_HEADER",
-        value_name = "HEADER"
-    )]
-    pylon_upstream_retry_header: String,
     /// Convert upstream Retry-After responses into x-stargate-retry-after-ms
     #[arg(
         long,
@@ -234,7 +225,8 @@ struct Args {
     #[arg(long, env = "PYLON_QUEUE_MISMATCH_RETRY_AFTER_MS", value_name = "MS")]
     pylon_queue_mismatch_retry_after_ms: Option<u64>,
     /// Engine dialect spoken to the local upstream: "dynamo" derives the
-    /// engine priority headers from x-priority, "passthrough" derives nothing
+    /// engine priority headers from x-priority and marks a 404 with
+    /// content-length 0 retryable, "passthrough" does neither
     #[arg(
         long,
         default_value = "dynamo",
@@ -272,6 +264,18 @@ struct Args {
         value_name = "MS"
     )]
     pylon_output_chunk_timeout_ms: u64,
+    /// Longest wait for in-flight requests after SIGTERM, counted from the
+    /// signal. It also bounds the window of up to 2 s that still accepts tunnel
+    /// streams and the final tunnel wait. Pylon needs up to 5 s more to stop, so set it
+    /// at least 5 s below the worker pod termination grace period
+    #[arg(
+        long,
+        default_value_t = pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(1..),
+        env = "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS",
+        value_name = "MS"
+    )]
+    pylon_shutdown_drain_timeout_ms: u64,
     /// Collect post-stream output quality metrics (gibberish checks)
     #[arg(long, default_value_t = false)]
     collect_quality_metrics: bool,
@@ -313,7 +317,6 @@ mod tests {
         EngineStatsStreamMode, ModelDiscoveryProvider, PylonQueueMismatchRetryConfig,
         PylonRetryConfig, TunnelForwardingConfig, TunnelTransportProtocol,
     };
-    use reqwest::header::HeaderName;
 
     use super::startup::{
         effective_cluster_id, normalize_base_url, pylon_queue_mismatch_retry_config_from_args,
@@ -383,6 +386,34 @@ mod tests {
             argument.get_env(),
             Some(std::ffi::OsStr::new("STARGATE_GRPC_TLS_CA_CERT_PATH"))
         );
+    }
+
+    #[test]
+    fn calibration_flags_declare_environment_bindings() {
+        let command = <Args as clap::CommandFactory>::command();
+        for (id, env) in [
+            ("do_calibration", "PYLON_DO_CALIBRATION"),
+            (
+                "bringup_calibration_timeout_ms",
+                "PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS",
+            ),
+        ] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} argument should exist"));
+
+            assert_eq!(argument.get_env(), Some(std::ffi::OsStr::new(env)), "{id}");
+        }
+    }
+
+    #[test]
+    fn calibration_defaults_to_off_and_rejects_a_zero_step_limit() {
+        let args = parse_args("");
+
+        assert!(!args.do_calibration);
+        assert_eq!(args.bringup_calibration_timeout_ms, None);
+        assert!(try_parse_argv(&["--bringup-calibration-timeout-ms", "0"]).is_err());
     }
 
     #[test]
@@ -461,11 +492,6 @@ mod tests {
             retry.retryable_upstream_status_codes,
             defaults.retryable_upstream_status_codes
         );
-        assert_eq!(
-            retry.require_upstream_retry_header,
-            defaults.require_upstream_retry_header
-        );
-        assert_eq!(retry.upstream_retry_header, defaults.upstream_retry_header);
         assert_eq!(retry.propagate_retry_after, defaults.propagate_retry_after);
         assert_eq!(
             retry.local_connect_failures_retryable,
@@ -478,9 +504,6 @@ mod tests {
         let args = parse_argv(&[
             "--pylon-retryable-upstream-status-codes",
             "418, 429,503",
-            "--pylon-require-upstream-retry-header=false",
-            "--pylon-upstream-retry-header",
-            "x-can-retry",
             "--pylon-propagate-retry-after=false",
             "--pylon-local-connect-failures-retryable=true",
         ]);
@@ -493,11 +516,6 @@ mod tests {
                 reqwest::StatusCode::TOO_MANY_REQUESTS,
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
             ]
-        );
-        assert!(!retry.require_upstream_retry_header);
-        assert_eq!(
-            retry.upstream_retry_header,
-            HeaderName::from_static("x-can-retry")
         );
         assert!(!retry.propagate_retry_after);
         assert!(retry.local_connect_failures_retryable);
@@ -532,6 +550,7 @@ mod tests {
     fn pylon_stream_timeouts_reject_zero() {
         assert!(try_parse_argv(&["--pylon-first-output-timeout-ms", "0"]).is_err());
         assert!(try_parse_argv(&["--pylon-output-chunk-timeout-ms", "0"]).is_err());
+        assert!(try_parse_argv(&["--pylon-shutdown-drain-timeout-ms", "0"]).is_err());
     }
 
     #[test]
@@ -590,16 +609,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_conflicting_input_tps_bootstrap_sources() {
-        let neither = parse_args("");
-        let both = parse_args("--do-calibration --initial-input-tps 2200");
-
-        assert!(startup::PylonStartupPlan::from_args(&neither).is_ok());
-        assert!(startup::PylonStartupPlan::from_args(&both).is_err());
-        assert!(startup::PylonStartupPlan::from_args(&parse_args("--do-calibration")).is_ok());
-        assert!(
-            startup::PylonStartupPlan::from_args(&parse_args("--initial-input-tps 2200")).is_ok()
-        );
+    fn startup_accepts_every_input_tps_bootstrap_combination() {
+        for args in [
+            "",
+            "--do-calibration",
+            "--initial-input-tps 2200",
+            "--do-calibration --initial-input-tps 2200",
+        ] {
+            assert!(
+                startup::PylonStartupPlan::from_args(&parse_args(args)).is_ok(),
+                "{args:?} must be accepted"
+            );
+        }
     }
 
     #[test]

@@ -24,11 +24,18 @@ mismatched combination is rejected at startup.
 
 Pylon model membership is either an explicit repeatable `--model-name` set or,
 when that flag is omitted, a continuously discovered Dynamo `GET /v1/models`
-set. Every Pylon must also select exactly one local stats initialization source:
+set. Every Pylon must also select a local stats initialization source:
 `--do-calibration` for a sole Pylon in its cluster or a per-Pylon
-`--initial-input-tps` value for shared-hardware clusters. See
+`--initial-input-tps` value for shared-hardware clusters. A sole Pylon can set
+both: it calibrates each model and falls back to `--initial-input-tps` for a
+model whose calibration fails. See
 [Pylon onboarding](docs/operations/pylon-onboarding.md) for the complete
 lifecycle and calibration contract.
+
+Pulsar weights clusters by generation maximum input TPS by default. Upgrade
+Pylons and registration relays before Stargates; see
+[load-balancer configuration](docs/load-balancer-configuration.md#pulsar) for
+the rollout order and the mean-weighting option.
 
 Pylon gates startup on an upstream health probe. It tries `/health` and then
 `/v1/health/ready`, reuses whichever path answers first, and forwards Stargate's
@@ -36,7 +43,9 @@ Pylon gates startup on an upstream health probe. It tries `/health` and then
 OpenAI-style ready endpoint work without extra configuration. The repeatable
 `--upstream-health-path` puts your own paths ahead of those defaults, which stay
 in place as a fallback, and `--upstream-health-wait-ms` bounds how long startup
-retries the probe (default 60000; `0` probes once and exits).
+retries the probe (`0` probes once and exits). Without the flag, Pylon uses the
+Go duration in `INFERENCE_READY_TIMEOUT` (for example `2h0m0s`) when it is set
+to a positive Go duration, and 60000 otherwise.
 
 For engines without a stats endpoint, set `pylon --max-engine-concurrency N`
 to provide a positive concurrency fallback for routing and local queue

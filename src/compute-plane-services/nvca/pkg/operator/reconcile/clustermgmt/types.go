@@ -24,8 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 )
 
 type Capability string
@@ -212,6 +212,10 @@ type clusterDTO struct {
 		HelmReValServiceURL                string `json:"helmReValServiceURL"`
 		HelmReValServiceHostHeaderOverride string `json:"helmReValServiceHostHeaderOverride,omitempty"`
 	} `json:"miniService,omitempty"`
+	// FNDService configures the Event Ledger (FnDS) endpoint the OTel collector exports to.
+	FNDService *struct {
+		ServiceURL string `json:"serviceURL"`
+	} `json:"fndService,omitempty"`
 	// Agent configures NVCA agent-specific settings sourced from cluster DTO.
 	Agent *agentDTO `json:"agent,omitempty"`
 }

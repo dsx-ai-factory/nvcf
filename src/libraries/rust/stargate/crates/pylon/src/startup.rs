@@ -16,13 +16,13 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::str::FromStr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use pylon_lib::{
-    AuthTokenProvider, BringupConfig, CalibrationConfig, EngineStatsStreamConfig,
+    AuthTokenProvider, BringupConfig, CalibrationConfig, DrainSummary, EngineStatsStreamConfig,
     EngineStatsStreamHandle, EngineStatsStreamMode, InferenceServerRegistrationClient,
     InferenceServerRegistrationConfig, MetricsServerHandle, ModelDiscoveryConfig,
     ModelInitialization, ModelLifecycleConfig, ModelLifecycleHandle, ModelSource, PylonMetrics,
@@ -32,7 +32,6 @@ use pylon_lib::{
     start_metrics_server, start_model_lifecycle, start_quic_http_tunnel,
     start_stats_collector_with_engine_stats, stats_aggregator_update_channel,
 };
-use reqwest::header::HeaderName;
 use stargate_proto::pb::InferenceServerStatus;
 use stargate_protocol::BackendConnectivity;
 use stargate_runtime::wait_for_termination_signal;
@@ -43,6 +42,11 @@ use super::{Args, OutputTokenCalibrationMode};
 
 type TaskExit = std::result::Result<(), JoinError>;
 
+const DEFAULT_STARTUP_HEALTH_WAIT: Duration = Duration::from_secs(60);
+const DEFAULT_CALIBRATION_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS: u64 = 5_000;
+const INFERENCE_READY_TIMEOUT_ENV: &str = "INFERENCE_READY_TIMEOUT";
+
 pub(super) async fn run(args: Args) -> Result<()> {
     let plan = PylonStartupPlan::from_args(&args)?;
     let _telemetry_guard = stargate_telemetry::init_telemetry(
@@ -51,7 +55,20 @@ pub(super) async fn run(args: Args) -> Result<()> {
         "pylon_upstream_http_request",
         None,
     )?;
-    let runtime = start_pylon_runtime(&args, &plan).await?;
+    if let Some(value) = &plan.ignored_inference_ready_timeout {
+        warn!(
+            value = %value,
+            default = ?DEFAULT_STARTUP_HEALTH_WAIT,
+            "ignoring invalid {INFERENCE_READY_TIMEOUT_ENV}; using the default upstream health wait"
+        );
+    }
+    let signal = wait_for_termination_signal();
+    tokio::pin!(signal);
+    let Some(runtime) =
+        start_unless_signalled(start_pylon_runtime(&args, &plan), signal.as_mut()).await?
+    else {
+        return Ok(());
+    };
 
     log_startup_complete(
         &args.stargate_address,
@@ -61,9 +78,24 @@ pub(super) async fn run(args: Args) -> Result<()> {
         &runtime.initial_model_ids,
     );
     info!("pylon running");
-    runtime
-        .run_until_shutdown(wait_for_termination_signal())
-        .await
+    runtime.run_until_shutdown(signal).await
+}
+
+async fn start_unless_signalled<T, S>(
+    startup: impl Future<Output = Result<T>>,
+    signal: Pin<&mut S>,
+) -> Result<Option<T>>
+where
+    S: Future<Output = std::io::Result<&'static str>>,
+{
+    tokio::select! {
+        result = startup => result.map(Some),
+        result = signal => {
+            let signal = result.context("failed to receive pylon termination signal")?;
+            info!(signal, "received shutdown signal during startup");
+            Ok(None)
+        }
+    }
 }
 
 fn log_startup_complete(
@@ -116,6 +148,7 @@ pub(crate) struct PylonStartupPlan {
     output_token_calibration: OutputTokenCalibrationMode,
     health_paths: UpstreamHealthPaths,
     startup_health_wait: Duration,
+    ignored_inference_ready_timeout: Option<String>,
     metrics_addr: SocketAddr,
     auth_token_provider: Option<Arc<AuthTokenProvider>>,
     backend_tunnel: BackendTunnelStartup,
@@ -151,8 +184,18 @@ impl BackendTunnelStartup {
 
 impl PylonStartupPlan {
     pub(crate) fn from_args(args: &Args) -> Result<Self> {
+        let inference_ready_timeout = std::env::var(INFERENCE_READY_TIMEOUT_ENV).ok();
+        Self::from_args_and_inference_ready_timeout(args, inference_ready_timeout.as_deref())
+    }
+
+    fn from_args_and_inference_ready_timeout(
+        args: &Args,
+        inference_ready_timeout: Option<&str>,
+    ) -> Result<Self> {
         let model_initialization = model_initialization_from_args(args)?;
         let model_source = model_source_from_args(args)?;
+        let (startup_health_wait, ignored_inference_ready_timeout) =
+            resolve_startup_health_wait(args.upstream_health_wait_ms, inference_ready_timeout);
         Ok(Self {
             upstream: normalize_base_url(&args.upstream_http_base_url),
             cluster_id: effective_cluster_id(args),
@@ -174,7 +217,8 @@ impl PylonStartupPlan {
             force_chat_completions_include_usage: args.force_chat_completions_include_usage,
             output_token_calibration: args.output_token_calibration,
             health_paths: UpstreamHealthPaths::new(args.upstream_health_paths.clone()),
-            startup_health_wait: Duration::from_millis(args.upstream_health_wait_ms),
+            startup_health_wait,
+            ignored_inference_ready_timeout,
             metrics_addr: format!("{}:{}", args.metrics_host, args.metrics_port).parse()?,
             auth_token_provider: auth_token_provider_from_args(args),
             backend_tunnel: BackendTunnelStartup::from_args(args)?,
@@ -193,6 +237,73 @@ impl PylonStartupPlan {
             ModelSource::Discovered(_) => None,
         }
     }
+}
+
+fn resolve_startup_health_wait(
+    flag_ms: Option<u64>,
+    inference_ready_timeout: Option<&str>,
+) -> (Duration, Option<String>) {
+    if let Some(ms) = flag_ms {
+        return (Duration::from_millis(ms), None);
+    }
+    match inference_ready_timeout.filter(|value| !value.is_empty()) {
+        None => (DEFAULT_STARTUP_HEALTH_WAIT, None),
+        Some(value) => match parse_go_duration(value) {
+            Some(wait) if !wait.is_zero() => (wait, None),
+            // NVCA renders an unset WorkerStartupTimeout as "0s".
+            Some(_) => (DEFAULT_STARTUP_HEALTH_WAIT, None),
+            None => (DEFAULT_STARTUP_HEALTH_WAIT, Some(value.to_string())),
+        },
+    }
+}
+
+fn parse_go_duration(value: &str) -> Option<Duration> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.is_empty() {
+        return None;
+    }
+    if value == "0" {
+        return Some(Duration::ZERO);
+    }
+    let mut rest = value;
+    let mut total_nanos: u128 = 0;
+    while !rest.is_empty() {
+        let number_len = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let (number, tail) = rest.split_at(number_len);
+        let unit_len = tail
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(tail.len());
+        let (unit, tail) = tail.split_at(unit_len);
+        let unit_nanos: u128 = match unit {
+            "ns" => 1,
+            "us" | "\u{b5}s" | "\u{3bc}s" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60_000_000_000,
+            "h" => 3_600_000_000_000,
+            _ => return None,
+        };
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        if whole.is_empty() && fraction.is_empty() {
+            return None;
+        }
+        let whole: u128 = if whole.is_empty() {
+            0
+        } else {
+            whole.parse().ok()?
+        };
+        let mut nanos = whole.checked_mul(unit_nanos)?;
+        let mut scale = unit_nanos;
+        for digit in fraction.chars() {
+            scale /= 10;
+            nanos = nanos.checked_add(u128::from(digit.to_digit(10)?) * scale)?;
+        }
+        total_nanos = total_nanos.checked_add(nanos)?;
+        rest = tail;
+    }
+    u64::try_from(total_nanos).ok().map(Duration::from_nanos)
 }
 
 fn auth_token_provider_from_args(args: &Args) -> Option<Arc<AuthTokenProvider>> {
@@ -231,6 +342,7 @@ fn model_source_from_args(args: &Args) -> Result<ModelSource> {
 }
 
 struct RunningPylon {
+    inference_server_id: String,
     registration_client: InferenceServerRegistrationClient,
     engine_stats_stream: Option<RunningEngineStatsStream>,
     stats_collector: StatsCollectorHandle,
@@ -259,7 +371,7 @@ impl RunningPylon {
                     if let Ok(signal) = &result {
                         info!(signal, "received shutdown signal");
                     }
-                    self.shutdown().await;
+                    self.shutdown(ShutdownCause::Signal).await;
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
@@ -294,13 +406,14 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown().await;
+            self.shutdown(ShutdownCause::CriticalTaskExit).await;
             return Err(error);
         }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(self, cause: ShutdownCause) {
         let Self {
+            inference_server_id,
             mut registration_client,
             engine_stats_stream,
             stats_collector,
@@ -309,8 +422,12 @@ impl RunningPylon {
             tunnel,
             ..
         } = self;
+        // Requests that arrive during the registration drain need admitted
+        // model generations, so the model lifecycle stops only after it.
+        if let Some(summary) = registration_client.shutdown().await {
+            log_drain_summary(&inference_server_id, cause, &summary);
+        }
         tokio::join!(
-            registration_client.shutdown(),
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
@@ -324,6 +441,56 @@ impl RunningPylon {
                     tunnel.shutdown().await;
                 }
             },
+        );
+    }
+}
+
+/// What started Pylon's shutdown, for the drain summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownCause {
+    Signal,
+    CriticalTaskExit,
+}
+
+impl ShutdownCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Signal => "signal",
+            Self::CriticalTaskExit => "critical_task_exit",
+        }
+    }
+}
+
+/// Logs one line per drain: `info` when every request finished, `warn` when
+/// the drain timeout cut some off.
+fn log_drain_summary(inference_server_id: &str, cause: ShutdownCause, summary: &DrainSummary) {
+    let duration_ms = u64::try_from(summary.duration.as_millis()).unwrap_or(u64::MAX);
+    let drain_timeout_ms = u64::try_from(summary.drain_timeout.as_millis()).unwrap_or(u64::MAX);
+    if summary.cut_off == 0 {
+        info!(
+            inference_server_id,
+            cause = cause.as_str(),
+            outcome = summary.outcome(),
+            requests_in_flight_at_start = summary.in_flight_at_start,
+            requests_accepted = summary.accepted,
+            requests_completed = summary.completed,
+            requests_cut_off = summary.cut_off,
+            duration_ms,
+            drain_timeout_ms,
+            "pylon drain finished"
+        );
+    } else {
+        warn!(
+            inference_server_id,
+            cause = cause.as_str(),
+            outcome = summary.outcome(),
+            requests_in_flight_at_start = summary.in_flight_at_start,
+            requests_accepted = summary.accepted,
+            requests_completed = summary.completed,
+            requests_cut_off = summary.cut_off,
+            duration_ms,
+            drain_timeout_ms,
+            "pylon drain finished"
         );
     }
 }
@@ -424,10 +591,14 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         server_identity_reloader,
     )
     .await?;
-    if matches!(
-        &plan.model_initialization,
-        ModelInitialization::Calibration(_)
-    ) {
+    // Without --cluster-id the cluster is this Pylon's own inference server ID,
+    // so it is the cluster's only Pylon.
+    if args.cluster_id.is_some()
+        && matches!(
+            &plan.model_initialization,
+            ModelInitialization::Calibration(_)
+        )
+    {
         warn!(
             cluster_id = %plan.cluster_id,
             "running local calibration; --do-calibration is valid only for a cluster with one pylon"
@@ -462,6 +633,7 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
     registration_client.start(registration_config)?;
 
     Ok(RunningPylon {
+        inference_server_id: args.inference_server_id.clone(),
         registration_client,
         engine_stats_stream,
         stats_collector,
@@ -564,6 +736,7 @@ fn registration_config_from_plan(
         tunnel_protocol: args.tunnel_protocol,
         forwarding,
         auth_token_provider: plan.auth_token_provider.clone(),
+        shutdown_drain_timeout: Duration::from_millis(args.pylon_shutdown_drain_timeout_ms),
     }
 }
 
@@ -658,14 +831,6 @@ pub(crate) fn pylon_retry_config_from_args(args: &Args) -> Result<PylonRetryConf
         retryable_upstream_status_codes: parse_retryable_status_codes(
             &args.pylon_retryable_upstream_status_codes,
         )?,
-        require_upstream_retry_header: args.pylon_require_upstream_retry_header,
-        upstream_retry_header: HeaderName::from_str(args.pylon_upstream_retry_header.trim())
-            .with_context(|| {
-                format!(
-                    "invalid pylon upstream retry header: {}",
-                    args.pylon_upstream_retry_header
-                )
-            })?,
         propagate_retry_after: args.pylon_propagate_retry_after,
         local_connect_failures_retryable: args.pylon_local_connect_failures_retryable,
     })
@@ -689,10 +854,6 @@ pub(crate) fn pylon_queue_mismatch_retry_config_from_args(
 
 fn model_initialization_from_args(args: &Args) -> Result<ModelInitialization> {
     ensure!(
-        !(args.do_calibration && args.initial_input_tps.is_some()),
-        "--do-calibration and --initial-input-tps cannot be used together"
-    );
-    ensure!(
         args.initial_input_tps
             .is_none_or(|input_tps| input_tps.is_finite() && input_tps > 0.0),
         "initial input TPS must be finite and positive"
@@ -702,12 +863,22 @@ fn model_initialization_from_args(args: &Args) -> Result<ModelInitialization> {
             args.calibration_requests > 0,
             "--do-calibration requires --calibration-requests greater than zero"
         );
+        // Without a seed, a ramp that measures nothing stops Pylon, so a slow
+        // first step gets the longer limit.
+        let calibration_timeout_ms =
+            args.bringup_calibration_timeout_ms
+                .unwrap_or(if args.initial_input_tps.is_some() {
+                    DEFAULT_FALLBACK_CALIBRATION_TIMEOUT_MS
+                } else {
+                    DEFAULT_CALIBRATION_TIMEOUT_MS
+                });
         return Ok(ModelInitialization::Calibration(CalibrationConfig {
             health_timeout: Duration::from_millis(args.bringup_canary_timeout_ms),
             calibration_requests: args.calibration_requests,
             calibration_prompt_units: args.calibration_prompt_units,
             calibration_max_concurrency: args.calibration_max_concurrency,
-            calibration_timeout: Duration::from_millis(args.bringup_calibration_timeout_ms),
+            calibration_timeout: Duration::from_millis(calibration_timeout_ms),
+            fallback_input_tps: args.initial_input_tps,
         }));
     }
 
@@ -795,8 +966,52 @@ mod tests {
         ];
         args.extend_from_slice(extra);
         let args = <Args as Parser>::try_parse_from(args).expect("args should parse");
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         (args, plan)
+    }
+
+    #[test]
+    fn calibration_step_limit_defaults_to_five_seconds_only_with_a_seed() {
+        for (label, extra, expected) in [
+            ("seed", &["--initial-input-tps", "100"][..], 5_000),
+            ("no seed", &[][..], 30_000),
+            (
+                "seed, explicit",
+                &[
+                    "--initial-input-tps",
+                    "100",
+                    "--bringup-calibration-timeout-ms",
+                    "1000",
+                ][..],
+                1_000,
+            ),
+            (
+                "no seed, explicit",
+                &["--bringup-calibration-timeout-ms", "1000"][..],
+                1_000,
+            ),
+        ] {
+            let mut argv = vec![
+                "pylon",
+                "--upstream-http-base-url",
+                "http://127.0.0.1:8090/",
+                "--do-calibration",
+            ];
+            argv.extend_from_slice(extra);
+            let args = <Args as Parser>::try_parse_from(argv).expect(label);
+
+            let Ok(ModelInitialization::Calibration(config)) =
+                model_initialization_from_args(&args)
+            else {
+                panic!("{label}: expected a calibration plan");
+            };
+            assert_eq!(
+                config.calibration_timeout,
+                Duration::from_millis(expected),
+                "{label}"
+            );
+        }
     }
 
     fn runtime_args(
@@ -1160,6 +1375,7 @@ mod tests {
         .await
         .expect("test model lifecycle should start");
         RunningPylon {
+            inference_server_id: "test-pylon".to_string(),
             registration_client: InferenceServerRegistrationClient::default(),
             engine_stats_stream: None,
             stats_collector,
@@ -1334,6 +1550,102 @@ mod tests {
         );
     }
 
+    fn startup_with_inference_ready_timeout(
+        extra: &[&str],
+        inference_ready_timeout: Option<&str>,
+    ) -> PylonStartupPlan {
+        let (args, _) = startup(extra);
+        PylonStartupPlan::from_args_and_inference_ready_timeout(&args, inference_ready_timeout)
+            .expect("startup plan should build")
+    }
+
+    #[test]
+    fn startup_health_wait_defaults_to_inference_ready_timeout() {
+        let plan = startup_with_inference_ready_timeout(&[], Some("2h0m0s"));
+        assert_eq!(plan.startup_health_wait, Duration::from_secs(7200));
+        assert_eq!(plan.ignored_inference_ready_timeout, None);
+
+        for value in [None, Some("0s")] {
+            let plan = startup_with_inference_ready_timeout(&[], value);
+            assert_eq!(plan.startup_health_wait, DEFAULT_STARTUP_HEALTH_WAIT);
+            assert_eq!(plan.ignored_inference_ready_timeout, None);
+        }
+    }
+
+    #[test]
+    fn explicit_upstream_health_wait_overrides_inference_ready_timeout() {
+        let plan = startup_with_inference_ready_timeout(
+            &["--upstream-health-wait-ms", "5000"],
+            Some("2h0m0s"),
+        );
+        assert_eq!(plan.startup_health_wait, Duration::from_millis(5000));
+
+        let plan =
+            startup_with_inference_ready_timeout(&["--upstream-health-wait-ms", "0"], Some("bad"));
+        assert_eq!(plan.startup_health_wait, Duration::ZERO);
+        assert_eq!(plan.ignored_inference_ready_timeout, None);
+    }
+
+    #[test]
+    fn invalid_inference_ready_timeout_falls_back_to_the_default_wait() {
+        for value in ["2 hours", "7200", "-5m"] {
+            let plan = startup_with_inference_ready_timeout(&[], Some(value));
+            assert_eq!(
+                plan.startup_health_wait, DEFAULT_STARTUP_HEALTH_WAIT,
+                "{value}"
+            );
+            assert_eq!(plan.ignored_inference_ready_timeout.as_deref(), Some(value));
+        }
+
+        let plan = startup_with_inference_ready_timeout(&[], Some(""));
+        assert_eq!(plan.startup_health_wait, DEFAULT_STARTUP_HEALTH_WAIT);
+        assert_eq!(plan.ignored_inference_ready_timeout, None);
+    }
+
+    #[test]
+    fn parse_go_duration_accepts_go_duration_strings() {
+        for (value, expected) in [
+            ("2h0m0s", Duration::from_secs(7200)),
+            ("30m0s", Duration::from_secs(1800)),
+            ("90s", Duration::from_secs(90)),
+            ("1h30m", Duration::from_secs(5400)),
+            ("500ms", Duration::from_millis(500)),
+            ("1.5h", Duration::from_secs(5400)),
+            ("1m30.25s", Duration::from_millis(90_250)),
+            (".5s", Duration::from_millis(500)),
+            ("1.5\u{b5}s", Duration::from_nanos(1500)),
+            ("2us3ns", Duration::from_nanos(2003)),
+            ("0s", Duration::ZERO),
+            ("0", Duration::ZERO),
+            ("+10m", Duration::from_secs(600)),
+            ("+0", Duration::ZERO),
+        ] {
+            assert_eq!(parse_go_duration(value), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn parse_go_duration_rejects_malformed_strings() {
+        for value in [
+            "",
+            "90",
+            "h",
+            ".s",
+            "1..5s",
+            "1x",
+            "-1s",
+            "+",
+            "++1s",
+            " 1s",
+            "1s ",
+            "1 s",
+            "1d",
+            "99999999999999999999h",
+        ] {
+            assert_eq!(parse_go_duration(value), None, "{value}");
+        }
+    }
+
     #[test]
     fn direct_tunnel_config_from_plan_preserves_runtime_inputs() {
         let (args, plan) = startup(&[
@@ -1416,6 +1728,10 @@ mod tests {
         assert_eq!(config.inference_server_url, "quic://127.0.0.1:4567");
         assert_eq!(config.min_update_interval, Duration::from_millis(250));
         assert!(!config.reverse_tunnel);
+        assert_eq!(
+            config.shutdown_drain_timeout,
+            pylon_lib::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+        );
     }
 
     #[test]
@@ -1451,6 +1767,8 @@ mod tests {
             "789",
             "--auth-token",
             "token-from-cli",
+            "--pylon-shutdown-drain-timeout-ms",
+            "55000",
         ]);
         let forwarding = test_forwarding(&plan);
         let metrics = forwarding.metrics.clone().unwrap();
@@ -1480,6 +1798,7 @@ mod tests {
         );
         assert!(config.quic_insecure);
         assert_eq!(config.tunnel_protocol, TunnelTransportProtocol::Http3);
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(55));
         assert!(Arc::ptr_eq(
             config.forwarding.metrics.as_ref().unwrap(),
             &metrics
@@ -1762,9 +2081,12 @@ mod tests {
     async fn running_pylon_shutdown_stops_owned_metrics_server() {
         let runtime = test_running_pylon(active_test_stats_collector()).await;
 
-        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
-            .await
-            .expect("owned metrics server should stop during shutdown");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.shutdown(ShutdownCause::Signal),
+        )
+        .await
+        .expect("owned metrics server should stop during shutdown");
     }
 
     #[tokio::test]
@@ -1826,7 +2148,8 @@ mod tests {
                 "1000",
             ],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         let startup = tokio::spawn(async move { start_pylon_runtime(&args, &plan).await });
 
         assert_eq!(
@@ -1861,7 +2184,7 @@ mod tests {
             .await
             .expect("pylon startup task should not panic")
             .expect("pylon startup should succeed")
-            .shutdown()
+            .shutdown(ShutdownCause::Signal)
             .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
@@ -1885,7 +2208,8 @@ mod tests {
                 "1000",
             ],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         let startup = tokio::spawn(async move { start_pylon_runtime(&args, &plan).await });
 
         assert_eq!(
@@ -1904,25 +2228,74 @@ mod tests {
         assert_eq!(registration.models.len(), 1);
         assert!(registration.models.contains_key("model-a"));
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
 
     #[tokio::test]
-    async fn conflicting_bootstrap_sources_make_zero_stargate_calls() {
-        let upstream = TestUpstream::spawn(false).await;
-        let control_plane = TestControlPlane::spawn().await;
-
+    async fn calibration_with_initial_input_tps_seeds_the_first_heartbeat_with_each_measured_rate()
+    {
+        let mut upstream = TestUpstream::spawn(false).await;
+        let mut control_plane = TestControlPlane::spawn().await;
         let args = runtime_args(
             &upstream.base_url,
             control_plane.addr,
-            &["model-a"],
-            &["--do-calibration", "--initial-input-tps", "100"],
+            &["model-a", "model-b"],
+            &[
+                "--do-calibration",
+                "--initial-input-tps",
+                "100",
+                "--calibration-requests",
+                "1",
+                "--calibration-prompt-units",
+                "256",
+                "--calibration-max-concurrency",
+                "1",
+                "--bringup-calibration-timeout-ms",
+                "1000",
+            ],
         );
-        assert!(PylonStartupPlan::from_args(&args).is_err());
-        control_plane.assert_no_calls();
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        let startup = tokio::spawn(async move { start_pylon_runtime(&args, &plan).await });
 
+        assert_eq!(
+            upstream.calibration_started.recv().await.as_deref(),
+            Some("model-a")
+        );
+        control_plane.assert_no_calls();
+        upstream.calibration_release.add_permits(5);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), upstream.calibration_started.recv())
+                .await
+                .expect("model-b should calibrate before registration")
+                .as_deref(),
+            Some("model-b")
+        );
+        control_plane.assert_no_calls();
+        upstream.calibration_release.add_permits(5);
+
+        let registration = control_plane.first_registration().await;
+        assert_eq!(upstream.calibration_plans.load(Ordering::SeqCst), 2);
+        for model_id in ["model-a", "model-b"] {
+            let input_tps = registration.models[model_id]
+                .stats
+                .as_ref()
+                .expect("first heartbeat should contain stats")
+                .last_mean_input_tps;
+            assert!(
+                input_tps.is_finite() && input_tps > 0.0 && input_tps != 100.0,
+                "{model_id}: {input_tps}"
+            );
+        }
+
+        startup
+            .await
+            .expect("pylon startup task should not panic")
+            .expect("pylon startup should succeed")
+            .shutdown(ShutdownCause::Signal)
+            .await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -1937,7 +2310,8 @@ mod tests {
             &["model-a", "model-b"],
             &[],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         let runtime = start_pylon_runtime(&args, &plan)
             .await
             .expect("pylon startup should succeed");
@@ -1956,7 +2330,7 @@ mod tests {
             );
         }
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -1977,7 +2351,8 @@ mod tests {
                 "256",
             ],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         let startup = tokio::spawn(async move { start_pylon_runtime(&args, &plan).await });
 
         assert_eq!(
@@ -1988,7 +2363,7 @@ mod tests {
         upstream.calibration_release.add_permits(1);
         let error = match startup.await.expect("pylon startup task should not panic") {
             Ok(runtime) => {
-                runtime.shutdown().await;
+                runtime.shutdown(ShutdownCause::Signal).await;
                 panic!("calibration request error must fail startup");
             }
             Err(error) => error,
@@ -2005,6 +2380,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn termination_signal_interrupts_the_startup_health_wait() {
+        let control_plane = TestControlPlane::spawn().await;
+        let args = runtime_args(
+            "http://127.0.0.1:1",
+            control_plane.addr,
+            &["model-a"],
+            &["--do-calibration", "--upstream-health-wait-ms", "600000"],
+        );
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        let signal = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok("SIGTERM")
+        };
+        tokio::pin!(signal);
+
+        let runtime = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_unless_signalled(start_pylon_runtime(&args, &plan), signal.as_mut()),
+        )
+        .await
+        .expect("SIGTERM should interrupt the startup health wait")
+        .expect("SIGTERM during startup should be a clean exit");
+
+        assert!(runtime.is_none());
+        control_plane.assert_no_calls();
+        control_plane.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_failure_is_returned_before_a_termination_signal() {
+        let signal = std::future::pending::<std::io::Result<&'static str>>();
+        tokio::pin!(signal);
+
+        let error = start_unless_signalled(
+            async { Err::<(), _>(anyhow::anyhow!("startup failed")) },
+            signal.as_mut(),
+        )
+        .await
+        .expect_err("startup failure should be returned");
+
+        assert_eq!(error.to_string(), "startup failed");
+    }
+
+    #[tokio::test]
     async fn initial_discovery_failure_returns_before_any_stargate_rpc() {
         let control_plane = TestControlPlane::spawn().await;
         let args = runtime_args(
@@ -2013,11 +2433,12 @@ mod tests {
             &[],
             &["--initial-input-tps", "100"],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
 
         let error = match start_pylon_runtime(&args, &plan).await {
             Ok(runtime) => {
-                runtime.shutdown().await;
+                runtime.shutdown(ShutdownCause::Signal).await;
                 panic!("initial discovery failure must fail startup");
             }
             Err(error) => error,
@@ -2042,7 +2463,8 @@ mod tests {
             &[],
             &["--initial-input-tps", "100"],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
 
         let runtime = start_pylon_runtime(&args, &plan)
             .await
@@ -2050,7 +2472,7 @@ mod tests {
         let registration = control_plane.first_registration().await;
 
         assert!(registration.models.is_empty());
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2065,7 +2487,8 @@ mod tests {
             &["model-a", "model-b"],
             &["--initial-input-tps", "123.5"],
         );
-        let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
         let runtime = start_pylon_runtime(&args, &plan)
             .await
             .expect("pylon startup should succeed");
@@ -2084,7 +2507,7 @@ mod tests {
             );
         }
 
-        runtime.shutdown().await;
+        runtime.shutdown(ShutdownCause::Signal).await;
         upstream.shutdown().await;
         control_plane.shutdown().await;
     }
@@ -2101,7 +2524,8 @@ mod tests {
                 &["--max-engine-concurrency", "25"],
             );
             args.engine_stats_stream = mode;
-            let plan = PylonStartupPlan::from_args(&args).expect("startup plan should build");
+            let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+                .expect("startup plan should build");
             let runtime = start_pylon_runtime(&args, &plan)
                 .await
                 .expect("pylon startup should succeed without engine stats");
@@ -2118,7 +2542,7 @@ mod tests {
                     "{model_id} should advertise the fallback in {mode} mode"
                 );
             }
-            runtime.shutdown().await;
+            runtime.shutdown(ShutdownCause::Signal).await;
             control_plane.shutdown().await;
         }
         assert_eq!(upstream.calibration_requests.load(Ordering::SeqCst), 0);

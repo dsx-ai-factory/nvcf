@@ -372,7 +372,7 @@ fn watch_snapshot(routers: &[&str], watch_urls: &[&str]) -> WatchEndpointSnapsho
     }
 }
 
-fn test_registration_config() -> InferenceServerRegistrationConfig {
+pub(super) fn test_registration_config() -> InferenceServerRegistrationConfig {
     InferenceServerRegistrationConfig {
         seeds: vec!["router-a".to_string()],
         inference_server_id: "inst-a".to_string(),
@@ -393,6 +393,7 @@ fn test_registration_config() -> InferenceServerRegistrationConfig {
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
         auth_token_provider: None,
+        shutdown_drain_timeout: crate::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     }
 }
 
@@ -1477,6 +1478,7 @@ fn runtime_snapshot_forwards_bootstrap_and_collected_stats_exactly() {
         "model-a",
         CurrentModelStats {
             last_mean_input_tps: 3.5,
+            max_input_tps: Some(4.5),
             output_tps: 2.5,
             queue_size: 4,
             queued_input_size: 5,
@@ -1502,6 +1504,7 @@ fn runtime_snapshot_forwards_bootstrap_and_collected_stats_exactly() {
     assert_eq!(model.status, InferenceServerStatus::Active as i32);
     let stats = model.stats.as_ref().expect("stats should be present");
     assert_eq!(stats.last_mean_input_tps, 3.5);
+    assert_eq!(stats.max_input_tps, Some(4.5));
     assert_eq!(stats.output_tps, 2.5);
     assert_eq!(
         stats.queue_time_estimate_ms_by_priority,

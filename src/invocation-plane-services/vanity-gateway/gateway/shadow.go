@@ -18,7 +18,6 @@ limitations under the License.
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -33,6 +32,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 
+	config "ai-api-gateway-service/gateway_config"
 	"ai-api-gateway-service/middleware"
 )
 
@@ -75,6 +75,11 @@ func (s *TrafficShadower) Shadow(req *http.Request, handler http.Handler) error 
 
 	go func() {
 		defer s.sem.Release(1)
+		// Like net/http servers, close the body once the handler returns so a
+		// pooled body is released even when the handler never read it.
+		if req.Body != nil {
+			defer req.Body.Close()
+		}
 
 		ctx, timeoutCancel := context.WithTimeout(ctx, s.timeout)
 		defer timeoutCancel()
@@ -92,11 +97,14 @@ func setShadowSpanAttribute(span trace.Span, req *http.Request) {
 	span.SetAttributes(traceAttrIsShadow.Bool(isShadowRequest(req)))
 }
 
-func newShadowRequest(req *http.Request, body []byte, ctx context.Context) *http.Request {
-	shadowReq := req.Clone(ctx)
+func newShadowRequest(req *http.Request, body io.ReadCloser, contentLength int64, ctx context.Context) *http.Request {
+	shadowReq := req.Clone(middleware.ShadowTelemetryContext(ctx))
 	shadowReq.Header.Set(shadowHeader, shadowHeaderValue)
-	shadowReq.Body = io.NopCloser(bytes.NewReader(body))
-	shadowReq.ContentLength = int64(len(body))
+	// A shadow is a separate upstream request, so it gets its own ID. The
+	// shadow span keeps it linked to the primary trace.
+	shadowReq.Header.Set(middleware.RequestIDHeader, middleware.NewRequestID())
+	shadowReq.Body = body
+	shadowReq.ContentLength = contentLength
 	return shadowReq
 }
 
@@ -144,6 +152,17 @@ func recordShadowDispatchSummary(ctx context.Context, targetModels []string, dis
 	span.SetAttributes(attrs...)
 }
 
+func setShadowSamplingMethodsAttribute(ctx context.Context, methods []config.ShadowSamplingMethod) {
+	if len(methods) == 0 {
+		return
+	}
+	names := make([]string, len(methods))
+	for i, method := range methods {
+		names[i] = string(method)
+	}
+	trace.SpanFromContext(ctx).SetAttributes(traceAttrShadowSamplingMethods.StringSlice(names))
+}
+
 func shadowDroppedReason(err error) string {
 	if errors.Is(err, errShadowConcurrencyLimit) {
 		return shadowDroppedReasonConcurrencyLimit
@@ -173,6 +192,9 @@ func newShadowReplayHandler(targetModel string, handler http.Handler) http.Handl
 		replay,
 		shadowReplaySpanName,
 		otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
+		otelhttp.WithMetricAttributesFn(func(*http.Request) []attribute.KeyValue {
+			return []attribute.KeyValue{attribute.Bool("nvcf.shadow", true)}
+		}),
 		otelhttp.WithSpanOptions(trace.WithAttributes(traceAttrShadowTargetModel.String(targetModel))),
 	)
 }

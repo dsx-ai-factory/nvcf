@@ -14,7 +14,8 @@
 // limitations under the License.
 
 use axum::Json;
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +25,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::info;
 
 use crate::AppState;
+use crate::engine_driver::EngineRequest;
 use crate::kv_cache::{KvCacheAccess, KvCacheStats, insert_kv_cache_headers};
 use crate::stats_stream::StatsStreamEvent;
 use crate::test_control::{TestEndpoint, TestRequestClass, is_canary_request, request_class};
@@ -175,11 +177,60 @@ struct StreamResponseConfig {
     id: String,
     request_id: String,
     input_tokens: usize,
-    first_token_delay: Duration,
     output_tokens: usize,
     kv_cache_access: KvCacheAccess,
-    request_slot: Option<OwnedSemaphorePermit>,
+    pacing: TokenPacing,
     kind: StreamKind,
+}
+
+/// Output timing for a request whose input has been processed.
+enum TokenPacing {
+    /// Legacy fixed per-request delays. The concurrency permit is held until
+    /// the response ends.
+    Fixed {
+        first_token_delay: Duration,
+        _request_slot: Option<OwnedSemaphorePermit>,
+    },
+    /// Token events from the shared batched engine, which has already
+    /// produced the first token.
+    Engine(EngineRequest),
+}
+
+impl TokenPacing {
+    async fn first_token(&self) {
+        if let Self::Fixed {
+            first_token_delay, ..
+        } = self
+        {
+            tokio::time::sleep(*first_token_delay).await;
+        }
+    }
+
+    async fn next_token(&mut self, state: &AppState, request_id: &str, token_index: usize) {
+        match self {
+            Self::Fixed { .. } => {
+                tokio::time::sleep(token_delay(state, request_id, token_index)).await;
+            }
+            Self::Engine(request) => request.next_token().await,
+        }
+    }
+
+    async fn whole_response(&mut self, state: &AppState, request_id: &str, output_tokens: usize) {
+        match self {
+            Self::Fixed {
+                first_token_delay, ..
+            } => {
+                tokio::time::sleep(non_streaming_delay(
+                    state,
+                    request_id,
+                    *first_token_delay,
+                    output_tokens,
+                ))
+                .await;
+            }
+            Self::Engine(request) => request.completion().await,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,18 +278,18 @@ pub(crate) async fn chat_completions(
             ),
         );
     };
-    let request_slot = state.acquire_request_slot().await;
     let stream = req.stream == Some(true);
     info!(id = %id, model = %model, stream = stream, "received chat/completions request");
     let cache_affinity_key = optional_header(&headers, "x-cache-affinity-key");
-    if stream {
-        state.emit_counters(&request_id, &model, 0, 0, false);
-    }
-    let kv_cache_access = state
-        .process_input_with_cache(cache_affinity_key.as_deref(), input_tokens)
+    let (kv_cache_access, mut pacing) = state
+        .prepare_request(
+            &model,
+            &request_id,
+            cache_affinity_key.as_deref(),
+            input_tokens,
+            output_tokens,
+        )
         .await;
-    let first_token_delay =
-        state.ttft + Duration::from_millis(jitter_ms(&request_id, "ttft", state.ttft_jitter_ms));
     info!(
         id = %id,
         cache_affinity_key = ?cache_affinity_key,
@@ -257,10 +308,9 @@ pub(crate) async fn chat_completions(
             id,
             request_id,
             input_tokens,
-            first_token_delay,
             output_tokens,
             kv_cache_access,
-            request_slot,
+            pacing,
             kind: StreamKind::Chat {
                 canary,
                 include_usage: req
@@ -271,13 +321,9 @@ pub(crate) async fn chat_completions(
         });
     }
 
-    tokio::time::sleep(non_streaming_delay(
-        &state,
-        &request_id,
-        first_token_delay,
-        output_tokens,
-    ))
-    .await;
+    pacing
+        .whole_response(&state, &request_id, output_tokens)
+        .await;
 
     let content = if canary {
         CANARY_ANSWER.to_string()
@@ -353,15 +399,17 @@ pub(crate) async fn responses(
             ),
         );
     };
-    let request_slot = state.acquire_request_slot().await;
     info!(id = %id, model = %model, "received responses request");
     let cache_affinity_key = optional_header(&headers, "x-cache-affinity-key");
-    state.emit_counters(&request_id, &model, 0, 0, false);
-    let kv_cache_access = state
-        .process_input_with_cache(cache_affinity_key.as_deref(), input_tokens)
+    let (kv_cache_access, pacing) = state
+        .prepare_request(
+            &model,
+            &request_id,
+            cache_affinity_key.as_deref(),
+            input_tokens,
+            output_tokens,
+        )
         .await;
-    let first_token_delay =
-        state.ttft + Duration::from_millis(jitter_ms(&request_id, "ttft", state.ttft_jitter_ms));
 
     stream_response(StreamResponseConfig {
         state,
@@ -369,10 +417,9 @@ pub(crate) async fn responses(
         id,
         request_id,
         input_tokens,
-        first_token_delay,
         output_tokens,
         kv_cache_access,
-        request_slot,
+        pacing,
         kind: StreamKind::Responses {
             created_at: current_unix_timestamp(),
         },
@@ -435,6 +482,405 @@ pub(crate) async fn embeddings(
     .into_response()
 }
 
+const DECISION_ECHO_HEADERS: [&str; 5] = [
+    "typesafe-danger-zone-images",
+    "x-model",
+    "x-input-tokens",
+    "x-request-id",
+    "x-vendor-test",
+];
+/// Caller credentials a gateway must not forward. The echo reports only
+/// whether any arrived, never a value.
+const DECISION_CREDENTIAL_HEADERS: [&str; 4] = [
+    "authorization",
+    "x-api-key",
+    "proxy-authorization",
+    "cookie",
+];
+const DECISION_MOCK_PROBABILITY: f64 = 0.99;
+const DECISION_MOCK_RETRY_AFTER_SECONDS: &str = "7";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecisionRoute {
+    Decisions,
+    Systemone,
+}
+
+/// Canned OpenAI Decisions response. Any JSON object is accepted, so tests can
+/// send large or loosely shaped payloads.
+pub(crate) async fn decisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    decision_response(state, headers, query, body, DecisionRoute::Decisions).await
+}
+
+/// Canned System One response.
+pub(crate) async fn systemone(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: Bytes,
+) -> Response {
+    decision_response(state, headers, query, body, DecisionRoute::Systemone).await
+}
+
+async fn decision_response(
+    state: AppState,
+    headers: HeaderMap,
+    query: Option<String>,
+    body: Bytes,
+    route: DecisionRoute,
+) -> Response {
+    let request = match parse_decision_body(&body) {
+        Some(request) => request,
+        None => {
+            return decision_error(
+                route,
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object",
+            );
+        }
+    };
+    let model = request
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| state.model_name.clone(), str::to_string);
+    let endpoint = match route {
+        DecisionRoute::Decisions => TestEndpoint::Decisions,
+        DecisionRoute::Systemone => TestEndpoint::Systemone,
+    };
+    state.record_request(&headers, endpoint, &model).await;
+    let input_tokens = optional_header(&headers, "x-input-tokens")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| (body.len() / 4).max(1));
+    let output_tokens = 1;
+    let request_id = optional_header(&headers, "x-request-id")
+        .unwrap_or_else(|| format!("decision-mock-{}", rand_id()));
+    info!(
+        request_id = %request_id,
+        model = %model,
+        input_tokens = input_tokens,
+        body_length = body.len(),
+        "received decision request"
+    );
+
+    let mock_error = query
+        .as_deref()
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .find_map(|pair| pair.strip_prefix("mock_error="));
+    match mock_error {
+        Some("429") => {
+            let mut response =
+                decision_error(route, StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(DECISION_MOCK_RETRY_AFTER_SECONDS),
+            );
+            return response;
+        }
+        Some("400") => return decision_error(route, StatusCode::BAD_REQUEST, "Invalid question"),
+        _ => {}
+    }
+
+    let (_, mut pacing) = state
+        .prepare_request(&model, &request_id, None, input_tokens, output_tokens)
+        .await;
+    pacing
+        .whole_response(&state, &request_id, output_tokens)
+        .await;
+
+    let echo: serde_json::Map<String, serde_json::Value> = DECISION_ECHO_HEADERS
+        .iter()
+        .filter_map(|name| {
+            optional_header(&headers, name).map(|value| ((*name).to_string(), value.into()))
+        })
+        .chain([
+            ("body_length".to_string(), body.len().into()),
+            (
+                "body_sha256".to_string(),
+                crate::sha256::sha256_hex(&body).into(),
+            ),
+            (
+                "credentials_received".to_string(),
+                DECISION_CREDENTIAL_HEADERS
+                    .iter()
+                    .any(|name| headers.contains_key(*name))
+                    .into(),
+            ),
+        ])
+        .collect();
+    let payload = match route {
+        DecisionRoute::Decisions => {
+            let answers: Vec<_> = request
+                .get("questions")
+                .and_then(serde_json::Value::as_array)
+                .filter(|questions| !questions.is_empty())
+                .map_or_else(
+                    || vec![serde_json::json!({"type": "predicate", "probability": DECISION_MOCK_PROBABILITY})],
+                    |questions| {
+                        questions
+                            .iter()
+                            .enumerate()
+                            .map(|(index, question)| decisions_answer(index, question))
+                            .collect()
+                    },
+                );
+            serde_json::json!({
+                "model": model,
+                "answers": answers,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                    "output_tokens": output_tokens,
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": input_tokens + output_tokens,
+                },
+                "echo": echo,
+            })
+        }
+        DecisionRoute::Systemone => {
+            let answers: serde_json::Map<String, serde_json::Value> = request
+                .get("questions")
+                .and_then(serde_json::Value::as_object)
+                .filter(|questions| !questions.is_empty())
+                .map_or_else(
+                    || {
+                        serde_json::Map::from_iter([(
+                            "question".to_string(),
+                            systemone_answer(&serde_json::Value::Null),
+                        )])
+                    },
+                    |questions| {
+                        questions
+                            .iter()
+                            .map(|(name, question)| (name.clone(), systemone_answer(question)))
+                            .collect()
+                    },
+                );
+            serde_json::json!({
+                "model": model,
+                "answers": answers,
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "echo": echo,
+            })
+        }
+    };
+    state.emit_counters(&request_id, &model, input_tokens, output_tokens, true);
+    let mut response = Json(payload).into_response();
+    if let Some(value) = headers.get("typesafe-danger-zone-images") {
+        response
+            .headers_mut()
+            .insert("x-mock-echo-typesafe-danger-zone-images", value.clone());
+    }
+    response
+}
+
+/// Parses one JSON object, as the decision backends require. Anything else,
+/// including trailing data, is a client error.
+fn parse_decision_body(body: &[u8]) -> Option<serde_json::Value> {
+    let request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    request.is_object().then_some(request)
+}
+
+/// Expected score for the mock probabilities: the probability-weighted level
+/// index, as a float.
+fn weighted_score(probabilities: &[f64]) -> f64 {
+    probabilities
+        .iter()
+        .enumerate()
+        .map(|(index, probability)| index as f64 * probability)
+        .sum()
+}
+
+fn question_type(question: &serde_json::Value) -> &str {
+    question
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// Probabilities for `count` options: the first gets the mock probability and
+/// the rest share the remainder.
+fn option_probabilities(count: usize) -> Vec<f64> {
+    let rest = 0.01 / count.saturating_sub(1).max(1) as f64;
+    (0..count)
+        .map(|index| {
+            if index == 0 {
+                DECISION_MOCK_PROBABILITY
+            } else {
+                rest
+            }
+        })
+        .collect()
+}
+
+fn mock_box() -> serde_json::Value {
+    serde_json::json!({"top": 0.1, "bottom": 0.9, "left": 0.1, "right": 0.9})
+}
+
+/// Canned answer for one Decisions question. Questions are read loosely so an
+/// unexpected field never fails the request; unknown types get the predicate
+/// answer.
+fn decisions_answer(index: usize, question: &serde_json::Value) -> serde_json::Value {
+    let kind = question_type(question);
+    let kind = if kind.is_empty() { "predicate" } else { kind };
+    let name = question
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| format!("q{index}"), str::to_string);
+    let options = |key: &str| -> Vec<serde_json::Value> {
+        question
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    match kind {
+        "choice" => {
+            let values: Vec<_> = options("choices")
+                .into_iter()
+                .map(|choice| choice.get("value").cloned().unwrap_or(choice))
+                .collect();
+            let probabilities = option_probabilities(values.len());
+            serde_json::json!({
+                "type": kind,
+                "name": name,
+                "choice": values.first().cloned().unwrap_or(serde_json::Value::Null),
+                "probabilities": values.iter().zip(&probabilities)
+                    .map(|(value, probability)| serde_json::json!({"value": value, "probability": probability}))
+                    .collect::<Vec<_>>(),
+                "confidence": DECISION_MOCK_PROBABILITY,
+            })
+        }
+        "score" => {
+            let labels: Vec<_> = options("levels")
+                .into_iter()
+                .map(|level| level.get("label").cloned().unwrap_or(level))
+                .collect();
+            let probabilities = option_probabilities(labels.len());
+            serde_json::json!({
+                "type": kind,
+                "name": name,
+                "score": weighted_score(&probabilities),
+                "probabilities": labels.iter().zip(&probabilities).enumerate()
+                    .map(|(value, (label, probability))| serde_json::json!({"value": value, "label": label, "probability": probability}))
+                    .collect::<Vec<_>>(),
+                "confidence": DECISION_MOCK_PROBABILITY,
+            })
+        }
+        "box" => serde_json::json!({
+            "type": kind,
+            "name": name,
+            "box": mock_box(),
+            "confidence": DECISION_MOCK_PROBABILITY,
+        }),
+        _ => serde_json::json!({
+            "type": kind,
+            "name": name,
+            "probability": DECISION_MOCK_PROBABILITY,
+        }),
+    }
+}
+
+/// Canned answer for one System One question, keyed by the caller. Unknown
+/// types get the noul answer.
+fn systemone_answer(question: &serde_json::Value) -> serde_json::Value {
+    let criteria = question.get("criteria");
+    match question_type(question) {
+        "choice" => {
+            let keys: Vec<String> = match criteria {
+                Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let probabilities = option_probabilities(keys.len());
+            serde_json::json!({
+                "type": "choice",
+                "choice": keys.first().cloned().unwrap_or_default(),
+                "confidence": DECISION_MOCK_PROBABILITY,
+                "probabilities": keys.iter().zip(&probabilities)
+                    .map(|(key, probability)| (key.clone(), serde_json::json!(probability)))
+                    .collect::<serde_json::Map<_, _>>(),
+            })
+        }
+        "score" => {
+            let labels: Vec<serde_json::Value> = criteria
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let probabilities = option_probabilities(labels.len());
+            serde_json::json!({
+                "type": "score",
+                "score": weighted_score(&probabilities),
+                "confidence": DECISION_MOCK_PROBABILITY,
+                "legend": labels.iter().enumerate()
+                    .map(|(index, label)| (index.to_string(), label.clone()))
+                    .collect::<serde_json::Map<_, _>>(),
+                "probabilities": probabilities.iter().enumerate()
+                    .map(|(index, probability)| (index.to_string(), serde_json::json!(probability)))
+                    .collect::<serde_json::Map<_, _>>(),
+            })
+        }
+        "box" => serde_json::json!({
+            "type": "box",
+            "box": mock_box(),
+            "confidence": DECISION_MOCK_PROBABILITY,
+        }),
+        _ => serde_json::json!({"type": "noul", "noul": DECISION_MOCK_PROBABILITY}),
+    }
+}
+
+/// Error bodies follow each route's native shape: OpenAI style for decisions,
+/// FastAPI style for System One.
+fn decision_error(route: DecisionRoute, status: StatusCode, message: &str) -> Response {
+    let rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
+    match route {
+        DecisionRoute::Decisions if rate_limited => error_response(
+            status,
+            serde_json::json!({
+                "message": message,
+                "type": "rate_limit_error",
+                "param": null,
+                "code": "rate_limit_exceeded",
+            }),
+        ),
+        DecisionRoute::Decisions => error_response(
+            status,
+            serde_json::json!({
+                "message": message,
+                "type": "invalid_request_error",
+                "param": "questions",
+                "code": "invalid_question",
+            }),
+        ),
+        DecisionRoute::Systemone if rate_limited => (
+            status,
+            Json(serde_json::json!({"detail": [{
+                "loc": ["body"],
+                "msg": message,
+                "type": "value_error",
+            }]})),
+        )
+            .into_response(),
+        DecisionRoute::Systemone => (
+            status,
+            Json(serde_json::json!({"detail": [{
+                "loc": ["body", "questions"],
+                "msg": message,
+                "type": "value_error",
+            }]})),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn health(State(state): State<AppState>) -> &'static str {
     if !state.health_delay.is_zero() {
         tokio::time::sleep(state.health_delay).await;
@@ -443,10 +889,59 @@ pub(crate) async fn health(State(state): State<AppState>) -> &'static str {
 }
 
 pub(crate) async fn kv_cache_stats(State(state): State<AppState>) -> Json<KvCacheStats> {
+    if let Some(engine) = &state.engine {
+        let workers = engine.worker_stats().await;
+        return Json(KvCacheStats::from_engine_workers(
+            &state.model_name,
+            &workers,
+        ));
+    }
     Json(state.kv_cache.lock().await.stats(&state.model_name))
 }
 
 impl AppState {
+    /// Processes the input and returns its cache access and output timing.
+    /// Stats counters report zero progress before input processing and the
+    /// processed input afterwards.
+    async fn prepare_request(
+        &self,
+        model: &str,
+        request_id: &str,
+        cache_affinity_key: Option<&str>,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) -> (KvCacheAccess, TokenPacing) {
+        if let Some(engine) = &self.engine {
+            let mut request = engine.submit(cache_affinity_key, input_tokens, output_tokens);
+            self.emit_counters(request_id, model, 0, 0, false);
+            // The engine never reports more reuse than the prompt length.
+            let reused = request.first_token().await;
+            self.emit_counters(request_id, model, input_tokens, 0, false);
+            let access = KvCacheAccess {
+                hit: reused > 0,
+                reused_input_tokens: reused,
+                uncached_input_tokens: input_tokens as u64 - reused,
+                ..KvCacheAccess::default()
+            };
+            return (access, TokenPacing::Engine(request));
+        }
+        let request_slot = self.acquire_request_slot().await;
+        self.emit_counters(request_id, model, 0, 0, false);
+        let kv_cache_access = self
+            .process_input_with_cache(cache_affinity_key, input_tokens)
+            .await;
+        self.emit_counters(request_id, model, input_tokens, 0, false);
+        let first_token_delay =
+            self.ttft + Duration::from_millis(jitter_ms(request_id, "ttft", self.ttft_jitter_ms));
+        (
+            kv_cache_access,
+            TokenPacing::Fixed {
+                first_token_delay,
+                _request_slot: request_slot,
+            },
+        )
+    }
+
     async fn process_input_with_cache(
         &self,
         cache_affinity_key: Option<&str>,
@@ -566,14 +1061,12 @@ fn stream_response(config: StreamResponseConfig) -> Response {
         id,
         request_id,
         input_tokens,
-        first_token_delay,
         output_tokens,
         kv_cache_access,
-        request_slot,
+        mut pacing,
         kind,
     } = config;
     let stream = async_stream::stream! {
-        let _request_slot = request_slot;
         let mut output_text = String::new();
         if let StreamKind::Responses { created_at } = kind {
             yield Ok::<_, std::convert::Infallible>(responses_sse_event(
@@ -592,9 +1085,7 @@ fn stream_response(config: StreamResponseConfig) -> Response {
                 }),
             ));
         }
-        tokio::time::sleep(first_token_delay).await;
-
-        state.emit_counters(&request_id, &model, input_tokens, 0, false);
+        pacing.first_token().await;
 
         if let StreamKind::Chat { include_usage, .. } = kind {
             yield Ok(chat_sse_event(&id, &model, ChatStreamChunk::Role, include_usage));
@@ -602,7 +1093,7 @@ fn stream_response(config: StreamResponseConfig) -> Response {
 
         for i in 0..output_tokens {
             if i > 0 {
-                tokio::time::sleep(token_delay(&state, &request_id, i)).await;
+                pacing.next_token(&state, &request_id, i).await;
             }
             let token = if matches!(kind, StreamKind::Chat { canary: true, .. }) {
                 CANARY_ANSWER

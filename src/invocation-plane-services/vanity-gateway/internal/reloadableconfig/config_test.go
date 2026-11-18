@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,6 +106,79 @@ func TestSetupConfigKeepsLastGoodConfigWhenReloadIsInvalid(t *testing.T) {
 	requireConfigValue(t, cfg, "two")
 }
 
+func TestSetupConfigReportsReloadErrorsOnlyForFailedReloads(t *testing.T) {
+	useFastReloadTiming(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, path, "one")
+
+	var failures atomic.Int32
+	cfg, err := SetupConfig[testConfig](path,
+		WithValidateFunc(func(c *testConfig) error {
+			if c.Value == "bad" {
+				return fmt.Errorf("bad value")
+			}
+			return nil
+		}),
+		WithReloadErrorFunc[testConfig](func(error) { failures.Add(1) }))
+	require.NoError(t, err)
+	require.Zero(t, failures.Load())
+
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "two")
+	requireConfigValue(t, cfg, "two")
+	require.Zero(t, failures.Load(), "a successful reload must not report an error")
+
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "bad")
+	require.Eventually(t, func() bool { return failures.Load() > 0 }, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, "two", cfg.Get().Value)
+
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, os.WriteFile(path, nil, 0600))
+	before := failures.Load()
+	require.Eventually(t, func() bool { return failures.Load() > before }, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, "two", cfg.Get().Value)
+}
+
+func TestSetupConfigReportsAPersistentlyBadFileOnce(t *testing.T) {
+	useFastReloadTiming(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeTestConfig(t, path, "one")
+
+	var failures atomic.Int32
+	cfg, err := SetupConfig[testConfig](path,
+		WithValidateFunc(func(c *testConfig) error {
+			if c.Value == "bad" || c.Value == "worse" {
+				return fmt.Errorf("bad value")
+			}
+			return nil
+		}),
+		WithReloadErrorFunc[testConfig](func(error) { failures.Add(1) }))
+	require.NoError(t, err)
+
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "bad")
+	require.Eventually(t, func() bool { return failures.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+
+	// Poll ticks keep retrying the unchanged bad file; they must not recount it.
+	time.Sleep(10 * PollInterval)
+	require.EqualValues(t, 1, failures.Load(), "one bad edit must be reported once")
+
+	// A different bad edit is a new failure.
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "worse")
+	require.Eventually(t, func() bool { return failures.Load() == 2 }, 2*time.Second, 5*time.Millisecond)
+
+	// A successful reload resets the state, so the same bad content reports again later.
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "two")
+	requireConfigValue(t, cfg, "two")
+	time.Sleep(20 * time.Millisecond)
+	writeTestConfig(t, path, "bad")
+	require.Eventually(t, func() bool { return failures.Load() == 3 }, 2*time.Second, 5*time.Millisecond)
+	require.Equal(t, "two", cfg.Get().Value)
+}
+
 func TestSetupConfigKeepsLastGoodConfigDuringZeroByteWrite(t *testing.T) {
 	useFastReloadTiming(t)
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -144,4 +218,27 @@ func TestSetupConfigReloadsConfigMapStyleSymlinkReplacement(t *testing.T) {
 	require.NoError(t, os.Rename(filepath.Join(root, "..data_tmp"), filepath.Join(root, "..data")))
 
 	requireConfigValue(t, cfg, "two")
+}
+
+func TestCustomUnmarshalKeepsLastGoodSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	c := &configData[testConfig]{filename: path}
+	WithUnmarshalFunc(func(data []byte, target *testConfig) error {
+		if string(data) == "invalid" {
+			return fmt.Errorf("invalid custom config")
+		}
+		target.Value = string(data)
+		return nil
+	})(c)
+	require.NoError(t, os.WriteFile(path, []byte("first"), 0600))
+	require.NoError(t, c.reloadConfig())
+	first := c.Get()
+	require.Equal(t, "first", first.Value)
+	require.NoError(t, os.WriteFile(path, []byte("invalid"), 0600))
+	require.ErrorContains(t, c.reloadConfig(), "invalid custom config")
+	require.Same(t, first, c.Get())
+	require.NoError(t, os.WriteFile(path, []byte("second"), 0600))
+	require.NoError(t, c.reloadConfig())
+	require.Equal(t, "second", c.Get().Value)
+	require.Equal(t, "first", first.Value)
 }

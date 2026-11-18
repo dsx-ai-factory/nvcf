@@ -22,9 +22,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 
-	"github.com/NVIDIA/nvcf/tests/perf/byoo-otel-collector/pkg/spec"
+	"github.com/dsx-ai-factory/nvcf/tests/perf/byoo-otel-collector/pkg/spec"
 )
 
 func TestRenderContainerExtractsSidecar(t *testing.T) {
@@ -202,4 +202,28 @@ func TestEnsureNonEmptyEnv(t *testing.T) {
 			t.Errorf("expected 2 env entries, got %d", len(c.Env))
 		}
 	})
+}
+
+func TestBenchPodSuppliesOptionalTracingEndpoint(t *testing.T) {
+	for _, shape := range []spec.Shape{spec.ShapeContainer, spec.ShapeHelm} {
+		t.Run(string(shape), func(t *testing.T) {
+			res, err := Render(shape, spec.DefaultOptions())
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			const endpoint = common.OTelExporterEndpointEnv
+			if _, ok := envValue(res.Collector.Env, endpoint); ok {
+				t.Fatal("translated collector should omit an unconfigured tracing endpoint")
+			}
+
+			pod := res.BenchPod("byoo-perf")
+			got, ok := envValue(pod.Spec.Containers[0].Env, endpoint)
+			if !ok || got.Value == "" {
+				t.Fatal("benchmark pod must supply a non-empty tracing fallback")
+			}
+			if _, ok := envValue(res.Collector.Env, endpoint); ok {
+				t.Fatal("benchmark fallback mutated the translated collector")
+			}
+		})
+	}
 }

@@ -22,6 +22,8 @@ import (
 	"net/http"
 
 	echo "github.com/labstack/echo/v4"
+
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
 )
 
 func providerHTTPError(err error) error {
@@ -29,6 +31,10 @@ func providerHTTPError(err error) error {
 	if errors.As(err, &httpErr) {
 		return httpErr
 	}
+	if errors.Is(err, provider.ErrStreamIncomplete) {
+		return echo.NewHTTPError(http.StatusBadGateway, msgUpstreamStreamIncomplete).SetInternal(err)
+	}
 
-	return echo.NewHTTPError(http.StatusBadGateway, err.Error())
+	// Transport errors carry internal addresses; keep them for the request log only.
+	return echo.NewHTTPError(http.StatusBadGateway, "upstream request failed").SetInternal(err)
 }

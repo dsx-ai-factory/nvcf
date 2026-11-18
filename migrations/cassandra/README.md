@@ -14,7 +14,7 @@ This repository ships:
 
 The container builds [`golang-migrate`](https://github.com/golang-migrate/migrate) v4.19.1 from its checksum-verified release source. The build enables only the Cassandra database driver. This keeps unrelated database and cloud-provider clients out of the runtime binary.
 
-The image also replaces Cassandra's Jackson and Netty libraries with the
+The image also replaces Cassandra's Jackson, Netty, and lz4 libraries with the
 coherent, checksum-pinned versions in `java-libraries.lock`. Set
 `MAVEN_REPOSITORY_BASE` at build time to use a caching Maven repository while
 preserving the locked paths and checksums.
@@ -29,7 +29,13 @@ preserving the locked paths and checksums.
 
 ## Building the container
 
-The `Dockerfile` uses the official `cassandra:5.0.9` base image and builds both supported architectures from the same pinned sources.
+The `Dockerfile` uses the official `cassandra:5.0.9` base image and builds both supported architectures from the same pinned sources. It replaces the JDK 17 `cacerts` file with the checksum-verified trust store from Temurin 17.0.21+9 without changing the JVM binary.
+
+The final image includes the trust store's MPL-2.0 notice and corresponding
+source location at `/usr/share/doc/cacerts-NOTICE`. To change the Cassandra
+version, update both the tag and digest in the `FROM cassandra:<version>@sha256:<digest>`
+line. Run `sh tests/test-image.sh <image>` after building. The test compares
+the image's Cassandra version with the Dockerfile tag and checks the notice.
 
 ```bash
 docker build \

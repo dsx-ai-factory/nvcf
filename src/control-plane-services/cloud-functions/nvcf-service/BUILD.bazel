@@ -81,7 +81,12 @@ nvcf_java_test(
         "@nv_third_party_deps//:org_springframework_spring_webmvc",
         "@nv_third_party_deps//:org_testcontainers_testcontainers",
         "@nv_third_party_deps//:org_testcontainers_testcontainers_cassandra",
+        "@nv_third_party_deps//:org_assertj_assertj_core",
         "@nv_third_party_deps//:org_slf4j_slf4j_api",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_core",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_jose",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_resource_server",
+        "@nv_third_party_deps//:org_springframework_spring_test",
         "@nv_third_party_deps//:org_wiremock_wiremock_standalone",
         "@nv_third_party_deps//:tools_jackson_core_jackson_databind",
     ],
@@ -134,6 +139,7 @@ java_oci_image(
         "ULIMIT_FLAG": "1",
         "JDK_JAVA_OPTIONS": "-XX:MaxRAMPercentage=40.0 -XX:+EnableDynamicAgentLoading -Dreactor.netty.pool.maxIdleTime=30000 -Dreactor.netty.pool.maxConnections=500",
     },
+    user = "1000:1000",
     workdir = "/home/app",
 )
 
@@ -147,5 +153,6 @@ java_image_contract_test(
         "ULIMIT_FLAG": "1",
         "JDK_JAVA_OPTIONS": "-XX:MaxRAMPercentage=40.0 -XX:+EnableDynamicAgentLoading -Dreactor.netty.pool.maxIdleTime=30000 -Dreactor.netty.pool.maxConnections=500",
     },
+    user = "1000:1000",
     workdir = "/home/app",
 )

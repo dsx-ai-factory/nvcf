@@ -23,8 +23,8 @@
 // To change the toolchain, edit the toolchain line below and nothing else, then
 // run tools/ci/check-go-version to find anything that has drifted.
 
-module github.com/NVIDIA/nvcf/tools/go-toolchain
+module github.com/dsx-ai-factory/nvcf/tools/go-toolchain
 
 go 1.26.5
 
-toolchain go1.26.8
+toolchain go1.26.10

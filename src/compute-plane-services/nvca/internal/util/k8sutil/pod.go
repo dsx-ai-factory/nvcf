@@ -23,12 +23,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 )
 
 const (
@@ -273,6 +273,38 @@ type ContainerStuckInitializing struct {
 	Message string
 }
 
+// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times
+// in a Pod launched more than PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during
+// the Pod's lifetime, so a container whose latest run exited with code 0 after the Pod became Ready is not
+// counted: the app ended on purpose (for example a streaming app that quits when its session ends) and the
+// kubelet restarted it in place.
+func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
+	if cs.RestartCount < RestartCountToFailInstance ||
+		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+		return false
+	}
+	return !exitedCleanlyAfterPodReady(pod.Status, cs)
+}
+
+// exitedCleanlyAfterPodReady reports whether the container's latest run exited with code 0 and the Pod was
+// Ready at some point after that run started.
+func exitedCleanlyAfterPodReady(status corev1.PodStatus, cs corev1.ContainerStatus) bool {
+	// State holds the latest run until the kubelet restarts the container, then LastTerminationState does.
+	last := cs.State.Terminated
+	if last == nil {
+		last = cs.LastTerminationState.Terminated
+	}
+	if last == nil || last.ExitCode != 0 || last.StartedAt.IsZero() {
+		return false
+	}
+	ready := getPodReadyCondition(status)
+	if ready == nil {
+		return false
+	}
+	// PodReady only toggles between True and False, so a False condition was True until its last transition.
+	return ready.Status == corev1.ConditionTrue || ready.LastTransitionTime.After(last.StartedAt.Time)
+}
+
 func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuckInitializing, bool) {
 	podStatus := pod.Status
 	initConditionTrue := false
@@ -285,8 +317,7 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 	stuckContainers := []ContainerStuckInitializing{}
 	if initConditionTrue {
 		for _, containerStatus := range podStatus.ContainerStatuses {
-			if containerStatus.RestartCount >= RestartCountToFailInstance &&
-				IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+			if IsContainerInRestartLoop(pod, containerStatus, k8sTimeConfig) {
 				reason := "ContainerInRestartLoop"
 				message := ""
 				switch {
@@ -312,8 +343,7 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 		}
 	} else {
 		for _, containerStatus := range podStatus.InitContainerStatuses {
-			if containerStatus.RestartCount >= RestartCountToFailInstance &&
-				IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+			if IsContainerInRestartLoop(pod, containerStatus, k8sTimeConfig) {
 				reason := "InitContainerInRestartLoop"
 				message := ""
 				switch {
@@ -352,23 +382,50 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 }
 
 func IsTimeSincePodLaunchedLaterThan(pod *corev1.Pod, dtc time.Duration) bool {
+	launched, ok := PodLaunchTime(pod)
+	return ok && IsOverTimeout(launched, dtc, time.Now())
+}
+
+// PodLaunchTime returns the time that launch timeouts, such as the scheduling
+// timeout, are measured from. It returns false when the pod has no such time.
+//
+// A started pod is measured from its start time. A pod that has not started and
+// is not scheduled is measured from its creation time, not from the
+// PodScheduled=False condition's LastTransitionTime. Some schedulers, such as the
+// KAI scheduler, rewrite that condition with a new LastTransitionTime on every
+// scheduling attempt, so a timeout measured from it never expires. A bound pod
+// is never unscheduled again: an evicted or preempted pod is replaced by a new
+// pod with its own creation time, so the creation time is how long this pod has
+// waited to be scheduled. The transition time is used only when the pod has no
+// creation time.
+func PodLaunchTime(pod *corev1.Pod) (metav1.Time, bool) {
 	ps := pod.Status
-	now := time.Now()
 	if ps.StartTime != nil && !ps.StartTime.IsZero() {
-		return IsOverTimeout(*ps.StartTime, dtc, now)
+		return *ps.StartTime, true
 	}
 
 	// If a Pod is not scheduled due for whatever reason, kubelet will not set the StartTime.
-	// Rely on scheduled=false condition's transition time to check if pod has launched within timeout.
 	for _, cond := range ps.Conditions {
-		if cond.Type == corev1.PodScheduled {
-			return cond.Status == corev1.ConditionFalse &&
-				!cond.LastTransitionTime.IsZero() &&
-				IsOverTimeout(cond.LastTransitionTime, dtc, now)
+		if cond.Type != corev1.PodScheduled {
+			continue
 		}
+		// A scheduled pod that the kubelet has not started yet has no launch time.
+		if cond.Status != corev1.ConditionFalse {
+			return metav1.Time{}, false
+		}
+		if !pod.CreationTimestamp.IsZero() {
+			return pod.CreationTimestamp, true
+		}
+		if !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime, true
+		}
+		return metav1.Time{}, false
 	}
 	// If there is no scheduled condition, rely on creation timestamp.
-	return !pod.CreationTimestamp.IsZero() && IsOverTimeout(pod.CreationTimestamp, dtc, now)
+	if pod.CreationTimestamp.IsZero() {
+		return metav1.Time{}, false
+	}
+	return pod.CreationTimestamp, true
 }
 
 func IsOverTimeout(t metav1.Time, timeoutDuration time.Duration, now time.Time) bool {

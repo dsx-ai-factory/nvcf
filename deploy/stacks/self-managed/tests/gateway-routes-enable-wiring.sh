@@ -7,6 +7,11 @@
 # without patching global.yaml.gotmpl. The gateway-routes chart owns the default
 # (enabled: true); the stack forwards enabled only when an environment file sets
 # it, so an unset flag passes no override and the chart default stands.
+#
+# The llmApiGateway and llmInvocation routes follow addons.llm.enabled, like
+# the other add-on routes, so an install without the LLM add-on gets no route to
+# a Service it never deployed. An environment can still turn either route off
+# while the add-on is on, but cannot turn one on without the add-on.
 set -euo pipefail
 
 stack_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,9 +100,9 @@ write_env() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Default: flags unset -> the stack passes NO enabled override for any of the
-#    three, so the gateway-routes chart default (true) stands and existing
-#    installs are unchanged.
+# 1. Default: flags unset -> the stack passes NO enabled override for apiKeys,
+#    sis or reval, so the gateway-routes chart default (true) stands. With the
+#    LLM add-on off by default, llmApiGateway is forced to false.
 # ---------------------------------------------------------------------------
 write_env <<'EOF'
 global:
@@ -111,6 +116,7 @@ render_ingress_values "$default_values"
 assert_route_unset apiKeys "$default_values"
 assert_route_unset sis "$default_values"
 assert_route_unset reval "$default_values"
+assert_route_enabled llmApiGateway false "$default_values"
 
 # ---------------------------------------------------------------------------
 # 2. Override: an environment file disabling the three routes reaches the chart
@@ -137,5 +143,74 @@ render_ingress_values "$off_values"
 assert_route_enabled apiKeys false "$off_values"
 assert_route_enabled sis false "$off_values"
 assert_route_enabled reval false "$off_values"
+
+# ---------------------------------------------------------------------------
+# 3. LLM add-on on: both LLM routes are enabled with it.
+# ---------------------------------------------------------------------------
+write_env <<'EOF'
+global:
+  image:
+    registry: nvcr.io
+    repository: test/nvcf
+addons:
+  llm:
+    enabled: true
+EOF
+
+llm_values="$work_dir/ingress-llm-values.yaml"
+render_ingress_values "$llm_values"
+assert_route_enabled llmApiGateway true "$llm_values"
+assert_route_enabled llmInvocation true "$llm_values"
+
+# ---------------------------------------------------------------------------
+# 4. LLM add-on on, one route turned off by the environment, for example
+#    when callers reach the gateway in-cluster. The other stays on, so a flag
+#    read from the wrong route fails here.
+# ---------------------------------------------------------------------------
+write_env <<'EOF'
+global:
+  image:
+    registry: nvcr.io
+    repository: test/nvcf
+addons:
+  llm:
+    enabled: true
+ingress:
+  gatewayApi:
+    routes:
+      llmApiGateway:
+        enabled: false
+EOF
+
+llm_off_values="$work_dir/ingress-llm-off-values.yaml"
+render_ingress_values "$llm_off_values"
+assert_route_enabled llmApiGateway false "$llm_off_values"
+assert_route_enabled llmInvocation true "$llm_off_values"
+
+# ---------------------------------------------------------------------------
+# 5. LLM add-on off: enabling a route cannot turn it on without its backend.
+#    A quoted "false" counts as off, as it does for the add-on's releases.
+# ---------------------------------------------------------------------------
+write_env <<'EOF'
+global:
+  image:
+    registry: nvcr.io
+    repository: test/nvcf
+addons:
+  llm:
+    enabled: "false"
+ingress:
+  gatewayApi:
+    routes:
+      llmApiGateway:
+        enabled: true
+      llmInvocation:
+        enabled: true
+EOF
+
+llm_no_addon_values="$work_dir/ingress-llm-no-addon-values.yaml"
+render_ingress_values "$llm_no_addon_values"
+assert_route_enabled llmApiGateway false "$llm_no_addon_values"
+assert_route_enabled llmInvocation false "$llm_no_addon_values"
 
 echo "gateway-routes-enable-wiring: all checks passed"

@@ -93,11 +93,16 @@ Response:
 - `model_ids`: model ids with a current routable target generation in the
   selected pod's local state.
 
-`ListModels` is a hint, not a reservation. If a recent positive result is
-followed by proxy `404` with `x-stargate-error-code: no_eligible_candidates`,
-the local route changed after discovery returned; the gateway may retry
-according to its normal policy. A `503` for a registered model means no
-eligible active backend, not a discovery miss.
+`ListModels` is a hint, not a reservation. It lists only models with a
+routable backend now. A model whose backends are inactive, or whose last
+backend deregistered within `--deregistered-model-grace-ms` (default 900000,
+15 minutes), gets proxy `503` with `x-stargate-error-code: no_ready_backends`
+and `Retry-After`. This covers backend replacement, where the old backend
+leaves before the new one registers. A `404` with
+`x-stargate-error-code: no_eligible_candidates` means no backend advertised the
+model on this pod within that window. If a recent positive result is followed
+by that `404`, the local route changed after discovery returned; the gateway
+may retry according to its normal policy.
 
 ## Operator Debug State
 
@@ -119,6 +124,8 @@ Supported:
 POST /v1/chat/completions
 POST /v1/responses
 POST /v1/embeddings
+POST /v1/decisions
+POST /v1/systemone
 ```
 
 Required headers:
@@ -134,15 +141,36 @@ Optional trusted headers:
 | Header | Meaning |
 | --- | --- |
 | `x-routing-key` | Authenticated routing scope. Omit for unscoped. |
-| `x-routing-method` | Request-scoped load-balancer override, only for methods allowed by Stargate config. |
+| `x-routing-method` | Request-scoped load-balancer override, only for methods allowed by Stargate config, optionally with expression parameters. See [routing expressions](load-balancer-configuration.md#routing-expressions). |
 | `x-cache-affinity-key` | Opaque cache/prefix identity. Required by some LB configs. |
 | `x-priority` | Unsigned priority rank; lower is more urgent. Omit when no priority is resolved. |
 | `x-request-slo-ms` | Per-request LB latency hint. |
 | `x-max-wait-ms` | Wait budget for temporarily infeasible candidates. |
 | `x-stargate-max-wait-ms` | Stargate internal retry budget. |
+| `x-stargate-last-cluster-id` | The `x-stargate-cluster-id` from the session's last 2xx response. Used only by algorithms with `last_cluster_affinity`. Stargate consumes it and never forwards it to pylon. |
 
 The gateway must synthesize or validate these headers. Do not pass public
 caller-supplied routing headers through blindly.
+
+Last-cluster rules for the gateway:
+
+- A session is one `x-routing-key`, `x-model`, and `x-cache-affinity-key`
+  tuple.
+- Always delete an inbound `x-stargate-last-cluster-id` before building the
+  Stargate request, including on paths that clone inbound headers.
+- Set the header only from the gateway's own store.
+- A payload-derived affinity key changes every turn, so do not key the store by
+  it. The LLM API gateway keys payload sessions by a prefix chain: it writes
+  under a hash of the full conversation and looks up under a hash of the
+  conversation before the last run of model output. Append-only clients then
+  find the previous turn's cluster. History edited or truncated in the part
+  hashed for lookup misses and is sent without the header. A gateway that
+  cannot derive such values must skip payload sessions.
+- Store the `x-stargate-cluster-id` of a 2xx response when the response
+  headers arrive, not at stream end. Do not store on non-2xx responses or
+  transport errors.
+- Bound the lookup. On a miss, store error, or timeout, send the request
+  without the header. Writes must never delay or fail the client response.
 
 Internal headers:
 
@@ -174,6 +202,8 @@ Body rules:
 - `/v1/chat/completions` and `/v1/responses` must be valid JSON with
   `"stream": true`.
 - `/v1/embeddings` must be valid JSON and does not need `stream`.
+- `/v1/decisions` and `/v1/systemone` (beta) must be valid JSON and do not
+  need `stream`. Responses are not streamed.
 
 ## Responses
 
@@ -185,14 +215,27 @@ Stargate forwards upstream status, body, and allowed headers, then adds:
 
 Treat them as internal unless the public API chooses to expose them.
 
+Every error that Stargate or Pylon generates carries
+`x-stargate-error-code`. A non-2xx response without it came from the model
+server and is relayed unchanged, including after Stargate exhausts its
+retries.
+
 Common errors:
 
-| Status | Meaning | Gateway behavior |
-| --- | --- | --- |
-| `400` | Missing/invalid contract input. | Do not retry unchanged. |
-| `404` + `no_eligible_candidates` | Unknown or unregistered local target. | Retry only when a recent discovery response may have raced a local route change. |
-| `413` | Replay body too large. | Do not retry unchanged. |
-| `502/503/504` | Transport, upstream, retry, or active-backend failure. | Treat as serving failure. |
+| Status | `x-stargate-error-code` | Meaning | Gateway behavior |
+| --- | --- | --- | --- |
+| `400` | `invalid_request` | Missing/invalid contract input, or a body Pylon rejects. | Do not retry unchanged. |
+| `400` | routing expression class | Invalid `x-routing-method`. | Do not retry unchanged. |
+| `404` | `no_eligible_candidates` | Unknown or unregistered local target. | Retry only when a recent discovery response may have raced a local route change. |
+| `413` | `request_too_large` | Replay body too large. | Do not retry unchanged. |
+| `500` | `internal_error` | Stargate could not build the response. | Treat as serving failure. |
+| `502` | `upstream_unreachable` | Tunnel or transport failure. | Treat as serving failure. |
+| `503` | `no_available_backend` | No backend could take the request. | Treat as serving failure. |
+| `503` | `no_ready_backends` | Known target with no ready backend: inactive, recently deregistered, or every backend failed this request. Carries `Retry-After`. | Retryable. Relay `Retry-After`. |
+| `503` | `overloaded_error` | Capacity or admission rejection. | Treat as serving failure. |
+| `503` | `local_connect_failure` | Pylon could not connect to its model server. | Treat as serving failure. |
+| `503` | `model_generation_unavailable` | Pylon has not admitted the model generation. | Treat as serving failure. |
+| `504` | `upstream_timeout` | The request was sent, but Pylon sent no response headers before `--quic-request-timeout-ms`. A timeout while opening the tunnel stream returns `502`. | Treat as serving failure. |
 
 Stargate strips pylon retry metadata before returning downstream:
 `x-stargate-retryable`, `x-stargate-retry-reason`,
@@ -207,17 +250,44 @@ By default it does so only when its local queue estimate exceeds Stargate's by
 at least 10 s and at least 4 times (`--pylon-queue-mismatch-min-delta-ms`,
 `--pylon-queue-mismatch-tolerance-factor`). Stargate's estimate lags behind
 Pylon's under load, so smaller differences are expected.
-The local upstream may mark `429` or `503` retryable for pylon with
-`x-stargate-upstream-retryable: true`; pylon converts that to Stargate retry
-metadata and does not forward the upstream header downstream.
+
+Pylon marks a model server error retryable from the response head, before any
+output reaches Stargate. By default it marks `529` and `503`
+(`--pylon-retryable-upstream-status-codes`). In `dynamo` backend mode it also
+marks a `404` with `content-length: 0`, which a Dynamo frontend answers after
+the model leaves its registry. By default, other model server errors, such as
+`429` and `500`, reach the client unchanged.
+
+Stargate retries a marked response on a cluster that this request has not
+tried, up to `--proxy-max-request-retries` (default 2). When no untried
+cluster is left or the retries run out, the client gets the last model server
+response. If every answer that the request got was a `529`, the client gets
+`503` with `x-stargate-error-code: overloaded_error` instead. The LLM API
+gateway returns that response as `529`.
 
 Queued requests can wait a long time before their first output. Stargate waits
 up to `--quic-request-timeout-ms` (default 300000) for response headers from
-Pylon. After the engine returns headers, Pylon waits up to
-`--pylon-first-output-timeout-ms` (default 300000) for the first streamed output
-and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs. The two
-waits run one after the other, so a single attempt can wait for their sum before
-its first output, and each retry can wait that long again.
+Pylon. When that wait ends, Stargate returns `504` and drops the tunnel stream.
+Pylon then cancels the engine request, as it does when the caller disconnects.
+This works over raw QUIC tunnels, direct or through `stargate-k8s-router`, and
+over direct WebTransport tunnels. After the engine returns headers, Pylon waits
+up to `--pylon-first-output-timeout-ms` (default 300000) for the first streamed
+output and `--pylon-output-chunk-timeout-ms` (default 30000) between outputs.
+The two waits run one after the other, so a single attempt can wait for their
+sum before its first output, and each retry can wait that long again.
+
+When a reverse-tunnel Pylon gets SIGTERM, it closes its registrations, accepts
+new tunnel streams for up to 2 s more, waits for in-flight requests, and keeps a raw
+QUIC tunnel open up to 1 s after its last request.
+`--pylon-shutdown-drain-timeout-ms` (default 90000) bounds all of these,
+counted from the signal. Pylon then needs up to 5 s more to stop, so set the
+timeout at least 5 s below the pod's termination grace period. With the
+default, the grace period must be at least 95 s, which is longer than the
+Kubernetes default of 30 s. For LLM container functions, NVCA sets the
+timeout from its inference stop pause. To check the timeout, read the
+`pylon drain finished` line that Pylon logs when the drain ends. An `outcome`
+of `timed_out` with `requests_cut_off` above 0 means requests were still
+running when the timeout expired, so the timeout is too short.
 
 Gateway rules:
 
@@ -241,3 +311,5 @@ Gateway rules:
 6. Enforce streaming body rules for chat and Responses.
 7. Treat `ListModels` as a short-lived hint.
 8. Keep backend response headers internal unless intentionally exposed.
+9. Strip inbound `x-stargate-last-cluster-id`; set it only from the gateway
+   store.

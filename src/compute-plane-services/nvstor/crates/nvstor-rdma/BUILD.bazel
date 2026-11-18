@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+load("@nvstor_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//src/compute-plane-services/nvstor:__subpackages__"])
+
+# build.rs links libibverbs (rdma-core) for the target. It comes from pinned
+# Ubuntu packages for the target architecture
+# (//src/compute-plane-services/nvstor/bazel:rdma_core.bzl), handed to build.rs
+# as RDMA_CORE_PREFIX, so the build needs no rdma-core on the host and amd64
+# and arm64 build in one invocation. The rdma-cm feature (src/cm.c, librdmacm)
+# is not built here: nvstor-peer does not use it.
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "RDMA_CORE_PREFIX": "$(execpath //src/compute-plane-services/nvstor/bazel:rdma_core_dev_prefix)",
+    },
+    data = ["//src/compute-plane-services/nvstor/bazel:rdma_core_dev_prefix"],
+    edition = "2021",
+    deps = all_crate_deps(build = True),
+)
+
+rust_library(
+    name = "nvstor-rdma",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    crate_name = "nvstor_rdma",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        ":build_script",
+        "//src/compute-plane-services/nvstor/crates/nvstor-core",
+    ] + all_crate_deps(normal = True),
+)
+
+# Tests that need an ACTIVE RDMA device are #[ignore]d and run by hand on RDMA
+# hardware (cargo test -p nvstor-rdma -- --ignored).
+# The test binaries load libibverbs.so.1 at start; the build host or CI image
+# need not have rdma-core, so the pinned runtime libraries are put on
+# LD_LIBRARY_PATH.
+_RDMA_CORE_LIBDIR = "//src/compute-plane-services/nvstor/bazel:rdma_core_runtime_libdir"
+
+rust_test(
+    name = "nvstor-rdma_test",
+    size = "medium",
+    aliases = aliases(normal_dev = True),
+    crate = ":nvstor-rdma",
+    data = [_RDMA_CORE_LIBDIR],
+    env = {"LD_LIBRARY_PATH": "$(rootpath %s)" % _RDMA_CORE_LIBDIR},
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)

@@ -26,7 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/golden"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 )
 
 func TestInputAudioContentRoundTrip(t *testing.T) {
@@ -40,9 +40,13 @@ func TestInputAudioContentRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, body, string(encoded))
 
+	// Parts missing data or format stay raw for the backend to validate.
 	for _, member := range []string{"null", `{}`, `{"data":"T2dnUw=="}`, `{"format":"ogg"}`} {
+		part := `{"type":"input_audio","input_audio":` + member + `}`
 		var invalid InputContent
-		require.Error(t, json.Unmarshal([]byte(`{"type":"input_audio","input_audio":`+member+`}`), &invalid))
+		require.NoError(t, json.Unmarshal([]byte(part), &invalid))
+		require.Equal(t, ContentTypeInputAudio, invalid.Type)
+		require.JSONEq(t, part, string(invalid.Raw))
 	}
 }
 

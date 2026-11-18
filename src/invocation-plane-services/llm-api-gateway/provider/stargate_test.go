@@ -31,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	echo "github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -39,12 +40,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/servicetier"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 func TestStargateProviderMetricsIncludeFunctionID(t *testing.T) {
@@ -241,7 +241,8 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 		require.Equal(t, stargateChatCompletionsPath, r.URL.Path)
 		require.Equal(t, contentTypeJSON, r.Header.Get(headerContentType))
 		require.Equal(t, contentTypeSSE, r.Header.Get(headerAccept))
-		require.Equal(t, "Bearer secret-token", r.Header.Get(headerAuthorization))
+		// The caller's NVCF key authorizes the gateway, never the model server.
+		require.Empty(t, r.Header.Values(headerAuthorization))
 		require.Equal(t, "req-123", r.Header.Get(headerRequestID))
 		require.Equal(t, "us-west1", r.Header.Get(headerTargetRegion))
 		require.Equal(t, "us-west1", r.Header.Get(headerLegacyTargetRegion))
@@ -278,7 +279,7 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 				Object:      models.ObjectChatCompletionChunk,
 				CreatedAt:   123,
 				Model:       "upstream-model",
-				ServiceTier: servicetier.Auto,
+				ServiceTier: "auto",
 				Choices: []models.ChatCompletionChunkChoice{
 					{
 						Index: 0,
@@ -294,7 +295,7 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 				Object:      models.ObjectChatCompletionChunk,
 				CreatedAt:   123,
 				Model:       "upstream-model",
-				ServiceTier: servicetier.Auto,
+				ServiceTier: "auto",
 				Choices: []models.ChatCompletionChunkChoice{
 					{
 						Index: 0,
@@ -534,7 +535,7 @@ func TestStargateProviderCompleteAggregatesMultipleChoicesAndReasoning(t *testin
 					CreatedAt:         123,
 					Model:             "choice-model",
 					SystemFingerprint: ptr.To(fingerprint),
-					ServiceTier:       servicetier.Auto,
+					ServiceTier:       "auto",
 					Choices: []models.ChatCompletionChunkChoice{
 						{
 							Index: 1,
@@ -585,7 +586,7 @@ func TestStargateProviderCompleteAggregatesMultipleChoicesAndReasoning(t *testin
 	require.Equal(t, int64(123), response.CreatedAt)
 	require.Equal(t, "choice-model", response.Model)
 	require.Equal(t, fingerprint, ptr.Deref(response.SystemFingerprint))
-	require.Equal(t, servicetier.Auto, response.ServiceTier)
+	require.Equal(t, "auto", response.ServiceTier)
 	require.Len(t, response.Choices, 2)
 	require.Equal(t, uint32(0), response.Choices[0].Index)
 	require.Equal(t, models.ChatCompletionRoleAssistant, response.Choices[0].Message.Role)
@@ -643,6 +644,22 @@ func TestStargateProviderCompletePropagatesStreamingHTTPError(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, response)
 	require.Contains(t, err.Error(), "stream denied")
+}
+
+func TestCheckHTTPErrorKeepsStargateErrorCodeForLogs(t *testing.T) {
+	t.Parallel()
+
+	err := checkHTTPError(&http.Response{
+		StatusCode: http.StatusNotFound,
+		Header:     http.Header{headerStargateErrorCode: []string{"no_eligible_candidates"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":"no eligible candidates","code":"no_eligible_candidates"}`)),
+	})
+
+	var httpErr *echo.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.StatusNotFound, httpErr.Code)
+	require.Equal(t, "no eligible candidates", httpErr.Message)
+	require.EqualError(t, httpErr.Internal, "stargate error code no_eligible_candidates")
 }
 
 func TestStargateProviderCompletePropagatesMalformedStreamChunk(t *testing.T) {
@@ -764,6 +781,72 @@ func TestStargateProviderReadStreamDoesNotBlockOnFullEventChannelAfterCancellati
 	}
 }
 
+// A client that goes away while an event is still buffered must not be
+// recorded as an upstream failure.
+func TestStargateProviderReadStreamReportsCancellationBeforeTrailingData(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	events := make(chan StreamEvent, 1)
+	// The first line of a multi-line event, cut off when the client went away.
+	body := io.NopCloser(strings.NewReader(`data: {"id":`))
+	(&StargateProvider{}).readStream(ctx, cancel, body, events)
+
+	event, ok := <-events
+	require.True(t, ok, "the stream closed without reporting the cancellation")
+	require.ErrorIs(t, event.Err, context.Canceled)
+	require.NotErrorIs(t, event.Err, ErrStreamIncomplete)
+}
+
+// A missed request deadline must reach a reader that is behind, or the stream
+// ends like a finished one ([DONE] or a partial 200).
+func TestStargateProviderReadStreamDeliversDeadlineToSlowReader(t *testing.T) {
+	t.Parallel()
+
+	chunk := sseChatBody(t, models.ChatCompletionChunk{
+		ID:      "chatcmpl-deadline",
+		Object:  models.ObjectChatCompletionChunk,
+		Choices: []models.ChatCompletionChunkChoice{{Delta: models.ChatCompletionChunkDelta{Content: ptr.To("hi")}}},
+	})
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "deadline while sending a chunk", body: chunk},
+		{name: "deadline at end of stream", body: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			t.Cleanup(cancel)
+			// A full buffer stands for a reader that has not caught up yet.
+			events := make(chan StreamEvent, 1)
+			events <- StreamEvent{Chunk: &models.ChatCompletionChunk{}}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				(&StargateProvider{}).readStream(ctx, cancel, io.NopCloser(strings.NewReader(tt.body)), events)
+			}()
+			// Read only after readStream has returned or is waiting to send, so the
+			// reader is behind when the deadline is reported.
+			select {
+			case <-done:
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			<-events
+			event, ok := <-events
+			require.True(t, ok, "the stream closed without reporting the deadline")
+			require.ErrorIs(t, event.Err, context.DeadlineExceeded)
+			require.ErrorIs(t, event.Err, ErrStreamIncomplete)
+		})
+	}
+}
+
 func TestStargateProviderCompletePropagatesTraceContext(t *testing.T) {
 	oldPropagator := otel.GetTextMapPropagator()
 	otel.SetTextMapPropagator(propagation.TraceContext{})
@@ -863,7 +946,7 @@ func TestStargateProviderStreamParsesSSE(t *testing.T) {
 				Object:      models.ObjectChatCompletionChunk,
 				CreatedAt:   123,
 				Model:       "stream-model",
-				ServiceTier: servicetier.Auto,
+				ServiceTier: "auto",
 				Choices: []models.ChatCompletionChunkChoice{
 					{
 						Index: 0,
@@ -879,7 +962,7 @@ func TestStargateProviderStreamParsesSSE(t *testing.T) {
 				Object:      models.ObjectChatCompletionChunk,
 				CreatedAt:   123,
 				Model:       "stream-model",
-				ServiceTier: servicetier.Auto,
+				ServiceTier: "auto",
 				Choices: []models.ChatCompletionChunkChoice{
 					{
 						Index: 0,
@@ -1069,72 +1152,72 @@ func TestStargateProviderNewOutboundRequestOmitsFieldsTheClientDidNotSend(t *tes
 			name:       "unary chat",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":50}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "max_tokens", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "max_tokens", "stream"},
 		},
 		{
 			name:       "unary chat forced to stream upstream",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":50}`,
 			stream:     true,
-			wantFields: []string{"messages", "model", "max_tokens", "service_tier", "stream", "stream_options"},
+			wantFields: []string{"messages", "model", "max_tokens", "stream", "stream_options"},
 		},
 		{
 			name:       "streaming chat",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}`,
 			stream:     true,
-			wantFields: []string{"messages", "model", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "stream"},
 		},
 		{
 			name:       "explicit reasoning fields",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"include_reasoning":false,"reasoning_format":"parsed","prompt_cache_key":"k"}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "include_reasoning", "reasoning_format", "prompt_cache_key", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "include_reasoning", "reasoning_format", "prompt_cache_key", "stream"},
 		},
 		{
 			name:       "explicit null fields",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":null,"stop":null}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "stream"},
 		},
 		{
 			name:       "explicit empty stop list",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"stop":[]}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "stop", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "stop", "stream"},
 			wantValues: map[string]string{"stop": `[]`},
 		},
 		{
 			name:       "stop string",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"stop":"END"}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "stop", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "stop", "stream"},
 			wantValues: map[string]string{"stop": `["END"]`},
 		},
 		{
 			name:       "explicit zero and false values",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0,"seed":0,"parallel_tool_calls":false,"logit_bias":{}}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "temperature", "seed", "parallel_tool_calls", "logit_bias", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "temperature", "seed", "parallel_tool_calls", "logit_bias", "stream"},
 			wantValues: map[string]string{"temperature": `0`, "seed": `0`, "parallel_tool_calls": `false`, "logit_bias": `{}`},
 		},
 		{
 			name:       "json schema without optional members",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"s"}}}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "response_format", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "response_format", "stream"},
 			wantValues: map[string]string{"response_format": `{"type":"json_schema","json_schema":{"name":"s"}}`},
 		},
 		{
 			name:       "json schema with explicit strict false and empty schema",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"s","schema":{},"strict":false}}}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "response_format", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "response_format", "stream"},
 			wantValues: map[string]string{"response_format": `{"type":"json_schema","json_schema":{"name":"s","schema":{},"strict":false}}`},
 		},
 		{
 			name:       "tool without optional members",
 			body:       `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}`,
 			stream:     false,
-			wantFields: []string{"messages", "model", "tools", "service_tier", "stream"},
+			wantFields: []string{"messages", "model", "tools", "stream"},
 		},
 	}
 	for _, tt := range tests {
@@ -1341,6 +1424,42 @@ func TestStargateProviderProxyOmitsPriorityWhenUnset(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.StatusCode)
 }
 
+// Stargate checks its size limit against the declared length, so a known body
+// length must reach it as Content-Length, not chunked.
+func TestStargateProviderProxy_ContentLength_SendsFixedLengthBody(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"proxy-model","input":"hello"}`
+	var gotContentLength int64
+	var gotTransferEncoding []string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentLength = r.ContentLength
+		gotTransferEncoding = r.TransferEncoding
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		w.Header().Set(headerContentType, contentTypeJSON)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+
+	provider, err := NewStargateProvider(config.StargateConfig{URL: server.URL})
+	require.NoError(t, err)
+
+	response, err := provider.Proxy(context.Background(), &requestctx.RequestContext{RequestID: "req-proxy"}, &ProxyRequest{
+		Method:        http.MethodPost,
+		Path:          "/v1/responses",
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	})
+	require.NoError(t, err)
+	defer response.Body.Close()
+
+	require.Empty(t, gotTransferEncoding)
+	require.Equal(t, int64(len(body)), gotContentLength)
+	require.Equal(t, body, gotBody)
+}
+
 func sseChatBody(t *testing.T, chunks ...models.ChatCompletionChunk) string {
 	t.Helper()
 
@@ -1377,4 +1496,97 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.URL = &url.URL{}
 	}
 	return f(req)
+}
+
+func TestStargateProxyCredentialsStopBeforeWorkerOnEveryRoute(t *testing.T) {
+	// The last path stands for any route added later: the rule has no route list.
+	for _, path := range []string{
+		"/v1/responses", "/v1/embeddings", "/v1/messages", "/v1/decisions", "/v1/systemone", "/v1/future-route",
+	} {
+		t.Run(path, func(t *testing.T) {
+			p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+			require.NoError(t, err)
+			var got http.Header
+			p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				got = r.Header.Clone()
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			})}
+			resp, err := p.Proxy(context.Background(),
+				&requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-route"},
+				&ProxyRequest{Method: "POST", Path: path, Header: http.Header{
+					"Authorization": {"Bearer caller-secret"}, "X-Api-Key": {"secret"},
+					"Proxy-Authorization": {"secret"}, "Cookie": {"session=secret"},
+					"X-Vendor": {"kept"},
+				}, Body: io.NopCloser(strings.NewReader(`{}`))})
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			for _, name := range []string{"Authorization", "X-Api-Key", "Proxy-Authorization", "Cookie"} {
+				require.Empty(t, got.Values(name), name)
+			}
+			require.Equal(t, "kept", got.Get("X-Vendor"))
+			require.Equal(t, "fn-route", got.Get(headerRoutingKey))
+		})
+	}
+}
+
+func TestStargateDecisionRouteControlHeaders(t *testing.T) {
+	for _, path := range []string{"/v1/decisions", "/v1/systemone"} {
+		for _, tc := range []struct {
+			name       string
+			estimate   int
+			wantTokens string
+		}{
+			{"positive estimate is sent", 42, "42"},
+			{"zero estimate is sent as one", 0, "1"},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+				require.NoError(t, err)
+				var got http.Header
+				p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					got = r.Header.Clone()
+					return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+				})}
+				resp, err := p.Proxy(context.Background(),
+					&requestctx.RequestContext{RoutingKey: "fn-decisions"},
+					&ProxyRequest{Method: "POST", Path: path, Header: http.Header{
+						"X-Input-Tokens":       {"999999"},
+						"X-Token-Estimate":     {"999999"},
+						"X-Max-Wait-Ms":        {"abc"},
+						"X-Request-Slo-Ms":     {"abc"},
+						"X-Cache-Affinity-Key": {"client-key"},
+						"Accept-Encoding":      {"gzip, br"},
+						"X-Vendor":             {"kept"},
+					}, Body: io.NopCloser(strings.NewReader(`{}`)), InputTokens: tc.estimate, TokenEstimate: tc.estimate})
+				require.NoError(t, err)
+				defer resp.Body.Close()
+
+				require.Equal(t, []string{tc.wantTokens}, got.Values(headerInputTokens))
+				require.Equal(t, []string{tc.wantTokens}, got.Values(headerTokenEstimate))
+				for _, name := range []string{"X-Max-Wait-Ms", "X-Request-Slo-Ms", headerCacheAffinityKey} {
+					require.Empty(t, got.Values(name), name)
+				}
+				// Identity keeps the response readable for the usage observer.
+				require.Equal(t, []string{"identity"}, got.Values("Accept-Encoding"))
+				require.Equal(t, "kept", got.Get("X-Vendor"))
+			})
+		}
+	}
+}
+
+func TestStargateNonDecisionRouteKeepsZeroEstimateUnset(t *testing.T) {
+	p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
+	require.NoError(t, err)
+	var got http.Header
+	p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r.Header.Clone()
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+	})}
+	resp, err := p.Proxy(context.Background(), &requestctx.RequestContext{RoutingKey: "fn"},
+		&ProxyRequest{Method: "POST", Path: "/v1/embeddings", Header: http.Header{"Accept-Encoding": {"gzip"}}, Body: io.NopCloser(strings.NewReader(`{}`))})
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Empty(t, got.Values(headerInputTokens))
+	require.Equal(t, "gzip", got.Get("Accept-Encoding"))
 }

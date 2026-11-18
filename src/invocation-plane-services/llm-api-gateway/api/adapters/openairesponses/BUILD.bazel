@@ -26,11 +26,12 @@ go_library(
         "tools.go",
         "types.go",
     ],
-    importpath = "github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/api/adapters/openairesponses",
+    importpath = "github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/api/adapters/openairesponses",
     visibility = ["//visibility:public"],
     deps = [
         "//src/invocation-plane-services/llm-api-gateway/internal/ptr",
         "//src/invocation-plane-services/llm-api-gateway/mcp",
+        "//src/invocation-plane-services/llm-api-gateway/models",
         "@com_jetify_go_sse//:sse",
     ],
 )

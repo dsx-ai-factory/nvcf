@@ -28,8 +28,8 @@ import (
 	"text/template"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
-	otelconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
+	otelconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/otelconfig/config"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -37,6 +37,9 @@ import (
 
 const (
 	OTelContainerEnv = "BYOO_OTEL_COLLECTOR_CONTAINER"
+	// OTelExporterEndpointEnv is where the collector exports its own traces. It is
+	// set on the collector container only when the control plane sends a value.
+	OTelExporterEndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	// Envs injected into workload containers.
 	OTelExporterLogsEndpointEnv    = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 	OTelExporterMetricsEndpointEnv = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
@@ -55,6 +58,7 @@ const (
 	DefaultFluentbitImage = "fluent/fluent-bit:3.2"
 
 	protocolGRPC                = "grpc"
+	protocolHTTPProtobuf        = "http/protobuf"
 	otelExporterPortGRPC        = 14357
 	otelExporterPortHTTP        = 14358
 	otelExporterPortHealthCheck = 13133
@@ -99,7 +103,7 @@ func MakeOTelEnvSet(
 			endpoint = fmt.Sprintf("%s:%d%s", svcURL, otelExporterPortHTTP, otelExporterHTTPPathLogs)
 		}
 		envs = append(envs, []corev1.EnvVar{
-			{Name: OTelExporterLogsProtocolEnv, Value: strings.ToLower(ls.Logs.Protocol)},
+			{Name: OTelExporterLogsProtocolEnv, Value: otlpExporterProtocol(ls.Logs.Protocol)},
 			{Name: OTelExporterLogsEndpointEnv, Value: endpoint},
 		}...)
 	}
@@ -111,7 +115,7 @@ func MakeOTelEnvSet(
 			endpoint = fmt.Sprintf("%s:%d%s", svcURL, otelExporterPortHTTP, otelExporterHTTPPathMetrics)
 		}
 		envs = append(envs, []corev1.EnvVar{
-			{Name: OTelExporterMetricsProtocolEnv, Value: strings.ToLower(ls.Metrics.Protocol)},
+			{Name: OTelExporterMetricsProtocolEnv, Value: otlpExporterProtocol(ls.Metrics.Protocol)},
 			{Name: OTelExporterMetricsEndpointEnv, Value: endpoint},
 		}...)
 	}
@@ -123,7 +127,7 @@ func MakeOTelEnvSet(
 			endpoint = fmt.Sprintf("%s:%d%s", svcURL, otelExporterPortHTTP, otelExporterHTTPPathTraces)
 		}
 		envs = append(envs, []corev1.EnvVar{
-			{Name: OTelExporterTracesProtocolEnv, Value: strings.ToLower(ls.Traces.Protocol)},
+			{Name: OTelExporterTracesProtocolEnv, Value: otlpExporterProtocol(ls.Traces.Protocol)},
 			{Name: OTelExporterTracesEndpointEnv, Value: endpoint},
 		}...)
 	}
@@ -131,6 +135,16 @@ func MakeOTelEnvSet(
 		{Name: OTelHealthCheckEndpointEnv, Value: fmt.Sprintf("%s:%d%s", svcURL, otelExporterPortHealthCheck, otelHealthCheckPath)},
 	}...)
 	return envs
+}
+
+// otlpExporterProtocol returns the OTEL_EXPORTER_OTLP_*_PROTOCOL value for a telemetry protocol.
+// The OpenTelemetry spec allows grpc, http/protobuf, and http/json, so HTTP telemetry maps to
+// http/protobuf, matching the collector's OTLP/HTTP receiver.
+func otlpExporterProtocol(protocol string) string {
+	if strings.ToLower(protocol) == protocolGRPC {
+		return protocolGRPC
+	}
+	return protocolHTTPProtobuf
 }
 
 const (
@@ -156,15 +170,23 @@ const (
 	fluentbitVarLogPath       = "/var/log"
 	fluentbitDBVolumeName     = "fluentbit-db"
 	fluentbitDBPath           = "/fluent-bit/db"
-	fluentbitParsersConfigKey = "parsers.conf"
+	fluentbitContainerLogDir  = fluentbitVarLogPath + "/containers"
+
+	// smbServerPodName is the shared storage SMB server pod that NVCA runs in a
+	// Helm workload namespace. It matches SMBServerPodName in NVCA's pkg/storage.
+	smbServerPodName = "nvcf-smb-server"
+
+	// modelCacheInitContainerName is the init container that NVCA's Helm storage
+	// webhook adds to workload pods to download the model cache when no shared
+	// cache backend is available. It matches EphemeralModelCacheInitContainerName
+	// in NVCA's pkg/storage. The model cache writer Job runs in NVCA's own
+	// namespace, outside the workload namespace that Fluent Bit reads.
+	modelCacheInitContainerName = "model-cache-init"
 )
 
 var (
 	//go:embed manifests/fluent-bit.conf.tmpl
 	fluentbitConfigTemplate string
-
-	//go:embed manifests/parsers.conf
-	fluentbitParsersConfig string
 
 	// fluentbitConfigTemplateParsed is the parsed template, initialized at package load time.
 	// If the template is invalid, the program will fail to start.
@@ -368,10 +390,6 @@ func NewOTelContainer(
 				Name:  "OTEL_TRACING_ACCESS_TOKEN",
 				Value: allEnvSet["TRACING_ACCESS_TOKEN"],
 			},
-			{
-				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
-				Value: allEnvSet["OTEL_EXPORTER_OTLP_ENDPOINT"],
-			},
 		}...)
 	} else {
 		otelEnvs = append(getCommonOTelEnvs(allEnvSet, oTelPodIPBindAddressOverride), []corev1.EnvVar{
@@ -383,11 +401,10 @@ func NewOTelContainer(
 				Name:  "OTEL_TRACING_ACCESS_TOKEN",
 				Value: allEnvSet["TRACING_ACCESS_TOKEN"],
 			},
-			{
-				Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
-				Value: allEnvSet["OTEL_EXPORTER_OTLP_ENDPOINT"],
-			},
 		}...)
+	}
+	if endpoint := allEnvSet[OTelExporterEndpointEnv]; endpoint != "" {
+		otelEnvs = append(otelEnvs, corev1.EnvVar{Name: OTelExporterEndpointEnv, Value: endpoint})
 	}
 	otelEnvs = append(otelEnvs, addtlOtelEnvs...)
 
@@ -555,25 +572,52 @@ func GetDefaultContainerResourcesFluentbit() corev1.ResourceRequirements {
 	}
 }
 
+// containerLogGlob returns a glob for kubelet container log files in the
+// namespace of the pod that Fluent Bit runs in. kubelet names each file
+// /var/log/containers/<pod>_<namespace>_<container>-<container-id>.log. Pod,
+// namespace, and container names cannot contain an underscore, so each field
+// matches exactly. An empty pod or container matches any.
+func containerLogGlob(pod, container string) string {
+	if pod == "" {
+		pod = "*"
+	}
+	file := "*"
+	if container != "" {
+		file = container + "-*"
+	}
+	return fmt.Sprintf("%s/%s_${POD_NAMESPACE}_%s.log", fluentbitContainerLogDir, pod, file)
+}
+
 // NewFluentbitConfigMap creates a ConfigMap with Fluent Bit configuration for collecting container logs.
 func NewFluentbitConfigMap(name string, podName string, workloadType string) *corev1.ConfigMap {
 	// Fluent Bit's OpenTelemetry output plugin uses HTTP protocol, so we must use port 14358 (HTTP)
 	// Use specific pod name in path to minimize file watches and prevent "too many open files" error
 
 	var logPath string
-	var excludePath string
+	excludePaths := []string{"*.gz", "*.zip", "*.bz2"}
 
 	if workloadType == WorkloadTypeHelm {
 		// For Helm chart deployments, Fluent Bit runs in utils pod but needs to collect logs from
 		// all application pods in the namespace (names are unpredictable).
-		// Exclude infrastructure pods: utils, SMB server, OTEL collector, and Fluent Bit itself.
-		logPath = "/var/log/containers/*_${POD_NAMESPACE}_*.log"
-		excludePath = "*.gz,*.zip,*.bz2,*_utils_*,*_nvcf-smb-server_*,*_byoo-otel-collector_*,*_fluentbit-logs_*"
+		// Fluent Bit matches Exclude_Path against the full file path, so each pattern names the
+		// log directory and the pod's namespace.
+		logPath = containerLogGlob("", "")
+		excludePaths = append(excludePaths,
+			// Every container of the pod Fluent Bit runs in: utils, ESS, init, the OTel
+			// collector, and Fluent Bit itself.
+			containerLogGlob(podName, ""),
+			containerLogGlob(smbServerPodName, ""),
+			// The sidecars by container name, in case they run in another pod.
+			containerLogGlob("", ByooOTelCollectorPodNameBase),
+			containerLogGlob("", FluentbitContainerName),
+			// The model cache download that NVCA injects into workload pods.
+			containerLogGlob("", modelCacheInitContainerName),
+		)
 	} else {
 		// For container deployments, use specific pod name and container name patterns
-		logPath = fmt.Sprintf("/var/log/containers/%s_${POD_NAMESPACE}_inference-*.log,/var/log/containers/%s_${POD_NAMESPACE}_task-*.log", podName, podName)
-		excludePath = "*.gz,*.zip,*.bz2"
+		logPath = containerLogGlob(podName, "inference") + "," + containerLogGlob(podName, "task")
 	}
+	excludePath := strings.Join(excludePaths, ",")
 
 	var fluentbitConfigBuf bytes.Buffer
 	if err := fluentbitConfigTemplateParsed.Execute(&fluentbitConfigBuf, map[string]interface{}{
@@ -589,8 +633,7 @@ func NewFluentbitConfigMap(name string, podName string, workloadType string) *co
 	cm := &corev1.ConfigMap{}
 	cm.Name = name
 	cm.Data = map[string]string{
-		fluentbitConfigCMKey:      fluentbitConfig,
-		fluentbitParsersConfigKey: fluentbitParsersConfig,
+		fluentbitConfigCMKey: fluentbitConfig,
 	}
 	return cm
 }

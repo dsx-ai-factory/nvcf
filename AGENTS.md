@@ -17,8 +17,10 @@ Useful pointers:
 - `BAZEL.md` for the contributor-facing Bazel build path
 - `docs/AGENTS.md` for in-repo user and developer documentation
 - `tools/AGENTS.md` for repo tooling
-- `src/libraries/rust/stargate/AGENTS.md` for Stargate deployment invariants,
-  including router transport assumptions to use during implementation and review
+- `tests/bdd/AGENTS.md` for behavior-driven development (BDD) scenarios and
+  suite rules
+- `src/libraries/rust/stargate/AGENTS.md` for mandatory Stargate mock and performance
+  validation, including related chart, deployment, benchmark, and CI changes
 - `imports.yaml` for subtree ownership and commit pins
 - `.cursor/skills/documentation-style/SKILL.md` for docs style
 - `.cursor/skills/` for root dev-skill symlink fanout
@@ -225,29 +227,27 @@ public snapshot; still follow OSS Snapshot Hygiene manually before finishing.
 | `nvcf-self-managed-installation` | `ai-tooling/user/skills/` | Install and deploy the self-managed NVCF stack |
 | `nvcf-self-managed-prerequisite` | `ai-tooling/user/skills/` | Install cluster-level prerequisites such as KAI Scheduler and SMB CSI driver |
 
-## GitLab CI for native subprojects
+## CI and release routing for native subprojects
 
-The umbrella parent pipeline (`.gitlab-ci.yml`) is not where native service
-build, test, helm-lint, or release validation jobs go. `.gitlab-ci.yml` and
-`tools/ci/generated-release-jobs.yml` are internal GitLab CI config not
-present in this public snapshot.
+Public validation and source release automation live in `.github/workflows/`.
+Read `RELEASE.md` and `docs/dev/github-release-process.md` for current component
+versioning and maintenance behavior. Read `docs/dev/umbrella-releases.md` for
+candidate assembly and product publication.
 
-| Job kind | Where to declare it |
-|---|---|
-| `<id>-bazel`, Go checks, custom `checks:` | `tools/ci/subproject-validations.yaml` (runs in `subproject-validations` child pipeline) |
-| Image push, semantic-release, helm publish | `release:` in same YAML, output in `tools/ci/generated-release-jobs.yml` |
-| License scan, bazel-smoke, docs, OSS snapshot | root `.gitlab-ci.yml` only |
-
-Before adding or moving any CI job for a path under `src/`, `deploy/helm/`, or
-`migrations/`, read this section in full.
-Do not add per-service jobs to root `.gitlab-ci.yml` and do not recreate
-`src/**/.gitlab-ci.yml`, `deploy/helm/**/.gitlab-ci.yml`, or
-`migrations/**/.gitlab-ci.yml` for native subprojects. Helm CI-only values
-belong in `tools/ci/helm-validate-values/`, not under chart `ci/` dirs.
+The former generated GitLab umbrella release jobs are retired for native
+public components. Do not recreate `src/**/.gitlab-ci.yml`,
+`deploy/helm/**/.gitlab-ci.yml` or `migrations/**/.gitlab-ci.yml` to add a lane.
+Keep private credentials, destinations and publication instructions outside
+this public source tree. Inspect the affected workflow and owning build
+configuration before adding validation.
 
 ## Commit Messages
 
-Use Conventional Commits v1.0.0. Include issue references in the footer when required by the change type. For GitHub PR work, use a public `NVIDIA/nvcf` issue reference.
+Use Conventional Commits v1.0.0. Include issue references in the footer when required by the change type. For GitHub PR work, use a public `dsx-ai-factory/nvcf` issue reference.
+
+Sign off every commit with `git commit -s` (Developer Certificate of Origin,
+see `CONTRIBUTING.md`). The DCO check rejects pull requests with unsigned
+commits, including commits made by agents.
 
 Format:
 
@@ -268,8 +268,8 @@ Use Conventional Commit format for Pull Request titles, as described in the
 Commit Messages section. Release automation depends on this format. Examples:
 `feat:`, `fix:`, `chore:`, `docs:`.
 
-For GitHub PRs, agents must create or link a public `NVIDIA/nvcf` issue in
-`## Issues` using `Closes #123`, `Fixes #123`, `Resolves NVIDIA/nvcf#123`, or
+For GitHub PRs, agents must create or link a public `dsx-ai-factory/nvcf` issue in
+`## Issues` using `Closes #123`, `Fixes #123`, `Resolves dsx-ai-factory/nvcf#123`, or
 `Relates to #123`. If context is private, create a generic public issue. Do not
 use `NO-REF`, Jira keys, private tracker or bug IDs, private URLs, title-only
 refs, other-repo issues, or invented issue numbers for agent-authored PRs.
@@ -350,6 +350,35 @@ whether `src/clis/nvcf-cli` needs a matching change, and list affected clients
 in the Pull Request "Related Pull Requests" section. If the CLI needs an
 update, file a follow-up issue.
 
+## LLM stack compatibility
+
+For independently deployed LLM stack components, maintain compatibility with
+stable releases published within the previous 90 days, measured from their
+UTC publication timestamps. Keep supporting older
+versions still deployed or needed for rollback. Retire a version only after
+its support window ends and deployment inventory confirms migration and the
+rollback window has closed. CI must exercise the oldest supported release.
+
+Preserve existing API, protobuf, transport, configuration, and telemetry
+contracts during rolling upgrades and rollback. Add fields and capabilities;
+do not remove, renumber, repurpose, or change the meaning of existing ones.
+New optional data must not become mandatory for an existing routing policy or
+default. Use an explicit opt-in or capability negotiation with a working
+legacy path. New public endpoints do not justify breaking internal protocols.
+
+Test old/new producer and consumer combinations, absent optional fields, and
+rollback before enabling a new default. Schema checks alone do not establish
+behavioral compatibility. Keep compatibility fixtures from released versions;
+do not regenerate them from the candidate to make a failing check pass.
+
+On the default branch, path-selected CI checks Stargate schemas against every
+supported Stargate release. All branches check against their target base.
+Behavioral tests use frozen released stats with current transports. Gateway
+server and client schema copies are checked against the target base only.
+Historical gateway releases, other components, historical binaries, relay
+combinations, and consumer downgrades need separate qualification. Extend the
+owning component's release matrix when changing one of those contracts.
+
 ## Tests
 
 Code changes must include tests. If a change does not include tests, explain why
@@ -357,6 +386,30 @@ in the Pull Request description (for example: pure documentation, CI-only
 change, or refactor with full existing coverage).
 
 Prefer the repo-native test runner (`make test`, `go test`, `cargo test`, etc.). Run tests before committing. Check coverage requirements in the subtree `AGENTS.md` or CI config.
+
+### BDD scenarios
+
+When changing self-managed installation, CLI workflows, or function/task
+lifecycle behavior, add or update the relevant Gherkin scenarios in
+`tests/bdd/features/`. Read `tests/bdd/AGENTS.md` and the step catalog in
+`tests/bdd/PLAN.md` first. Reuse existing steps to express operator actions
+and observable results.
+
+Run the non-live checks from the BDD module:
+
+```sh
+cd tests/bdd
+go test -short ./...
+golangci-lint run --config .golangci.yml ./...
+```
+
+Before pushing changes to behavior covered by BDD, run the relevant live
+suites. Use `tests/bdd/README.md` to select suites and prerequisites, and
+follow the local QA safety rules before running them. If a required run fails
+or is blocked, stop before pushing and report the failure or blocker and
+unvalidated behavior. Anchor live test names with `^...$` to exclude similarly
+named wiring tests. Report fake-runner wiring checks separately from live
+results; wiring checks do not validate a deployment.
 
 ### Version-pin assertions
 

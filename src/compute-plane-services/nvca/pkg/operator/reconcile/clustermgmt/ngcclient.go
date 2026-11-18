@@ -30,16 +30,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	cmnhttp "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/http"
-	cmnsecret "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/secret"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	cmnhttp "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/http"
+	cmnsecret "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/secret"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/ptr"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
-	nvcaoptypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	nvcaoptypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 )
 
 // Ensure NGCManagedClient implements Client
@@ -464,6 +464,19 @@ func withMiniServiceMapper() clusterMapper {
 			}
 			dest.NVCFBackend.Spec.ClusterConfig.MiniService.HelmReValServiceURL = src.MiniService.HelmReValServiceURL
 			dest.NVCFBackend.Spec.ClusterConfig.MiniService.HelmReValServiceHostHeaderOverride = src.MiniService.HelmReValServiceHostHeaderOverride
+		}
+		return nil
+	}
+}
+
+// withFNDServiceMapper maps only the service URL. Enabling the agent's own FnDS
+// publishing stays with the UseFunctionDeploymentStages feature flag.
+func withFNDServiceMapper() clusterMapper {
+	return func(_ context.Context, _ nvidiaiov1.EnvType, src *clusterDTO, dest *Cluster) error {
+		if src.FNDService != nil && src.FNDService.ServiceURL != "" {
+			dest.NVCFBackend.Spec.ClusterConfig.FNDService = &nvidiaiov1.FNDServiceConfig{
+				ServiceURL: src.FNDService.ServiceURL,
+			}
 		}
 		return nil
 	}

@@ -25,8 +25,8 @@ import (
 
 	echo "github.com/labstack/echo/v4"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
 )
 
 // newPriorityGuardTestServer wires the production route registration so these
@@ -43,7 +43,7 @@ func newPriorityGuardTestServer(authClient InvocationAuthClient) *echo.Echo {
 func TestLLMRoutesRejectClientSuppliedPriority(t *testing.T) {
 	t.Parallel()
 
-	paths := []string{"/v1/chat/completions", "/v1/responses", "/v1/embeddings"}
+	paths := []string{"/v1/chat/completions", "/v1/responses", "/v1/embeddings", "/v1/messages"}
 	values := []struct {
 		name     string
 		priority string

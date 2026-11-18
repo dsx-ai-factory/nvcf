@@ -28,7 +28,7 @@ pub(crate) use upstream::check_upstream_health;
 
 const DEFAULT_ACTIVE_CANARY_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_CANARY_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_CANARY_MAX_GENERATION_THRESHOLD: u32 = 237;
+const DEFAULT_CANARY_MAX_GENERATION_THRESHOLD: u32 = 16;
 const DEFAULT_CALIBRATION_REQUESTS: usize = 5;
 const DEFAULT_CALIBRATION_PROMPT_UNITS: usize = 4096;
 const DEFAULT_CALIBRATION_MAX_CONCURRENCY: usize = 4;
@@ -49,6 +49,10 @@ pub struct CalibrationConfig {
     pub calibration_prompt_units: usize,
     pub calibration_max_concurrency: usize,
     pub calibration_timeout: Duration,
+    /// Makes calibration best effort: a 429, 503, or 529 ends the ramp, input
+    /// counts come from response usage, and a model whose calibration fails
+    /// starts at this rate.
+    pub fallback_input_tps: Option<f64>,
 }
 
 impl Default for BringupConfig {
@@ -70,6 +74,7 @@ impl Default for CalibrationConfig {
             calibration_prompt_units: DEFAULT_CALIBRATION_PROMPT_UNITS,
             calibration_max_concurrency: DEFAULT_CALIBRATION_MAX_CONCURRENCY,
             calibration_timeout: DEFAULT_CALIBRATION_TIMEOUT,
+            fallback_input_tps: None,
         }
     }
 }
@@ -87,7 +92,7 @@ mod tests {
     use super::*;
     use super::{calibration::*, lifecycle::*, upstream::*};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
     use axum::Json;
     use axum::Router;
@@ -165,6 +170,7 @@ mod tests {
             crate::generated_request_id::GeneratedRequestKind::Calibration,
             &test_generation(),
             Some(&runtime_state),
+            false,
         )
         .await;
         let states = observations
@@ -562,6 +568,7 @@ mod tests {
                 concurrency: 2,
             },
             &test_runtime_state(),
+            None,
         )
         .await
         .expect("calibration batch should succeed");
@@ -770,12 +777,20 @@ mod tests {
                 concurrency: 3,
             },
             &test_runtime_state(),
+            None,
         )
         .await
         .expect("calibration batch should succeed");
 
         assert_eq!(outcome, CalibrationStepOutcome::Completed);
         assert_eq!(max_in_flight.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn calibration_prompts_are_unique_and_keep_the_requested_length() {
+        let prompt = calibration_prompt(CALIBRATION_PROMPT_UNITS_FLOOR);
+        assert_eq!(prompt.len(), CALIBRATION_PROMPT_UNITS_FLOOR);
+        assert_ne!(prompt, calibration_prompt(CALIBRATION_PROMPT_UNITS_FLOOR));
     }
 
     #[tokio::test]
@@ -805,6 +820,7 @@ mod tests {
                 concurrency: 1,
             },
             &runtime_state,
+            None,
         )
         .await
         .expect("calibration batch should succeed");
@@ -889,6 +905,219 @@ mod tests {
             .expect("a completed observed interval should retain the calibration frontier");
         tokio::time::resume();
         stats.shutdown().await;
+    }
+
+    /// Completes `completions` calibration requests, then answers `status`.
+    async fn spawn_overloading_server(completions: usize, status: u16) -> TestHttpServer {
+        let remaining = Arc::new(AtomicUsize::new(completions));
+        TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let remaining = remaining.clone();
+                async move {
+                    if remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                            value.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return Json(serde_json::json!({"usage": {"completion_tokens": 1}}))
+                            .into_response();
+                    }
+                    (
+                        StatusCode::from_u16(status).expect("test status is valid"),
+                        Json(serde_json::json!({
+                            "message": "Service temporarily overloaded",
+                            "type": "Overloaded",
+                            "code": status
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        ))
+        .await
+    }
+
+    /// Returns the calibration result and the input TPS it left in the stats.
+    async fn run_test_calibration(
+        base_url: &str,
+        fallback_input_tps: Option<f64>,
+    ) -> (Result<(), BringupError>, f64) {
+        let (runtime_state, stats) = test_stats_collector();
+        let generation = test_generation();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_calibration(
+                &reqwest::Client::new(),
+                base_url,
+                &generation,
+                &CalibrationConfig {
+                    calibration_requests: 1,
+                    calibration_max_concurrency: 1,
+                    fallback_input_tps,
+                    ..CalibrationConfig::default()
+                },
+                &stats.control(),
+                &runtime_state,
+            ),
+        )
+        .await
+        .expect("a busy reply should end the calibration");
+        let input_tps = stats
+            .control()
+            .flush_and_snapshot(&generation)
+            .await
+            .expect("stats collector should respond")
+            .expect("generation should remain live")
+            .last_mean_input_tps;
+        stats.shutdown().await;
+        (result, input_tps)
+    }
+
+    #[tokio::test]
+    async fn overload_ends_a_fallback_calibration() {
+        for (label, completions, status, is_measured) in [
+            ("529 after completed requests", 3, 529, true),
+            ("503 after completed requests", 3, 503, true),
+            ("429 after completed requests", 3, 429, true),
+            ("529 before any completed request", 0, 529, false),
+        ] {
+            let server = spawn_overloading_server(completions, status).await;
+
+            let (result, input_tps) = run_test_calibration(server.as_str(), Some(100.0)).await;
+
+            if is_measured {
+                result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                assert!(input_tps > 0.0, "{label}");
+            } else {
+                assert!(
+                    matches!(result, Err(BringupError::InsufficientCalibrationData)),
+                    "{label}: {result:?}"
+                );
+            }
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn overload_still_fails_a_calibration_without_a_fallback() {
+        let server = spawn_overloading_server(3, 529).await;
+
+        let (result, _) = run_test_calibration(server.as_str(), None).await;
+
+        assert!(matches!(result, Err(error) if error.is_overloaded()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn calibration_input_tokens_come_from_usage_only_with_a_fallback() {
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                Json(serde_json::json!({"usage": {"prompt_tokens": 7, "completion_tokens": 1}}))
+            }),
+        ))
+        .await;
+
+        for (input_tokens_from_usage, expected_input_tokens) in [
+            (false, CALIBRATION_PROMPT_UNITS_FLOOR as u64), // prompt characters
+            (true, 7),
+        ] {
+            let (runtime_state, observations) = PylonRuntimeState::observed(
+                InferenceServerStatus::Active,
+                &["test-model".to_string()],
+                32,
+                None,
+            );
+            send_calibration_batch(
+                &reqwest::Client::new(),
+                server.as_str(),
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: CALIBRATION_PROMPT_UNITS_FLOOR,
+                    request_count: 1,
+                    concurrency: 1,
+                },
+                &runtime_state,
+                input_tokens_from_usage.then_some(&AtomicBool::new(false)),
+            )
+            .await
+            .expect("calibration batch should succeed");
+
+            let completed = observations
+                .try_iter()
+                .last()
+                .expect("calibration request should be observed")
+                .into_observation();
+            assert_eq!(
+                completed.state,
+                crate::RequestObservationState::Complete,
+                "input_tokens_from_usage={input_tokens_from_usage}"
+            );
+            assert_eq!(
+                completed.input_tokens, expected_input_tokens,
+                "input_tokens_from_usage={input_tokens_from_usage}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn calibration_without_usage_prompt_tokens_logs_and_counts_characters() {
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { Json(serde_json::json!({"usage": {"completion_tokens": 1}})) }),
+        ))
+        .await;
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &["test-model".to_string()],
+            32,
+            None,
+        );
+        let subscriber = crate::test_support::RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        // Two steps of one ramp share the flag, so the line is logged once.
+        let prompt_tokens_missing = AtomicBool::new(false);
+        for _ in 0..2 {
+            send_calibration_batch(
+                &reqwest::Client::new(),
+                server.as_str(),
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: CALIBRATION_PROMPT_UNITS_FLOOR,
+                    request_count: 2,
+                    concurrency: 1,
+                },
+                &runtime_state,
+                Some(&prompt_tokens_missing),
+            )
+            .await
+            .expect("calibration batch should succeed");
+        }
+        drop(default_guard);
+
+        let completed = observations
+            .try_iter()
+            .last()
+            .expect("calibration request should be observed")
+            .into_observation();
+        assert_eq!(
+            completed.input_tokens,
+            CALIBRATION_PROMPT_UNITS_FLOOR as u64
+        );
+        let message = "calibration responses have no usage.prompt_tokens; counting prompt characters as input tokens";
+        assert_eq!(subscriber.event_count(message), 1);
+        assert_eq!(
+            crate::test_support::tracing_event_by_message(&subscriber.events(), message).level,
+            tracing::Level::WARN
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1078,79 +1307,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_canary_timeout_is_inconclusive_while_the_upstream_serves_requests() {
-        let canary_requests = Arc::new(AtomicUsize::new(0));
-        let base_url = spawn_test_server(TestServerState {
-            canary_requests: Some(canary_requests.clone()),
-            canary_hangs: true,
-            ..TestServerState::default()
-        })
-        .await;
-        let runtime_state = PylonRuntimeState::new(
-            InferenceServerStatus::Active,
-            &["test-model".into(), "busy-model".into()],
-        );
-        let stop = CancellationToken::new();
-        let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
-        let task = tokio::spawn(run_bringup_task(
-            test_task_config(
-                base_url.to_string(),
-                BringupConfig {
-                    active_canary_interval: Duration::from_millis(10),
-                    canary_timeout: Duration::from_millis(150),
-                    ..BringupConfig::default()
-                },
-            ),
-            runtime_state.clone(),
-            stop.clone(),
-        ));
+    async fn active_canary_busy_result_keeps_the_model_ready_while_the_upstream_serves_requests() {
+        for (label, state) in busy_canary_replies() {
+            let canary_requests = Arc::new(AtomicUsize::new(0));
+            let base_url = spawn_test_server(TestServerState {
+                canary_requests: Some(canary_requests.clone()),
+                ..state
+            })
+            .await;
+            let runtime_state = PylonRuntimeState::new(
+                InferenceServerStatus::Active,
+                &["test-model".into(), "busy-model".into()],
+            );
+            let stop = CancellationToken::new();
+            let progress =
+                spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
+            let task = tokio::spawn(run_bringup_task(
+                test_task_config(
+                    base_url.to_string(),
+                    BringupConfig {
+                        active_canary_interval: Duration::from_millis(10),
+                        canary_timeout: Duration::from_millis(150),
+                        ..BringupConfig::default()
+                    },
+                ),
+                runtime_state.clone(),
+                stop.clone(),
+            ));
 
-        // The second canary starts only after the first one timed out.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while canary_requests.load(Ordering::SeqCst) < 2 {
-                assert_eq!(
-                    runtime_state.model_bringup_ready("test-model"),
-                    Some(true),
-                    "model should stay ready while the upstream is serving requests"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the idle model should still be probed while another model is busy");
-        assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(true));
+            // The second canary starts only after the first one failed.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while canary_requests.load(Ordering::SeqCst) < 2 {
+                    assert_eq!(
+                        runtime_state.model_bringup_ready("test-model"),
+                        Some(true),
+                        "{label}: model should stay ready while the upstream is serving requests"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{label}: the idle model should still be probed while another model is busy")
+            });
+            assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(true));
 
-        stop.cancel();
-        task.await.unwrap();
-        progress.await.unwrap();
+            stop.cancel();
+            task.await.unwrap();
+            progress.await.unwrap();
+        }
     }
 
     #[tokio::test]
-    async fn active_canary_timeout_demotes_when_the_upstream_is_stalled() {
-        let base_url = spawn_test_server(TestServerState {
-            canary_hangs: true,
-            ..TestServerState::default()
-        })
-        .await;
-        let runtime_state = test_runtime_state();
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(run_bringup_task(
-            test_task_config(
-                base_url.to_string(),
-                BringupConfig {
-                    active_canary_interval: Duration::from_millis(10),
-                    canary_timeout: Duration::from_millis(30),
-                    ..BringupConfig::default()
+    async fn active_canary_demotes_when_the_upstream_is_stalled() {
+        for (label, state) in busy_canary_replies() {
+            let base_url = spawn_test_server(state).await;
+            let runtime_state = test_runtime_state();
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(run_bringup_task(
+                test_task_config(
+                    base_url.to_string(),
+                    BringupConfig {
+                        active_canary_interval: Duration::from_millis(10),
+                        canary_timeout: Duration::from_millis(30),
+                        ..BringupConfig::default()
+                    },
+                ),
+                runtime_state.clone(),
+                stop.clone(),
+            ));
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while runtime_state.model_bringup_ready("test-model") != Some(false) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}: a stalled canary should demote the model"));
+
+            stop.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    /// Canary replies from a busy upstream: a queued request and Dynamo's
+    /// overload rejection.
+    fn busy_canary_replies() -> [(&'static str, TestServerState); 2] {
+        [
+            (
+                "timeout",
+                TestServerState {
+                    canary_hangs: true,
+                    ..TestServerState::default()
                 },
             ),
-            runtime_state.clone(),
-            stop.clone(),
-        ));
-
-        wait_for_bringup_ready(&runtime_state, false).await;
-
-        stop.cancel();
-        task.await.unwrap();
+            (
+                "overload",
+                TestServerState {
+                    canary_status: Arc::new(AtomicU16::new(529)),
+                    ..TestServerState::default()
+                },
+            ),
+        ]
     }
 
     #[tokio::test]
@@ -1194,9 +1452,12 @@ mod tests {
             ..TestServerState::default()
         })
         .await;
-        let runtime_state = PylonRuntimeState::new(
+        let metrics = crate::PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, _observations) = PylonRuntimeState::observed(
             InferenceServerStatus::Active,
-            &["test-model".into(), "busy-model".into()],
+            &["test-model".to_string(), "busy-model".to_string()],
+            4096,
+            Some(metrics.clone()),
         );
         let stop = CancellationToken::new();
         let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
@@ -1230,6 +1491,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        let body = metrics.gather_text().expect("metrics should render");
+        assert!(
+            body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="timed_out_upstream_busy"} 0"#
+            ) && !body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="failed"} 0"#
+            ),
+            "a held demotion should record its timed-out recovery canary as failed"
+        );
 
         // The next recovery canary answers normally and restores the model.
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1243,6 +1513,451 @@ mod tests {
         stop.cancel();
         task.await.unwrap();
         progress.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_overload_keeps_a_model_demoted_for_a_failure_until_a_canary_passes() {
+        let canary_requests = Arc::new(AtomicUsize::new(0));
+        let canary_status = Arc::new(AtomicU16::new(500));
+        let base_url = spawn_test_server(TestServerState {
+            canary_requests: Some(canary_requests.clone()),
+            canary_status: canary_status.clone(),
+            ..TestServerState::default()
+        })
+        .await;
+        let metrics = crate::PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, _observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &["test-model".to_string(), "busy-model".to_string()],
+            4096,
+            Some(metrics.clone()),
+        );
+        let stop = CancellationToken::new();
+        let progress = spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
+        let task = tokio::spawn(run_bringup_task(
+            test_task_config(
+                base_url.to_string(),
+                BringupConfig {
+                    active_canary_interval: Duration::from_millis(10),
+                    canary_timeout: Duration::from_millis(100),
+                    ..BringupConfig::default()
+                },
+            ),
+            runtime_state.clone(),
+            stop.clone(),
+        ));
+
+        wait_for_bringup_ready(&runtime_state, false).await;
+
+        // Overload replies while another model serves must not restore a
+        // model demoted for a real failure, and they count as failures.
+        canary_status.store(529, Ordering::SeqCst);
+        let overloaded_from = canary_requests.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while canary_requests.load(Ordering::SeqCst) < overloaded_from + 2 {
+                assert_eq!(
+                    runtime_state.model_bringup_ready("test-model"),
+                    Some(false),
+                    "an overloaded recovery canary should not restore the model"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("recovery canaries should keep running");
+        assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(false));
+        let body = metrics.gather_text().expect("metrics should render");
+        assert!(
+            body.contains(
+                r#"pylon_model_canary_results_total{model="test-model",phase="recovery",result="rejected_upstream_busy"} 0"#
+            ),
+            "a held demotion should not record busy recovery results"
+        );
+
+        canary_status.store(0, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runtime_state.model_bringup_ready("test-model") != Some(true) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a passing recovery canary should restore the model");
+
+        stop.cancel();
+        task.await.unwrap();
+        progress.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_busy_result_restores_a_model_demoted_for_a_stall() {
+        for (label, state) in busy_canary_replies() {
+            let canary_requests = Arc::new(AtomicUsize::new(0));
+            let base_url = spawn_test_server(TestServerState {
+                canary_requests: Some(canary_requests.clone()),
+                ..state
+            })
+            .await;
+            let runtime_state = PylonRuntimeState::new(
+                InferenceServerStatus::Active,
+                &["test-model".into(), "busy-model".into()],
+            );
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(run_bringup_task(
+                test_task_config(
+                    base_url.to_string(),
+                    BringupConfig {
+                        active_canary_interval: Duration::from_millis(10),
+                        canary_timeout: Duration::from_millis(50),
+                        ..BringupConfig::default()
+                    },
+                ),
+                runtime_state.clone(),
+                stop.clone(),
+            ));
+
+            // No request produces output yet, so the failed canary is a stall,
+            // and recovery canaries that also stall keep the model demoted.
+            wait_for_bringup_ready(&runtime_state, false).await;
+            let at_demotion = canary_requests.load(Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while canary_requests.load(Ordering::SeqCst) < at_demotion + 2 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}: recovery canaries should keep running"));
+            assert_eq!(
+                runtime_state.model_bringup_ready("test-model"),
+                Some(false),
+                "{label}: a stalled recovery canary should not restore the model"
+            );
+            let progress =
+                spawn_backend_progress(runtime_state.clone(), "busy-model", stop.clone());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while runtime_state.model_bringup_ready("test-model") != Some(true) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{label}: a busy recovery canary should restore a model demoted for a stall")
+            });
+
+            stop.cancel();
+            task.await.unwrap();
+            progress.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_upstream_passes_the_default_canary_without_traffic() {
+        let canary_requests = Arc::new(AtomicUsize::new(0));
+        // A reasoning model writes every allowed token; at this pace only a
+        // short canary finishes within the timeout.
+        let base_url = spawn_test_server(TestServerState {
+            canary_requests: Some(canary_requests.clone()),
+            canary_token_delay: Some(Duration::from_millis(10)),
+            ..TestServerState::default()
+        })
+        .await;
+        let runtime_state = test_runtime_state();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run_bringup_task(
+            test_task_config(
+                base_url.to_string(),
+                BringupConfig {
+                    active_canary_interval: Duration::from_millis(10),
+                    canary_timeout: Duration::from_millis(500),
+                    ..BringupConfig::default()
+                },
+            ),
+            runtime_state.clone(),
+            stop.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while canary_requests.load(Ordering::SeqCst) < 3 {
+                assert_eq!(
+                    runtime_state.model_bringup_ready("test-model"),
+                    Some(true),
+                    "a slow upstream should pass the default canary"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("active canaries should keep running");
+        assert_eq!(runtime_state.model_bringup_ready("test-model"), Some(true));
+
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    /// Character text whose estimate is one token per character.
+    fn estimated_tokens(count: usize) -> String {
+        "\u{e9}".repeat(count)
+    }
+
+    fn reasoning_event(text: &str) -> Value {
+        serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"reasoning_content": text}}],
+        })
+    }
+
+    fn usage_event(text: &str, completion_tokens: u32) -> Value {
+        serde_json::json!({
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"reasoning_content": text}}],
+            "usage": {"completion_tokens": completion_tokens},
+        })
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CanaryEnd {
+        Done,
+        Eof,
+        Stall,
+    }
+
+    /// Serves the given canary events, then ends the stream as `end` says.
+    async fn spawn_canary_event_server(events: Vec<Value>, end: CanaryEnd) -> TestHttpServer {
+        use futures::StreamExt as _;
+
+        TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                let mut body = events
+                    .iter()
+                    .map(|event| format!("data: {event}\n\n"))
+                    .collect::<String>();
+                if end == CanaryEnd::Done {
+                    body.push_str("data: [DONE]\n\n");
+                }
+                let first = futures::stream::once(async move {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(body))
+                });
+                let body = if end == CanaryEnd::Stall {
+                    axum::body::Body::from_stream(first.chain(futures::stream::pending()))
+                } else {
+                    axum::body::Body::from_stream(first)
+                };
+                ([("content-type", "text/event-stream")], body)
+            }),
+        ))
+        .await
+    }
+
+    async fn send_test_canary(events: Vec<Value>, end: CanaryEnd) -> Result<(), BringupError> {
+        let server = spawn_canary_event_server(events, end).await;
+        let result = send_canary_request(
+            &reqwest::Client::new(),
+            server.as_str(),
+            &test_generation(),
+            Duration::from_millis(200),
+            7,
+        )
+        .await;
+        server.shutdown().await;
+        result
+    }
+
+    #[tokio::test]
+    async fn canary_exact_usage_at_threshold_settles_a_split_estimate_overshoot() {
+        send_test_canary(
+            vec![reasoning_event(&estimated_tokens(15)), usage_event("", 7)],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect("exact usage at the cap should override a higher estimate");
+    }
+
+    #[tokio::test]
+    async fn canary_exact_usage_at_threshold_settles_an_overshoot_in_the_same_event() {
+        send_test_canary(vec![usage_event(&estimated_tokens(15), 7)], CanaryEnd::Done)
+            .await
+            .expect("exact usage at the cap should override a higher estimate");
+    }
+
+    #[tokio::test]
+    async fn canary_mid_stream_usage_then_final_usage_at_threshold_passes() {
+        send_test_canary(
+            vec![
+                usage_event(&estimated_tokens(5), 5),
+                reasoning_event(&estimated_tokens(4)),
+                usage_event("", 7),
+            ],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect("final exact usage at the cap should settle the estimated tail");
+    }
+
+    #[tokio::test]
+    async fn canary_judges_a_completed_stream_by_exact_usage_despite_a_later_estimated_tail() {
+        send_test_canary(
+            vec![
+                usage_event(&estimated_tokens(7), 7),
+                reasoning_event(&estimated_tokens(9)),
+            ],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect("accepted exact usage should decide the verdict");
+    }
+
+    #[tokio::test]
+    async fn canary_ignores_regressed_exact_usage() {
+        send_test_canary(
+            vec![usage_event(&estimated_tokens(5), 5), usage_event("", 0)],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect("regressed usage should keep the prior exact count");
+    }
+
+    #[tokio::test]
+    async fn canary_failure_event_with_usage_above_threshold_is_not_runaway() {
+        let error = send_test_canary(
+            vec![serde_json::json!({
+                "type": "error",
+                "usage": {"completion_tokens": 8},
+            })],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect_err("a failed stream should fail");
+
+        assert!(
+            matches!(error, BringupError::InvalidResponse(_)),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_exact_usage_above_threshold_is_runaway() {
+        let error = send_test_canary(
+            vec![reasoning_event(&estimated_tokens(3)), usage_event("", 8)],
+            CanaryEnd::Done,
+        )
+        .await
+        .expect_err("exact usage above the cap should fail");
+
+        assert!(
+            matches!(error, BringupError::RunawayGeneration { tokens: 8 }),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_exact_usage_above_threshold_fails_before_the_stream_ends() {
+        let error = send_test_canary(vec![usage_event("", 8)], CanaryEnd::Stall)
+            .await
+            .expect_err("exact usage above the cap should fail immediately");
+
+        assert!(
+            matches!(error, BringupError::RunawayGeneration { tokens: 8 }),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_without_usage_uses_the_estimate_at_completion() {
+        send_test_canary(vec![reasoning_event(&estimated_tokens(7))], CanaryEnd::Done)
+            .await
+            .expect("an estimate at the cap should pass");
+
+        let error = send_test_canary(vec![reasoning_event(&estimated_tokens(8))], CanaryEnd::Done)
+            .await
+            .expect_err("an unsettled estimate above the cap should fail");
+
+        assert!(
+            matches!(error, BringupError::RunawayGeneration { tokens: 8 }),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_stall_after_estimate_overshoot_is_a_timeout() {
+        let error = send_test_canary(
+            vec![reasoning_event(&estimated_tokens(9))],
+            CanaryEnd::Stall,
+        )
+        .await
+        .expect_err("a stalled canary should fail");
+
+        assert!(error.is_timeout(), "unexpected canary error: {error}");
+    }
+
+    #[tokio::test]
+    async fn canary_eof_after_estimate_overshoot_is_an_invalid_response() {
+        let error = send_test_canary(vec![reasoning_event(&estimated_tokens(9))], CanaryEnd::Eof)
+            .await
+            .expect_err("a stream without [DONE] should fail");
+
+        assert!(
+            matches!(error, BringupError::InvalidResponse(_)),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_completion_event_without_done_is_an_invalid_response() {
+        let error = send_test_canary(
+            vec![
+                reasoning_event("2"),
+                serde_json::json!({"type": "response.completed"}),
+            ],
+            CanaryEnd::Eof,
+        )
+        .await
+        .expect_err("a canary stream must end with [DONE]");
+
+        assert!(
+            matches!(error, BringupError::InvalidResponse(_)),
+            "unexpected canary error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_read_error_after_estimate_overshoot_is_not_runaway() {
+        use futures::StreamExt as _;
+
+        let server = TestHttpServer::spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let event = format!("data: {}\n\n", reasoning_event(&estimated_tokens(9)));
+                let first = futures::stream::once(async move {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(event))
+                });
+                let reset = futures::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Err(std::io::Error::other("connection reset"))
+                });
+                let body = first.chain(reset);
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+            }),
+        ))
+        .await;
+
+        let error = send_canary_request(
+            &reqwest::Client::new(),
+            server.as_str(),
+            &test_generation(),
+            Duration::from_secs(1),
+            7,
+        )
+        .await
+        .expect_err("a broken canary stream should fail");
+
+        assert!(
+            matches!(error, BringupError::InvalidResponse(_)),
+            "unexpected canary error: {error}"
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test]
@@ -1361,6 +2076,118 @@ mod tests {
             !error.is_timeout(),
             "unexpected timeout classification: {error}"
         );
+    }
+
+    /// Sampling fields that a backend can fix or limit. Such a backend
+    /// answers 400 when a request sets one of them.
+    const BACKEND_RESTRICTED_FIELDS: [&str; 2] = ["top_p", "temperature"];
+
+    #[tokio::test]
+    async fn canary_passes_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                ..TestServerState::default()
+            })
+            .await;
+
+            send_canary_request(
+                &reqwest::Client::new(),
+                &base_url,
+                &test_generation(),
+                Duration::from_secs(1),
+                7,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("canary failed on a backend that rejects `{rejected_field}`: {error}")
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_completes_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                ..TestServerState::default()
+            })
+            .await;
+
+            let outcome = send_calibration_batch(
+                &reqwest::Client::new(),
+                &base_url,
+                &test_generation(),
+                Duration::from_secs(1),
+                CalibrationBatch {
+                    prompt_units: 256,
+                    request_count: 1,
+                    concurrency: 1,
+                },
+                &test_runtime_state(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("calibration failed on a backend that rejects `{rejected_field}`: {error}")
+            });
+
+            assert_eq!(
+                outcome,
+                CalibrationStepOutcome::Completed,
+                "backend rejects `{rejected_field}`"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_stays_ready_on_a_backend_that_rejects_a_sampling_field() {
+        for rejected_field in BACKEND_RESTRICTED_FIELDS {
+            let canary_requests = Arc::new(AtomicUsize::new(0));
+            let base_url = spawn_test_server(TestServerState {
+                rejected_field: Some(rejected_field),
+                canary_requests: Some(canary_requests.clone()),
+                ..TestServerState::default()
+            })
+            .await;
+            let runtime_state = test_runtime_state();
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(run_bringup_task(
+                test_task_config(
+                    base_url.to_string(),
+                    BringupConfig {
+                        active_canary_interval: Duration::from_millis(10),
+                        canary_timeout: Duration::from_secs(1),
+                        ..BringupConfig::default()
+                    },
+                ),
+                runtime_state.clone(),
+                stop.clone(),
+            ));
+
+            // The server counts a canary before Pylon has its result, so the
+            // count alone can miss a demotion. Each poll checks readiness.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    assert_eq!(
+                        runtime_state.model_bringup_ready("test-model"),
+                        Some(true),
+                        "backend rejects `{rejected_field}`"
+                    );
+                    if canary_requests.load(Ordering::SeqCst) >= 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a backend that rejects `{rejected_field}` should accept active canaries")
+            });
+
+            stop.cancel();
+            task.await.unwrap();
+        }
     }
 
     /// Serves canary responses over HTTP/1.1 keep-alive connections and counts
@@ -1534,6 +2361,7 @@ mod tests {
     struct TestServerState {
         completion_tokens: u32,
         error_body: Option<String>,
+        rejected_field: Option<&'static str>,
         event_stream_content_type: Option<String>,
         prompt_too_long_above: Option<usize>,
         calibration_barrier: Option<Arc<Barrier>>,
@@ -1545,6 +2373,9 @@ mod tests {
         canaries: Option<CanarySequence>,
         canary_requests: Option<Arc<AtomicUsize>>,
         canary_hangs: bool,
+        /// Error status for canaries in Dynamo's error shape; 0 answers normally.
+        canary_status: Arc<AtomicU16>,
+        canary_token_delay: Option<Duration>,
         health_requests: Option<Arc<AtomicUsize>>,
         request_ids: Option<Arc<Mutex<Vec<String>>>>,
         prompt_lengths: Option<Arc<Mutex<Vec<usize>>>>,
@@ -1556,6 +2387,7 @@ mod tests {
             Self {
                 completion_tokens: 1,
                 error_body: None,
+                rejected_field: None,
                 event_stream_content_type: None,
                 prompt_too_long_above: None,
                 calibration_barrier: None,
@@ -1567,6 +2399,8 @@ mod tests {
                 canaries: None,
                 canary_requests: None,
                 canary_hangs: false,
+                canary_status: Arc::new(AtomicU16::new(0)),
+                canary_token_delay: None,
                 health_requests: None,
                 request_ids: None,
                 prompt_lengths: None,
@@ -1723,12 +2557,63 @@ mod tests {
             return (StatusCode::SERVICE_UNAVAILABLE, error_body).into_response();
         }
 
+        if let Some(rejected_field) = state.rejected_field
+            && request.get(rejected_field).is_some()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {"message": "invalid request parameters"}
+                })),
+            )
+                .into_response();
+        }
+
         if prompt == "1+1=" {
             if let Some(canary_requests) = &state.canary_requests {
                 canary_requests.fetch_add(1, Ordering::SeqCst);
             }
             if state.canary_hangs {
                 std::future::pending::<()>().await;
+            }
+            let canary_status = state.canary_status.load(Ordering::SeqCst);
+            if canary_status != 0 {
+                // 529 is Dynamo's reply when every worker of the model is busy.
+                return (
+                    StatusCode::from_u16(canary_status).expect("test status is valid"),
+                    Json(serde_json::json!({
+                        "message": "Service temporarily overloaded",
+                        "type": "Overloaded",
+                        "code": canary_status
+                    })),
+                )
+                    .into_response();
+            }
+            if let Some(delay) = state.canary_token_delay {
+                let max_tokens = request
+                    .get("max_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let body = async_stream::stream! {
+                    for _ in 0..max_tokens {
+                        tokio::time::sleep(delay).await;
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+                            "data: {}\n\n",
+                            reasoning_event("x")
+                        )));
+                    }
+                    let usage = serde_json::json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                        "usage": {"completion_tokens": max_tokens},
+                    });
+                    yield Ok(bytes::Bytes::from(format!("data: {usage}\n\ndata: [DONE]\n\n")));
+                };
+                return (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(body),
+                )
+                    .into_response();
             }
         }
 

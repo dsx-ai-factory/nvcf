@@ -77,6 +77,13 @@ management:
             - readinessState
             - cassandra
             - nats
+        # cassandraSession restarts only a pod whose session stays broken after
+        # Cassandra recovers. Cassandra itself stays out of liveness because every
+        # replica shares it.
+        liveness:
+          include:
+            - livenessState
+            - cassandraSession
   tracing:
     export:
       enabled: false
@@ -84,7 +91,8 @@ management:
     tracing:
       export:
         otlp:
-          endpoint: https://dummy:8282
+          # No trace backend by default. Trace export is disabled above.
+          endpoint: ""
           headers:
             lightstep-access-token: unused
   prometheus:

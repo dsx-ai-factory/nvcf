@@ -25,7 +25,7 @@ import (
 
 	k8sclient "k8s.io/client-go/kubernetes"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/yaml"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 )
 
 const (
@@ -61,7 +61,10 @@ const (
 	// Crowdstrike
 	EgressCrowdstrikeNetworkPolicyName  = "allow-egress-crowdstrike"
 	IngressCrowdstrikeNetworkPolicyName = "allow-ingress-crowdstrike"
-	// BYOO
+	// BYOO. This policy allows only the default platform metrics federation
+	// target. Self-hosted clusters prune every policy in workload namespaces,
+	// so it never applies there; a managed cluster that sets a different
+	// byooOtelCollector.platformMetricsFederation.target needs a custom policy.
 	EgressBYOOOTelPrometheusNetworkPolicyName = "allow-egress-prometheus-nvcf-byoo"
 	// This label k/v must be set on all pods containing the byoo-otel-collector container
 	// so metrics can be forwarded to the local prometheus instance running in a separate namespace.

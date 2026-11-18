@@ -110,6 +110,10 @@
             "nvcfApiEndpoint": {
               "$ref": "#/definitions/nonEmptyString"
             },
+            "nvcfControlPlaneEndpoint": {
+              "type": "string",
+              "pattern": "^$|^https?://[^/]+/?$"
+            },
             "llmGatewayEndpoint": {
               "type": "string",
               "pattern": "^$|^https?://[^/]+/?$"
@@ -129,8 +133,15 @@
             "shadowMaxConcurrent": {
               "type": "integer",
               "minimum": 1
+            },
+            "maxRequestSizeBytes": {
+              "description": "Maximum model API request body size in bytes (default 26214400, or 25 MiB).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
             }
           },
+          "required": ["maxRequestSizeBytes"],
           "additionalProperties": false
         },
         "mappingConfig": {
@@ -141,6 +152,12 @@
               "properties": {
                 "openai": {
                   "$ref": "#/definitions/openAIRoutes"
+                },
+                "anthropicMessages": {
+                  "$ref": "#/definitions/openAIStickyEndpointRoutes"
+                },
+                "typesafeSystemOne": {
+                  "$ref": "#/definitions/openAIDecisionRoutes"
                 },
                 "vanity": {
                   "$ref": "#/definitions/vanityRoutes"
@@ -197,83 +214,156 @@
               "mappingConfig": {
                 "properties": {
                   "v2config": {
-                    "properties": {
-                      "openai": {
-                        "anyOf": [
-                          {
-                            "properties": {
-                              "chatCompletions": {
-                                "not": {
-                                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "openai": {
+                            "anyOf": [
+                              {
+                                "properties": {
+                                  "chatCompletions": {
                                     "not": {
-                                      "properties": {
-                                        "functionType": {
-                                          "const": "LLM"
+                                      "additionalProperties": {
+                                        "not": {
+                                          "properties": {
+                                            "functionType": {
+                                              "const": "LLM"
+                                            }
+                                          },
+                                          "required": [
+                                            "functionType"
+                                          ]
                                         }
-                                      },
-                                      "required": [
-                                        "functionType"
-                                      ]
+                                      }
                                     }
                                   }
-                                }
-                              }
-                            },
-                            "required": [
-                              "chatCompletions"
-                            ]
-                          },
-                          {
-                            "properties": {
-                              "responses": {
-                                "not": {
-                                  "additionalProperties": {
+                                },
+                                "required": [
+                                  "chatCompletions"
+                                ]
+                              },
+                              {
+                                "properties": {
+                                  "responses": {
                                     "not": {
-                                      "properties": {
-                                        "functionType": {
-                                          "const": "LLM"
+                                      "additionalProperties": {
+                                        "not": {
+                                          "properties": {
+                                            "functionType": {
+                                              "const": "LLM"
+                                            }
+                                          },
+                                          "required": [
+                                            "functionType"
+                                          ]
                                         }
-                                      },
-                                      "required": [
-                                        "functionType"
-                                      ]
+                                      }
                                     }
                                   }
-                                }
-                              }
-                            },
-                            "required": [
-                              "responses"
-                            ]
-                          },
-                          {
-                            "properties": {
-                              "embeddings": {
-                                "not": {
-                                  "additionalProperties": {
+                                },
+                                "required": [
+                                  "responses"
+                                ]
+                              },
+                              {
+                                "properties": {
+                                  "embeddings": {
                                     "not": {
-                                      "properties": {
-                                        "functionType": {
-                                          "const": "LLM"
+                                      "additionalProperties": {
+                                        "not": {
+                                          "properties": {
+                                            "functionType": {
+                                              "const": "LLM"
+                                            }
+                                          },
+                                          "required": [
+                                            "functionType"
+                                          ]
                                         }
-                                      },
-                                      "required": [
-                                        "functionType"
-                                      ]
+                                      }
                                     }
                                   }
-                                }
+                                },
+                                "required": [
+                                  "embeddings"
+                                ]
+                              },
+                              {
+                                "properties": {
+                                  "decisions": {
+                                    "not": {
+                                      "additionalProperties": {
+                                        "not": {
+                                          "properties": {
+                                            "functionType": {
+                                              "const": "LLM"
+                                            }
+                                          },
+                                          "required": [
+                                            "functionType"
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "required": [
+                                  "decisions"
+                                ]
                               }
-                            },
-                            "required": [
-                              "embeddings"
                             ]
                           }
+                        },
+                        "required": [
+                          "openai"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "anthropicMessages": {
+                            "not": {
+                              "additionalProperties": {
+                                "not": {
+                                  "properties": {
+                                    "functionType": {
+                                      "const": "LLM"
+                                    }
+                                  },
+                                  "required": [
+                                    "functionType"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "anthropicMessages"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "typesafeSystemOne": {
+                            "not": {
+                              "additionalProperties": {
+                                "not": {
+                                  "properties": {
+                                    "functionType": {
+                                      "const": "LLM"
+                                    }
+                                  },
+                                  "required": [
+                                    "functionType"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": [
+                          "typesafeSystemOne"
                         ]
                       }
-                    },
-                    "required": [
-                      "openai"
                     ]
                   }
                 },
@@ -319,7 +409,7 @@
           "$ref": "#/definitions/nonEmptyString"
         },
         "chatCompletions": {
-          "$ref": "#/definitions/openAILLMEndpointRoutes"
+          "$ref": "#/definitions/openAIStickyEndpointRoutes"
         },
         "completions": {
           "$ref": "#/definitions/openAINonLLMEndpointRoutes"
@@ -327,8 +417,11 @@
         "embeddings": {
           "$ref": "#/definitions/openAILLMEndpointRoutes"
         },
+        "decisions": {
+          "$ref": "#/definitions/openAIDecisionRoutes"
+        },
         "responses": {
-          "$ref": "#/definitions/openAILLMEndpointRoutes"
+          "$ref": "#/definitions/openAIStickyEndpointRoutes"
         },
         "imageGenerations": {
           "$ref": "#/definitions/openAINonLLMEndpointRoutes"
@@ -348,6 +441,12 @@
       "type": "object",
       "additionalProperties": {
         "$ref": "#/definitions/openAIModelRoute"
+      }
+    },
+    "openAIStickyEndpointRoutes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/openAILLMModelRoute"
       }
     },
     "openAIMultipartEndpointRoutes": {
@@ -410,8 +509,14 @@
         "modelName",
         "functionID"
       ],
-      "$comment": "The gateway reads the shadows key and the legacy shadow keys in any letter case, so the shadows rules use (?i) patterns. That flag is Go regexp syntax, which Helm uses; ECMA-262 validators do not accept it. The legacy keys keep the exact-name checks above so their behavior is unchanged.",
+      "$comment": "The gateway reads the shadows key and legacy shadow keys in any letter case, so their rules use (?i) patterns. That flag is Go regexp syntax, which Helm uses; ECMA-262 validators do not accept it.",
       "patternProperties": {
+        "^(?i)shadowsamplingmethod$": {
+          "$ref": "#/definitions/shadowSamplingMethod"
+        },
+        "^(?i)promptcachekeyheaders$": {
+          "$ref": "#/definitions/promptCacheKeyHeaders"
+        },
         "^(?i)shadows$": {
           "type": "array",
           "items": {
@@ -455,13 +560,110 @@
         }
       ]
     },
-    "shadowSamplingMethod": {
+    "shadowSamplingMethodValue": {
       "type": "string",
       "enum": [
-        "",
         "random",
-        "perBearerKey"
+        "perBearerKey",
+        "promptCacheKey",
+        "firstMessageHash"
       ]
+    },
+    "orderedShadowSamplingMethods": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/definitions/shadowSamplingMethodValue"
+      },
+      "not": {
+        "anyOf": [
+          {
+            "minItems": 2,
+            "items": [
+              {
+                "const": "random"
+              }
+            ]
+          },
+          {
+            "minItems": 3,
+            "items": [
+              {},
+              {
+                "const": "random"
+              }
+            ]
+          },
+          {
+            "minItems": 4,
+            "items": [
+              {},
+              {},
+              {
+                "const": "random"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "shadowSamplingMethod": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "",
+            "random",
+            "perBearerKey",
+            "promptCacheKey",
+            "firstMessageHash"
+          ]
+        },
+        {
+          "$ref": "#/definitions/orderedShadowSamplingMethods"
+        }
+      ]
+    },
+    "basicShadowSamplingMethod": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "",
+            "random",
+            "perBearerKey"
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/orderedShadowSamplingMethods"
+            },
+            {
+              "items": {
+                "enum": [
+                  "random",
+                  "perBearerKey"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "promptCacheKeyHeaders": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$",
+        "not": {
+          "pattern": "^(?i)(authorization|proxy-authorization)$"
+        }
+      }
     },
     "shadowTarget": {
       "type": "object",
@@ -490,6 +692,39 @@
         }
       },
       "additionalProperties": false
+    },
+    "basicShadowTarget": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/shadowTarget"
+        },
+        {
+          "patternProperties": {
+            "^(?i)samplingmethod$": {
+              "$ref": "#/definitions/basicShadowSamplingMethod"
+            }
+          }
+        }
+      ]
+    },
+    "nonRequestBodyShadowSampling": {
+      "type": "object",
+      "patternProperties": {
+        "^(?i)shadowsamplingmethod$": {
+          "$ref": "#/definitions/basicShadowSamplingMethod"
+        },
+        "^(?i)shadows$": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/basicShadowTarget"
+          }
+        }
+      },
+      "propertyNames": {
+        "not": {
+          "pattern": "^(?i)promptcachekeyheaders$"
+        }
+      }
     },
     "vanityRoutes": {
       "type": "object",
@@ -609,8 +844,36 @@
     "openAILLMEndpointRoutes": {
       "type": "object",
       "additionalProperties": {
-        "$ref": "#/definitions/openAILLMModelRoute"
+        "$ref": "#/definitions/openAINonStickyLLMModelRoute"
       }
+    },
+    "openAIDecisionRoutes": {
+      "description": "Decision routes return backend 429 bodies unchanged, so tooManyRequestsMessage must be empty.",
+      "type": "object",
+      "additionalProperties": {
+        "allOf": [
+          {
+            "$ref": "#/definitions/openAINonStickyLLMModelRoute"
+          },
+          {
+            "patternProperties": {
+              "^(?i)toomanyrequestsmessage$": {
+                "maxLength": 0
+              }
+            }
+          }
+        ]
+      }
+    },
+    "openAINonStickyLLMModelRoute": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/openAILLMModelRoute"
+        },
+        {
+          "$ref": "#/definitions/nonRequestBodyShadowSampling"
+        }
+      ]
     },
     "openAINonLLMModelRoute": {
       "allOf": [
@@ -623,6 +886,9 @@
               "functionType"
             ]
           }
+        },
+        {
+          "$ref": "#/definitions/nonRequestBodyShadowSampling"
         }
       ]
     },

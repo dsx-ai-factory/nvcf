@@ -15,11 +15,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
+
+use crate::drain::{DrainRecorder, DrainSummary};
 
 use super::discovery::run_watch_stargate_discovery;
 use super::grpc_endpoint::StargateGrpcEndpoint;
@@ -27,7 +30,12 @@ use super::router_stream::run_router_registration_stream;
 use super::topology::RegistrationRouterTopology;
 use super::types::{ClientError, InferenceServerRegistrationConfig, RegistrationSessionConfig};
 
-async fn run_registration_session(config: RegistrationSessionConfig, stop: CancellationToken) {
+async fn run_registration_session(
+    config: RegistrationSessionConfig,
+    drain: Option<Arc<DrainRecorder>>,
+    stop: CancellationToken,
+) {
+    let drain_timeout = config.shutdown_drain_timeout;
     let config = Arc::new(config);
     let (router_topology_tx, router_topology_rx) =
         watch::channel(RegistrationRouterTopology::default());
@@ -50,7 +58,12 @@ async fn run_registration_session(config: RegistrationSessionConfig, stop: Cance
     let tasks = vec![watch_task, registration_task];
 
     stop.cancelled().await;
-    OwnedTask::shutdown_all(tasks, TASK_SHUTDOWN_TIMEOUT).await;
+    // A child task that exits on its own also stops the session, which then
+    // drains without a call to `shutdown`.
+    if let Some(drain) = &drain {
+        drain.start();
+    }
+    OwnedTask::shutdown_all(tasks, drain_timeout).await;
 }
 
 async fn run_registration_supervisor(
@@ -73,8 +86,7 @@ async fn run_registration_supervisor(
         let retired_tasks = per_router_tasks
             .extract_if(|router, _| !desired_routers.contains(router))
             .map(|(_, task)| task)
-            .collect();
-        OwnedTask::shutdown_all(retired_tasks, TASK_SHUTDOWN_TIMEOUT).await;
+            .collect::<Vec<_>>();
 
         for router in &desired_routers {
             if !per_router_tasks.contains_key(router) {
@@ -90,6 +102,9 @@ async fn run_registration_supervisor(
                 per_router_tasks.insert(router.clone(), task);
             }
         }
+        // Retired streams drain their reverse tunnels, so register with new
+        // routers first.
+        OwnedTask::shutdown_all(retired_tasks, TASK_SHUTDOWN_TIMEOUT).await;
 
         let finished = tokio::select! {
             _ = stop.cancelled() => true,
@@ -102,7 +117,7 @@ async fn run_registration_supervisor(
 
     OwnedTask::shutdown_all(
         per_router_tasks.into_values().collect(),
-        TASK_SHUTDOWN_TIMEOUT,
+        config.shutdown_drain_timeout,
     )
     .await;
 }
@@ -110,17 +125,32 @@ async fn run_registration_supervisor(
 #[derive(Default)]
 pub struct InferenceServerRegistrationClient {
     running: Option<OwnedTask>,
+    drain_timeout: Duration,
+    /// Set only for a reverse tunnel, the mode whose shutdown drains.
+    drain: Option<Arc<DrainRecorder>>,
+    /// The drain of a session that stopped on its own, kept for `shutdown`.
+    exited_drain: Option<DrainSummary>,
 }
 
 impl InferenceServerRegistrationClient {
     pub fn stop(&mut self) {
         self.running = None;
+        self.exited_drain = None;
     }
 
-    pub async fn shutdown(&mut self) {
-        if let Some(running) = self.running.take() {
-            running.shutdown(TASK_SHUTDOWN_TIMEOUT).await;
+    /// Drains and stops the registration session. For a reverse tunnel, it
+    /// returns what the drain did so that the caller can log it. If the
+    /// session already stopped on its own, it returns that session's drain.
+    pub async fn shutdown(&mut self) -> Option<DrainSummary> {
+        let Some(running) = self.running.take() else {
+            return self.exited_drain.take();
+        };
+        let drain = self.drain.take();
+        if let Some(drain) = &drain {
+            drain.start();
         }
+        running.shutdown(self.drain_timeout).await;
+        drain?.summary()
     }
 
     pub async fn wait_for_exit(&mut self) -> std::result::Result<(), tokio::task::JoinError> {
@@ -129,14 +159,23 @@ impl InferenceServerRegistrationClient {
         };
         let result = running.wait_for_exit().await;
         self.running = None;
+        self.exited_drain = self.drain.take().and_then(|drain| drain.summary());
         result
     }
 
     pub fn start(&mut self, config: InferenceServerRegistrationConfig) -> Result<(), ClientError> {
         self.stop();
-        let config = config.try_into()?;
+        let config: RegistrationSessionConfig = config.try_into()?;
+        self.drain_timeout = config.shutdown_drain_timeout;
+        self.drain = config.reverse_tunnel.then(|| {
+            Arc::new(DrainRecorder::new(
+                config.forwarding.runtime_state.drain_counters(),
+                config.shutdown_drain_timeout,
+            ))
+        });
+        let session_drain = self.drain.clone();
         self.running = Some(OwnedTask::spawn("registration session", move |stop| {
-            run_registration_session(config, stop)
+            run_registration_session(config, session_drain, stop)
         }));
         Ok(())
     }
@@ -178,6 +217,7 @@ mod tests {
         let (running, dropped) = spawn_pending_owned_task().await;
         let client = InferenceServerRegistrationClient {
             running: Some(running),
+            ..Default::default()
         };
 
         // Dropping the client must tear down its one physical session root.
@@ -187,5 +227,49 @@ mod tests {
             .await
             .expect("session root should be aborted when the client drops")
             .expect("session root drop notifier should send");
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_the_drain_of_a_session_that_stopped_on_its_own() {
+        let config: RegistrationSessionConfig = super::super::tests::test_registration_config()
+            .try_into()
+            .expect("test registration config should be valid");
+        let counters = config.forwarding.runtime_state.drain_counters();
+        let drain_timeout = Duration::from_secs(1);
+        let drain = Arc::new(DrainRecorder::new(Arc::clone(&counters), drain_timeout));
+        let running_request = counters.begin_request();
+        let session_drain = Arc::clone(&drain);
+        let mut client = InferenceServerRegistrationClient {
+            running: Some(OwnedTask::spawn("registration session", move |stop| {
+                // What a child task that exits on its own does to the session.
+                stop.cancel();
+                run_registration_session(config, Some(session_drain), stop)
+            })),
+            drain_timeout,
+            drain: Some(drain),
+            exited_drain: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), client.wait_for_exit())
+            .await
+            .expect("session should stop")
+            .expect("session should not panic");
+        // The summary ends when the session stops, before Pylon's exit.
+        drop(running_request);
+
+        let summary = client
+            .shutdown()
+            .await
+            .expect("shutdown should return the session's drain");
+        assert_eq!(
+            (
+                summary.in_flight_at_start,
+                summary.accepted,
+                summary.completed,
+                summary.cut_off
+            ),
+            (1, 0, 0, 1)
+        );
+        assert_eq!(client.shutdown().await, None);
     }
 }

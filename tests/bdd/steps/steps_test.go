@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 	messages "github.com/cucumber/messages/go/v21"
@@ -172,6 +173,9 @@ func TestIPrepareHelmfileEnvironmentRestoresExistingDestination(t *testing.T) {
 	if err := os.WriteFile(dest, original, 0o640); err != nil {
 		t.Fatalf("seed destination: %v", err)
 	}
+	if err := os.Chmod(dest, 0o640); err != nil {
+		t.Fatalf("set destination mode: %v", err)
+	}
 	table := docTable(t, [][]string{{"observability.mode", "install"}})
 
 	if err := sc.iPrepareHelmfileEnvironment("existing", "observability", fixture, table); err != nil {
@@ -270,6 +274,9 @@ func TestIPrepareSelfManagedSecretsFileRestoresExistingDestination(t *testing.T)
 	original := []byte("operator-authored: original\n")
 	if err := os.WriteFile(destAbs, original, 0o640); err != nil {
 		t.Fatalf("seed destination: %v", err)
+	}
+	if err := os.Chmod(destAbs, 0o640); err != nil {
+		t.Fatalf("set destination mode: %v", err)
 	}
 
 	if err := sc.iPrepareSelfManagedSecretsFile(destRel, templateRel); err != nil {
@@ -686,6 +693,47 @@ func TestISuccessfullyRunCommandDocPreservesOutput(t *testing.T) {
 	}
 }
 
+func TestIPollCommandUntilOutputContainsRetriesAndPreservesMatch(t *testing.T) {
+	previousInterval := commandPollInterval
+	commandPollInterval = time.Nanosecond
+	t.Cleanup(func() { commandPollInterval = previousInterval })
+
+	sc, fake := newScenarioContext(t)
+	fake.runResults = []harness.Result{
+		{ExitCode: 0, Stdout: `{"status":"pending"}`},
+		{ExitCode: 0, Stdout: `{"status":"ready"}`},
+	}
+	doc := &godog.DocString{Content: "nvcf-cli stats get --json"}
+	if err := sc.iPollCommandUntilOutputContains(context.Background(), 1, `"ready"`, doc); err != nil {
+		t.Fatalf("poll command: %v", err)
+	}
+	if len(fake.runs) != 2 {
+		t.Fatalf("runs = %d, want 2", len(fake.runs))
+	}
+	if sc.LastResult.Stdout != `{"status":"ready"}` {
+		t.Fatalf("last stdout = %q", sc.LastResult.Stdout)
+	}
+}
+
+func TestIPollCommandUntilOutputContainsBoundsHangingCommand(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	fake.runHook = func(ctx context.Context, _ int) (harness.Result, error) {
+		<-ctx.Done()
+		return harness.Result{ExitCode: -1}, ctx.Err()
+	}
+	doc := &godog.DocString{Content: "nvcf-cli stats get --json"}
+	done := make(chan error, 1)
+	go func() { done <- sc.iPollCommandUntilOutputContains(context.Background(), 1, `"ready"`, doc) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "command poll timed out after 1 seconds") {
+			t.Fatalf("err = %v, want poll timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hanging command was not bounded by the polling deadline")
+	}
+}
+
 func TestISuccessfullyRunCommandRejectsNonZeroExit(t *testing.T) {
 	sc, fake := newScenarioContext(t)
 	fake.result = harness.Result{ExitCode: 2, Stderr: "failed"}
@@ -910,6 +958,23 @@ func TestIExportCommandOutputToEnvRejectsEmptyName(t *testing.T) {
 	err := sc.iExportCommandOutputToEnv(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty name, got nil")
+	}
+}
+
+func TestIExportCommandJSONFieldSetsEnv(t *testing.T) {
+	const name = "BDD_TEST_EXPORT_JSON"
+	t.Setenv(name, "original")
+
+	sc, _ := newScenarioContext(t)
+	sc.LastResult = harness.Result{ExitCode: 0, Stdout: `{"contexts":[{"context":"cluster_id=c1"}]}`}
+	if err := sc.iExportCommandJSONField(context.Background(), "contexts.0.context", name); err != nil {
+		t.Fatalf("export JSON field: %v", err)
+	}
+	if got := os.Getenv(name); got != "cluster_id=c1" {
+		t.Fatalf("got %q, want cluster_id=c1", got)
+	}
+	if err := sc.Suite.EnvLedger.RestoreAll(); err != nil {
+		t.Fatalf("restore: %v", err)
 	}
 }
 
@@ -1871,6 +1936,64 @@ func TestPylonMetricTableRejectsInvalidStructureBeforeRunning(t *testing.T) {
 	}
 }
 
+func TestPrometheusMetricsShouldTotalRunsVisibleExpectations(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	fake.result = harness.Result{ExitCode: 0}
+	t.Setenv("BDD_FUNCTION_ID", "function-1")
+	table := docTable(t, [][]string{
+		{"metric", "labels", "comparison", "total"},
+		{"stargate_routing_session_selections_total", "routing_key=${BDD_FUNCTION_ID},session_state=returning,selection=primary", "exactly", "4"},
+		{"llm_api_gateway_last_cluster_lookups_total", "result=hit", "at least", "4"},
+	})
+
+	err := sc.prometheusMetricsShouldTotal(
+		context.Background(),
+		"9090",
+		"app.kubernetes.io/name=llm-request-router,app.kubernetes.io/instance=llm-request-router",
+		"nvcf",
+		"k3d-ncp-local-cp",
+		"2m",
+		table,
+	)
+	if err != nil {
+		t.Fatalf("observe Prometheus totals: %v", err)
+	}
+	want := "bash tests/bdd/scripts/wait-prometheus-totals.sh 9090" +
+		" app.kubernetes.io/name=llm-request-router,app.kubernetes.io/instance=llm-request-router nvcf k3d-ncp-local-cp 2m" +
+		" stargate_routing_session_selections_total routing_key=function-1,session_state=returning,selection=primary exactly 4" +
+		" llm_api_gateway_last_cluster_lookups_total result=hit 'at least' 4"
+	if len(fake.runs) != 1 || fake.runs[0].command != want {
+		t.Fatalf("runs = %#v, want %q", fake.runs, want)
+	}
+}
+
+func TestPrometheusTotalTableRejectsInvalidStructureBeforeRunning(t *testing.T) {
+	for name, rows := range map[string][][]string{
+		"missing labels header": {
+			{"metric", "comparison", "total"},
+			{"stargate_routing_session_selections_total", "exactly", "1"},
+		},
+		"invalid total": {
+			{"metric", "labels", "comparison", "total"},
+			{"stargate_routing_session_selections_total", "session_state=new", "exactly", "not-a-total"},
+		},
+		"no data rows": {
+			{"metric", "labels", "comparison", "total"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sc, fake := newScenarioContext(t)
+			err := sc.prometheusMetricsShouldTotal(context.Background(), "9090", "app=router", "nvcf", "context", "2m", docTable(t, rows))
+			if err == nil {
+				t.Fatal("expected table validation error")
+			}
+			if len(fake.runs) != 0 {
+				t.Fatalf("runs = %d, want 0 before table validation", len(fake.runs))
+			}
+		})
+	}
+}
+
 func TestJSONOutputContainsRowsAssertion(t *testing.T) {
 	sc, _ := newScenarioContext(t)
 	sc.LastResult = harness.Result{Stdout: `[{"name":"api","namespace":"nvcf"}]`}
@@ -1925,6 +2048,24 @@ func TestRenderedManifestsShouldContainAcceptsExplicitMarkers(t *testing.T) {
 	}
 	if len(fake.runs) != 0 {
 		t.Fatalf("runs = %d, want 0", len(fake.runs))
+	}
+}
+
+func TestRenderedWorkloadEnvShouldEqual(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	renderDir := filepath.Join(sc.Suite.Config.RepoRoot, "out", "rendered")
+	if err := os.MkdirAll(renderDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "kind: Job\nmetadata:\n  name: migrations\nspec:\n  template:\n    spec:\n      containers:\n        - name: migrate\n          env:\n            - name: ALLOWED_DOMAINS\n              value: example.invalid\n"
+	if err := os.WriteFile(filepath.Join(renderDir, "job.yaml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.renderedWorkloadEnvShouldEqual("Job", "migrations", "out/rendered", "migrate", "ALLOWED_DOMAINS", "example.invalid"); err != nil {
+		t.Fatalf("assert rendered environment: %v", err)
+	}
+	if len(fake.runs) != 0 {
+		t.Fatal("render assertion unexpectedly invoked a command")
 	}
 }
 

@@ -28,9 +28,9 @@ import (
 
 	echo "github.com/labstack/echo/v4"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
 )
 
 func TestGatewayTranslatesOnlyStargateOverloadResponses(t *testing.T) {
@@ -154,12 +154,14 @@ func TestProxyResponseStripsInternalHeaders(t *testing.T) {
 		e := echo.New()
 		rec := httptest.NewRecorder()
 		ctx := &GatewayContext{Context: e.NewContext(httptest.NewRequest(http.MethodPost, "/", nil), rec)}
+		const body = `{"error":{"message":"application body"}}`
 		if err := writeProxyResponse(ctx, &provider.ProxyResponse{
-			StatusCode: status, Header: src, Body: io.NopCloser(strings.NewReader("application body")),
+			StatusCode: status, Header: src, Body: io.NopCloser(strings.NewReader(body)),
 		}); err != nil {
-			t.Fatal(err)
+			e.HTTPErrorHandler = newHTTPErrorHandler(false)
+			e.HTTPErrorHandler(err, ctx)
 		}
-		if rec.Code != status || rec.Body.String() != "application body" {
+		if rec.Code != status || rec.Body.String() != body {
 			t.Fatalf("response changed: %d %s", rec.Code, rec.Body.String())
 		}
 		want := http.Header{

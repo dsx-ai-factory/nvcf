@@ -13,14 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-module github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger
+module github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger
 
-go 1.26.1
+go 1.26.10
 
 require (
 	github.com/Masterminds/squirrel v1.5.4
-	github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/common v0.0.0-00010101000000-000000000000
 	github.com/cloudevents/sdk-go/v2 v2.16.2
+	github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/common v0.0.0-00010101000000-000000000000
 	github.com/felixge/httpsnoop v1.0.4
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gocql/gocql v1.7.0
@@ -54,12 +54,12 @@ require (
 )
 
 require (
-	github.com/NVIDIA/nvcf/src/libraries/go/lib v0.0.0-20260923212141-ea12b8777d46
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
+	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260923212141-ea12b8777d46
 	github.com/go-co-op/gocron v1.37.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -100,12 +100,11 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	github.com/uptrace/opentelemetry-go-extra/otelutil v0.3.2 // indirect
+	github.com/uptrace/opentelemetry-go-extra/otelutil v0.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.62.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.42.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.42.0 // indirect
-	go.opentelemetry.io/otel/log v0.11.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
@@ -124,6 +123,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/common => ./common
+replace github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/common => ./common
 
 replace nhooyr.io/websocket v1.8.7 => github.com/coder/websocket v1.8.7
+
+replace github.com/dsx-ai-factory/nvcf/src/libraries/go/lib => ../../libraries/go/lib

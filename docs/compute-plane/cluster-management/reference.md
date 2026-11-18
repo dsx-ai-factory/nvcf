@@ -10,28 +10,35 @@ version for the authoritative list of parameters and defaults:
 
 </Warning>
 
+Image tags in the override examples describe the selected stack combination.
+The Compute Plane package passes its credential-helper tag through
+`global.nvcaOperator.selfManaged.imageCredHelper.imageTag`; the selected
+package sets `0.11.3`. A standalone chart can have an older default. Set the
+example override explicitly when using that image outside the stack, and
+check the rendered backend configuration before applying.
+
 ## How Values Are Structured
 
 The chart values are organized into two layers:
 
-1. **Shared parameters** (top-level) — These control the operator image, authentication,
+1. Shared parameters (top-level): These control the operator image, authentication,
    node placement, network policies, observability, agent resources, and agent runtime config.
    Examples: `image`, `ngcConfig`, `nodeSelector`, `networkPolicy`, `agent`,
    `agentConfig`.
-2. **\`\`selfManaged.\*\`\`** — Used when `ngcConfig.clusterSource` is `"self-managed"`.
+2. \`\`selfManaged.\*\`\`: Used when `ngcConfig.clusterSource` is `"self-managed"`.
    These define the backend configuration including NVCA version, feature gates, cluster
    attributes, and manual GPU config.
 
-**The key field is \`\`ngcConfig.clusterSource\`\`:**
+The key field is \`\`ngcConfig.clusterSource\`\`:
 
-- `"self-managed"` — The operator reads backend configuration from `selfManaged.*` values.
+- `"self-managed"`: The operator reads backend configuration from `selfManaged.*` values.
 
 ```yaml
 # --- Shared parameters (all modes) ---
 image:
   repository: "nvcr.io/nvidia/nvcf-byoc/nvca-operator"
 ngcConfig:
-  clusterSource: "helm-managed"    # ← This determines which section below is used
+  clusterSource: "helm-managed"    # This determines which section below is used
   serviceKey: "<your-key>"
 nodeSelector:
   key: "node.kubernetes.io/instance-type"
@@ -94,7 +101,7 @@ logLevel: info                  # debug, info, warn, error
 priorityClassName: ""           # K8s PriorityClassName for eviction preference
 k8sVersionOverride: ""          # Override K8s version NVCA registers with
 enableGXCache: true             # Enable GXCache support
-ddcsIPAllowList: ""             # Comma-separated CIDRs for DDCS access control
+ddcsIPAllowList: ""             # Comma-separated CIDRs for OVDC access control (legacy key name)
 nvcaHelmRepositoryPrefix: ""    # Restrict Helm repos to specific org/team
 ```
 
@@ -132,9 +139,13 @@ networkPolicy:
 
 ### OpenTelemetry
 
+Set the endpoint for your collector when enabling tracing. See
+[Tracing](./monitoring.md#tracing) for endpoint selection and verification.
+
 ```yaml
 otel:
   enabled: false
+  endpoint: ""          # Required when enabled; OTLP gRPC host:port
   lightstep:
     serviceName: ""        # Lightstep service name
     accessToken: ""        # Lightstep API token
@@ -173,7 +184,7 @@ agentConfig:
 otelCollector:
   enabled: false
   imageRepository: ""       # Auto-calculated if empty
-  imageTag: 0.143.2
+  imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Helm-Managed Parameters
@@ -202,10 +213,10 @@ helmManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 ## Self-Managed Parameters
@@ -222,10 +233,10 @@ selfManaged:
   ## Image overrides (advanced, usually auto-calculated)
   imageCredHelper:
     imageRepository: ""
-    imageTag: 0.11.1
+    imageTag: 0.11.4
   otelCollector:
     imageRepository: ""
-    imageTag: 0.143.2
+    imageTag: 0.160.0-nv-0.4.7
 ```
 
 <Note>
@@ -233,7 +244,7 @@ The `selfManaged` and `helmManaged` sections share the same backend fields. The 
 differences are:
 
 - `selfManaged` does not have cluster identity fields (`cloudProvider`,
-  `clusterRegion`, `clusterGroupID`, `clusterGroupName`) — these come from the
+  `clusterRegion`, `clusterGroupID`, `clusterGroupName`): these come from the
   self-hosted control plane.
 - `selfManaged.featureGateValues` defaults to `["DynamicGPUDiscovery"]`. To disable a
   feature, remove it from the list (set to `[]`).
@@ -244,5 +255,5 @@ differences are:
 
 ## Related Documentation
 
-- [NVCA Configuration](./configuration.md) — how to use these values to configure specific features (caching, network policies, manual instance config, etc.)
-- [Agent config merging](./configuration.md) — using `agentConfig.mergeConfig` for runtime config overrides
+- [NVCA Configuration](./configuration.md): how to use these values to configure specific features (caching, network policies, manual instance config, etc.)
+- [Agent config merging](./configuration.md): using `agentConfig.mergeConfig` for runtime config overrides

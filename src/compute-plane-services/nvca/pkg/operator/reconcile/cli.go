@@ -25,18 +25,19 @@ import (
 	"fmt"
 	"time"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
-	nvcaoperatorerrors "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/internal/errors"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	nvcaoperatorerrors "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/internal/errors"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
-	cmnsecret "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/secret"
-	nvversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	cmnsecret "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/secret"
+	nvversion "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	cli "github.com/urfave/cli/v2"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/mirror"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/reconcile/clustermgmt"
-	nvcaoptypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/clustervalidator"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/mirror"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/reconcile/clustermgmt"
+	nvcaoptypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 
 	"github.com/bombsimon/logrusr/v4"
 	corev1 "k8s.io/api/core/v1"
@@ -110,6 +111,16 @@ func NewOperatorCommand() *cli.Command {
 				Name:    "pod-namespace",
 				EnvVars: []string{"POD_NAMESPACE"},
 				Usage:   "Namespace of this pod (from Downward API)",
+			},
+			&cli.BoolFlag{
+				Name:    "cluster-validator-enabled",
+				EnvVars: []string{clustervalidator.EnabledEnv},
+				Usage:   "The chart runs the cluster-validator, so the agent publishes its metrics baseline",
+			},
+			&cli.StringFlag{
+				Name:    "cluster-validator-cronjob",
+				EnvVars: []string{clustervalidator.InitialRunCronJobEnv},
+				Usage:   "Cluster-validator CronJob in this pod's namespace to run whenever its validator spec changes",
 			},
 			&cli.StringFlag{
 				Name:    "deployment-name",
@@ -469,6 +480,8 @@ func doAction(c *cli.Context) error {
 		ShutdownAddr:                      c.String("listen-shutdown"),
 		PodName:                           c.String("pod-name"),
 		PodNamespace:                      c.String("pod-namespace"),
+		ClusterValidatorEnabled:           c.Bool("cluster-validator-enabled"),
+		ClusterValidatorCronJob:           c.String("cluster-validator-cronjob"),
 		DeploymentName:                    c.String("deployment-name"),
 		SystemNamespace:                   c.String("system-namespace"),
 		PriorityClassName:                 c.String("priority-class-name"),

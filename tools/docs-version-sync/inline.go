@@ -18,18 +18,26 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 func SyncInlineVersions(path, content string, catalog *Catalog) (string, bool, error) {
+	if sync := inlineVersionSyncer(path); sync != nil {
+		return sync(content, catalog)
+	}
+	return content, false, nil
+}
+
+func inlineVersionSyncer(path string) func(string, *Catalog) (string, bool, error) {
 	switch path {
 	case "docs/overview/image-mirroring.md":
-		return syncImageMirroring(content, catalog)
+		return syncImageMirroring
 	case "docs/compute-plane/cluster-management/self-managed.md":
-		return syncClusterManagementSelfManaged(content, catalog)
+		return syncClusterManagementSelfManaged
 	case "docs/compute-plane/cluster-management/reference.md":
-		return syncClusterManagementReference(content, catalog)
+		return syncClusterManagementReference
 	default:
-		return content, false, nil
+		return nil
 	}
 }
 
@@ -49,6 +57,15 @@ func syncImageMirroring(content string, catalog *Catalog) (string, bool, error) 
 	if chartName == "" {
 		chartName = chart.Name
 	}
+	variables := regexp.MustCompile(fmt.Sprintf(`(?m)^CHART_NAME="(?:helm-nvca-operator|%s)"\nCHART_VERSION="[^"\n]+"\nCHART_REFERENCE=[^\n]+`, regexp.QuoteMeta(chartName)))
+	total += len(variables.FindAllStringIndex(updated, -1))
+	referenceAssignment := pullReference
+	if !strings.HasPrefix(referenceAssignment, `"`) {
+		referenceAssignment = fmt.Sprintf("%q", referenceAssignment)
+	}
+	updated = variables.ReplaceAllStringFunc(updated, func(string) string {
+		return fmt.Sprintf("CHART_NAME=%q\nCHART_VERSION=%q\nCHART_REFERENCE=%s", chartName, chart.Version, referenceAssignment)
+	})
 	updated, count = replaceNVCAOperatorChartPull(updated, pullReference, chartName, chart.Version)
 	total += count
 	updated, count = replaceNVCAOperatorChartArchiveComments(updated, chart.Version)

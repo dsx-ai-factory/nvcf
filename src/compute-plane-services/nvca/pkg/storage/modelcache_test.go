@@ -27,9 +27,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -50,13 +50,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	nvcaenvtest "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/envtest"
-	modelcachetypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	nvcav1new "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1"
-	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	featureflagmock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcaenvtest "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/envtest"
+	modelcachetypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/modelcachetypes"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	nvcav1new "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1"
+	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	featureflagmock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 func TestReconcile_ModelCache(t *testing.T) {
@@ -1343,6 +1343,17 @@ func createSharedFSModelCacheRequest(
 	t *testing.T, ctx context.Context, c client.Client, cacheHandle, workloadNSName string,
 ) (*corev1.Namespace, *nvcav2beta1.ICMSRequest, *nvcav1new.StorageRequest) {
 	t.Helper()
+	return createSharedFSModelCacheRequestWithAnnotations(t, ctx, c, cacheHandle, workloadNSName, nil)
+}
+
+// createSharedFSModelCacheRequestWithAnnotations is the shared-FS request
+// fixture with annotations on the ICMSRequest, so a test can persist the
+// storage selection the agent would have recorded.
+func createSharedFSModelCacheRequestWithAnnotations(
+	t *testing.T, ctx context.Context, c client.Client, cacheHandle, workloadNSName string,
+	annotations map[string]string,
+) (*corev1.Namespace, *nvcav2beta1.ICMSRequest, *nvcav1new.StorageRequest) {
+	t.Helper()
 	srNamespace := &corev1.Namespace{}
 	srNamespace.Name = types.DefaultICMSRequestNamespace
 	require.NoError(t, c.Create(ctx, srNamespace))
@@ -1354,6 +1365,7 @@ func createSharedFSModelCacheRequest(
 
 	sr := &nvcav2beta1.ICMSRequest{}
 	sr.Name, sr.Namespace = workloadNS.Name, srNamespace.Name
+	sr.Annotations = annotations
 	sr.Spec = newModelCacheICMSSpec(cacheHandle)
 	require.NoError(t, c.Create(ctx, sr))
 
@@ -2388,3 +2400,64 @@ func TestNewSharedFSReaderPVTakesMountOptionsFromSelection(t *testing.T) {
 		"the catalog's reader options are required and the configured rw must not negate them")
 	assert.True(t, roPV.Spec.CSI.ReadOnly)
 }
+
+// TestReconcile_ModelCacheSharedFSWriterIdentity pins that the Helm
+// shared-filesystem writer honors the identity the agent persisted on the
+// request: root where the CSI driver skips fsGroup on ReadWriteMany claims,
+// the translator's non-root identity everywhere else.
+func TestReconcile_ModelCacheSharedFSWriterIdentity(t *testing.T) {
+	cases := []struct {
+		name         string
+		identity     string
+		wantUID      int64
+		wantNonRoot  *bool
+		wantExplicit bool
+	}{
+		{name: "root", identity: ModelCacheWriterIdentityRoot, wantUID: 0, wantNonRoot: ptrBool(false), wantExplicit: true},
+		{name: "fsgroup", identity: ModelCacheWriterIdentityFSGroup, wantUID: 65532},
+		{name: "legacy", identity: "", wantUID: 65532},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, c, _, _ := startModelCacheController(t, nvcaconfig.Config{})
+			require.NoError(t, c.Create(ctx, &storagev1.StorageClass{
+				ObjectMeta:  metav1.ObjectMeta{Name: HelmCacheSharedStorageClassName},
+				Provisioner: SMBCSIDriverName,
+			}))
+			cacheHandle := "sharedfsid" + tc.name
+			var annotations map[string]string
+			if tc.identity != "" {
+				annotations = map[string]string{ModelCacheStorageSelectionAnnotationKey: sharedFSSelectionAnnotation(t, tc.identity)}
+			}
+			createSharedFSModelCacheRequestWithAnnotations(t, ctx, c, cacheHandle, "sr-sharedfs-"+tc.name, annotations)
+
+			initJob := &batchv1.Job{}
+			assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+				assert.NoError(ct, c.Get(ctx, client.ObjectKey{Name: "writer-job-" + cacheHandle, Namespace: ModelCacheInitNamespace}, initJob))
+			}, 5*time.Second, 50*time.Millisecond)
+
+			var writer *corev1.Container
+			for i := range initJob.Spec.Template.Spec.Containers {
+				if MountsSharedClaimReadWrite(&initJob.Spec.Template.Spec.Containers[i]) {
+					writer = &initJob.Spec.Template.Spec.Containers[i]
+				}
+			}
+			require.NotNil(t, writer, "the translator's writer container mounts the model volume read-write")
+			require.NotNil(t, writer.SecurityContext)
+			require.NotNil(t, writer.SecurityContext.RunAsUser)
+			assert.EqualValues(t, tc.wantUID, *writer.SecurityContext.RunAsUser)
+			if tc.wantExplicit {
+				require.NotNil(t, writer.SecurityContext.RunAsNonRoot)
+				assert.Equal(t, *tc.wantNonRoot, *writer.SecurityContext.RunAsNonRoot)
+			} else {
+				assert.Nil(t, writer.SecurityContext.RunAsNonRoot, "the translator sets no container-level runAsNonRoot")
+			}
+			// Readers never gain privileges whatever the writer runs as.
+			if fsGroup := initJob.Spec.Template.Spec.SecurityContext.FSGroup; assert.NotNil(t, fsGroup) {
+				assert.EqualValues(t, 65532, *fsGroup, "the translator's fsGroup is kept")
+			}
+		})
+	}
+}
+
+func ptrBool(b bool) *bool { return &b }

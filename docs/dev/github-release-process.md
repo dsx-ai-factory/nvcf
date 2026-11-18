@@ -7,6 +7,15 @@ the sole tag and release authority, publishing is live, and a merge to
 except the three under `deploy/stacks/`, which release from a
 maintenance branch instead.
 
+## Umbrella product releases
+
+An umbrella product release packages exact independently released stacks. It
+uses the explicit `Publish Umbrella Release` workflow and `nvcf/X.Y.Z` tag
+namespace. Component release triggers remain unchanged. Documentation
+corrections can advance an approved docs revision under the same umbrella
+version without creating another release. Follow the
+[qualification, activation, and rollback procedure](umbrella-releases.md).
+
 ## Publish gate
 
 The workflow reads these repository variables:
@@ -39,12 +48,12 @@ GitHub is the sole tag and release authority. The active release path
 is:
 
 ```text
-NVIDIA/nvcf -> GitLab mirror -> scheduled internal release dispatcher -> image release pipeline
+NVIDIA/nvcf -> GitLab mirror -> scheduled internal release dispatcher -> image or chart release pipeline
 ```
 
-After a GitHub tag and release appear in the mirror, the scheduled
-internal release dispatcher detects eligible releases and starts the
-image release pipeline.
+The scheduled internal release dispatcher polls GitHub releases. Once a
+release's tag has reached the mirror, it starts the image or chart
+release pipeline.
 
 ## Service auto-tags
 
@@ -123,11 +132,15 @@ branch rather than the highest-sorting tag, because the highest tag can
 sit on a maintenance branch this history never contained. It covers
 every commit since that tag rather than only the tagged commit, because
 the workflow's concurrency group cancels queued runs and a superseded
-push is first tagged by the next run to finish.
+push is first tagged by the next run to finish. A dependency-triggered
+release, described below, comments only on the pull requests of the
+dependency commits it lists. The rest of the range did not change what
+it ships.
 
-For `nvcf-compute-plane-stack`, GitHub-created
-`deploy/stacks/nvcf-compute-plane/v*` tags are mirrored. The scheduled
-release dispatcher then starts the stack image and package pipeline.
+For all three stacks, the tag workflow publishes the original resolved
+inventory. The scheduled dispatcher can start a separate resource packaging
+lane after the tag is mirrored. Resource packaging does not publish the images
+or charts referenced by the stack.
 
 For semantic-release services, the GitHub workflow uses these release
 rules:
@@ -162,7 +175,10 @@ the following hold:
 - semantic-release computed no version for that service on this run. If
   the same push also touched the service, semantic-release owns the
   version and nothing extra is tagged.
-- The service already has a release tag to bump from.
+- The service already has a stable release tag, reachable from the
+  branch, to bump from. This is the baseline semantic-release uses, so
+  a prerelease, or a higher tag on a maintenance branch this history
+  never contained, is never bumped.
 - At least one release-worthy commit touching a framework path landed
   since that tag. Release-worthiness uses the same rules listed above: a
   framework `feat:`, `fix:`, `perf:`, or breaking `!` commit fans out; a
@@ -183,6 +199,51 @@ changes in the service directory can see why the version moved.
 
 Dry-run mode prints the tag and notes it would create and creates
 nothing, the same as every other release path in this script.
+
+## Go SDK and base image dependency releases
+
+Go services have the same gap. Two shared inputs reach every Go service
+image without touching the service directory:
+
+- The Bazel Go SDK, declared once in `tools/go-toolchain/go.mod`.
+  `rules_go` compiles every `go_binary` with it.
+- The base images pinned by `oci.pull` in `MODULE.bazel`. An image
+  target takes one as its `base`, for example
+  `base = "@distroless_go"`.
+
+`tools/ci/github-release auto` fans these out as well. It parses each
+service's own `BUILD.bazel` files for the edge, so there is no second
+list to keep in sync:
+
+- A registered subproject is a Go service when a `BUILD.bazel` file
+  under its path declares a `go_binary`. Files under `vendor/` and
+  `node_modules/` are ignored.
+- Its base images are the `oci.pull` repositories its image targets
+  take as `base`. A repository named only in a comment or in another
+  attribute does not count.
+- An image target that sets no `base` is tied to no base image, even
+  though its image macro supplies a default. Not every image target is
+  shipped, and a repin of the default must not release a service that
+  only builds such an image for development. Set `base` on a published
+  image so that a repin of its base releases the service.
+- A `BUILD.bazel` file that does not parse stops the run with an error
+  naming the file.
+
+A Go service gets a dependency-triggered release under the same
+conditions as a Java service: semantic-release computed no version for
+it on this run, it has a stable release tag reachable from the branch,
+and at least one release-worthy commit since that tag changed one of
+its inputs. A commit counts when it changed the SDK version that
+`tools/go-toolchain/go.mod` selects, which is its `toolchain` line, or
+its `go` line when there is no `toolchain` line. It also counts when it
+changed the `oci.pull` declaration of one of the service's own bases.
+Other edits to either file release nothing, including comment and
+formatting edits. A base image bump releases only the services built on
+that base.
+
+The bump is always a patch. Use `fix:` for a Go SDK or base image
+update that must ship, such as a security fix. Use `build:` or `chore:`
+when the services can wait for their next release.
 
 ## Release notes for pushed tags
 
@@ -208,15 +269,15 @@ release metadata still declares `legacy_tag_prefix`:
 
 Invalid tags are skipped without creating a GitHub release.
 
-## Image publishing bridge
+## Image and chart publishing bridge
 
-GitHub does not need image-publishing credentials. Tag pushes only run
-the GitHub release-note workflow. Image publishing starts after the tag
-and release appear in the mirror.
+Tag pushes do not publish images or Helm charts. They only run the
+GitHub release-note workflow. Image and chart publishing starts after
+the GitHub release is published and its tag reaches the mirror.
 
-After a GitHub tag and release are mirrored, the scheduled release
-dispatcher detects eligible releases and starts the corresponding image
-release pipeline. The pipeline uses the mirrored source ref and release
+The scheduled release dispatcher polls GitHub releases. For each
+eligible release whose tag has reached the mirror, it starts the
+corresponding image or chart release pipeline. The pipeline uses the mirrored source ref and release
 metadata to build, promote, and publish artifacts. The mirror tag
 pipeline does not publish artifacts.
 
@@ -229,6 +290,57 @@ Package metadata uses SemVer without the leading `v`:
 | `src/compute-plane-services/nvca/v3.0.0` | `3.0.0` |
 | `deploy/helm/nvca-operator/v1.11.1-rc.1` | `1.11.1-rc.1` |
 | `nvcf-ratelimiter-v1.15.1` | `1.15.1` |
+
+## Automatic pin bumps
+
+Published releases open reviewed bot Pull Requests against `main`. They
+do not release a stack. A stack still releases only from its release
+branch.
+
+- A service release runs `.github/workflows/chart-version-bump.yml`. It
+  moves each target whose `deploys` entry in
+  `tools/ci/github-release-subprojects.json` names the service. A chart
+  target moves its image tag or declared values paths. A stack target
+  moves the paths its `values_files` declare, such as the compute-plane
+  `global.nvcaOperator.imageTag` and
+  `global.nvcaOperator.selfManaged.nvcaVersion` on an NVCA release.
+- A chart release runs `.github/workflows/stack-pin-bump.yml`. It moves
+  the `version:` of every Helmfile release under `deploy/stacks/` that
+  pins that chart, such as `helm-nvca-operator` in the compute-plane
+  stack.
+
+For an upgrade-sensitive service, its object-form `deploys` entry can set
+`manual_bump_reason`. The bumper reports that reason and leaves the pins
+unchanged; the dependency remains in the chart inventory. OpenBao server,
+agent, and migration pins use this policy because they must match the JWT
+plugin lifecycle mode. Change those pins together in a reviewed upgrade using
+the [JWT plugin procedure](../self-managed/runbooks/openbao-jwt-plugin-upgrade.md).
+Do not change the lifecycle mode automatically to accommodate a new image.
+
+When a bump changes anything under `deploy/stacks/nvcf-compute-plane`,
+the workflow renders that stack's golden fixtures again with
+`tools/ci/refresh-compute-plane-goldens` and commits them on top of the
+bumps. Each run drops the previous fixture commit and renders them again
+for what the branch then pins. If the render fails, the pull request says
+so and the run fails. Render them by hand with
+`make -C deploy/stacks/nvcf-compute-plane generate-golden`, or let the
+next bump run render them again. A chart reaches its registry after its
+GitHub release, so the first render after a chart release can fail this
+way.
+
+The `compute-plane goldens` workflow renders the stack and compares the
+result with the fixtures. It runs for:
+
+- Pull requests that target `main`, `release-**`, or `release/**`.
+- Pushes to `main`.
+- Manual runs through `workflow_dispatch`.
+
+Pull requests and pushes run it only when they change
+`deploy/stacks/nvcf-compute-plane/`,
+`.github/workflows/compute-plane-goldens.yml`, or
+`tools/ci/refresh-compute-plane-goldens`. A pull request from a fork gets
+a notice instead. The check fails when the fixtures do not match, or when
+the chart registry secrets are not set.
 
 ## Release branches
 
@@ -258,13 +370,51 @@ Examples:
 
 Slashes remain branch namespace separators.
 
+### Patch an existing component minor
+
+Start from the latest stable patch in the required major/minor line, rather
+than the older patch currently selected by a stack. Reuse that release if it
+already contains the required fix and its published artifacts pass validation.
+Otherwise backport the missing fix and release the next ordinary patch version.
+
+Use `main` when it still belongs to the required minor and its unreleased changes
+are compatible with the patch. When development has moved to a later minor,
+create `release-<component-path>/vX.Y` from the latest release in the selected
+line. Preserve the released tree and comply with the release branch's linear
+history rules. Review the backport through a Pull Request targeting that branch.
+The `branch-cut` command is restricted to version-file registrations; it does
+not create ordinary service or chart maintenance branches.
+
+A service or chart maintenance merge does not create a tag automatically. After
+review and validation, publish the unused tag rendered from the registration's
+`tag_format`, or `<component-path>/vX.Y.Z` when no override exists, from the
+reviewed maintenance commit. Confirm that both the tag and its non-draft GitHub Release exist; the
+downstream dispatcher polls Releases. A historical branch can contain older
+tag-workflow behavior. Inspect that workflow before release creation and
+recover a failed release-note step without moving the immutable source tag.
+
+Automatic chart and stack pin updates skip releases with a lower major, minor,
+or patch than the selected pin. A patch for an older minor must not downgrade
+the default branch. Update maintenance stack pins through their own reviewed
+Pull Requests after the component artifacts are verified. A stack inventory
+renders a source chart from its release tag, so keep a chart maintenance
+branch after tagging from it; the inventory looks for the tag there.
+
+Run the affected stack checks before merging its maintenance branch. These
+merges can create stable GitHub source releases and inventories independently
+of umbrella QA. Select the completed releases in the umbrella manifest, then
+qualify that combination. Customer stack-resource publication remains a
+separate gate; it is not required for candidate assembly. Follow
+[the umbrella release workflow](umbrella-releases.md).
+
 ## The version-file model
 
 `nvcf-compute-plane-stack`, `nvcf-self-managed-stack`, and
 `nvcf-observability-stack` declare `version_file` and
 `release_branch_only`. They do not use semantic-release. A stack is a
-pinned composition of charts, so its version states which set was
-qualified together, and semantic-release answers a different question:
+pinned composition of charts. Its version identifies those inputs; runtime
+qualification records which combinations work together. Semantic-release
+answers a different question:
 what the commits since the last tag imply.
 
 NVCA declared the same pair until the 3.3 line and now uses
@@ -315,6 +465,28 @@ release branch is a parallel history: its tags are not ancestors of
 `main`, which is why `release_baseline_version` filters on
 reachability.
 
+The snapshot records the selected default-branch commit in a
+`Snapshot-Of: <sha>` trailer, and that commit must hold the snapshot's
+tree. Chart tags released from the default branch are ancestors of that
+commit but not of the snapshot. The stack inventory accepts a pinned
+source chart tag that is an ancestor of the stack commit or of the
+recorded commit. A snapshot cut before the trailer existed is matched to
+a commit in the checkout with the same tree.
+
+A patch on the train can also pin a chart version released after the
+cut. The inventory accepts a chart tag outside the stack's history when
+`origin/main` or the chart's maintenance branch for that minor,
+`origin/release-<tag prefix>X.Y`, contains it. The tag workflow's
+full-history checkout fetches every branch. Any other chart tag is
+rejected, so the inventory still renders only reviewed chart source.
+
+The `VERSION` bump pull request is a single commit on top of the
+selected default-branch commit, pushed to
+`chore/release-train/<service id>/vX.Y-to-vX.Y+1`. It carries the
+default branch's history, including its merges, so it stays outside the
+`release-*` branch names that the release ruleset holds to a linear
+history.
+
 Re-running `branch-cut` is safe. An existing release branch whose tree
 matches the selected base is reused, one whose tree differs is an
 error, and an open bump pull request is reported rather than replaced.
@@ -349,9 +521,8 @@ For example, to ship self-managed stack `1.0.2` after `1.0.1`:
    `1.0.1`. The branch's `VERSION` can remain `1.0.0`; its patch field
    does not select the next patch once stable tags exist.
 3. The tag workflow prepares the GitHub Release and its inventory.
-   The workflow publishes any configured Helm chart before it creates
-   the GitHub Release. Image publishing follows the bridge described
-   above, after the tag and release are mirrored.
+   Resource packaging can follow once the tag reaches the mirror. Referenced
+   images and charts retain their own release and publication workflows.
 
 Re-running `auto` at an already-tagged commit creates no additional
 patch. Merging the default-branch `VERSION` bump pull request also
@@ -424,13 +595,13 @@ Documentation has one SemVer docs edition for the qualified combination of all
 three stacks. Stack artifacts keep their independent releases. A stack release
 does not qualify or publish a docs edition automatically.
 
-Use `edition prepare` with a reviewed source commit and all three exact versions.
-After qualification, protect and register the full-version `docs/releases/X.Y.Z`
-branch. Do not create docs tags or per-stack snapshot folders. Corrections use a
-new patch edition; existing docs release branches remain unchanged.
-
-See [the docs edition workflow](./docs-editions.md) for release and rollback
-commands.
+Legacy immutable editions use `edition prepare` and protected
+`docs/releases/X.Y.Z` branches. Their corrections allocate a new patch edition.
+Umbrella product releases use the separate maintained-docs model where the
+manifest schema is supported. Schema 2 docs activation is a separate follow-up;
+a successful product bundle does not enable it. See the
+[docs model selection](docs-editions.md#choose-the-docs-model) and
+[umbrella docs workflow](umbrella-releases.md) before selecting commands.
 
 ## NVCA's cutover onto semantic-release
 
@@ -664,3 +835,60 @@ above. A tag pushed with the `NV_GITHUB_TOKEN` secret, or another
 workflow-capable token, starts the tag workflow, but it stays inert
 if either variable is unset, falling back to dry-run. Tags pushed
 with the default `GITHUB_TOKEN` do not trigger the follow-up workflow.
+
+## Shared bump branches
+
+The chart version bump and stack pin bump workflows add one commit per
+release to `chore/chart-version-bumps` and `chore/stack-pin-bumps`.
+Before a run applies its own bump, `tools/ci/prepare-stack-pin-branch`
+replays the branch onto `main`, oldest commit first:
+
+- A commit that still applies is kept.
+- A commit that is already on `main` is dropped.
+- A bump commit that conflicts with `main` is regenerated. A conflict
+  means `main` moved the same pin, for example through a manual bump.
+  The helper runs the workflow's bump tool again for the release tag
+  that the commit message records. A release older than the current
+  pin moves nothing and drops out.
+- Any other commit that conflicts stops the run, and nothing is pushed.
+  A person wrote it, so a person decides how it applies.
+
+Each run pushes the branch with the `NV_GITHUB_TOKEN` secret, so the push
+starts the Pull Request checks. A push made with the default
+`GITHUB_TOKEN` starts no workflow, which left bump Pull Requests without
+CI until a person pushed to them. Without the secret, for example on a
+fork, the push falls back to `GITHUB_TOKEN`. The checkout keeps no
+credential, and only the push and Pull Request steps hold a token.
+
+A `release` event runs the workflow file from the released commit. A tag
+cut from a branch that predates a workflow change runs the older
+workflow. A run dispatched from `main` uses the current one.
+
+### Recover a stopped bump branch
+
+Use these steps when a run stops on a hand-written commit, or when
+release events failed before their bumps were recorded.
+
+1. Land any change from the hand-written commit that must stay, such as
+   release metadata, through its own Pull Request.
+2. Record the release tags the branch carries. Deleting the branch
+   drops their bumps too:
+
+   ```bash
+   git log --format=%B origin/main..origin/<bump-branch> | grep '^Opened by'
+   ```
+
+3. Delete the bump branch. Its bot Pull Request closes, and the next run
+   starts the branch from `main`.
+4. Dispatch the workflow from `main` for the newest release tag of each
+   service from step 2, and of each service whose release event failed.
+   The bump tools only move a pin forward, so the newest tag also covers
+   the older releases of that service.
+
+A dry run on `main` shows whether a tag still moves a pin. It prints a
+`<chart>: <from> -> <to>` line for each pin that would move:
+
+```bash
+tools/ci/chart-version-bumper --tag <service-path>/v<version>
+gh workflow run chart-version-bump.yml --ref main -f tag=<service-path>/v<version>
+```

@@ -16,9 +16,9 @@ limitations under the License.
 -->
 # NVCF Container Cache
 
-**Version:** 0.25.12
-**Application Version:** 1.2.1
-**Chart Name:** nvcf-container-cache
+Version: 0.25.12
+Application Version: 1.2.1
+Chart Name: nvcf-container-cache
 
 ## Table of Contents
 
@@ -41,22 +41,22 @@ limitations under the License.
 
 NVCF Container Cache is a high-performance caching system with two complementary modes:
 
-- **Container Cache** -- caches container image pulls (OCI/Docker registry protocol) for containerd and CRI-O
-- **Proxy Cache** -- caches S3 objects, NGC assets, HuggingFace models, and Nucleus files via DNS-based MITM
+- Container Cache -- caches container image pulls (OCI/Docker registry protocol) for containerd and CRI-O
+- Proxy Cache -- caches S3 objects, NGC assets, HuggingFace models, and Nucleus files via DNS-based MITM
 
 Both run in the same StatefulSet pod and share the OpenResty/Nginx engine with dynamic TLS certificate generation.
 
 ### Key Features
 
-- **Multi-runtime**: Supports both containerd and CRI-O for container image caching
-- **Multi-endpoint**: S3, NGC Files, HuggingFace CDN, Nucleus/LFT for proxy caching
-- **Multi-registry**: NGC, Docker Hub, GCR, ECR, and any OCI-compliant registry
-- **Transparent fallback**: If the cache is unavailable, container pulls fall through to the upstream registry
-- **DNS-based MITM**: nvcf-unbound DNS redirects S3/NGC/HF traffic to the proxy cache transparently
-- **Dynamic TLS**: Generates leaf certificates on-the-fly signed by a bundled CA (SNI-based)
-- **Auto-configuration**: DaemonSet configures container runtimes on every node automatically
-- **Disk-pressure aware**: `min_free` watermark prevents the cache from filling the disk
-- **Observable**: Prometheus metrics, structured JSON logs, optional OpenTelemetry traces
+- Multi-runtime: Supports both containerd and CRI-O for container image caching
+- Multi-endpoint: S3, NGC Files, HuggingFace CDN, Nucleus/LFT for proxy caching
+- Multi-registry: NGC, Docker Hub, GCR, ECR, and any OCI-compliant registry
+- Transparent fallback: If the cache is unavailable, container pulls fall through to the upstream registry
+- DNS-based MITM: nvcf-unbound DNS redirects S3/NGC/HF traffic to the proxy cache transparently
+- Dynamic TLS: Generates leaf certificates on-the-fly signed by a bundled CA (SNI-based)
+- Auto-configuration: DaemonSet configures container runtimes on every node automatically
+- Disk-pressure aware: `min_free` watermark prevents the cache from filling the disk
+- Observable: Prometheus metrics, structured JSON logs, optional OpenTelemetry traces
 
 ---
 
@@ -106,15 +106,15 @@ Caches container image layers and manifests pulled by containerd or CRI-O. Routi
      +----------------------------------------------------+
 ```
 
-**How a cached pull works:**
+How a cached pull works:
 
-1. **kubelet** asks the container runtime to pull `nvcr.io/nvidia/cuda:12.4.0`
-2. **containerd/CRI-O** checks its mirror config (`hosts.toml` / `registries.conf`)
-3. The request is routed to the **cache proxy** (via NodePort or pod IP)
-4. The proxy checks its **on-disk cache**:
-   - **HIT**: Returns the cached layer immediately
-   - **MISS**: Fetches from the upstream registry, caches it, and returns it
-5. If the cache proxy is **unreachable**, the runtime falls back to the **upstream registry** directly
+1. kubelet asks the container runtime to pull `nvcr.io/nvidia/cuda:12.4.0`
+2. containerd/CRI-O checks its mirror config (`hosts.toml` / `registries.conf`)
+3. The request is routed to the cache proxy (via NodePort or pod IP)
+4. The proxy checks its on-disk cache:
+   - HIT: Returns the cached layer immediately
+   - MISS: Fetches from the upstream registry, caches it, and returns it
+5. If the cache proxy is unreachable, the runtime falls back to the upstream registry directly
 
 ### Proxy Cache
 
@@ -153,30 +153,30 @@ Caches S3 objects, NGC assets, and HuggingFace models. Uses DNS-based MITM via n
      +---------------------------------------------+
 ```
 
-**How DNS-based MITM caching works:**
+How DNS-based MITM caching works:
 
-1. A **training pod** calls `s3.us-east-1.amazonaws.com` to download a dataset
-2. The DNS query goes to **nvcf-unbound**, which returns a CNAME pointing to `nvcf-proxy-cache.container-caching.svc.cluster.local`
-3. The pod connects to the **cache pod** on port 14128 via TLS, presenting the original hostname as SNI
-4. **lua-ssl.lua** dynamically generates a leaf certificate matching the SNI hostname
-5. The cache checks its **on-disk cache** (`proxy_s3` or `proxy_ngc` zone):
-   - **HIT**: Returns the cached response immediately
-   - **MISS**: Proxies to the real upstream, caches the response, and returns it
+1. A training pod calls `s3.us-east-1.amazonaws.com` to download a dataset
+2. The DNS query goes to nvcf-unbound, which returns a CNAME pointing to `nvcf-proxy-cache.container-caching.svc.cluster.local`
+3. The pod connects to the cache pod on port 14128 via TLS, presenting the original hostname as SNI
+4. lua-ssl.lua dynamically generates a leaf certificate matching the SNI hostname
+5. The cache checks its on-disk cache (`proxy_s3` or `proxy_ngc` zone):
+   - HIT: Returns the cached response immediately
+   - MISS: Proxies to the real upstream, caches the response, and returns it
 6. The pod receives the response as if it came directly from S3 -- completely transparent
 
 ### Authentication Flow (Container Registries)
 
-The cache validates credentials on **every request** by sending a HEAD to the upstream registry before serving cached content. This ensures revoked or rotated keys are rejected immediately.
+The cache validates credentials on every request by sending a HEAD to the upstream registry before serving cached content. This ensures revoked or rotated keys are rejected immediately.
 
 ![Container Registry Auth Flow](docs/container-registry-auth-flow.png)
 
 Key behaviors:
 
-- **Key rotation**: Old keys are rejected immediately. The cache never serves content with stale credentials.
-- **Public registries**: HEAD with no auth header returns 200, so caching works for all users with no configuration needed.
-- **Private registries**: Each request is validated against the upstream. Different users sharing the same cluster get the same cached blobs (blobs are content-addressed by SHA256, so identical content is safe to share).
-- **Manifest by tag** (e.g., `:latest`): Never cached. Tags are mutable, so every request goes to the upstream registry to get the current digest.
-- **Node-local cache**: Once an image is pulled to a node, it is available to all pods on that node without auth. Set `imagePullPolicy: Always` to force re-validation through the cache on every pod start.
+- Key rotation: Old keys are rejected immediately. The cache never serves content with stale credentials.
+- Public registries: HEAD with no auth header returns 200, so caching works for all users with no configuration needed.
+- Private registries: Each request is validated against the upstream. Different users sharing the same cluster get the same cached blobs (blobs are content-addressed by SHA256, so identical content is safe to share).
+- Manifest by tag (e.g., `:latest`): Never cached. Tags are mutable, so every request goes to the upstream registry to get the current digest.
+- Node-local cache: Once an image is pulled to a node, it is available to all pods on that node without auth. Set `imagePullPolicy: Always` to force re-validation through the cache on every pod start.
 
 ### Authentication Flow (S3 Proxy Cache)
 
@@ -235,24 +235,24 @@ The S3 proxy cache validates access on every request using `lua-access.lua`. The
 
 Key behaviors:
 
-- **Cache key**: `bucket_region | bucket_name | method | URI | versionId | If-Match | filtered_args | range`. This ensures different buckets, versions, and byte ranges are cached independently.
-- **Presigned URLs**: Cached until their `X-Amz-Expires` time minus a 10-second safety margin. This avoids serving content after the presigned URL has expired.
-- **HEAD auth caching**: HEAD results are cached in shared memory with a configurable TTL. This dramatically reduces upstream calls during burst traffic (e.g., hundreds of pods starting simultaneously and checking the same S3 object).
-- **Public S3 objects**: If a request has no `Authorization` header and no `X-Amz-Signature` query parameter, it is treated as public. No upstream auth check is performed, and the cached object is shared across all users.
-- **Locking**: Concurrent requests for the same URI are serialized using a lock (`resty.lock`) to avoid thundering herd -- only one request performs the upstream auth check, and subsequent requests use the cached result.
-- **Stale cache resilience**: On upstream errors (500/502/503/504), stale cached content is served rather than returning an error to the client.
-- **If-Match / ETag**: The `If-Match` header is preserved end-to-end (S3 normally expects it for content integrity) and is included in the cache key to avoid serving mismatched content.
-- **Last-Modified validation**: On cache HIT, the proxy compares the cached `Last-Modified` timestamp against the upstream value. If upstream is newer, the stale entry is purged and a 429 is returned so the client retries and gets fresh content.
+- Cache key: `bucket_region | bucket_name | method | URI | versionId | If-Match | filtered_args | range`. This ensures different buckets, versions, and byte ranges are cached independently.
+- Presigned URLs: Cached until their `X-Amz-Expires` time minus a 10-second safety margin. This avoids serving content after the presigned URL has expired.
+- HEAD auth caching: HEAD results are cached in shared memory with a configurable TTL. This dramatically reduces upstream calls during burst traffic (e.g., hundreds of pods starting simultaneously and checking the same S3 object).
+- Public S3 objects: If a request has no `Authorization` header and no `X-Amz-Signature` query parameter, it is treated as public. No upstream auth check is performed, and the cached object is shared across all users.
+- Locking: Concurrent requests for the same URI are serialized using a lock (`resty.lock`) to avoid thundering herd -- only one request performs the upstream auth check, and subsequent requests use the cached result.
+- Stale cache resilience: On upstream errors (500/502/503/504), stale cached content is served rather than returning an error to the client.
+- If-Match / ETag: The `If-Match` header is preserved end-to-end (S3 normally expects it for content integrity) and is included in the cache key to avoid serving mismatched content.
+- Last-Modified validation: On cache HIT, the proxy compares the cached `Last-Modified` timestamp against the upstream value. If upstream is newer, the stale entry is purged and a 429 is returned so the client retries and gets fresh content.
 
 ---
 
 ## Prerequisites
 
-1. **Kubernetes** 1.19+ with containerd or CRI-O runtime
-2. **Helm** 3.x
-3. **NGC API Key** for pulling NVIDIA container images
-4. **Storage**: Persistent volumes or sufficient node storage
-5. **Network**: Outbound HTTPS to target registries
+1. Kubernetes 1.19+ with containerd or CRI-O runtime
+2. Helm 3.x
+3. NGC API Key for pulling NVIDIA container images
+4. Storage: Persistent volumes or sufficient node storage
+5. Network: Outbound HTTPS to target registries
 
 ---
 
@@ -270,10 +270,11 @@ Key behaviors:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `images.server` | `<your-registry>/<your-org>/nvcf-container-cache:v1.1.33` | Cache proxy image |
-| `images.exporter` | `<your-registry>/<your-org>/nginx-prometheus-exporter:1.0` | Metrics exporter |
-| `images.certificates` | `<your-registry>/<your-org>/nvcf-proxy-tls-certs:1.2.2` | TLS cert bundle |
-| `images.secrets` | `[nvidia-ngcuser-pull-secret]` | Image pull secrets |
+| `images.server` | `nvcr.io/nvidia/nvcf/nvcf-container-cache:v1.1.42` | Cache proxy image |
+| `images.exporter` | `docker.io/nginx/nginx-prometheus-exporter:1.5.3` | Metrics exporter |
+| `images.certificates` | `nvcr.io/nvidia/nvcf/nvcf-proxy-tls-certs:v1.2.15` | TLS cert bundle |
+| `images.init` | `""` (uses `images.certificates`) | Init image that fixes cache volume ownership; needs bash, chown, chmod, find |
+| `images.secrets` | `[]` | Set explicitly for private images or authenticated registry pulls |
 
 ### Cache Behavior
 
@@ -335,27 +336,112 @@ CRI-O requires a separate listening port per registry (unlike containerd which u
 | `vault.enabled` | `false` | Enable HashiCorp Vault for cert management |
 | `vault.vaultAddress` | `https://vault.example.com` | Vault server URL |
 | `vault.certLocation` | `""` | URL to download CA cert (vault mode) |
+| `vault.intermediateCertTTL` | `336h` | Lifetime requested for the Vault-issued signing intermediate (Vault duration format; 336h is 14 days) |
 
 When `vault.enabled=false`, the bundled TLS certificates from the `images.certificates` image are used. The proxy dynamically generates leaf certificates signed by the bundled intermediate CA.
+
+#### Vault certificate lifecycle
+
+With `vault.enabled=true` each pod owns one signing key for its whole life and
+Vault signs a short-lived intermediate for it:
+
+1. The `certs` init container generates `leaf-ca.key` and a CSR once. The key
+   is never rotated while the pod runs.
+2. The vault-agent init container sends the CSR to the PKI mount's
+   `sign-intermediate` endpoint with `ttl=<vault.intermediateCertTTL>`, writes
+   the result to `nginx-intermediate.pem`, and assembles `ssl-bundle.crt` from
+   it and the mount's CA chain. The pod cannot start until this succeeds.
+3. The vault-agent sidecar repeats the same request on start and then again at
+   about 80 percent of the certificate's lifetime. Each time it rewrites
+   `ssl-bundle.crt` and calls the nginx `/reload` endpoint on port 13129.
+   No pod restart is involved. Vault Agent runs that hook only when the
+   rendered template output changes, so the template renders the issued
+   certificate's serial and expiration; without that line every render is
+   identical and the hook never fires.
+4. nginx reads `ssl-bundle.crt` from disk every time it mints a leaf
+   certificate, so new connections are signed with the new intermediate as
+   soon as the file changes. Minted leaves are cached in shared memory for one
+   hour and are valid for two, so a client can be handed a chain containing the
+   previous intermediate for up to one hour after a rotation. The previous
+   intermediate is still valid then, and both intermediates carry the same
+   subject and public key, so the chain verifies either way.
+
+A `ttl` above the mount's `max_lease_ttl` is truncated to that maximum with
+only a warning, so a cluster whose mount maximum is below
+`vault.intermediateCertTTL` rotates faster than the value suggests. The
+rotation leaves roughly 20 percent of the lifetime (about 3 days at 336h)
+between the first re-issue attempt and expiry; a Vault, auth, or policy
+outage longer than that puts an expired chain on every pod, so the alerts
+below are part of the rollout, not an afterthought.
+
+The TTL is always sent explicitly. A request without one takes the PKI
+mount's default, and Vault rejects the request when that default is longer
+than the signing CA's remaining life. A pod that restarts into that rejection
+stays in `Init:2/3` and never serves. `trunc_by_ca_not_after` is not used
+because it would silently tie the certificate's life to the CA's expiry
+instead of a predictable rotation period.
+
+Two failures look different on disk:
+
+- A failed re-sign leaves `nginx-intermediate.pem` and `ssl-bundle.crt`
+  unchanged. The agent logs the error and retries, and nginx keeps serving
+  with the previous intermediate until it expires.
+- A failed `/reload` after a successful re-sign leaves the new
+  `ssl-bundle.crt` already on disk. Newly minted leaves use it anyway, because
+  the signer reads the file per leaf; only the static fallback certificate
+  that nginx loaded at its last (re)start stays old, and that one is used
+  only when the Lua signer fails.
+
+Both are silent at the nginx level, so alert on
+`container_cache_tls_cert_not_after_seconds` and
+`container_cache_tls_bundle_read_ok` (see Observability). With a 14 day TTL
+and rotation at about day 11, a depth 0 certificate with less than 2 days
+left means rotation has stalled.
 
 ### Observability
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `monitoring.enabled` | `false` | Deploy the `nginx-prometheus-exporter` sidecar **and** create a PodMonitor for Prometheus. When `false`, neither is rendered and the `images.exporter` image does not need to be reachable. The lua-prometheus endpoint on `cache-metrics` (port 9145) is unaffected by this setting and remains available for in-cluster scraping. |
+| `monitoring.enabled` | `false` | Deploy the `nginx-prometheus-exporter` sidecar and create a PodMonitor for Prometheus. When `false`, neither is rendered and the `images.exporter` image does not need to be reachable. The lua-prometheus endpoint on `cache-metrics` (port 9145) is unaffected by this setting and remains available for in-cluster scraping. |
 | `metrics.cacheMetricsStorageSize` | `300m` | Shared memory for Prometheus metrics |
 | `traces.enabled` | `false` | Enable OpenTelemetry tracing |
 | `nucleus.enabled` | `false` | Enable nucleus proxy integration |
+
+The `/cache_metrics` endpoint also exports
+`container_cache_tls_cert_not_after_seconds{depth}`, the notAfter of every
+certificate in the served TLS bundle. Depth is the certificate's position in
+`ssl-bundle.crt`, which the producer always writes intermediate first, so
+depth `0` is the signing intermediate that leaf certificates are minted from
+and higher depths are the CA chain above it. Series are updated in place and
+removed only when the bundle shrinks. If the bundle cannot be read, is empty,
+or any block in it fails to parse, every series is removed and
+`container_cache_tls_bundle_read_ok` is `0`. Example alert expressions:
+
+```promql
+# Signing intermediate not rotated (expected before 2 days remain on a 14 day TTL).
+container_cache_tls_cert_not_after_seconds{depth="0"} - time() < 2 * 86400
+
+# The CA chain itself is approaching expiry; the mount needs re-provisioning.
+container_cache_tls_cert_not_after_seconds{depth!="0"} - time() < 90 * 86400
+
+# Bundle unreadable, or the expiry series vanished.
+container_cache_tls_bundle_read_ok == 0 or absent(container_cache_tls_cert_not_after_seconds{depth="0"})
+```
 
 ---
 
 ## Deployment Guide
 
-### 1. Create namespace and pull secret
+### 1. Create the namespace
 
 ```bash
 kubectl create namespace container-caching
+```
 
+For private images, create a pull secret in this namespace and list it in
+`images.secrets`. For example, to authenticate to NGC:
+
+```bash
 kubectl create secret docker-registry nvidia-ngcuser-pull-secret \
   --docker-server=nvcr.io \
   --docker-username='$oauthtoken' \
@@ -374,9 +460,9 @@ replicaCount: 1
 targetHost: nvcr.io,stg.nvcr.io
 
 images:
-  server: <your-registry>/<your-org>/nvcf-container-cache:v1.1.33
-  exporter: <your-registry>/<your-org>/nginx-prometheus-exporter:1.0
-  certificates: <your-registry>/<your-org>/nvcf-proxy-tls-certs:1.2.2
+  server: <your-registry>/<your-org>/nvcf-container-cache:v1.1.42
+  exporter: <your-registry>/<your-org>/nginx-prometheus-exporter:1.5.3
+  certificates: <your-registry>/<your-org>/nvcf-proxy-tls-certs:v1.2.15
   secrets:
     - nvidia-ngcuser-pull-secret
 
@@ -430,6 +516,56 @@ capabilities = ["pull", "resolve"]
 
 The `skip_verify = true` is needed because the proxy's dynamically-generated TLS certificate cannot match every node IP when traffic arrives via NodePort (kube-proxy NATs the original destination IP). The explicit `[host."https://nvcr.io"]` entry ensures containerd falls back to the upstream registry if the cache is unavailable.
 
+### Upgrading an existing installation
+
+For proxy-cache clients that use NVCF Unbound certificate injection, upgrade
+Unbound with the same certificate-helper image version as the cache. When reusing
+Unbound overrides, align both `images.certificates` (Kyverno injection) and
+`webhook.certificatesImage` (webhook injection) with that version. Roll out
+existing function deployments after the upgrade to refresh their CA bundles.
+Other existing proxy-cache client pods, including Job pods, also retain their
+old CA bundles. Plan their replacement according to the workload's procedure.
+
+Set `images.secrets` explicitly in your values file before upgrading an
+installation that pulls private images. Earlier chart versions supplied
+`nvidia-ngcuser-pull-secret` by default; the default is now an empty list.
+Keep the required secret names alongside your image overrides:
+
+```yaml
+images:
+  secrets:
+    - nvidia-ngcuser-pull-secret
+```
+
+Before the dry run, update explicitly pinned `images.server`,
+`images.certificates` and `images.exporter` overrides to the intended versions.
+Review `images.init` too if it is set. For mirrored images, keep your registry
+paths and update the versions. If the public chart defaults are appropriate and
+you are not using `--reuse-values`, remove stale image overrides instead.
+
+Include every required values file and `--set` override from the existing
+installation in both the dry run and upgrade. The example below assumes
+`my-values.yaml` contains the complete override set. Review the current values
+and manifest, then compare them with the rendered upgrade before applying it:
+
+```bash
+helm get values nvcf-container-cache -n container-caching -o yaml
+helm get manifest nvcf-container-cache -n container-caching
+helm upgrade nvcf-container-cache ./deploy \
+  -n container-caching \
+  -f my-values.yaml \
+  --dry-run
+```
+
+After reviewing the planned resources, run the same upgrade with all required
+values files and overrides, omitting `--dry-run`. If you use `--reuse-values`,
+review and update the image versions explicitly because it retains old chart
+defaults too.
+
+If Docker Hub throttles exporter pulls when monitoring is enabled, provide
+Docker Hub credentials through `images.secrets` or set `images.exporter` to
+your registry mirror. See [Docker Hub pull limits](https://docs.docker.com/docker-hub/usage/pulls/).
+
 ---
 
 ## Container Runtime Support
@@ -446,7 +582,7 @@ The DaemonSet writes `hosts.toml` files to `/etc/containerd/certs.d/<registry>/`
 
 CRI-O uses a different configuration model (`registries.conf` instead of `hosts.toml`). Key differences:
 
-- CRI-O does not support `?ns=` query parameters, so each registry needs a **dedicated port**
+- CRI-O does not support `?ns=` query parameters, so each registry needs a dedicated port
 - The DaemonSet writes to `/etc/containers/registries.conf.d/nvcf-container-cache.conf`
 - CRI-O mirrors are configured using pod IPs (discovered via Kubernetes API) or the service hostname
 - The DaemonSet refreshes CRI-O mirrors every 5 minutes and signals CRI-O to reload
@@ -506,6 +642,15 @@ kubectl delete namespace container-caching
 ### TLS errors: `certificate is valid for X, not Y`
 
 This means the proxy's dynamically-generated certificate SAN doesn't match the IP the client connected to. This is expected with NodePort traffic (kube-proxy NATs the destination IP). The `skip_verify = true` in `hosts.toml` resolves this for containerd. For CRI-O, `insecure = true` is set when using the service hostname.
+
+### Pod stuck in `Init:2/3` with `vault.enabled=true`
+
+The vault-agent init container is retrying the `sign-intermediate` request.
+Its logs show the Vault error. A message such as `ttl must be set to Nd or
+less` means the requested lifetime (or, if none was sent, the mount default)
+exceeds the signing CA's remaining life; check `vault.intermediateCertTTL`
+and the deployed ConfigMap. Deleting the pod does not help until the request
+succeeds, because the proxy cannot start without a signed intermediate.
 
 ### Connection refused on NodePort
 

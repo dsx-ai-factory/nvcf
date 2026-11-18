@@ -23,14 +23,14 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned"
 )
 
 // ShutdownResponse is the JSON response from the /shutdown endpoint
@@ -189,7 +189,8 @@ func RunShutdownCleanup(ctx context.Context, opts ShutdownHandlerOptions) Shutdo
 		log.Infof("Processing NVCFBackend %s/%s", nb.Namespace, nb.Name)
 
 		// Get namespaces for this backend
-		systemNS, requestsNS := BackendNamespaces(nb)
+		systemNS, _ := BackendNamespaces(nb)
+		requestsNS := AgentRequestsNamespace(ctx, opts.K8sClient, nb)
 
 		// Check if there are any ICMSRequest CRs (active workloads)
 		requestCount, err := CountICMSRequests(ctx, opts.DynamicClient, requestsNS)

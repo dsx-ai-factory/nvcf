@@ -6,6 +6,7 @@
 package objectstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,12 +16,16 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/atomicfile"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 )
 
 // maxObjectBytes is the S3 single-PutObject limit. A segment past this size
@@ -37,6 +42,7 @@ type Client struct {
 	// s3 is nil in dry-run mode: Submit logs the computed bucket, key, and
 	// size instead of calling the store.
 	s3     *s3.Client
+	calls  *swappableTransport
 	bucket string
 	prefix string
 	// source namespaces the object key by uploader instance. Without it, two
@@ -82,7 +88,8 @@ func New(cfg config.Config) (backend.Client, error) {
 
 // newClient builds the backend with an optional transport override, so a test
 // can point it at an httptest.Server whose TLS certificate the default
-// transport would not trust. A nil transport uses the SDK default. It is
+// transport would not trust. A nil transport uses Go's default one. Either
+// way the wait for the response headers is bounded (boundedTransport). It is
 // unused in dry-run mode, which never constructs an S3 client.
 //
 // The resulting HTTP client always rejects a redirect to a non-https URL,
@@ -132,17 +139,67 @@ func newClient(cfg config.Config, transport http.RoundTripper) (backend.Client, 
 	if cfg.ObjectStore.Endpoint != "" {
 		options.BaseEndpoint = aws.String(cfg.ObjectStore.Endpoint)
 	}
+	// The base transport is never nil, so a client works on its own, before
+	// or without UseTransport, and the core's wrapper keeps the bound.
+	transport = boundedTransport(transport, cmp.Or(cfg.ObjectStore.ResponseTimeout, config.DefaultObjectStoreResponseTimeout))
+	calls := &swappableTransport{base: transport}
+	calls.current.Store(&transport)
 	options.HTTPClient = &http.Client{
-		Transport:     transport,
+		Transport:     calls,
 		CheckRedirect: rejectNonHTTPSRedirect,
 	}
 
 	return &Client{
 		s3:     s3.New(options),
+		calls:  calls,
 		bucket: cfg.ObjectStore.Bucket,
 		prefix: cfg.ObjectStore.KeyPrefix,
 		source: source,
 	}, nil
+}
+
+// boundedTransport returns transport, or Go's default one when nil, with the
+// wait for the response headers bounded by timeout, the objectstore response
+// timeout setting. It is per request, not a total deadline for a submit or
+// the SDK's retries. The clock
+// starts once the request, body included, is sent, so it never cuts an
+// upload on a slow link; it ends a wait on a store that took the object and
+// never answers, which would otherwise hold every later submit. A transport
+// that is not an *http.Transport is used as given.
+func boundedTransport(transport http.RoundTripper, timeout time.Duration) http.RoundTripper {
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	base, ok := transport.(*http.Transport)
+	if !ok {
+		return transport
+	}
+	bounded := base.Clone()
+	bounded.ResponseHeaderTimeout = timeout
+	return bounded
+}
+
+// UseTransport routes every store call through the core's transport, so
+// each call is a child span with the trace context and is counted, under
+// the operation name "upload". The redirect check and TLS settings stay. A
+// dry run makes no calls, so it ignores the wrapper.
+func (c *Client) UseTransport(wrap telemetry.TransportWrapper) {
+	if c.calls == nil {
+		return
+	}
+	wrapped := wrap("upload", c.calls.base)
+	c.calls.current.Store(&wrapped)
+}
+
+// swappableTransport is the store client's transport, which UseTransport
+// can replace after the client is built.
+type swappableTransport struct {
+	base    http.RoundTripper
+	current atomic.Pointer[http.RoundTripper]
+}
+
+func (t *swappableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return (*t.current.Load()).RoundTrip(req)
 }
 
 // rejectNonHTTPSRedirect replaces http.Client's default redirect policy.
@@ -161,7 +218,8 @@ func rejectNonHTTPSRedirect(req *http.Request, via []*http.Request) error {
 func loadCredentials(path string) (credentials, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", err)
+		// The runner logs this error at startup; logs never carry paths.
+		return credentials{}, fmt.Errorf("objectstore backend: read credentials: %w", atomicfile.Pathless(err))
 	}
 	var creds credentials
 	if err := json.Unmarshal(data, &creds); err != nil {
@@ -173,15 +231,23 @@ func loadCredentials(path string) (credentials, error) {
 	return creds, nil
 }
 
-// Submit uploads the segment at request.Path and returns once the store has
+// Submit uploads the request's one file and returns once the store has
 // durably accepted it. The returned id is the object key: Status looks
-// nothing up because Capabilities declares TerminalOutcomeSync.
+// nothing up because the outcome is already final.
+//
+// The key names the source segment, request.Segment.Path, when the request
+// carries one, so the object layout does not depend on what the uploader
+// calls the prepared file it sends. Otherwise it names the file sent.
 //
 // In dry-run mode, Submit stats the segment, computes the key, logs both
 // along with the bucket and size, and returns without opening the file or
 // contacting a store.
 func (c *Client) Submit(ctx context.Context, request backend.SubmitRequest) (string, error) {
-	info, err := os.Stat(request.Path)
+	path, err := request.SinglePath()
+	if err != nil {
+		return "", fmt.Errorf("objectstore backend: %w", err)
+	}
+	info, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("objectstore backend: stat segment: %w", err)
 	}
@@ -189,7 +255,7 @@ func (c *Client) Submit(ctx context.Context, request backend.SubmitRequest) (str
 		return "", fmt.Errorf("objectstore backend: segment is %d bytes, over the %d byte single-object limit", info.Size(), maxObjectBytes)
 	}
 
-	key := c.key(request.Path)
+	key := c.key(objectName(request, path))
 	if c.dryRun {
 		slog.Info("objectstore backend: dry run, not uploading",
 			"segment", request.Segment.Index,
@@ -199,7 +265,7 @@ func (c *Client) Submit(ctx context.Context, request backend.SubmitRequest) (str
 		return key, nil
 	}
 
-	file, err := os.Open(request.Path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("objectstore backend: open segment: %w", err)
 	}
@@ -224,28 +290,36 @@ func (c *Client) Submit(ctx context.Context, request backend.SubmitRequest) (str
 // Status always reports success. PutObject in Submit already blocked until
 // the store returned a durable response, so there is nothing left to poll.
 func (c *Client) Status(context.Context, string) (backend.Status, error) {
-	return backend.StatusSuccess, nil
+	return backend.StatusSucceeded, nil
 }
 
-// Capabilities declares that PutObject is a single synchronous, idempotent
-// call: a Submit that returns success is already durable, resubmitting the
-// same segment overwrites the same key, and segments are independent objects
-// so nothing requires in-order delivery.
+// Capabilities declares that PutObject is idempotent: resubmitting the same
+// segment overwrites the same key.
 //
 // Exports is false in dry-run mode: nothing was sent anywhere, so a caller
 // must never delete a source segment on the strength of a dry-run Submit
 // succeeding, the same rule debug's Capabilities enforces for its own reads.
 func (c *Client) Capabilities() backend.Capabilities {
 	return backend.Capabilities{
-		ResubmitSafe:        true,
-		TerminalOutcomeSync: true,
-		OutOfOrderTolerant:  true,
-		AcceptedFormats:     []backend.Format{backend.FormatGzipJSONL},
-		MaxObjectBytes:      maxObjectBytes,
-		Exports:             !c.dryRun,
+		ResubmitSafe:    true,
+		AcceptedFormats: []backend.Format{backend.FormatGzipJSONL},
+		MaxObjectBytes:  maxObjectBytes,
+		Exports:         !c.dryRun,
 	}
 }
 
+// objectName returns the path whose file name the object key uses.
+func objectName(request backend.SubmitRequest, path string) string {
+	if request.Segment.Path != "" {
+		return request.Segment.Path
+	}
+	return path
+}
+
+// key is <prefix>/<host>/<segment file name>. A name is not reused within a
+// spool: the writer numbers each new segment above the highest index, and
+// nothing deletes the highest-indexed segment. A host name reused with an
+// empty spool starts the numbering again and would overwrite earlier objects.
 func (c *Client) key(sourcePath string) string {
 	name := filepath.Base(sourcePath)
 	if c.prefix == "" {

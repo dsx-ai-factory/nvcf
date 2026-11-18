@@ -14,9 +14,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/config"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/segment"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/segment"
 )
 
 // captureLogs redirects the default slog logger to a buffer for the duration
@@ -82,7 +82,7 @@ func TestSubmitReadsSegmentAndReportsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status() error = %v", err)
 	}
-	if status != backend.StatusSuccess {
+	if status != backend.StatusSucceeded {
 		t.Errorf("Status() = %v, want success", status)
 	}
 }
@@ -272,5 +272,20 @@ func TestSubmitDetailedVerbosityTruncatesOversizedFields(t *testing.T) {
 	}
 	if !strings.Contains(output, "...(truncated)") {
 		t.Error("detailed verbosity did not mark the oversized field as truncated")
+	}
+}
+
+func TestSubmitReadsAFilesOnlyRequest(t *testing.T) {
+	path := writeSegment(t,
+		`{"schema":"dynamo.request.trace.v1","event_type":"request_end","event_time_unix_ms":1,"request":{"request_id":"req-1"}}`,
+	)
+
+	client := &Client{}
+	id, err := client.Submit(context.Background(), backend.SubmitRequest{Files: []backend.File{{Path: path}}})
+	if err != nil {
+		t.Fatalf("Submit() error = %v, want the one file in Files read", err)
+	}
+	if id == "" {
+		t.Fatal("Submit() returned an empty id")
 	}
 }

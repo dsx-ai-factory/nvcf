@@ -30,14 +30,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/imagecredential"
-	cmnotel "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otel"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/imagecredential"
+	cmnotel "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/otel"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	otelattr "go.opentelemetry.io/otel/attribute"
@@ -61,31 +61,31 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/icms"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/logging"
-	nvcametrics "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
-	nvcaotel "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/otel"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/envutil"
-	helmutil "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/helm"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
-	nvcav2beta1new "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/scheme"
-	nvcainformers "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/informers/externalversions"
-	nvcav2beta1listers "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/listers/nvca/v2beta1"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/sharedcluster"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce/kaischeduler"
-	nvcaerrors "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/errors"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/fnds"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/profiling"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/storage"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
-	nvcatypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/icms"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/logging"
+	nvcametrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics/workloadtypes"
+	nvcaotel "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/otel"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/envutil"
+	helmutil "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/helm"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
+	nvcav2beta1new "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/scheme"
+	nvcainformers "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/informers/externalversions"
+	nvcav2beta1listers "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/listers/nvca/v2beta1"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/sharedcluster"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce/kaischeduler"
+	nvcaerrors "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/errors"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/fnds"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/profiling"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/storage"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 const (
@@ -101,6 +101,11 @@ const (
 	NVCAFinalizer               = "nvca.finalizers.nvidia.io"
 	NVCADeploymentName          = "nvca"
 	SecretMirroredFromLabelKey  = "nvca.nvcf.nvidia.io/mirrored-from-namespace"
+
+	// ICMSRequestCreationRejectedAnnotation records why NVCA rejected a creation
+	// message because of cluster configuration. A rejected request is never
+	// applied: it is reported to ICMS as failed with this reason.
+	ICMSRequestCreationRejectedAnnotation = "nvca.nvcf.nvidia.io/creation-rejected-reason"
 )
 
 var (
@@ -159,11 +164,14 @@ type BackendK8sCache struct {
 	lowLatencyStreamingEnabled bool
 	clients                    *kubeclients.KubeClients
 	modelCacheMtx              sync.Mutex
-	logPostingEnabled          bool
-	computeBackend             BackendType
-	clusterRegion              string
-	clusterName                string
-	cloudProvider              string
+	// modelCachingFallbacks holds requests whose model caching fallback this agent recorded, until the
+	// request is deleted. Keyed by modelCachingFallbackKey.
+	modelCachingFallbacks sync.Map
+	logPostingEnabled     bool
+	computeBackend        BackendType
+	clusterRegion         string
+	clusterName           string
+	cloudProvider         string
 
 	// Helm config flags
 	helmRBACEnforcementEnabled           bool
@@ -613,6 +621,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 	nvcaInformerFactory := nvcainformers.NewSharedInformerFactoryWithOptions(
 		b.clients.BART,
 		ResyncInterval,
+		nvcainformers.WithTransform(k8sutil.StripManagedFields),
 	)
 	icmsReqGenInf, err := nvcaInformerFactory.ForResource(nvcav2beta1new.SchemeGroupVersion.WithResource("icmsrequests"))
 	if err != nil {
@@ -628,7 +637,8 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 	nodeInfFactory := k8sinformers.NewSharedInformerFactoryWithOptions(
 		c.clients.K8s,
 		c.resyncPeriod,
-		nodefeatures.NewNodeInformerOptions(c.featureFlagFetcher)...,
+		append(nodefeatures.NewNodeInformerOptions(c.featureFlagFetcher),
+			k8sinformers.WithTransform(k8sutil.StripManagedFields))...,
 	)
 	nodeInf := nodeInfFactory.Core().V1().Nodes()
 	sharedNodeIInf := nodeInf.Informer()
@@ -668,6 +678,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 			podInfFactory := k8sinformers.NewSharedInformerFactoryWithOptions(
 				k8sClient,
 				resyncPeriod,
+				k8sinformers.WithTransform(k8sutil.StripManagedFields),
 			)
 			podInf := podInfFactory.Core().V1().Pods()
 			_, err := podInf.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
@@ -720,6 +731,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 			eventInfFactory := k8sinformers.NewSharedInformerFactoryWithOptions(
 				k8sClient,
 				resyncPeriod,
+				k8sinformers.WithTransform(k8sutil.StripManagedFields),
 			)
 			eventInf := eventInfFactory.Core().V1().Events()
 			_, err := eventInf.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
@@ -745,8 +757,8 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 		// Labels must be added for podInstanceNamespace if gxcache is enabled
 		if c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.GXCache) {
 			if err := ensureGXCacheNamespaceLabels(ctx, c.clients.K8s.CoreV1().Namespaces(), c.podInstanceNamespace); err != nil {
-				log.WithError(err).Error("failed to apply label to nvcf-backend namespace for GXCache enablement")
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("apply GXCache label to requests namespace %q (worker.requestsNamespace): %w",
+					c.podInstanceNamespace, err)
 			}
 		}
 
@@ -852,6 +864,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 				c.icmsRequestWQ.Add(makeNamespacedName(req))
 			},
 			DeleteFunc: func(obj interface{}) {
+				c.forgetModelCachingFallback(obj)
 				c.enqueueNotFoundInstancesOnDelete(ctx, obj)
 			},
 		})
@@ -1009,6 +1022,7 @@ func (c *BackendK8sCache) startSecretMirroringInformer(ctx context.Context) erro
 		k8sinformers.WithTweakListOptions(func(lo *metav1.ListOptions) {
 			lo.LabelSelector = labelSelector.String()
 		}),
+		k8sinformers.WithTransform(k8sutil.StripManagedFields),
 	)
 	secretInf := secretInfFactory.Core().V1().Secrets()
 	c.secretLister = secretInf.Lister()
@@ -1501,7 +1515,8 @@ func addConfigMapInformers(ctx context.Context, c *BackendK8sCache) error {
 	f := k8sinformers.NewSharedInformerFactoryWithOptions(
 		c.clients.K8s,
 		c.resyncPeriod,
-		k8sinformers.WithNamespace(c.systemNamespace))
+		k8sinformers.WithNamespace(c.systemNamespace),
+		k8sinformers.WithTransform(k8sutil.StripManagedFields))
 
 	cmi := f.Core().V1().ConfigMaps()
 	c.syncedFuncs = append(c.syncedFuncs, cmi.Informer().HasSynced)
@@ -1636,6 +1651,7 @@ func (c *BackendK8sCache) initInstanceNamespaceInformer(ctx context.Context) err
 		k8sinformers.WithTweakListOptions(func(lo *metav1.ListOptions) {
 			lo.LabelSelector = namespaceLabelSel.String()
 		}),
+		k8sinformers.WithTransform(k8sutil.StripManagedFields),
 	)
 	namespaceInf := infFactory.Core().V1().Namespaces()
 	c.instanceNamespaceLister = namespaceInf.Lister()
@@ -1945,6 +1961,34 @@ func (c *BackendK8sCache) GetRegisteredBackendGPUs(ctx context.Context,
 	return regBackendGPUs, nil
 }
 
+// overheadRemovedInstanceTypesHint explains, for a registration that ICMS
+// rejected, which instance types the infrastructure resource overhead leaves out
+// of the registration. It returns "" when the overhead leaves none out.
+func (c *BackendK8sCache) overheadRemovedInstanceTypesHint(ctx context.Context) string {
+	overhead, err := c.infraOverheadGetter.GetInfraOverhead(ctx)
+	if err != nil || len(overhead) == 0 {
+		return ""
+	}
+	backendGPUs, err := c.GetAllBackendGPUs(ctx)
+	if err != nil {
+		return ""
+	}
+	removed := types.BackendGPUs(backendGPUs).InstanceTypesRemovedByOverhead(
+		c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.MultiNodeWorkloads), overhead)
+	if len(removed) == 0 {
+		return ""
+	}
+	names := make([]string, len(removed))
+	for i, it := range removed {
+		names[i] = it.Name
+	}
+	return fmt.Sprintf("the infrastructure resource overhead of %s leaves no room in instance types %s, so NVCA "+
+		"left them out of the registration; if they have active instances, ICMS rejects the registration for that "+
+		"reason: lower byoo.additionalResourceOverhead or another infrastructure container resource (utils.resources, "+
+		"byoo.resources, byoo.fluentbit.resources, storage.sharedStorage.server.resources), or remove those instances",
+		k8sutil.FormatResourceList(overhead), strings.Join(names, ", "))
+}
+
 func (c *BackendK8sCache) UpdateInstanceTypeMetrics(
 	ctx context.Context,
 	gpus []types.RegistrationGPU,
@@ -2164,6 +2208,66 @@ func getICMSRequestObjectMeta(depInfo types.DeploymentInfo) metav1.ObjectMeta {
 	return om
 }
 
+// modelCachingFallbackKey identifies a request across informer copies. The UID keeps a recreated request
+// with the same name from inheriting an old fallback.
+func modelCachingFallbackKey(req *nvcav2beta1new.ICMSRequest) string {
+	return req.Namespace + "/" + req.Name + "/" + string(req.UID)
+}
+
+// markModelCachingFailed records on the ICMSRequest that model caching failed, so later passes
+// over the request skip caching. The merge patch avoids conflicts with concurrent status writes.
+func (c *BackendK8sCache) markModelCachingFailed(ctx context.Context, req *nvcav2beta1new.ICMSRequest) error {
+	if req.Annotations[types.ModelCachingFailedAnnotationKey] == "true" {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]string{types.ModelCachingFailedAnnotationKey: "true"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = c.clients.BART.NvcaV2beta1().ICMSRequests(req.Namespace).Patch(
+		ctx, req.Name, apitypes.MergePatchType, patch, metav1.PatchOptions{})
+	if metrics := nvcametrics.FromContext(ctx); metrics != nil {
+		metrics.TrackK8sAPICall("icmsrequest", err)
+	}
+	if err != nil {
+		return err
+	}
+	if req.Annotations == nil {
+		req.Annotations = map[string]string{}
+	}
+	req.Annotations[types.ModelCachingFailedAnnotationKey] = "true"
+	// The informer copy may not show the annotation for a while. Remember the fallback so a pass that
+	// starts from that older copy does not start a new writer after cleanup removed the failed one.
+	c.modelCachingFallbacks.Store(modelCachingFallbackKey(req), struct{}{})
+	return nil
+}
+
+// modelCachingFailed reports whether the request has recorded its model caching fallback: the annotation
+// is on this copy, or this agent recorded it. The record is kept even after an annotated copy is seen,
+// because a pass that started from an older copy may still run afterwards.
+func (c *BackendK8sCache) modelCachingFailed(req *nvcav2beta1new.ICMSRequest) bool {
+	if req.Annotations[types.ModelCachingFailedAnnotationKey] == "true" {
+		return true
+	}
+	_, recorded := c.modelCachingFallbacks.Load(modelCachingFallbackKey(req))
+	return recorded
+}
+
+// forgetModelCachingFallback drops the in-memory fallback record of a deleted request, the only point at
+// which no older copy of the request can start another pass.
+func (c *BackendK8sCache) forgetModelCachingFallback(obj any) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	if req, ok := obj.(*nvcav2beta1new.ICMSRequest); ok {
+		c.modelCachingFallbacks.Delete(modelCachingFallbackKey(req))
+	}
+}
+
 func (c *BackendK8sCache) applyICMSRequestStatusChange(ctx context.Context,
 	sr *nvcav2beta1new.ICMSRequest, modify func(context.Context, *nvcav2beta1new.ICMSRequest),
 ) bool {
@@ -2284,7 +2388,7 @@ func getICMSLabelSelectorString(msgID string) string {
 	return fmt.Sprintf("%s=%s", SQSMessageIDKey, msgID)
 }
 
-func (c *BackendK8sCache) checkICMSRequestExists(ctx context.Context, msgID string) (bool, error) {
+func (c *BackendK8sCache) checkICMSRequestExists(ctx context.Context, msgID, requestID string) (bool, error) {
 	log := core.GetLogger(ctx)
 	selectorStr := getICMSLabelSelectorString(msgID)
 	icmsRequests, err := c.clients.BART.NvcaV2beta1().ICMSRequests(c.requestsNamespace).List(ctx, metav1.ListOptions{LabelSelector: selectorStr})
@@ -2292,9 +2396,13 @@ func (c *BackendK8sCache) checkICMSRequestExists(ctx context.Context, msgID stri
 		return true, fmt.Errorf("failed to list ICMS request in %v namespace: err: %v", c.requestsNamespace, err)
 	}
 
-	if icmsRequests != nil && len(icmsRequests.Items) > 0 {
-		log.Debugf("ICMS request for %v already in progress, skipping", msgID)
-		return true, nil
+	if icmsRequests != nil {
+		for _, request := range icmsRequests.Items {
+			if requestID == "" || request.Spec.RequestID == "" || request.Spec.RequestID == requestID {
+				log.WithField("requestId", requestID).Debugf("ICMS request for %v already in progress, skipping", msgID)
+				return true, nil
+			}
+		}
 	}
 	return false, nil
 }
@@ -2305,15 +2413,14 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 ) (*nvcav2beta1new.ICMSRequest, error) {
 	log := core.GetLogger(ctx)
 
-	exists, err := c.checkICMSRequestExists(ctx, msgID)
+	msgMeta := msg.GetCreationQueueMessageMetadata()
+	exists, err := c.checkICMSRequestExists(ctx, msgID, msgMeta.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("failed precheck %v, err: %v", msgID, err)
 	}
 	if exists {
 		return nil, nil
 	}
-
-	msgMeta := msg.GetCreationQueueMessageMetadata()
 
 	o := nvcav2beta1new.ICMSRequest{
 		Spec: nvcav2beta1new.ICMSRequestSpec{
@@ -2339,7 +2446,10 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 	metrics.QueueMessageProcessedTotal.
 		WithLabelValues(metrics.WithDefaultLabelValues(string(msg.GetCreationQueueMessageMetadata().Action))...).Inc()
 
-	isBYOOEnabled := c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.BYOObservability)
+	// rejectReason is set for configuration rejections that will fail the same
+	// way on every retry. Such requests are persisted and reported as failed
+	// instead of being requeued.
+	var rejectReason string
 
 	switch mt := msg.(type) {
 	case function.CreationQueueMessage:
@@ -2350,22 +2460,22 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 			mt.LaunchSpecification == nil || mt.LaunchSpecification.EnvironmentB64 == "" {
 			o.Spec.CreationMsgInfo.LaunchArtifacts = mt.LaunchArtifacts
 		}
-		if mt.LaunchSpecification != nil && mt.LaunchSpecification.Telemetries != nil &&
-			!(isBYOOEnabled && c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.UseFunctionTranslator)) {
-			return nil, fmt.Errorf("telemetries is set but required features are disabled: %s, %s",
-				featureflag.BYOObservability.Key, featureflag.UseFunctionTranslator.Key)
+		if mt.LaunchSpecification != nil && mt.LaunchSpecification.Telemetries != nil {
+			rejectReason = c.byooDisabledReason("function",
+				featureflag.BYOObservability, featureflag.UseFunctionTranslator)
 		}
 		o.Spec.CreationMsgInfo.FunctionLaunchSpecification = mt.LaunchSpecification
 		// Apply environment variable overrides if configured
-		if len(c.functionEnvOverrides) > 0 && mt.LaunchSpecification != nil {
+		if rejectReason == "" && len(c.functionEnvOverrides) > 0 && mt.LaunchSpecification != nil {
 			modified, err := envutil.ApplyEnvOverrides(
 				mt.LaunchSpecification.EnvironmentB64,
 				c.functionEnvOverrides,
 			)
 			if err != nil {
-				return nil, fmt.Errorf("apply function env overrides: %w", err)
+				rejectReason = fmt.Sprintf("NVCA could not apply the cluster's function environment overrides: %v", err)
+			} else {
+				o.Spec.CreationMsgInfo.FunctionLaunchSpecification.EnvironmentB64 = modified
 			}
-			o.Spec.CreationMsgInfo.FunctionLaunchSpecification.EnvironmentB64 = modified
 		}
 		// TODO: remove these fields when migration is in place.
 		o.Spec.FunctionID = mt.Details.FunctionID
@@ -2382,22 +2492,22 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 	case task.CreationQueueMessage:
 		o.Spec.TaskDetails = mt.Details
 
-		if mt.LaunchSpecification.Telemetries != nil && !isBYOOEnabled {
-			return nil, fmt.Errorf("telemetries is set but required features are disabled: %s",
-				featureflag.BYOObservability.Key)
+		if mt.LaunchSpecification.Telemetries != nil {
+			rejectReason = c.byooDisabledReason("task", featureflag.BYOObservability)
 		}
 
 		o.Spec.CreationMsgInfo.TaskLaunchSpecification = &mt.LaunchSpecification
 		// Apply environment variable overrides if configured
-		if len(c.taskEnvOverrides) > 0 {
+		if rejectReason == "" && len(c.taskEnvOverrides) > 0 {
 			modified, err := envutil.ApplyEnvOverrides(
 				mt.LaunchSpecification.EnvironmentB64,
 				c.taskEnvOverrides,
 			)
 			if err != nil {
-				return nil, fmt.Errorf("apply task env overrides: %w", err)
+				rejectReason = fmt.Sprintf("NVCA could not apply the cluster's task environment overrides: %v", err)
+			} else {
+				o.Spec.CreationMsgInfo.TaskLaunchSpecification.EnvironmentB64 = modified
 			}
-			o.Spec.CreationMsgInfo.TaskLaunchSpecification.EnvironmentB64 = modified
 		}
 		o.ObjectMeta = getICMSRequestObjectMeta(types.DeploymentInfo{
 			RequestID:      msgMeta.RequestID,
@@ -2408,7 +2518,12 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 			TaskID:         mt.Details.TaskID,
 		})
 	}
-	if err := c.persistModelCacheStorageSelection(ctx, &o); err != nil {
+	if rejectReason != "" {
+		if o.Annotations == nil {
+			o.Annotations = map[string]string{}
+		}
+		o.Annotations[ICMSRequestCreationRejectedAnnotation] = rejectReason
+	} else if err := c.persistModelCacheStorageSelection(ctx, &o); err != nil {
 		return nil, err
 	}
 	obj, err := c.clients.BART.NvcaV2beta1().ICMSRequests(c.requestsNamespace).Create(ctx, &o, metav1.CreateOptions{})
@@ -2421,10 +2536,38 @@ func (c *BackendK8sCache) CreateICMSCreationMessageRequest(ctx context.Context,
 	return obj, nil
 }
 
+// byooDisabledReason returns an actionable rejection reason when any of the
+// feature flags BYOO needs for this workload kind are disabled, or "" when all
+// of them are enabled.
+func (c *BackendK8sCache) byooDisabledReason(workload string, required ...*featureflag.FeatureFlag) string {
+	var disabled []string
+	for _, ff := range required {
+		if !c.featureFlagFetcher.IsFeatureFlagEnabled(ff) {
+			disabled = append(disabled, ff.Key)
+		}
+	}
+	if len(disabled) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Bring Your Own Observability (BYOO) is disabled on this cluster: "+
+		"the %s requests telemetries, but these NVCA feature flags are not enabled: %s. "+
+		"Enable them on the cluster, or deploy without telemetries.",
+		workload, strings.Join(disabled, ", "))
+}
+
+// GetCreationRejectionReason returns why NVCA rejected the creation message
+// for req, or "" if it was accepted.
+func GetCreationRejectionReason(req *nvcav2beta1new.ICMSRequest) string {
+	if req == nil {
+		return ""
+	}
+	return req.Annotations[ICMSRequestCreationRejectedAnnotation]
+}
+
 func (c *BackendK8sCache) CreateICMSTerminationMessageRequest(ctx context.Context, tm types.ICMSTerminationMessage, msgReceipt, msgID string) error {
 	log := core.GetLogger(ctx)
 
-	exists, err := c.checkICMSRequestExists(ctx, msgID)
+	exists, err := c.checkICMSRequestExists(ctx, msgID, tm.RequestID)
 	if err != nil {
 		return fmt.Errorf("failed precheck %v, err: %v", msgID, err)
 	}
@@ -2788,6 +2931,10 @@ func (c *BackendK8sCache) syncICMSRequest(ctx context.Context, req *nvcav2beta1n
 	case nvcav2beta1new.ICMSRequestStatusInProgress, nvcav2beta1new.ICMSRequestStatusCachingInProgress:
 		switch requestAction {
 		case common.FunctionCreationAction, common.TaskCreationAction:
+			if reason := GetCreationRejectionReason(req); reason != "" {
+				// Fail through the terminal error path so ICMS is told why.
+				return nvcaerrors.TerminalError(errors.New(reason))
+			}
 			if c.icmsRequestHelper.AllInstancesTerminatedAndReported(ctx, req) {
 				// this occurs when the backend goes unhealthy
 				// ICMS sends a termination for all instances
@@ -2807,6 +2954,18 @@ func (c *BackendK8sCache) syncICMSRequest(ctx context.Context, req *nvcav2beta1n
 			if err := c.ApplyICMSRequestStatusChange(ctx, req); err != nil {
 				log.WithError(err).Debug("Failed to apply the ICMS request")
 				return fmt.Errorf("failed to sync ICMS request %s, will be requeued, err: %w", req.Name, err)
+			}
+		}
+		// Retry before the request can be removed, including after completion is acknowledged.
+		switch requestAction {
+		case common.FunctionCreationAction, common.TaskCreationAction:
+			if err := c.icmsRequestHelper.RetryFailedModelCacheCleanup(ctx, req); err != nil {
+				// Keep the request for another attempt only when the error can clear. A permanent error
+				// would otherwise keep the request, and requeue it, forever.
+				if k8sutil.IsTransientK8sError(err) {
+					return fmt.Errorf("retry model cache cleanup for request %s: %w", req.Name, err)
+				}
+				log.WithError(err).Errorf("model cache cleanup for request %s failed, needs manual cleanup", req.Name)
 			}
 		}
 		err = c.CleanupCreationRequestResources(ctx, req)

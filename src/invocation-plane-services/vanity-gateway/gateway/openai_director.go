@@ -23,8 +23,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +40,6 @@ import (
 	"github.com/felixge/httpsnoop"
 	"github.com/go-chi/chi/v5"
 	"github.com/goccy/go-json"
-	"github.com/valyala/bytebufferpool"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
@@ -59,11 +57,24 @@ const (
 	contentTypeMultipartFormData = "multipart/form-data"
 )
 
-type OpenAIDirector struct {
+type shadowSamplingEndpoint string
+
+const (
+	shadowSamplingEndpointNone            shadowSamplingEndpoint = ""
+	shadowSamplingEndpointChatCompletions shadowSamplingEndpoint = "chatCompletions"
+	shadowSamplingEndpointResponses       shadowSamplingEndpoint = "responses"
+	shadowSamplingEndpointMessages        shadowSamplingEndpoint = "messages"
+)
+
+// ModelDirector shares model routing across native OpenAI and Anthropic endpoints.
+type ModelDirector struct {
 	chatCompletions    ModelMapping
 	completions        ModelMapping
 	embeddings         ModelMapping
 	responses          ModelMapping
+	messages           ModelMapping
+	decisions          ModelMapping
+	systemOne          ModelMapping
 	imageGenerations   ModelMapping
 	imageEdits         ModelMapping
 	imageVariations    ModelMapping
@@ -73,6 +84,18 @@ type OpenAIDirector struct {
 	shadower           *TrafficShadower
 	shadowRandomBucket func() int
 	shadowBodyRewriter func(body []byte, modelName string) ([]byte, error)
+
+	// requestBodyLimit is the route body limit. A request whose declared
+	// Content-Length exceeds it is rejected before any body byte is read.
+	// Shadow replays are exempt. Zero means unknown.
+	requestBodyLimit int64
+
+	// Private models are listed only for callers whose API key may access the
+	// function version they route to. privateModels is nil when private model
+	// listing is disabled.
+	privateIndex  privateModelIndex
+	privateModels *privateModelAccess
+	sections      []endpointModelMapping // every model section with its path, in listing order
 
 	// Cache for filtered models
 	filteredModelsCache        []ModelInfo
@@ -92,7 +115,18 @@ type OpenAIError struct {
 	Error CustomOpenAIError `json:"error"`
 }
 
+func writeOpenAIError(writer http.ResponseWriter, status int, message, code string) {
+	writer.Header().Set(contentTypeHeader, contentTypeApplicationJSON)
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(OpenAIError{Error: CustomOpenAIError{
+		Message: message,
+		Type:    "invalid_request_error",
+		Code:    code,
+	}})
+}
+
 type FunctionInfo struct {
+	publicModelName        string
 	functionId             string
 	functionVersionId      string
 	pathOverride           *string
@@ -103,6 +137,7 @@ type FunctionInfo struct {
 	offlineMessage         string
 	tooManyRequestsMessage string
 	shadows                []shadowConfig
+	promptCacheKeyHeaders  []string
 	functionType           config.FunctionType
 }
 
@@ -113,20 +148,38 @@ func (f FunctionInfo) targetsLLMGateway() bool {
 type shadowConfig struct {
 	modelName                string
 	percentage               int
-	samplingMethod           config.ShadowSamplingMethod
+	samplingMethods          config.ShadowSamplingMethods
 	cancelOnClientDisconnect bool
 }
 
 type ModelMapping struct {
-	modelNameToNVCFUrl   map[string]FunctionInfo
-	modelNameToModelInfo map[string]ModelInfo // only contains public models
+	modelNameToNVCFUrl          map[string]FunctionInfo
+	modelNameToModelInfo        map[string]ModelInfo // only contains public models
+	privateModelNameToModelInfo map[string]ModelInfo
 }
 
 type ModelInfo struct {
-	Id      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	modelInfoFields    map[string]stdjson.RawMessage
+	SupportedEndpoints []string `json:"supported_endpoints,omitempty"`
+	Id                 string   `json:"id"`
+	Object             string   `json:"object"`
+	Created            int64    `json:"created"`
+	OwnedBy            string   `json:"owned_by"`
+}
+
+// MarshalJSON flattens static metadata into a fresh response buffer. Published
+// director snapshots and their cached model lists remain immutable.
+func (m ModelInfo) MarshalJSON() ([]byte, error) {
+	type coreModelInfo ModelInfo
+	core, err := json.Marshal(coreModelInfo(m))
+	if err != nil || len(m.modelInfoFields) == 0 {
+		return core, err
+	}
+	fields, err := stdjson.Marshal(m.modelInfoFields)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(core[:len(core)-1], ','), fields[1:]...), nil
 }
 
 type ModelListResponse struct {
@@ -145,18 +198,21 @@ type ModelNameToFunctionIdVersionId struct {
 	OfflineMessage         string
 	TooManyRequestsMessage string
 	Shadows                []shadowConfig
+	PromptCacheKeyHeaders  []string
 	FunctionType           config.FunctionType
 }
 
 type openAIRequestBody struct {
 	Model  string `json:"model"`
 	Stream bool   `json:"stream"`
+	raw    []byte
 }
 
 type resolvedOpenAIRequest struct {
 	request      *http.Request
 	functionInfo FunctionInfo
 	modelName    string
+	rawBody      []byte
 }
 
 type primaryProxyObserver struct {
@@ -240,6 +296,7 @@ func buildModelMapping(
 	privateModelMatcher *regexp.Regexp) (ModelMapping, error) {
 
 	modelNameToModelInfo := make(map[string]ModelInfo, len(modelNameToFunctionIdVersionId))
+	privateModelNameToModelInfo := make(map[string]ModelInfo)
 	modelNameToNVCFUrl := make(map[string]FunctionInfo, len(modelNameToFunctionIdVersionId))
 	// build the mapping for models to nvcf pexec url
 	for modelName, entry := range modelNameToFunctionIdVersionId {
@@ -248,7 +305,12 @@ func buildModelMapping(
 			pathOverride = &entry.OutgoingPathOverride
 		}
 		initializeShadowDropMetrics(shadowModelNames(entry.Shadows))
+		publicModelName := ""
+		if !privateModelMatcher.MatchString(modelName) {
+			publicModelName = modelName
+		}
 		modelNameToNVCFUrl[modelName] = FunctionInfo{
+			publicModelName:        publicModelName,
 			functionId:             entry.FunctionId,
 			functionVersionId:      entry.FunctionVersionId,
 			pathOverride:           pathOverride,
@@ -259,84 +321,158 @@ func buildModelMapping(
 			offlineMessage:         entry.OfflineMessage,
 			tooManyRequestsMessage: entry.TooManyRequestsMessage,
 			shadows:                entry.Shadows,
+			promptCacheKeyHeaders:  entry.PromptCacheKeyHeaders,
 			functionType:           entry.FunctionType,
 		}
 
 		// build the modelInfo list and modelName to modelInfo map
-		if !privateModelMatcher.MatchString(modelName) {
-			modelInfo := ModelInfo{
-				Id:      modelName,
-				Object:  "model",
-				Created: 735790403, // filler (year NVIDIA was founded)
-				OwnedBy: strings.Split(modelName, "/")[0],
-			}
+		modelInfo := ModelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 735790403, // filler (year NVIDIA was founded)
+			OwnedBy: strings.Split(modelName, "/")[0],
+		}
+		if publicModelName != "" {
 			modelNameToModelInfo[modelName] = modelInfo
+		} else {
+			privateModelNameToModelInfo[modelName] = modelInfo
 		}
 	}
-	return ModelMapping{modelNameToNVCFUrl, modelNameToModelInfo}, nil
+	return ModelMapping{
+		modelNameToNVCFUrl:          modelNameToNVCFUrl,
+		modelNameToModelInfo:        modelNameToModelInfo,
+		privateModelNameToModelInfo: privateModelNameToModelInfo,
+	}, nil
 }
 
-func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*OpenAIDirector, error) {
-	chatCompletions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ChatCompletions), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
+type endpointModelMapping struct {
+	path    string
+	mapping ModelMapping
+}
 
-	completions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Completions), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	embeddings, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Embeddings), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	responses, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Responses), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	imageGenerations, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageGenerations), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	imageEdits, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageEdits), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	imageVariations, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageVariations), privateModelMatcher)
-	if err != nil {
-		return nil, err
-	}
-
-	// Merge model lists across all endpoint sections, dedup by model ID, sort alphabetically
+// listModelInfos merges one model list across all endpoint sections, dedups by
+// model ID, attaches configured metadata, and sorts alphabetically. Aliases
+// that support a native protocol (Messages, decisions or System One) are
+// annotated so shared discovery does not imply that such a model accepts
+// OpenAI chat requests. Each endpoint map gets the merged entry back so
+// single-model lookups match the list.
+func listModelInfos(endpoints []endpointModelMapping, native []ModelMapping, metadata map[string]map[string]stdjson.RawMessage, models func(ModelMapping) map[string]ModelInfo) []ModelInfo {
 	seen := make(map[string]ModelInfo)
-	for _, models := range []map[string]ModelInfo{
-		chatCompletions.modelNameToModelInfo,
-		completions.modelNameToModelInfo,
-		embeddings.modelNameToModelInfo,
-		responses.modelNameToModelInfo,
-		imageGenerations.modelNameToModelInfo,
-		imageEdits.modelNameToModelInfo,
-		imageVariations.modelNameToModelInfo,
-	} {
-		for id, info := range models {
+	for _, endpoint := range endpoints {
+		for id, info := range models(endpoint.mapping) {
 			seen[id] = info
 		}
 	}
-	allModels := maps.Values(seen)
-	slices.SortFunc(allModels, func(a, b ModelInfo) int {
+	nativeIDs := make(map[string]struct{})
+	for _, mapping := range native {
+		for id := range models(mapping) {
+			nativeIDs[id] = struct{}{}
+		}
+	}
+	for id := range nativeIDs {
+		info := seen[id]
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				info.SupportedEndpoints = append(info.SupportedEndpoints, endpoint.path)
+			}
+		}
+		seen[id] = info
+	}
+	for id, info := range seen {
+		info.modelInfoFields = metadata[id]
+		seen[id] = info
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				models(endpoint.mapping)[id] = info
+			}
+		}
+	}
+	return sortModels(maps.Values(seen))
+}
+
+func sortModels(models []ModelInfo) []ModelInfo {
+	slices.SortFunc(models, func(a, b ModelInfo) int {
 		return cmp.Compare(a.Id, b.Id)
 	})
+	return models
+}
 
-	return &OpenAIDirector{
+func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*ModelDirector, error) {
+	chatCompletions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ChatCompletions, "openai.chatCompletions"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	completions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Completions, "openai.completions"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	embeddings, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Embeddings, "openai.embeddings"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	responses, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Responses, "openai.responses"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	messages, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.AnthropicMessages, "anthropicMessages"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	decisions, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.Decisions, "openai.decisions"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	systemOne, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.TypeSafeSystemOne, "typesafeSystemOne"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	imageGenerations, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageGenerations, "openai.imageGenerations"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	imageEdits, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageEdits, "openai.imageEdits"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	imageVariations, err := buildModelMapping(convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping.OpenAI.ImageVariations, "openai.imageVariations"), privateModelMatcher)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoints := []endpointModelMapping{
+		{"/v1/chat/completions", chatCompletions},
+		{"/v1/completions", completions},
+		{"/v1/embeddings", embeddings},
+		{"/v1/responses", responses},
+		{"/v1/messages", messages},
+		{decisionsPath, decisions},
+		{systemOnePath, systemOne},
+		{"/v1/images/generations", imageGenerations},
+		{"/v1/images/edits", imageEdits},
+		{"/v1/images/variations", imageVariations},
+	}
+	native := []ModelMapping{messages, decisions, systemOne}
+	metadata := mapping.ModelInfoFieldsByName()
+	allModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.modelNameToModelInfo })
+	allPrivateModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.privateModelNameToModelInfo })
+
+	d := &ModelDirector{
 		chatCompletions:    chatCompletions,
 		completions:        completions,
 		embeddings:         embeddings,
 		responses:          responses,
+		messages:           messages,
+		decisions:          decisions,
+		systemOne:          systemOne,
 		imageGenerations:   imageGenerations,
 		imageEdits:         imageEdits,
 		imageVariations:    imageVariations,
@@ -344,7 +480,10 @@ func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *reg
 		vanityDirector:     vanityDirector,
 		llmGatewayDirector: llmGatewayDirector,
 		shadower:           shadower,
-	}, nil
+	}
+	d.sections = endpoints
+	d.privateIndex = indexPrivateModels(allPrivateModels, d.allMappings()...)
+	return d, nil
 }
 
 // filterExpiredModels returns a new slice with expired models removed
@@ -369,7 +508,7 @@ func filterExpiredModels(models []ModelInfo, allMappings ...map[string]FunctionI
 }
 
 // getFilteredModels returns the filtered models list with lazy caching (1 minute TTL)
-func (d *OpenAIDirector) getFilteredModels() []ModelInfo {
+func (d *ModelDirector) getFilteredModels() []ModelInfo {
 	const cacheTTL = time.Minute
 
 	// Fast path: check if cache is fresh without acquiring write lock
@@ -391,22 +530,29 @@ func (d *OpenAIDirector) getFilteredModels() []ModelInfo {
 	}
 
 	// Compute filtered models
-	d.filteredModelsCache = filterExpiredModels(
-		d.allPublicModels,
-		d.chatCompletions.modelNameToNVCFUrl,
-		d.completions.modelNameToNVCFUrl,
-		d.embeddings.modelNameToNVCFUrl,
-		d.responses.modelNameToNVCFUrl,
-		d.imageGenerations.modelNameToNVCFUrl,
-		d.imageEdits.modelNameToNVCFUrl,
-		d.imageVariations.modelNameToNVCFUrl,
-	)
+	d.filteredModelsCache = filterExpiredModels(d.allPublicModels, d.allMappings()...)
 	d.filteredModelsLastComputed = time.Now()
 
 	return d.filteredModelsCache
 }
 
-func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]config.ModelFunctionDetails) map[string]ModelNameToFunctionIdVersionId {
+// allMappings returns the model routes of every endpoint section.
+func (d *ModelDirector) allMappings() []map[string]FunctionInfo {
+	return []map[string]FunctionInfo{
+		d.chatCompletions.modelNameToNVCFUrl,
+		d.completions.modelNameToNVCFUrl,
+		d.embeddings.modelNameToNVCFUrl,
+		d.responses.modelNameToNVCFUrl,
+		d.messages.modelNameToNVCFUrl,
+		d.decisions.modelNameToNVCFUrl,
+		d.systemOne.modelNameToNVCFUrl,
+		d.imageGenerations.modelNameToNVCFUrl,
+		d.imageEdits.modelNameToNVCFUrl,
+		d.imageVariations.modelNameToNVCFUrl,
+	}
+}
+
+func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]config.ModelFunctionDetails, sectionName string) map[string]ModelNameToFunctionIdVersionId {
 	modelNameToFunctionIdVersionId := make(map[string]ModelNameToFunctionIdVersionId)
 	for _, entry := range mapping {
 		modelNameToFunctionIdVersionId[entry.ModelName] = ModelNameToFunctionIdVersionId{
@@ -420,6 +566,7 @@ func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]co
 			OfflineMessage:         entry.OfflineMessage,
 			TooManyRequestsMessage: entry.TooManyRequestsMessage,
 			Shadows:                normalizeShadowConfigs(entry.EffectiveShadows()),
+			PromptCacheKeyHeaders:  entry.EffectivePromptCacheKeyHeadersForSection(sectionName),
 			FunctionType:           entry.FunctionType,
 		}
 	}
@@ -434,11 +581,12 @@ func defaultShadowPercentage(shadowPercentage *int) int {
 	return *shadowPercentage
 }
 
-func defaultShadowSamplingMethod(shadowSamplingMethod config.ShadowSamplingMethod) config.ShadowSamplingMethod {
-	if shadowSamplingMethod == "" {
-		return config.ShadowSamplingMethodRandom
+func defaultShadowSamplingMethods(methods config.ShadowSamplingMethods) config.ShadowSamplingMethods {
+	result := slices.Clone(methods)
+	if len(result) == 0 || result[len(result)-1] != config.ShadowSamplingMethodRandom {
+		result = append(result, config.ShadowSamplingMethodRandom)
 	}
-	return shadowSamplingMethod
+	return result
 }
 
 func normalizeShadowConfigs(shadows []config.ShadowConfig) []shadowConfig {
@@ -450,7 +598,7 @@ func normalizeShadowConfigs(shadows []config.ShadowConfig) []shadowConfig {
 		result = append(result, shadowConfig{
 			modelName:                shadow.ModelName,
 			percentage:               defaultShadowPercentage(shadow.Percentage),
-			samplingMethod:           defaultShadowSamplingMethod(shadow.SamplingMethod),
+			samplingMethods:          defaultShadowSamplingMethods(shadow.SamplingMethod),
 			cancelOnClientDisconnect: shadow.CancelOnClientDisconnect,
 		})
 	}
@@ -468,37 +616,74 @@ func shadowModelNames(shadows []shadowConfig) []string {
 	return modelNames
 }
 
-func (d *OpenAIDirector) ServeCompletions(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.completions.modelNameToNVCFUrl)
+func (d *ModelDirector) ServeCompletions(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.completions.modelNameToNVCFUrl, shadowSamplingEndpointNone)
 }
 
-func (d *OpenAIDirector) ServeChatCompletions(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.chatCompletions.modelNameToNVCFUrl)
+func (d *ModelDirector) ServeChatCompletions(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.chatCompletions.modelNameToNVCFUrl, shadowSamplingEndpointChatCompletions)
 }
 
-func (d *OpenAIDirector) ServeEmbeddings(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.embeddings.modelNameToNVCFUrl)
+func (d *ModelDirector) ServeEmbeddings(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.embeddings.modelNameToNVCFUrl, shadowSamplingEndpointNone)
 }
 
-func (d *OpenAIDirector) ServeResponses(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.responses.modelNameToNVCFUrl)
+func (d *ModelDirector) ServeResponses(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.responses.modelNameToNVCFUrl, shadowSamplingEndpointResponses)
 }
 
-func (d *OpenAIDirector) ServeImageGenerations(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.imageGenerations.modelNameToNVCFUrl)
+func (d *ModelDirector) ServeMessages(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolMessages)
+	d.proxyModelMappedRequest(writer, request, d.messages.modelNameToNVCFUrl, shadowSamplingEndpointMessages)
 }
 
-func (d *OpenAIDirector) ServeImageEdits(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.imageEdits.modelNameToNVCFUrl)
+// ServeDecisions passes POST /v1/decisions through to the model's function.
+// The body is not parsed beyond model, and errors the gateway writes use the
+// OpenAI shape.
+func (d *ModelDirector) ServeDecisions(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolDecisions)
+	d.proxyModelMappedRequest(writer, request, d.decisions.modelNameToNVCFUrl, shadowSamplingEndpointNone)
 }
 
-func (d *OpenAIDirector) ServeImageVariations(writer http.ResponseWriter, request *http.Request) {
-	d.proxyModelMappedRequest(writer, request, d.imageVariations.modelNameToNVCFUrl)
+// ServeSystemOne passes POST /v1/systemone through to the model's function.
+// Errors the gateway writes use the System One shape.
+func (d *ModelDirector) ServeSystemOne(writer http.ResponseWriter, request *http.Request) {
+	request = withNativeProtocol(request, nativeProtocolSystemOne)
+	d.proxyModelMappedRequest(writer, request, d.systemOne.modelNameToNVCFUrl, shadowSamplingEndpointNone)
 }
 
-func (d *OpenAIDirector) ListModels(writer http.ResponseWriter, _ *http.Request) {
+func (d *ModelDirector) ServeImageGenerations(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.imageGenerations.modelNameToNVCFUrl, shadowSamplingEndpointNone)
+}
+
+func (d *ModelDirector) ServeImageEdits(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.imageEdits.modelNameToNVCFUrl, shadowSamplingEndpointNone)
+}
+
+func (d *ModelDirector) ServeImageVariations(writer http.ResponseWriter, request *http.Request) {
+	d.proxyModelMappedRequest(writer, request, d.imageVariations.modelNameToNVCFUrl, shadowSamplingEndpointNone)
+}
+
+// ListModels answers in the caller's API: Anthropic clients get the Messages
+// models in the Anthropic shape, everyone else the shared OpenAI list. A
+// request with a bearer API key also gets the private models that key may
+// access.
+func (d *ModelDirector) ListModels(writer http.ResponseWriter, request *http.Request) {
+	// A keyed request can also list private models, so shared caches must keep
+	// responses for different keys apart.
+	writer.Header().Add("Vary", "Authorization")
+	if middleware.IsAnthropicRequest(request) {
+		d.listAnthropicModels(writer, request, d.authorizedPrivateModels(writer, request, d.messagesSections()))
+		return
+	}
+	privateModels := d.authorizedPrivateModels(writer, request, d.sections)
+
 	// Get filtered models with lazy caching
 	activeModels := d.getFilteredModels()
+	if len(privateModels) > 0 {
+		privateModels = filterExpiredModels(privateModels, d.allMappings()...)
+		activeModels = sortModels(append(slices.Clone(activeModels), privateModels...))
+	}
 
 	m := ModelListResponse{
 		Object: "list",
@@ -513,18 +698,27 @@ func (d *OpenAIDirector) ListModels(writer http.ResponseWriter, _ *http.Request)
 	}
 }
 
-func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Request) {
-	// support "/" in model name to follow pre established format
+func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Request) {
+	// support "/" in model name to follow pre established format. Private
+	// names often carry a prefix, as in private/company/model.
+	prefix := chi.URLParam(request, "prefix")
 	company := chi.URLParam(request, "company")
 	model := chi.URLParam(request, "model")
 
 	var modelName string
-	if company != "" && model != "" {
+	if prefix != "" && company != "" && model != "" {
+		modelName = prefix + "/" + company + "/" + model
+	} else if company != "" && model != "" {
 		modelName = company + "/" + model
 	} else if model != "" {
 		modelName = model
 	} else {
+		markGatewayRejected(writer, request)
 		http.Error(writer, "model name was undefined", http.StatusInternalServerError)
+		return
+	}
+	if middleware.IsAnthropicRequest(request) {
+		d.getAnthropicModel(writer, request, modelName)
 		return
 	}
 
@@ -533,12 +727,19 @@ func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Requ
 		d.embeddings.modelNameToModelInfo,
 		d.chatCompletions.modelNameToModelInfo,
 		d.responses.modelNameToModelInfo,
+		d.messages.modelNameToModelInfo,
+		d.decisions.modelNameToModelInfo,
+		d.systemOne.modelNameToModelInfo,
 		d.imageGenerations.modelNameToModelInfo,
 		d.imageEdits.modelNameToModelInfo,
 		d.imageVariations.modelNameToModelInfo,
 	)
 	if !ok {
+		modelInfo, ok = d.authorizedPrivateModel(writer, request, modelName, d.sections)
+	}
+	if !ok {
 		modelMissingError := "Model does not exist by the name of " + modelName
+		markGatewayRejected(writer, request)
 		http.Error(writer, modelMissingError, http.StatusNotFound)
 		return
 	}
@@ -549,6 +750,9 @@ func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Requ
 		d.embeddings.modelNameToNVCFUrl,
 		d.chatCompletions.modelNameToNVCFUrl,
 		d.responses.modelNameToNVCFUrl,
+		d.messages.modelNameToNVCFUrl,
+		d.decisions.modelNameToNVCFUrl,
+		d.systemOne.modelNameToNVCFUrl,
 		d.imageGenerations.modelNameToNVCFUrl,
 		d.imageEdits.modelNameToNVCFUrl,
 		d.imageVariations.modelNameToNVCFUrl,
@@ -556,7 +760,7 @@ func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Requ
 	if ok {
 		middleware.AddOpenAIRequestMetricAttributes(request.Context(), modelName, funcInfo.functionId)
 	}
-	if ok && writeFunctionStatusError(writer, funcInfo.offlineMessage, funcInfo.eol, modelName) {
+	if ok && writeFunctionStatusError(writer, request, funcInfo.offlineMessage, funcInfo.eol, modelName) {
 		return
 	}
 
@@ -567,17 +771,18 @@ func (d *OpenAIDirector) GetModel(writer http.ResponseWriter, request *http.Requ
 	}
 }
 
-func (d *OpenAIDirector) proxyModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) {
+func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo, endpoint shadowSamplingEndpoint) {
 	span := trace.SpanFromContext(request.Context())
-	span.SetAttributes(traceAttrEndpointType.String(traceAttrValueEndpointOpenAI))
+	span.SetAttributes(traceAttrEndpointType.String(endpointTypeForPath(request.URL.Path, traceAttrValueEndpointOpenAI)))
 	setShadowSpanAttribute(span, request)
 
 	resolved, handled := d.resolveModelMappedRequest(writer, request, modelToNVCFUrl)
 	if handled {
 		return
 	}
+	defer limitStreamedBodyIdle(writer, resolved.request)()
 
-	finishShadowPrimary := d.dispatchShadowIfNeeded(resolved, modelToNVCFUrl)
+	finishShadowPrimary := d.dispatchShadowIfNeeded(resolved, modelToNVCFUrl, endpoint)
 	var proxyErr error
 	proxyReturned := false
 	defer func() {
@@ -605,24 +810,30 @@ func (d *OpenAIDirector) proxyModelMappedRequest(writer http.ResponseWriter, req
 	proxyReturned = true
 }
 
-func (d *OpenAIDirector) resolveModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (resolvedOpenAIRequest, bool) {
-	body, err := extractOpenAIRequestBody(request)
+func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (resolvedOpenAIRequest, bool) {
+	if isDecisionRoute(request) && !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
+		if request.Body != nil {
+			_ = request.Body.Close()
+		}
+		markGatewayRejected(writer, request)
+		writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
+		return resolvedOpenAIRequest{}, true
+	}
+	body, bodyMode, err := d.readModelRequestBody(request, modelToNVCFUrl)
 	if err != nil {
+		markGatewayRejected(writer, request)
+		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+			status, kind, message := requestReadFailure(protocol, err)
+			writeNativeError(writer, request, status, kind, message)
+			return resolvedOpenAIRequest{}, true
+		}
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			// Handle the case where the body is too large
-			writer.WriteHeader(http.StatusBadRequest)
-			errorMessage := OpenAIError{
-				Error: CustomOpenAIError{
-					Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-						"If larger assets are required please refer to our Assets API.", maxRequestSize),
-					Type: "invalid_request_error",
-					Code: "invalid_image_format",
-				},
-			}
-			if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
-				http.Error(writer, err.Error(), http.StatusInternalServerError)
-			}
+			writeOpenAIRequestTooLarge(writer, maxBytesErr)
+			return resolvedOpenAIRequest{}, true
+		}
+		if errors.Is(err, errInvalidJSONBody) {
+			writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
 			return resolvedOpenAIRequest{}, true
 		}
 		if errors.Is(err, errModelFieldMissing) {
@@ -647,26 +858,34 @@ func (d *OpenAIDirector) resolveModelMappedRequest(writer http.ResponseWriter, r
 		traceAttrModelName.String(body.Model),
 		traceAttrModelStream.Bool(body.Stream),
 	)
+	recordRequestBodyMode(request, bodyMode)
 
 	nvcfUrl, ok := modelToNVCFUrl[body.Model]
 	if !ok {
 		_ = request.Body.Close()
-		http.NotFound(writer, request)
+		markGatewayRejected(writer, request)
+		if !writeNativeError(writer, request, http.StatusNotFound, "", "model not found") {
+			http.NotFound(writer, request)
+		}
 		return resolvedOpenAIRequest{}, true
 	}
+	middleware.SetPreUpstreamModel(request.Context(), nvcfUrl.publicModelName)
 	middleware.AddOpenAIRequestMetricAttributes(request.Context(), body.Model, nvcfUrl.functionId)
 
-	if writeFunctionStatusError(writer, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model) {
+	statusHandled := writeFunctionStatusError(writer, request, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model)
+	if statusHandled {
 		_ = request.Body.Close()
 		return resolvedOpenAIRequest{}, true
 	}
 
-	if nvcfUrl.tooManyRequestsMessage != "" {
+	// Decision backend 429 bodies pass through byte for byte.
+	if nvcfUrl.tooManyRequestsMessage != "" && !isDecisionRoute(request) {
 		ctx := context.WithValue(request.Context(), tooManyRequestsKey, nvcfUrl.tooManyRequestsMessage)
 		request = request.WithContext(ctx)
 	}
 
-	// setPollingHeaderIfNotPresent checks the Accept header, so we have to override it first
+	// setPollingHeaderIfNotPresent checks the Accept header, so we have to override it first.
+	// Decision routes never read stream, so body.Stream is false there.
 	if body.Stream {
 		request.Header.Set("Accept", "text/event-stream")
 	}
@@ -675,26 +894,39 @@ func (d *OpenAIDirector) resolveModelMappedRequest(writer http.ResponseWriter, r
 		request:      request,
 		functionInfo: nvcfUrl,
 		modelName:    body.Model,
+		rawBody:      body.raw,
 	}, false
 }
 
-func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, modelToNVCFUrl map[string]FunctionInfo) func(error) {
+func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, modelToNVCFUrl map[string]FunctionInfo, endpoint shadowSamplingEndpoint) func(error) {
 	if isShadowRequest(resolved.request) {
 		return func(error) {}
 	}
 	if d.shadower == nil {
 		return func(error) {}
 	}
-	shadows := admittedShadows(resolved.request, resolved.functionInfo.shadows, d.randomShadowBucket)
+	if len(resolved.functionInfo.shadows) == 0 {
+		return func(error) {}
+	}
+	sampler := newShadowRequestSampler(
+		resolved.request,
+		resolved.rawBody,
+		endpoint,
+		resolved.functionInfo.promptCacheKeyHeaders,
+		d.randomShadowBucket,
+	)
+	shadows := admittedShadowsWithSampler(resolved.functionInfo.shadows, sampler)
+	setShadowSamplingMethodsAttribute(resolved.request.Context(), sampler.decidedMethods)
 	if len(shadows) == 0 {
 		return func(error) {}
 	}
 
 	targetModelNames := shadowModelNames(shadows)
 
-	// Clone body only for shadowed requests — avoids allocation on the hot path.
-	rawBody, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close() // releases bytebufferpool buffer
+	// Shadow bodies read from the primary's pooled buffer instead of copying it.
+	// Each holds its own reference, so the buffer returns to the pool only after
+	// the primary proxy and every shadow replay close their bodies.
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		recordShadowDispatchSummary(
 			resolved.request.Context(),
@@ -706,15 +938,13 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 		)
 		return func(error) {}
 	}
-	// Reset primary request body (pool buffer released above).
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rawBody))
-	resolved.request.ContentLength = int64(len(rawBody))
+	modelSpans, modelSpansErr := topLevelModelSpans(body.peek())
 
 	// Replay through the same code path — proxyModelMappedRequest will resolve the
 	// shadow model name from the same mapping and proxy it. The NVCF-Shadow header
 	// prevents further shadowing on the recursive call.
 	replayHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		d.proxyModelMappedRequest(w, r, modelToNVCFUrl)
+		d.proxyModelMappedRequest(w, r, modelToNVCFUrl, endpoint)
 	})
 
 	dispatchedCount := 0
@@ -723,7 +953,7 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 	var droppedTargetModels []string
 	finishers := make([]func(error), 0, len(shadows))
 	for _, shadow := range shadows {
-		shadowBody, err := d.rewriteShadowBody(rawBody, shadow.modelName)
+		shadowBody, shadowBodyLength, err := d.newShadowBody(body, modelSpans, modelSpansErr, shadow.modelName)
 		if err != nil {
 			zap.L().Warn("shadow body rewrite failed, dropping target", append(
 				middleware.TraceFields(resolved.request.Context()),
@@ -741,13 +971,14 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 		// Build shadow request with the rewritten body and recursion guard.
 		shadowCtx, finishShadow := shadowContext(resolved.request, shadow.cancelOnClientDisconnect)
 		finishers = append(finishers, finishShadow)
-		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowCtx)
+		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowBodyLength, shadowCtx)
 		handler := newShadowReplayHandler(shadow.modelName, replayHandler)
 
 		// Shadow admission errors are logged by TrafficShadower and summarized below.
 		// They must not affect the primary request.
 		err = d.shadower.Shadow(shadowReq, handler)
 		if err != nil {
+			_ = shadowBody.Close()
 			droppedCount++
 			if reason := shadowDroppedReason(err); reason != "" {
 				droppedReasons = append(droppedReasons, reason)
@@ -768,56 +999,36 @@ func (d *OpenAIDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, 
 	return finishShadows(finishers)
 }
 
-func (d *OpenAIDirector) randomShadowBucket() int {
+func (d *ModelDirector) randomShadowBucket() int {
 	if d.shadowRandomBucket != nil {
 		return d.shadowRandomBucket()
 	}
 	return rand.IntN(100)
 }
 
-func (d *OpenAIDirector) rewriteShadowBody(body []byte, modelName string) ([]byte, error) {
+// newShadowBody points a shadow copy at its target model. It replaces only
+// the model values found in modelSpans, so the shadow keeps every other byte,
+// as the primary does, and reads them from the primary's pooled buffer.
+func (d *ModelDirector) newShadowBody(body *pooledRequestBody, modelSpans []byteSpan, modelSpansErr error, modelName string) (io.ReadCloser, int64, error) {
 	if d.shadowBodyRewriter != nil {
-		return d.shadowBodyRewriter(body, modelName)
+		rewritten, err := d.shadowBodyRewriter(body.peek(), modelName)
+		if err != nil {
+			return nil, 0, err
+		}
+		return io.NopCloser(bytes.NewReader(rewritten)), int64(len(rewritten)), nil
 	}
-	return rewriteShadowRequestModel(body, modelName)
-}
-
-func admittedShadows(req *http.Request, shadows []shadowConfig, randomBucket func() int) []shadowConfig {
-	var admitted []shadowConfig
-	var requestRandomBucket int
-	randomBucketSet := false
-	var credentialBucket int
-	credentialBucketSet := false
-	credentialValid := false
-
-	for _, shadow := range shadows {
-		if shadow.percentage >= 100 {
-			admitted = append(admitted, shadow)
-			continue
-		}
-		if shadow.samplingMethod == config.ShadowSamplingMethodPerBearerKey {
-			if !credentialBucketSet {
-				credential, ok := bearerCredential(req)
-				credentialValid = ok
-				if ok {
-					credentialBucket = shadowBucketForBearerCredential(credential)
-				}
-				credentialBucketSet = true
-			}
-			if credentialValid && credentialBucket < shadow.percentage {
-				admitted = append(admitted, shadow)
-			}
-			continue
-		}
-		if !randomBucketSet {
-			requestRandomBucket = randomBucket()
-			randomBucketSet = true
-		}
-		if requestRandomBucket < shadow.percentage {
-			admitted = append(admitted, shadow)
-		}
+	if modelSpansErr != nil {
+		return nil, 0, modelSpansErr
 	}
-	return admitted
+	modelValue, err := encodeModelValue(modelName)
+	if err != nil {
+		return nil, 0, err
+	}
+	shadowBody, err := body.withModel(modelSpans, modelValue)
+	if err != nil {
+		return nil, 0, err
+	}
+	return shadowBody, shadowBody.Len(), nil
 }
 
 func finishShadows(finishers []func(error)) func(error) {
@@ -828,60 +1039,36 @@ func finishShadows(finishers []func(error)) func(error) {
 	}
 }
 
-func bearerCredential(req *http.Request) ([]byte, bool) {
-	values := req.Header.Values("Authorization")
-	if len(values) != 1 {
-		return nil, false
-	}
-
-	const scheme = "Bearer"
-	value := values[0]
-	if len(value) <= len(scheme) || !strings.EqualFold(value[:len(scheme)], scheme) {
-		return nil, false
-	}
-
-	remainder := value[len(scheme):]
-	if remainder == "" || strings.TrimLeft(remainder, " \t") == remainder {
-		return nil, false
-	}
-
-	credential := strings.TrimLeft(remainder, " \t")
-	if credential == "" {
-		return nil, false
-	}
-	return []byte(credential), true
-}
-
-func shadowBucketForBearerCredential(credential []byte) int {
-	digest := sha256.Sum256(credential)
-	// Use the first 8 digest bytes as a stable uint64. This is enough entropy for
-	// 100 buckets while keeping the bucket algorithm simple to reproduce.
-	return int(binary.BigEndian.Uint64(digest[:8]) % 100)
-}
-
 // proxyToLLMGateway rewrites the request model to the functionID/modelName form
 // the LLM Gateway routes on, so vanity callers never see the function ID.
-func (d *OpenAIDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
+func (d *ModelDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
 	if d.llmGatewayDirector == nil {
 		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("LLM Gateway upstream is not configured"))
 		return nil
 	}
 
-	body, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close()
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("failed to read request body: %w", err))
 		return nil
 	}
-
-	rewritten, err := rewriteShadowRequestModel(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
+	// The forwarded body reads the pooled buffer around the new model values and
+	// holds its own buffer reference, so the primary body can close now.
+	rewritten, err := body.withTopLevelModel(resolved.functionInfo.functionId + "/" + resolved.modelName)
+	_ = body.Close()
+	if errors.Is(err, errInvalidJSONBody) {
+		// The model extractor accepts some bodies strict JSON rejects, such as
+		// raw control characters in strings. The caller sent them, so answer 400.
+		writeInvalidJSONBody(writer, resolved.request, err)
+		return nil
+	}
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, err)
 		return nil
 	}
 
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rewritten))
-	resolved.request.ContentLength = int64(len(rewritten))
+	resolved.request.Body = rewritten
+	resolved.request.ContentLength = rewritten.Len()
 
 	return d.llmGatewayDirector.ServeProxy(
 		LLMGatewayRequest{
@@ -894,10 +1081,20 @@ func (d *OpenAIDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved 
 	)
 }
 
-func (d *OpenAIDirector) proxyResolvedRequest(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
+func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolved resolvedOpenAIRequest) error {
 	if resolved.functionInfo.sessionTimeout > 0 {
 		span := trace.SpanFromContext(resolved.request.Context())
 		span.SetAttributes(traceAttrSessionTimeoutSeconds.Int(int(resolved.functionInfo.sessionTimeout)))
+	}
+
+	// endpoint.type names the native route, so upstream.kind records whether
+	// it went through the LLM Gateway.
+	if requestProtocol(resolved.request) != nativeProtocolNone {
+		kind := traceAttrValueUpstreamDirect
+		if resolved.functionInfo.targetsLLMGateway() {
+			kind = traceAttrValueUpstreamLLMGateway
+		}
+		trace.SpanFromContext(resolved.request.Context()).SetAttributes(traceAttrUpstreamKind.String(kind))
 	}
 
 	if resolved.functionInfo.targetsLLMGateway() {
@@ -922,33 +1119,32 @@ func (d *OpenAIDirector) proxyResolvedRequest(writer http.ResponseWriter, resolv
 	return observer.shadowFinalizationError(resolved.request, proxyErr)
 }
 
-func rewriteShadowRequestModel(body []byte, modelName string) ([]byte, error) {
-	if modelName == "" {
-		return body, nil
+// writeOpenAIRequestTooLarge writes the OpenAI-shaped response for a body
+// over the route limit. The forwarding path uses it too, when the limit is
+// reached after the request was dispatched but before any response.
+func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError) {
+	writer.WriteHeader(http.StatusBadRequest)
+	errorMessage := OpenAIError{
+		Error: CustomOpenAIError{
+			Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
+				"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
+			Type: "invalid_request_error",
+			Code: "invalid_image_format",
+		},
 	}
-
-	payload := map[string]json.RawMessage{}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("failed to decode shadow request body: %w", err)
+	if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
 	}
-
-	modelValue, err := json.Marshal(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow model name: %w", err)
-	}
-	payload["model"] = modelValue
-
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow request body: %w", err)
-	}
-	return rewritten, nil
 }
 
 // errModelFieldMissing signals that the client sent a valid request body that did
 // not contain a non-empty "model" field. Callers render this as HTTP 400 rather
 // than letting it fall through to a misleading 404 "model not found".
 var errModelFieldMissing = errors.New("model field is required")
+
+// errInvalidJSONBody signals that the client sent a body that is not a JSON
+// object with the expected field types. Callers render this as HTTP 400.
+var errInvalidJSONBody = errors.New("invalid json body")
 
 // extractOpenAIRequestBody dispatches on Content-Type: multipart/form-data requests
 // (image edits, image variations) read the model from a form field; everything
@@ -1033,6 +1229,58 @@ func readMultipartModelField(r io.Reader, boundary string) (string, error) {
 	}
 }
 
+// isDecisionContentType reports whether a decision route accepts the
+// Content-Type header. A missing header is read as JSON, as on the chat
+// completions route.
+func isDecisionContentType(header string) bool {
+	if header == "" {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(header)
+	return err == nil && mediaType == contentTypeApplicationJSON
+}
+
+// errInvalidRequestBody signals a body that is valid JSON but not an object
+// with a string model. Callers render this as HTTP 400 invalid_request.
+var errInvalidRequestBody = errors.New("invalid request body")
+
+// extractDecisionRequestBody reads only model from a decision route body. The
+// rest of the body is the backend's to validate, so a field the gateway does
+// not use, such as a non-boolean stream, never fails the request here. Only a
+// JSON syntax error is errInvalidJSONBody.
+func extractDecisionRequestBody(request *http.Request) (openAIRequestBody, error) {
+	bodyBytes, err := readOpenAIRequestBody(request, "json body")
+	if err != nil {
+		return openAIRequestBody{}, err
+	}
+	return decodeDecisionRequestBody(bodyBytes)
+}
+
+// decodeDecisionRequestBody applies the decision route checks to a complete
+// buffered body and releases the buffer on error.
+func decodeDecisionRequestBody(bodyBytes *pooledRequestBody) (openAIRequestBody, error) {
+	if !stdjson.Valid(bodyBytes.peek()) {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, errInvalidJSONBody
+	}
+	if bytes.Equal(bytes.TrimSpace(bodyBytes.peek()), []byte("null")) {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, fmt.Errorf("%w: body is null", errInvalidRequestBody)
+	}
+	var decoded struct {
+		Model string `json:"model"`
+	}
+	if err := json.UnmarshalWithOption(bodyBytes.peek(), &decoded, json.DecodeFieldPriorityFirstWin()); err != nil {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidRequestBody, err)
+	}
+	if decoded.Model == "" {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, errModelFieldMissing
+	}
+	return openAIRequestBody{Model: strings.Clone(decoded.Model), raw: bodyBytes.peek()}, nil
+}
+
 // extractOpenAIJSONBody reads the full request body into a pooled ReadCloser and
 // replaces request.Body with it.
 func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
@@ -1040,12 +1288,22 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	if err != nil {
 		return openAIRequestBody{}, err
 	}
+	return decodeOpenAIJSONBody(bodyBytes)
+}
 
+// decodeOpenAIJSONBody reads model and stream from a complete buffered body
+// and releases the buffer on error.
+func decodeOpenAIJSONBody(bodyBytes *pooledRequestBody) (openAIRequestBody, error) {
+	// A top-level null decodes without error, but the body must be a JSON object.
+	if bytes.Equal(bytes.TrimSpace(bodyBytes.peek()), []byte("null")) {
+		_ = bodyBytes.Close()
+		return openAIRequestBody{}, fmt.Errorf("%w: body is null", errInvalidJSONBody)
+	}
 	body := openAIRequestBody{}
-	err = json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
+	err := json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
 	if err != nil {
 		_ = bodyBytes.Close()
-		return openAIRequestBody{}, fmt.Errorf("failed to decode json body: %w", err)
+		return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidJSONBody, err)
 	}
 	if body.Model == "" {
 		_ = bodyBytes.Close()
@@ -1053,48 +1311,8 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	}
 
 	body.Model = strings.Clone(body.Model)
+	body.raw = bodyBytes.peek()
 	return body, nil
-}
-
-type bufferedOpenAIRequestBody struct {
-	*bytes.Reader
-	buffer  *bytebufferpool.ByteBuffer
-	release func()
-}
-
-func readOpenAIRequestBody(request *http.Request, bodyDescription string) (*bufferedOpenAIRequestBody, error) {
-	if request.Body == nil {
-		return nil, fmt.Errorf("expecting %s", bodyDescription)
-	}
-
-	bodyBytes := bytebufferpool.Get()
-	releaseBuffer := sync.OnceFunc(func() {
-		bodyBytes.Reset()
-		bytebufferpool.Put(bodyBytes)
-	})
-	_, err := io.Copy(bodyBytes, request.Body)
-	_ = request.Body.Close()
-	if err != nil {
-		releaseBuffer()
-		return nil, fmt.Errorf("failed to read body: %w", err)
-	}
-
-	bufferedBody := &bufferedOpenAIRequestBody{
-		Reader:  bytes.NewReader(bodyBytes.Bytes()),
-		buffer:  bodyBytes,
-		release: releaseBuffer,
-	}
-	request.Body = bufferedBody
-	return bufferedBody, nil
-}
-
-func (b *bufferedOpenAIRequestBody) peek() []byte {
-	return b.buffer.Bytes()
-}
-
-func (b *bufferedOpenAIRequestBody) Close() error {
-	b.release()
-	return nil
 }
 
 func getFirstValue[K comparable, V any](k K, maps ...map[K]V) (V, bool) {
@@ -1115,4 +1333,55 @@ func isModelExpired(eol time.Time) bool {
 
 	// Model is expired if current time is after the EOL time
 	return time.Now().After(eol)
+}
+
+// OpenAIDirector preserves the existing routing API for callers.
+type OpenAIDirector = ModelDirector
+
+func NewOpenAIDirectorV2(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*ModelDirector, error) {
+	return NewModelDirector(mapping, privateModelMatcher, vanityDirector, llmGatewayDirector, shadower)
+}
+
+func isDecisionRoute(request *http.Request) bool {
+	protocol := requestProtocol(request)
+	return protocol == nativeProtocolDecisions || protocol == nativeProtocolSystemOne
+}
+
+// requestReadFailure maps a failure to read or parse the request body to the
+// status, error code and message of the route's native error.
+// writeInvalidJSONBody answers a request whose body is not valid JSON with 400
+// invalid_json in the route's error shape.
+func writeInvalidJSONBody(writer http.ResponseWriter, request *http.Request, err error) {
+	markGatewayRejected(writer, request)
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+		status, kind, message := requestReadFailure(protocol, err)
+		writeNativeError(writer, request, status, kind, message)
+		return
+	}
+	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
+}
+
+func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
+	status, kind := http.StatusInternalServerError, ""
+	message := "failed to read request"
+	if protocol == nativeProtocolMessages {
+		message = "failed to read Messages request"
+	}
+	if errors.Is(err, errInvalidJSONBody) || errors.Is(err, errModelFieldMissing) {
+		status, kind, message = http.StatusBadRequest, errKindInvalidJSON, "request body is not valid JSON"
+		if protocol == nativeProtocolMessages {
+			message = "invalid Messages request JSON"
+		}
+	}
+	if errors.Is(err, errInvalidRequestBody) {
+		status, kind, message = http.StatusBadRequest, errKindInvalidRequest, "request body must be a JSON object with a string model"
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
+	}
+	if errors.Is(err, errModelFieldMissing) {
+		kind, message = errKindInvalidRequest, "model field is required"
+	}
+	return status, kind, message
 }

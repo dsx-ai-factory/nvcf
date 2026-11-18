@@ -33,17 +33,16 @@ import (
 	"strings"
 	"time"
 
-	echo "github.com/labstack/echo/v4"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/servicetier"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/lastcluster"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
 
 const (
@@ -51,6 +50,7 @@ const (
 
 	headerAuthorization      = "Authorization"
 	headerContentType        = "Content-Type"
+	headerContentEncoding    = "Content-Encoding"
 	headerAccept             = "Accept"
 	headerRequestID          = "X-Request-Id"
 	headerTargetRegion       = "X-NVCF-Target-Region"
@@ -74,12 +74,22 @@ const (
 	sseMaxToken = 4 * 1024 * 1024
 )
 
+const (
+	// headerStargateClusterID names the cluster that served a request.
+	headerStargateClusterID = "X-Stargate-Cluster-Id"
+	// headerStargateLastClusterID is gateway-owned: it carries the cluster
+	// that served the session's last successful request.
+	headerStargateLastClusterID = "X-Stargate-Last-Cluster-Id"
+)
+
 type StargateProvider struct {
 	baseURL                 *url.URL
 	client                  *http.Client
 	requestTimeout          time.Duration
 	upstreamRequestsTotal   otelmetric.Int64Counter
 	upstreamRequestDuration otelmetric.Float64Histogram
+	// lastCluster is nil when last-cluster hints are disabled.
+	lastCluster *lastcluster.Tracker
 }
 
 func NewStargateProvider(cfg config.StargateConfig) (*StargateProvider, error) {
@@ -120,6 +130,33 @@ func NewStargateProvider(cfg config.StargateConfig) (*StargateProvider, error) {
 	}, nil
 }
 
+// SetLastClusterTracker enables last-cluster hints. Call it before serving
+// requests.
+func (p *StargateProvider) SetLastClusterTracker(tracker *lastcluster.Tracker) {
+	p.lastCluster = tracker
+}
+
+// setLastClusterHeader replaces any inbound last-cluster hint with the
+// gateway's own value, or removes it when there is none.
+func setLastClusterHeader(headers http.Header, clusterID string) {
+	headers.Del(headerStargateLastClusterID)
+	if clusterID != "" {
+		headers.Set(headerStargateLastClusterID, clusterID)
+	}
+}
+
+// rememberLastCluster records the serving cluster at response-header time.
+// The tracker ignores non-2xx responses and writes in the background.
+func (p *StargateProvider) rememberLastCluster(
+	ctx context.Context,
+	reqCtx *requestctx.RequestContext,
+	model string,
+	key string,
+	resp *http.Response,
+) {
+	p.lastCluster.Remember(ctx, reqCtx, model, key, resp.StatusCode, resp.Header.Get(headerStargateClusterID))
+}
+
 func (p *StargateProvider) Complete(
 	ctx context.Context,
 	reqCtx *requestctx.RequestContext,
@@ -129,6 +166,9 @@ func (p *StargateProvider) Complete(
 	if err != nil {
 		return nil, err
 	}
+	lastClusterModel := effectiveModel(reqCtx, request)
+	lastClusterKey, lastClusterID := p.lastCluster.Lookup(ctx, reqCtx, lastClusterModel)
+	setLastClusterHeader(outbound.Header, lastClusterID)
 
 	requestCtx, cancel := p.requestContext(ctx)
 	start := time.Now()
@@ -145,6 +185,7 @@ func (p *StargateProvider) Complete(
 		p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, err)
 		return nil, err
 	}
+	p.rememberLastCluster(ctx, reqCtx, lastClusterModel, lastClusterKey, resp)
 
 	events := make(chan StreamEvent, 8)
 	go p.readStream(requestCtx, cancel, resp.Body, events)
@@ -169,6 +210,9 @@ func (p *StargateProvider) Stream(
 	if err != nil {
 		return nil, err
 	}
+	lastClusterModel := effectiveModel(reqCtx, request)
+	lastClusterKey, lastClusterID := p.lastCluster.Lookup(ctx, reqCtx, lastClusterModel)
+	setLastClusterHeader(outbound.Header, lastClusterID)
 
 	requestCtx, cancel := p.requestContext(ctx)
 	start := time.Now()
@@ -187,6 +231,7 @@ func (p *StargateProvider) Stream(
 	}
 
 	p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, nil)
+	p.rememberLastCluster(ctx, reqCtx, lastClusterModel, lastClusterKey, resp)
 	events := make(chan StreamEvent, 8)
 	go p.readStream(requestCtx, cancel, resp.Body, events)
 
@@ -303,9 +348,6 @@ func (p *StargateProvider) newOutboundRequest(
 	if reqCtx.Priority != nil {
 		req.Header.Set(headerPriority, strconv.FormatUint(uint64(*reqCtx.Priority), 10))
 	}
-	if bearerToken := reqCtx.BearerToken; bearerToken != "" {
-		req.Header.Set(headerAuthorization, "Bearer "+bearerToken)
-	}
 
 	model := effectiveModel(reqCtx, request)
 	if model != "" {
@@ -336,6 +378,12 @@ func (p *StargateProvider) Proxy(
 		return nil, errors.New("proxy path is required")
 	}
 
+	var lastClusterModel, lastClusterKey, lastClusterID string
+	if reqCtx != nil {
+		lastClusterModel = reqCtx.Model
+		lastClusterKey, lastClusterID = p.lastCluster.Lookup(ctx, reqCtx, lastClusterModel)
+	}
+
 	requestCtx, cancel := p.requestContext(ctx)
 	target := p.baseURL.ResolveReference(&url.URL{
 		Path:     request.Path,
@@ -355,12 +403,32 @@ func (p *StargateProvider) Proxy(
 	if request.Header != nil {
 		outbound.Header = request.Header.Clone()
 	}
+	decisionRoute := isDecisionPath(request.Path)
+	if decisionRoute {
+		// Decision routes clone every client header. Stargate control headers
+		// are gateway-owned there: a client value would override the estimate
+		// or make Stargate answer with a bare 400.
+		for _, name := range stargateControlHeaders {
+			outbound.Header.Del(name)
+		}
+		// Ask for an uncompressed response so the gateway can read the
+		// reported usage, as Messages does.
+		outbound.Header.Set("Accept-Encoding", "identity")
+	}
+	// Send a fixed-length body, not chunked, so Stargate can reject a body over
+	// its size limit before it reads the body.
+	if request.ContentLength > 0 {
+		outbound.ContentLength = request.ContentLength
+	}
 	// X-Priority is gateway-owned: a client-supplied value cloned from the
 	// inbound request must never reach Stargate, even when no priority
 	// resolves for this request.
 	outbound.Header.Del(headerPriority)
 	// An inbound X-Routing-Method request header must never reach the router.
 	outbound.Header.Del(headerRoutingMethod)
+	// X-Stargate-Last-Cluster-Id is gateway-owned: only the gateway store may
+	// set it.
+	setLastClusterHeader(outbound.Header, lastClusterID)
 
 	if reqCtx != nil {
 		if reqCtx.RequestID != "" {
@@ -384,15 +452,25 @@ func (p *StargateProvider) Proxy(
 		if reqCtx.Model != "" {
 			outbound.Header.Set(headerModel, reqCtx.Model)
 		}
-		if bearerToken := reqCtx.BearerToken; bearerToken != "" {
-			outbound.Header.Set(headerAuthorization, "Bearer "+bearerToken)
+	}
+	// Caller credentials authorize NVCF, never the model server. Remove them on
+	// every route before Stargate, because Pylon forwards request headers to
+	// the model server.
+	for _, name := range callerCredentialHeaders {
+		outbound.Header.Del(name)
+	}
+
+	if decisionRoute {
+		// Stargate requires X-Input-Tokens, so send at least 1.
+		outbound.Header.Set(headerInputTokens, strconv.Itoa(max(1, request.InputTokens)))
+		outbound.Header.Set(headerTokenEstimate, strconv.Itoa(max(1, request.TokenEstimate)))
+	} else {
+		if request.InputTokens > 0 {
+			outbound.Header.Set(headerInputTokens, strconv.Itoa(request.InputTokens))
 		}
-	}
-	if request.InputTokens > 0 {
-		outbound.Header.Set(headerInputTokens, strconv.Itoa(request.InputTokens))
-	}
-	if request.TokenEstimate > 0 {
-		outbound.Header.Set(headerTokenEstimate, strconv.Itoa(request.TokenEstimate))
+		if request.TokenEstimate > 0 {
+			outbound.Header.Set(headerTokenEstimate, strconv.Itoa(request.TokenEstimate))
+		}
 	}
 
 	start := time.Now()
@@ -404,11 +482,27 @@ func (p *StargateProvider) Proxy(
 	}
 
 	p.recordUpstreamRequest(ctx, reqCtx, start, resp.StatusCode, nil)
+	p.rememberLastCluster(ctx, reqCtx, lastClusterModel, lastClusterKey, resp)
 	return &ProxyResponse{
 		StatusCode: clientStatusCode(resp),
 		Header:     resp.Header.Clone(),
 		Body:       &proxyResponseBody{ReadCloser: resp.Body, cancel: cancel},
 	}, nil
+}
+
+// callerCredentialHeaders carry the caller's NVCF credentials or session.
+var callerCredentialHeaders = []string{headerAuthorization, "X-Api-Key", "Proxy-Authorization", "Cookie"}
+
+// stargateControlHeaders are request headers Stargate reads to admit and
+// route a request.
+var stargateControlHeaders = []string{
+	"X-Max-Wait-Ms", "X-Request-Slo-Ms", headerCacheAffinityKey, headerInputTokens, headerTokenEstimate,
+}
+
+// isDecisionPath reports whether path is a decision route, which forwards
+// every client header and body member.
+func isDecisionPath(path string) bool {
+	return path == "/v1/decisions" || path == "/v1/systemone"
 }
 
 type proxyResponseBody struct {
@@ -445,16 +539,13 @@ func outboundChatRequest(
 		streamOptions.IncludeUsage = ptr.To(true)
 		outbound.StreamOptions = &streamOptions
 	}
-	if !outbound.ServiceTier.IsValid() {
-		outbound.ServiceTier = servicetier.Auto
-	}
 
 	return &outbound
 }
 
 // gatewayOwnedChatFields are replaced or removed in the forwarded client body.
 // Keys are matched case-insensitively because encoding/json binds them that way.
-var gatewayOwnedChatFields = []string{"model", "stream", "stream_options", "service_tier", "debug"}
+var gatewayOwnedChatFields = []string{"model", "stream", "stream_options", "debug"}
 
 func outboundChatRequestBody(request *NormalizedRequest, stream bool) ([]byte, error) {
 	outbound := outboundChatRequest(request, stream)
@@ -495,9 +586,6 @@ func outboundChatRequestBody(request *NormalizedRequest, stream bool) ([]byte, e
 		return nil, err
 	}
 	if err := setJSONField(payload, "stream", outbound.Stream); err != nil {
-		return nil, err
-	}
-	if err := setJSONField(payload, "service_tier", outbound.ServiceTier); err != nil {
 		return nil, err
 	}
 
@@ -573,22 +661,8 @@ func checkHTTPError(resp *http.Response) error {
 		return nil
 	}
 
-	statusCode := clientStatusCode(resp)
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
-	message := string(body)
-
-	var errorResponse models.ErrorResponse
-	if err := json.Unmarshal(body, &errorResponse); err == nil && errorResponse.Error.Message != "" {
-		if statusCode == statusOverloaded && errorResponse.Error.Code == overloadErrorCode {
-			return echo.NewHTTPError(statusCode, errorResponse)
-		}
-		message = errorResponse.Error.Message
-	}
-	if message == "" {
-		message = http.StatusText(resp.StatusCode)
-	}
-
-	return echo.NewHTTPError(statusCode, message)
+	body := ReadUpstreamErrorBody(resp.Body, resp.Header.Get(headerContentEncoding))
+	return NewUpstreamHTTPError(clientStatusCode(resp), resp.Header, body)
 }
 
 type chatCompletionChoiceAccumulator struct {
@@ -638,8 +712,10 @@ func aggregateChatCompletionStream(events <-chan StreamEvent) (*models.ChatCompl
 			response.CreatedAt = chunk.CreatedAt
 			response.Model = chunk.Model
 			response.SystemFingerprint = chunk.SystemFingerprint
-			response.ServiceTier = chunk.ServiceTier
 			seenChunk = true
+		}
+		if response.ServiceTier == "" {
+			response.ServiceTier = chunk.ServiceTier
 		}
 		if chunk.Usage != nil {
 			response.Usage = *chunk.Usage
@@ -922,6 +998,22 @@ func (a *chatCompletionChoiceAccumulator) buildToolCalls() []models.ChatCompleti
 	return toolCalls
 }
 
+// upstreamStreamError returns the error event that engines such as vLLM send in
+// place of a chunk when they fail after the 200, or nil for any other payload.
+// The message follows the rules and size cap for upstream error bodies.
+func upstreamStreamError(payload string) *UpstreamStreamError {
+	var event struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(payload), &event) != nil {
+		return nil
+	}
+	if len(event.Error) == 0 || bytes.Equal(event.Error, []byte("null")) {
+		return nil
+	}
+	return &UpstreamStreamError{Message: UpstreamErrorMessage([]byte(payload))}
+}
+
 func (p *StargateProvider) readStream(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -934,6 +1026,21 @@ func (p *StargateProvider) readStream(
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxToken)
+
+	// A canceled context means the client went away and may not read again. A
+	// missed request deadline must reach the reader, or the stream ends like a
+	// finished one; the API layer drains the stream if it stops reading early.
+	sendContextErr := func() {
+		ctxErr := ctx.Err()
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			events <- StreamEvent{Err: fmt.Errorf("%w: %w", ErrStreamIncomplete, ctxErr)}
+			return
+		}
+		select {
+		case events <- StreamEvent{Err: ctxErr}:
+		default:
+		}
+	}
 
 	var dataLines []string
 	emit := func() bool {
@@ -948,20 +1055,26 @@ func (p *StargateProvider) readStream(
 			return false
 		}
 
+		// An error member can come with choices (OpenRouter sends finish_reason
+		// "error"). Only payloads that contain the key are parsed for it.
+		if strings.Contains(payload, `"error"`) {
+			if upstreamErr := upstreamStreamError(payload); upstreamErr != nil {
+				events <- StreamEvent{Err: upstreamErr}
+				return false
+			}
+		}
+
 		var chunk models.ChatCompletionChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			events <- StreamEvent{
-				Err: fmt.Errorf("decode stargate stream chunk: %w", err),
+				Err: fmt.Errorf("%w: decode stargate stream chunk: %w", ErrStreamIncomplete, err),
 			}
 			return false
 		}
 
 		select {
 		case <-ctx.Done():
-			select {
-			case events <- StreamEvent{Err: ctx.Err()}:
-			default:
-			}
+			sendContextErr()
 			return false
 		case events <- StreamEvent{Chunk: &chunk, Raw: json.RawMessage(payload)}:
 			return true
@@ -984,23 +1097,25 @@ func (p *StargateProvider) readStream(
 		}
 	}
 
-	if len(dataLines) > 0 {
-		_ = emit()
+	// Check the context first: an event cut off because the client went away
+	// would otherwise fail to decode and look like an upstream failure.
+	if ctx.Err() != nil {
+		sendContextErr()
+		return
 	}
-
+	if len(dataLines) > 0 && !emit() {
+		return
+	}
 	if err := scanner.Err(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			select {
-			case events <- StreamEvent{Err: ctxErr}:
-			default:
-			}
-			return
-		}
 		if errors.Is(err, context.Canceled) {
 			return
 		}
 		events <- StreamEvent{
-			Err: fmt.Errorf("read stargate stream: %w", err),
+			Err: fmt.Errorf("%w: read stargate stream: %w", ErrStreamIncomplete, err),
 		}
+		return
 	}
+	// A stream cut short upstream (Pylon output timeout, worker hang) can still
+	// end in a clean EOF, so only [DONE] marks a finished response.
+	events <- StreamEvent{Err: fmt.Errorf("%w: stargate stream ended before [DONE]", ErrStreamIncomplete)}
 }

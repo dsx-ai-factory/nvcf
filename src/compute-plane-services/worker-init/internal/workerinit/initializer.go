@@ -19,20 +19,22 @@ package workerinit
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 	"go.uber.org/zap"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-init/configs"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-init/internal/downloader"
-	initMetrics "github.com/NVIDIA/nvcf/src/compute-plane-services/worker-init/internal/metrics"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/worker-init/pkg/ess"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metering"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/types"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-init/configs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-init/internal/downloader"
+	initMetrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-init/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-init/pkg/ess"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metering"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
 )
 
 type baseInitializer struct {
@@ -81,7 +83,7 @@ func NewInitializer(config configs.InitConfig) (Initializer, error) {
 		config.ICMSEnvironment = config.SpotEnvironment
 	}
 
-	otelUrl, err := url.Parse(config.OTELExporterOTLPEndpoint)
+	otlpHost, otlpInsecure, err := otlpTraceTarget(config.OTELExporterOTLPEndpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -96,9 +98,9 @@ func NewInitializer(config configs.InitConfig) (Initializer, error) {
 		}
 	}
 	tracingConfig := tracing.OTELConfig{
-		Enabled:     true,
-		Endpoint:    otelUrl.Host,
-		Insecure:    otelUrl.Scheme == "http",
+		Enabled:     otlpHost != "",
+		Endpoint:    otlpHost,
+		Insecure:    otlpInsecure,
 		AccessToken: config.TracingAccessToken,
 		Attributes: tracing.Attributes{
 			ServiceName:    serviceName,
@@ -121,6 +123,10 @@ func NewInitializer(config configs.InitConfig) (Initializer, error) {
 		tracingConfig.Attributes.Extra["function_id"] = config.FunctionId
 		tracingConfig.Attributes.Extra["function_version_id"] = config.FunctionVersionId
 		tracingConfig.Attributes.Extra["function_name"] = config.FunctionName
+	}
+	if !tracingConfig.Enabled {
+		zap.L().Info("OTEL_EXPORTER_OTLP_ENDPOINT is not set, tracing is disabled",
+			zap.String("service", serviceName))
 	}
 	_, err = tracing.SetupOTELTracer(&tracingConfig)
 	if err != nil {
@@ -218,6 +224,24 @@ func (in *baseInitializer) downloadArtifacts(ctx context.Context, getArtifactsLi
 
 func isNVCTInit(config configs.InitConfig) bool {
 	return config.NvcfConfig.NvcfWorkerToken == ""
+}
+
+// otlpTraceTarget parses OTEL_EXPORTER_OTLP_ENDPOINT into the host and
+// transport security for the OTLP gRPC trace exporter. An empty or unset
+// endpoint returns an empty host, which means tracing is disabled.
+func otlpTraceTarget(endpoint string) (host string, insecure bool, err error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", false, nil
+	}
+	otelURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", false, err
+	}
+	if otelURL.Host == "" {
+		return "", false, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT must be a URL with a host, such as http://otel-collector:4317")
+	}
+	return otelURL.Host, otelURL.Scheme == "http", nil
 }
 
 func logArtifactsForDebug(kind, baseRepo string, artifacts []types.Artifact) {

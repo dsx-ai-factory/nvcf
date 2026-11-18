@@ -23,11 +23,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/nats-auth-callout/internal/config"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/nkey"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/oauth"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/types"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/webhook"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/config"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/nkey"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/oauth"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/types"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/nats-auth-callout/internal/plugins/webhook"
 )
 
 // PluginKey represents a composite key for identifying plugins.
@@ -104,13 +104,14 @@ func (pm *Manager) initializePlugins() {
 			if alias == "" {
 				alias = plugin.ID // Default to plugin ID if no alias
 			}
+			pluginAccountName := accountName
 			if plugin.ID == "nkey" {
 				// the nkey plugin maintains its own internal account list and is special cased.
 				// we don't know the account name until the nkey is looked up by the plugin.
-				accountName = ""
+				pluginAccountName = ""
 			}
 			pluginKey := PluginKey{
-				AccountName: accountName,
+				AccountName: pluginAccountName,
 				PluginName:  alias,
 			}
 

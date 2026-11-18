@@ -69,7 +69,10 @@ nvcf_java_test(
         "@nv_third_party_deps//:org_slf4j_slf4j_api",
         "@nv_third_party_deps//:org_springframework_boot_spring_boot",
         "@nv_third_party_deps//:org_springframework_boot_spring_boot_actuator_autoconfigure",
+        "@nv_third_party_deps//:org_springframework_boot_spring_boot_autoconfigure",
+        "@nv_third_party_deps//:org_springframework_boot_spring_boot_health",
         "@nv_third_party_deps//:org_springframework_boot_spring_boot_starter_test",
+        "@nv_third_party_deps//:org_springframework_boot_spring_boot_test",
         "@nv_third_party_deps//:org_springframework_boot_spring_boot_testcontainers",
         "@nv_third_party_deps//:org_springframework_spring_beans",
         "@nv_third_party_deps//:org_springframework_spring_context",
@@ -106,6 +109,7 @@ java_oci_image(
         "ULIMIT_FLAG": "1",
         "JAVA_TOOL_OPTIONS": "-XX:+PrintFlagsFinal -XX:InitialRAMPercentage=60 -XX:MaxRAMPercentage=60 -XX:+EnableDynamicAgentLoading",
     },
+    user = "1000:1000",
     workdir = "/home/app",
 )
 
@@ -119,5 +123,6 @@ java_image_contract_test(
         "ULIMIT_FLAG": "1",
         "JAVA_TOOL_OPTIONS": "-XX:+PrintFlagsFinal -XX:InitialRAMPercentage=60 -XX:MaxRAMPercentage=60 -XX:+EnableDynamicAgentLoading",
     },
+    user = "1000:1000",
     workdir = "/home/app",
 )
