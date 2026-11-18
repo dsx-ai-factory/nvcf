@@ -289,6 +289,7 @@ releases:
     values:
       - collectorName: {{ dig "collector" "collectorName" "nvcf-observability" .Values | quote }}
         image: {{ dig "collector" "image" "" .Values | quote }}
+        replicas: {{ dig "collector" "replicas" 1 .Values }}
         {{- if .Values.global.imagePullSecrets }}
         imagePullSecrets:
           {{- toYaml .Values.global.imagePullSecrets | nindent 10 }}

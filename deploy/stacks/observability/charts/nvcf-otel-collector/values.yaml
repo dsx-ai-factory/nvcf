@@ -15,6 +15,7 @@
 
 collectorName: nvcf-observability
 image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0
+replicas: 1
 imagePullSecrets: []
 
 targetAllocatorRbac:

@@ -309,6 +309,8 @@ for profile in control compute all; do
     "$profile targetAllocator.enabled"
   assert_yaml_value "$collector_values" '.targetAllocatorRbac.create' true \
     "$profile targetAllocatorRbac.create"
+  assert_yaml_value "$collector_values" '.replicas' 1 \
+    "$profile collector replicas default"
   assert_yaml_value "$collector_values" \
     '.config.exporters.prometheusremotewrite.endpoint' \
     'http://vmsingle.monitoring.svc.cluster.local:8428/api/v1/write' \
@@ -577,6 +579,20 @@ NVCF_TARGET_ALLOCATOR_ROLE="$collector_name-otel" yq -e '
   .rules[] | select(.apiGroups[] == "") | .resources[] | select(. == "secrets")
 ' "$work_dir/collector-manifests.yaml" >/dev/null ||
   fail "Target Allocator RBAC must allow referenced Secret discovery"
+assert_yaml_value "$work_dir/collector-manifests.yaml" \
+  'select(.kind == "OpenTelemetryCollector") | .spec.replicas' 1 \
+  'collector CR replicas default'
+
+# collector.replicas reaches the OpenTelemetryCollector resource.
+replicas_values="$work_dir/collector-replicas-values.yaml"
+write_release_values control otel-collector "$replicas_values" \
+  --state-values-set collector.replicas=2
+assert_yaml_value "$replicas_values" '.replicas' 2 'collector.replicas override'
+helm template otel-collector "$stack_dir/charts/nvcf-otel-collector" \
+  --values "$replicas_values" >"$work_dir/collector-replicas-manifests.yaml"
+assert_yaml_value "$work_dir/collector-replicas-manifests.yaml" \
+  'select(.kind == "OpenTelemetryCollector") | .spec.replicas' 2 \
+  'collector CR replicas override'
 
 # Every supported external authentication mode must pass validation and retain
 # the external collector endpoint. Autoscaler-specific auth values are covered
