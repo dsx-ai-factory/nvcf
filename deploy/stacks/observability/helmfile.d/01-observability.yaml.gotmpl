@@ -66,8 +66,8 @@ environments:
 {{- if and (eq $targetAllocatorMode "install") (eq $discoveryRbacMode "disabled") }}
 {{- fail "observability.components.discoveryRbac.mode cannot be disabled when the Target Allocator is installed; use existing for externally managed RBAC" }}
 {{- end }}
-{{- $collectorReplicas := int (dig "collector" "replicas" 1 .Values) }}
-{{- if lt $collectorReplicas 1 }}
+{{- $collectorReplicas := toString (dig "collector" "replicas" 1 .Values) }}
+{{- if and (eq $collectorMode "install") (not (regexMatch "^[1-9][0-9]*$" $collectorReplicas)) }}
 {{- fail "collector.replicas must be an integer of at least 1; use observability.components.collector.mode=disabled to run no collector" }}
 {{- end }}
 {{- $observabilityNamespace := dig "observability" "namespace" "monitoring" .Values }}

@@ -164,9 +164,11 @@ split deployment, configure compute-plane collection separately. See [Cluster
 Monitoring](../compute-plane/cluster-management/monitoring.md).
 
 The collector runs one replica by default. Set `collector.replicas` to run
-more. The Target Allocator splits scrape targets across the replicas and each
-target keeps one collector, so a collector restart interrupts only that
-replica's share of targets.
+more. When the Target Allocator is installed (the default), it assigns each
+scrape target to one replica at a time, so a collector restart pauses only
+part of the targets, and it moves a removed replica's targets to the others.
+Without the Target Allocator, every replica runs the full scrape
+configuration.
 
 ### Logging
 
