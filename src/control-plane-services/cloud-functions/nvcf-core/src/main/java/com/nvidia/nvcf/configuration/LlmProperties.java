@@ -26,19 +26,41 @@ import org.springframework.context.annotation.Configuration;
 @Data
 @RefreshScope
 @Configuration
-@ConfigurationProperties(prefix = "nvcf.llm.termination-grace-period")
-public class TerminationGracePeriodProperties {
+@ConfigurationProperties(prefix = "nvcf.llm")
+public class LlmProperties {
 
-    // When a function has no stored duration, the minimum is sent at launch.
-    private Duration min = Duration.ofMinutes(1);
-    private Duration max = Duration.ofMinutes(5);
+    private RequestRouter requestRouter = new RequestRouter();
+    private Worker worker = new Worker();
+
+    @Data
+    public static class RequestRouter {
+        private String workerAddress;
+    }
+
+    @Data
+    public static class Worker {
+        private TerminationGracePeriod terminationGracePeriod = new TerminationGracePeriod();
+    }
+
+    @Data
+    public static class TerminationGracePeriod {
+        // When a function has no stored duration, the minimum is sent at launch.
+        private Duration min = Duration.ofMinutes(1);
+        private Duration max = Duration.ofMinutes(5);
+    }
 
     @PostConstruct
     void validate() {
+        if (worker == null || worker.getTerminationGracePeriod() == null) {
+            throw new IllegalStateException("nvcf.llm.worker.termination-grace-period is required");
+        }
+        var gracePeriod = worker.getTerminationGracePeriod();
+        var min = gracePeriod.getMin();
+        var max = gracePeriod.getMax();
         if (min == null || max == null || min.isNegative() || min.isZero()
                 || max.compareTo(min) < 0) {
             throw new IllegalStateException(
-                    "nvcf.llm.termination-grace-period requires 0 < min <= max");
+                    "nvcf.llm.worker.termination-grace-period requires 0 < min <= max");
         }
     }
 }

@@ -114,7 +114,7 @@ import tools.jackson.databind.json.JsonMapper;
         properties = {
                 "spring.profiles.active=test",
                 "nvcf.global-fqdn-grpc=http://localhost:9090",
-                "nvcf.llm.termination-grace-period.min=PT2M"
+                "nvcf.llm.worker.termination-grace-period.min=PT2M"
         })
 @ContextConfiguration(initializers = IntegrationTestConfiguration.Initializer.class)
 class IcmsClientTest {

@@ -19,7 +19,7 @@ package com.nvidia.nvcf.service.function;
 import com.nimbusds.oauth2.sdk.util.CollectionUtils;
 import com.nvidia.boot.exceptions.BadRequestException;
 import com.nvidia.boot.exceptions.NotFoundException;
-import com.nvidia.nvcf.configuration.TerminationGracePeriodProperties;
+import com.nvidia.nvcf.configuration.LlmProperties;
 import com.nvidia.nvcf.persistence.function.entity.FunctionEntity;
 import com.nvidia.nvcf.persistence.function.entity.FunctionType;
 import com.nvidia.nvcf.rest.function.management.dto.CreateFunctionRequest;
@@ -79,7 +79,7 @@ public class FunctionLlmService {
 
     private final FunctionLookupService functionLookupService;
     private final FunctionMapperService functionMapperService;
-    private final TerminationGracePeriodProperties terminationGracePeriodProperties;
+    private final LlmProperties llmProperties;
 
     /**
      * Resolves the caller's invocation priority: the per-account override when the caller has one,
@@ -140,8 +140,9 @@ public class FunctionLlmService {
             return;
         }
         var duration = config.terminationGracePeriodDuration();
-        var min = terminationGracePeriodProperties.getMin();
-        var max = terminationGracePeriodProperties.getMax();
+        var gracePeriod = llmProperties.getWorker().getTerminationGracePeriod();
+        var min = gracePeriod.getMin();
+        var max = gracePeriod.getMax();
         if (duration.compareTo(min) < 0 || duration.compareTo(max) > 0) {
             var detail = MESG_INVALID_TERMINATION_GRACE_PERIOD.formatted(min, max);
             var message = functionId == null ? detail

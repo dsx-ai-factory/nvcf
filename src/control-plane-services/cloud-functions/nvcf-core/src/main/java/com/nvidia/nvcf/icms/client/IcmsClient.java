@@ -38,7 +38,7 @@ import com.nvidia.boot.exceptions.NotFoundException;
 import com.nvidia.boot.exceptions.UpstreamException;
 import com.nvidia.boot.registries.service.registry.client.ngc.NgcRegistryUtils;
 import com.nvidia.boot.registries.service.registry.dto.ArtifactTypeEnum;
-import com.nvidia.nvcf.configuration.TerminationGracePeriodProperties;
+import com.nvidia.nvcf.configuration.LlmProperties;
 import com.nvidia.nvcf.configuration.nats.NatsConfiguration.NatsProperties;
 import com.nvidia.nvcf.configuration.staticclientauth.FixedBearerExchangeFilterFunction;
 import com.nvidia.nvcf.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientIcmsProperties;
@@ -172,11 +172,10 @@ public class IcmsClient {
     private final String otelCollectorContainer;
     private final String llmCredentialManagerImage;
     private final String llmRouterClientImage;
-    private final String llmRequestRouterAddress;
+    private final LlmProperties llmProperties;
     private final JsonMapper jsonMapper;
     private final GrpcTokenService grpcTokenService;
     private final FunctionMapperService functionMapperService;
-    private final TerminationGracePeriodProperties terminationGracePeriodProperties;
     private final NatsProperties natsProperties;
     private final TelemetryService telemetryService;
     private final RegistryArtifactValidationService registryArtifactValidationService;
@@ -215,7 +214,6 @@ public class IcmsClient {
             @Value("${nvcf.sidecars.otel-collector-container:}") String otelCollectorContainer,
             @Value("${nvcf.sidecars.llm-credential-manager-image}") String llmCredentialManagerImage,
             @Value("${nvcf.sidecars.llm-router-client-image}") String llmRouterClientImage,
-            @Value("${nvcf.llm-request-router.worker-address}") String llmRequestRouterAddress,
             @Value("${nvcf.fqdn}") String selfFqdn,
             @Value("${nvcf.global-fqdn-grpc}") String globalFqdnGrpc,
             @Value("${" + OTLP_ENDPOINT_PROPERTY + ":}") String tracingEndpoint,
@@ -233,7 +231,7 @@ public class IcmsClient {
             JsonMapper jsonMapper,
             GrpcTokenService grpcTokenService,
             FunctionMapperService functionMapperService,
-            TerminationGracePeriodProperties terminationGracePeriodProperties,
+            LlmProperties llmProperties,
             NatsProperties natsProperties,
             TelemetryService telemetryService,
             RegistryArtifactValidationService registryArtifactValidationService,
@@ -251,13 +249,12 @@ public class IcmsClient {
         this.otelCollectorContainer = otelCollectorContainer;
         this.llmCredentialManagerImage = llmCredentialManagerImage;
         this.llmRouterClientImage = llmRouterClientImage;
-        this.llmRequestRouterAddress = llmRequestRouterAddress;
+        this.llmProperties = llmProperties;
         this.selfFqdn = selfFqdn;
         this.globalFqdnGrpc = globalFqdnGrpc;
         this.jsonMapper = jsonMapper;
         this.grpcTokenService = grpcTokenService;
         this.functionMapperService = functionMapperService;
-        this.terminationGracePeriodProperties = terminationGracePeriodProperties;
         this.telemetryService = telemetryService;
         this.essFqdn = essFqdn;
         this.sendLegacyCredProps = sendLegacyCredProps;
@@ -490,7 +487,8 @@ public class IcmsClient {
             envStream = Stream.concat(envStream, Stream.of(
                     Pair.of("LLM_CREDENTIAL_MANAGER_IMAGE", llmCredentialManagerImage),
                     Pair.of("LLM_ROUTER_CLIENT_IMAGE", llmRouterClientImage),
-                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS", llmRequestRouterAddress)));
+                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS",
+                            llmProperties.getRequestRouter().getWorkerAddress())));
             var terminationGracePeriod = terminationGracePeriod(function);
             if (terminationGracePeriod != null) {
                 envStream = Stream.concat(envStream, Stream.of(
@@ -535,7 +533,7 @@ public class IcmsClient {
         LlmInvocationConfigDto config = functionMapperService.toLlmInvocationConfigDto(
                 function.getLlmConfig());
         var duration = config == null ? null : config.terminationGracePeriodDuration();
-        return (duration == null ? terminationGracePeriodProperties.getMin()
+        return (duration == null ? llmProperties.getWorker().getTerminationGracePeriod().getMin()
                 : duration).toString();
     }
 

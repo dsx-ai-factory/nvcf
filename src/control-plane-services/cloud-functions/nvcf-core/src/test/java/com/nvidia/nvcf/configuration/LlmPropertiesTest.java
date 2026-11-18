@@ -26,32 +26,40 @@ import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
-class TerminationGracePeriodPropertiesTest {
+class LlmPropertiesTest {
 
     @Test
     void defaultsAndOverrides() {
-        var defaults = new TerminationGracePeriodProperties();
+        var defaults = new LlmProperties();
         defaults.validate();
-        assertThat(defaults.getMin()).isEqualTo(Duration.ofMinutes(1));
-        assertThat(defaults.getMax()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(defaults.getWorker().getTerminationGracePeriod().getMin())
+                .isEqualTo(Duration.ofMinutes(1));
+        assertThat(defaults.getWorker().getTerminationGracePeriod().getMax())
+                .isEqualTo(Duration.ofMinutes(5));
 
         var source = new MapConfigurationPropertySource(Map.of(
-                "nvcf.llm.termination-grace-period.min", "2m",
-                "nvcf.llm.termination-grace-period.max", "6m"));
-        var overridden = new TerminationGracePeriodProperties();
-        new Binder(source).bind("nvcf.llm.termination-grace-period",
+                "nvcf.llm.worker.termination-grace-period.min", "2m",
+                "nvcf.llm.worker.termination-grace-period.max", "6m",
+                "nvcf.llm.request-router.worker-address", "router.example.com:50071"));
+        var overridden = new LlmProperties();
+        new Binder(source).bind("nvcf.llm",
                                 Bindable.ofInstance(overridden));
         overridden.validate();
-        assertThat(overridden.getMin()).isEqualTo(Duration.ofMinutes(2));
-        assertThat(overridden.getMax()).isEqualTo(Duration.ofMinutes(6));
+        assertThat(overridden.getWorker().getTerminationGracePeriod().getMin())
+                .isEqualTo(Duration.ofMinutes(2));
+        assertThat(overridden.getWorker().getTerminationGracePeriod().getMax())
+                .isEqualTo(Duration.ofMinutes(6));
+        assertThat(overridden.getRequestRouter().getWorkerAddress())
+                .isEqualTo("router.example.com:50071");
     }
 
     @Test
     void rejectsInvalidBounds() {
-        var properties = new TerminationGracePeriodProperties();
-        properties.setMin(Duration.ZERO);
+        var properties = new LlmProperties();
+        var gracePeriod = properties.getWorker().getTerminationGracePeriod();
+        gracePeriod.setMin(Duration.ZERO);
         assertThatThrownBy(properties::validate).isInstanceOf(IllegalStateException.class);
-        properties.setMin(Duration.ofMinutes(6));
+        gracePeriod.setMin(Duration.ofMinutes(6));
         assertThatThrownBy(properties::validate).isInstanceOf(IllegalStateException.class);
     }
 }
