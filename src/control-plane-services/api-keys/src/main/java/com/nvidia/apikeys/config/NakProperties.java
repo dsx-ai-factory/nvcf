@@ -59,16 +59,6 @@ public class NakProperties {
     @Builder.Default
     private String tieredRateLimitRuleName = "apikey.account_rate_limit";
 
-    @Valid
-    @NestedConfigurationProperty
-    @Builder.Default
-    private SchedulerProperties scheduler = new SchedulerProperties();
-
-    @Data
-    public static class SchedulerProperties {
-        private boolean enabled = true;
-    }
-
     // api key properties
     @NotBlank
     private String keyPrefix;
@@ -85,4 +75,14 @@ public class NakProperties {
     @NotNull
     @NestedConfigurationProperty
     private EncryptedModelConverterProperties encryptedModelConverter;
+
+    @Valid
+    @NestedConfigurationProperty
+    @Builder.Default
+    private SchedulerProperties scheduler = new SchedulerProperties();
+
+    @Data
+    public static class SchedulerProperties {
+        private boolean enabled = true;
+    }
 }
