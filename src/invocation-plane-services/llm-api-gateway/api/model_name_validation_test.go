@@ -136,6 +136,7 @@ func serveModelNameRequest(e *echo.Echo, path, bodyFormat, model string) *httpte
 	encodedModel, _ := json.Marshal(model)
 	if !utf8.ValidString(model) {
 		// json.Marshal would replace the invalid bytes; send them raw as a client could.
+		// Such a case must hold no quote, backslash, or control byte.
 		encodedModel = []byte(`"` + model + `"`)
 	}
 	body := fmt.Sprintf(bodyFormat, encodedModel)
