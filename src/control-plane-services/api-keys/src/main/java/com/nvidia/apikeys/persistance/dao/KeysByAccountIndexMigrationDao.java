@@ -128,28 +128,14 @@ public class KeysByAccountIndexMigrationDao {
                 .map(row -> map(row, KeyByOwnerAndAccountAndServiceModel.class));
     }
 
-    public Optional<TimedRow<KeyByOwnerAndServiceModel>> owner(
-            KeyByOwnerAndAccountAndServiceModel key, Set<String> issuerIds) {
+    public boolean ownerExists(KeyByOwnerAndAccountAndServiceModel key, Set<String> issuerIds) {
         for (var issuer : issuerIds) {
-            var row = traced("read-row", () -> ownerRepository.findMigrationRow(
-                    key.getOwnerType(), key.getOwnerId(), issuer, key.getKeyId()).one());
-            if (row != null) {
-                return Optional.of(map(row, KeyByOwnerAndServiceModel.class));
+            if (traced("read-row", () -> ownerRepository.findByOwnerTypeAndOwnerIdAndIssuerServiceIdAndKeyId(
+                    key.getOwnerType(), key.getOwnerId(), issuer, key.getKeyId())).isPresent()) {
+                return true;
             }
         }
-        return Optional.empty();
-    }
-
-    public boolean ownerExists(KeyByOwnerAndAccountAndServiceModel key, Set<String> issuerIds) {
-        return owner(key, issuerIds).isPresent();
-    }
-
-    public Optional<KeyByOwnerAndServiceModel> setOwnerNcaId(
-            KeyByOwnerAndServiceModel key, String ncaId, long timestamp) {
-        traced("assign-owner-nca", () -> ownerRepository.setNcaIdAtTimestamp(
-                key.getOwnerType(), key.getOwnerId(), key.getIssuerServiceId(), key.getKeyId(), ncaId, timestamp));
-        return traced("read-row", () -> ownerRepository.findByOwnerTypeAndOwnerIdAndIssuerServiceIdAndKeyId(
-                key.getOwnerType(), key.getOwnerId(), key.getIssuerServiceId(), key.getKeyId()));
+        return false;
     }
 
     public void copy(KeyByOwnerAndAccountAndServiceModel model, long timestamp) {

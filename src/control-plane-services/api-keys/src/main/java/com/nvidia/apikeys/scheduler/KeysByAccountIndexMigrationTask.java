@@ -39,7 +39,6 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -129,8 +128,8 @@ public class KeysByAccountIndexMigrationTask {
     }
 
     private void scan(Summary summary, Runnable renewLock) throws InterruptedException {
-        pages(state -> dao.accountPage(state, migrationProperties.getPageSize()), row -> reconcileAccount(row, summary), renewLock);
         pages(state -> dao.ownerPage(state, migrationProperties.getPageSize()), row -> copy(row, summary), renewLock);
+        pages(state -> dao.accountPage(state, migrationProperties.getPageSize()), row -> removeOrphan(row, summary), renewLock);
     }
 
     private void copy(TimedRow<KeyByOwnerAndServiceModel> source, Summary summary) {
@@ -144,23 +143,18 @@ public class KeysByAccountIndexMigrationTask {
             if (StringUtils.isBlank(key.getKeyHash())) {
                 throw new IllegalStateException("Key hash is missing from owner-index details");
             }
-            if (summary.blockedKeys.contains(key.getKeyHash())) {
-                return;
-            }
             var credential = dao.credential(key.getKeyHash());
             var assignments = Stream.of(key.getNcaId(), key.getNcaIdInDetails(),
                             credential.map(row -> row.model().getNcaId()).orElse(null))
                     .map(StringUtils::trimToNull).filter(StringUtils::isNotBlank)
                     .collect(Collectors.toSet());
             if (assignments.size() > 1) {
-                conflict(summary, key.getKeyId(), key.getKeyHash(), assignments);
+                log.atError().addKeyValue("keyId", key.getKeyId())
+                        .addKeyValue("ncaIds", assignments).log("Conflicting key NCA IDs block migration");
+                record(summary, "conflict", true);
                 return;
             }
             var ncaId = assignments.stream().findFirst().orElse(properties.getNcaId());
-            var changed = StringUtils.isBlank(model.getNcaId());
-            if (!retainAssignment(source, ncaId, key.getKeyHash(), summary)) {
-                return;
-            }
             if (services.getServiceById(key.getIssuerServiceId()).isEmpty()) {
                 record(summary, "unmapped", false);
             }
@@ -173,6 +167,7 @@ public class KeysByAccountIndexMigrationTask {
                     .build();
             var targetModel = accountConverter.voToModel(target);
             var stored = dao.account(targetModel);
+            var changed = false;
             if (stored.isEmpty() || !sameAccount(stored.get().model(), target)) {
                 dao.copy(targetModel, source);
                 changed = true;
@@ -201,68 +196,16 @@ public class KeysByAccountIndexMigrationTask {
         }
     }
 
-    private boolean retainAssignment(TimedRow<KeyByOwnerAndServiceModel> source,
-            String ncaId, String keyHash, Summary summary) {
-        if (StringUtils.isNotBlank(source.model().getNcaId())) {
-            return true;
-        }
-        // Reuse the data timestamp so assignment metadata cannot outrank a later delete.
-        var written = dao.setOwnerNcaId(source.model(), ncaId, source.timestamp());
-        if (written.isEmpty() || StringUtils.isBlank(written.get().getNcaId())) {
-            summary.blockedKeys.add(keyHash);
-            record(summary, "retry", true);
-            return false;
-        }
-        var storedNcaId = StringUtils.trimToNull(written.get().getNcaId());
-        if (!ncaId.equals(storedNcaId)) {
-            conflict(summary, source.model().getKeyId(), keyHash, Set.of(ncaId, storedNcaId));
-            return false;
-        }
-        return true;
-    }
-
-    private void recoverAssignment(TimedRow<KeyByOwnerAndServiceModel> source,
-            KeyByOwnerAndAccountAndServiceModel account, Summary summary) {
-        var key = ownerConverter.modelToVo(source.model());
-        var stored = accountConverter.modelToVo(account);
-        String credentialNcaId = null;
-        if (StringUtils.isBlank(key.getNcaId())) {
-            credentialNcaId = dao.credential(key.getKeyHash())
-                    .map(row -> row.model().getNcaId()).orElse(null);
-        }
-        var assignments = Stream.of(key.getNcaId(), key.getNcaIdInDetails(), credentialNcaId,
-                        account.getNcaId(), stored.getNcaIdInDetails())
-                .map(StringUtils::trimToNull).filter(StringUtils::isNotBlank)
-                .collect(Collectors.toSet());
-        if (assignments.size() > 1) {
-            conflict(summary, key.getKeyId(), key.getKeyHash(), assignments);
-            return;
-        }
-        if (StringUtils.isBlank(key.getNcaId())
-                && retainAssignment(source, StringUtils.trim(account.getNcaId()), key.getKeyHash(), summary)) {
-            record(summary, "copied", true);
-        }
-    }
-
-    private void conflict(Summary summary, String keyId, String keyHash, Set<String> assignments) {
-        summary.blockedKeys.add(keyHash);
-        log.atError().addKeyValue("keyId", keyId)
-                .addKeyValue("ncaIds", assignments).log("Conflicting key NCA IDs block migration");
-        record(summary, "conflict", true);
-    }
-
     private boolean sameAccount(KeyByOwnerAndAccountAndServiceModel model,
             KeyByOwnerAndAccountAndServiceVo target) {
         return accountConverter.modelToVo(model).equals(target);
     }
 
-    private void reconcileAccount(TimedRow<KeyByOwnerAndAccountAndServiceModel> row, Summary summary) {
+    private void removeOrphan(TimedRow<KeyByOwnerAndAccountAndServiceModel> row, Summary summary) {
         var key = row.model();
         try {
             var issuers = services.storedServiceIds(key.getIssuerServiceId());
-            var source = dao.owner(key, issuers);
-            if (source.isPresent()) {
-                recoverAssignment(source.get(), key, summary);
+            if (dao.ownerExists(key, issuers)) {
                 return;
             }
             var oldestAllowed = clock.instant().minus(migrationProperties.getOrphanMinAge()).toEpochMilli() * 1000;
@@ -333,7 +276,6 @@ public class KeysByAccountIndexMigrationTask {
 
     private static class Summary {
         private final Map<String, Long> counts = new HashMap<>();
-        private final Set<String> blockedKeys = new HashSet<>();
         private boolean clean = true;
     }
 }

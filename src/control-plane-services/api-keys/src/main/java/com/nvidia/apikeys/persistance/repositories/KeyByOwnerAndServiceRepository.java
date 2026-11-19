@@ -17,20 +17,11 @@
 
 package com.nvidia.apikeys.persistance.repositories;
 
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_DELETES_AT;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_EXPIRES_AT;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_ISSUER_SERVICE_ID;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_KEY_DETAILS;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_KEY_ID;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_KEY_STATUS;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_NCA_ID;
 import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_OWNER_ID;
 import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_OWNER_STATUS;
 import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_OWNER_STATUS_UPDATED_AT;
 import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.COLUMN_OWNER_TYPE;
-import static com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel.TABLE_NAME;
 
-import com.datastax.oss.driver.api.core.DefaultConsistencyLevel;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
 import com.nvidia.apikeys.vo.KeyOwnerStatus;
@@ -38,7 +29,6 @@ import com.nvidia.apikeys.vo.KeyOwnerType;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
-import org.springframework.data.cassandra.repository.Consistency;
 import org.springframework.data.cassandra.repository.MapIdCassandraRepository;
 import org.springframework.data.cassandra.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -59,45 +49,6 @@ public interface KeyByOwnerAndServiceRepository extends
 
     List<KeyByOwnerAndServiceModel> findByOwnerTypeAndOwnerId(
             KeyOwnerType ownerType, String ownerId);
-
-    @Consistency(DefaultConsistencyLevel.LOCAL_QUORUM)
-    @Query("SELECT " + COLUMN_OWNER_TYPE
-            + ", " + COLUMN_OWNER_ID
-            + ", " + COLUMN_ISSUER_SERVICE_ID
-            + ", " + COLUMN_KEY_ID
-            + ", " + COLUMN_NCA_ID
-            + ", " + COLUMN_OWNER_STATUS
-            + ", " + COLUMN_OWNER_STATUS_UPDATED_AT
-            + ", " + COLUMN_EXPIRES_AT
-            + ", " + COLUMN_DELETES_AT
-            + ", " + COLUMN_KEY_STATUS
-            + ", " + COLUMN_KEY_DETAILS
-            + ", WRITETIME(" + COLUMN_NCA_ID + ") AS wt_" + COLUMN_NCA_ID
-            + ", WRITETIME(" + COLUMN_EXPIRES_AT + ") AS wt_" + COLUMN_EXPIRES_AT
-            + ", WRITETIME(" + COLUMN_DELETES_AT + ") AS wt_" + COLUMN_DELETES_AT
-            + ", WRITETIME(" + COLUMN_KEY_STATUS + ") AS wt_" + COLUMN_KEY_STATUS
-            + ", WRITETIME(" + COLUMN_KEY_DETAILS + ") AS wt_" + COLUMN_KEY_DETAILS
-            + " FROM " + TABLE_NAME
-            + " WHERE " + COLUMN_OWNER_TYPE + "=:ownerType"
-            + " AND " + COLUMN_OWNER_ID + "=:ownerId"
-            + " AND " + COLUMN_ISSUER_SERVICE_ID + "=:issuerServiceId"
-            + " AND " + COLUMN_KEY_ID + "=:keyId")
-    ResultSet findMigrationRow(@Param("ownerType") KeyOwnerType ownerType,
-            @Param("ownerId") String ownerId, @Param("issuerServiceId") String issuerServiceId,
-            @Param("keyId") String keyId);
-
-    @Consistency(DefaultConsistencyLevel.LOCAL_QUORUM)
-    @Query(value = "UPDATE " + TABLE_NAME
-            + " USING TIMESTAMP :timestamp SET " + COLUMN_NCA_ID + "=:ncaId"
-            + " WHERE " + COLUMN_OWNER_TYPE + "=:ownerType"
-            + " AND " + COLUMN_OWNER_ID + "=:ownerId"
-            + " AND " + COLUMN_ISSUER_SERVICE_ID + "=:issuerServiceId"
-            + " AND " + COLUMN_KEY_ID + "=:keyId",
-            idempotent = Query.Idempotency.IDEMPOTENT)
-    ResultSet setNcaIdAtTimestamp(@Param("ownerType") KeyOwnerType ownerType,
-            @Param("ownerId") String ownerId, @Param("issuerServiceId") String issuerServiceId,
-            @Param("keyId") String keyId, @Param("ncaId") String ncaId,
-            @Param("timestamp") long timestamp);
 
     @Query("INSERT INTO " + KeyByOwnerAndServiceModel.TABLE_NAME
             + "(" + COLUMN_OWNER_TYPE

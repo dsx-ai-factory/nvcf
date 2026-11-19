@@ -126,7 +126,6 @@ class KeysByAccountIndexMigrationTaskTest {
 
     @Test
     void pageFetchRetriesAreBoundedAndFailureDoesNotMarkCompletion() {
-        when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
         when(dao.ownerPage(null, 500)).thenThrow(new IllegalStateException("fetch failed"));
 
         task.run(() -> { });
@@ -200,7 +199,7 @@ class KeysByAccountIndexMigrationTaskTest {
         when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(
                 new TimedRow<>(model, TEST_TIME.minusSeconds(600).toEpochMilli() * 1000)), null));
         when(services.storedServiceIds("service")).thenReturn(Set.of("service"));
-        when(dao.ownerExists(model, Set.of("service"))).thenReturn(true);
+        when(dao.ownerExists(model, Set.of("service"))).thenReturn(false, true);
 
         task.run(() -> { });
 
@@ -254,7 +253,6 @@ class KeysByAccountIndexMigrationTaskTest {
     void renewalFailureInsidePageStopsBeforeNextRow() {
         var model = KeyByOwnerAndServiceModel.builder().ownerType(KeyOwnerType.USER).ownerId("owner").build();
         var row = new TimedRow<>(model, 0);
-        when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
         when(dao.ownerPage(null, 500)).thenReturn(new Page<>(List.of(row, row, row), null));
 
         task.run(() -> {
@@ -272,7 +270,6 @@ class KeysByAccountIndexMigrationTaskTest {
     @Test
     void renewalFailureBetweenFetchAttemptsStopsRetries() {
         var attempts = new AtomicInteger();
-        when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
         when(dao.ownerPage(null, 500)).thenAnswer(call -> {
             attempts.incrementAndGet();
             throw new IllegalStateException("fetch failed");
