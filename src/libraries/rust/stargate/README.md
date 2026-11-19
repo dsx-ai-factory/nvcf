@@ -49,14 +49,17 @@ to a positive Go duration, and 60000 otherwise.
 
 `--readiness-gate` (`PYLON_READINESS_GATE`) replaces that startup probe with the
 function's declared HTTP health check on the upstream host. The check reads its
-path, port, and expected status from `INFERENCE_HEALTH_ENDPOINT`,
-`INFERENCE_HEALTH_PORT`, and `INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE`. Only the
+path, port, expected status, and probe timeout from `INFERENCE_HEALTH_ENDPOINT`,
+`INFERENCE_HEALTH_PORT`, `INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE`, and
+`INFERENCE_HEALTH_TIMEOUT` (an ISO-8601 duration such as `PT10S`). Only the
 expected status passes, and the gate applies with or without bringup canaries.
 The NVCF default check is `/v2/health/ready` on the upstream port. If the
-upstream answers that check with 404, Pylon logs a warning and uses the
-upstream health paths. A gRPC health check keeps the upstream health paths. The
-metrics listener serves `GET /ready`: 503 until startup admission ends and
-registration starts, then 200 for the life of the process.
+upstream answers a check equal to that default with 401, 403, 404, or 405,
+Pylon logs a warning and uses the upstream health paths. A gRPC health check
+keeps the upstream health paths. Pylon logs each new failure outcome of the
+check. The metrics listener serves `GET /ready`: 503 until a router
+acknowledges the registration, or with a reverse tunnel until the tunnel
+connects, then 200 for the life of the process.
 
 For engines without a stats endpoint, set `pylon --max-engine-concurrency N`
 to provide a positive concurrency fallback for routing and local queue

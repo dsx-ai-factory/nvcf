@@ -87,7 +87,7 @@ struct Args {
     /// Upstream health path probed ahead of the built-in defaults; repeat to try several in order
     #[arg(long = "upstream-health-path", value_name = "PATH")]
     upstream_health_paths: Vec<String>,
-    /// Hold startup and `GET /ready` on the metrics port until the function's declared HTTP health check returns its expected status. A 404 from the NVCF default check (`/v2/health/ready` on the upstream port) falls back to the upstream health paths
+    /// Hold startup and `GET /ready` on the metrics port until the function's declared HTTP health check returns its expected status. A 401, 403, 404, or 405 from a check equal to the NVCF default (`/v2/health/ready` on the upstream port) falls back to the upstream health paths
     #[arg(long, default_value_t = false, env = "PYLON_READINESS_GATE")]
     readiness_gate: bool,
     /// Path of the declared health check used by --readiness-gate
