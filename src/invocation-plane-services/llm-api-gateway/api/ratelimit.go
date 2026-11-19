@@ -19,6 +19,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -281,6 +282,9 @@ type RateLimitContext struct {
 	limitingDimension     ratelimit.LimitDimension
 	limitingResult        *ratelimit.RateLimitResult
 	limitingResourceLimit ratelimit.ResourceLimit
+
+	oversizedDimension ratelimit.LimitDimension
+	oversizedResult    *ratelimit.RateLimitResult
 }
 
 func (ctx *RateLimitContext) RevertAndRecalculateStats() {
@@ -309,11 +313,17 @@ func (ctx *RateLimitContext) calculateStats() {
 	ctx.limitingDimension = ""
 	ctx.limitingResult = nil
 	ctx.limitingResourceLimit = ratelimit.ResourceLimit{}
+	ctx.oversizedDimension = ""
+	ctx.oversizedResult = nil
 
 	for i, results := range ctx.Results {
 		for dim, result := range results {
 			if result == nil {
 				continue
+			}
+			if !result.Allowed() && result.ExceedsLimit() && ctx.oversizedResult == nil {
+				ctx.oversizedDimension = dim
+				ctx.oversizedResult = result
 			}
 			if !result.Allowed() &&
 				(ctx.limitingResult == nil || result.RetryAfter() > maxRetryAfter) {
@@ -344,7 +354,9 @@ func (ctx *RateLimitContext) calculateStats() {
 		}
 	}
 
-	if ctx.limitingResult != nil {
+	if ctx.oversizedResult != nil {
+		stats.ShouldRetry = ptr.To(false)
+	} else if ctx.limitingResult != nil {
 		retryAfter := int64(math.Ceil(ctx.limitingResult.RetryAfter().Seconds()))
 		stats.RetryAfter = ptr.To(retryAfter)
 		if retryAfter > 60 {
@@ -505,11 +517,13 @@ func (p *AdmissionPlan) CheckRequests(ctx context.Context) error {
 
 	for _, group := range p.groups {
 		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, requestsOnly, p.requestID)
-		if rlCtx != nil {
-			lastCtx = rlCtx
-		}
 		if err != nil {
-			lastErr = err
+			if keepRetryableLimitError(lastErr, err) {
+				lastErr = err
+				if rlCtx != nil {
+					lastCtx = rlCtx
+				}
+			}
 			continue
 		}
 
@@ -545,11 +559,13 @@ func (p *AdmissionPlan) CheckTokensAndFinalize(ctx context.Context) (*RateLimitC
 		group := p.groups[i]
 		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, tokenOnly, p.requestID)
 		combinedCtx := mergeRateLimitContexts(rlCtx, firstPassCtx)
-		if combinedCtx != nil {
-			lastCtx = combinedCtx
-		}
 		if err != nil {
-			lastErr = err
+			if keepRetryableLimitError(lastErr, err) {
+				lastErr = err
+				if combinedCtx != nil {
+					lastCtx = combinedCtx
+				}
+			}
 			continue
 		}
 
@@ -673,11 +689,46 @@ func checkRateLimit(
 	}
 
 	rlCtx.calculateStats()
+	if limited && rlCtx.oversizedResult != nil {
+		return rlCtx, oversizedRequestError(rlCtx.oversizedDimension, rlCtx.oversizedResult)
+	}
 	if limited {
 		return rlCtx, echo.NewHTTPError(http.StatusTooManyRequests, "rate limit exceeded")
 	}
 
 	return rlCtx, nil
+}
+
+// oversizedRequestError rejects a request that needs more than the limit
+// refills in a whole period. A 429 would have the client retry forever.
+func oversizedRequestError(dim ratelimit.LimitDimension, result *ratelimit.RateLimitResult) error {
+	unit, period := string(dim), ""
+	if i := strings.LastIndex(unit, "_"); i >= 0 {
+		unit, period = unit[:i], unit[i+1:]
+	}
+	unit = strings.ReplaceAll(unit, "_", " ")
+	return echo.NewHTTPError(
+		http.StatusRequestEntityTooLarge,
+		fmt.Sprintf(
+			"request needs %d %s, more than the rate limit of %d %s per %s",
+			result.Requested, unit, result.RateLimit.Limit, unit, period,
+		),
+	)
+}
+
+// keepRetryableLimitError reports whether err should replace prev as the
+// error for the whole plan. A 429 from one group outranks a 413 from another,
+// because the first group can admit the request later.
+func keepRetryableLimitError(prev, err error) bool {
+	return !(httpStatus(prev) == http.StatusTooManyRequests && httpStatus(err) == http.StatusRequestEntityTooLarge)
+}
+
+func httpStatus(err error) int {
+	var httpErr *echo.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Code
+	}
+	return 0
 }
 
 func mergeRateLimitContexts(first *RateLimitContext, second *RateLimitContext) *RateLimitContext {
