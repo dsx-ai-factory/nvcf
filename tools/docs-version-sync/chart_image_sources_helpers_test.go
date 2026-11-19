@@ -96,9 +96,8 @@ var (
 //
 // Template comments and YAML comments are ignored, and a flow-style image key
 // counts only in YAML structure, not inside a quoted or block scalar. Known
-// limit: a default on a variable that does not name the field, placed after a
-// function with arguments (| trimSuffix "/" |), or built with printf is not
-// seen, and an image: value is read up to the first space on its line. A
+// limit: a default on a variable that does not name the field, or built with
+// printf, is not seen, and an image: value is read up to the first space on its line. A
 // block-style image key or an --<name>-image= argument inside a block scalar
 // is still reported. The per-image guard renders still catch a default that fires.
 func (c *chartCheck) checkTemplateSources(chart string) {

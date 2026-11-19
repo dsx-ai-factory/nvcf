@@ -172,6 +172,9 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 	if err := scanStackTemplates(repoRoot, stack, tracked, check); err != nil {
 		return nil, run, nil, err
 	}
+	// The release inventory and states are checked first: a configuration
+	// error fails the run even when base.yaml is missing too.
+	states := stackRenderStates(repoRoot, stack, tracked, check)
 	base, err := readStackBaseValues(repoRoot, stack)
 	if errors.Is(err, os.ErrNotExist) {
 		check.fail(findingImageSource, "", "", "", "stack has no "+stackBaseValuesFile,
@@ -182,7 +185,6 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 		return nil, run, nil, err
 	}
 	leaves := probeLeaves(stack, base, check)
-	states := stackRenderStates(repoRoot, stack, tracked, check)
 	if len(states) == 0 {
 		return check, run, nil, nil
 	}

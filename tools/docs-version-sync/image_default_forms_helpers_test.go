@@ -10,7 +10,8 @@ import (
 
 // literalDefaultForm is one way a template action can default an image field
 // to a literal. pattern holds FIELD where the field alternation goes and
-// LITERAL where the non-empty quoted or raw string literal goes; example is a
+// LITERAL where the non-empty quoted or raw string literal goes, and PIPELINE
+// where intermediate pipeline functions go; example is a
 // case it catches. Each form is wrong for the same reason: the literal becomes
 // a hidden image source that no values file shows or overrides.
 type literalDefaultForm struct {
@@ -24,17 +25,23 @@ type literalDefaultForm struct {
 // "imageRegistry"). A variable assigned from any form is caught by that form,
 // as in the pipe example.
 var literalDefaultFormTable = []literalDefaultForm{
-	{"pipe", `\.\w*(?:FIELD)\s*(?:\|\s*\w+\s*)*\|\s*default\s+LITERAL`,
-		`{{- $registry := .Values.image.registry | trim | default "docker.io" }}`},
+	{"pipe", `\.\w*(?:FIELD)\s*PIPELINE\|\s*default\s+LITERAL`,
+		`{{- $registry := .Values.image.registry | trimSuffix "/" | default "docker.io" }}`},
 	{"prefix", `\bdefault\s+LITERAL\s+\(?\s*[\w.$]*\.\w*(?:FIELD)\b`,
 		`{{ default "docker.io" (.Values.image.registry) }}`},
-	{"dig key then pipe", `\bdig\s+(?:"[^"]*"\s+)*"[\w-]*(?:FIELD)"\s+(?:""|` + "``" + `)\s+[\w.$]+\s*(?:\|\s*\w+\s*)*\|\s*default\s+LITERAL`,
+	{"dig key then pipe", `\bdig\s+(?:"[^"]*"\s+)*"[\w-]*(?:FIELD)"\s+(?:""|` + "``" + `)\s+[\w.$]+\s*PIPELINE\|\s*default\s+LITERAL`,
 		`{{ dig "nats" "container" "image" "registry" "" .Values | default "docker.io" }}`},
 	{"dig default argument", `\bdig\s+(?:"[^"]*"\s+)*"[\w-]*(?:FIELD)"\s+LITERAL\s+[.$(]`,
 		`{{ dig "registry" "docker.io" $natsImage | quote }}`},
 }
 
 const literalDefaultLiteral = `(?:"([^"]+)"|` + "`([^`]+)`" + `)`
+
+// literalDefaultPipeline matches the functions piped between the field and
+// the default, each with optional arguments, such as | trim or
+// | trimSuffix "/". Its groups do not capture, so each form keeps exactly two
+// literal groups.
+const literalDefaultPipeline = `(?:\|\s*\w+(?:\s+(?:"[^"]*"|` + "`[^`]*`" + `|[\w.$-]+))*\s*)*`
 
 // literalDefaultForms compiles every form for the given field names into one
 // case-insensitive expression. Each form contributes two capture groups, the
@@ -44,6 +51,7 @@ func literalDefaultForms(fields ...string) *regexp.Regexp {
 	patterns := make([]string, 0, len(literalDefaultFormTable))
 	for _, form := range literalDefaultFormTable {
 		pattern := strings.ReplaceAll(form.pattern, "FIELD", alternation)
+		pattern = strings.ReplaceAll(pattern, "PIPELINE", literalDefaultPipeline)
 		patterns = append(patterns, strings.ReplaceAll(pattern, "LITERAL", literalDefaultLiteral))
 	}
 	return regexp.MustCompile("(?i)" + strings.Join(patterns, "|"))

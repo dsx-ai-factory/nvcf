@@ -149,6 +149,9 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		fixtureStack("pending-render", fixtureBase, fixtureRelease("app", "helm-broken", "{}\n")),
 		fixtureStack("dev-released", fixtureBase, sourced),
 		{"deploy/stacks/dev/helmfile.yaml.gotmpl": "releases: []\n"},
+		// pending-fix does not excuse a missing inventory, even without a
+		// base.yaml: the configuration error is checked first.
+		{"deploy/stacks/pending-no-base/helmfile.d/01.yaml.gotmpl": "releases: []\n"},
 		{"deploy/stacks/no-inventory/helmfile.d/01.yaml.gotmpl": fixtureStateHeader + sourced, "deploy/stacks/no-inventory/environments/base.yaml": fixtureBase},
 	}
 	files := map[string]string{
@@ -158,6 +161,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 			"deploy/stacks/dev-released: {reason: dev-only}\n" +
 			"deploy/stacks/dev: {reason: dev-only}\n" +
 			"deploy/stacks/dev-child: {reason: dev-only}\n" +
+			"deploy/stacks/pending-no-base: {reason: pending-fix}\n" +
 			"deploy/stacks/gone: {reason: pending-fix}\n",
 		// The included stacks' own states, which the parents include.
 		"deploy/stacks/child/helmfile.d/01.yaml.gotmpl":         childState(childRelease),
@@ -231,6 +235,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		"deploy/stacks/digest-swallowed":     {findingImageSource, "app.image.digest: digest set in base.yaml does not reach its rendered image"},
 		"deploy/stacks/stale-state":          {findingStackConfig, "helmfile.d/09.yaml.gotmpl: listed state is not a tracked Helmfile state"},
 		"deploy/stacks/bad-inventory":        {findingStackConfig, "schemaVersion is 2"},
+		"deploy/stacks/pending-no-base":      {findingStackConfig, "released stack has no release-inventory.yaml"},
 		"deploy/stacks/pending-passing":      {findingPendingFixed, "stack now passes image sources"},
 		"deploy/stacks/pending-render":       {findingRenderError, "unrelated template error"},
 		"deploy/stacks/dev-released":         {findingInvalidEntry, "so it is released"},
