@@ -35,6 +35,9 @@ func TestLiteralDefaultFormsByGate(t *testing.T) {
 		{`{{ (.Values.image.tag | default "latest") }}`, false, true},
 		{`{{ .Values.image.digest | default "sha256:abc" }}`, false, true},
 		{`{{ default "v1" .Values.image.tag }}`, false, true},
+		// A parenthesized field before the default.
+		{`{{ (.Values.image.tag) | default "v1" }}`, false, true},
+		{`{{ (.Values.image.registry) | default "docker.io" }}`, true, true},
 		// A function with arguments between the field and the default.
 		{`{{ .Values.global.image.registry | trimSuffix "/" | default "docker.io" }}`, true, true},
 		{`{{ dig "nats" "image" "registry" "" .Values | trimPrefix "https://" | default "docker.io" }}`, true, true},

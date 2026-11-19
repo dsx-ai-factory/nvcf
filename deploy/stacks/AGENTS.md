@@ -68,6 +68,7 @@ make -C deploy/stacks/self-managed test
 make -C deploy/stacks/nvcf-compute-plane test-local
 make -C deploy/stacks/observability test
 go test -C tools/docs-version-sync ./...
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
 go run -C tools/docs-version-sync . --target main
 ./tools/ci/check-doc-version-sync
 ./tools/ci/check-docs

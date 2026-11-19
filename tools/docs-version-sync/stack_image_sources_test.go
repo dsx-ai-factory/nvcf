@@ -47,6 +47,18 @@ var stackFixtureCharts = map[string]string{
 	"deploy/helm/defaulted/values.yaml": "image: {registry: docker.io, repository: team/defaulted, tag: v1}\n",
 	"deploy/helm/defaulted/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: defaulted\nspec:\n  containers:\n    - name: app\n" +
 		"      image: {{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}\n",
+	// workers renders a second Pod only in the workers namespace.
+	"deploy/helm/workers/Chart.yaml":  "apiVersion: v2\nname: helm-workers\nversion: 0.1.0\n",
+	"deploy/helm/workers/values.yaml": "image: {registry: \"\", repository: \"\", tag: v1}\n",
+	"deploy/helm/workers/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: app\nspec:\n  containers:\n" +
+		"    - name: app\n      image: {{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}\n" +
+		"{{- if eq .Release.Namespace \"workers\" }}\n---\napiVersion: v1\nkind: Pod\nmetadata:\n  name: worker\nspec:\n  containers:\n" +
+		"    - name: worker\n      image: docker.io/team/worker:v1\n{{- end }}\n",
+	// indexed declares its image in an index and prefills it.
+	"deploy/helm/indexed/Chart.yaml":  "apiVersion: v2\nname: helm-indexed\nversion: 0.1.0\n",
+	"deploy/helm/indexed/values.yaml": "ownedImages: {server: server.image}\nserver:\n  image: {registry: docker.io, repository: team/indexed, tag: v1}\n",
+	"deploy/helm/indexed/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: indexed\nspec:\n  containers:\n    - name: app\n" +
+		"      image: {{ .Values.server.image.registry }}/{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}\n",
 	"deploy/helm/broken/Chart.yaml":         "apiVersion: v2\nname: helm-broken\nversion: 0.1.0\n",
 	"deploy/helm/broken/templates/pod.yaml": "{{ fail \"unrelated template error\" }}\n",
 }
@@ -143,6 +155,22 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		// dev-child is dev-only, so it is not run: the parent reports its
 		// chart default image itself.
 		fixtureStack("parent-of-dev", "global: {}\n", include("dev-child", forward("dev-child"))),
+		// A release set entry replaces the base.yaml registry after the
+		// values files; the probe applies it as Helmfile does.
+		fixtureStack("set-override", fixtureBase, sourced+"    set:\n      - name: image.registry\n        value: docker.io\n"),
+		// A release marked installed: false is not deployed, so it is not
+		// rendered (its chart would fail).
+		fixtureStack("not-installed", fixtureBase, sourced+"  - name: skipped\n    namespace: skipped\n    chart: nvcf/helm-broken\n    version: 0.1.0\n    installed: false\n"),
+		// The release renders an extra image only in its own namespace.
+		fixtureStack("namespace-workload", fixtureBase, fixtureRelease("workers", "helm-workers", fixtureSourcedValues)),
+		// The index names the values path of a prefilled image.
+		fixtureStack("indexed-default", "app: {}\n", fixtureRelease("app", "helm-indexed", "{}\n")),
+		// Parent and included stack both declare global.image with a tag;
+		// the parent's forwarded value wins, so both pass.
+		fixtureStack("shared-child", "global:\n  image: {registry: nvcr.io, repository: child, tag: v2}\n", ""),
+		fixtureStack("shared-parent", "global:\n  image: {registry: nvcr.io, repository: team, tag: v1}\n",
+			fixtureRelease("app", "helm-app", "registry: {{ .Values.global.image.registry }}\n          repository: {{ .Values.global.image.repository }}/app\n          tag: {{ .Values.global.image.tag }}\n")+"helmfiles:\n  - path: ../../shared-child/helmfile.d/01.yaml.gotmpl\n    values:\n      - values-included.yaml\n"+
+				"      - global:\n          {{- toYaml .Values.global | nindent 10 }}\n"),
 		fixtureStack("digest-swallowed", "global:\n  image: {registry: nvcr.io, repository: team}\napp:\n  image: {tag: v2, digest: \"sha256:"+strings.Repeat("c", 64)+"\"}\n", sourced),
 		fixtureStack("pending-passing", fixtureBase, sourced),
 		fixtureStack("pending-failing", "app: {}\n", fixtureRelease("app", "helm-defaulted", "{}\n")),
@@ -168,6 +196,10 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		"deploy/stacks/failing-child/helmfile.d/01.yaml.gotmpl": childState(fixtureRelease("failing", "helm-defaulted", "{}\n")),
 		"deploy/stacks/dev-child/helmfile.d/01.yaml.gotmpl":     childState(fixtureRelease("dev", "helm-defaulted", "{}\n")),
 		"deploy/stacks/dev-child/environments/base.yaml":        "dev-child: {}\n",
+		"deploy/stacks/shared-child/helmfile.d/01.yaml.gotmpl": childState(fixtureRelease("shared", "helm-app",
+			"registry: {{ .Values.global.image.registry }}\n          repository: {{ .Values.global.image.repository }}\n          tag: {{ .Values.global.image.tag }}\n")),
+		// A values file in the include, read for the keys it forwards.
+		"deploy/stacks/shared-parent/helmfile.d/values-included.yaml": "included: true\n",
 	}
 	for name, content := range stackFixtureCharts {
 		files[name] = content
@@ -214,7 +246,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 			got[finding.Subject] = make(map[string]bool)
 		}
 		got[finding.Subject][finding.Category] = true
-		problems[finding.Subject] = append(problems[finding.Subject], finding.ValuesPath+": "+finding.Problem)
+		problems[finding.Subject] = append(problems[finding.Subject], strings.TrimSpace(finding.Image+" "+finding.ValuesPath)+": "+finding.Problem)
 	}
 	// Each fixture names the problem its rule must report, so another rule
 	// producing the same category cannot stand in for a broken one.
@@ -236,6 +268,9 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		"deploy/stacks/stale-state":          {findingStackConfig, "helmfile.d/09.yaml.gotmpl: listed state is not a tracked Helmfile state"},
 		"deploy/stacks/bad-inventory":        {findingStackConfig, "schemaVersion is 2"},
 		"deploy/stacks/pending-no-base":      {findingStackConfig, "released stack has no release-inventory.yaml"},
+		"deploy/stacks/set-override":         {findingImageSource, "image does not take its registry and repository from base.yaml"},
+		"deploy/stacks/namespace-workload":   {findingImageSource, "docker.io/team/worker:v1"},
+		"deploy/stacks/indexed-default":      {findingImageSource, "server.image: image does not take its registry and repository"},
 		"deploy/stacks/pending-passing":      {findingPendingFixed, "stack now passes image sources"},
 		"deploy/stacks/pending-render":       {findingRenderError, "unrelated template error"},
 		"deploy/stacks/dev-released":         {findingInvalidEntry, "so it is released"},
@@ -256,7 +291,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 	}
 	// The parent that forwards the included stack's values passes, and the
 	// layered probe environment reaches every image of the covered stacks.
-	if strings.Join(report.Covered, ",") != "deploy/stacks/child,deploy/stacks/covered,deploy/stacks/parent-forwarding,deploy/stacks/parent-of-failing,deploy/stacks/untracked" {
+	if strings.Join(report.Covered, ",") != "deploy/stacks/child,deploy/stacks/covered,deploy/stacks/not-installed,deploy/stacks/parent-forwarding,deploy/stacks/parent-of-failing,deploy/stacks/shared-child,deploy/stacks/shared-parent,deploy/stacks/untracked" {
 		t.Errorf("covered %v\n%s", report.Covered, report.Summary())
 	}
 	if expected := strings.Join(report.Expected, "\n"); !strings.Contains(expected, "deploy/stacks/pending-failing") || !strings.Contains(expected, "issues/3297") {

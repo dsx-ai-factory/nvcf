@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -196,13 +197,16 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 	if err != nil {
 		return nil, run, nil, err
 	}
+	includedLeaves = withoutSharedPaths(includedLeaves, leaves)
 	all := append(append([]probeLeaf{}, leaves...), includedLeaves...)
 	if err := writeProbeEnvironment(space.copyRoot, stack, tracked.stacks, all); err != nil {
 		return nil, run, nil, err
 	}
 	sentinels := indexProbeLeaves(all)
 	findings := &stackFindings{check: check, run: run}
-	var images []parsedImageReference
+	// Images are kept per state: a tag forwarded in one state must not
+	// satisfy the same leaf in another state that replaces it.
+	var images [][]parsedImageReference
 	for _, state := range states {
 		documents, releases, err := space.renderState(state)
 		if err != nil {
@@ -211,13 +215,15 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 			continue
 		}
 		checkForwardedKeys(space, stack, documents, includes, includedLeaves, check)
+		var stateImages []parsedImageReference
 		for _, release := range releases {
 			if release.Untracked != "" {
 				check.untracked = append(check.untracked, release.Stack+" "+release.Name+" ("+release.Untracked+": "+untrackedStackCharts[release.Untracked]+")")
 				continue
 			}
-			images = append(images, checkRenderedRelease(release, sentinels, findings)...)
+			stateImages = append(stateImages, checkRenderedRelease(release, sentinels, findings)...)
 		}
+		images = append(images, stateImages)
 	}
 	for _, leaf := range unreachedVersionLeaves(all, images) {
 		findings.record(leaf.Stack, failureKey("", leaf.Path), imageGateFinding{Category: findingImageSource, ValuesPath: leaf.Path,
@@ -227,8 +233,26 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 	return check, run, findings.included, nil
 }
 
+// withoutSharedPaths drops the included stack's leaves at a values path the
+// parent also declares, such as global.image.registry in both base.yaml
+// files. The parent's value is what it forwards, so only the parent's
+// sentinel may count for that path.
+func withoutSharedPaths(included, own []probeLeaf) []probeLeaf {
+	paths := make(map[string]bool)
+	for _, leaf := range own {
+		paths[leaf.Path] = true
+	}
+	var kept []probeLeaf
+	for _, leaf := range included {
+		if !paths[leaf.Path] {
+			kept = append(kept, leaf)
+		}
+	}
+	return kept
+}
+
 // unreachedVersionLeaves returns each tag and digest leaf whose value does not
-// reach its image:
+// reach its image. images holds the rendered images of each state:
 //   - A leaf beside a registry or repository sentinel, such as nats.image.tag
 //     next to nats.image.registry, must appear on an image that carries one of
 //     those sentinels. When no rendered image carries them, the image is not
@@ -237,35 +261,67 @@ func checkStackImageSources(repoRoot, stack string, tracked trackedStacks, chart
 //   - A tag-only leaf, such as cassandra.migrations.image.tag whose registry
 //     comes from global.image, must appear on some rendered image.
 //
+// The sibling rule holds in each state: when two states render the same
+// image, one forwarding the tag does not excuse the other replacing it.
+//
 // One carrier with the sentinel is enough: images that share a registry, such
 // as a container and a sidecar both reading nats.image.registry, may set their
 // own tags.
-func unreachedVersionLeaves(leaves []probeLeaf, images []parsedImageReference) []probeLeaf {
+func unreachedVersionLeaves(leaves []probeLeaf, images [][]parsedImageReference) []probeLeaf {
 	var unreached []probeLeaf
 	for _, leaf := range leaves {
 		if leaf.Field != "tag" && leaf.Field != "digest" {
 			continue
 		}
-		parent := leaf.Path[:strings.LastIndex(leaf.Path, ".")]
-		var siblings []probeLeaf
-		for _, other := range leaves {
-			if other.Stack == leaf.Stack && (other.Field == "registry" || other.Field == "repository") && other.Path == parent+"."+other.Field {
-				siblings = append(siblings, other)
-			}
-		}
-		carriers, reached := 0, false
-		for _, image := range images {
-			if len(siblings) > 0 && !carriesSentinel(image, siblings) {
-				continue
-			}
-			carriers++
-			reached = reached || (leaf.Field == "tag" && image.Version == leaf.Sentinel) || (leaf.Field == "digest" && image.Digest == leaf.Sentinel)
-		}
-		if !reached && (len(siblings) == 0 || carriers > 0) {
+		siblings := sourceSiblings(leaf, leaves)
+		if !versionReached(leaf, siblings, images) {
 			unreached = append(unreached, leaf)
 		}
 	}
 	return unreached
+}
+
+// sourceSiblings returns the registry and repository leaves in the same image
+// map as a tag or digest leaf.
+func sourceSiblings(leaf probeLeaf, leaves []probeLeaf) []probeLeaf {
+	parent := leaf.Path[:strings.LastIndex(leaf.Path, ".")]
+	var siblings []probeLeaf
+	for _, other := range leaves {
+		if other.Stack == leaf.Stack && (other.Field == "registry" || other.Field == "repository") && other.Path == parent+"."+other.Field {
+			siblings = append(siblings, other)
+		}
+	}
+	return siblings
+}
+
+// versionReached applies the two rules above. A leaf with siblings is checked
+// in every state that renders a carrier; a tag-only leaf needs one image in
+// any state.
+func versionReached(leaf probeLeaf, siblings []probeLeaf, images [][]parsedImageReference) bool {
+	carries := func(image parsedImageReference) bool {
+		return (leaf.Field == "tag" && image.Version == leaf.Sentinel) || (leaf.Field == "digest" && image.Digest == leaf.Sentinel)
+	}
+	if len(siblings) == 0 {
+		for _, state := range images {
+			if slices.ContainsFunc(state, carries) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, state := range images {
+		carriers, reached := 0, false
+		for _, image := range state {
+			if carriesSentinel(image, siblings) {
+				carriers++
+				reached = reached || carries(image)
+			}
+		}
+		if carriers > 0 && !reached {
+			return false
+		}
+	}
+	return true
 }
 
 // carriesSentinel reports whether a rendered image's repository (registry host
@@ -326,7 +382,12 @@ func discoverIncludedStacks(space *stackWorkspace, stack string, allStacks []str
 			if space.stackOf(document.Source) != stack {
 				continue
 			}
-			for path := range includedStates(document) {
+			included, err := includedStates(document)
+			if err != nil {
+				check.fail(findingStackConfig, "", "", state.Path, err.Error(), "readable included values", "fix the helmfiles values of the state")
+				continue
+			}
+			for path := range included {
 				other := space.stackOf(path)
 				switch {
 				case !isStack[other]:
@@ -363,7 +424,11 @@ func checkForwardedKeys(space *stackWorkspace, stack string, documents []builtSt
 		if space.stackOf(document.Source) != stack {
 			continue
 		}
-		included := includedStates(document)
+		// discoverIncludedStacks already reported an unreadable values file.
+		included, err := includedStates(document)
+		if err != nil {
+			continue
+		}
 		for _, path := range sortedKeys(included) {
 			forwarded, other := included[path], space.stackOf(path)
 			if !includes[other] {
@@ -391,7 +456,9 @@ func checkRenderedRelease(release renderedRelease, sentinels probeSentinels, fin
 		if guardPath.MatchString(release.Err.Error()) {
 			category, problem = findingImageSource, "chart image guard rejects the probe values: "+problem
 		}
-		findings.record(release.Stack, failureKey(release.Name, "render"), imageGateFinding{Category: category,
+		// The category is part of the key: a guard rejection in the
+		// included stack must not hide an unrelated render error here.
+		findings.record(release.Stack, failureKey(release.Name, "render:"+category), imageGateFinding{Category: category,
 			Release: release.Name, Problem: problem, Expected: "a release that renders with the base.yaml image sources", Fix: fixStackSource})
 		return nil
 	}
@@ -405,10 +472,10 @@ func checkRenderedRelease(release renderedRelease, sentinels probeSentinels, fin
 		if sentinels.sourcedFromProbe(image.Repository) {
 			continue
 		}
-		path := imageValuesPath(release, image)
+		path, reason := imageValuesPath(release, image)
 		problem := "image does not take its registry and repository from base.yaml"
 		if path == "" {
-			problem += "; chart default, values path unknown (chart has no image index)"
+			problem += "; chart default, values path unknown (" + reason + ")"
 		}
 		findings.record(release.Stack, failureKey(release.Name, image.Reference), imageGateFinding{Category: findingImageSource,
 			Release: release.Name, Image: image.Reference, ValuesPath: path, Problem: problem,
@@ -417,21 +484,25 @@ func checkRenderedRelease(release renderedRelease, sentinels probeSentinels, fin
 	return images
 }
 
-// imageValuesPath names the values path that produced a rendered image:
-//  1. the chart's image index entry that renders it;
+// imageValuesPath names the values path that produced a rendered image, or
+// says why it cannot:
+//  1. the chart's image index entry that resolves to the image;
 //  2. otherwise the computed release values leaf that holds its reference,
 //     repository or registry, which finds a literal a stack template wrote,
 //     such as grove.image.repository;
-//  3. otherwise "", a chart default with no index to name it.
-func imageValuesPath(release renderedRelease, image parsedImageReference) string {
+//  3. otherwise "" with the reason: the chart has no image index, or its
+//     index does not name the image.
+func imageValuesPath(release renderedRelease, image parsedImageReference) (string, string) {
+	reason := "chart has no image index"
 	if release.Indexed {
-		// An unreadable index only loses the index path here; the chart gate
-		// reports an index error in the chart defaults itself, so the search
-		// below still runs.
-		if catalog, err := readImageIndex(release.Snapshot.Values, release.Snapshot.Dependencies); err == nil {
+		reason = "the chart image index does not name it"
+		// An unresolvable index only loses the index path here; the chart
+		// gate reports an index error in the chart defaults itself, so the
+		// search below still runs.
+		if catalog, err := resolveChartImageCatalog(release.Snapshot); err == nil {
 			for _, entry := range catalog {
 				if entry.Reference == image.Reference {
-					return entry.Path
+					return entry.Path, ""
 				}
 			}
 		}
@@ -439,10 +510,10 @@ func imageValuesPath(release renderedRelease, image parsedImageReference) string
 	host, path, _ := strings.Cut(image.Repository, "/")
 	for _, candidate := range []string{image.Reference, image.Repository, path, host} {
 		if found := findValuesLeaf("", release.Snapshot.Values, candidate); found != "" {
-			return found
+			return found, ""
 		}
 	}
-	return ""
+	return "", reason
 }
 
 func findValuesLeaf(prefix string, values map[string]any, want string) string {

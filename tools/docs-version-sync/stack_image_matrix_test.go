@@ -56,18 +56,22 @@ func TestUnreachedVersionLeaves(t *testing.T) {
 	nats := natsRegistry.Sentinel + "/" + natsRepository.Sentinel
 	for _, test := range []struct {
 		name   string
-		images []parsedImageReference
+		states [][]parsedImageReference
 		want   string
 	}{
-		{"every tag reaches its image", []parsedImageReference{image(nats, natsTag.Sentinel), image("r/x", migrationsTag.Sentinel)}, ""},
+		{"every tag reaches its image", [][]parsedImageReference{{image(nats, natsTag.Sentinel), image("r/x", migrationsTag.Sentinel)}}, ""},
 		// The nats tag appears only on another image: its own image lost it.
-		{"tag on the wrong image", []parsedImageReference{image(nats, "v1"), image("r/x", natsTag.Sentinel), image("r/y", migrationsTag.Sentinel)}, "nats.image.tag"},
-		{"tag-only leaf reaches no image", []parsedImageReference{image(nats, natsTag.Sentinel)}, "migrations.image.tag"},
-		{"digest misses its image", []parsedImageReference{{Repository: nats, Version: natsTag.Sentinel}, image("r/y", migrationsTag.Sentinel)}, "nats.image.digest"},
+		{"tag on the wrong image", [][]parsedImageReference{{image(nats, "v1"), image("r/x", natsTag.Sentinel), image("r/y", migrationsTag.Sentinel)}}, "nats.image.tag"},
+		{"tag-only leaf reaches no image", [][]parsedImageReference{{image(nats, natsTag.Sentinel)}}, "migrations.image.tag"},
+		{"digest misses its image", [][]parsedImageReference{{{Repository: nats, Version: natsTag.Sentinel}, image("r/y", migrationsTag.Sentinel)}}, "nats.image.digest"},
+		// One state forwards the nats tag and another replaces it.
+		{"tag lost in one state", [][]parsedImageReference{{image(nats, natsTag.Sentinel), image("r/x", migrationsTag.Sentinel)}, {image(nats, "v1")}}, "nats.image.tag"},
+		// A tag-only leaf may appear in any state.
+		{"tag-only leaf in another state", [][]parsedImageReference{{image(nats, natsTag.Sentinel)}, {image("r/x", migrationsTag.Sentinel)}}, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var got []string
-			for _, leaf := range unreachedVersionLeaves(leaves, test.images) {
+			for _, leaf := range unreachedVersionLeaves(leaves, test.states) {
 				got = append(got, leaf.Path)
 			}
 			// off.image is never rendered, so its tag is never reported.

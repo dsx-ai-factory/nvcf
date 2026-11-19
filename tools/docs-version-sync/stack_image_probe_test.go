@@ -18,7 +18,9 @@ func TestProbeLeavesSelectImageValues(t *testing.T) {
 		"  image: {registry: nvcr.io, repository: team}\n" +
 		"collector:\n  image: ghcr.io/x/collector:1\n" +
 		"operator:\n  collectorImage: {repository: ghcr.io/x/collector, tag: \"1\"}\n" +
-		"nats:\n  image: {registry: docker.io, repository: \"\", tag: v2, digest: \"\"}\n"
+		"nats:\n  image: {registry: docker.io, repository: \"\", tag: v2, digest: \"\"}\n" +
+		"fluent:\n  image: {tag: 3.2}\n" +
+		"bad:\n  image: {registry: [docker.io]}\n"
 	var values map[string]any
 	if err := yaml.Unmarshal([]byte(base), &values); err != nil {
 		t.Fatal(err)
@@ -28,9 +30,10 @@ func TestProbeLeavesSelectImageValues(t *testing.T) {
 	for _, leaf := range probeLeaves("deploy/stacks/s", values, check) {
 		paths = append(paths, leaf.Path)
 	}
-	// global.helm.sources is a chart source, empty values are not set, and a
-	// repository with a host gets no sentinel.
-	if got, want := strings.Join(paths, ","), "global.image.registry,global.image.repository,nats.image.registry,nats.image.tag,operator.collectorImage.tag"; got != want {
+	// global.helm.sources is a chart source, empty values are not set, a
+	// repository with a host gets no sentinel, and the numeric fluent tag
+	// gets one.
+	if got, want := strings.Join(paths, ","), "fluent.image.tag,global.image.registry,global.image.repository,nats.image.registry,nats.image.tag,operator.collectorImage.tag"; got != want {
 		t.Fatalf("leaves %s, want %s", got, want)
 	}
 	var problems []string
@@ -38,7 +41,9 @@ func TestProbeLeavesSelectImageValues(t *testing.T) {
 		problems = append(problems, finding.ValuesPath+": "+finding.Problem)
 	}
 	for _, want := range []string{`collector.image: image is a single string "ghcr.io/x/collector:1"`,
-		`operator.collectorImage.repository: repository "ghcr.io/x/collector" contains registry host ghcr.io`} {
+		`operator.collectorImage.repository: repository "ghcr.io/x/collector" contains registry host ghcr.io`,
+		// A numeric tag is still a tag; a list is not a value.
+		`bad.image.registry: image registry is a []interface {}, not a scalar`} {
 		if !strings.Contains(strings.Join(problems, "\n"), want) {
 			t.Errorf("findings %q, want %q", problems, want)
 		}
@@ -122,7 +127,10 @@ func TestParseHelmfileBuildKeepsSources(t *testing.T) {
 	if len(states) != 2 || states[0].Releases[0].Chart != "../charts/c" {
 		t.Fatalf("states %+v", states)
 	}
-	included := includedStates(states[1])
+	included, err := includedStates(states[1])
+	if err != nil {
+		t.Fatal(err)
+	}
 	if forwarded := included["/r/deploy/stacks/o/helmfile.d/01.yaml.gotmpl"]; !forwarded["collector"] || len(forwarded) != 1 {
 		t.Fatalf("included %v", included)
 	}

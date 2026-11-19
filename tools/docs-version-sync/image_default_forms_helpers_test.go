@@ -25,7 +25,7 @@ type literalDefaultForm struct {
 // "imageRegistry"). A variable assigned from any form is caught by that form,
 // as in the pipe example.
 var literalDefaultFormTable = []literalDefaultForm{
-	{"pipe", `\.\w*(?:FIELD)\s*PIPELINE\|\s*default\s+LITERAL`,
+	{"pipe", `\.\w*(?:FIELD)\)?\s*PIPELINE\|\s*default\s+LITERAL`,
 		`{{- $registry := .Values.image.registry | trimSuffix "/" | default "docker.io" }}`},
 	{"prefix", `\bdefault\s+LITERAL\s+\(?\s*[\w.$]*\.\w*(?:FIELD)\b`,
 		`{{ default "docker.io" (.Values.image.registry) }}`},

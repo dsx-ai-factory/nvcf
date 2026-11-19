@@ -6,6 +6,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -88,11 +89,16 @@ func probeLeaves(stack string, base map[string]any, check *stackCheck) []probeLe
 func imageMapLeaves(stack, path string, image map[string]any, check *stackCheck) []probeLeaf {
 	var leaves []probeLeaf
 	for _, field := range imageValueFields {
-		value, _ := image[field].(string)
+		leafPath := path + "." + field
+		value, ok := imageScalar(image[field])
+		if !ok {
+			check.fail(findingImageSource, "", "", leafPath, fmt.Sprintf("image %s is a %T, not a scalar", field, image[field]),
+				"a string value", "write "+leafPath+" as a string in base.yaml")
+			continue
+		}
 		if value == "" {
 			continue
 		}
-		leafPath := path + "." + field
 		if field == "repository" {
 			if host, found := imageReferenceHost(value); found {
 				check.fail(findingImageSource, "", "", leafPath, "repository "+quoteValue(value)+" contains registry host "+host,
@@ -103,6 +109,22 @@ func imageMapLeaves(stack, path string, image map[string]any, check *stackCheck)
 		leaves = append(leaves, probeLeaf{Stack: stack, Path: leafPath, Field: field, Sentinel: probeSentinel(stack, leafPath, field)})
 	}
 	return leaves
+}
+
+// imageScalar returns an image field as text. YAML reads an unquoted tag such
+// as 2 or 3.2 as a number, which is still a configured tag; a map or list is
+// not a usable value.
+func imageScalar(value any) (string, bool) {
+	switch value := value.(type) {
+	case nil:
+		return "", true
+	case string:
+		return value, true
+	case int, int64, uint64, float64, bool:
+		return fmt.Sprint(value), true
+	default:
+		return "", false
+	}
 }
 
 // probeSentinel is deterministic per stack and values path, so an included

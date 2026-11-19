@@ -115,8 +115,9 @@ type builtState struct {
 	Repositories []helmfileRepository `yaml:"repositories"`
 	Releases     []builtRelease       `yaml:"releases"`
 	Helmfiles    []struct {
-		Path   string           `yaml:"path"`
-		Values []map[string]any `yaml:"values"`
+		Path string `yaml:"path"`
+		// Values holds inline maps and values file paths, in order.
+		Values []any `yaml:"values"`
 	} `yaml:"helmfiles"`
 }
 
@@ -125,6 +126,40 @@ type builtRelease struct {
 	Namespace string `yaml:"namespace"`
 	Chart     string `yaml:"chart"`
 	Version   string `yaml:"version"`
+	// Set and SetString are applied by Helmfile as helm flags, after the
+	// values files; write-values does not include them.
+	Set       []builtSetValue `yaml:"set"`
+	SetString []builtSetValue `yaml:"setString"`
+}
+
+// builtSetValue is one release set entry: a value, a list of values, or a
+// file.
+type builtSetValue struct {
+	Name   string   `yaml:"name"`
+	Value  string   `yaml:"value"`
+	Values []string `yaml:"values"`
+	File   string   `yaml:"file"`
+}
+
+// helmSetFlags returns the helm template flags for a release's set and
+// setString entries, in Helmfile's order.
+func (r builtRelease) helmSetFlags() []string {
+	var flags []string
+	add := func(flag string, entries []builtSetValue) {
+		for _, entry := range entries {
+			switch {
+			case entry.File != "":
+				flags = append(flags, "--set-file", entry.Name+"="+entry.File)
+			case len(entry.Values) > 0:
+				flags = append(flags, flag, entry.Name+"={"+strings.Join(entry.Values, ",")+"}")
+			default:
+				flags = append(flags, flag, entry.Name+"="+entry.Value)
+			}
+		}
+	}
+	add("--set", r.Set)
+	add("--set-string", r.SetString)
+	return flags
 }
 
 var (
@@ -199,12 +234,14 @@ func (w *stackWorkspace) renderState(state stackRenderState) ([]builtState, []re
 	}
 	valuesDir := w.workspace()
 	if _, err := w.helmfile(state, "write-values", "--output-file-template",
-		filepath.Join(valuesDir, "{{ .Release.Namespace }}--{{ .Release.Name }}.yaml")); err != nil {
+		filepath.Join(valuesDir, releaseValuesFile("{{ .Release.Namespace }}", "{{ .Release.Name }}"))); err != nil {
 		return nil, nil, fmt.Errorf("write values of %s: %w", state.Path, err)
 	}
 	var rendered []renderedRelease
 	for _, release := range releases {
-		if !release.Enabled {
+		// write-values skips a release that is disabled or marked
+		// installed: false, and the stack does not deploy it.
+		if !release.Enabled || !release.Installed {
 			continue
 		}
 		document, declared := findBuiltRelease(documents, release)
@@ -225,15 +262,20 @@ func (w *stackWorkspace) renderState(state stackRenderState) ([]builtState, []re
 			result.Indexed, err = chartHasImageIndex(chart)
 		}
 		if err == nil {
-			// renderImageChart uses a fixed release name and namespace; image
-			// references do not depend on them.
-			values := filepath.Join(valuesDir, release.Namespace+"--"+release.Name+".yaml")
-			result.Snapshot, err = renderImageChart(chart, []string{values})
+			values := filepath.Join(valuesDir, releaseValuesFile(release.Namespace, release.Name))
+			identity := imageRelease{Name: release.Name, Namespace: release.Namespace, Flags: declared.helmSetFlags()}
+			result.Snapshot, err = renderImageChartAs(chart, identity, []string{values})
 		}
 		result.Err = err
 		rendered = append(rendered, result)
 	}
 	return documents, rendered, nil
+}
+
+// releaseValuesFile names a release's written values file. Namespaces and
+// release names cannot contain "_", so the name is unique per release.
+func releaseValuesFile(namespace, name string) string {
+	return namespace + "_" + name + ".yaml"
 }
 
 func findBuiltRelease(documents []builtState, release helmfileRelease) (*builtState, builtRelease) {
@@ -336,8 +378,10 @@ func pullChart(repository helmfileRepository, name, version, workspace string) (
 }
 
 // includedStates returns the states a state document includes, each with the
-// top-level keys of the values it forwards.
-func includedStates(document builtState) map[string]map[string]bool {
+// top-level keys of the values it forwards. A values entry is an inline map
+// or a values file path relative to the including state; a file is read for
+// its keys.
+func includedStates(document builtState) (map[string]map[string]bool, error) {
 	included := make(map[string]map[string]bool)
 	for _, include := range document.Helmfiles {
 		path := include.Path
@@ -345,14 +389,41 @@ func includedStates(document builtState) map[string]map[string]bool {
 			path = filepath.Join(filepath.Dir(document.Source), path)
 		}
 		forwarded := make(map[string]bool)
-		for _, values := range include.Values {
+		for _, entry := range include.Values {
+			values, err := includedValues(document, entry)
+			if err != nil {
+				return nil, err
+			}
 			for key := range values {
 				forwarded[key] = true
 			}
 		}
 		included[filepath.Clean(path)] = forwarded
 	}
-	return included
+	return included, nil
+}
+
+func includedValues(document builtState, entry any) (map[string]any, error) {
+	switch value := entry.(type) {
+	case map[string]any:
+		return value, nil
+	case string:
+		file := value
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(filepath.Dir(document.Source), file)
+		}
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read included values file of %s: %w", document.Source, err)
+		}
+		values := make(map[string]any)
+		if err := yaml.Unmarshal(raw, &values); err != nil {
+			return nil, fmt.Errorf("parse included values file %s: %w", file, err)
+		}
+		return values, nil
+	default:
+		return nil, fmt.Errorf("included values entry of %s is %T, want a map or a file path", document.Source, entry)
+	}
 }
 
 // guardPath matches a chart template guard (required or fail, which Helm
