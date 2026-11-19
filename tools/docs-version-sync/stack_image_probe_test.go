@@ -31,8 +31,8 @@ func TestProbeLeavesSelectImageValues(t *testing.T) {
 		paths = append(paths, leaf.Path)
 	}
 	// global.helm.sources is a chart source, empty values are not set, a
-	// repository with a host gets no sentinel, and the numeric fluent tag
-	// gets one.
+	// single image string and a repository with a host get no sentinel, and
+	// the numeric fluent tag gets one.
 	if got, want := strings.Join(paths, ","), "fluent.image.tag,global.image.registry,global.image.repository,nats.image.registry,nats.image.tag,operator.collectorImage.tag"; got != want {
 		t.Fatalf("leaves %s, want %s", got, want)
 	}
@@ -40,7 +40,11 @@ func TestProbeLeavesSelectImageValues(t *testing.T) {
 	for _, finding := range check.findings {
 		problems = append(problems, finding.ValuesPath+": "+finding.Problem)
 	}
-	for _, want := range []string{`collector.image: image is a single string "ghcr.io/x/collector:1"`,
+	// The single image string is reported by the render check, not here.
+	if strings.Contains(strings.Join(problems, "\n"), "collector.image:") {
+		t.Errorf("findings %q, want none for collector.image", problems)
+	}
+	for _, want := range []string{
 		`operator.collectorImage.repository: repository "ghcr.io/x/collector" contains registry host ghcr.io`,
 		// A numeric tag is still a tag; a list is not a value.
 		`bad.image.registry: image registry is a []interface {}, not a scalar`} {

@@ -59,6 +59,11 @@ var stackFixtureCharts = map[string]string{
 	"deploy/helm/indexed/values.yaml": "ownedImages: {server: server.image}\nserver:\n  image: {registry: docker.io, repository: team/indexed, tag: v1}\n",
 	"deploy/helm/indexed/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: indexed\nspec:\n  containers:\n    - name: app\n" +
 		"      image: {{ .Values.server.image.registry }}/{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}\n",
+	// whole takes its image as one string, as nvcf-otel-collector does.
+	"deploy/helm/whole/Chart.yaml":  "apiVersion: v2\nname: helm-whole\nversion: 0.1.0\n",
+	"deploy/helm/whole/values.yaml": "image: \"\"\n",
+	"deploy/helm/whole/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: whole\nspec:\n  containers:\n    - name: app\n" +
+		"      image: {{ .Values.image }}\n",
 	"deploy/helm/broken/Chart.yaml":         "apiVersion: v2\nname: helm-broken\nversion: 0.1.0\n",
 	"deploy/helm/broken/templates/pod.yaml": "{{ fail \"unrelated template error\" }}\n",
 }
@@ -136,7 +141,10 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 			"registry: {{ dig \"global\" \"image\" \"registry\" \"\" .Values }}\n          repository: {{ dig \"global\" \"image\" \"repository\" \"\" .Values }}/app\n")),
 		fixtureStack("empty-key", "global:\n  image: {registry: \"\", repository: team}\n", fixtureRelease("app", "helm-app",
 			"registry: {{ .Values.global.image.registry }}\n          repository: {{ .Values.global.image.repository }}/app\n")),
-		fixtureStack("single-string", fixtureBase+"sidecar:\n  image: nvcr.io/team/sidecar:v1\n", sourced),
+		// The sidecar image is one string in base.yaml, so it gets no
+		// sentinel and its rendered image is reported.
+		fixtureStack("single-string", fixtureBase+"sidecar:\n  image: nvcr.io/team/sidecar:v1\n",
+			sourced+fixtureRelease("sidecar", "helm-whole", "{{ .Values.sidecar.image }}\n")[len("releases:\n"):]),
 		fixtureStack("repository-host", "global:\n  image: {registry: nvcr.io, repository: docker.io/team}\napp:\n  image: {tag: v2}\n", sourced),
 		// A listed untracked chart is skipped, not rendered or reported.
 		fixtureStack("untracked", fixtureBase, sourced+fixtureRelease("skipped", untracked, "{}\n")[len("releases:\n"):]),
@@ -257,7 +265,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 		"deploy/stacks/comment-only":         {findingImageSource, "chart image guard rejects the probe values"},
 		"deploy/stacks/undeclared-key":       {findingImageSource, "chart image guard rejects the probe values"},
 		"deploy/stacks/empty-key":            {findingImageSource, "chart image guard rejects the probe values"},
-		"deploy/stacks/single-string":        {findingImageSource, `sidecar.image: image is a single string "nvcr.io/team/sidecar:v1"`},
+		"deploy/stacks/single-string":        {findingImageSource, "nvcr.io/team/sidecar:v1 image: image does not take its registry and repository from base.yaml"},
 		"deploy/stacks/repository-host":      {findingImageSource, `global.image.repository: repository "docker.io/team" contains registry host docker.io`},
 		"deploy/stacks/tag-swallowed":        {findingImageSource, "app.image.tag: tag set in base.yaml does not reach its rendered image"},
 		"deploy/stacks/parent-dropping":      {findingImageSource, "child.image.registry: image value of included stack deploy/stacks/child is not forwarded"},

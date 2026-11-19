@@ -54,31 +54,25 @@ func isImageMapKey(key string) bool {
 
 // probeLeaves returns a sentinel leaf for every non-empty image registry,
 // repository, tag and digest in a stack's base.yaml, plus a finding for each
-// image value written in a form the stack rules reject:
+// image field written in a form the stack rules reject.
 //
-//	collector: {image: ghcr.io/x/collector:1}            single image string
-//	image: {repository: ghcr.io/x/collector}             repository with a host
-//
-// A rejected repository gets no sentinel, so its rendered image is reported
-// too.
+// A single image string, such as collector: {image: ghcr.io/x/collector:1},
+// gets no sentinel and no finding here: an image that reads it carries no
+// sentinel, so the render check reports it.
 func probeLeaves(stack string, base map[string]any, check *stackCheck) []probeLeaf {
 	var leaves []probeLeaf
 	var walk func(prefix string, values map[string]any)
 	walk = func(prefix string, values map[string]any) {
 		for _, key := range sortedKeys(values) {
 			path := strings.TrimPrefix(prefix+"."+key, ".")
-			switch value := values[key].(type) {
-			case map[string]any:
-				if isImageMapKey(key) {
-					leaves = append(leaves, imageMapLeaves(stack, path, value, check)...)
-				}
-				walk(path, value)
-			case string:
-				if isImageMapKey(key) && value != "" {
-					check.fail(findingImageSource, "", "", path, "image is a single string "+quoteValue(value)+" in base.yaml",
-						"separate registry and repository keys", "split the image into registry, repository and tag in base.yaml")
-				}
+			value, ok := values[key].(map[string]any)
+			if !ok {
+				continue
 			}
+			if isImageMapKey(key) {
+				leaves = append(leaves, imageMapLeaves(stack, path, value, check)...)
+			}
+			walk(path, value)
 		}
 	}
 	walk("", base)
