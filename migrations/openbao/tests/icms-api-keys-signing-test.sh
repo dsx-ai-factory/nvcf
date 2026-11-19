@@ -45,7 +45,7 @@ run_migration() {
   export ROLE_READ_MODE="$1"
   : >"$BAO_CALLS"
   rm -f "$SIS_SECRET_ROLE" "$SIS_AUTH_ROLE"
-  ( source "$migration" ) >"$work_dir/output.log" 2>&1 || {
+  bash "$migration" >"$work_dir/output.log" 2>&1 || {
     case "$1" in
       failed|missing) ;;
       *) cat "$work_dir/output.log" >&2; fail "migration failed for $1" ;;
