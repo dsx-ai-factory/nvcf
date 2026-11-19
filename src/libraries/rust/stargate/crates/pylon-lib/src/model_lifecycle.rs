@@ -725,6 +725,14 @@ async fn wait_for_upstream_health(
             return Ok(());
         }
         if Instant::now() >= deadline {
+            if let Some(gate) = &config.readiness_gate {
+                tracing::warn!(
+                    readiness_gate = %gate.url(),
+                    last_failure = ?gate.last_failure(),
+                    wait = ?config.startup_health_wait,
+                    "the readiness gate did not pass before the startup wait ended"
+                );
+            }
             return Err(BringupError::UnhealthyUpstream.into());
         }
         if reported {

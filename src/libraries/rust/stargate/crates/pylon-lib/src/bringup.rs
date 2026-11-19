@@ -343,24 +343,72 @@ mod tests {
     #[tokio::test]
     async fn readiness_gate_passes_only_on_the_expected_status() {
         // Every upstream also answers `/health`, which the lenient probe accepts.
-        for (label, path, served, expected, want) in [
-            ("declared check not ready", "/ready", 503, 200, false),
-            ("declared check ready", "/ready", 200, 200, true),
-            ("declared path not served", "/ready", 404, 200, false),
+        for (label, path, served, expected, want, want_failure) in [
+            (
+                "declared check not ready",
+                "/ready",
+                503,
+                200,
+                false,
+                Some("HTTP 503 Service Unavailable"),
+            ),
+            ("declared check ready", "/ready", 200, 200, true, None),
+            (
+                "declared path not served",
+                "/ready",
+                404,
+                200,
+                false,
+                Some("HTTP 404 Not Found"),
+            ),
+            (
+                "declared check unauthorized",
+                "/ready",
+                401,
+                200,
+                false,
+                Some("HTTP 401 Unauthorized"),
+            ),
             (
                 "2xx other than the expected status",
                 "/ready",
                 204,
                 200,
                 false,
+                Some("HTTP 204 No Content"),
             ),
-            ("custom expected status", "/ready", 204, 204, true),
+            ("custom expected status", "/ready", 204, 204, true, None),
             (
                 "default check not served",
                 "/v2/health/ready",
                 404,
                 200,
                 true,
+                None,
+            ),
+            (
+                "default check unauthorized",
+                "/v2/health/ready",
+                401,
+                200,
+                true,
+                None,
+            ),
+            (
+                "default check forbidden",
+                "/v2/health/ready",
+                403,
+                200,
+                true,
+                None,
+            ),
+            (
+                "default check method not allowed",
+                "/v2/health/ready",
+                405,
+                200,
+                true,
+                None,
             ),
             (
                 "default check not ready",
@@ -368,6 +416,23 @@ mod tests {
                 503,
                 200,
                 false,
+                Some("HTTP 503 Service Unavailable"),
+            ),
+            (
+                "default check bad request",
+                "/v2/health/ready",
+                400,
+                200,
+                false,
+                Some("HTTP 400 Bad Request"),
+            ),
+            (
+                "default check rate limited",
+                "/v2/health/ready",
+                429,
+                200,
+                false,
+                Some("HTTP 429 Too Many Requests"),
             ),
         ] {
             let status = StatusCode::from_u16(served).expect(label);
@@ -391,6 +456,7 @@ mod tests {
                 want,
                 "{label}"
             );
+            assert_eq!(gate.last_failure().as_deref(), want_failure, "{label}");
             server.shutdown().await;
         }
     }
@@ -412,6 +478,7 @@ mod tests {
             )
             .await
         );
+        assert_eq!(gate.last_failure().as_deref(), Some("connection failed"));
         server.shutdown().await;
     }
 

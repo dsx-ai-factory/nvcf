@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use parking_lot::Mutex;
 use reqwest::StatusCode;
 use url::Url;
 
@@ -44,10 +45,12 @@ pub enum ReadinessGateError {
 pub struct ReadinessGate {
     url: String,
     expected_status: StatusCode,
-    // Backends that do not serve the control-plane default answer it with 404.
-    // Those functions declared nothing, so they keep the lenient probe.
+    // A check equal to the control-plane default is often one the function
+    // never declared, so it keeps the lenient probe when the backend does not
+    // serve that path.
     is_control_plane_default: bool,
     fallback_logged: Arc<AtomicBool>,
+    last_failure: Arc<Mutex<Option<String>>>,
 }
 
 impl ReadinessGate {
@@ -80,6 +83,7 @@ impl ReadinessGate {
             is_control_plane_default: path == CONTROL_PLANE_DEFAULT_HEALTH_PATH
                 && port == upstream_port,
             fallback_logged: Arc::new(AtomicBool::new(false)),
+            last_failure: Arc::default(),
         })
     }
 
@@ -95,13 +99,32 @@ impl ReadinessGate {
         self.is_control_plane_default
     }
 
-    pub(crate) fn log_fallback_once(&self) {
+    pub(crate) fn log_fallback_once(&self, status: StatusCode) {
         if !self.fallback_logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 url = %self.url,
+                status = %status,
                 "upstream does not serve the default health check; using the fallback health paths"
             );
         }
+    }
+
+    /// Logs a failure only when its outcome changes, so a long wait shows why
+    /// the check fails without a line for every probe.
+    pub(crate) fn record_failure(&self, outcome: String) {
+        let mut last_failure = self.last_failure.lock();
+        if last_failure.as_deref() != Some(outcome.as_str()) {
+            tracing::warn!(url = %self.url, outcome = %outcome, "readiness gate check failed");
+            *last_failure = Some(outcome);
+        }
+    }
+
+    pub(crate) fn record_pass(&self) {
+        *self.last_failure.lock() = None;
+    }
+
+    pub(crate) fn last_failure(&self) -> Option<String> {
+        self.last_failure.lock().clone()
     }
 }
 
