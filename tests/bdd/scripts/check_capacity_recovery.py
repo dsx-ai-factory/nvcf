@@ -141,6 +141,15 @@ class RecoveryCheck:
         args = self.args
         prefix = "bdd-capacity-" + uuid.uuid4().hex[:8]
         try:
+            def configured():
+                startup = self.kubectl("logs", "deployment/nvca", "-n", "nvca-system", "--tail=10000")
+                return ("version " + args.agent_version + " with options" in startup
+                        and discovery_mode(startup) == args.discovery_mode
+                        and periodic_heartbeat_seconds(startup) == 300)
+
+            self.wait("candidate version and discovery configuration", configured, 180)
+            self.save("setup.json", {"agentVersion": args.agent_version,
+                                     "discoveryMode": args.discovery_mode})
             # Independent requests preserve the min=max=1 release behavior.
             for index in range(args.expected_capacity):
                 self.cli("function", "create", "--name", f"{prefix}-{index}",
@@ -149,6 +158,7 @@ class RecoveryCheck:
                 selected = json.loads(self.cli("status", "--json"))["currentFunction"]
                 identity = (selected["functionId"], selected["versionId"])
                 self.identities.append(identity)
+                self.save("functions.json", self.identities)
                 self.cli("function", "deploy", "create", "--function-id", identity[0],
                          "--version-id", identity[1], "--backend", args.backend, "--gpu", args.gpu,
                          "--instance-type", args.instance_type, "--regions", args.region,

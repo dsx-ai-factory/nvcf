@@ -334,8 +334,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | global.helm.sources.repository            | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
         | global.image.repository                   | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
         | global.nvcaOperator.selfManaged.nvcaVersion | ${CAPACITY_NVCA_AGENT_VERSION} |
-        | global.nvcaOperator.nvcaImage.pullPolicy    | IfNotPresent                              |
-      And I set yaml file "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml" key "global.nvcaOperator.worker.staticGPUCapacity" to:
+      And I set yaml file "deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml" key "worker.staticGPUCapacity" to:
         """
         <static_capacity>
         """

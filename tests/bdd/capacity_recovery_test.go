@@ -46,6 +46,7 @@ func TestCapacityRecoveryScenarioUsesCandidateAndSaturatedProbe(t *testing.T) {
 	}
 	suite := newWiringSuite(t, runner)
 	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
+	writeHelmfileRegisterValues(t, suite.Config.RepoRoot)
 	environment := filepath.Join(suite.Config.RepoRoot, "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml")
 	if err := os.MkdirAll(filepath.Dir(environment), 0o755); err != nil {
 		t.Fatal(err)
@@ -76,6 +77,12 @@ func TestCapacityRecoveryScenarioUsesCandidateAndSaturatedProbe(t *testing.T) {
 	version, found, err := dsl.ReadYAMLKey(environment, "global.nvcaOperator.selfManaged.nvcaVersion")
 	if err != nil || !found || version != "3.0.0-review" {
 		t.Fatalf("candidate version override = %v, found=%v, err=%v", version, found, err)
+	}
+	registration := filepath.Join(suite.Config.RepoRoot,
+		"deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml")
+	capacity, found, err := dsl.ReadYAMLKey(registration, "worker.staticGPUCapacity")
+	if err != nil || !found || capacity != "4" {
+		t.Fatalf("static capacity in operator values = %v, found=%v, err=%v", capacity, found, err)
 	}
 	if !commandRanThatContainsAll(runner.runs, "check_capacity_recovery.py", "--agent-version 3.0.0-review",
 		"--expected-capacity 4", "--publication-timeout 60", "--recovery-timeout 180", "--context k3d-ncp-local") {
