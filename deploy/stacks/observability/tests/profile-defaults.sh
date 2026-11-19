@@ -569,14 +569,56 @@ assert_yaml_value "$autoscaler_monitor_manifest" \
 assert_yaml_value "$autoscaler_monitor_manifest" \
   '.spec.endpoints[0].interval' 30s 'function autoscaler scrape interval'
 
-helm template otel-collector "$stack_dir/charts/nvcf-otel-collector" \
-  >"$work_dir/collector-manifests.yaml"
-collector_name="$(yq -r '.collectorName' "$stack_dir/charts/nvcf-otel-collector/values.yaml")"
-NVCF_TARGET_ALLOCATOR_ROLE="$collector_name-otel" yq -e '
-  select(.kind == "ClusterRole" and .metadata.name == strenv(NVCF_TARGET_ALLOCATOR_ROLE)) |
-  .rules[] | select(.apiGroups[] == "") | .resources[] | select(. == "secrets")
-' "$work_dir/collector-manifests.yaml" >/dev/null ||
-  fail "Target Allocator RBAC must allow referenced Secret discovery"
+# The Target Allocator watches Secrets in its own namespace by default. The
+# bundled monitors reference none, so discovery RBAC grants Secrets through a
+# Role in the release namespace, not through the ClusterRole. A non-default
+# namespace catches a hardcoded one.
+collector_chart="$stack_dir/charts/nvcf-otel-collector"
+collector_namespace=telemetry
+collector_manifests="$work_dir/collector-manifests.yaml"
+helm template otel-collector "$collector_chart" \
+  --namespace "$collector_namespace" >"$collector_manifests"
+collector_name="$(yq -r '.collectorName' "$collector_chart/values.yaml")"
+target_allocator_role="$collector_name-otel"
+target_allocator_account="$collector_name-targetallocator"
+target_allocator_secrets_role="$collector_name-otel-secrets"
+target_allocator_secrets_binding="$target_allocator_secrets_role-targetallocator"
+
+assert_equal "$(NVCF_ROLE="$target_allocator_role" yq -N -r '
+  select(.kind == "ClusterRole" and .metadata.name == strenv(NVCF_ROLE)) |
+  .metadata.name
+' "$collector_manifests")" "$target_allocator_role" \
+  "Target Allocator ClusterRole"
+assert_equal "$(yq -N -r '
+  select(.kind == "ClusterRole") | .rules[] |
+  select((.resources // []) | any_c(. == "secrets")) |
+  (.apiGroups | join(",")) + ":" + (.resources | join(","))
+' "$collector_manifests")" "" \
+  "Target Allocator ClusterRole Secret rules"
+assert_equal "$(NVCF_ROLE="$target_allocator_secrets_role" yq -N -r '
+  select(.kind == "Role" and .metadata.name == strenv(NVCF_ROLE)) |
+  .metadata.namespace + "|" +
+  ([.rules[] | (.apiGroups | join(",")) + ":" + (.resources | join(",")) +
+    ":" + (.verbs | join(","))] | join(";"))
+' "$collector_manifests")" "$collector_namespace|:secrets:get,list,watch" \
+  "Target Allocator Secret Role"
+assert_equal "$(NVCF_BINDING="$target_allocator_secrets_binding" yq -N -r '
+  select(.kind == "RoleBinding" and .metadata.name == strenv(NVCF_BINDING)) |
+  .metadata.namespace + "|" + .roleRef.kind + "/" + .roleRef.name + "|" +
+  ([.subjects[] | .kind + "/" + .namespace + "/" + .name] | join(","))
+' "$collector_manifests")" \
+  "$collector_namespace|Role/$target_allocator_secrets_role|ServiceAccount/$collector_namespace/$target_allocator_account" \
+  "Target Allocator Secret RoleBinding"
+
+helm template otel-collector "$collector_chart" \
+  --namespace "$collector_namespace" \
+  --set targetAllocatorRbac.create=false \
+  >"$work_dir/collector-manifests-without-rbac.yaml"
+assert_equal "$(yq -N -r '
+  select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding" or
+    .kind == "Role" or .kind == "RoleBinding") | .kind
+' "$work_dir/collector-manifests-without-rbac.yaml")" "" \
+  "Target Allocator RBAC with targetAllocatorRbac.create=false"
 
 # Every supported external authentication mode must pass validation and retain
 # the external collector endpoint. Autoscaler-specific auth values are covered
