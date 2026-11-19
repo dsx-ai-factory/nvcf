@@ -120,6 +120,9 @@ func TestImplicitTemplateSources(t *testing.T) {
 		// "#" starts a comment only after whitespace.
 		{`containers: [{name: a#b, image: quay.io/x:1}]`, "literal registry host quay.io"},
 		{`- {name: x, image: docker.io/y:1}`, "literal registry host docker.io"},
+		// An unquoted flow value stops before the next key.
+		{`containers: [{image: app:v1},{image: docker.io/hidden:v1}]`, "image reference docker.io/hidden:v1 starts with literal registry host docker.io"},
+		{`containers: [{name: a, image: app:v1}, {name: b, image: quay.io/x:1}]`, "image reference quay.io/x:1 starts with"},
 		// "," is a flow indicator only inside a flow collection.
 		{`note: one, image: docker.io/x:1`, ""},
 		{`note: [a] two, image: docker.io/x:1`, ""},
@@ -238,6 +241,10 @@ func TestGuardErrorNamesPath(t *testing.T) {
 		{"execution error: set x.image.registry-backup", false},
 		{"execution error: set backup-x.image.registry", false},
 		{"execution error: set x.image.registry, then retry", true},
+		{"execution error: set .Values.x.image.registry", true},
+		{"execution error: required (.Values.x.image.registry)", true},
+		{"execution error: set .Values.y.x.image.registry", false},
+		{"execution error: set Values.x.image.registry", false},
 		{`execution error: "set x.image.registry."`, true},
 		{"execution error: set y.x.image.registry", false},
 		{"execution error: image source missing", false},

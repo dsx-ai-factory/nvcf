@@ -85,10 +85,14 @@ var (
 	sourceDefault = regexp.MustCompile("(?i)" +
 		`\.\w*(?:registry|repository)\s*(?:\|\s*\w+\s*)*\|\s*default\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)` +
 		`|\bdefault\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)\s+\(?\s*[\w.$]*\.\w*(?:registry|repository)\b`)
-	// imageField captures the value of an image: key, in block style or after
-	// "{" or "," in a flow mapping, or of a --<name>-image= argument. Group 1
-	// is the text before the key; it holds "{" or "," for a flow mapping.
-	imageField = regexp.MustCompile(`(?:(^\s*(?:-\s*)?|[{,]\s*)"?image"?\s*:\s*|--[\w-]+-image=)("[^"]*"|'[^']*'|\S+)`)
+	// imageField captures the value of a block-style image: key or of a
+	// --<name>-image= argument.
+	imageField = regexp.MustCompile(`(?:^\s*(?:-\s*)?"?image"?\s*:\s*|--[\w-]+-image=)("[^"]*"|'[^']*'|\S+)`)
+	// flowImageField captures the value of an image: key after "{" or "," in
+	// a flow mapping. An unquoted value stops at ",", "}" or "]", so it never
+	// swallows the next key: in "[{image: a:v1},{image: docker.io/b:v1}]"
+	// both values are read.
+	flowImageField = regexp.MustCompile(`[{,]\s*"?image"?\s*:\s*("[^"]*"|'[^']*'|[^\s,}\]]+)`)
 )
 
 // checkTemplateSources scans the chart's own templates/ for an implicit image
@@ -218,25 +222,11 @@ func templateImageFieldSources(text string) []templateSource {
 
 // imageFieldSources reports the image fields on one line that start before
 // end, the start of a YAML comment. A flow key counts only after a "{" or ","
-// in flow, the structural flow indicators of the line.
+// in flow, the structural flow indicators of the line. Block keys and
+// arguments use the line scan's original pattern.
 func imageFieldSources(number int, line string, end int, flow map[int]bool) []templateSource {
 	var sources []templateSource
-	for _, match := range imageField.FindAllStringSubmatchIndex(line, -1) {
-		if match[0] >= end {
-			continue
-		}
-		flowKey := match[2] >= 0 && match[3] > match[2] && strings.ContainsRune("{,", rune(line[match[2]]))
-		if flowKey && !flow[match[2]] {
-			continue
-		}
-		value := line[match[4]:match[5]]
-		if flowKey || strings.HasPrefix(line[match[0]:], "--") {
-			// A flow mapping or sequence value ends at the first "}", "]"
-			// or ",", which also drops a template action glued after it.
-			if cut := strings.IndexAny(value, ",}]"); cut >= 0 {
-				value = value[:cut]
-			}
-		}
+	report := func(value string) {
 		value = strings.Trim(value, `"'`)
 		// Actions become a placeholder segment, so only literal text can
 		// start the reference: "nvcr.io/{{ .x }}" -> "nvcr.io/x" has a host,
@@ -244,6 +234,25 @@ func imageFieldSources(number int, line string, end int, flow map[int]bool) []te
 		if host, found := imageReferenceHost(templateAction.ReplaceAllString(value, "x")); found {
 			sources = append(sources, templateSource{number,
 				fmt.Sprintf("image reference %s starts with literal registry host %s", value, host)})
+		}
+	}
+	for _, match := range imageField.FindAllStringSubmatchIndex(line, -1) {
+		if match[0] >= end {
+			continue
+		}
+		value := line[match[2]:match[3]]
+		if strings.HasPrefix(line[match[0]:], "--") {
+			// An argument inside a flow sequence ends at the first "}", "]"
+			// or ",".
+			if cut := strings.IndexAny(value, ",}]"); cut >= 0 {
+				value = value[:cut]
+			}
+		}
+		report(value)
+	}
+	for _, match := range flowImageField.FindAllStringSubmatchIndex(line, -1) {
+		if match[0] < end && flow[match[0]] {
+			report(line[match[2]:match[3]])
 		}
 	}
 	return sources

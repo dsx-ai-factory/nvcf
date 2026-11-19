@@ -330,14 +330,16 @@ func (c *chartCheck) checkGuards(chart, name, scenario string, catalog []catalog
 
 // guardNamesPath reports whether a render error names the values path itself,
 // not a longer path that contains it. A hyphen continues a path token, as in
-// a values key such as cert-manager.
+// a values key such as cert-manager, and Helm's .Values. prefix is accepted.
 //
 //	"set x.image.registry."            names x.image.registry
+//	"set .Values.x.image.registry"     names x.image.registry
 //	"set x.image.registryMirror"       does not
 //	"set x.image.registry.sub"         does not
 //	"set x.image.registry-backup"      does not
+//	"set .Values.y.x.image.registry"   does not
 func guardNamesPath(message, path string) bool {
-	return regexp.MustCompile(`(^|[^\w.-])` + regexp.QuoteMeta(path) + `($|[^\w.-]|\.($|[^\w-]))`).MatchString(message)
+	return regexp.MustCompile(`(^|[^\w.-])(\.Values\.)?` + regexp.QuoteMeta(path) + `($|[^\w.-]|\.($|[^\w-]))`).MatchString(message)
 }
 
 func firstLine(text string) string {
