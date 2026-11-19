@@ -183,15 +183,17 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
 ```
 
 The capacity checks fill all four simulated GPUs with independent one-worker
-functions using minInstances=maxInstances=1. It verifies the candidate image and
+functions using minInstances=maxInstances=1. Each verifies the candidate image and
 its occupied heartbeat after a complete agent restart, removes one worker, and
 requires released capacity within 60 seconds and a replacement Ready within
 180 seconds. Both deadlines are shorter than the verified five-minute periodic
 heartbeat. Run evidence is written under `out/capacity-recovery-*`; the check
 deletes only its own function definitions and deployments on completion or
-failure. The general Helmfile suite excludes this candidate-only scenario.
-This validates real Kubernetes and
-control-plane behavior with simulated GPUs and a CPU sample, and does not
+failure. Static discovery explicitly disables the dynamic discovery gate and
+uses `fixtures/capacity-gpus.json`. The probe waits for the generated discovery
+configuration and restarts the agent if its startup settings are stale.
+The general Helmfile suite excludes this candidate-only scenario. This validates
+real Kubernetes and control-plane behavior with simulated GPUs and a CPU sample, and does not
 validate physical GPU or application-specific shutdown behavior.
 
 After a full installation, use `TestExistingClusterCapacityRecovery` with the

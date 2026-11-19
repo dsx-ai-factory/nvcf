@@ -18,6 +18,7 @@ limitations under the License.
 package bdd_tmp
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +38,16 @@ func TestCapacityRecoveryScenarioUsesCandidateAndSaturatedProbe(t *testing.T) {
 	t.Setenv("SAMPLE_NGC_ORG", "test-org")
 	t.Setenv("SAMPLE_NGC_TEAM", "test-team")
 	t.Setenv("HOME", t.TempDir())
+	gpuConfig, err := os.ReadFile(filepath.Join("fixtures", "capacity-gpus.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedConfig := base64.StdEncoding.EncodeToString(gpuConfig)
 	runner := newFakeRunner(nil)
 	runner.respond = func(command string) (harness.Result, bool) {
+		if strings.Contains(command, "base64.b64encode") {
+			return harness.Result{Stdout: encodedConfig}, true
+		}
 		if strings.Contains(command, "scripts/check_capacity_recovery.py") {
 			return harness.Result{Stdout: "capacity recovery passed"}, true
 		}
@@ -80,9 +89,17 @@ func TestCapacityRecoveryScenarioUsesCandidateAndSaturatedProbe(t *testing.T) {
 	}
 	registration := filepath.Join(suite.Config.RepoRoot,
 		"deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml")
+	config, found, err := dsl.ReadYAMLKey(registration, "selfManaged.gpuManualInstanceConfigB64")
+	if err != nil || !found || config != encodedConfig {
+		t.Fatalf("static GPU configuration in operator values: found=%v, err=%v", found, err)
+	}
 	capacity, found, err := dsl.ReadYAMLKey(registration, "worker.staticGPUCapacity")
 	if err != nil || !found || capacity != "4" {
-		t.Fatalf("static capacity in operator values = %v, found=%v, err=%v", capacity, found, err)
+		t.Fatalf("static capacity = %v, found=%v, err=%v", capacity, found, err)
+	}
+	gate, found, err := dsl.ReadYAMLKey(environment, "global.nvcaOperator.selfManaged.featureGateValues[2]")
+	if err != nil || !found || gate != "-DynamicGPUDiscovery" {
+		t.Fatalf("static discovery gate = %v, found=%v, err=%v", gate, found, err)
 	}
 	if !commandRanThatContainsAll(runner.runs, "check_capacity_recovery.py", "--agent-version 3.0.0-review",
 		"--expected-capacity 4", "--publication-timeout 60", "--recovery-timeout 180", "--context k3d-ncp-local") {

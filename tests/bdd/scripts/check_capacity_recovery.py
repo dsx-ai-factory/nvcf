@@ -77,6 +77,14 @@ def discovery_mode(logs):
     return "dynamic" if modes[-1] == "true" else "static"
 
 
+def prepared_discovery(backends, config, backend, mode, capacity):
+    selected = next((b for b in backends if b["metadata"]["name"] == backend), {})
+    discovery = selected.get("spec", {}).get("clusterConfig", {}).get("gpuDiscovery", {})
+    overrides = re.findall(r"(?m)^\s*staticGPUCapacity:\s*(\d+)\s*$", config)
+    configured_capacity = int(overrides[-1]) if overrides else 0
+    return mode in discovery and configured_capacity == (capacity if mode == "static" else 0)
+
+
 class RecoveryCheck:
     def __init__(self, args):
         self.args = args
@@ -141,12 +149,37 @@ class RecoveryCheck:
         args = self.args
         prefix = "bdd-capacity-" + uuid.uuid4().hex[:8]
         try:
+            def rollout_complete():
+                agents = [p for p in self.objects("pods", "nvca-system")
+                          if p["metadata"]["name"].startswith("nvca-")
+                          and p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
+                return (len(agents) == 1 and not agents[0]["metadata"].get("deletionTimestamp")
+                        and bool(agents[0].get("status", {}).get("containerStatuses"))
+                        and all(c.get("ready") for c in agents[0]["status"]["containerStatuses"]))
+
             def configured():
+                if not rollout_complete():
+                    return False
                 startup = self.kubectl("logs", "deployment/nvca", "-n", "nvca-system", "--tail=10000")
                 return ("version " + args.agent_version + " with options" in startup
                         and discovery_mode(startup) == args.discovery_mode
                         and periodic_heartbeat_seconds(startup) == 300)
 
+            def prepared():
+                config = json.loads(self.kubectl("get", "configmap/agent-config", "-n", "nvca-system", "-o", "json"))
+                return prepared_discovery(self.objects("nvcfbackends"), config["data"]["config.yaml"],
+                                          args.backend, args.discovery_mode, args.expected_capacity)
+
+            self.wait("backend and agent discovery configuration", prepared, 180)
+            try:
+                current = configured()
+            except (RuntimeError, subprocess.TimeoutExpired):
+                current = False
+            if not current:
+                # The installed operator can update the mounted ConfigMap without
+                # restarting an agent that reads its configuration only at startup.
+                self.kubectl("rollout", "restart", "deployment/nvca", "-n", "nvca-system")
+                self.kubectl("rollout", "status", "deployment/nvca", "-n", "nvca-system", "--timeout=300s")
             self.wait("candidate version and discovery configuration", configured, 180)
             self.save("setup.json", {"agentVersion": args.agent_version,
                                      "discoveryMode": args.discovery_mode})
@@ -174,14 +207,6 @@ class RecoveryCheck:
             # giving the test a full default heartbeat interval for its deadline.
             self.kubectl("rollout", "restart", "deployment/nvca", "-n", "nvca-system")
             self.kubectl("rollout", "status", "deployment/nvca", "-n", "nvca-system", "--timeout=300s")
-
-            def rollout_complete():
-                agents = [p for p in self.objects("pods", "nvca-system")
-                          if p["metadata"]["name"].startswith("nvca-")
-                          and p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
-                return (len(agents) == 1 and not agents[0]["metadata"].get("deletionTimestamp")
-                        and bool(agents[0].get("status", {}).get("containerStatuses"))
-                        and all(c.get("ready") for c in agents[0]["status"]["containerStatuses"]))
 
             self.wait("old agent exited", rollout_complete, 300)
             deployment = json.loads(self.kubectl("get", "deployment/nvca", "-n", "nvca-system", "-o", "json"))

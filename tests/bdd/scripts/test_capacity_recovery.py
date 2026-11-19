@@ -14,12 +14,74 @@ from check_capacity_recovery import (
     latest_heartbeat,
     occupied_by_candidate,
     periodic_heartbeat_seconds,
+    prepared_discovery,
     ready_workers,
     RecoveryCheck,
 )
 
 
 class CapacityRecoveryTests(unittest.TestCase):
+    def test_static_fixture_supplies_required_instance_values_and_test_capacity(self):
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "capacity-gpus.json"
+        gpus = json.loads(fixture.read_text())
+        self.assertEqual(4, sum(gpu["capacity"] for gpu in gpus))
+        for gpu in gpus:
+            for instance in gpu["instanceTypes"]:
+                self.assertTrue(instance["name"])
+                self.assertEqual(instance["name"], instance["value"])
+
+    def test_startup_restarts_agent_only_when_effective_configuration_is_stale(self):
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                check = RecoveryCheck.__new__(RecoveryCheck)
+                check.args = SimpleNamespace(backend="target", discovery_mode="static", expected_capacity=4,
+                                             agent_version="candidate", image="sample")
+                check.identities = []
+                check.save = Mock()
+                def objects(kind, _namespace=None):
+                    if kind == "pods":
+                        return [{"metadata": {"name": "nvca-test"}, "status": {
+                            "phase": "Running", "containerStatuses": [{"ready": True}]}}]
+                    return [{"metadata": {"name": "target"}, "spec": {
+                        "clusterConfig": {"gpuDiscovery": {"static": {}}}}}]
+
+                check.objects = objects
+                restarted = False
+
+                def kubectl(*args):
+                    nonlocal restarted
+                    if args[0] == "get":
+                        return json.dumps({"data": {"config.yaml": "agent:\n  staticGPUCapacity: 4\n"}})
+                    if args[:2] == ("rollout", "restart"):
+                        restarted = True
+                    if args[0] == "logs":
+                        mode = "true" if stale and not restarted else "false"
+                        return ("version candidate with options: HeartbeatInterval:300000000000, "
+                                + "DynamicGPUDiscoveryEnabled:" + mode + ",")
+                    return ""
+
+                check.kubectl = Mock(side_effect=kubectl)
+
+                def wait(label, condition, _timeout):
+                    self.assertTrue(condition(), label)
+
+                check.wait = wait
+                check.cli = Mock(side_effect=RuntimeError("stop before fixtures"))
+                with self.assertRaisesRegex(RuntimeError, "stop before fixtures"):
+                    check.run()
+                self.assertEqual(stale, restarted)
+
+    def test_prepared_discovery_requires_backend_mode_and_updated_agent_config(self):
+        def backend(mode, name="target"):
+            return {"metadata": {"name": name}, "spec": {"clusterConfig": {"gpuDiscovery": {mode: {}}}}}
+        check = lambda b, c, mode: prepared_discovery(b, c, "target", mode, 4)
+        self.assertTrue(check([backend("dynamic")], "agent: {}", "dynamic"))
+        self.assertTrue(check([backend("static")], "agent:\n  staticGPUCapacity: 4\n", "static"))
+        self.assertFalse(check([backend("dynamic")], "  staticGPUCapacity: 4\n", "static"))
+        self.assertFalse(check([backend("static")], "agent: {}", "static"))
+        self.assertFalse(check([backend("dynamic")], "  staticGPUCapacity: 4\n", "dynamic"))
+        self.assertFalse(check([backend("static", "different")], "  staticGPUCapacity: 4\n", "static"))
+
     def test_failure_deletes_owned_definitions_and_continues_after_cleanup_error(self):
         with tempfile.TemporaryDirectory() as output:
             check = RecoveryCheck.__new__(RecoveryCheck)

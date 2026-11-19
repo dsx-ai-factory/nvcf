@@ -334,6 +334,14 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | global.helm.sources.repository            | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
         | global.image.repository                   | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
         | global.nvcaOperator.selfManaged.nvcaVersion | ${CAPACITY_NVCA_AGENT_VERSION} |
+        | global.nvcaOperator.selfManaged.featureGateValues[2] | <discovery_gate> |
+      When I successfully run command:
+        """
+        python3 -c 'import base64,pathlib; print(base64.b64encode(pathlib.Path("${REPO_ROOT}/tests/bdd/fixtures/capacity-gpus.json").read_bytes()).decode())'
+        """
+      And I export command output to environment variable "BDD_CAPACITY_GPU_CONFIG"
+      And I update yaml file "deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml" with keys:
+        | selfManaged.gpuManualInstanceConfigB64 | ${BDD_CAPACITY_GPU_CONFIG} |
       And I set yaml file "deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml" key "worker.staticGPUCapacity" to:
         """
         <static_capacity>
@@ -353,9 +361,9 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       Then the command output should contain "capacity recovery passed"
 
       Examples:
-        | discovery_mode | static_capacity |
-        | dynamic        | 0               |
-        | static         | 4               |
+        | discovery_mode | discovery_gate       | static_capacity |
+        | dynamic        | DynamicGPUDiscovery  | 0               |
+        | static         | -DynamicGPUDiscovery | 4               |
 
     @function-lifecycle @helm-function
     Scenario: Operator sees a Helm function without resource limits fail
