@@ -203,6 +203,12 @@ flags. Run `go run ./cmd/api --help` for all options.
 Cassandra is the supported database. Its schema must be provisioned before the
 service starts. CloudEvents publishing and distributed tracing are optional.
 
+Events with CloudEvent source `grpc-proxy` expire three hours after their last
+write. Stats rows written from those events expire after 72 hours. Configure
+`v3.grpc-proxy-event-ttl-seconds` and `v3.grpc-proxy-stats-ttl-seconds` to
+change these durations. Both values must be positive. Other event sources do
+not receive a TTL. These settings apply to incoming writes, not existing rows.
+
 ## Build and test
 
 Use the Go version declared in `go.mod`.
