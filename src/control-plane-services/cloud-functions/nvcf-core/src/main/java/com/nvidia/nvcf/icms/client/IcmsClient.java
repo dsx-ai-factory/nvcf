@@ -533,6 +533,7 @@ public class IcmsClient {
         LlmInvocationConfigDto config = functionMapperService.toLlmInvocationConfigDto(
                 function.getLlmConfig());
         var duration = config == null ? null : config.terminationGracePeriodDuration();
+        // if duration is not set in database we should send a default value which is equals to min
         return (duration == null ? llmProperties.getWorker().getTerminationGracePeriod().getMin()
                 : duration).toString();
     }
