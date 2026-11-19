@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -256,6 +257,9 @@ var (
 func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, path string) (map[string]string, error) {
 	values := make(map[string]any)
 	want := make(map[string]string)
+	// Repositories are lower case, so identities such as API and api would
+	// share a name; a numeric suffix keeps every expected reference distinct.
+	used := make(map[string]bool)
 	for _, image := range catalog {
 		parsed, err := parseResolvedImageReference(image.Reference)
 		if err != nil {
@@ -267,7 +271,12 @@ func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, pat
 			// digest fields are both exercised.
 			version = "override"
 		}
-		repository := target.Repository + "/" + strings.ToLower(image.ID)
+		base := target.Repository + "/" + strings.ToLower(image.ID)
+		repository := base
+		for n := 1; used[repository]; n++ {
+			repository = base + "-" + strconv.Itoa(n)
+		}
+		used[repository] = true
 		setImageValue(values, image.Path, image.Exception.override(target.Registry, repository, version, target.Digest))
 		want[image.ID] = target.Registry + "/" + repository + ":" + version + "@" + target.Digest
 	}

@@ -10,8 +10,11 @@
 # reason:
 #   pending-fix        Not yet remediated. Expected to fail the chart image
 #                      checks, for example because it still prefills an image
-#                      registry or repository. Once the chart passes, CI fails
-#                      until this entry is removed.
+#                      registry or repository. Only coverage findings are
+#                      expected, including undeclared rendered images. An
+#                      invalid index, an incomplete CI values scenario or a
+#                      render error still fails CI. Once the chart passes, CI
+#                      fails until this entry is removed.
 #   test-fixture       Testdata, validator test charts, and samples that no
 #                      NVCF stack deploys. Skipped.
 #   no-runtime-image   Renders no image in its defaults or any CI values

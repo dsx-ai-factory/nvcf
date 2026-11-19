@@ -22,9 +22,9 @@ type imageValueException struct {
 	// imageSourceFields are extra fields of the image object that select a
 	// source. They must be empty in chart values, and overrides clear them.
 	imageSourceFields []string
-	// chartSourceFields are fields of the dependency values root that select
-	// a source for every image of the dependency. They must be empty in chart
-	// values.
+	// chartSourceFields are dotted paths under the dependency values root
+	// that select a source for every image of the dependency. They must be
+	// empty in chart values.
 	chartSourceFields []string
 	// digestReplacesTag: a digest renders <repository>@<digest> and drops the tag.
 	digestReplacesTag bool
@@ -44,11 +44,13 @@ type imageValueException struct {
 // on the convention.
 var imageValueExceptions = map[string]imageValueException{
 	// NATS (nats-io/k8s chart): fullImageName replaces registry and
-	// repository, and a digest replaces the tag.
+	// repository, a digest replaces the tag, and global.image.registry is the
+	// registry of every image whose own registry is empty.
 	//   {registry: r.example, repository: nats, tag: 2.10, digest: sha256:aa..} -> r.example/nats@sha256:aa..
 	"nats": {
 		name:              "nats",
 		imageSourceFields: []string{"fullImageName"},
+		chartSourceFields: []string{"global.image.registry"},
 		digestReplacesTag: true,
 	},
 	// cert-manager (jetstack "image" helper): imageRegistry and imageNamespace

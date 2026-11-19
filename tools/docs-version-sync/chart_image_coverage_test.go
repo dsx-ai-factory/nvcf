@@ -290,6 +290,7 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		"covered": fixtureScenario, "wrapped": "sub:\n  image: {registry: r.example, repository: team/sub}\n",
 		"prefilled-registry": fixtureScenario, "prefilled-repository": fixtureScenario, "repository-host": fixtureScenario,
 		"unguarded": fixtureScenario, "unnamed-guard": fixtureScenario, "template-host": fixtureScenario,
+		"unrelated-guard":  fixtureScenario + "mode: server\n",
 		"template-default": fixtureScenario, "hidden": fixtureScenario + "hidden: r.example/team/server:v1\n",
 		"undeclared": fixtureScenario + "sidecar: r.example/sidecar:v1\n", "scenario-gap": "server:\n  image: {registry: r.example}\n",
 		"format-key":      "nats:\n  image: {registry: r.example, repository: nats}\n",
@@ -323,6 +324,12 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	wrapped["charts/wrapped/charts/sub/values.yaml"] = "image: {registry: \"\", repository: \"\", tag: v2}\n"
 	wrapped["charts/wrapped/charts/sub/templates/pod.yaml"] = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: sub\nspec:\n  containers:\n" +
 		"    - name: sub\n      image: {{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}\n"
+	// The defaults fail on a required value unrelated to the image source,
+	// which the scenario supplies, before any image guard runs; every
+	// per-image guard is named.
+	unrelatedGuard := coverageFixtureChart("unrelated-guard", fixtureIndexed+"mode: \"\"\n", fixtureGuarded)
+	unrelatedGuard["charts/unrelated-guard/templates/object.yaml"] = `{{- $_ := required "set mode" .Values.mode -}}` + "\n" +
+		unrelatedGuard["charts/unrelated-guard/templates/object.yaml"]
 	for _, chart := range []map[string]string{
 		coverageFixtureChart("covered", fixtureIndexed, fixtureGuarded),
 		wrapped,
@@ -332,6 +339,7 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		coverageFixtureChart("unguarded", fixtureIndexed, fixtureUnguarded),
 		coverageFixtureChart("unnamed-guard", fixtureIndexed,
 			`{{ required "image source missing" .Values.server.image.registry }}/{{ required "image source missing" .Values.server.image.repository }}:{{ .Values.server.image.tag }}`),
+		unrelatedGuard,
 		coverageFixtureChart("template-host", fixtureIndexed, fixtureGuarded, "docker.io/library/busybox:1"),
 		coverageFixtureChart("template-default", fixtureIndexed,
 			`{{ .Values.server.image.registry | default "r.example" }}/{{ required "set server.image.repository" .Values.server.image.repository }}:{{ .Values.server.image.tag }}`),
@@ -390,6 +398,7 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		"charts/repository-host":      {findingCoverage, "server.image.repository: repository \"docker.io/team/server\" contains registry host docker.io"},
 		"charts/unguarded":            {findingCoverage, ": defaults render without an image source"},
 		"charts/unnamed-guard":        {findingCoverage, "server.image.registry: scenario unnamed-guard.yaml with an empty registry fails without naming it"},
+		"charts/unrelated-guard":      {findingCoverage, ": defaults render fails without naming an image source path"},
 		"charts/template-host":        {findingCoverage, "templates/object.yaml:10: image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
 		"charts/template-default":     {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
 		"charts/hidden":               {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},

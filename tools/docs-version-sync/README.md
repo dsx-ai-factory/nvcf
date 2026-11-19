@@ -50,9 +50,10 @@ Use repositories containing the selected versions. Image copying and artifact
 identity verification belong to release preparation. Values overrides do not
 publish or verify images. A single global registry setting does not retarget
 every chart. cert-manager takes `registry`, `repository`, `tag` and `digest`
-for all five images; empty tags inherit the vendored appVersion. OpenBao and
-Cassandra take separate `registry`, `repository` and `tag` fields. Their tag
-fields also accept `tag@sha256:digest` references.
+for all five images; when both tag and digest are empty, the image inherits
+the vendored appVersion. OpenBao and Cassandra take separate `registry`,
+`repository` and `tag` fields. Their tag fields also accept
+`tag@sha256:digest` references.
 
 CI runs the chart image checks on every tracked chart. A chart either declares
 an image index and passes, or is listed in `chart-image-exclusions.yaml`. For

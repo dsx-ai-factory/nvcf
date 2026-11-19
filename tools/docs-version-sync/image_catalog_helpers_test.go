@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -106,7 +107,11 @@ func renderImageChart(chart string, values []string) (imageChartSnapshot, error)
 	}
 }
 
-// imageCatalogCommand bounds external tool execution and attaches stderr to failures.
+// imageCatalogCommand bounds external tool execution and attaches stderr to
+// failures. A command that ran to completion and exited nonzero returns a
+// commandRejectedError. A timeout, a command killed by a signal (an OOM kill,
+// for example) or a command that could not start does not: none of them is
+// Helm deciding to reject the chart.
 func imageCatalogCommand(name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -118,9 +123,29 @@ func imageCatalogCommand(name string, args ...string) ([]byte, error) {
 	command.Stderr = &stderr
 	output, err := command.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%s failed: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		err = fmt.Errorf("%s failed: %w: %s", name, err, strings.TrimSpace(stderr.String()))
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.Exited() && ctx.Err() == nil {
+			return nil, &commandRejectedError{err}
+		}
+		return nil, err
 	}
 	return output, nil
+}
+
+// commandRejectedError is a command that ran and exited nonzero, such as a
+// helm render that a required guard rejects. Any other render failure is an
+// execution error and never evidence that a guard fired.
+type commandRejectedError struct{ err error }
+
+func (e *commandRejectedError) Error() string { return e.err.Error() }
+func (e *commandRejectedError) Unwrap() error { return e.err }
+
+// renderRejected reports whether a render error is Helm rejecting the chart,
+// as opposed to a timeout or a setup failure of the probe.
+func renderRejected(err error) bool {
+	var rejected *commandRejectedError
+	return errors.As(err, &rejected)
 }
 
 // chartDependency is one dependencies entry of a Chart.yaml.
@@ -199,24 +224,27 @@ func readImageIndex(values map[string]any, dependencies map[string]string) ([]ca
 	var declarationError error
 	identities := make(map[string]bool)
 	for _, category := range imageIndexCategories {
-		entries, ok := values[category].(map[string]any)
-		if values[category] != nil && !ok {
+		raw, present := values[category]
+		entries, ok := raw.(map[string]any)
+		if present && !ok {
 			declarationError = cmp.Or(declarationError, error(&imageIndexError{category + " must be a map of image value paths"}))
 			continue
 		}
 		for _, id := range sortedKeys(entries) {
 			path, ok := entries[id].(string)
-			if !ok || path == "" || identities[id] {
-				declarationError = cmp.Or(declarationError, error(&imageIndexError{
-					fmt.Sprintf("%s.%s must be a unique identity referencing image values", category, id)}))
-				continue
+			if ok && path != "" {
+				exception, err := imageExceptionFor(path, dependencies)
+				if err != nil {
+					return nil, fmt.Errorf("%s.%s (%s): %w", category, id, path, err)
+				}
+				if !identities[id] {
+					identities[id] = true
+					declared = append(declared, catalogImage{ID: id, Path: path, Ownership: category, Exception: exception})
+					continue
+				}
 			}
-			exception, err := imageExceptionFor(path, dependencies)
-			if err != nil {
-				return nil, fmt.Errorf("%s.%s (%s): %w", category, id, path, err)
-			}
-			identities[id] = true
-			declared = append(declared, catalogImage{ID: id, Path: path, Ownership: category, Exception: exception})
+			declarationError = cmp.Or(declarationError, error(&imageIndexError{
+				fmt.Sprintf("%s.%s must be a unique identity referencing image values", category, id)}))
 		}
 	}
 	if declarationError != nil {
@@ -237,6 +265,16 @@ func resolveChartImageCatalog(snapshot imageChartSnapshot) ([]catalogImage, erro
 	if err != nil {
 		return nil, err
 	}
+	return resolveImageCatalog(snapshot, images)
+}
+
+// resolveImageCatalog resolves a given index against a rendered snapshot. The
+// chart checks pass the index from the chart's own values.yaml, so a scenario
+// or override that rewrites thirdPartyImages or ownedImages cannot move a
+// check away from the paths the chart declares; only image settings are read
+// from the snapshot.
+func resolveImageCatalog(snapshot imageChartSnapshot, index []catalogImage) ([]catalogImage, error) {
+	images := append([]catalogImage(nil), index...)
 	for index, image := range images {
 		node, err := imageCatalogValue(snapshot.Values, image.Path)
 		if err != nil {

@@ -94,7 +94,7 @@ func checkIndexedChart(c *chartCheck) {
 	}
 	c.checkChartSources(values, catalog)
 	c.checkTemplateSources(chart)
-	c.checkDefaultsRejected(chart)
+	c.checkDefaultsRejected(chart, catalog)
 	if len(c.scenarios) == 0 {
 		c.fail(findingScenario, "", "", "indexed chart has no CI values scenario",
 			"at least one scenario in "+chartValuesMapFile, fixScenario)
@@ -131,14 +131,37 @@ func (c *chartCheck) readIndex(chart string) (map[string]any, []catalogImage, bo
 }
 
 // checkDefaultsRejected requires a render with only the chart defaults to
-// fail, because no image source is set. Which guard fires, and whether it
-// names the right values path, is proven image by image in checkGuards.
-func (c *chartCheck) checkDefaultsRejected(chart string) {
-	if _, err := renderImageChart(chart, nil); err == nil {
-		c.fail(findingCoverage, "", "", "defaults render without an image source",
-			"the defaults render to fail with a guard naming the values path to set",
+// fail on an image source guard: Helm must reject the render with an error
+// that names an indexed registry or repository path. A rejection for another
+// reason, such as an unrelated required value, does not show that the chart
+// refuses a missing source. A render that could not run is a render error.
+// Whether every image is guarded is proven image by image in checkGuards.
+func (c *chartCheck) checkDefaultsRejected(chart string, catalog []catalogImage) {
+	const expected = "the defaults render to fail with a guard naming an indexed registry or repository path"
+	_, err := renderImageChart(chart, nil)
+	switch {
+	case err == nil:
+		c.fail(findingCoverage, "", "", "defaults render without an image source", expected,
 			"guard every indexed registry and repository with required, in the wrapper for subchart images")
+	case !renderRejected(err):
+		c.renderError("defaults", err)
+	case !guardNamesSourcePath(err.Error(), catalog):
+		c.fail(findingCoverage, "", "", "defaults render fails without naming an image source path: "+firstLine(err.Error()), expected,
+			"guard the indexed registry and repository before other required values, and name the path in the message")
 	}
+}
+
+// guardNamesSourcePath reports whether a render error names the registry or
+// repository path of any indexed image.
+func guardNamesSourcePath(message string, catalog []catalogImage) bool {
+	for _, image := range catalog {
+		for _, field := range imageSourceFields {
+			if guardNamesPath(message, image.Path+"."+field) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // checkDeclared fails each rendered image the catalog does not declare.
@@ -167,13 +190,13 @@ func (c *chartCheck) checkScenario(chart, scenario string, catalog []catalogImag
 	if !ok {
 		return
 	}
-	resolved, err := resolveChartImageCatalog(snapshot)
+	resolved, err := resolveImageCatalog(snapshot, catalog)
 	if err != nil {
 		c.catalogFailure(fmt.Sprintf("%s: %v", name, err), err, "every indexed path to resolve to a complete image reference", fixScenario)
 		return
 	}
 	c.checkDeclared(name, resolved, snapshot.Manifest)
-	c.checkOverrides(chart, name, scenario, resolved)
+	c.checkOverrides(chart, name, scenario, catalog, resolved)
 	c.checkGuards(chart, name, scenario, resolved)
 }
 
@@ -211,7 +234,7 @@ func (c *chartCheck) checkScenarioSources(name, scenario string, catalog []catal
 // the scenario, then applies an explicit customer file last. An image
 // hard-coded outside the index stays at its old reference and is caught as
 // undeclared.
-func (c *chartCheck) checkOverrides(chart, name, scenario string, catalog []catalogImage) {
+func (c *chartCheck) checkOverrides(chart, name, scenario string, index, catalog []catalogImage) {
 	stem := strings.TrimSuffix(filepath.Base(scenario), ".yaml")
 	steps := []struct {
 		name   string
@@ -233,14 +256,14 @@ func (c *chartCheck) checkOverrides(chart, name, scenario string, catalog []cata
 		if !ok {
 			return
 		}
-		c.checkOverrideReached(step.name, snapshot, want)
+		c.checkOverrideReached(step.name, snapshot, index, want)
 	}
 }
 
 // checkOverrideReached requires each override to change the resolved value
 // and to reach a rendered workload or registered indirect image setting.
-func (c *chartCheck) checkOverrideReached(step string, snapshot imageChartSnapshot, want map[string]string) {
-	resolved, err := resolveChartImageCatalog(snapshot)
+func (c *chartCheck) checkOverrideReached(step string, snapshot imageChartSnapshot, index []catalogImage, want map[string]string) {
+	resolved, err := resolveImageCatalog(snapshot, index)
 	if err != nil {
 		c.catalogFailure(fmt.Sprintf("%s: %v", step, err), err, "every indexed path to resolve after an override",
 			"keep the image value shape overridable with ordinary values")
@@ -291,6 +314,8 @@ func (c *chartCheck) checkGuards(chart, name, scenario string, catalog []catalog
 			}
 			_, err = renderImageChart(chart, []string{scenario, blank})
 			switch {
+			case err != nil && !renderRejected(err):
+				c.renderError(fmt.Sprintf("%s with an empty %s", name, path), err)
 			case err == nil:
 				c.fail(findingCoverage, image.ID, path, fmt.Sprintf("%s renders with an empty %s", name, field),
 					"the render to fail with an error naming "+path,
@@ -304,13 +329,15 @@ func (c *chartCheck) checkGuards(chart, name, scenario string, catalog []catalog
 }
 
 // guardNamesPath reports whether a render error names the values path itself,
-// not a longer path that contains it.
+// not a longer path that contains it. A hyphen continues a path token, as in
+// a values key such as cert-manager.
 //
-//	"set x.image.registry."      names x.image.registry
-//	"set x.image.registryMirror" does not
-//	"set x.image.registry.sub"   does not
+//	"set x.image.registry."            names x.image.registry
+//	"set x.image.registryMirror"       does not
+//	"set x.image.registry.sub"         does not
+//	"set x.image.registry-backup"      does not
 func guardNamesPath(message, path string) bool {
-	return regexp.MustCompile(`(^|[^\w.])` + regexp.QuoteMeta(path) + `($|[^\w.]|\.($|[^\w]))`).MatchString(message)
+	return regexp.MustCompile(`(^|[^\w.-])` + regexp.QuoteMeta(path) + `($|[^\w.-]|\.($|[^\w-]))`).MatchString(message)
 }
 
 func firstLine(text string) string {

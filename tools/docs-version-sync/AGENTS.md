@@ -26,7 +26,8 @@ Charts do not choose an image source. For an indexed chart the test requires:
   digest may be prefilled.
 - The chart's own templates contain no literal registry host in an image
   reference and no `default` with a literal registry or repository.
-- A render with only the defaults fails. Emptying any indexed `registry` or
+- A render with only the defaults fails with an error that names an indexed
+  `registry` or `repository` path. Emptying any indexed `registry` or
   `repository` fails with an error that names its values path. Wrappers add
   this guard for images that an upstream subchart renders.
 - Every CI values scenario in `tools/ci/helm-chart-values.yaml` supplies

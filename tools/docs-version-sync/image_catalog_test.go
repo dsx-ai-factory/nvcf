@@ -218,7 +218,10 @@ func TestImageIndexErrorsFailPendingFix(t *testing.T) {
 	}{
 		{"empty path beside key error", "thirdPartyImages: {aa: \"\", server: nats.container.image}\n", true},
 		{"non-string path beside key error", "thirdPartyImages: {aa: [x], server: nats.container.image}\n", true},
-		{"duplicate identity beside key error", "ownedImages: {server: nats.container.image}\nthirdPartyImages: {server: nats.container.image}\n", true},
+		// thirdPartyImages is read first, so only the duplicate names nats.
+		{"duplicate identity beside key error", "thirdPartyImages: {server: server.image}\nownedImages: {server: nats.container.image}\n", true},
+		{"null category beside key error", "thirdPartyImages:\nownedImages: {server: nats.container.image}\n", true},
+		{"null category", "thirdPartyImages:\nownedImages: {server: server.image}\n", false},
 		{"category is not a map beside key error", "thirdPartyImages: [x]\nownedImages: {server: nats.container.image}\n", true},
 		{"empty path", "thirdPartyImages: {aa: \"\"}\n", false},
 		{"empty index", "thirdPartyImages: {}\n", false},
@@ -238,6 +241,70 @@ func TestImageIndexErrorsFailPendingFix(t *testing.T) {
 				t.Fatalf("pending-fix outcome: findings %+v, expected label %q", findings, expected)
 			}
 		})
+	}
+}
+
+// TestImageCatalogKeepsChartIndex resolves a scenario against the index from
+// the chart's own values.yaml. A scenario that rewrites ownedImages must not
+// move the checks to a path the chart does not declare.
+func TestImageCatalogKeepsChartIndex(t *testing.T) {
+	index, err := readImageIndex(map[string]any{"ownedImages": map[string]any{"server": "server.image"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := imageCatalogFixture(t, "ownedImages: {server: other.image}\n"+
+		"server: {image: {registry: r.example, repository: team/server, tag: v1}}\n"+
+		"other: {image: {registry: r.example, repository: team/other, tag: v1}}\n")
+	resolved, err := resolveImageCatalog(snapshot, index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 1 || resolved[0].Path != "server.image" || resolved[0].Reference != "r.example/team/server:v1" {
+		t.Fatalf("resolved %+v, want server.image at r.example/team/server:v1", resolved)
+	}
+	if index[0].Reference != "" {
+		t.Fatalf("resolving changed the chart index: %+v", index)
+	}
+}
+
+// TestImageOverridesKeepCaseVariantIdentitiesDistinct gives identities that
+// differ only by case their own expected reference, so one image cannot pass
+// the override check with another image's reference.
+func TestImageOverridesKeepCaseVariantIdentitiesDistinct(t *testing.T) {
+	catalog := []catalogImage{
+		{ID: "API", Path: "upper.image", Reference: "r.example/api:v1"},
+		{ID: "api", Path: "lower.image", Reference: "r.example/api:v1"},
+		{ID: "api-1", Path: "suffixed.image", Reference: "r.example/api:v1"},
+	}
+	want, err := writeImageOverrides(catalog, mirrorOverride, filepath.Join(t.TempDir(), "mirror.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]string)
+	for id, reference := range want {
+		if other, ok := seen[reference]; ok {
+			t.Fatalf("%s and %s share the expected override %s", id, other, reference)
+		}
+		seen[reference] = id
+	}
+	if len(seen) != len(catalog) {
+		t.Fatalf("want %v, one reference per identity", want)
+	}
+}
+
+// TestRenderRejectedSeparatesExecutionErrors counts only a command that ran
+// and exited nonzero as a rejection; a command that cannot run or is killed
+// by a signal is an execution error, never evidence that a guard fired.
+func TestRenderRejectedSeparatesExecutionErrors(t *testing.T) {
+	if _, err := imageCatalogCommand("sh", "-c", "echo set x.image.registry >&2; exit 1"); !renderRejected(err) {
+		t.Fatalf("nonzero exit not a rejection: %v", err)
+	}
+	if _, err := imageCatalogCommand(filepath.Join(t.TempDir(), "missing-helm")); err == nil || renderRejected(err) {
+		t.Fatalf("missing command counted as a rejection: %v", err)
+	}
+	// An OOM kill ends Helm with a signal before it decides anything.
+	if _, err := imageCatalogCommand("sh", "-c", "echo set x.image.registry >&2; kill -KILL $$"); err == nil || renderRejected(err) {
+		t.Fatalf("signal termination counted as a rejection: %v", err)
 	}
 }
 

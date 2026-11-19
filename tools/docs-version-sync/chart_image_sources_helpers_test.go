@@ -46,9 +46,10 @@ func (c *chartCheck) checkChartSources(values map[string]any, catalog []catalogI
 		}
 	}
 	for _, path := range sortedKeys(chartFields) {
-		root, field, _ := strings.Cut(path, ".")
-		parent, _ := values[root].(map[string]any)
-		c.checkSourceField("", path, parent, field)
+		separator := strings.LastIndex(path, ".")
+		// A missing parent is a nil map: the field reads as not written.
+		parent, _ := imageCatalogValue(values, path[:separator])
+		c.checkSourceField("", path, parent, path[separator+1:])
 	}
 }
 
@@ -69,8 +70,12 @@ func (c *chartCheck) checkSourceField(id, path string, node map[string]any, fiel
 }
 
 var (
-	// templateAction matches one single-line template action.
-	templateAction = regexp.MustCompile(`{{.*?}}`)
+	// templateAction matches one template action. With (?s) it spans lines,
+	// so a default split across lines is still one action.
+	templateAction = regexp.MustCompile(`(?s){{.*?}}`)
+	// templateComment matches one template comment, which may span lines and
+	// contain "}}". Helm renders nothing for it.
+	templateComment = regexp.MustCompile(`(?s){{-?\s*/\*.*?\*/\s*-?}}`)
 	// sourceDefault matches a non-empty string literal defaulted onto a field
 	// that names an image source, such as .Values.image.registry or
 	// .imageRegistry, with a quoted or raw string literal:
@@ -80,9 +85,10 @@ var (
 	sourceDefault = regexp.MustCompile("(?i)" +
 		`\.\w*(?:registry|repository)\s*(?:\|\s*\w+\s*)*\|\s*default\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)` +
 		`|\bdefault\s+(?:"([^"]+)"|` + "`([^`]+)`" + `)\s+\(?\s*[\w.$]*\.\w*(?:registry|repository)\b`)
-	// imageField captures the value of an image: key or a --<name>-image=
-	// argument.
-	imageField = regexp.MustCompile(`(?:^\s*(?:-\s*)?"?image"?\s*:\s*|--[\w-]+-image=)("[^"]*"|'[^']*'|\S+)`)
+	// imageField captures the value of an image: key, in block style or after
+	// "{" or "," in a flow mapping, or of a --<name>-image= argument. Group 1
+	// is the text before the key; it holds "{" or "," for a flow mapping.
+	imageField = regexp.MustCompile(`(?:(^\s*(?:-\s*)?|[{,]\s*)"?image"?\s*:\s*|--[\w-]+-image=)("[^"]*"|'[^']*'|\S+)`)
 )
 
 // checkTemplateSources scans the chart's own templates/ for an implicit image
@@ -93,11 +99,13 @@ var (
 //	{{ .Values.image.registry | default "nvcr.io" }}   fails: default source
 //	{{ .Values.replicas | default 1 }}                 passes
 //
-// Known limit: the scan reads one line at a time and matches single-line
-// actions, so a default split across lines, applied to a variable, placed
-// after a function with arguments (| trimSuffix "/" |), or built with printf
-// is not seen. The per-image guard renders still catch a default that fires.
-// A literal host inside a multi-line comment is reported.
+// Template comments and YAML comments are ignored, and a flow-style image key
+// counts only in YAML structure, not inside a quoted or block scalar. Known
+// limit: a default applied to a variable, placed after a function with
+// arguments (| trimSuffix "/" |), or built with printf is not seen, and an
+// image: value is read up to the first space on its line. A block-style
+// image key or an --<name>-image= argument inside a block scalar is still
+// reported. The per-image guard renders still catch a default that fires.
 func (c *chartCheck) checkTemplateSources(chart string) {
 	root := filepath.Join(chart, "templates")
 	var files []string
@@ -119,36 +127,232 @@ func (c *chartCheck) checkTemplateSources(chart string) {
 			return
 		}
 		relative, _ := filepath.Rel(chart, file)
-		for number, line := range strings.Split(string(raw), "\n") {
-			location := fmt.Sprintf("%s:%d", relative, number+1)
-			for _, problem := range implicitTemplateSources(line) {
-				c.fail(findingCoverage, "", location, problem, "no implicit image source in chart templates", fixImplicitSource)
-			}
+		for _, source := range implicitTemplateSources(string(raw)) {
+			c.fail(findingCoverage, "", fmt.Sprintf("%s:%d", relative, source.line), source.problem,
+				"no implicit image source in chart templates", fixImplicitSource)
 		}
 	}
 }
 
-// implicitTemplateSources returns each implicit image source on one template line.
-func implicitTemplateSources(line string) []string {
-	var problems []string
-	for _, action := range templateAction.FindAllString(line, -1) {
-		if strings.HasPrefix(strings.TrimLeft(action, "{- "), "/*") {
-			continue
-		}
+// templateSource is one implicit image source and the 1-based line it starts on.
+type templateSource struct {
+	line    int
+	problem string
+}
+
+// implicitTemplateSources returns each implicit image source in a template
+// file, in source order. Comments are blanked first, keeping their line
+// breaks, so every reported line is the line in the original file.
+func implicitTemplateSources(text string) []templateSource {
+	text = blankTemplateComments(text)
+	sources := append(templateDefaultSources(text), templateImageFieldSources(text)...)
+	sort.SliceStable(sources, func(i, j int) bool { return sources[i].line < sources[j].line })
+	return sources
+}
+
+// blankTemplateComments replaces each template comment with spaces, keeping
+// its line breaks. Helm renders nothing for a comment.
+func blankTemplateComments(text string) string {
+	return templateComment.ReplaceAllStringFunc(text, func(comment string) string {
+		return strings.Map(func(r rune) rune {
+			if r == '\n' {
+				return r
+			}
+			return ' '
+		}, comment)
+	})
+}
+
+// templateDefaultSources reports each action, possibly spanning lines, that
+// defaults an image source field to a literal. Helm runs an action wherever
+// it sits, even inside a YAML comment or a quoted string.
+func templateDefaultSources(text string) []templateSource {
+	var sources []templateSource
+	for _, span := range templateAction.FindAllStringIndex(text, -1) {
+		action := text[span[0]:span[1]]
 		if match := sourceDefault.FindStringSubmatch(action); match != nil {
 			// The first non-empty literal group: quoted or raw, pipe or prefix form.
 			literal := cmp.Or(match[1:]...)
-			problems = append(problems, fmt.Sprintf("default %q supplies an image source in %s", literal, action))
+			sources = append(sources, templateSource{strings.Count(text[:span[0]], "\n") + 1,
+				fmt.Sprintf("default %q supplies an image source in %s", literal, strings.Join(strings.Fields(action), " "))})
 		}
 	}
-	for _, match := range imageField.FindAllStringSubmatch(line, -1) {
-		value := strings.Trim(match[1], `"'`)
+	return sources
+}
+
+// templateImageFieldSources reports each image field whose value starts with
+// a literal registry host. It reads the YAML around each match, with
+// template actions masked, so text that renders no image field is skipped:
+//
+//	image: docker.io/x                            block key: reported
+//	containers: [{name: a, image: docker.io/x}]   flow key: reported
+//	args: ["--solver-image=docker.io/x"]          argument in a string: reported
+//	metadata: {} # e.g. {image: docker.io/x}      comment: skipped
+//	data: '{"image": "docker.io/x"}'              quoted scalar: skipped
+//	config.json: |                                block scalar: flow keys
+//	  {"image": "docker.io/x"}                    in it are skipped
+func templateImageFieldSources(text string) []templateSource {
+	masked := strings.Split(maskTemplateActions(text), "\n")
+	scalarIndent := -1 // column a block scalar's content must exceed, or -1
+	var scanner yamlScanner
+	var sources []templateSource
+	for number, line := range strings.Split(text, "\n") {
+		structure := masked[number]
+		indent := len(structure) - len(strings.TrimLeft(structure, " "))
+		if scalarIndent >= 0 && (strings.Trim(structure, " \t\x01") == "" || indent > scalarIndent) {
+			// Block scalar content: no comment and no flow collection. Block
+			// keys and arguments are still reported, as the line scan did
+			// before flow keys were recognized, so no earlier finding is lost.
+			sources = append(sources, imageFieldSources(number+1, line, len(line), nil)...)
+			continue
+		}
+		scalarIndent = -1
+		end, flow := scanner.line(structure)
+		sources = append(sources, imageFieldSources(number+1, line, end, flow)...)
+		if !scanner.open() && blockScalarHeader.MatchString(structure[:end]) {
+			scalarIndent = blockScalarIndent(structure, end)
+		}
+	}
+	return sources
+}
+
+// imageFieldSources reports the image fields on one line that start before
+// end, the start of a YAML comment. A flow key counts only after a "{" or ","
+// in flow, the structural flow indicators of the line.
+func imageFieldSources(number int, line string, end int, flow map[int]bool) []templateSource {
+	var sources []templateSource
+	for _, match := range imageField.FindAllStringSubmatchIndex(line, -1) {
+		if match[0] >= end {
+			continue
+		}
+		flowKey := match[2] >= 0 && match[3] > match[2] && strings.ContainsRune("{,", rune(line[match[2]]))
+		if flowKey && !flow[match[2]] {
+			continue
+		}
+		value := line[match[4]:match[5]]
+		if flowKey || strings.HasPrefix(line[match[0]:], "--") {
+			// A flow mapping or sequence value ends at the first "}", "]"
+			// or ",", which also drops a template action glued after it.
+			if cut := strings.IndexAny(value, ",}]"); cut >= 0 {
+				value = value[:cut]
+			}
+		}
+		value = strings.Trim(value, `"'`)
 		// Actions become a placeholder segment, so only literal text can
 		// start the reference: "nvcr.io/{{ .x }}" -> "nvcr.io/x" has a host,
 		// "{{ .registry }}/nvcr.io" -> "x/nvcr.io" does not.
 		if host, found := imageReferenceHost(templateAction.ReplaceAllString(value, "x")); found {
-			problems = append(problems, fmt.Sprintf("image reference %s starts with literal registry host %s", value, host))
+			sources = append(sources, templateSource{number,
+				fmt.Sprintf("image reference %s starts with literal registry host %s", value, host)})
 		}
 	}
-	return problems
+	return sources
+}
+
+// maskTemplateActions replaces every byte of each action except line breaks
+// with \x01, keeping offsets, so quotes, braces and "#" inside an action do
+// not read as YAML.
+func maskTemplateActions(text string) string {
+	return templateAction.ReplaceAllStringFunc(text, func(action string) string {
+		masked := []byte(action)
+		for i := range masked {
+			if masked[i] != '\n' {
+				masked[i] = 1
+			}
+		}
+		return string(masked)
+	})
+}
+
+var (
+	// blockScalarHeader matches a line that opens a literal or folded block
+	// scalar, such as "config.json: |" or "- >-".
+	blockScalarHeader = regexp.MustCompile(`(?:^\s*-|:)\s+[|>][1-9]?[-+]?[1-9]?\s*$`)
+	// sequencePrefix matches the indent and sequence dashes before a key.
+	sequencePrefix = regexp.MustCompile(`^\s*(?:-\s+)*`)
+)
+
+// blockScalarIndent returns the column that a block scalar's content must be
+// indented beyond: the key's column for "key: |" (after any "- "), or the
+// dash's column for "- |". In a list item "- args: |" the key is at column
+// 2, so a "run" line at column 4 is content, while a sibling "image: x" back
+// at column 2 ends the scalar and is read as YAML again.
+func blockScalarIndent(structure string, end int) int {
+	prefix := sequencePrefix.FindString(structure)
+	if strings.Contains(structure[len(prefix):end], ":") {
+		return len(prefix)
+	}
+	return strings.LastIndex(prefix, "-")
+}
+
+// yamlScanner reads YAML one line at a time with template actions masked.
+// It carries an open quoted scalar or flow collection to the next line, so a
+// scalar or collection that spans lines is read as one.
+type yamlScanner struct {
+	quote      byte
+	depth      int
+	valueStart bool
+}
+
+// open reports whether a quoted scalar or flow collection continues past the
+// last line read.
+func (s *yamlScanner) open() bool { return s.quote != 0 || s.depth > 0 }
+
+// line reads the next line. It returns where a comment starts, or len(line),
+// and the offsets of "{" and "," that are flow indicators: outside quoted
+// scalars, with "{" opening a value and "," inside a flow collection. A quote
+// opens a quoted scalar only where a value starts, so "it's" in a plain
+// scalar is not one. A masked action counts as blank, so the "{" in
+// "{{- with .x }}{image: y}" still opens a mapping.
+//
+// Every case that keeps a value start open ends with continue; any other
+// byte is plain text and closes it.
+func (s *yamlScanner) line(line string) (int, map[int]bool) {
+	flow := make(map[int]bool)
+	if !s.open() {
+		s.valueStart = true
+	}
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if s.quote != 0 {
+			switch {
+			case s.quote == '"' && c == '\\':
+				i++
+			case c == '\'' && s.quote == '\'' && i+1 < len(line) && line[i+1] == '\'':
+				i++
+			case c == s.quote:
+				s.quote = 0
+			}
+			continue
+		}
+		blankAfter := i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t'
+		switch {
+		case c == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t'):
+			return i, flow
+		case c == ' ' || c == '\t' || c == 1:
+			continue
+		case (c == '"' || c == '\'') && s.valueStart:
+			s.quote = c
+		case (c == '{' || c == '[') && (s.valueStart || s.depth > 0):
+			s.depth++
+			if c == '{' {
+				flow[i] = true
+			}
+			s.valueStart = true
+			continue
+		case c == ',' && s.depth > 0:
+			flow[i] = true
+			s.valueStart = true
+			continue
+		case (c == '}' || c == ']') && s.depth > 0:
+			s.depth--
+		case c == ':' && (blankAfter || s.depth > 0):
+			s.valueStart = true
+			continue
+		case c == '-' && s.valueStart && blankAfter:
+			continue
+		}
+		s.valueStart = false
+	}
+	return len(line), flow
 }
