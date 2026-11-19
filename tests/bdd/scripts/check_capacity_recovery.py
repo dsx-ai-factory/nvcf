@@ -183,6 +183,16 @@ class RecoveryCheck:
             self.wait("candidate version and discovery configuration", configured, 180)
             self.save("setup.json", {"agentVersion": args.agent_version,
                                      "discoveryMode": args.discovery_mode})
+
+            def unused():
+                usage = self.usage()
+                return (usage.get("capacity") == args.expected_capacity
+                        and usage.get("allocated") == 0
+                        and usage.get("available") == args.expected_capacity)
+
+            # Deleting the previous example's definitions can return before its
+            # workers finish terminating and their released capacity is published.
+            self.wait("all test capacity available before fixture creation", unused, 360)
             # Independent requests preserve the min=max=1 release behavior.
             for index in range(args.expected_capacity):
                 self.cli("function", "create", "--name", f"{prefix}-{index}",

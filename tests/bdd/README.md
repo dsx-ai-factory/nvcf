@@ -192,6 +192,8 @@ deletes only its own function definitions and deployments on completion or
 failure. Static discovery explicitly disables the dynamic discovery gate and
 uses `fixtures/capacity-gpus.json`. The probe waits for the generated discovery
 configuration and restarts the agent if its startup settings are stale.
+It also waits for all test capacity to be available before creating functions,
+including when workers from the preceding example are still terminating.
 The general Helmfile suite excludes this candidate-only scenario. This validates
 real Kubernetes and control-plane behavior with simulated GPUs and a CPU sample, and does not
 validate physical GPU or application-specific shutdown behavior.

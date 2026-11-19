@@ -5,7 +5,7 @@
     "instanceTypes": [
       {
         "name": "NCP.GPU.H100_1x",
-        "value": "NCP.GPU.H100_1x",
+        "value": "NCP.GPU.H100",
         "description": "Single simulated H100 for local capacity recovery",
         "default": true,
         "cpuCores": 8,

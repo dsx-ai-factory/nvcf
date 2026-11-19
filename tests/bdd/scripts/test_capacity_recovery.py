@@ -28,7 +28,8 @@ class CapacityRecoveryTests(unittest.TestCase):
         for gpu in gpus:
             for instance in gpu["instanceTypes"]:
                 self.assertTrue(instance["name"])
-                self.assertEqual(instance["name"], instance["value"])
+                self.assertEqual("NCP.GPU." + gpu["name"], instance["value"])
+                self.assertEqual(instance["value"] + "_1x", instance["name"])
 
     def test_startup_restarts_agent_only_when_effective_configuration_is_stale(self):
         for stale in (False, True):
@@ -38,6 +39,8 @@ class CapacityRecoveryTests(unittest.TestCase):
                                              agent_version="candidate", image="sample")
                 check.identities = []
                 check.save = Mock()
+                check.usage = Mock(side_effect=[{"capacity": 4, "allocated": 4, "available": 0},
+                                               {"capacity": 4, "allocated": 0, "available": 4}])
                 def objects(kind, _namespace=None):
                     if kind == "pods":
                         return [{"metadata": {"name": "nvca-test"}, "status": {
@@ -63,6 +66,8 @@ class CapacityRecoveryTests(unittest.TestCase):
                 check.kubectl = Mock(side_effect=kubectl)
 
                 def wait(label, condition, _timeout):
+                    if label == "all test capacity available before fixture creation":
+                        self.assertFalse(condition(), "previous workers must finish releasing their capacity")
                     self.assertTrue(condition(), label)
 
                 check.wait = wait
@@ -70,6 +75,7 @@ class CapacityRecoveryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "stop before fixtures"):
                     check.run()
                 self.assertEqual(stale, restarted)
+                self.assertEqual(2, check.usage.call_count, "capacity must be ready before creating a function")
 
     def test_prepared_discovery_requires_backend_mode_and_updated_agent_config(self):
         def backend(mode, name="target"):
