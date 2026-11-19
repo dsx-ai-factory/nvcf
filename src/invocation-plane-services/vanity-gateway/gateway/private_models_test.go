@@ -56,8 +56,9 @@ const (
 // fixed test keys, one entry per accessible function version. While legacy is
 // set, it answers 404 for List Invocable Functions, like an NVCF API that
 // predates it. The key "later" gets 403 until granted is set, like a key that
-// gains the list scope. When gate is set, each response waits until it is
-// closed. While failing is set, every response is a server error.
+// gains the list scope. The key "noaccount" gets 404 from both listings, like a
+// JWT whose client has no account. When gate is set, each response waits until
+// it is closed. While failing is set, every response is a server error.
 type fakeFunctionIDs struct {
 	t     *testing.T
 	calls atomic.Int32
@@ -81,6 +82,10 @@ func (f *fakeFunctionIDs) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !invocable {
 		f.functionsCalls.Add(1)
+	}
+	if r.Header.Get("Authorization") == "Bearer noaccount" {
+		http.NotFound(w, r)
+		return
 	}
 	if invocable && f.legacy.Load() {
 		http.NotFound(w, r)
@@ -549,6 +554,84 @@ func TestInvocableStatus(t *testing.T) {
 	for _, status := range []string{"DEPLOYING", "DEGRADED", "ERROR", "INACTIVE", "DELETED", "UNKNOWN"} {
 		require.False(t, invocableStatus(status), status)
 	}
+}
+
+// A 404 can be about the caller rather than the route: the NVCF API answers 404
+// on both listings for a JWT whose client has no account. That lookup falls
+// back on its own, and the next caller still uses List Invocable Functions.
+func TestPrivateModelLookupKeepsTheRouteAfterACallerSpecific404(t *testing.T) {
+	nvcf, endpoint := newFakeFunctionIDs(t)
+	mux := privateModelsMux(t, endpoint)
+
+	rec := listModels(t, mux, "/v1/models", keyHeaders("noaccount"))
+	require.Equal(t, privateModelsUnavailable, rec.Header().Get(PrivateModelsHeader))
+	require.Equal(t, []string{"acme/public"}, listedModelIDs(t, rec))
+	require.EqualValues(t, 2, nvcf.calls.Load())
+	require.EqualValues(t, 1, nvcf.functionsCalls.Load())
+
+	rec = listModels(t, mux, "/v1/models", keyHeaders("good"))
+	require.Equal(t, privateModelsAuthorized, rec.Header().Get(PrivateModelsHeader))
+	require.EqualValues(t, 3, nvcf.calls.Load())
+	require.EqualValues(t, 1, nvcf.functionsCalls.Load())
+}
+
+// The pod switches to the function listing only when that listing answers for
+// the same key. A failed function listing after a 404 says nothing about the
+// route, so the next lookup tries List Invocable Functions again.
+func TestPrivateModelLookupSwitchesOnlyAfterTheFunctionListingAnswers(t *testing.T) {
+	nvcf, endpoint := newFakeFunctionIDs(t)
+	nvcf.legacy.Store(true)
+	nvcf.failing.Store(true)
+	mux := privateModelsMux(t, endpoint)
+	access := sharedAccess(t, endpoint)
+	now := time.Unix(1_800_000_000, 0)
+	access.now = func() time.Time { return now }
+
+	rec := listModels(t, mux, "/v1/models", keyHeaders("good"))
+	require.Equal(t, privateModelsUnavailable, rec.Header().Get(PrivateModelsHeader))
+	require.EqualValues(t, 2, nvcf.calls.Load())
+	require.EqualValues(t, 1, nvcf.functionsCalls.Load())
+
+	nvcf.failing.Store(false)
+	now = now.Add(privateModelLookupRetryAfter)
+	rec = listModels(t, mux, "/v1/models", keyHeaders("good"))
+	require.Equal(t, privateModelsAuthorized, rec.Header().Get(PrivateModelsHeader))
+	require.EqualValues(t, 4, nvcf.calls.Load())
+	require.EqualValues(t, 2, nvcf.functionsCalls.Load())
+
+	rec = listModels(t, mux, "/v1/models", keyHeaders("other"))
+	require.Equal(t, privateModelsAuthorized, rec.Header().Get(PrivateModelsHeader))
+	require.EqualValues(t, 5, nvcf.calls.Load())
+	require.EqualValues(t, 3, nvcf.functionsCalls.Load())
+}
+
+// A 401 or 403 is not served stale. Once a rejection is older than
+// privateModelLookupRetryAfter, a failed or skipped refresh reports
+// unavailable rather than replaying the rejection.
+func TestPrivateModelLookupDoesNotServeAStaleRejection(t *testing.T) {
+	nvcf, endpoint := newFakeFunctionIDs(t)
+	mux := privateModelsMux(t, endpoint)
+	access := sharedAccess(t, endpoint)
+	now := time.Unix(1_800_000_000, 0)
+	access.now = func() time.Time { return now }
+	result := func() string {
+		rec := listModels(t, mux, "/v1/models", keyHeaders("noscope"))
+		require.Equal(t, []string{"acme/public"}, listedModelIDs(t, rec))
+		return rec.Header().Get(PrivateModelsHeader)
+	}
+
+	require.Equal(t, privateModelsForbidden, result())
+
+	now = now.Add(privateModelLookupRetryAfter)
+	nvcf.failing.Store(true)
+	require.Equal(t, privateModelsUnavailable, result(), "failed refresh")
+	require.EqualValues(t, 2, nvcf.calls.Load())
+
+	now = now.Add(privateModelLookupRetryAfter)
+	nvcf.failing.Store(false)
+	access.newKeys = newTokenBucket(0, 0)
+	require.Equal(t, privateModelsUnavailable, result(), "refresh skipped under the limits")
+	require.EqualValues(t, 2, nvcf.calls.Load())
 }
 
 // A 401 or 403 is kept for privateModelLookupRetryAfter only, so a key that

@@ -124,7 +124,8 @@ var nativeModelPaths = map[string]struct{}{"/v1/messages": {}, decisionsPath: {}
 var errPrivateModelLookupLimited = errors.New("private model lookup skipped by the gateway's limits")
 
 // errNVCFNotFound is a 404 from the NVCF API. For List Invocable Functions, it
-// means the NVCF API does not serve that listing yet.
+// means that the NVCF API does not serve that listing yet, or that it found no
+// account for the caller.
 var errNVCFNotFound = errors.New("NVCF API returned status 404")
 
 // authorizedVersions maps each accessible function behind a private alias to
@@ -303,9 +304,19 @@ func (a *privateModelAccess) lookup(request *http.Request, authorization string,
 		if !errors.Is(err, errNVCFNotFound) {
 			return entry, err
 		}
-		a.fallbackUntil.Store(a.now().Add(privateModelFallbackRecheck).UnixNano())
-		zap.L().Info("NVCF API does not serve List Invocable Functions, using the function listing",
-			zap.Duration("recheck_after", privateModelFallbackRecheck))
+		// A 404 can be about the caller rather than the route: the NVCF API
+		// answers 404 for a JWT whose client has no account, on both
+		// listings. This lookup falls back on its own. The pod switches to the
+		// function listing only when that listing answers for the same
+		// credential, which shows that the route is missing.
+		entry, err = a.readListing(ctx, request, authorization, a.functionsURL, index)
+		if err == nil {
+			a.fallbackUntil.Store(a.now().Add(privateModelFallbackRecheck).UnixNano())
+			zap.L().Info("NVCF API does not serve List Invocable Functions, using the function listing",
+				zap.String("request_id", request.Header.Get(middleware.RequestIDHeader)),
+				zap.Duration("recheck_after", privateModelFallbackRecheck))
+		}
+		return entry, err
 	}
 	return a.readListing(ctx, request, authorization, a.functionsURL, index)
 }
@@ -472,10 +483,12 @@ func (a *privateModelAccess) cached(key string, maxAge time.Duration) (privateMo
 	return entry, true
 }
 
-// lastGood returns the key's last successful result while it is within the
-// stale window, or an unavailable result.
+// lastGood returns the key's last authorized result while it is within the
+// stale window, or an unavailable result. A 401 or 403 is not served stale: it
+// is fresh for privateModelLookupRetryAfter only, and after that a failed or
+// skipped refresh must not report a rejection the NVCF API did not repeat.
 func (a *privateModelAccess) lastGood(key string) privateModelAccessEntry {
-	if entry, ok := a.cached(key, privateModelLookupStaleTTL); ok {
+	if entry, ok := a.cached(key, privateModelLookupStaleTTL); ok && entry.result == privateModelsAuthorized {
 		return entry
 	}
 	return privateModelAccessEntry{result: privateModelsUnavailable}

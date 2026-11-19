@@ -688,15 +688,25 @@ Functions, `GET /v2/nvcf/invocable/functions/versions/ids?visibility=authorized,
 on `NVCF_CONTROL_PLANE_ENDPOINT`. That listing has one entry per invocable
 function version, in `ACTIVE` or `DEGRADING` status, and needs the
 `list_functions` scope. The NVCF API applies the same account and API key
-resource checks as invocation, version by version. An NVCF API that answers
-`404` for that listing predates it. The gateway then uses
-`GET /v2/nvcf/functions?visibility=authorized,private`, which needs the same
-scope, keeps only its `ACTIVE` and `DEGRADING` versions, and tries List
-Invocable Functions again after 10 minutes. A model whose name
-matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
-the function version it routes to. An entry without `functionVersionID` is
-listed when any version of its function is returned. Expiry,
-`supported_endpoints`, and metadata follow the public-model rules, and
+resource checks as invocation, version by version. After a `404` for that
+listing, the lookup uses `GET /v2/nvcf/functions?visibility=authorized,private`
+instead and keeps only its `ACTIVE` and `DEGRADING` versions. When the function
+listing answers for the same key, the NVCF API predates List Invocable
+Functions, so every lookup in the pod uses the function listing for 10 minutes
+and then tries List Invocable Functions again. A `404` from both listings, as
+for a JWT whose client has no account, leaves the pod on List Invocable
+Functions.
+
+The function listing accepts the `list_functions_details` scope as well as
+`list_functions`. Against an NVCF API without List Invocable Functions, a key
+with only `list_functions_details` can therefore discover private models. After
+the NVCF API is upgraded, List Invocable Functions answers such a key with
+`403`, and the key needs `list_functions` for discovery.
+
+A model whose name matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when
+the NVCF API returns the function version it routes to. An entry without
+`functionVersionID` is listed when any version of its function is returned.
+Expiry, `supported_endpoints`, and metadata follow the public-model rules, and
 Anthropic clients get the same models in the Anthropic shape. An alias can
 route to different functions per section. A key sees it only for the sections
 whose route it may use: `supported_endpoints` lists only those, and Anthropic
@@ -715,7 +725,7 @@ The lookup never fails a request:
 | Key accepted | Public list plus the private models the key may access |
 | NVCF API rejects the key (`401`) | Public list. The key is looked up again after 10 seconds. |
 | Key lacks the `list_functions` scope (`403`) | Public list. The key is looked up again after 10 seconds. |
-| NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
+| NVCF API error, timeout, or redirect | The key's last authorized result if it is under 15 minutes old, otherwise the public list. A `401` or `403` is never served stale. The key is not looked up again for 10 seconds. |
 | `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
 
 Keyed responses carry `Cache-Control: private, no-store` and
@@ -737,7 +747,7 @@ authorized result share a per-pod budget of 50 lookups per second, so random
 tokens cannot drive NVCF API calls. Without a private alias in the mapping,
 there is no lookup. The lookup never follows a redirect, so the key goes only
 to `NVCF_CONTROL_PLANE_ENDPOINT`. A request that the gateway skips under these
-limits gets the key's last successful result or the public list.
+limits gets the key's last authorized result or the public list.
 
 ## Invoking the Anthropic Messages Endpoint
 
