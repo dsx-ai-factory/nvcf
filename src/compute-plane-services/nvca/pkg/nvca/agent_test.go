@@ -827,7 +827,8 @@ func TestAgentRegisterWithICMSUpdatesQueueManagerCredentials(t *testing.T) {
 		MetricsRegisterer:              prometheus.NewRegistry(),
 	}
 	agent := newMockAgentSingleGPU(t, ctx, agentOpts)
-	require.NoError(t, agent.Start(ctx))
+	// Exercise registration updates without an independent credential-renewal tick.
+	delete(agent.resourceEventWorkerQueues, EventTickRenewICMSCredentials)
 
 	updatedGPU := types.GPUName("H100")
 	updatedQueue := getTestCreationMessageQueueInfo(true)
@@ -836,13 +837,25 @@ func TestAgentRegisterWithICMSUpdatesQueueManagerCredentials(t *testing.T) {
 	updatedCreds.CreationQueues = types.CreationQueueInfoSet{
 		updatedGPU: updatedQueue,
 	}
-	agent.icmsClient = &mockICMSClient{
-		registrationResponse: &types.ICMSRegistrationResponse{
+	icmsClient := newBlockingRecordingICMSClient(
+		registrationResult{response: &types.ICMSRegistrationResponse{
+			ClusterID:      agent.ClusterID,
+			ClusterGroupID: "test-cluster-group-id",
+			Credentials:    getTestQueueCreds(false),
+		}},
+		registrationResult{response: &types.ICMSRegistrationResponse{
 			ClusterID:      agent.ClusterID,
 			ClusterGroupID: "test-cluster-group-id",
 			Credentials:    updatedCreds,
-		},
-	}
+		}},
+	)
+	icmsClient.release(0)
+	icmsClient.release(1)
+	// Install the client before Start launches event workers that read it.
+	agent.icmsClient = icmsClient
+	require.NoError(t, agent.Start(ctx))
+	assert.NotEmpty(t, agent.queueManager.getCreateQueue(testGPUNameDefault).QueueURL)
+	assert.Empty(t, agent.queueManager.getCreateQueue(updatedGPU).QueueURL)
 
 	_, err := agent.registerWithICMS(ctx, []types.RegistrationGPU{{Name: string(updatedGPU)}})
 	require.NoError(t, err)

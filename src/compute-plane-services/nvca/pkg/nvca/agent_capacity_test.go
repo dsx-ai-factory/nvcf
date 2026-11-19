@@ -364,9 +364,10 @@ func TestCapacityHeartbeatMiniServiceRelease(t *testing.T) {
 			require.NoError(t, a.PutNVCAStatusUpdate(ctx))
 			require.Zero(t, gets.Load(), "unreported instances do not need a live object lookup")
 			report := func() {
+				reported := updated.DeepCopy()
 				inst.LastReportedStatus = string(types.ICMSInstanceTerminated)
-				updated.Status.Instances["worker"] = inst
-				require.NoError(t, requests.Update(updated.DeepCopy()))
+				reported.Status.Instances["worker"] = inst
+				require.NoError(t, requests.Update(reported))
 			}
 			remove := func() { require.NoError(t, a.backendk8scache.clients.HelmV2.Delete(ctx, ms)) }
 			first, second := remove, report
