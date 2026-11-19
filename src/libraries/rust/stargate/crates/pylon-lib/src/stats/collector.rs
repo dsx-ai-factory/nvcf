@@ -197,18 +197,25 @@ impl StatsCollectorControl {
     async fn request<T>(
         &self,
         command: StatsCollectorCommand,
-        acknowledged: oneshot::Receiver<T>,
+        mut acknowledged: oneshot::Receiver<T>,
     ) -> Result<T, StatsCollectorStopped> {
         let exchange = async {
             self.tx
                 .send_async(command)
                 .await
                 .map_err(|_| StatsCollectorStopped)?;
-            acknowledged.await.map_err(|_| StatsCollectorStopped)
+            (&mut acknowledged).await.map_err(|_| StatsCollectorStopped)
         };
+        // A reply sent before the collector exited wins over the exit.
+        // `biased` polls the exchange first, but the collector can reply and
+        // exit between the polls of the two branches, so the exit branch
+        // still returns a reply that is already there.
         tokio::select! {
+            biased;
             result = exchange => result,
-            () = self.exited.cancelled() => Err(StatsCollectorStopped),
+            () = self.exited.cancelled() => {
+                acknowledged.try_recv().map_err(|_| StatsCollectorStopped)
+            }
         }
     }
 }
