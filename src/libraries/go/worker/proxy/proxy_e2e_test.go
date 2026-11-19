@@ -156,13 +156,13 @@ func TestProxy_EndToEnd(t *testing.T) {
 	require.NoError(t, nc.Publish("stateful_session.reconnect."+requestId, []byte{0xff, 0xff, 0xff}))
 	require.NoError(t, nc.Flush())
 
-	// Publish a reconnect message for this request id. The reconnect goroutine
-	// inside Proxy should pick it up, establish a fresh tunnel, and serve it,
+	// Send a reconnect for this request id as a request. The reconnect goroutine
+	// inside Proxy should answer it, then establish a fresh tunnel and serve it,
 	// exercising the reconnect branch.
 	reconnectBody, err := proto.Marshal(work)
 	require.NoError(t, err)
-	require.NoError(t, nc.Publish("stateful_session.reconnect."+requestId, reconnectBody))
-	require.NoError(t, nc.Flush())
+	_, err = nc.Request("stateful_session.reconnect."+requestId, reconnectBody, 5*time.Second)
+	require.NoError(t, err, "worker should answer a reconnect sent as a request")
 
 	// A second tunnel should be established for the reconnect.
 	select {
@@ -184,4 +184,11 @@ func TestProxy_EndToEnd(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Proxy did not return after teardown")
 	}
+
+	// Proxy removes the registration before it returns.
+	infoCtx, infoCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer infoCancel()
+	info, err := stream.Info(infoCtx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), info.State.Msgs, "registration should be removed when Proxy returns")
 }
