@@ -68,6 +68,22 @@ enable_secrets_mount "${VAULT_SECRET_BASE_PATH}/jwt" "vault-plugin-secrets-jwt"
 jwt_secret_mount_config=$(generate_jwt_secret_mount_config)
 config_jwt_secret_mount_config "${VAULT_SECRET_BASE_PATH}/jwt" "${jwt_secret_mount_config}"
 
+# Give SIS a token for API-key policy evaluation.
+SIS_SERVICE_ACCOUNT_NAMESPACE="sis"
+SIS_SERVICE_ACCOUNT_NAME="sis-api"
+SCOPES="pdp-evaluate"
+
+jwt_secret_role=$(generate_jwt_secret_role "${SERVICE_ACCOUNT_NAMESPACE}" "${SERVICE_ACCOUNT_NAME}" "${SIS_SERVICE_ACCOUNT_NAME}" "${SCOPES}")
+create_secret_jwt_role "${VAULT_SECRET_BASE_PATH}/jwt" "${SIS_SERVICE_ACCOUNT_NAME}" "${jwt_secret_role}"
+
+policy=$(generate_acl_policy "${VAULT_SECRET_BASE_PATH}/jwt/sign/${SIS_SERVICE_ACCOUNT_NAME}" "create,update,read")
+policy_name="${VAULT_POLICY_BASE_PATH}-jwt-sign-${SIS_SERVICE_ACCOUNT_NAME}-rw"
+write_policy "${policy_name}" "${policy}"
+
+sis_merged_policies=$(merge_jwt_role_policies "${SIS_SERVICE_ACCOUNT_NAME}" "${policy_name}" true)
+sis_jwt_auth_role=$(generate_jwt_auth_role "${SIS_SERVICE_ACCOUNT_NAME}" "${SIS_SERVICE_ACCOUNT_NAMESPACE}" "${sis_merged_policies}")
+create_auth_jwt_role "${SIS_SERVICE_ACCOUNT_NAME}" "${sis_jwt_auth_role}"
+
 
 #-------------------------------------------
 # Provision JWT Auth Role with policies
