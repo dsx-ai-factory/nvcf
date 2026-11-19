@@ -36,6 +36,9 @@ pub struct CurrentModelStats {
     pub last_mean_input_tps: f64,
     // Greatest max-eligible last_mean_input_tps of this model generation, if any.
     pub max_input_tps: Option<f64>,
+    // True while last_mean_input_tps is still the configured initial rate and
+    // no request has measured it. Pylon-local; not sent to Stargate.
+    pub input_tps_from_seed: bool,
     // Token/sec output rate for streaming generation endpoints. Embeddings item
     // cardinality is observed separately and is not exported through this field.
     pub output_tps: f64,
@@ -377,8 +380,11 @@ impl PylonRuntimeState {
             let Some(model) = advertised.current_mut(generation) else {
                 return false;
             };
-            self.live_requests
-                .update_generation_throughput(generation, stats.last_mean_input_tps);
+            self.live_requests.update_generation_throughput(
+                generation,
+                stats.last_mean_input_tps,
+                stats.input_tps_from_seed,
+            );
             model.stats = stats;
             model.stats.clone()
         };
@@ -572,7 +578,7 @@ impl PylonRuntimeState {
             .current_generation(model_id)
             .expect("test model generation should already exist");
         self.live_requests
-            .update_generation_throughput(&generation, last_mean_input_tps);
+            .update_generation_throughput(&generation, last_mean_input_tps, false);
     }
 
     pub(crate) fn metrics(&self) -> Option<&PylonMetrics> {
