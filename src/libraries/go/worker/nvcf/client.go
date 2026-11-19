@@ -400,7 +400,9 @@ func createWorkerClient(nvcfFqdn string, timeout time.Duration) (pb.WorkerClient
 
 func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string) (*nats.Conn, error) {
 	const maxNatsReconnectDelay = 15 * time.Second
-	const maxNatsReconnects = 12
+	// Reconnect without limit. A closed connection is never re-created, so a limit would leave the worker
+	// disconnected for good after a long NATS outage.
+	const maxNatsReconnects = -1
 	// backoff is not thread-safe, so we need to lock it
 	expBackoffMutex := sync.Mutex{}
 	expBackoff := backoff.NewExponentialBackOff(
@@ -415,6 +417,9 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string
 		nats.RetryOnFailedConnect(true),
 		nats.Timeout(5*time.Second),
 		nats.MaxReconnects(maxNatsReconnects),
+		// Keep reconnecting after repeated auth errors too. The token can be rejected while the NVCF token refresh
+		// is failing during the same outage, and a closed connection is never re-created.
+		nats.IgnoreAuthErrorAbort(),
 		nats.Name("worker_"+functionVersionId+"_"+instanceId),
 		nats.CustomReconnectDelay(func(attempt int) time.Duration {
 			expBackoffMutex.Lock()
