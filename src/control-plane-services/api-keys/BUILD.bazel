@@ -17,6 +17,7 @@ API_KEYS_TEST_RESOURCES = glob(["src/test/resources/**"])
 API_KEYS_DEPS = [
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-cassandra:nv_boot_starter_cassandra",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-core:nv_boot_starter_core",
+    "//src/libraries/java/nv-boot-parent/nv-boot-starter-data-migration-notification:data_migration_annotation",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-exceptions:nv_boot_starter_exceptions",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-jwt:nv_boot_starter_jwt",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-observability:nv_boot_starter_observability",

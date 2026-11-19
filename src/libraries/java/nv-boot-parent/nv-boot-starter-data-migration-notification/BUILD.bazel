@@ -1,3 +1,4 @@
+load("@rules_java//java:defs.bzl", "java_library")
 load("//rules/java:defs.bzl", "nvcf_java_coverage_test", "nvcf_java_test", "nv_boot_library")
 
 DATA_MIGRATION_NOTIFICATION_COMPILE_DEPS = [
@@ -20,6 +21,12 @@ DATA_MIGRATION_NOTIFICATION_COMPILE_DEPS = [
     "@nv_third_party_deps//:org_springframework_spring_core",
     "@nv_third_party_deps//:tools_jackson_core_jackson_databind",
 ]
+
+java_library(
+    name = "data_migration_annotation",
+    srcs = ["src/main/java/com/nvidia/boot/migration/notification/service/DataMigration.java"],
+    visibility = ["//visibility:public"],
+)
 
 nv_boot_library(
     name = "nv_boot_starter_data_migration_notification",

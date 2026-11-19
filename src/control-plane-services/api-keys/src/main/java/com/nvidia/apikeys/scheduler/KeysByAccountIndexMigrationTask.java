@@ -25,10 +25,12 @@ import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.TimedRo
 import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
+import com.nvidia.apikeys.persistance.models.KeyModel;
 import com.nvidia.apikeys.services.ServicesService;
 import com.nvidia.apikeys.vo.KeyByOwnerAndAccountAndServiceVo;
 import com.nvidia.apikeys.vo.KeyByOwnerAndServiceVo;
 import com.nvidia.boot.jwt.services.mapping.EncryptedModelConverter;
+import com.nvidia.boot.migration.notification.service.DataMigration;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.trace.Span;
@@ -56,6 +58,13 @@ import org.springframework.stereotype.Service;
 @Slf4j
 @Service
 @RequiredArgsConstructor
+@DataMigration(
+        keyspace = "nvcf_api_keys",
+        newTables = {KeyByOwnerAndAccountAndServiceModel.TABLE_NAME},
+        newColumns = {KeyModel.TABLE_NAME + "." + KeyModel.COLUMN_NCA_ID,
+                KeyByOwnerAndServiceModel.TABLE_NAME + "." + KeyByOwnerAndServiceModel.COLUMN_NCA_ID},
+        requiresTables = {KeyModel.TABLE_NAME, KeyByOwnerAndServiceModel.TABLE_NAME, "row_update_lock", "lock"},
+        description = "Copy legacy keys into the account index and backfill credential NCA IDs before M0")
 public class KeysByAccountIndexMigrationTask {
     public static final String MARKER_TABLE = "keys_by_account_index_copy";
     public static final String MARKER_RECORD = "completed";

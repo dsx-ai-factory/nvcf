@@ -44,6 +44,7 @@ import com.nvidia.apikeys.vo.KeyByOwnerAndAccountAndServiceVo;
 import com.nvidia.apikeys.vo.KeyByOwnerAndServiceVo;
 import com.nvidia.apikeys.vo.KeyOwnerType;
 import com.nvidia.boot.jwt.services.mapping.EncryptedModelConverter;
+import com.nvidia.boot.migration.notification.service.DataMigration;
 import io.micrometer.prometheusmetrics.PrometheusConfig;
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import io.opentelemetry.api.OpenTelemetry;
@@ -96,6 +97,20 @@ class KeysByAccountIndexMigrationTaskTest {
                 Clock.fixed(TEST_TIME, ZoneOffset.UTC));
         when(markers.isCompleted(anyString(), anyString())).thenAnswer(invocation -> completed.get());
         task.initializeMetrics();
+    }
+
+    @Test
+    void migrationMetadataIsAvailableToReleaseTooling() {
+        var migration = KeysByAccountIndexMigrationTask.class.getAnnotation(DataMigration.class);
+
+        assertThat(migration).isNotNull();
+        assertThat(migration.keyspace()).isEqualTo("nvcf_api_keys");
+        assertThat(migration.newTables()).containsExactly("keys_by_owner_and_account_and_service");
+        assertThat(migration.newColumns()).containsExactlyInAnyOrder(
+                "keys.nca_id", "keys_by_owner_and_service.nca_id");
+        assertThat(migration.requiresTables()).containsExactlyInAnyOrder(
+                "keys", "keys_by_owner_and_service", "row_update_lock", "lock");
+        assertThat(migration.description()).isNotBlank();
     }
 
     @Test
