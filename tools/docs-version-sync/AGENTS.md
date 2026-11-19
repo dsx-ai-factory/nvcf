@@ -60,8 +60,10 @@ repository, one stack per rule. For a stack the test requires:
   with the chart gate.
 - Every rendered image takes its `registry` and `repository` from the stack's
   `environments/base.yaml`, or from an included stack's `base.yaml` that the
-  including state forwards. A single image string or a `repository` with a
-  registry host fails. A `tag` or `digest` set in `base.yaml` reaches a
+  including state forwards. An image value lives in a map named `image`, a
+  map ending in `Image`, or `global.image`; a `registry` under any other map,
+  such as `global.helm.sources`, is not an image source. A single image
+  string or a `repository` with a registry host fails. A `tag` or `digest` set in `base.yaml` reaches a
   rendered image.
 
 The test renders each state that `release-inventory.yaml` lists, plus
