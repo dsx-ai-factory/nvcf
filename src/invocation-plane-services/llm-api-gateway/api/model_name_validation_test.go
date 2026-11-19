@@ -18,6 +18,7 @@ limitations under the License.
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,8 +31,49 @@ import (
 	echo "github.com/labstack/echo/v4"
 
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
 )
+
+const (
+	modelNameTestRoutedModel = "company-name/model-name"
+	modelNameTestModel       = "3f2b1c4d-5e6a-4b7c-8d9e-0a1b2c3d4e5f/" + modelNameTestRoutedModel
+)
+
+var modelNameTestRoutes = []struct {
+	name       string
+	path       string
+	bodyFormat string
+}{
+	{"chat", "/v1/chat/completions", `{"model":%s,"messages":[{"role":"user","content":"hi"}]}`},
+	{"chat stream", "/v1/chat/completions", `{"model":%s,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+	{"responses", "/v1/responses", `{"model":%s,"input":"hi"}`},
+	{"messages", "/v1/messages", `{"model":%s,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
+	{"embeddings", "/v1/embeddings", `{"model":%s,"input":["hi"]}`},
+	{"decisions", "/v1/decisions", `{"model":%s}`},
+	{"systemone", "/v1/systemone", `{"model":%s}`},
+}
+
+// modelSpecAuthClient declares the test model on every route, so the decision
+// routes, which have no default-allow, reach the router too.
+type modelSpecAuthClient struct{}
+
+func (modelSpecAuthClient) AuthorizeInvocation(
+	ctx context.Context,
+	token string,
+	routingKey string,
+) (*nvcf.InvocationAuthResponse, error) {
+	response, err := echoingInvocationAuthClient{}.AuthorizeInvocation(ctx, token, routingKey)
+	if err != nil {
+		return nil, err
+	}
+	uris := make([]string, 0, len(modelNameTestRoutes))
+	for _, route := range modelNameTestRoutes {
+		uris = append(uris, route.path)
+	}
+	response.ModelSpecs = map[string]nvcf.ModelSpec{modelNameTestRoutedModel: {URIs: uris}}
+	return response, nil
+}
 
 type routerModelSeen struct {
 	header    string
@@ -57,7 +99,9 @@ func (r *recordingRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `data: {"id":"chatcmpl-name","object":"chat.completion.chunk","created":123,"model":"company-name/model-name","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`+"\n\n")
+	fmt.Fprint(w, `data: {"id":"chatcmpl-name","object":"chat.completion.chunk","created":123,`+
+		`"model":"company-name/model-name","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},`+
+		`"finish_reason":"stop"}]}`+"\n\n")
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
@@ -82,7 +126,7 @@ func newModelNameTestServer(t *testing.T) (*echo.Echo, *recordingRouter) {
 	cfg := config.Default()
 	e := echo.New()
 	e.Use(NewContextMiddleware(cfg))
-	e.Use(NewNVCFAuthMiddleware(echoingInvocationAuthClient{}))
+	e.Use(NewNVCFAuthMiddleware(modelSpecAuthClient{}))
 	RegisterRoutes(e, NewHandlers(cfg, stargateProvider, nil))
 	return e, router
 }
@@ -99,49 +143,34 @@ func serveModelNameRequest(e *echo.Echo, path, bodyFormat, model string) *httpte
 }
 
 // TestLLMRoutesRejectMalformedModelNamesBeforeRouting covers model names the
-// router header cannot carry unchanged. Go's HTTP client refuses control bytes
-// in X-Model (a 502), the header path drops surrounding whitespace while the
-// body keeps it, and the router cannot read non-ASCII bytes.
+// router header cannot carry unchanged: Go's HTTP client refuses control bytes,
+// the header path drops surrounding whitespace, and the router reads only ASCII.
 func TestLLMRoutesRejectMalformedModelNamesBeforeRouting(t *testing.T) {
 	t.Parallel()
 
-	const modelPrefix = "3f2b1c4d-5e6a-4b7c-8d9e-0a1b2c3d4e5f/company-name/model-name"
 	const (
 		whitespaceMessage = "model has leading or trailing whitespace"
 		charactersMessage = "model contains control or non-ASCII characters"
 	)
-
-	routes := []struct {
-		name       string
-		path       string
-		bodyFormat string
-	}{
-		{"chat", "/v1/chat/completions", `{"model":%s,"messages":[{"role":"user","content":"hi"}]}`},
-		{"chat stream", "/v1/chat/completions", `{"model":%s,"stream":true,"messages":[{"role":"user","content":"hi"}]}`},
-		{"responses", "/v1/responses", `{"model":%s,"input":"hi"}`},
-		{"messages", "/v1/messages", `{"model":%s,"max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
-		{"embeddings", "/v1/embeddings", `{"model":%s,"input":["hi"]}`},
-		{"decisions", "/v1/decisions", `{"model":%s}`},
-	}
 	cases := []struct {
 		name        string
 		model       string
 		wantMessage string
 	}{
-		{"trailing space", modelPrefix + " ", whitespaceMessage},
-		{"trailing tab", modelPrefix + "\t", whitespaceMessage},
-		{"leading space", strings.Replace(modelPrefix, "/", "/ ", 1), whitespaceMessage},
-		{"newline", modelPrefix + "\n", charactersMessage},
-		{"carriage return newline", modelPrefix + "\r\n", charactersMessage},
-		{"nul", modelPrefix + "\x00", charactersMessage},
-		{"interior tab", strings.Replace(modelPrefix, "-name", "\t-name", 1), charactersMessage},
-		{"delete", modelPrefix + "\x7f", charactersMessage},
-		{"non-ascii", modelPrefix + "\u00e9", charactersMessage},
-		{"invalid utf-8", modelPrefix + "\xff", charactersMessage},
+		{"trailing space", modelNameTestModel + " ", whitespaceMessage},
+		{"trailing tab", modelNameTestModel + "\t", whitespaceMessage},
+		{"leading space", strings.Replace(modelNameTestModel, "/", "/ ", 1), whitespaceMessage},
+		{"newline", modelNameTestModel + "\n", charactersMessage},
+		{"carriage return newline", modelNameTestModel + "\r\n", charactersMessage},
+		{"nul", modelNameTestModel + "\x00", charactersMessage},
+		{"interior tab", strings.Replace(modelNameTestModel, "-name", "\t-name", 1), charactersMessage},
+		{"delete", modelNameTestModel + "\x7f", charactersMessage},
+		{"non-ascii", modelNameTestModel + "\xc3\xa9", charactersMessage},
+		{"invalid utf-8", modelNameTestModel + "\xff", charactersMessage},
 	}
 
 	e, router := newModelNameTestServer(t)
-	for _, route := range routes {
+	for _, route := range modelNameTestRoutes {
 		for _, tc := range cases {
 			t.Run(route.name+"/"+tc.name, func(t *testing.T) {
 				rec := serveModelNameRequest(e, route.path, route.bodyFormat, tc.model)
@@ -161,23 +190,19 @@ func TestLLMRoutesRejectMalformedModelNamesBeforeRouting(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsSendsSameModelInHeaderAndBody(t *testing.T) {
+func TestLLMRoutesSendSameModelInHeaderAndBody(t *testing.T) {
 	t.Parallel()
 
 	e, router := newModelNameTestServer(t)
-	rec := serveModelNameRequest(
-		e,
-		"/v1/chat/completions",
-		`{"model":%s,"messages":[{"role":"user","content":"hi"}]}`,
-		"3f2b1c4d-5e6a-4b7c-8d9e-0a1b2c3d4e5f/company-name/model-name",
-	)
-	seen := router.take()
+	want := routerModelSeen{header: modelNameTestRoutedModel, bodyModel: modelNameTestRoutedModel}
+	for _, route := range modelNameTestRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			serveModelNameRequest(e, route.path, route.bodyFormat, modelNameTestModel)
+			seen := router.take()
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	want := []routerModelSeen{{header: "company-name/model-name", bodyModel: "company-name/model-name"}}
-	if len(seen) != 1 || seen[0] != want[0] {
-		t.Fatalf("router saw %q, want %q", seen, want)
+			if len(seen) != 1 || seen[0] != want {
+				t.Fatalf("router saw %q, want one request %q", seen, want)
+			}
+		})
 	}
 }

@@ -84,9 +84,8 @@ func normalizeOpenAIRequestModel(
 	if routedModel == "" {
 		return "", echo.NewHTTPError(http.StatusBadRequest, "model suffix is required after routing key")
 	}
-	// The routed model travels in both the router header and the body. Header
-	// writes drop surrounding spaces and tabs and refuse control bytes, and the
-	// router reads only visible ASCII, so such names cannot arrive unchanged.
+	// The model goes to the router in headers, which drop surrounding spaces and tabs
+	// and refuse control bytes; the router reads only ASCII. Such names cannot arrive intact.
 	if strings.Trim(routedModel, " \t") != routedModel {
 		return "", echo.NewHTTPError(http.StatusBadRequest, "model has leading or trailing whitespace")
 	}
