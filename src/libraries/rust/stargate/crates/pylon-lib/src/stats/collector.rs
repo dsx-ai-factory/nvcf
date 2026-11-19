@@ -4020,7 +4020,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_admission_skips_the_mismatch_check_until_the_seeded_input_tps_is_measured() {
+    async fn queue_admission_skips_the_mismatch_check_while_the_input_tps_is_the_seed() {
         let collector = RunningCollector::spawn_empty(StatsCollectorConfig::default(), None, false);
         collector.begin_configured_model("model-a", 100.0).await;
         let runtime = &collector.runtime_state;

@@ -1082,8 +1082,10 @@ mod tests {
 
     #[test]
     fn first_measured_input_tps_after_the_seed_logs_once() {
-        let runtime_state =
-            PylonRuntimeState::new(InferenceServerStatus::Active, &["model-a".to_string()]);
+        let runtime_state = PylonRuntimeState::new(
+            InferenceServerStatus::Active,
+            &["model-a".to_string(), "model-b".to_string()],
+        );
         let stats = |last_mean_input_tps, input_tps_from_seed| CurrentModelStats {
             last_mean_input_tps,
             input_tps_from_seed,
@@ -1095,6 +1097,8 @@ mod tests {
             runtime_state.set_model_stats("model-a", stats(100.0, true));
             runtime_state.set_model_stats("model-a", stats(517.0, false));
             runtime_state.set_model_stats("model-a", stats(1_350.0, false));
+            // A model that starts without a seed has no seed to replace.
+            runtime_state.set_model_stats("model-b", stats(900.0, false));
         });
 
         let events = subscriber.events();
