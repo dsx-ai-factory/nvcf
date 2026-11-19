@@ -100,7 +100,10 @@ class RecoveryCheck:
         return result.stdout.strip()
 
     def cli(self, *args):
-        return self.command([self.args.cli, "--config", self.args.cli_config, *args])
+        try:
+            return self.command([self.args.cli, "--config", self.args.cli_config, *args])
+        except RuntimeError:
+            raise RuntimeError("nvcf-cli " + " ".join(args[:2]) + " failed") from None
 
     def kubectl(self, *args):
         return self.command(["kubectl", "--context", self.args.context, *args])
@@ -142,7 +145,7 @@ class RecoveryCheck:
             for index in range(args.expected_capacity):
                 self.cli("function", "create", "--name", f"{prefix}-{index}",
                          "--image", args.image, "--inference-url", "/echo", "--inference-port", "8000",
-                         "--health-uri", "/health", "--health-port", "8000")
+                         "--health-uri", "/health", "--health-port", "8000", "--health-timeout", "PT30S")
                 selected = json.loads(self.cli("status", "--json"))["currentFunction"]
                 identity = (selected["functionId"], selected["versionId"])
                 self.identities.append(identity)
