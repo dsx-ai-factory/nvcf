@@ -413,6 +413,7 @@ func TestNewLLMRouterClientContainer(t *testing.T) {
 					Path: "/ready",
 					Port: intstr.FromString(common.WorkerMetricsPortName),
 				}, c.ReadinessProbe.HTTPGet)
+				assert.Contains(t, c.Args, "--readiness-gate")
 				envMap := envSliceToMap(c.Env)
 				assert.Equal(t, "true", envMap["PYLON_READINESS_GATE"])
 				assert.Equal(t, "8001", envMap["INFERENCE_HEALTH_PORT"])
@@ -430,6 +431,8 @@ func TestNewLLMRouterClientContainer(t *testing.T) {
 			isHelm:     false,
 			validate: func(t *testing.T, c corev1.Container) {
 				assert.Empty(t, healthPathArgs(c.Args))
+				assert.NotContains(t, c.Args, "--readiness-gate")
+				assert.Nil(t, c.ReadinessProbe)
 			},
 		},
 	}

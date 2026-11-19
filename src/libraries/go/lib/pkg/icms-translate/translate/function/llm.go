@@ -275,6 +275,12 @@ func newLLMRouterClientContainer(
 	if tcfg.StargateQUICInsecure {
 		args = append(args, "--quic-insecure")
 	}
+	readinessProbe := llmWorkerReadinessProbe(allEnvSet)
+	if readinessProbe != nil {
+		// A Pylon without /ready rejects the flag and exits at startup, instead
+		// of staying NotReady until INFERENCE_READY_TIMEOUT.
+		args = append(args, "--readiness-gate")
+	}
 
 	for _, model := range ls.Models {
 		// Only include a model name if the LLM model config is present.
@@ -294,7 +300,7 @@ func newLLMRouterClientContainer(
 		}},
 		Args:           args,
 		Env:            common.SortEnvs(envs),
-		ReadinessProbe: llmWorkerReadinessProbe(allEnvSet),
+		ReadinessProbe: readinessProbe,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    *resource.NewMilliQuantity(500, resource.DecimalSI),
