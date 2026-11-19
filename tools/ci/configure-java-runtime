@@ -24,22 +24,31 @@ printf 'JAVA_TOOL_OPTIONS=%s\n' "$java_options" >> "$GITHUB_ENV"
 # actions also use a separate environment, including compiler/toolchain JVMs.
 bazelrc="${HOME}/.bazelrc"
 touch "$bazelrc"
-added_header=false
-while IFS= read -r option; do
-    if ! grep -Fxq -- "$option" "$bazelrc"; then
-        if [[ "$added_header" == false ]]; then
-            printf '\n# Temporary CI JVM mitigation.\n' >> "$bazelrc"
-            added_header=true
-        fi
-        printf '%s\n' "$option" >> "$bazelrc"
-    fi
-done <<'EOF'
+bazel_options="$(cat <<'EOF'
+# BEGIN NVCF CI Java runtime mitigation
 startup --host_jvm_args=-XX:-UseBASE64Intrinsics
 build --host_jvmopt=-XX:-UseBASE64Intrinsics
 build --jvmopt=-XX:-UseBASE64Intrinsics
 build --action_env=JAVA_TOOL_OPTIONS
 build --host_action_env=JAVA_TOOL_OPTIONS
 test --test_env=JAVA_TOOL_OPTIONS
+# END NVCF CI Java runtime mitigation
 EOF
+)"
+
+# Move only helper-owned entries to the end so later enabling options cannot
+# override them. Keep unrelated settings, including conflicting caller flags.
+bazelrc_tmp="$(mktemp "${bazelrc}.XXXXXX")"
+trap 'rm -f "$bazelrc_tmp"' EXIT
+printf '%s\n' "$bazel_options" | awk '
+    NR == FNR {
+        owned[$0] = 1
+        block = block $0 "\n"
+        next
+    }
+    !($0 in owned) && $0 != "# Temporary CI JVM mitigation." { print }
+    END { printf "%s", block }
+' - "$bazelrc" > "$bazelrc_tmp"
+cat "$bazelrc_tmp" > "$bazelrc"
 
 echo "Configured CI JVM options for Bazel servers, actions and tests."

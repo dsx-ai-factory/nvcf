@@ -10,6 +10,14 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/home"
 env_file="$fixture/github-env"
 bazelrc="$fixture/home/.bazelrc"
+expected_controls=(
+    'startup --host_jvm_args=-XX:-UseBASE64Intrinsics'
+    'build --host_jvmopt=-XX:-UseBASE64Intrinsics'
+    'build --jvmopt=-XX:-UseBASE64Intrinsics'
+    'build --action_env=JAVA_TOOL_OPTIONS'
+    'build --host_action_env=JAVA_TOOL_OPTIONS'
+    'test --test_env=JAVA_TOOL_OPTIONS'
+)
 
 # Preserve caller options and a pre-existing rc file without a final newline.
 printf 'build --color=no' > "$bazelrc"
@@ -19,6 +27,12 @@ env HOME="$fixture/home" GITHUB_ENV="$env_file" \
 options="$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)"
 [[ "$options" == '-Dfixture=preserved -XX:+UseBASE64Intrinsics -XX:-UseBASE64Intrinsics' ]]
 grep -Fxq 'build --color=no' "$bazelrc"
+for option in "${expected_controls[@]}"; do
+    grep -Fxq -- "$option" "$bazelrc" || {
+        echo "FAIL missing Bazel control: $option" >&2
+        exit 1
+    }
+done
 echo 'ok   preserves caller options and existing Bazel settings'
 
 # Calling the helper again must not grow the rc file or repeat the last flag.
@@ -28,6 +42,35 @@ env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
 cmp "$bazelrc" "$fixture/first.bazelrc"
 [[ "$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)" == "$options" ]]
 echo 'ok   repeated setup is idempotent'
+
+# Later conflicting settings must not override the helper's mitigation.
+cat >> "$bazelrc" <<'EOF'
+startup --host_jvm_args=-XX:+UseBASE64Intrinsics
+build --host_jvmopt=-XX:+UseBASE64Intrinsics
+build --jvmopt=-XX:+UseBASE64Intrinsics
+build --action_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+build --host_action_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+test --test_env=JAVA_TOOL_OPTIONS=-XX:+UseBASE64Intrinsics
+build --jobs=2
+EOF
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+for option in "${expected_controls[@]}"; do
+    prefix="${option%%=*}="
+    effective="$(awk -v prefix="$prefix" 'index($0, prefix) == 1 { last = $0 } END { print last }' "$bazelrc")"
+    [[ "$effective" == "$option" && "$(grep -Fxc -- "$option" "$bazelrc")" == 1 ]] || {
+        echo "FAIL Bazel control must be last and occur once: $option" >&2
+        exit 1
+    }
+done
+grep -Fxq 'startup --host_jvm_args=-XX:+UseBASE64Intrinsics' "$bazelrc"
+grep -Fxq 'build --color=no' "$bazelrc"
+grep -Fxq 'build --jobs=2' "$bazelrc"
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   moves mitigation after conflicting options without duplicating it'
 
 # A multiline value must not inject extra GitHub environment entries or make
 # any partial changes to the rc/environment files.
