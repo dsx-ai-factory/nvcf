@@ -697,6 +697,15 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 					for _, ww := range []workloadWatcher{watchForPodCrashesRestarts, onNVCFPodUpdateFunc} {
 						ww(ctx, oldPod, newPod)
 					}
+					recordWorkerRestartBaseline(ctx, k8sClient, newPod, time.Now())
+				},
+				DeleteFunc: func(obj any) {
+					if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+						obj = tombstone.Obj
+					}
+					if pod, ok := obj.(*corev1.Pod); ok {
+						k8sutil.ForgetWorkerRestartBaseline(pod.UID)
+					}
 				},
 			})
 			if err != nil {
@@ -707,6 +716,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 			c.podSpecLister = podInf.Lister().Pods(c.podInstanceNamespace)
 			c.syncedFuncs = append(c.syncedFuncs, podInf.Informer().HasSynced)
 			podInfFactory.Start(ctx.Done())
+			startWorkerRestartBaselineRecorder(ctx, k8sClient, c.podLister)
 		}
 
 		if err := c.initInstanceNamespaceInformer(ctx); err != nil {

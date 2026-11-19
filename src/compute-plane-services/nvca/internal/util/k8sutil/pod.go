@@ -20,13 +20,16 @@ package k8sutil
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apitypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 )
@@ -37,6 +40,12 @@ const (
 	ImagePullIssueReason          = "ErrImagePull"
 	ImagePullIssueAlternateReason = "ImagePullBackOff"
 	RestartCountToFailInstance    = int32(3)
+	// WorkerRestartCountBaselineAnnotationKey records the NVCA worker container's RestartCount at the end of its
+	// last healthy period. Only restarts above this count count toward the worker restart threshold.
+	WorkerRestartCountBaselineAnnotationKey = "nvca.nvcf.nvidia.io/worker-restart-count-baseline"
+	// WorkerRestartCountResetPeriod is how long the NVCA worker container must run and stay ready before its
+	// earlier restarts stop counting toward the worker restart threshold.
+	WorkerRestartCountResetPeriod = 30 * time.Minute
 )
 
 // IsPodReady returns true if a pod is ready; false otherwise.
@@ -299,19 +308,188 @@ type ContainerStuckInitializing struct {
 
 // IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times, or
 // WorkerContainerRestartCountToFailInstance times for the NVCA worker container, in a Pod launched more than
-// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so a
-// container whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose
-// (for example a streaming app that quits when its session ends) and the kubelet restarted it in place.
+// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so for the
+// worker only restarts since its last healthy period of WorkerRestartCountResetPeriod count. A container
+// whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose (for
+// example a streaming app that quits when its session ends) and the kubelet restarted it in place.
 func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
 	threshold := RestartCountToFailInstance
+	restarts := cs.RestartCount
 	if isWorkerContainer(pod, cs.Name) {
 		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
+		restarts -= workerRestartCountBaseline(pod, cs, time.Now())
 	}
-	if cs.RestartCount < threshold ||
+	if restarts < threshold ||
 		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
 		return false
 	}
 	return !exitedCleanlyAfterPodReady(pod.Status, cs)
+}
+
+// WorkerRestartCountBaselineToRecord returns the worker restart baseline to record on the Pod in
+// WorkerRestartCountBaselineAnnotationKey, and false when the recorded baseline is already up to date. A recorded
+// baseline above the worker's RestartCount belongs to an earlier counter sequence (for example before a node
+// reboot reset the count), so it is replaced even when the worker has not been healthy since.
+func WorkerRestartCountBaselineToRecord(pod *corev1.Pod, now time.Time) (int32, bool) {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !isWorkerContainer(pod, cs.Name) {
+			continue
+		}
+		recorded, present := parseWorkerRestartCountBaseline(pod)
+		healthy, ok := healthyWorkerRestartCount(pod.Status, cs, now)
+		if pending, pok := pendingWorkerRestartBaselines.get(pod, cs.RestartCount); pok && (!ok || pending > healthy) {
+			healthy, ok = pending, true
+		}
+		if present && recorded > cs.RestartCount {
+			if !ok {
+				healthy = 0
+			}
+			return healthy, true
+		}
+		if !ok || (present && healthy <= recorded) {
+			return 0, false
+		}
+		return healthy, true
+	}
+	return 0, false
+}
+
+// workerRestartCountBaseline returns how many of the worker container's restarts happened before its last healthy
+// period, from the recorded annotation or the container's current state, whichever is later.
+func workerRestartCountBaseline(pod *corev1.Pod, cs corev1.ContainerStatus, now time.Time) int32 {
+	baseline, present := parseWorkerRestartCountBaseline(pod)
+	if !present || baseline > cs.RestartCount {
+		baseline = 0
+	}
+	if healthy, ok := healthyWorkerRestartCount(pod.Status, cs, now); ok && healthy > baseline {
+		baseline = healthy
+	}
+	if pending, ok := pendingWorkerRestartBaselines.get(pod, cs.RestartCount); ok && pending > baseline {
+		baseline = pending
+	}
+	return baseline
+}
+
+// pendingWorkerRestartBaselines holds the worker restart baselines that NVCA detected but has not yet seen recorded
+// on their Pod. A failed or delayed annotation patch then does not lose a baseline when the next restart replaces the
+// termination state it was detected from.
+var pendingWorkerRestartBaselines = &workerRestartBaselineStore{baselines: map[apitypes.UID]int32{}}
+
+type workerRestartBaselineStore struct {
+	mu        sync.Mutex
+	baselines map[apitypes.UID]int32
+}
+
+// RetainWorkerRestartBaseline keeps the worker restart baseline detected for a Pod until the Pod shows it recorded in
+// WorkerRestartCountBaselineAnnotationKey, the worker's RestartCount drops below it, or the Pod is deleted.
+func RetainWorkerRestartBaseline(pod *corev1.Pod, baseline int32) {
+	pendingWorkerRestartBaselines.retain(pod.UID, baseline)
+}
+
+// ForgetWorkerRestartBaseline drops the retained worker restart baseline of a deleted Pod.
+func ForgetWorkerRestartBaseline(uid apitypes.UID) {
+	pendingWorkerRestartBaselines.forget(uid)
+}
+
+func (s *workerRestartBaselineStore) retain(uid apitypes.UID, baseline int32) {
+	if uid == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if baseline > s.baselines[uid] {
+		s.baselines[uid] = baseline
+	}
+}
+
+func (s *workerRestartBaselineStore) forget(uid apitypes.UID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.baselines, uid)
+}
+
+// get returns the retained baseline for the Pod, and drops it once the Pod has it recorded or the worker's
+// RestartCount is below it.
+func (s *workerRestartBaselineStore) get(pod *corev1.Pod, restartCount int32) (int32, bool) {
+	if pod.UID == "" {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	baseline, ok := s.baselines[pod.UID]
+	if !ok {
+		return 0, false
+	}
+	if recorded, present := parseWorkerRestartCountBaseline(pod); baseline > restartCount ||
+		(present && recorded >= baseline && recorded <= restartCount) {
+		delete(s.baselines, pod.UID)
+		return 0, false
+	}
+	return baseline, true
+}
+
+// parseWorkerRestartCountBaseline returns the baseline recorded on the Pod, and false when it is missing or invalid.
+func parseWorkerRestartCountBaseline(pod *corev1.Pod) (int32, bool) {
+	v, ok := pod.Annotations[WorkerRestartCountBaselineAnnotationKey]
+	if !ok {
+		return 0, false
+	}
+	baseline, err := strconv.ParseInt(v, 10, 32)
+	if err != nil || baseline < 0 {
+		return 0, false
+	}
+	return int32(baseline), true
+}
+
+// healthyWorkerRestartCount returns the RestartCount of the worker container's latest run that lasted at least
+// WorkerRestartCountResetPeriod: the current run once it and the Pod have stayed ready that long, or the run that
+// ended most recently when it ran that long. A run that ended is not checked for readiness because its readiness
+// history is not available. The kubelet increments RestartCount only when the next run starts, so a run that ended
+// keeps its count while the container is terminated or waiting, and is one below the count once the next run is
+// running or was created and is waiting to start, which shows as a container ID different from the ended run's.
+func healthyWorkerRestartCount(status corev1.PodStatus, cs corev1.ContainerStatus, now time.Time) (int32, bool) {
+	if cs.RestartCount == 0 {
+		return 0, false
+	}
+	if running := cs.State.Running; running != nil {
+		if since, ok := readySince(status, cs, running.StartedAt.Time); ok && now.Sub(since) >= WorkerRestartCountResetPeriod {
+			return cs.RestartCount, true
+		}
+		if ranLongEnough(cs.LastTerminationState.Terminated) {
+			return cs.RestartCount - 1, true
+		}
+		return 0, false
+	}
+	if ended := cs.State.Terminated; ended != nil {
+		if ranLongEnough(ended) {
+			return cs.RestartCount, true
+		}
+		return 0, false
+	}
+	ended := cs.LastTerminationState.Terminated
+	if !ranLongEnough(ended) {
+		return 0, false
+	}
+	if cs.ContainerID != "" && ended.ContainerID != "" && cs.ContainerID != ended.ContainerID {
+		return cs.RestartCount - 1, true
+	}
+	return cs.RestartCount, true
+}
+
+// readySince returns when the running container and its Pod became ready, and false when either is not ready.
+func readySince(status corev1.PodStatus, cs corev1.ContainerStatus, startedAt time.Time) (time.Time, bool) {
+	ready := getPodReadyCondition(status)
+	if !cs.Ready || ready == nil || ready.Status != corev1.ConditionTrue {
+		return time.Time{}, false
+	}
+	if ready.LastTransitionTime.After(startedAt) {
+		return ready.LastTransitionTime.Time, true
+	}
+	return startedAt, true
+}
+
+func ranLongEnough(t *corev1.ContainerStateTerminated) bool {
+	return t != nil && !t.StartedAt.IsZero() && t.FinishedAt.Sub(t.StartedAt.Time) >= WorkerRestartCountResetPeriod
 }
 
 // exitedCleanlyAfterPodReady reports whether the container's latest run exited with code 0 and the Pod was
