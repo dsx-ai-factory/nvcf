@@ -689,9 +689,8 @@ async fn start_pylon_runtime(args: &Args, plan: &PylonStartupPlan) -> Result<Run
         tls_cert_pem,
         grpc_tls_ca_cert_pem,
     );
-    let mut registration_client = InferenceServerRegistrationClient::default();
+    let mut registration_client = InferenceServerRegistrationClient::with_readiness(readiness);
     registration_client.start(registration_config)?;
-    readiness.mark_ready();
 
     Ok(RunningPylon {
         inference_server_id: args.inference_server_id.clone(),

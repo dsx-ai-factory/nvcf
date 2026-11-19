@@ -738,9 +738,10 @@ async fn get_metrics(
 
 owned_task_handle!(MetricsServerHandle);
 
-/// Backs `GET /ready`: 503 until startup admission ends and registration
-/// starts, then 200 for the rest of the process. Canaries handle later
-/// upstream failures, so readiness never turns back.
+/// Backs `GET /ready`: 503 until a router acknowledges registration, or in
+/// reverse mode until a router has the connected tunnel, then 200 for the rest
+/// of the process. Canaries handle later upstream failures, so readiness never
+/// turns back.
 #[derive(Clone, Debug, Default)]
 pub struct StartupReadiness(Arc<AtomicBool>);
 
@@ -749,7 +750,7 @@ impl StartupReadiness {
         self.0.store(true, Ordering::Release);
     }
 
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }
