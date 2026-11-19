@@ -280,13 +280,47 @@ fn readiness_gate_from_args(args: &Args) -> Result<(Option<ReadinessGate>, Optio
         .transpose()?
         .filter(|status| *status != 0)
         .unwrap_or(DEFAULT_READINESS_HEALTH_STATUS);
-    let gate = ReadinessGate::new(
+    let timeout = non_empty(&args.readiness_health_timeout)
+        .map(|timeout| {
+            parse_iso8601_duration(timeout)
+                .with_context(|| format!("invalid readiness health timeout {timeout:?}"))
+        })
+        .transpose()?
+        .filter(|timeout| !timeout.is_zero());
+    let mut gate = ReadinessGate::new(
         &normalize_base_url(&args.upstream_http_base_url),
         path,
         port,
         expected_status,
     )?;
+    if let Some(timeout) = timeout {
+        gate = gate.with_timeout(timeout);
+    }
     Ok((Some(gate), None))
+}
+
+/// Parses the time-based ISO-8601 durations that the control plane sends, such
+/// as `PT10S`, `PT1M30S`, or `PT0.5S`.
+fn parse_iso8601_duration(value: &str) -> Option<Duration> {
+    let mut rest = value.strip_prefix("PT").filter(|rest| !rest.is_empty())?;
+    let mut seconds = 0.0;
+    for (unit, unit_seconds) in [('H', 3600.0), ('M', 60.0), ('S', 1.0)] {
+        if let Some((number, tail)) = rest.split_once(unit) {
+            let is_number = !number.is_empty()
+                && number
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || (unit == 'S' && c == '.'));
+            if !is_number {
+                return None;
+            }
+            seconds += number.parse::<f64>().ok()? * unit_seconds;
+            rest = tail;
+        }
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds).ok()
 }
 
 fn non_empty(value: &Option<String>) -> Option<&str> {
@@ -1132,6 +1166,10 @@ mod tests {
                     "1000",
                 ][..],
             ),
+            (
+                "bad timeout",
+                &["--readiness-gate", "--readiness-health-timeout", "10s"][..],
+            ),
         ] {
             let mut argv = vec![
                 "pylon",
@@ -1145,6 +1183,25 @@ mod tests {
                 PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None).is_err(),
                 "{label}"
             );
+        }
+    }
+
+    #[test]
+    fn iso8601_duration_parses_the_control_plane_timeout_format() {
+        for (value, expected) in [
+            ("PT10S", Some(Duration::from_secs(10))),
+            ("PT1M30S", Some(Duration::from_secs(90))),
+            ("PT2H", Some(Duration::from_secs(7200))),
+            ("PT0.5S", Some(Duration::from_millis(500))),
+            ("PT0S", Some(Duration::ZERO)),
+            ("10s", None),
+            ("PT", None),
+            ("PT-1S", None),
+            ("PT1.5M", None),
+            ("PT30S1H", None),
+            ("P1D", None),
+        ] {
+            assert_eq!(parse_iso8601_duration(value), expected, "{value}");
         }
     }
 

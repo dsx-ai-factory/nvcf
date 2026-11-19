@@ -69,6 +69,7 @@ pub(crate) async fn check_readiness_gate(
     gate: &ReadinessGate,
     fallback_paths: &UpstreamHealthPaths,
 ) -> bool {
+    let timeout = gate.timeout().unwrap_or(timeout);
     let status = match http_client.get(gate.url()).timeout(timeout).send().await {
         Ok(response) => response.status(),
         Err(error) => {

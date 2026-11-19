@@ -106,6 +106,9 @@ struct Args {
         value_name = "STATUS"
     )]
     readiness_health_expected_status: Option<String>,
+    /// Timeout of each declared health check probe, as an ISO-8601 duration such as `PT10S`. Defaults to the bringup canary timeout
+    #[arg(long, env = "INFERENCE_HEALTH_TIMEOUT", value_name = "DURATION")]
+    readiness_health_timeout: Option<String>,
     /// How long startup retries the upstream health probe before exiting. `0` probes once.
     /// Defaults to INFERENCE_READY_TIMEOUT when set, otherwise 60000
     #[arg(long, value_name = "MS")]
@@ -438,6 +441,7 @@ mod tests {
                 "readiness_health_expected_status",
                 "INFERENCE_HEALTH_EXPECTED_RESPONSE_CODE",
             ),
+            ("readiness_health_timeout", "INFERENCE_HEALTH_TIMEOUT"),
         ] {
             let argument = command
                 .get_arguments()

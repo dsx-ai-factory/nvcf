@@ -462,6 +462,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_gate_probes_with_the_declared_timeout() {
+        // The check answers after 300 ms; the caller's own timeout is 100 ms.
+        for (label, declared_timeout, want) in [
+            ("no declared timeout", None, false),
+            ("declared timeout", Some(Duration::from_secs(2)), true),
+        ] {
+            let server = TestHttpServer::spawn(Router::new().route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    "ok"
+                }),
+            ))
+            .await;
+            let mut gate = ReadinessGate::new(server.as_str(), "/ready", None, 200).expect(label);
+            if let Some(timeout) = declared_timeout {
+                gate = gate.with_timeout(timeout);
+            }
+
+            assert_eq!(
+                check_readiness_gate(
+                    &reqwest::Client::new(),
+                    server.as_str(),
+                    Duration::from_millis(100),
+                    &gate,
+                    &UpstreamHealthPaths::default(),
+                )
+                .await,
+                want,
+                "{label}"
+            );
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn readiness_gate_fails_when_the_declared_port_is_closed() {
         let server =
             TestHttpServer::spawn(Router::new().route("/health", get(|| async { "ok" }))).await;

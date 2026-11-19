@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use reqwest::StatusCode;
@@ -45,6 +46,7 @@ pub enum ReadinessGateError {
 pub struct ReadinessGate {
     url: String,
     expected_status: StatusCode,
+    timeout: Option<Duration>,
     // A check equal to the control-plane default is often one the function
     // never declared, so it keeps the lenient probe when the backend does not
     // serve that path.
@@ -80,6 +82,7 @@ impl ReadinessGate {
         Ok(Self {
             url: url.into(),
             expected_status,
+            timeout: None,
             is_control_plane_default: path == CONTROL_PLANE_DEFAULT_HEALTH_PATH
                 && port == upstream_port,
             fallback_logged: Arc::new(AtomicBool::new(false)),
@@ -91,8 +94,19 @@ impl ReadinessGate {
         &self.url
     }
 
+    /// Probe timeout from the declared check; without one, callers use their
+    /// own.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     pub(crate) fn expected_status(&self) -> StatusCode {
         self.expected_status
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     pub(crate) fn is_control_plane_default(&self) -> bool {
