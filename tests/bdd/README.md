@@ -188,8 +188,9 @@ its occupied heartbeat after a complete agent restart, removes one worker, and
 requires released capacity within 60 seconds and a replacement Ready within
 180 seconds. Both deadlines are shorter than the verified five-minute periodic
 heartbeat. Run evidence is written under `out/capacity-recovery-*`; the check
-undeploys only its own functions on completion or failure. The general Helmfile
-suite excludes this candidate-only scenario. This validates real Kubernetes and
+deletes only its own function definitions and deployments on completion or
+failure. The general Helmfile suite excludes this candidate-only scenario.
+This validates real Kubernetes and
 control-plane behavior with simulated GPUs and a CPU sample, and does not
 validate physical GPU or application-specific shutdown behavior.
 

@@ -134,6 +134,7 @@ func TestCapacityHeartbeatWaitsForRelease(t *testing.T) {
 			second()
 			a.apply(ctx, &core.Event{Kind: EventTickUpdateHeartbeat, ObjectMetaKey: "capacity-check"})
 			require.Len(t, icms.healthStatusRequests, 2)
+			require.Contains(t, icms.healthStatusRequests[1].GPUUsage, types.GPUName("L4"))
 			require.Zero(t, icms.healthStatusRequests[1].GPUUsage["L4"].Allocated)
 			require.EqualValues(t, 1, a.backendHealthCache.GetStatus().GPUUsage["L4"].Allocated,
 				"the test must exercise a still-warm health cache")
@@ -142,6 +143,7 @@ func TestCapacityHeartbeatWaitsForRelease(t *testing.T) {
 			require.Len(t, icms.healthStatusRequests, 2, "unchanged capacity must not send extra heartbeats")
 			require.NoError(t, a.PutNVCAStatusUpdate(ctx))
 			require.Len(t, icms.healthStatusRequests, 3, "periodic heartbeat must still publish unchanged capacity")
+			require.Contains(t, icms.healthStatusRequests[2].GPUUsage, types.GPUName("L4"))
 			require.Zero(t, icms.healthStatusRequests[2].GPUUsage["L4"].Allocated,
 				"periodic heartbeat must not republish the stale cached allocation")
 		})
