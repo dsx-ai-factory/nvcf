@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	echo "github.com/labstack/echo/v4"
 
@@ -133,6 +134,10 @@ func newModelNameTestServer(t *testing.T) (*echo.Echo, *recordingRouter) {
 
 func serveModelNameRequest(e *echo.Echo, path, bodyFormat, model string) *httptest.ResponseRecorder {
 	encodedModel, _ := json.Marshal(model)
+	if !utf8.ValidString(model) {
+		// json.Marshal would replace the invalid bytes; send them raw as a client could.
+		encodedModel = []byte(`"` + model + `"`)
+	}
 	body := fmt.Sprintf(bodyFormat, encodedModel)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
