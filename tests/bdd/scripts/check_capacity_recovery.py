@@ -172,7 +172,6 @@ class RecoveryCheck:
             # With no free GPUs, a fresh agent cannot send an availability-increase
             # heartbeat. Observe its first occupied periodic heartbeat before loss,
             # giving the test a full default heartbeat interval for its deadline.
-            since = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self.kubectl("rollout", "restart", "deployment/nvca", "-n", "nvca-system")
             self.kubectl("rollout", "status", "deployment/nvca", "-n", "nvca-system", "--timeout=300s")
 
@@ -199,13 +198,17 @@ class RecoveryCheck:
             self.save("candidate.json", {"images": images, "heartbeatSeconds": interval,
                 "imageIDs": [c.get("imageID") for p in agent_pods
                              for c in p.get("status", {}).get("containerStatuses", [])]})
+            # Exclude heartbeats the old process sent while it was terminating.
+            since = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
             def occupied():
                 heartbeat = latest_heartbeat(self.kubectl("logs", "deployment/spot-instance-service",
                     "-n", "sis", "--since-time=" + since, "--tail=10000"))
                 usage = self.usage()
                 if occupied_by_candidate(usage, heartbeat, args.gpu, args.expected_capacity, args.agent_version):
-                    return {"usage": usage, "heartbeat": heartbeat, "images": images}
+                    return {"usage": usage, "heartbeat": heartbeat, "images": images,
+                            "notBefore": since,
+                            "observedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
                 return None
 
             self.save("occupied.json", self.wait("candidate heartbeat with no spare capacity", occupied, 360))
@@ -235,19 +238,20 @@ class RecoveryCheck:
             self.save("result.json", result)
             print("capacity recovery passed: " + json.dumps(result))
         finally:
-            # Only remove deployments created by this invocation, including on failure.
+            # Remove this invocation's definitions as well as deployments so repeated
+            # runs do not consume the account's function quota.
             failed = sys.exc_info()[0] is not None
             cleanup_errors = 0
             for function_id, version_id in reversed(self.identities):
                 try:
                     self.cli("function", "delete", "--function-id", function_id,
-                             "--version-id", version_id, "--deployment-only")
+                             "--version-id", version_id)
                 except (RuntimeError, subprocess.TimeoutExpired):
                     cleanup_errors += 1
             if cleanup_errors:
-                self.save("cleanup.json", {"failedUndeployments": cleanup_errors})
+                self.save("cleanup.json", {"failedFunctionDeletions": cleanup_errors})
                 if not failed:
-                    raise RuntimeError("test deployment cleanup failed")
+                    raise RuntimeError("test function cleanup failed")
 
 
 def main():

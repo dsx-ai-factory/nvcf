@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 from check_capacity_recovery import (
     allocation_released,
@@ -11,10 +15,28 @@ from check_capacity_recovery import (
     occupied_by_candidate,
     periodic_heartbeat_seconds,
     ready_workers,
+    RecoveryCheck,
 )
 
 
 class CapacityRecoveryTests(unittest.TestCase):
+    def test_failure_deletes_owned_definitions_and_continues_after_cleanup_error(self):
+        with tempfile.TemporaryDirectory() as output:
+            check = RecoveryCheck.__new__(RecoveryCheck)
+            check.args = SimpleNamespace(expected_capacity=2)
+            check.output = Path(output)
+            check.identities = [("owned-first", "version-one"), ("owned-second", "version-two")]
+            check.wait = Mock(side_effect=RuntimeError("primary failure"))
+            check.cli = Mock(side_effect=[RuntimeError("delete failed"), "deleted"])
+            with self.assertRaisesRegex(RuntimeError, "primary failure"):
+                check.run()
+            self.assertEqual([
+                ("function", "delete", "--function-id", "owned-second", "--version-id", "version-two"),
+                ("function", "delete", "--function-id", "owned-first", "--version-id", "version-one"),
+            ], [call.args for call in check.cli.call_args_list])
+            self.assertEqual({"failedFunctionDeletions": 1},
+                             json.loads((check.output / "cleanup.json").read_text()))
+
     def test_release_requires_object_gone_and_termination_reported(self):
         for exists in (False, True):
             for reported in (False, True):
