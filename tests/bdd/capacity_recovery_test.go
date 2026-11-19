@@ -45,6 +45,7 @@ func TestCapacityRecoveryScenarioUsesCandidateAndSaturatedProbe(t *testing.T) {
 		return harness.Result{}, false
 	}
 	suite := newWiringSuite(t, runner)
+	seedComputePlaneLocalBDDFixture(t, suite.Config.RepoRoot)
 	environment := filepath.Join(suite.Config.RepoRoot, "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml")
 	if err := os.MkdirAll(filepath.Dir(environment), 0o755); err != nil {
 		t.Fatal(err)

@@ -70,6 +70,13 @@ def periodic_heartbeat_seconds(logs):
     return int(intervals[-1]) / 1_000_000_000
 
 
+def discovery_mode(logs):
+    modes = re.findall(r"\bDynamicGPUDiscoveryEnabled:(true|false)", logs)
+    if not modes:
+        raise RuntimeError("agent startup did not report its effective discovery mode")
+    return "dynamic" if modes[-1] == "true" else "static"
+
+
 class RecoveryCheck:
     def __init__(self, args):
         self.args = args
@@ -169,10 +176,12 @@ class RecoveryCheck:
             images = [c["image"] for c in deployment["spec"]["template"]["spec"]["containers"]]
             if not any(image.endswith(":" + args.agent_version) for image in images):
                 raise RuntimeError("the installed agent image does not match the candidate version")
-            interval = periodic_heartbeat_seconds(self.kubectl(
-                "logs", "deployment/nvca", "-n", "nvca-system", "--tail=10000"))
+            startup = self.kubectl("logs", "deployment/nvca", "-n", "nvca-system", "--tail=10000")
+            interval = periodic_heartbeat_seconds(startup)
             if interval != 300:
                 raise RuntimeError("the test requires the default five-minute heartbeat interval")
+            if discovery_mode(startup) != args.discovery_mode:
+                raise RuntimeError("the agent is not using the requested GPU discovery mode")
             agent_pods = self.objects("pods", "nvca-system")
             self.save("candidate.json", {"images": images, "heartbeatSeconds": interval,
                 "imageIDs": [c.get("imageID") for p in agent_pods
@@ -206,7 +215,7 @@ class RecoveryCheck:
 
             self.wait("automatic replacement ready", recovered,
                       max(1, args.recovery_timeout - (time.monotonic() - released)))
-            result = {"passed": True, "agentVersion": args.agent_version,
+            result = {"passed": True, "agentVersion": args.agent_version, "discoveryMode": args.discovery_mode,
                       "capacity": args.expected_capacity, "publicationSeconds": published,
                       "replacementReadySeconds": time.monotonic() - released,
                       "workerGraceSeconds": 5, "periodicHeartbeatSeconds": 300}
@@ -234,6 +243,7 @@ def main():
                  "gpu", "instance-type", "region", "account", "api-url", "icms-host", "output-dir"):
         parser.add_argument("--" + flag, required=True)
     parser.add_argument("--expected-capacity", type=int, required=True)
+    parser.add_argument("--discovery-mode", choices=("dynamic", "static"), default="dynamic")
     parser.add_argument("--publication-timeout", type=int, default=60)
     parser.add_argument("--recovery-timeout", type=int, default=180)
     args = parser.parse_args()

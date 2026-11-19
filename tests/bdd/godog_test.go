@@ -3251,7 +3251,8 @@ func TestCapacityRecoveryTagsSelectInstallationAndReuse(t *testing.T) {
 		"Operator installs the control plane through the local Helmfile environment",
 		"Operator registers the local cluster and installs the NVCA operator",
 		"Operator invokes the Load Tester Supreme sample function through default and vanity endpoints",
-		"Operator recovers a worker before the next periodic heartbeat with no spare capacity",
+		"Operator recovers a worker using dynamic discovery with no spare capacity",
+		"Operator recovers a worker using static discovery with no spare capacity",
 	}
 	if status != 1 || !slices.Equal(selected, want) {
 		t.Fatalf("expected installation and saturated recovery scenarios, got status=%d scenarios=%v\n%s",
@@ -3269,6 +3270,18 @@ func TestSingleClusterCapacityRecovery(t *testing.T) {
 		t.Fatal("set CAPACITY_NVCA_AGENT_VERSION to the candidate image tag built from the revision under test")
 	}
 	runLiveFeatureTags(t, "single-cluster-helmfile.feature", capacityRecoveryTags)
+}
+
+// TestExistingClusterCapacityRecovery reruns candidate validation on the local
+// stack installed by TestSingleClusterCapacityRecovery, preserving its registration.
+func TestExistingClusterCapacityRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	if os.Getenv("CAPACITY_NVCA_AGENT_VERSION") == "" {
+		t.Fatal("set CAPACITY_NVCA_AGENT_VERSION to the candidate image tag built from the revision under test")
+	}
+	runLiveFeatureTags(t, "single-cluster-helmfile.feature", "@capacity-recovery")
 }
 
 // TestSingleClusterHelmfile is the live entry point for the helmfile

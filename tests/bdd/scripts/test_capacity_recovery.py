@@ -6,6 +6,7 @@ import unittest
 
 from check_capacity_recovery import (
     allocation_released,
+    discovery_mode,
     latest_heartbeat,
     occupied_by_candidate,
     periodic_heartbeat_seconds,
@@ -52,6 +53,12 @@ class CapacityRecoveryTests(unittest.TestCase):
         self.assertEqual(15, periodic_heartbeat_seconds("options: HeartbeatInterval:15000000000, rest"))
         with self.assertRaises(RuntimeError):
             periodic_heartbeat_seconds("no effective interval")
+
+    def test_discovery_mode_is_observed_in_startup(self):
+        self.assertEqual("dynamic", discovery_mode("DynamicGPUDiscoveryEnabled:true,"))
+        self.assertEqual("static", discovery_mode("DynamicGPUDiscoveryEnabled:false,"))
+        with self.assertRaises(RuntimeError):
+            discovery_mode("mode not reported")
 
     def test_only_ready_non_deleting_workers_for_the_target_functions_count(self):
         def pod(function_id, ready=True, deleting=False):

@@ -1670,9 +1670,11 @@ func (a *Agent) putNVCAStatusUpdate(ctx context.Context, capacityOnly bool) erro
 		if capacityOnly {
 			return err
 		}
-		// Preserve periodic publication when the health cache is still usable.
-		log.WithError(err).Warn("Using cached GPU usage for periodic heartbeat")
+		// Keep publishing, but do not advertise cached free capacity as healthy
+		// when the current allocation could not be determined.
+		log.WithError(err).Warn("Reporting unhealthy heartbeat with cached GPU usage")
 		gpuUsage = agentHealth.GPUUsage
+		agentHealth.Status = types.HealthStatusUnhealthy
 	}
 	if capacityOnly && !a.gpuAvailabilityIncreased(gpuUsage) {
 		return nil

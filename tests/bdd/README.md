@@ -130,9 +130,13 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   go test -run '^TestSingleClusterHelmfile$' -timeout 90m -v
 
 # Full local installation, upgrade to an explicit candidate agent, and saturated
-# capacity recovery. Build and publish the candidate NVCA image in the selected
-# sample repository first; the base stack's released image does not test a patch.
+# capacity recovery in dynamic and static discovery modes. Build the candidate
+# in the selected sample repository and import it into each local k3d node (or
+# publish it to a registry you control). The released pin does not test a patch.
 # Requires the NGC variables above; Helm sample charts are not needed.
+# For local import, prepare a fresh ncp-local topology using the documented local
+# development workflow, then load the tagged candidate before running this test:
+# k3d image import nvcr.io/<org>/<team>/nvca:<candidate-image-tag> --cluster ncp-local
 NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   CAPACITY_NVCA_AGENT_VERSION=<candidate-image-tag> \
   go test -run '^TestSingleClusterCapacityRecovery$' -timeout 90m -v
@@ -178,7 +182,7 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   go test -run '^TestMultiClusterHelmfileLLMLastClusterAffinity$' -timeout 120m -v
 ```
 
-The capacity check fills all four simulated GPUs with independent one-worker
+The capacity checks fill all four simulated GPUs with independent one-worker
 functions using minInstances=maxInstances=1. It verifies the candidate image and
 its occupied heartbeat after a complete agent restart, removes one worker, and
 requires released capacity within 60 seconds and a replacement Ready within
@@ -188,6 +192,10 @@ undeploys only its own functions on completion or failure. The general Helmfile
 suite excludes this candidate-only scenario. This validates real Kubernetes and
 control-plane behavior with simulated GPUs and a CPU sample, and does not
 validate physical GPU or application-specific shutdown behavior.
+
+After a full installation, use `TestExistingClusterCapacityRecovery` with the
+same environment to rerun only the two recovery cases on that local stack. Keep
+the generated compute-plane registration values from the full installation.
 
 The capacity probe's pure checks can also run without a cluster:
 

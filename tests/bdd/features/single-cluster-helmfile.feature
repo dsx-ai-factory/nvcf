@@ -327,19 +327,36 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
     # the four simulated GPUs with independent min=max=1 functions, verifies a
     # fresh occupied heartbeat, then deletes one worker with five-second grace.
     @capacity-recovery
-    Scenario: Operator recovers a worker before the next periodic heartbeat with no spare capacity
+    Scenario Outline: Operator recovers a worker using <discovery_mode> discovery with no spare capacity
       Given environment variable "CAPACITY_NVCA_AGENT_VERSION" is set
-      And I update yaml file "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml" with keys:
+      And I prepare Helmfile environment "local-bdd" for stack "nvcf-compute-plane" from fixture "tests/bdd/fixtures/nvcf-compute-plane-local-bdd.yaml" with values:
+        | global.imagePullSecrets[0].name            | nvcr-pull-secret                         |
+        | global.helm.sources.repository            | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
+        | global.image.repository                   | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
         | global.nvcaOperator.selfManaged.nvcaVersion | ${CAPACITY_NVCA_AGENT_VERSION} |
+        | global.nvcaOperator.nvcaImage.pullPolicy    | IfNotPresent                              |
+      And I set yaml file "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml" key "global.nvcaOperator.worker.staticGPUCapacity" to:
+        """
+        <static_capacity>
+        """
+      When I successfully run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        """
       When I successfully run command:
         """
         make -C deploy/stacks/nvcf-compute-plane install CLUSTER_NAME=ncp-local HELMFILE_ENV=local-bdd NVCF_CLI=${NVCF_CLI} NVCF_CLI_CONFIG=${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml
         """
       When I successfully run command:
         """
-        python3 ${REPO_ROOT}/tests/bdd/scripts/check_capacity_recovery.py --cli ${NVCF_CLI} --cli-config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml --state-file ${HOME}/.nvcf-cli.nvcf-cli-local.state --context k3d-ncp-local --backend ncp-local --agent-version ${CAPACITY_NVCA_AGENT_VERSION} --image nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/load_tester_supreme:0.0.8 --gpu H100 --instance-type NCP.GPU.H100_1x --region us-west-1 --account nvcf-default --api-url http://127.0.0.1:8080 --icms-host sis.localhost --expected-capacity 4 --publication-timeout 60 --recovery-timeout 180 --output-dir ${REPO_ROOT}/tests/bdd/out
+        python3 ${REPO_ROOT}/tests/bdd/scripts/check_capacity_recovery.py --cli ${NVCF_CLI} --cli-config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml --state-file ${HOME}/.nvcf-cli.nvcf-cli-local.state --context k3d-ncp-local --backend ncp-local --agent-version ${CAPACITY_NVCA_AGENT_VERSION} --discovery-mode <discovery_mode> --image nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/load_tester_supreme:0.0.8 --gpu H100 --instance-type NCP.GPU.H100_1x --region us-west-1 --account nvcf-default --api-url http://127.0.0.1:8080 --icms-host sis.localhost --expected-capacity 4 --publication-timeout 60 --recovery-timeout 180 --output-dir ${REPO_ROOT}/tests/bdd/out
         """
       Then the command output should contain "capacity recovery passed"
+
+      Examples:
+        | discovery_mode | static_capacity |
+        | dynamic        | 0               |
+        | static         | 4               |
 
     @function-lifecycle @helm-function
     Scenario: Operator sees a Helm function without resource limits fail

@@ -255,13 +255,16 @@ func TestCapacityHeartbeatNoGPUsAndRecovery(t *testing.T) {
 
 func TestCapacityHeartbeatPeriodicUsesWarmHealthOnDiscoveryError(t *testing.T) {
 	ctx := newTestContext()
-	a, _, _, _, _ := newCapacityTestAgent(t)
+	a, requests, _, req, _ := newCapacityTestAgent(t)
+	require.NoError(t, requests.Delete(req))
 	icms := a.icmsClient.(*mockICMSClient)
 	require.NoError(t, a.PutNVCAStatusUpdate(ctx))
 	a.backendk8scache.nfClient.(*capacityNodeFeatures).err = errors.New("discovery unavailable")
 	require.NoError(t, a.PutNVCAStatusUpdate(ctx))
 	require.Len(t, icms.healthStatusRequests, 2)
 	require.Equal(t, icms.healthStatusRequests[0].GPUUsage, icms.healthStatusRequests[1].GPUUsage)
+	require.Equal(t, types.HealthStatusUnhealthy, icms.healthStatusRequests[1].Status,
+		"cached free capacity must not keep a failed discovery healthy")
 	require.Error(t, a.putNVCAStatusUpdate(ctx, true))
 	require.Len(t, icms.healthStatusRequests, 2)
 }
