@@ -50,13 +50,13 @@ import io.opentelemetry.api.OpenTelemetry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import net.javacrumbs.shedlock.core.ClockProvider;
 import net.javacrumbs.shedlock.core.DefaultLockingTaskExecutor;
-import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockConfiguration;
 import net.javacrumbs.shedlock.core.LockExtender;
 import net.javacrumbs.shedlock.core.LockProvider;
@@ -72,6 +72,7 @@ import org.springframework.data.cassandra.core.CassandraTemplate;
 import org.springframework.data.cassandra.core.DeleteOptions;
 import org.springframework.data.cassandra.core.InsertOptions;
 import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
 @ExtendWith(IntegrationTestConfiguration.TestCleanerExtension.class)
 @AutoConfigureTestRestTemplate
@@ -101,6 +102,8 @@ class KeysByAccountIndexMigrationIntegrationTest {
     private AdminFacade adminFacade;
     @Autowired
     private ScheduledTaskService scheduler;
+    @MockitoSpyBean
+    private KeysByAccountIndexMigrationTask migrationTask;
     @Autowired
     private EncryptedModelConverter<KeyByOwnerAndServiceModel, KeyByOwnerAndServiceVo> ownerConverter;
     @Autowired
@@ -468,7 +471,8 @@ class KeysByAccountIndexMigrationIntegrationTest {
 
     @Test
     void markerHasNoTtlAndDeletionIsObservedWithoutCaching() {
-        task(dao).run(() -> { });
+        var task = task(dao);
+        task.run(() -> { });
         assertThat(completed()).isTrue();
         var row = session.execute("SELECT TTL(updated_at) AS ttl FROM row_update_lock "
                 + "WHERE table_name=? AND record_key=?", KeysByAccountIndexMigrationTask.MARKER_TABLE,
@@ -479,7 +483,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         session.execute("DELETE FROM row_update_lock WHERE table_name=? AND record_key=?",
                 KeysByAccountIndexMigrationTask.MARKER_TABLE, KeysByAccountIndexMigrationTask.MARKER_RECORD);
         assertThat(completed()).isFalse();
-        task(dao).run(() -> { });
+        task.run(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -520,29 +524,26 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     @Test
-    void schedulerUsesCassandraLockAndExtendsItBetweenPages() throws InterruptedException {
-        scheduler.keysByAccountIndexCopy();
-        assertThat(completed()).isTrue();
-        var executor = new DefaultLockingTaskExecutor(lockProvider);
-        var ran = new AtomicBoolean();
-        executor.executeWithLock((Runnable) () -> {
-            LockAssert.assertLocked();
-            var before = session.execute("SELECT lockuntil FROM lock WHERE name=?", "contention-test")
+    void schedulerExtendsItsCassandraLockDuringMigration() throws InterruptedException {
+        var lockTime = Instant.now().truncatedTo(ChronoUnit.MILLIS);
+        doAnswer(call -> {
+            var before = session.execute("SELECT lockuntil FROM lock WHERE name=?", "keys-by-account-index-copy")
                     .one().getInstant("lockuntil");
-            LockExtender.extendActiveLock(Duration.ofMinutes(10), Duration.ZERO);
-            var after = session.execute("SELECT lockuntil FROM lock WHERE name=?", "contention-test")
+            // Advance ShedLock's clock so renewal must move the persisted deadline forward.
+            ClockProvider.setClock(Clock.fixed(lockTime.plusSeconds(1), ZoneOffset.UTC));
+            call.callRealMethod();
+            var after = session.execute("SELECT lockuntil FROM lock WHERE name=?", "keys-by-account-index-copy")
                     .one().getInstant("lockuntil");
             assertThat(after).isAfter(before);
-            var contender = lockProvider.lock(new LockConfiguration(Instant.now(), "contention-test",
-                    Duration.ofMinutes(1), Duration.ZERO));
-            assertThat(contender).isEmpty();
-            ran.set(true);
-        }, new LockConfiguration(Instant.now(), "contention-test", Duration.ofMinutes(1), Duration.ZERO));
-        assertThat(ran).isTrue();
-        var next = lockProvider.lock(new LockConfiguration(Instant.now(), "contention-test",
-                Duration.ofMinutes(1), Duration.ZERO));
-        assertThat(next).isPresent();
-        next.orElseThrow().unlock();
+            return null;
+        }).when(migrationTask).run(any(Runnable.class));
+        ClockProvider.setClock(Clock.fixed(lockTime, ZoneOffset.UTC));
+        try {
+            scheduler.keysByAccountIndexCopy();
+        } finally {
+            ClockProvider.setClock(Clock.systemUTC());
+        }
+        assertThat(completed()).isTrue();
     }
 
     private KeysByAccountIndexMigrationTask task(KeysByAccountIndexMigrationDao migrationDao) {
