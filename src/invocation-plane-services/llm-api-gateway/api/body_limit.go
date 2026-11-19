@@ -28,11 +28,16 @@ import (
 
 // bufferRequestBody reads the request body up to limit bytes and replaces it
 // with the buffered copy, so later readers never see more than limit bytes. It
-// returns 413 for larger bodies. A limit of zero or less disables the check.
+// returns 413 for larger bodies. A limit of zero or less disables the size check,
+// but the body is still read here so a read failure is handled in one place.
 // Read failures keep the cause internal; a timed-out read returns 408.
 func bufferRequestBody(req *http.Request, limit int64) error {
-	if limit <= 0 || req == nil || req.Body == nil || req.Body == http.NoBody {
+	if req == nil || req.Body == nil || req.Body == http.NoBody {
 		return nil
+	}
+	if limit <= 0 {
+		_, err := captureRequestBody(req)
+		return err
 	}
 	if req.ContentLength > limit {
 		return echo.ErrStatusRequestEntityTooLarge

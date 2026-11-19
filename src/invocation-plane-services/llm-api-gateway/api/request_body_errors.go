@@ -51,7 +51,15 @@ func requireJSONBody(req *http.Request, body []byte) error {
 		return err
 	}
 	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+	if len(trimmed) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "request body must be a JSON object")
+	}
+	// The binder decodes only the first JSON value, so trailing data would
+	// otherwise reach routing.
+	if !json.Valid(trimmed) {
+		return echo.NewHTTPError(http.StatusBadRequest, "request body must be valid JSON")
+	}
+	if trimmed[0] != '{' {
 		return echo.NewHTTPError(http.StatusBadRequest, "request body must be a JSON object")
 	}
 	return nil
@@ -76,16 +84,22 @@ func requestDecodeError(err error) error {
 }
 
 func requestDecodeMessage(err error) string {
+	return jsonDecodeMessage(err, "request body", "")
+}
+
+// jsonDecodeMessage describes why subject failed to decode. fieldPrefix
+// qualifies field names when subject is nested in a larger request.
+func jsonDecodeMessage(err error, subject, fieldPrefix string) string {
 	var typeErr *json.UnmarshalTypeError
 	var syntaxErr *json.SyntaxError
 	switch {
 	case errors.As(err, &typeErr):
 		if typeErr.Field == "" {
-			return "request body must be a JSON object"
+			return subject + " must be a JSON object"
 		}
-		return fmt.Sprintf("field %q must be %s", typeErr.Field, jsonTypeDescription(typeErr.Type))
+		return fmt.Sprintf("field %q must be %s", fieldPrefix+typeErr.Field, jsonTypeDescription(typeErr.Type))
 	case errors.As(err, &syntaxErr), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
-		return "request body must be valid JSON"
+		return subject + " must be valid JSON"
 	}
 	// Remaining errors come from the request models' own validation.
 	for {

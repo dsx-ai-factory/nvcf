@@ -19,6 +19,7 @@ package api
 
 import (
 	"encoding/json"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,8 @@ func TestJSONRoutesDescribeBadBodiesWithoutInternals(t *testing.T) {
 		{name: "number body", path: "/v1/chat/completions", body: "42", wantStatus: http.StatusBadRequest, wantMessage: "request body must be a JSON object"},
 		{name: "trailing comma", path: "/v1/chat/completions", body: `{"model":"fn-alpha/company/model",}`, wantStatus: http.StatusBadRequest, wantMessage: "request body must be valid JSON"},
 		{name: "truncated", path: "/v1/chat/completions", body: `{"model":`, wantStatus: http.StatusBadRequest, wantMessage: "request body must be valid JSON"},
+		{name: "trailing data", path: "/v1/chat/completions", body: `{"model":"fn-alpha/company/model","messages":[{"role":"user","content":"hi"}]}x`, wantStatus: http.StatusBadRequest, wantMessage: "request body must be valid JSON"},
+		{name: "embeddings trailing data", path: "/v1/embeddings", body: `{}x`, wantStatus: http.StatusBadRequest, wantMessage: "request body must be valid JSON"},
 		{
 			name:        "negative max_tokens",
 			path:        "/v1/chat/completions",
@@ -116,7 +119,6 @@ func (deadlineReader) Read([]byte) (int, error) {
 func TestTimedOutBodyReadReturns408WithoutAddresses(t *testing.T) {
 	t.Parallel()
 
-	// A zero limit skips the middleware buffer, so the handler's own read fails.
 	for _, limit := range []int64{8, 0} {
 		handlerBody := "not called"
 		e := newBodyLimitAPI(limit, &handlerBody)
@@ -130,5 +132,29 @@ func TestTimedOutBodyReadReturns408WithoutAddresses(t *testing.T) {
 		require.Contains(t, rec.Body.String(), "timed out reading request body")
 		require.NotContains(t, rec.Body.String(), "10.0.0.1")
 		require.Equal(t, "not called", handlerBody)
+	}
+}
+
+func TestSpeechToSpeechFieldErrorsNameTheField(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		field       string
+		value       string
+		wantMessage string
+	}{
+		{name: "type mismatch", field: "llm", value: `{"model":42}`, wantMessage: `field "llm.model" must be a string`},
+		{name: "malformed", field: "tts", value: `{"voice":`, wantMessage: "`tts` field must be valid JSON"},
+		{name: "not an object", field: "stt", value: `[]`, wantMessage: "`stt` field must be a JSON object"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			form := &multipart.Form{Value: map[string][]string{tt.field: {tt.value}}}
+			_, err := parseSpeechToSpeechRequest(form)
+			require.EqualError(t, err, tt.wantMessage)
+		})
 	}
 }
