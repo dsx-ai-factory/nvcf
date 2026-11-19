@@ -292,7 +292,7 @@ class KeysByAccountIndexMigrationTaskTest {
     void renewalUsesElapsedTimeAndThrottlesRepeatedChecks() {
         var nanos = new AtomicLong(-Duration.ofSeconds(5).toNanos());
         var extensions = new AtomicInteger();
-        var renewal = new KeysByAccountIndexMigrationScheduler.LockRenewal(
+        var renewal = new ScheduledTaskService.LockRenewal(
                 extensions::incrementAndGet, Duration.ofSeconds(1), nanos::get);
         renewal.run();
         for (var i = 0; i < 500; i++) {

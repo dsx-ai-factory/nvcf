@@ -100,7 +100,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
     @Autowired
     private AdminFacade adminFacade;
     @Autowired
-    private KeysByAccountIndexMigrationScheduler scheduler;
+    private ScheduledTaskService scheduler;
     @Autowired
     private EncryptedModelConverter<KeyByOwnerAndServiceModel, KeyByOwnerAndServiceVo> ownerConverter;
     @Autowired
@@ -638,7 +638,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         }).when(racing).credential(anyString());
         var executor = new DefaultLockingTaskExecutor(lockProvider);
         executor.executeWithLock((Runnable) () -> {
-            var renewal = new KeysByAccountIndexMigrationScheduler.LockRenewal(() -> {
+            var renewal = new ScheduledTaskService.LockRenewal(() -> {
                 var before = session.execute("SELECT lockuntil FROM lock WHERE name=?", "slow-page-test")
                         .one().getInstant("lockuntil");
                 LockExtender.extendActiveLock(Duration.ofMinutes(1), Duration.ZERO);
@@ -659,8 +659,8 @@ class KeysByAccountIndexMigrationIntegrationTest {
     }
 
     @Test
-    void schedulerUsesCassandraLockAndExtendsItBetweenPages() {
-        scheduler.run();
+    void schedulerUsesCassandraLockAndExtendsItBetweenPages() throws InterruptedException {
+        scheduler.keysByAccountIndexCopy();
         assertThat(completed()).isTrue();
         var executor = new DefaultLockingTaskExecutor(lockProvider);
         var ran = new AtomicBoolean();

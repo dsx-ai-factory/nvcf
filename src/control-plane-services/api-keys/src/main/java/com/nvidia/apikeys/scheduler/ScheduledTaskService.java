@@ -19,36 +19,51 @@ package com.nvidia.apikeys.scheduler;
 
 import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.LongSupplier;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.core.LockExtender;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.ApplicationListener;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+@Slf4j
 @Service
 @EnableScheduling
 @RequiredArgsConstructor
-@ConditionalOnProperty(prefix = "account-index-migration",
+@ConditionalOnProperty(prefix = "apikeys.scheduler",
         name = "enabled", havingValue = "true", matchIfMissing = true)
-public class KeysByAccountIndexMigrationScheduler {
+public class ScheduledTaskService implements ApplicationListener<ApplicationReadyEvent> {
+    private static final String KEYS_BY_ACCOUNT_INDEX_COPY = "keys-by-account-index-copy";
+    private final CountDownLatch initialised = new CountDownLatch(1);
     private final KeysByAccountIndexMigrationTask task;
     private final KeysByAccountIndexMigrationProperties properties;
 
+    @Override
+    public void onApplicationEvent(ApplicationReadyEvent event) {
+        initialised.countDown();
+    }
+
     @Scheduled(initialDelayString = "${account-index-migration.initial-delay:PT30M}",
             fixedDelayString = "${account-index-migration.fixed-delay:PT5M}")
-    @SchedulerLock(name = "keys-by-account-index-copy",
+    @SchedulerLock(name = KEYS_BY_ACCOUNT_INDEX_COPY,
             lockAtLeastFor = "${account-index-migration.lock-at-least-for:PT1S}",
             lockAtMostFor = "${account-index-migration.lock-at-most-for:PT5M}")
-    public void run() {
+    public void keysByAccountIndexCopy() throws InterruptedException {
+        initialised.await();
         LockAssert.assertLocked();
+        log.debug("Begin task: '{}'", KEYS_BY_ACCOUNT_INDEX_COPY);
         var atMost = properties.getLockAtMostFor();
         var atLeast = properties.getLockAtLeastFor();
         task.run(new LockRenewal(() -> LockExtender.extendActiveLock(atMost, atLeast),
                 atMost.dividedBy(3), System::nanoTime));
+        log.debug("End task: '{}'", KEYS_BY_ACCOUNT_INDEX_COPY);
     }
 
     static final class LockRenewal implements Runnable {
