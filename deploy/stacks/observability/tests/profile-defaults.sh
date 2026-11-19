@@ -309,6 +309,8 @@ for profile in control compute all; do
     "$profile targetAllocator.enabled"
   assert_yaml_value "$collector_values" '.targetAllocatorRbac.create' true \
     "$profile targetAllocatorRbac.create"
+  assert_yaml_value "$collector_values" '.replicas' 1 \
+    "$profile collector replicas default"
   assert_yaml_value "$collector_values" \
     '.config.exporters.prometheusremotewrite.endpoint' \
     'http://vmsingle.monitoring.svc.cluster.local:8428/api/v1/write' \
@@ -577,6 +579,29 @@ NVCF_TARGET_ALLOCATOR_ROLE="$collector_name-otel" yq -e '
   .rules[] | select(.apiGroups[] == "") | .resources[] | select(. == "secrets")
 ' "$work_dir/collector-manifests.yaml" >/dev/null ||
   fail "Target Allocator RBAC must allow referenced Secret discovery"
+assert_yaml_value "$work_dir/collector-manifests.yaml" \
+  'select(.kind == "OpenTelemetryCollector") | .spec.replicas' 1 \
+  'collector CR replicas default'
+
+# collector.replicas reaches the OpenTelemetryCollector resource.
+replicas_values="$work_dir/collector-replicas-values.yaml"
+write_release_values control otel-collector "$replicas_values" \
+  --state-values-set collector.replicas=2
+assert_yaml_value "$replicas_values" '.replicas' 2 'collector.replicas override'
+helm template otel-collector "$stack_dir/charts/nvcf-otel-collector" \
+  --values "$replicas_values" >"$work_dir/collector-replicas-manifests.yaml"
+assert_yaml_value "$work_dir/collector-replicas-manifests.yaml" \
+  'select(.kind == "OpenTelemetryCollector") | .spec.replicas' 2 \
+  'collector CR replicas override'
+
+# Without a stack-owned collector, collector.replicas is not checked.
+assert_equal "$(profile_releases_csv control \
+  --state-values-set=observability.components.collector.mode=disabled \
+  --state-values-set=observability.components.targetAllocator.mode=disabled \
+  --state-values-set=observability.components.discoveryRbac.mode=disabled \
+  --state-values-set=collector.replicas=0)" \
+  'default-monitors,opentelemetry-operator,prometheus-operator-crds,victoria-metrics' \
+  'collector.replicas ignored without a stack-owned collector'
 
 # Every supported external authentication mode must pass validation and retain
 # the external collector endpoint. Autoscaler-specific auth values are covered
@@ -724,6 +749,9 @@ validation_cases=(
   'existing-collector-installed-target|observability.components.targetAllocator.mode=install requires observability.components.collector.mode=install|--state-values-set=observability.profile=compute --state-values-set=observability.components.collector.mode=existing --state-values-set=observability.components.targetAllocator.mode=install'
   'existing-collector-installed-rbac|observability.components.discoveryRbac.mode=install requires observability.components.collector.mode=install|--state-values-set=observability.profile=compute --state-values-set=observability.components.collector.mode=existing --state-values-set=observability.components.targetAllocator.mode=existing --state-values-set=observability.components.discoveryRbac.mode=install'
   'target-without-rbac|observability.components.discoveryRbac.mode cannot be disabled when the Target Allocator is installed|--state-values-set=observability.profile=compute --state-values-set=observability.components.discoveryRbac.mode=disabled'
+  'zero-collector-replicas|collector.replicas must be an integer of at least 1|--state-values-set=observability.profile=control --state-values-set=collector.replicas=0'
+  'non-numeric-collector-replicas|collector.replicas must be an integer of at least 1|--state-values-set=observability.profile=control --state-values-set-string=collector.replicas=abc'
+  'boolean-collector-replicas|collector.replicas must be an integer of at least 1|--state-values-set=observability.profile=control --state-values-set=collector.replicas=true'
   'invalid-auth-mode|metricsBackend.authentication.mode must be none, token, or mtls|--state-values-set=observability.profile=compute --state-values-set=metricsBackend.authentication.mode=invalid'
   'bundled-external-type|metricsBackend.type must be victoriaMetrics when metricsBackend.mode=install|--state-values-set=observability.profile=compute --state-values-set=metricsBackend.type=external'
   'bundled-auth|metricsBackend.authentication.mode must be none when metricsBackend.mode=install|--state-values-set=observability.profile=compute --state-values-set=metricsBackend.authentication.mode=token'
