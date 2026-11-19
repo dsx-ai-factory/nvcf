@@ -4076,6 +4076,40 @@ mod tests {
             .await;
         let measured = evaluate();
         assert_eq!(measured.result_label(), "rejected", "{measured:?}");
+
+        // A calibration fallback replaces the generation with one at the seed.
+        assert!(runtime.retire_generation(&generation).is_some());
+        assert!(
+            collector
+                .handle
+                .control()
+                .retire_generation(&generation)
+                .await
+                .expect("collector should acknowledge retirement")
+        );
+        let fallback = ModelGeneration::new("model-a", 1);
+        assert!(runtime.begin_generation(fallback.clone()));
+        assert!(
+            collector
+                .handle
+                .control()
+                .begin_generation(
+                    fallback.clone(),
+                    ModelStatsInitialization::ConfiguredInputTps { input_tps: 100.0 }
+                )
+                .await
+                .expect("collector should acknowledge the fallback generation")
+        );
+        let _fallback_burst = runtime.track_request(&required("fallback-burst", 30_000));
+        let fallback_incoming = required("fallback-incoming", 144);
+        let _fallback_incoming = runtime.track_request(&fallback_incoming);
+        let reopened = runtime.evaluate_generation_queue_admission(
+            &crate::PylonQueueMismatchRetryConfig::default(),
+            &fallback_incoming,
+            Some(&fallback),
+            &headers,
+        );
+        assert_eq!(reopened.result_label(), "unmeasured_rate", "{reopened:?}");
         collector.handle.shutdown().await;
     }
 

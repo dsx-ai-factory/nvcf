@@ -393,7 +393,7 @@ impl PylonRuntimeState {
             tracing::info!(
                 model_id = generation.model_id(),
                 input_tps = observed_stats.last_mean_input_tps,
-                "model input TPS measured; queue mismatch check applies"
+                "model input TPS measured; seeded rate replaced"
             );
         }
         self.registration_changes.notify();
@@ -1102,7 +1102,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.fields.get("message").map(String::as_str)
-                    == Some("model input TPS measured; queue mismatch check applies")
+                    == Some("model input TPS measured; seeded rate replaced")
             })
             .collect::<Vec<_>>();
         assert_eq!(measured.len(), 1, "{events:?}");
