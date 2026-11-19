@@ -375,7 +375,7 @@ impl PylonRuntimeState {
         generation: &ModelGeneration,
         stats: CurrentModelStats,
     ) -> bool {
-        let observed_stats = {
+        let (observed_stats, measured_after_seed) = {
             let mut advertised = self.advertised.lock();
             let Some(model) = advertised.current_mut(generation) else {
                 return false;
@@ -385,9 +385,17 @@ impl PylonRuntimeState {
                 stats.last_mean_input_tps,
                 stats.input_tps_from_seed,
             );
+            let measured_after_seed = model.stats.input_tps_from_seed && !stats.input_tps_from_seed;
             model.stats = stats;
-            model.stats.clone()
+            (model.stats.clone(), measured_after_seed)
         };
+        if measured_after_seed {
+            tracing::info!(
+                model_id = generation.model_id(),
+                input_tps = observed_stats.last_mean_input_tps,
+                "model input TPS measured; queue mismatch check applies"
+            );
+        }
         self.registration_changes.notify();
         if let Some(metrics) = &self.metrics {
             metrics.observe_model_stats(generation.model_id(), &observed_stats);
@@ -803,8 +811,8 @@ mod tests {
     use stargate_proto::pb::InferenceServerStatus;
 
     use super::{
-        ModelGeneration, OutputCalibrationFacts, PylonRuntimeState, RequestGenerationAdmission,
-        RequestObservationEvent,
+        CurrentModelStats, ModelGeneration, OutputCalibrationFacts, PylonRuntimeState,
+        RequestGenerationAdmission, RequestObservationEvent,
     };
     use crate::PylonMetrics;
     use crate::request_observer::{
@@ -1070,6 +1078,37 @@ mod tests {
         });
 
         assert_drop_warning(&subscriber, "req-dropped-disconnected", "disconnected");
+    }
+
+    #[test]
+    fn first_measured_input_tps_after_the_seed_logs_once() {
+        let runtime_state =
+            PylonRuntimeState::new(InferenceServerStatus::Active, &["model-a".to_string()]);
+        let stats = |last_mean_input_tps, input_tps_from_seed| CurrentModelStats {
+            last_mean_input_tps,
+            input_tps_from_seed,
+            ..CurrentModelStats::default()
+        };
+        let subscriber = RecordingTracingSubscriber::default();
+        tracing::subscriber::with_default(subscriber.clone(), || {
+            runtime_state.set_model_stats("model-a", stats(100.0, true));
+            runtime_state.set_model_stats("model-a", stats(100.0, true));
+            runtime_state.set_model_stats("model-a", stats(517.0, false));
+            runtime_state.set_model_stats("model-a", stats(1_350.0, false));
+        });
+
+        let events = subscriber.events();
+        let measured = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("model input TPS measured; queue mismatch check applies")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(measured.len(), 1, "{events:?}");
+        assert_eq!(measured[0].level, tracing::Level::INFO);
+        assert_tracing_event_field(measured[0], "model_id", "model-a");
+        assert_tracing_event_field(measured[0], "input_tps", "517.0");
     }
 
     #[test]
