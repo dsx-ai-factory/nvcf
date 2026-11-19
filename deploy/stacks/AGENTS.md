@@ -31,6 +31,9 @@ For every dependency change:
 2. Give an optional release an explicit condition and inventory render profile.
 3. Update the owning stack's `release-inventory.yaml`.
 4. Add registry and repository overrides for images that customers must mirror.
+   Declare every image registry and repository in the stack's
+   `environments/base.yaml`, with no literal default in a `.gotmpl` file.
+   `TestStackImageSources` in `tools/docs-version-sync` enforces this.
 5. Record images that do not appear in rendered Kubernetes `image` fields.
 6. Update the artifact classification in `docs/version-catalog/main.yaml`.
 7. If the change alters which trains of another stack this stack works with,
