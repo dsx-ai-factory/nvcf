@@ -63,7 +63,7 @@ func (h *OpenAIProxyHandlers) handleAudioToTextProxy(ec echo.Context, translatio
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
@@ -176,7 +176,7 @@ func (h *OpenAIProxyHandlers) SpeechToSpeech(ec echo.Context) error {
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
