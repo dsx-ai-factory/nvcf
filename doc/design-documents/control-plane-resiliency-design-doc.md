@@ -313,7 +313,7 @@ Confirms the live cluster actually meets the HA guarantee for the intended mode.
 
 The invariants:
 
-- **Minimum replicas per role:** in-convention Tier-1 Deployments have `spec.replicas` ≥ 2 and Ready ≥ 2, including grpc-proxy and invocation-service when they use per-pod callback addresses or the worker callback proxy; invocation-service with a fixed worker callback URL, or grpc-proxy with one and HTTP/3 off, is exactly 1; Tier-2 StatefulSets are 3 Ready. The validator does not yet check the worker callback proxy's own replicas.
+- **Minimum replicas per role:** in-convention Tier-1 Deployments have `spec.replicas` ≥ 2 and Ready ≥ 2, including grpc-proxy and invocation-service when they use per-pod callback addresses or the worker callback proxy; invocation-service with a fixed worker callback URL, or grpc-proxy with one and HTTP/3 off, is exactly 1; Tier-2 StatefulSets are 3 Ready. Today the Tier-1 row checks only that Ready matches `spec.replicas`; the ≥2 floor per mode comes with the HA Guarantee row ([#2546](https://github.com/NVIDIA/nvcf/pull/2546)), which does not yet cover the worker callback proxy.
 - **PDBs:** present with the correct floor (`minAvailable: 1` stateless; one-disruption for quorum).
 - **Effective placement:** hostname anti-affinity present; zone `topologySpreadConstraints` present (and hard under `enforced`); nodes labelled `topology.kubernetes.io/zone`.
 - **Degraded-guarantee reporting:** flags any workload whose effective objects fall below what the intended mode requires (e.g. `mode: enforced` but `api` effective `replicaCount: 1`, a missing PDB, or anti-affinity removed by an escape hatch).
