@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+script="$repo/tools/ci/configure-java-runtime"
+fixture="$(mktemp -d)"
+trap 'rm -rf "$fixture"' EXIT
+mkdir -p "$fixture/home"
+env_file="$fixture/github-env"
+bazelrc="$fixture/home/.bazelrc"
+
+# Preserve caller options and a pre-existing rc file without a final newline.
+printf 'build --color=no' > "$bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" \
+    JAVA_TOOL_OPTIONS='-Dfixture=preserved -XX:+UseBASE64Intrinsics' \
+    bash "$script" >/dev/null
+options="$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)"
+[[ "$options" == '-Dfixture=preserved -XX:+UseBASE64Intrinsics -XX:-UseBASE64Intrinsics' ]]
+grep -Fxq 'build --color=no' "$bazelrc"
+echo 'ok   preserves caller options and existing Bazel settings'
+
+# Calling the helper again must not grow the rc file or repeat the last flag.
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+[[ "$(sed -n 's/^JAVA_TOOL_OPTIONS=//p' "$env_file" | tail -1)" == "$options" ]]
+echo 'ok   repeated setup is idempotent'
+
+# A multiline value must not inject extra GitHub environment entries or make
+# any partial changes to the rc/environment files.
+cp "$env_file" "$fixture/first.env"
+for invalid in $'value\nINJECTED=true' $'value\rINJECTED=true'; do
+    if env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$invalid" \
+        bash "$script" >"$fixture/output" 2>&1; then
+        echo 'FAIL multiline options were accepted' >&2
+        exit 1
+    fi
+    cmp "$env_file" "$fixture/first.env"
+    cmp "$bazelrc" "$fixture/first.bazelrc"
+done
+echo 'ok   rejects environment-file injection before writing'
+
+if env -u GITHUB_ENV HOME="$fixture/home" bash "$script" >"$fixture/output" 2>&1; then
+    echo 'FAIL missing GitHub environment file was accepted' >&2
+    exit 1
+fi
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   requires a GitHub Actions environment file'

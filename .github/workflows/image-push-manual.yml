@@ -159,6 +159,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure CI Java runtime options
+        run: bash tools/ci/configure-java-runtime
+
       # actions/checkout runs on the runner host; this job's steps run inside
       # the bazel-ci container, which mounts that checkout under a different
       # UID. Since git 2.35.2 (CVE-2022-24765) git refuses to operate on a

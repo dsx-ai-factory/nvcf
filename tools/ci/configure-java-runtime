@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Temporary CI mitigation until all Java runtimes use qualified patched JDKs.
+set -euo pipefail
+
+: "${GITHUB_ENV:?GITHUB_ENV must point to the GitHub Actions environment file}"
+: "${HOME:?HOME must be set for the Bazel user configuration}"
+
+java_options="${JAVA_TOOL_OPTIONS:-}"
+case "$java_options" in
+    *$'\n'* | *$'\r'*)
+        echo "configure-java-runtime: JAVA_TOOL_OPTIONS must be a single line" >&2
+        exit 1
+        ;;
+esac
+if [[ ! "$java_options" =~ (^|[[:space:]])-XX:-UseBASE64Intrinsics[[:space:]]*$ ]]; then
+    java_options="${java_options:+$java_options }-XX:-UseBASE64Intrinsics"
+fi
+printf 'JAVA_TOOL_OPTIONS=%s\n' "$java_options" >> "$GITHUB_ENV"
+
+# Bazel clears Java option variables before starting its server. Execution
+# actions also use a separate environment, including compiler/toolchain JVMs.
+bazelrc="${HOME}/.bazelrc"
+touch "$bazelrc"
+added_header=false
+while IFS= read -r option; do
+    if ! grep -Fxq -- "$option" "$bazelrc"; then
+        if [[ "$added_header" == false ]]; then
+            printf '\n# Temporary CI JVM mitigation.\n' >> "$bazelrc"
+            added_header=true
+        fi
+        printf '%s\n' "$option" >> "$bazelrc"
+    fi
+done <<'EOF'
+startup --host_jvm_args=-XX:-UseBASE64Intrinsics
+build --host_jvmopt=-XX:-UseBASE64Intrinsics
+build --jvmopt=-XX:-UseBASE64Intrinsics
+build --action_env=JAVA_TOOL_OPTIONS
+build --host_action_env=JAVA_TOOL_OPTIONS
+test --test_env=JAVA_TOOL_OPTIONS
+EOF
+
+echo "Configured CI JVM options for Bazel servers, actions and tests."

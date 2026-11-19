@@ -93,6 +93,7 @@ jobs:
           bash tools/ci/test-bazel-remote-probe
           bash tools/ci/test-bazel-lock-touches-java
           python3 tools/ci/test-bazel-lock-touches-java-properties
+          bash tools/scripts/test/test-configure-java-runtime
           python3 -m unittest discover -s src/libraries/rust/stargate/scripts -p 'test_compatibility_scope.py'
 
       - name: Compute changed subtrees
@@ -299,6 +300,8 @@ jobs:
             rules/java/
             tools/bazel/java/
             tools/ci/stage-bazel-java-artifacts
+            tools/ci/configure-java-runtime
+            tools/scripts/test/test-configure-java-runtime
           )
           # Two of these globs fire far more often than they carry Java
           # meaning, so a path hit on them is confirmed against content before
@@ -616,6 +619,9 @@ jobs:
           # Full history so the root row can diff a PR against its base to
           # compute affected targets (see "Determine build targets").
           fetch-depth: 0
+
+      - name: Configure CI Java runtime options
+        run: bash tools/ci/configure-java-runtime
 
       # A subtree can be selected but not yet have its Bazel scaffold on
       # the mirror (its upstream OSS-flip MR is still open, or the
@@ -1113,6 +1119,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
+      - name: Configure CI Java runtime options
+        run: bash tools/ci/configure-java-runtime
       - name: Install bazelisk
         run: |
           sudo curl -fsSLo /usr/local/bin/bazel \
