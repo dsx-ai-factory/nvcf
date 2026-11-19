@@ -708,6 +708,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		Options: &godog.Options{
 			Format: "pretty",
 			Paths:  []string{featurePath},
+			Tags:   "~@capacity-recovery",
 			Strict: true,
 			Output: &out,
 		},
@@ -821,7 +822,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
-	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 13)
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
 	for _, key := range []string{"early", "late"} {
 		if !requestBody.seen[key] {
 			t.Errorf("vanity request body scenario never sent the %s-field request", key)
@@ -3245,8 +3246,15 @@ func TestCapacityRecoveryTagsSelectInstallationAndReuse(t *testing.T) {
 			Output: &output,
 		},
 	}.Run()
-	if status != 1 || len(selected) != 5 {
-		t.Fatalf("expected five installation and reuse scenarios, got status=%d scenarios=%v\n%s",
+	want := []string{
+		"Operator validates the authored Helmfile environment renders",
+		"Operator installs the control plane through the local Helmfile environment",
+		"Operator registers the local cluster and installs the NVCA operator",
+		"Operator invokes the Load Tester Supreme sample function through default and vanity endpoints",
+		"Operator recovers a worker before the next periodic heartbeat with no spare capacity",
+	}
+	if status != 1 || !slices.Equal(selected, want) {
+		t.Fatalf("expected installation and saturated recovery scenarios, got status=%d scenarios=%v\n%s",
 			status, selected, output.String())
 	}
 }
@@ -3256,6 +3264,9 @@ func TestCapacityRecoveryTagsSelectInstallationAndReuse(t *testing.T) {
 func TestSingleClusterCapacityRecovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
+	}
+	if os.Getenv("CAPACITY_NVCA_AGENT_VERSION") == "" {
+		t.Fatal("set CAPACITY_NVCA_AGENT_VERSION to the candidate image tag built from the revision under test")
 	}
 	runLiveFeatureTags(t, "single-cluster-helmfile.feature", capacityRecoveryTags)
 }
@@ -3270,7 +3281,7 @@ func TestSingleClusterHelmfile(t *testing.T) {
 		t.Setenv(sampleLLMEchoImageEnv, "nvcr.io/"+os.Getenv("SAMPLE_NGC_ORG")+"/"+os.Getenv("SAMPLE_NGC_TEAM")+"/"+sampleLLMEchoDefaultImage)
 	}
 	tags := singleClusterHelmfileTags()
-	if tags != "" {
+	if os.Getenv(sampleLLMDecisionsImageEnv) == "" {
 		t.Logf("%s is not set, so the @llm-decision-routes scenarios are skipped", sampleLLMDecisionsImageEnv)
 	}
 	runLiveFeatureTags(t, "single-cluster-helmfile.feature", tags)
@@ -3282,13 +3293,13 @@ func TestSingleClusterHelmfile(t *testing.T) {
 // only when an operator sets this variable.
 const sampleLLMDecisionsImageEnv = "SAMPLE_LLM_DECISIONS_IMAGE"
 
-// singleClusterHelmfileTags excludes the decision route scenarios unless
-// SAMPLE_LLM_DECISIONS_IMAGE is set.
+// singleClusterHelmfileTags keeps candidate-only capacity validation in its
+// dedicated suite and excludes decision routes unless their sample is set.
 func singleClusterHelmfileTags() string {
 	if os.Getenv(sampleLLMDecisionsImageEnv) == "" {
-		return "~@llm-decision-routes"
+		return "~@llm-decision-routes && ~@capacity-recovery"
 	}
-	return ""
+	return "~@capacity-recovery"
 }
 
 // sampleLLMEchoImageEnv selects the OpenAI-compatible sample the LLM

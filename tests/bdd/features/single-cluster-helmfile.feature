@@ -323,28 +323,23 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       # scenario's deployment at once.
       And I successfully undeploy the function selected by NVCF CLI
 
-    # Reuse the function undeployed above. The timeout is shorter than the
-    # default heartbeat interval, so replacement capacity must arrive promptly.
-    @function-lifecycle @capacity-recovery
-    Scenario: Operator reuses released capacity for the same function
-      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
-
-      When I successfully deploy the function selected by NVCF CLI with options:
-        | option          | value           |
-        | --gpu           | H100            |
-        | --instance-type | NCP.GPU.H100_1x  |
-        | --backend       | ncp-local       |
-        | --regions       | us-west-1       |
-        | --min-instances | 1               |
-        | --max-instances | 1               |
-        | --timeout       | 180             |
-
-      When I successfully invoke the function selected by NVCF CLI over HTTP with timeout "120" seconds and poll duration "5" seconds:
+    # This focused check requires an explicitly built candidate image. It fills
+    # the four simulated GPUs with independent min=max=1 functions, verifies a
+    # fresh occupied heartbeat, then deletes one worker with five-second grace.
+    @capacity-recovery
+    Scenario: Operator recovers a worker before the next periodic heartbeat with no spare capacity
+      Given environment variable "CAPACITY_NVCA_AGENT_VERSION" is set
+      And I update yaml file "deploy/stacks/nvcf-compute-plane/environments/local-bdd.yaml" with keys:
+        | global.nvcaOperator.selfManaged.nvcaVersion | ${CAPACITY_NVCA_AGENT_VERSION} |
+      When I successfully run command:
         """
-        {"message":"bdd-echo","repeats":1}
+        make -C deploy/stacks/nvcf-compute-plane install CLUSTER_NAME=ncp-local HELMFILE_ENV=local-bdd NVCF_CLI=${NVCF_CLI} NVCF_CLI_CONFIG=${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml
         """
-      Then the command output should contain "bdd-echo"
-      And I successfully undeploy the function selected by NVCF CLI
+      When I successfully run command:
+        """
+        python3 ${REPO_ROOT}/tests/bdd/scripts/check_capacity_recovery.py --cli ${NVCF_CLI} --cli-config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml --state-file ${HOME}/.nvcf-cli.nvcf-cli-local.state --context k3d-ncp-local --backend ncp-local --agent-version ${CAPACITY_NVCA_AGENT_VERSION} --image nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/load_tester_supreme:0.0.8 --gpu H100 --instance-type NCP.GPU.H100_1x --region us-west-1 --account nvcf-default --api-url http://127.0.0.1:8080 --icms-host sis.localhost --expected-capacity 4 --publication-timeout 60 --recovery-timeout 180 --output-dir ${REPO_ROOT}/tests/bdd/out
+        """
+      Then the command output should contain "capacity recovery passed"
 
     @function-lifecycle @helm-function
     Scenario: Operator sees a Helm function without resource limits fail

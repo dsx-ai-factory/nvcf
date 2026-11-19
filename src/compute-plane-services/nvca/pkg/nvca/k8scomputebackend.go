@@ -2442,15 +2442,15 @@ func (c K8sComputeBackend) AllInstancesTerminatedAndReported(ctx context.Context
 		return false
 	}
 	for _, inst := range req.Status.Instances {
+		// Unreported termination cannot release allocation, regardless of object existence.
+		if inst.LastReportedStatus != string(types.ICMSInstanceTerminated) {
+			return false
+		}
 		// if the object is found (or any other error occurs looking it up), consider not terminated
 		if c.instanceObjectExists(ctx, inst) {
 			return false
 		}
 		log.Debugf("Instance %s (%s) no longer exists", inst.ID, inst.Type)
-		// if the termination was reported to ICMS
-		if inst.LastReportedStatus != string(types.ICMSInstanceTerminated) {
-			return false
-		}
 	}
 
 	// TODO: Add event for all instances terminated when we transition to controller-runtime

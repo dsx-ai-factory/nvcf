@@ -129,9 +129,12 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   SAMPLE_LLM_DECISIONS_IMAGE=<optional-image-reference-enables-decision-routes> \
   go test -run '^TestSingleClusterHelmfile$' -timeout 90m -v
 
-# Full local installation plus container-function capacity reuse. Requires the
-# NGC variables above; Helm function and task sample charts are not needed.
+# Full local installation, upgrade to an explicit candidate agent, and saturated
+# capacity recovery. Build and publish the candidate NVCA image in the selected
+# sample repository first; the base stack's released image does not test a patch.
+# Requires the NGC variables above; Helm sample charts are not needed.
 NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
+  CAPACITY_NVCA_AGENT_VERSION=<candidate-image-tag> \
   go test -run '^TestSingleClusterCapacityRecovery$' -timeout 90m -v
 
 # Single-cluster HA Helmfile feature: installs the control plane with
@@ -173,6 +176,23 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   LLM_REQUEST_ROUTER_IMAGE_TAG=<optional-tag> \
   LAST_CLUSTER_INSTANCE_TYPE=<optional-type> \
   go test -run '^TestMultiClusterHelmfileLLMLastClusterAffinity$' -timeout 120m -v
+```
+
+The capacity check fills all four simulated GPUs with independent one-worker
+functions using minInstances=maxInstances=1. It verifies the candidate image and
+its occupied heartbeat after a complete agent restart, removes one worker, and
+requires released capacity within 60 seconds and a replacement Ready within
+180 seconds. Both deadlines are shorter than the verified five-minute periodic
+heartbeat. Run evidence is written under `out/capacity-recovery-*`; the check
+undeploys only its own functions on completion or failure. The general Helmfile
+suite excludes this candidate-only scenario. This validates real Kubernetes and
+control-plane behavior with simulated GPUs and a CPU sample, and does not
+validate physical GPU or application-specific shutdown behavior.
+
+The capacity probe's pure checks can also run without a cluster:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_capacity_recovery.py'
 ```
 
 ### OpenBao JWT plugin lifecycle

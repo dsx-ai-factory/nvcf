@@ -469,7 +469,7 @@ sum(rate(nvca_workload_result_total[5m])) > 0.1
 **Labels:**
 
 - `operation` - The upstream operation type. One of:
-  - `heartbeat` — periodic health status update sent to ICMS (`PutHealthStatus`)
+  - `heartbeat` — health status update sent to ICMS (`PutHealthStatus`), from either the periodic timer or a released-capacity check
   - `register` — initial cluster registration with ICMS (`Register`)
   - `credentials` — queue credential fetch from ICMS (`GetCreds`)
   - `jwks-push` — projected-SA-token JWKS rotation push to ICMS (`PUT /v1/nvca/clusters/{id}/jwks`); self-hosted PSAT-mode only
@@ -477,6 +477,12 @@ sum(rate(nvca_workload_result_total[5m])) > 0.1
 - `http_status` - HTTP status code as a string: `"200"` on success, the numeric code (e.g. `"401"`, `"503"`) for HTTP errors, or `"0"` for non-HTTP errors (network failures, context cancellations, etc.)
 
 **Zero-initialized:** Yes — all 8 combinations (4 operations × success/200 and failure/0) are pre-initialized to 0 on startup.
+
+An unchanged-capacity check does not send an upstream request and does not
+increment this counter. Heartbeat event-processing latency includes these no-op
+checks as well as publications; use upstream client metrics to measure requests.
+Published-heartbeat debug logs include `heartbeat_trigger=periodic` or
+`heartbeat_trigger=capacity` to distinguish the two sources.
 
 **Usage:**
 

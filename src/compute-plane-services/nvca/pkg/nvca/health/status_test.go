@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,6 +147,46 @@ func TestBackendStatusCache(t *testing.T) {
 type mockStatusRefresher struct {
 	responses []mockResponse
 	callCount int
+}
+
+func TestBackendStatusCacheConcurrentFirstRefresh(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	cache := NewBackendStatusCache(time.Hour, GetComponentStatusFunc(func(context.Context) (nvcatypes.AgentHealth, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return nvcatypes.AgentHealth{GPUUsage: map[nvcatypes.GPUName]nvcatypes.GPUResource{
+			"A100": {Capacity: 1},
+		}}, nil
+	}))
+	results := make(chan nvcatypes.AgentHealth, 32)
+	refresh := func() {
+		status, err := cache.RefreshStatus(context.Background())
+		assert.NoError(t, err)
+		results <- status
+	}
+	go refresh()
+	<-started
+	for range 31 {
+		go refresh()
+	}
+	var early []nvcatypes.AgentHealth
+	select {
+	case result := <-results:
+		early = append(early, result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	assert.Empty(t, early, "callers must wait for an in-progress refresh instead of reading an uninitialized cache")
+	for len(early) < 32 {
+		early = append(early, <-results)
+	}
+	for _, result := range early {
+		assert.Contains(t, result.GPUUsage, nvcatypes.GPUName("A100"))
+	}
+	require.EqualValues(t, 1, calls.Load())
 }
 
 type mockResponse struct {
