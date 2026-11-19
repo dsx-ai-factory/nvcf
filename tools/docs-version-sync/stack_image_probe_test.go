@@ -107,18 +107,6 @@ func TestGuardPathNamesImageSources(t *testing.T) {
 	}
 }
 
-// TestWithoutHelmTestsDropsTestHooks keeps deployed objects and hooks other
-// than tests.
-func TestWithoutHelmTestsDropsTestHooks(t *testing.T) {
-	manifest := "kind: Pod\nmetadata:\n  name: app\n---\n" +
-		"kind: Pod\nmetadata:\n  name: check\n  annotations: {helm.sh/hook: test}\n---\n" +
-		"kind: Job\nmetadata:\n  name: migrate\n  annotations: {helm.sh/hook: \"pre-install,pre-upgrade\"}\n"
-	kept := string(withoutHelmTests([]byte(manifest)))
-	if strings.Contains(kept, "name: check") || !strings.Contains(kept, "name: app") || !strings.Contains(kept, "name: migrate") {
-		t.Fatalf("kept:\n%s", kept)
-	}
-}
-
 // TestParseHelmfileBuildKeepsSources reads each printed state with its source
 // and included states.
 func TestParseHelmfileBuildKeepsSources(t *testing.T) {

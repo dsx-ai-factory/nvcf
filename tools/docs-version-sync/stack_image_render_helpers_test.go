@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -263,7 +262,10 @@ func (w *stackWorkspace) renderState(state stackRenderState) ([]builtState, []re
 		}
 		if err == nil {
 			values := filepath.Join(valuesDir, releaseValuesFile(release.Namespace, release.Name))
-			identity := imageRelease{Name: release.Name, Namespace: release.Namespace, Flags: declared.helmSetFlags()}
+			// A Helm test hook runs only on helm test and is not deployed;
+			// the release inventory renders with --skip-tests too.
+			flags := append(declared.helmSetFlags(), "--skip-tests")
+			identity := imageRelease{Name: release.Name, Namespace: release.Namespace, Flags: flags}
 			result.Snapshot, err = renderImageChartAs(chart, identity, []string{values})
 		}
 		result.Err = err
@@ -437,25 +439,3 @@ func includedValues(document builtState, entry any) (map[string]any, error) {
 // guard and stays a render error. Remove this rule if charts stop guarding
 // their image sources.
 var guardPath = regexp.MustCompile(`execution error at \([^)]*\):[^\n]*?\b[\w-]+(?:\.[\w-]+)*\.(?:registry|repository)\b`)
-
-// withoutHelmTests drops Helm test hooks from a manifest. A test Pod runs only
-// on helm test and is not deployed, so it is no image the stack deploys; the
-// release inventory renders with --skip-tests for the same reason.
-func withoutHelmTests(manifest []byte) []byte {
-	var kept []string
-	for _, document := range documentSeparator.Split(string(manifest), -1) {
-		var object struct {
-			Metadata struct {
-				Annotations map[string]string `yaml:"annotations"`
-			} `yaml:"metadata"`
-		}
-		if yaml.Unmarshal([]byte(document), &object) == nil {
-			hooks := strings.Split(object.Metadata.Annotations["helm.sh/hook"], ",")
-			if slices.ContainsFunc(hooks, func(hook string) bool { return strings.HasPrefix(strings.TrimSpace(hook), "test") }) {
-				continue
-			}
-		}
-		kept = append(kept, document)
-	}
-	return []byte(strings.Join(kept, "\n---\n"))
-}

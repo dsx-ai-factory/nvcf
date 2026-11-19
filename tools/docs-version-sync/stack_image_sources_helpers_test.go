@@ -462,7 +462,7 @@ func checkRenderedRelease(release renderedRelease, sentinels probeSentinels, fin
 			Release: release.Name, Problem: problem, Expected: "a release that renders with the base.yaml image sources", Fix: fixStackSource})
 		return nil
 	}
-	images, err := extractResolvedImages(withoutHelmTests(release.Snapshot.Manifest))
+	images, err := extractResolvedImages(release.Snapshot.Manifest)
 	if err != nil {
 		findings.record(release.Stack, failureKey(release.Name, "images"), imageGateFinding{Category: findingRenderError,
 			Release: release.Name, Problem: err.Error(), Expected: "resolvable rendered images", Fix: fixStackSource})

@@ -36,13 +36,16 @@ func TestStackImageSources(t *testing.T) {
 	}
 }
 
-// Fixture charts: app guards its image source as the chart gate requires,
-// defaulted prefills one, and broken fails for a reason unrelated to images.
+// Fixture charts: app guards its image source as the chart gate requires and
+// carries a Helm test hook that is not deployed, defaulted prefills one, and
+// broken fails for a reason unrelated to images.
 var stackFixtureCharts = map[string]string{
 	"deploy/helm/app/Chart.yaml":  "apiVersion: v2\nname: helm-app\nversion: 0.1.0\n",
 	"deploy/helm/app/values.yaml": "image: {registry: \"\", repository: \"\", tag: v1}\n",
 	"deploy/helm/app/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: app\nspec:\n  containers:\n    - name: app\n" +
 		`      image: {{ required "set image.registry" .Values.image.registry }}/{{ required "set image.repository" .Values.image.repository }}:{{ .Values.image.tag }}` + "\n",
+	"deploy/helm/app/templates/test.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: app-test\n  annotations: {helm.sh/hook: test}\nspec:\n  containers:\n" +
+		"    - name: check\n      image: busybox:latest\n",
 	"deploy/helm/defaulted/Chart.yaml":  "apiVersion: v2\nname: helm-defaulted\nversion: 0.1.0\n",
 	"deploy/helm/defaulted/values.yaml": "image: {registry: docker.io, repository: team/defaulted, tag: v1}\n",
 	"deploy/helm/defaulted/templates/pod.yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: defaulted\nspec:\n  containers:\n    - name: app\n" +
