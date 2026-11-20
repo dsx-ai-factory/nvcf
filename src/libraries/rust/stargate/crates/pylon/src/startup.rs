@@ -2846,8 +2846,6 @@ mod tests {
     }
 
     const CRITICAL_TASK_EXITED: &str = "critical pylon task exited";
-    const SUPERVISOR_STOPPED_IN_SHUTDOWN: &str =
-        "model lifecycle supervisor stopped with the stats collector during shutdown";
 
     /// Records the level, message and other fields of every event at DEBUG or
     /// above on the thread that installs it.
@@ -3323,9 +3321,13 @@ mod tests {
     #[tokio::test]
     async fn running_pylon_shutdown_with_a_lifecycle_request_in_flight_logs_no_error() {
         // Pylon stops the stats collector and the model lifecycle supervisor in
-        // the same join, and the collector can stop first. A lifecycle request
-        // in flight then fails because of the shutdown, which is not an error.
-        // A held KV-cache poll keeps the collector from reading the request.
+        // the same join, in no fixed order. If the collector stops first, a
+        // lifecycle request in flight fails because of the shutdown, which is
+        // not an error; if the supervisor stops first, it drops the request.
+        // Either way the shutdown logs no error. The pylon-lib test
+        // `collector_shutdown_during_a_lifecycle_request_logs_no_error` stops
+        // only the collector and pins the debug line for the first case. A
+        // held KV-cache poll keeps the collector from reading the request.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
         let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
         let recorded = RecordedEvents::default();
@@ -3351,22 +3353,6 @@ mod tests {
         assert!(
             errors.is_empty(),
             "a normal Pylon shutdown should log no error: {errors:?}"
-        );
-        // The join wakes the collector before the supervisor. This check relies
-        // on tokio's current-thread scheduler running woken tasks in that
-        // order, which tokio does not document: the collector exits first, so
-        // the supervisor's request fails with the collector stop instead of
-        // being dropped by the supervisor's own stop. The pylon-lib test
-        // `collector_shutdown_during_a_lifecycle_request_logs_no_error` checks
-        // the same log level without relying on task order.
-        let stopped = recorded.with_message(SUPERVISOR_STOPPED_IN_SHUTDOWN);
-        assert!(
-            stopped
-                .iter()
-                .any(|event| event.level == tracing::Level::DEBUG),
-            "the lifecycle request in flight should fail with the collector stop; if it did \
-             not, either requests no longer fail when the collector ends, or tokio no longer \
-             runs the collector, woken first, before the supervisor"
         );
         upstream.shutdown().await;
     }

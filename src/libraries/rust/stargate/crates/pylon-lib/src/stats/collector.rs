@@ -4829,12 +4829,13 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_is_marked_before_a_request_can_see_the_collector_stop() {
-        // The model lifecycle supervisor reads this mark when a request fails
-        // because the collector stopped, to tell a shutdown from a crash. The
-        // shutdown is polled once and then left alone until a request has seen
-        // the collector stop, so a mark set after that first poll would still
-        // be unset then, in whatever order the runtime runs its tasks.
+    fn a_request_failed_by_a_collector_shutdown_finds_the_collector_ended_by_it() {
+        // The model lifecycle supervisor reads the collector's exit record when
+        // a request fails because the collector stopped, to tell a shutdown
+        // from a crash. The shutdown is polled once and then left alone until a
+        // request has seen the collector stop, as in Pylon's shutdown, where
+        // the supervisor's request can fail first. A shutdown mark set after
+        // that first poll would leave the shutdown out of the record.
         let runtimes = [
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4854,8 +4855,8 @@ mod tests {
                     None,
                     false,
                 );
-                let shutdown_started = collector.shutdown_started.child_token();
                 let control = collector.control();
+                let exit = collector.exit();
                 let generation = ModelGeneration::new("model-a", 1);
                 let answered = bounded(
                     "a request to the running collector",
@@ -4866,24 +4867,29 @@ mod tests {
                     answered.is_ok(),
                     "the running collector should answer: {answered:?}"
                 );
+                // The record is read only once the collector has ended, so a
+                // request that fails while the collector is ending cannot read
+                // it before the collector writes it.
+                let early_record = exit.ended_by_shutdown();
+                tokio::pin!(early_record);
                 assert!(
-                    !shutdown_started.is_cancelled(),
-                    "a running collector should not be marked as shutting down"
+                    futures::poll!(&mut early_record).is_pending(),
+                    "a running collector should not report how it ended"
                 );
 
                 let shutdown = collector.shutdown();
                 tokio::pin!(shutdown);
                 let shutdown_finished = futures::poll!(&mut shutdown).is_ready();
-                let marked = bounded("a request that sees the collector stop", async {
+                bounded("a request that sees the collector stop", async {
                     // A collector on another worker can still answer requests
                     // sent before it sees its stop.
                     while control.retire_generation(&generation).await.is_ok() {}
-                    shutdown_started.is_cancelled()
                 })
                 .await;
                 assert!(
-                    marked,
-                    "the shutdown should be marked before a request can see the collector stop"
+                    bounded("the collector's exit record", exit.ended_by_shutdown()).await,
+                    "a request that the collector's shutdown failed should find the collector \
+                     ended by that shutdown"
                 );
                 if !shutdown_finished {
                     bounded("the collector shutdown", shutdown).await;
@@ -4927,7 +4933,7 @@ mod tests {
             handle: collector, ..
         } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
         let control = collector.control();
-        let shutdown_started = collector.shutdown_started.child_token();
+        let exit = collector.exit();
 
         let reported = bounded(
             "the collector shutdown",
@@ -4939,8 +4945,9 @@ mod tests {
             "a collector that stopped normally should not be reported: {reported:?}"
         );
         assert!(
-            shutdown_started.is_cancelled(),
-            "the shutdown should be marked, so a request it fails is not reported as a crash"
+            bounded("the collector's exit record", exit.ended_by_shutdown()).await,
+            "the collector should record that this shutdown ended it, so a request it fails is \
+             not reported as a crash"
         );
         let probed = bounded(
             "a request after the shutdown",
