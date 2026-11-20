@@ -488,7 +488,7 @@ impl RunningPylon {
                 result = self.stats_collector.wait_for_exit() => critical_task_exit_error("stats collector", result),
                 result = async {
                     self.model_lifecycle.wait_for_exit().await
-                } => self.model_lifecycle_exit_error(result).await,
+                } => critical_task_exit_error("model lifecycle supervisor", result),
                 result = self.metrics_server.wait_for_exit() => critical_task_exit_error("metrics server", result),
                 result = async {
                     match self.tunnel.as_mut() {
@@ -505,21 +505,6 @@ impl RunningPylon {
             let _ = self.shutdown(ShutdownCause::CriticalTaskExit).await;
             return Err(error);
         }
-    }
-
-    /// Reports the model lifecycle supervisor's exit. A supervisor that the
-    /// stats collector's end stopped reports the collector, whose own exit
-    /// follows promptly. Such a supervisor holds its generations until its
-    /// stop, which comes only in `shutdown`, so the main loop normally sees
-    /// the collector's own exit instead.
-    async fn model_lifecycle_exit_error(&mut self, result: TaskExit) -> anyhow::Error {
-        if self.model_lifecycle.stopped_by_stats_collector() {
-            return critical_task_exit_error(
-                "stats collector",
-                self.stats_collector.wait_for_exit().await,
-            );
-        }
-        critical_task_exit_error("model lifecycle supervisor", result)
     }
 
     /// Stops every task. Returns an error if the stats collector panicked and
@@ -3480,57 +3465,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_stopped_by_a_stats_collector_panic_is_reported_as_the_collector() {
-        // The supervisor's request fails as soon as the collector panics, so
-        // the supervisor can exit before Pylon's main loop sees the collector
-        // exit. `model_lifecycle_exit_error` handles that order.
-        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
-        let (mut runtime, runtime_state) = start_discovery_pylon(&upstream).await;
-        upstream.hold_kv_cache_polls().await;
-        // The held collector reads no commands, so the begin that panics it
-        // stays queued ahead of the supervisor's begin for model-b. This relies
-        // on the collector reading queued commands in the order they were
-        // sent, which flume does not document.
-        queue_stats_collector_panic(&runtime.stats_collector);
-        upstream.set_models(&["model-a", "model-b"]);
-        wait_for_model(&runtime_state, "model-b").await;
-        upstream.release_kv_cache_polls();
-
-        let exit = tokio::time::timeout(
-            Duration::from_secs(2),
-            runtime.model_lifecycle.wait_for_exit(),
-        )
-        .await
-        .expect(
-            "the supervisor should stop when its begin fails with the collector panic; if it \
-             did not, either the queued command no longer panics the collector, or the \
-             collector answered the begin before the command queued ahead of it",
-        );
-        assert!(
-            runtime.model_lifecycle.stopped_by_stats_collector(),
-            "the supervisor should report that the collector's end stopped it"
-        );
-        let error = tokio::time::timeout(
-            Duration::from_secs(2),
-            runtime.model_lifecycle_exit_error(exit),
-        )
-        .await
-        .expect("the collector's exit should follow the supervisor's promptly");
-        assert_reports_a_stats_collector_panic(
-            "a supervisor exit caused by a stats collector panic",
-            &error.to_string(),
-        );
-        let shutdown_error =
-            shutdown_without_re_raising(runtime, ShutdownCause::CriticalTaskExit).await;
-        assert!(
-            shutdown_error.is_none(),
-            "a collector panic that was already reported should not be reported again: \
-             {shutdown_error:?}"
-        );
-        upstream.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn running_pylon_waits_for_and_reports_the_stats_collector_that_stopped_its_supervisor() {
         // In Pylon the supervisor and the main loop share one collector, whose
         // exit follows the supervisor's promptly, so the main loop can see
@@ -3595,33 +3529,6 @@ mod tests {
             "Pylon should log the collector once as its critical task exit"
         );
         upstream.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn supervisor_exit_not_caused_by_the_stats_collector_is_reported_as_the_supervisor() {
-        let mut runtime = test_running_pylon(active_test_stats_collector()).await;
-
-        // The collector still runs, so a report that waited for its exit would
-        // never finish.
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            runtime.model_lifecycle_exit_error(Ok(())),
-        )
-        .await
-        .expect(
-            "a supervisor exit that the collector did not cause should be reported without \
-             waiting for the collector",
-        );
-        assert_eq!(
-            error.to_string(),
-            "model lifecycle supervisor exited unexpectedly"
-        );
-        let shutdown_error =
-            shutdown_without_re_raising(runtime, ShutdownCause::CriticalTaskExit).await;
-        assert!(
-            shutdown_error.is_none(),
-            "a running collector should stop without an error: {shutdown_error:?}"
-        );
     }
 
     #[tokio::test]

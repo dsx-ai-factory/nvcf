@@ -16,7 +16,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
@@ -91,20 +90,11 @@ pub enum ModelLifecycleError {
 /// supervisor and leaves them as they are.
 pub struct ModelLifecycleHandle {
     task: OwnedTask,
-    stopped_by_stats_collector: Arc<AtomicBool>,
 }
 
 impl ModelLifecycleHandle {
     pub async fn wait_for_exit(&mut self) -> Result<(), tokio::task::JoinError> {
         self.task.wait_for_exit().await
-    }
-
-    /// Whether the supervisor stopped because the stats collector ended other
-    /// than by its handle's shutdown, for example by a panic. The supervisor
-    /// then holds its generations until `shutdown`, and the collector's own
-    /// exit follows promptly.
-    pub fn stopped_by_stats_collector(&self) -> bool {
-        self.stopped_by_stats_collector.load(Ordering::Acquire)
     }
 
     pub async fn shutdown(self) {
@@ -223,47 +213,39 @@ pub async fn start_model_lifecycle(
     }
 
     let stats_collector_exit = stats_collector.exit();
-    let stopped_by_stats_collector = Arc::new(AtomicBool::new(false));
-    let task = OwnedTask::spawn("model lifecycle supervisor", {
-        let stopped_by_stats_collector = Arc::clone(&stopped_by_stats_collector);
-        move |stop| async move {
-            let shutdown = SupervisorShutdown {
-                stop,
-                stats_collector: stats_collector_exit,
-            };
-            match supervisor.run(&shutdown).await {
-                Ok(()) => {}
-                // A collector that its handle's shutdown ended stops this
-                // supervisor as part of that shutdown. One that panicked, or
-                // ended before any shutdown, is a failure, even if a shutdown
-                // started before the supervisor got here.
-                Err(error @ ModelLifecycleError::StatsCollectorStopped) => {
-                    if shutdown.stats_collector.ended_by_shutdown().await {
-                        tracing::debug!(
-                            error = %error,
-                            "model lifecycle supervisor stopped with the stats collector during shutdown"
-                        );
-                    } else {
-                        stopped_by_stats_collector.store(true, Ordering::Release);
-                        tracing::error!(error = %error, "model lifecycle supervisor failed");
-                    }
-                    // The admitted generations stay routable until this
-                    // supervisor's stop. Pylon stops it only after its
-                    // registration drain, so requests that the drain still
-                    // accepts can use them.
-                    shutdown.stop.cancelled().await;
-                }
-                Err(error) => {
+    let task = OwnedTask::spawn("model lifecycle supervisor", move |stop| async move {
+        let shutdown = SupervisorShutdown {
+            stop,
+            stats_collector: stats_collector_exit,
+        };
+        match supervisor.run(&shutdown).await {
+            Ok(()) => {}
+            // A collector that its handle's shutdown ended stops this
+            // supervisor as part of that shutdown. One that panicked, or ended
+            // before any shutdown, is a failure, even if a shutdown started
+            // before the supervisor got here.
+            Err(error @ ModelLifecycleError::StatsCollectorStopped) => {
+                if shutdown.stats_collector.ended_by_shutdown().await {
+                    tracing::debug!(
+                        error = %error,
+                        "model lifecycle supervisor stopped with the stats collector during shutdown"
+                    );
+                } else {
                     tracing::error!(error = %error, "model lifecycle supervisor failed");
                 }
+                // The admitted generations stay routable until this
+                // supervisor's stop. Pylon stops it only after its
+                // registration drain, so requests that the drain still
+                // accepts can use them.
+                shutdown.stop.cancelled().await;
             }
-            supervisor.shutdown().await;
+            Err(error) => {
+                tracing::error!(error = %error, "model lifecycle supervisor failed");
+            }
         }
+        supervisor.shutdown().await;
     });
-    Ok(ModelLifecycleHandle {
-        task,
-        stopped_by_stats_collector,
-    })
+    Ok(ModelLifecycleHandle { task })
 }
 
 fn observe_discovery_poll(
@@ -3098,11 +3080,6 @@ mod tests {
         );
         assert_eq!(stopped[0].level, tracing::Level::DEBUG);
         assert_tracing_event_field(stopped[0], "error", STATS_COLLECTOR_STOPPED);
-        assert!(
-            !lifecycle.stopped_by_stats_collector(),
-            "a supervisor that stopped with the collector's shutdown should not report the \
-             collector as the reason it stopped"
-        );
 
         kv_cache.unblock();
         kv_cache.shutdown().await;
@@ -3131,10 +3108,6 @@ mod tests {
             let dispatch = tracing::Dispatch::new(subscriber.clone());
             let default_guard = tracing::dispatcher::set_default(&dispatch);
             hold_stats_collector(&kv_cache).await;
-            assert!(
-                !lifecycle.stopped_by_stats_collector(),
-                "{ending}: a running supervisor should not report a collector stop"
-            );
 
             if panics {
                 // The panic trigger is queued ahead of the supervisor's
@@ -3183,11 +3156,6 @@ mod tests {
             assert!(
                 events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
                 "{ending}: a collector that ended outside a shutdown is not part of one"
-            );
-            assert!(
-                lifecycle.stopped_by_stats_collector(),
-                "{ending}: the supervisor should report that the collector's end stopped it, so \
-                 Pylon names the collector"
             );
 
             kv_cache.unblock();
@@ -3243,11 +3211,6 @@ mod tests {
         assert!(
             events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
             "a failure other than a collector stop is not part of the collector's shutdown"
-        );
-        // Pylon waits for the collector's exit when this is set.
-        assert!(
-            !lifecycle.stopped_by_stats_collector(),
-            "a supervisor that failed on its own should not report the collector as the reason"
         );
 
         upstream.shutdown().await;
@@ -3527,10 +3490,6 @@ mod tests {
                 "{ending:?}: a collector that its shutdown did not end is not part of that \
                  shutdown"
             );
-            assert!(
-                lifecycle.stopped_by_stats_collector(),
-                "{ending:?}: the supervisor should report that the collector's end stopped it"
-            );
 
             upstream.shutdown().await;
         }
@@ -3756,10 +3715,6 @@ mod tests {
                 0,
                 "{label}: the calibration should not be recorded as an error"
             );
-            assert!(
-                !lifecycle.stopped_by_stats_collector(),
-                "{label}: a collector shutdown is not the collector ending on its own"
-            );
 
             kv_cache.unblock();
             kv_cache.shutdown().await;
@@ -3906,11 +3861,6 @@ mod tests {
                 assert!(
                     events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
                     "{label}: a collector that ended outside a shutdown is not part of one"
-                );
-                assert!(
-                    lifecycle.stopped_by_stats_collector(),
-                    "{label}: the supervisor should report that the collector's end stopped it, \
-                     so Pylon names the collector"
                 );
 
                 upstream.shutdown().await;
@@ -4149,7 +4099,7 @@ mod tests {
         }
         wait_for(
             "the supervisor should find its stats collector gone",
-            || lifecycle.stopped_by_stats_collector(),
+            || subscriber.event_count(SUPERVISOR_FAILED) >= 1,
         )
         .await;
         SupervisorStoppedByCollector {
@@ -4408,10 +4358,6 @@ mod tests {
             runtime_state.advertised_model_ids(),
             ["model-a"],
             "model-a should stay advertised through the drain"
-        );
-        assert!(
-            !lifecycle.stopped_by_stats_collector(),
-            "a collector shutdown is not the collector ending on its own"
         );
         within("the supervisor's stop", lifecycle.shutdown()).await;
         drop(default_guard);
