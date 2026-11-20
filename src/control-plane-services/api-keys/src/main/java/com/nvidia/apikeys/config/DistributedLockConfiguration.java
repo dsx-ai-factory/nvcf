@@ -25,7 +25,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 @Configuration
-@EnableSchedulerLock(defaultLockAtMostFor = "PT5M")
+@EnableSchedulerLock(defaultLockAtMostFor = "60s")
 public class DistributedLockConfiguration {
     @Bean
     public LockProvider accountIndexMigrationLockProvider(
