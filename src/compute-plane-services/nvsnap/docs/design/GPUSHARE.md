@@ -33,6 +33,7 @@ tests for amd64 and arm64 with warnings as errors.
   - [Chunk store](#chunk-store)
 - [Use through nvsnap](#use-through-nvsnap)
   - [Workloads that span nodes](#workloads-that-span-nodes)
+  - [NCCL over InfiniBand or RoCE](#nccl-over-infiniband-or-roce)
 - [Requirements and limits](#requirements-and-limits)
 - [Validation](#validation)
 <!-- /toc -->
@@ -326,6 +327,47 @@ Limits of the move:
   minutes.
 - Requires a CRIU with `--inet-addr-map` and `net-unlock` (base image
   v0.0.26 or later); the restore refuses to start otherwise.
+
+### NCCL over InfiniBand or RoCE
+
+NCCL opens the node's RDMA devices when it starts, even when every rank is on
+one node, and keeps them, with its queue pairs and memory registrations, until
+the process exits. CRIU cannot dump them, so the capture preflight refuses
+such a pod. Annotated `nvsnap.io/gpushare-ibv: "true"`, the pod's GPU
+containers get `NCCL_IBVERBS_LIB` pointed at `libnvsnap_ibv.so` from the node
+bundle (a value the pod sets itself wins). NCCL then loads its verbs from that
+library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
+
+- NCCL gets shadow objects. The queue pair numbers, memory keys, LIDs and GIDs
+  it reads, and has sent its peers, keep their values for the life of the
+  process. Each post and poll goes to the real object underneath, with the
+  keys and numbers translated to the real ones, per device (two NICs can
+  give out the same key or queue pair number).
+- `quiesce`, once GPU work has drained, lets every send NCCL posted
+  complete: a signaled zero-length write (a read, on a queue pair that allows
+  only reads) completes after them. The sends need their peers' queue pairs,
+  and no node releases before every node has quiesced. Completions nobody had
+  polled yet are kept for NCCL.
+- `release` empties every completion queue, then destroys every queue pair,
+  completion queue, registration, protection domain and device, so the
+  process holds no RDMA device file.
+- `load`, once GPU memory is back, opens the devices of the same name and
+  creates every object again. GPU memory registered through a dma-buf gets a
+  new dma-buf of the same range from CUDA. The queue pairs go to INIT, and
+  the receives NCCL had posted that were still outstanding are posted again.
+- `fabmap` adds the new GIDs, LIDs, queue pair numbers and keys to the
+  exchange. Across nodes, the agent's fabric session merges them. Without
+  `--fabric-map`, the tool merges the lists of the pods' own processes.
+  `remap` then brings each queue pair to RTR and RTS with its peer's new
+  numbers, and `resume` lets NCCL's verbs calls run again.
+
+Every rank NCCL connects must be suspended and restored together, which the
+group checkpoint does. Not handled: a shared receive queue, an address
+handle, a completion channel, or a queue pair other than reliable-connected.
+A process whose NCCL creates one refuses the suspend, and its workload runs
+on. Devices are matched by name (`mlx5_3`), so the restore node needs the
+same NIC names. Other users of verbs in the process (UCX, NIXL) are not
+covered: their devices still fail the dump, which rolls the workload back.
 
 ## Requirements and limits
 

@@ -392,6 +392,35 @@ func TestGPUSharePatches_FabricAnnotation(t *testing.T) {
 	}
 }
 
+// A pod annotated nvsnap.io/gpushare-ibv gets NCCL pointed at the bundled
+// verbs library, unless it names one itself; without the annotation, NCCL
+// keeps its own.
+func TestGPUSharePatches_IBVAnnotation(t *testing.T) {
+	m := &Mutator{}
+	pod := gpushareTestPod(true, nil)
+	got := applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+	if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e != nil {
+		t.Errorf("unannotated pod got %s=%q", ncclIBVerbsLibEnv, e.Value)
+	}
+
+	pod = gpushareTestPod(true, nil)
+	pod.Annotations[GPUShareIBVAnnotation] = "true"
+	got = applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+	if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e == nil || e.Value != GPUShareIBVLibPath {
+		t.Errorf("%s = %+v, want %s", ncclIBVerbsLibEnv, e, GPUShareIBVLibPath)
+	}
+	if e := envOf(got.Spec.Containers[0], ncclIBVerbsLibEnv); e != nil {
+		t.Errorf("a container without GPUs got %s=%q", ncclIBVerbsLibEnv, e.Value)
+	}
+
+	pod = gpushareTestPod(true, []corev1.EnvVar{{Name: ncclIBVerbsLibEnv, Value: "/opt/my/libibverbs.so"}})
+	pod.Annotations[GPUShareIBVAnnotation] = "true"
+	got = applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+	if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e == nil || e.Value != "/opt/my/libibverbs.so" {
+		t.Errorf("the pod's own %s was overridden: %+v", ncclIBVerbsLibEnv, e)
+	}
+}
+
 // Debug variables land on the GPU containers of the matching pods only,
 // next to the gpushare library, and never override the pod's own values.
 func TestDebugEnv(t *testing.T) {

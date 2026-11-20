@@ -64,6 +64,8 @@ jobs:
           cid="$(docker create "$cuda")"
           docker cp "$cid:/usr/local/cuda/include/cuda.h" "$hdr/cuda.h"
           docker rm "$cid" >/dev/null
+          # test_ibv.py compiles against the rdma-core headers.
+          sudo apt-get install -y -q libibverbs-dev >/dev/null
           # Every host test file runs, so a new one cannot be left out. A test
           # that skips (no gcc or cuda.h) still exits 0: fail on it here.
           for t in "$nvsnap"/tests/gpushare/host/test_*.py; do

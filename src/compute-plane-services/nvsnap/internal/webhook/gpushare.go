@@ -38,6 +38,14 @@ const (
 	// that memory as fabric handles, which a multi-node suspend can
 	// re-establish (see the agent's group checkpoint).
 	GPUShareFabricAnnotation = "nvsnap.io/gpushare-fabric"
+	// GPUShareIBVAnnotation ("true") points NCCL at libnvsnap_ibv.so for its
+	// verbs, so that a pod whose NCCL uses RDMA (IB or RoCE) can be
+	// captured: the library destroys NCCL's RDMA state before the checkpoint
+	// and creates it again after the restore (docs/design/GPUSHARE.md).
+	// Off by default.
+	GPUShareIBVAnnotation = "nvsnap.io/gpushare-ibv"
+	// GPUShareIBVLibPath is that library, in the node bundle.
+	GPUShareIBVLibPath = nvsnapToolsMountPath + "/libnvsnap_ibv.so"
 	// GPUShareStorePath is where a GPU container sees its chunk store: a
 	// per-pod directory on the node's local checkpoint disk. A restore
 	// placeholder mounts the checkpoint's copy at the same path. It is a
@@ -56,6 +64,7 @@ const (
 	gpushareStoreVolume = "nvsnap-gpushare-store"
 	gpusharePodUIDEnv   = "NVSNAP_POD_UID"
 	gpushareFabricEnv   = "NVSNAP_GPUSHARE_FABRIC"
+	ncclIBVerbsLibEnv   = "NCCL_IBVERBS_LIB"
 )
 
 // gpushareMode reports whether a pod runs under the gpushare library and
@@ -229,6 +238,11 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 		// A value the pod sets itself wins: it may switch fabric sharing off.
 		if fabric && !hasEnv(c, gpushareFabricEnv) {
 			vars = append(vars, corev1.EnvVar{Name: gpushareFabricEnv, Value: "1"})
+		}
+		// NCCL's own choice of verbs library wins: then its RDMA state stays
+		// as before, and a capture of the pod is refused.
+		if pod.Annotations[GPUShareIBVAnnotation] == "true" && !hasEnv(c, ncclIBVerbsLibEnv) {
+			vars = append(vars, corev1.EnvVar{Name: ncclIBVerbsLibEnv, Value: GPUShareIBVLibPath})
 		}
 		patches = append(patches, setContainerEnv(i, c, vars)...)
 	}

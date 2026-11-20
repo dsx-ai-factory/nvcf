@@ -760,6 +760,8 @@ static int ctl_all_par(const int *pids, int n, const char *cmd)
  * its multicast groups) before any binds multicast memory, which blocks
  * until all devices have rejoined. "resume" reopens the launch gate. */
 static int fabric_exchange(const int *pids, int n, char *remap, size_t len);
+static int local_exchange(const int *pids, int n, char *remap, size_t len);
+static char local_dir[32];  /* local_exchange's directory, removed after "remap" */
 
 /* Tell every process the host NUMA node of each GPU it now has, by the
  * GPU's UUID and, with --gpu-map, by the UUID of the GPU it replaces:
@@ -826,7 +828,15 @@ static int remap_all(const int *pids, int n)
     }
     int r = ctl_all_par(pids, n, load);
     if (r >= 0 && fabric_dir) r = fabric_exchange(pids, n, remap, sizeof(remap));
+    else if (r >= 0) r = local_exchange(pids, n, remap, sizeof(remap));
     if (r >= 0) r = ctl_all(pids, n, remap);
+    if (local_dir[0]) {
+        char p[64];
+        snprintf(p, sizeof(p), "%s/out", local_dir);
+        unlink(p);
+        rmdir(local_dir);
+        local_dir[0] = 0;
+    }
     if (r >= 0 && hold_gate) r = resume_held(pids, n);
     else if (r >= 0) r = ctl_all(pids, n, "resume");
     if (r >= 0) resume_diag(pids, n);
@@ -866,6 +876,36 @@ static int open_all(const int *pids, int n)
     free(j);
     free(t);
     return bad ? -1 : 0;
+}
+
+/* NCCL's verbs (libnvsnap_ibv.so): its queue pairs and keys have new
+ * numbers after "load", and their peers here need them. Without
+ * --fabric-map the peers are all among pids: merge their lists into a
+ * directory of the workload's user (they write their parts) and pass the
+ * merged list to "remap" at once. Nothing to do when no pid has NCCL's
+ * verbs open (an older library answers "err unknown command"). */
+static int local_exchange(const int *pids, int n, char *remap, size_t len)
+{
+    char rep[GPUSHARE_REPLY_MAX];
+    int any = 0;
+    for (int i = 0; i < n && !any; i++) {
+        int d = 0;
+        any = ctl_rep(pids[i], "ibv", rep, sizeof(rep), 1) == 0 && sscanf(rep, "ok ibv %d", &d) == 1 && d > 0;
+    }
+    if (!any) return 0;
+    char path[64];
+    struct stat st;
+    snprintf(local_dir, sizeof(local_dir), "/tmp/nvsnap-ibv-XXXXXX");
+    snprintf(path, sizeof(path), "/proc/%d", pids[0]);
+    if (!mkdtemp(local_dir) || stat(path, &st) != 0 || chown(local_dir, st.st_uid, st.st_gid) != 0) {
+        fprintf(stderr, "%s: %s\n", local_dir, strerror(errno));
+        return -1;
+    }
+    const char *saved = fabric_dir;
+    fabric_dir = local_dir;
+    int r = fabric_exchange(pids, n, remap, len);
+    fabric_dir = saved;
+    return r;
 }
 
 /* Multi-node NVLink: memory shared across nodes is imported by fabric
@@ -909,6 +949,11 @@ static int fabric_exchange(const int *pids, int n, char *remap, size_t len)
     if (r < 0) fprintf(stderr, "%s: %s\n", out, strerror(errno));
     close(dfd);
     if (r < 0) return -1;
+    if (fabric_dir == local_dir) {  /* local_exchange: every peer is here */
+        printf("verbs map: %d line(s) in %s\n", nh, out);
+        snprintf(remap, len, "remap %s", out);
+        return 0;
+    }
     printf("fabric map: %d handle(s) in %s; waiting for %s\n", nh, out, in);
     for (int t = 0; access(in, R_OK) != 0; t++) {
         if (t >= 6000) { fprintf(stderr, "no %s after 600 s\n", in); return -1; }

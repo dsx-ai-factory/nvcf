@@ -1223,6 +1223,38 @@ static void do_poll(char *reply, size_t n, int step)
     }
 }
 
+/* ── NCCL's verbs ─────────────────────────────────────────────────────
+ * With NCCL_IBVERBS_LIB naming libnvsnap_ibv.so, NCCL's RDMA devices,
+ * queue pairs and registrations are destroyed at "release" and created
+ * again at "load", on the NICs the process has then; "quiesce" first
+ * lets every send NCCL posted complete; "fabmap" adds their
+ * new numbers to the exchange and "remap" reconnects them (see
+ * nvsnap_ibv.c). */
+static struct {
+    int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
+    int (*connect)(const char *, char *, size_t), (*count)(void);
+    void (*open)(void);
+} ibv;
+
+/* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
+static int ibv_devices(void)
+{
+    if (!ibv.count) {
+        void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) return 0;
+        *(void **)&ibv.fence = real_dlsym(h, "nvsnap_ibv_fence");
+        *(void **)&ibv.suspend = real_dlsym(h, "nvsnap_ibv_suspend");
+        *(void **)&ibv.restore = real_dlsym(h, "nvsnap_ibv_restore");
+        *(void **)&ibv.map = real_dlsym(h, "nvsnap_ibv_map");
+        *(void **)&ibv.connect = real_dlsym(h, "nvsnap_ibv_connect");
+        *(void **)&ibv.open = real_dlsym(h, "nvsnap_ibv_open");
+        if (!ibv.fence || !ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
+        *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
+        if (!ibv.count) return 0;
+    }
+    return ibv.count();
+}
+
 /* Hold launches, drain GPU work, and check that "release" can drop every
  * shared mapping. Separate from "release" so that a busy or refusing
  * process leaves every process's mappings untouched. */
@@ -1285,6 +1317,10 @@ static void do_quiesce(char *reply, size_t n)
         if (b->memh && b->memh_released && !(b->ucva = lmap_va(b->memh)))
             snprintf(reply, n, "err memory bound to a multicast object is neither held nor mapped");
     }
+    /* NCCL's sends complete while every peer still has its queue pairs. */
+    char fq[200];
+    if (!reply[0] && ibv_devices() > 0 && ibv.fence(fq, sizeof(fq)) < 0)
+        snprintf(reply, n, "err busy (NCCL verbs: %s)", fq + (strncmp(fq, "err ", 4) ? 0 : 4));
     if (reply[0]) gate_open();
     else {
         verify_log("quiesce");
@@ -1335,6 +1371,11 @@ static void do_release(char *reply, size_t n, const char *args)
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
     if (!gated) {
         snprintf(reply, n, "err not quiesced");
+        pthread_mutex_unlock(&mu);
+        return;
+    }
+    /* Before any memory goes: NCCL's registrations of it come first. */
+    if (ibv_devices() > 0 && ibv.suspend(reply, n) < 0) {
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -1622,9 +1663,14 @@ static void do_load(char *reply, size_t n, const char *cache_dir)
         for (int j = i; j < n_fexps; j++)
             if (!memcmp(fexps[j].fh.data, old.data, sizeof(old.data))) fexps[j].fh = nf;
     }
+    char rq[160] = "";
+    if (r == CUDA_SUCCESS && ibv_devices() > 0 && ibv.restore(rq, sizeof(rq)) < 0) {
+        snprintf(reply, n, "%s", rq);  /* GPU memory is back: NCCL's registrations of it now */
+        r = CUDA_ERROR_UNKNOWN;
+    }
     if (r == CUDA_SUCCESS)
-        snprintf(reply, n, "ok loaded %d allocation(s) (%zu MiB) in %.1fs: %zu MiB from cache, %zu MiB from store",
-                 nl, nb >> 20, secs() - t0, st_hit >> 20, st_miss >> 20);
+        snprintf(reply, n, "ok loaded %d allocation(s) (%zu MiB) in %.1fs: %zu MiB from cache, %zu MiB from store%s%s",
+                 nl, nb >> 20, secs() - t0, st_hit >> 20, st_miss >> 20, rq[0] ? "; NCCL verbs: " : "", rq + (rq[0] ? 3 : 0));
     pop_ctx(dev);
     pthread_mutex_unlock(&mu);
 }
@@ -1640,8 +1686,9 @@ static void do_fabmap(char *reply, size_t n, const char *path)
         hex_encode(pubs[i].cur.data, sizeof(pubs[i].cur.data), b);
         fprintf(fp, "%s %s\n", a, b);
     }
+    int nv = fp && ibv_devices() > 0 ? ibv.map(fp) : 0;  /* NCCL's queue pairs, keys and ports */
     if (!fp || fclose(fp)) snprintf(reply, n, "err write %.200s: %s", path, strerror(errno));
-    else snprintf(reply, n, "ok %d fabric handle(s)", n_pubs);
+    else snprintf(reply, n, "ok %d fabric handle(s), %d verbs line(s)", n_pubs, nv);
     pthread_mutex_unlock(&mu);
 }
 
@@ -1824,6 +1871,8 @@ static void do_remap(char *reply, size_t n, const char *fabmap_path)
              "%d host buffer(s) in %.2fs: host register %.2fs (%zu MiB; prefault %.1fs, waited %.1fs), "
              "import %.2fs here + %.2fs remote, map %.2fs, multicast %.2fs", nm, ngone, nmc, nh, secs() - t0, th,
              hb >> 20, tpr, tpf, tl, tr, tm, tmc);
+    if (ibv_devices() > 0 && ibv.connect(fabmap_path, rep, sizeof(rep)) < 0)
+        snprintf(reply, n, "%.*s", (int)n - 1, rep);
 out:
     stage_put();
     pop_ctx(dev);
@@ -1872,6 +1921,7 @@ static void do_resume(char *reply, size_t n, int hold)
         snprintf(reply, n, "ok resumed (%d multicast bind(s), %d multicast mapping(s))%s", nb, nm,
                  hold ? "; launches held until open" : "");
         held = hold;
+        if (ibv_devices() > 0) ibv.open();  /* NCCL's verbs calls run again */
         if (!hold) gate_open();
     }
     pop_ctx(dev);
@@ -2178,6 +2228,7 @@ static void serve(int s)
     else if (!strcmp(buf, "resume")) { do_resume(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "resume hold")) { do_resume(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "ibv")) { snprintf(rep, sizeof(rep), "ok ibv %d", ibv_devices()); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "export ", 7)) do_export(strtoull(buf + 7, NULL, 10), 0, s);
     else if (!strncmp(buf, "exportfab ", 10)) do_export(strtoull(buf + 10, NULL, 10), 1, s);
     else if (!strcmp(buf, "whose") && fd >= 0) do_whose(fd, s);

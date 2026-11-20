@@ -80,6 +80,7 @@ where the files column says.
 | `nvsnap.io/gpus` | `annGPUs` (internal/server/manifests.go) |  |
 | `nvsnap.io/gpushare` | `GPUShareAnnotation` (internal/webhook/gpushare.go) | Opts a pod in. |
 | `nvsnap.io/gpushare-fabric` | `GPUShareFabricAnnotation` (internal/webhook/gpushare.go) | Marks a pod whose GPU memory is shared with pods on other nodes over multi-node NVLink. |
+| `nvsnap.io/gpushare-ibv` | `GPUShareIBVAnnotation` (internal/webhook/gpushare.go) | ("true") points NCCL at libnvsnap_ibv.so for its verbs, so that a pod whose NCCL uses RDMA (IB or RoCE) can be captured: the library destroys NCCL's RDMA state before the checkpoint and creates it again after the restore… |
 | `nvsnap.io/hash` | `HashAnnotation` (internal/election/election.go)<br>`HashLabel` (internal/election/election.go)<br>`stampedHashAnnotation` (internal/rootfsonly/watcher.go) | Carries the full cache hash the webhook composed at admission. |
 | `nvsnap.io/hash-short` | `labelHashShort` (internal/checkpointstore/promoter_shared.go) |  |
 | `nvsnap.io/inject` | `InjectLabel` (internal/webhook/mutate.go) | On a pod (or, via the registration's namespaceSelector, on its namespace) set to InjectDisabled opts the pod out of every nvsnap mutation. |
