@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 )
@@ -25,8 +24,9 @@ func (list *workspaceList) Set(value string) error {
 }
 
 type rcGuard struct {
-	home, workdir, workspace string
-	visiting                 map[string]bool
+	workdir, workspace string
+	visiting           map[string]bool
+	afterHome          bool
 }
 
 type sourceLine struct {
@@ -65,27 +65,23 @@ func sourceLines(input string) []sourceLine {
 	return lines
 }
 
-var unresolvedPlaceholder = regexp.MustCompile(`%[^%/]+%`)
-
-func (guard *rcGuard) resolve(path string) (string, error) {
-	path = strings.ReplaceAll(path, "%workspace%", guard.workspace)
-	path = strings.ReplaceAll(path, "%user.home%", guard.home)
-	if unresolvedPlaceholder.MatchString(path) {
-		return "", fmt.Errorf("unsupported rc path placeholder")
+func (guard *rcGuard) resolve(path string) string {
+	// Bazel expands only a leading %workspace%/ in import filenames. Other
+	// percent-delimited names, including %user.home%, are literal paths.
+	if strings.HasPrefix(path, "%workspace%/") {
+		path = guard.workspace + string(os.PathSeparator) + strings.TrimPrefix(path, "%workspace%/")
 	}
 	// Bazel resolves relative imports against its working directory, not the
 	// directory containing the importing file.
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(guard.workdir, path)
+		path = guard.workdir + string(os.PathSeparator) + path
 	}
-	return filepath.Clean(path), nil
+	// Let filesystem resolution handle symlinks before parent components.
+	return path
 }
 
 func (guard *rcGuard) file(path string, optional bool) error {
-	resolved, err := guard.resolve(path)
-	if err != nil {
-		return err
-	}
+	resolved := guard.resolve(path)
 	canonical, err := filepath.EvalSymlinks(resolved)
 	if err != nil {
 		if optional && os.IsNotExist(err) {
@@ -131,12 +127,22 @@ func (guard *rcGuard) contents(input, path string, allowFixed bool) error {
 		}
 		for i := 1; i < len(words); i++ {
 			option, assignment, joined := strings.Cut(words[i].value, "=")
-			if option != "--action_env" && option != "--host_action_env" && option != "--test_env" {
+			jvmOption := option == "--host_jvm_args" || option == "--jvmopt" || option == "--host_jvmopt"
+			if !jvmOption && option != "--action_env" && option != "--host_action_env" && option != "--test_env" {
 				continue
 			}
 			if !joined && i+1 < len(words) {
 				i++
 				assignment = words[i].value
+			}
+			if jvmOption {
+				// BAZELRC and its imports load after the managed home block.
+				// Each option supplies one JVM argument; property values that
+				// merely contain this text are not enabling JVM arguments.
+				if guard.afterHome && assignment == "-XX:+UseBASE64Intrinsics" {
+					return fmt.Errorf("%s:%d: JVM mitigation conflict in %s; remove the enabling option from BAZELRC or its imports", path, line.number, option)
+				}
+				continue
 			}
 			name, _, fixed := strings.Cut(assignment, "=")
 			if name == "JAVA_TOOL_OPTIONS" && fixed {
@@ -177,7 +183,7 @@ func checkRCs(input, cwd, home string, workspaces []string, extraRC, systemRC st
 		if err != nil {
 			return err
 		}
-		guard := rcGuard{home: home, workdir: workdir, workspace: root, visiting: map[string]bool{}}
+		guard := rcGuard{workdir: workdir, workspace: root, visiting: map[string]bool{}}
 		if systemRC != "" {
 			if err := guard.file(systemRC, true); err != nil {
 				return err
@@ -192,9 +198,14 @@ func checkRCs(input, cwd, home string, workspaces []string, extraRC, systemRC st
 			return err
 		}
 		if extraRC != "" {
+			guard.afterHome = true
 			for _, path := range strings.Split(extraRC, ",") {
 				if path == "" {
 					return fmt.Errorf("BAZELRC contains an empty path")
+				}
+				// BAZELRC entries are paths, not rc import declarations.
+				if !filepath.IsAbs(path) {
+					path = workdir + string(os.PathSeparator) + path
 				}
 				if err := guard.file(path, false); err != nil {
 					return err

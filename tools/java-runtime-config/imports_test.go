@@ -59,8 +59,8 @@ func TestGuardTraversesImportsWithBazelPathSemantics(t *testing.T) {
 	// Relative imports are resolved from Bazel cwd, not config/first.rc.
 	writeRCFixture(t, filepath.Join(workspace, "config", "first.rc"), "import second.rc\n")
 	writeRCFixture(t, filepath.Join(workspace, "config", "second.rc"), "# unused file\n")
-	writeRCFixture(t, filepath.Join(workspace, "second.rc"), "try-import %user.home%/extra.rc\n")
 	path := filepath.Join(home, "extra.rc")
+	writeRCFixture(t, filepath.Join(workspace, "second.rc"), "try-import "+quoteWord(path)+"\n")
 	writeRCFixture(t, path, "common --action_env=JAVA_TOOL_OPTIONS=-Dfoo=bar\n")
 	err := checkRCs("", workspace, home, nil, "", "")
 	if err == nil || !strings.Contains(err.Error(), path+":1:") {
@@ -76,7 +76,7 @@ func TestGuardInlineHomeValuesAndInheritedReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeRCFixture(t, filepath.Join(home, "imported.rc"), "common --host_action_env=JAVA_TOOL_OPTIONS=\n")
-	if err := checkRCs(inline+"import %user.home%/imported.rc\n", workspace, home, nil, "", ""); err == nil {
+	if err := checkRCs(inline+"import "+quoteWord(filepath.Join(home, "imported.rc"))+"\n", workspace, home, nil, "", ""); err == nil {
 		t.Fatal("home imported fixed value was accepted")
 	}
 }
@@ -121,7 +121,6 @@ func TestGuardAdditionalAndSystemRC(t *testing.T) {
 func TestGuardRejectsUnverifiableImports(t *testing.T) {
 	for _, input := range []string{
 		"import missing.rc\n",
-		"try-import %unknown%/optional.rc\n",
 		"try-import-if-bazel-version >=9.0.0 optional.rc\n",
 		"import a b\n",
 		"import .bazelrc\n",
@@ -133,6 +132,95 @@ func TestGuardRejectsUnverifiableImports(t *testing.T) {
 				t.Fatal("unverifiable import accepted")
 			}
 		})
+	}
+}
+
+func TestGuardLiteralImportNames(t *testing.T) {
+	for _, name := range []string{"%user.home%/.bazelrc.user", "%unknown%/optional.rc", "sub/%workspace%/optional.rc", "%workspace%literal.rc"} {
+		t.Run(name, func(t *testing.T) {
+			workspace, home := newGuardFixture(t)
+			writeRCFixture(t, filepath.Join(home, ".bazelrc.user"), "common --action_env=JAVA_TOOL_OPTIONS=-Dunrelated=hidden\n")
+			writeRCFixture(t, filepath.Join(workspace, ".bazelrc"), "try-import "+name+"\n")
+			if err := checkRCs("", workspace, home, nil, "", ""); err != nil {
+				t.Fatalf("missing literal optional import should be skipped: %v", err)
+			}
+			literal := filepath.Join(workspace, name)
+			writeRCFixture(t, literal, "common --test_env=JAVA_TOOL_OPTIONS=-Dactual=hidden\n")
+			err := checkRCs("", workspace, home, nil, "", "")
+			if err == nil || !strings.Contains(err.Error(), literal+":1:") {
+				t.Fatalf("existing literal import was not checked: %v", err)
+			}
+		})
+	}
+}
+
+func TestGuardRejectsLaterJVMEnablingOptions(t *testing.T) {
+	for _, scope := range []string{"startup", "startup:linux", "startup:macos", "build:linux", "test:macos", "run"} {
+		flags := []string{"--jvmopt", "--host_jvmopt"}
+		if strings.HasPrefix(scope, "startup") {
+			flags = []string{"--host_jvm_args"}
+		}
+		for _, flag := range flags {
+			for _, separator := range []string{"=", " "} {
+				t.Run(scope+flag+separator, func(t *testing.T) {
+					workspace, home := newGuardFixture(t)
+					late := filepath.Join(workspace, "late.rc")
+					writeRCFixture(t, late, "import %workspace%/enabling.rc\n")
+					writeRCFixture(t, filepath.Join(workspace, "enabling.rc"), scope+" "+flag+separator+"-XX:+UseBASE64Intrinsics\n")
+					err := checkRCs("", workspace, home, nil, late, "")
+					if err == nil || !strings.Contains(err.Error(), "JVM mitigation conflict") || !strings.Contains(err.Error(), flag) {
+						t.Fatalf("late enabling option accepted: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGuardPreservesNonconflictingJVMArguments(t *testing.T) {
+	workspace, home := newGuardFixture(t)
+	late := filepath.Join(workspace, "late.rc")
+	contents := "startup:linux --host_jvm_args=-Xmx2g\nstartup --host_jvm_args=-Dmessage=-XX:+UseBASE64Intrinsics\nbuild --jvmopt=-XX:-UseBASE64Intrinsics\n"
+	contents += "startup --host_jvm_args=\"-Dmessage=literal -XX:+UseBASE64Intrinsics\"\n"
+	writeRCFixture(t, late, contents)
+	if err := checkRCs("", workspace, home, nil, late, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(late)
+	if err != nil || string(got) != contents {
+		t.Fatalf("unrelated JVM arguments changed: %v", err)
+	}
+	// Earlier startup controls remain safe because the home block takes precedence.
+	writeRCFixture(t, filepath.Join(workspace, ".bazelrc"), "startup:linux --host_jvm_args=-XX:+UseBASE64Intrinsics\n")
+	if err := checkRCs("", workspace, home, nil, "", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBazelRCPathsAreNotImportDeclarations(t *testing.T) {
+	workspace, home := newGuardFixture(t)
+	writeRCFixture(t, filepath.Join(workspace, "late.rc"), "common --action_env=JAVA_TOOL_OPTIONS=-Dunrelated=hidden\n")
+	// A leading workspace token expands in imports, but not BAZELRC paths.
+	writeRCFixture(t, filepath.Join(workspace, "%workspace%", "late.rc"), "# literal path\n")
+	if err := checkRCs("", workspace, home, nil, "%workspace%/late.rc", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestImportParentComponentsFollowSymlinks(t *testing.T) {
+	workspace, home := newGuardFixture(t)
+	outside := t.TempDir()
+	if err := os.Mkdir(filepath.Join(outside, "child"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "child"), filepath.Join(workspace, "linked")); err != nil {
+		t.Skip(err)
+	}
+	writeRCFixture(t, filepath.Join(workspace, ".bazelrc"), "import linked/../actual.rc\n")
+	writeRCFixture(t, filepath.Join(outside, "actual.rc"), "common --action_env=JAVA_TOOL_OPTIONS=-Dactual=hidden\n")
+	writeRCFixture(t, filepath.Join(workspace, "actual.rc"), "# unrelated file\n")
+	if err := checkRCs("", workspace, home, nil, "", ""); err == nil {
+		t.Fatal("symlink parent import was cleaned before filesystem resolution")
 	}
 }
 

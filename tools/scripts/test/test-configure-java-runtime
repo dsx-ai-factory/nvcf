@@ -198,7 +198,7 @@ assert_guard_failure() {
     fi
     cmp "$bazelrc" "$fixture/before-guard.bazelrc"
     cmp "$env_file" "$fixture/before-guard.env"
-    grep -Fq 'fixed JAVA_TOOL_OPTIONS' "$fixture/output"
+    grep -Fq "${TEST_GUARD_ERROR:-fixed JAVA_TOOL_OPTIONS}" "$fixture/output"
     if grep -Fq 'secret-must-not-appear' "$fixture/output"; then
         echo 'FAIL fixed option contents leaked into the error' >&2
         exit 1
@@ -210,11 +210,11 @@ assert_guard_failure
 echo 'ok   rejects fixed workspace values without changing rc or environment'
 
 printf 'try-import %%workspace%%/nested.rc\n' > .bazelrc
-printf 'import %%user.home%%/external.rc\n' > nested.rc
+printf 'import "%s/external.rc"\n' "$fixture/home" > nested.rc
 printf 'common --host_action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/home/external.rc"
 assert_guard_failure
 printf '# workspace has no fixed options\n' > .bazelrc
-printf 'import %%user.home%%/external.rc\n' >> "$bazelrc"
+printf 'import "%s/external.rc"\n' "$fixture/home" >> "$bazelrc"
 assert_guard_failure
 cp "$fixture/first.bazelrc" "$bazelrc"
 echo 'ok   rejects fixed values in workspace and home import chains'
@@ -234,3 +234,13 @@ if env HOME="$fixture/empty-home" GITHUB_ENV="$fixture/absent-env" \
 fi
 [[ ! -e "$fixture/empty-home/.bazelrc" && ! -e "$fixture/absent-env" ]]
 echo 'ok   rejected first-time setup creates neither rc nor environment files'
+
+printf 'try-import %%user.home%%/.bazelrc.user\n' > .bazelrc
+printf 'common --action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/home/.bazelrc.user"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+echo 'ok   literal optional home import does not read an unrelated home file'
+
+printf 'startup:linux --host_jvm_args=-XX:+UseBASE64Intrinsics\n' > "$fixture/later.rc"
+TEST_BAZELRC="$fixture/later.rc" TEST_GUARD_ERROR='JVM mitigation conflict' assert_guard_failure
+echo 'ok   later startup overrides are rejected before rc or environment writes'
