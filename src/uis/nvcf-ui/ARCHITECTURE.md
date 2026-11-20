@@ -175,8 +175,9 @@ Error handling is centralized. Do not add local equivalents.
   recovery the global fallback cannot give, and that exception is recorded
   here.
 - Copy for a specific status goes in `RouteErrorFallback`, which branches on
-  `HttpError.status` and delegates to a sibling component. A 502 means the BFF
-  could not reach the upstream service, so it renders
+  `HttpError.status` and delegates to a sibling component. A 502 means the
+  upstream service is not responding: either the BFF could not reach it, or
+  the upstream returned its own 502, which the BFF passes through. Both render
   `UnreachableServiceFallback` instead of the bare status line. Feature and
   route code still never inspects status.
 - `AsyncBoundary` isolates suspense and errors below the route, for a panel
