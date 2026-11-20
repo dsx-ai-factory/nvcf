@@ -244,3 +244,11 @@ echo 'ok   literal optional home import does not read an unrelated home file'
 printf 'startup:linux --host_jvm_args=-XX:+UseBASE64Intrinsics\n' > "$fixture/later.rc"
 TEST_BAZELRC="$fixture/later.rc" TEST_GUARD_ERROR='JVM mitigation conflict' assert_guard_failure
 echo 'ok   later startup overrides are rejected before rc or environment writes'
+
+printf 'startup:linux --host_jvm_args\nstartup:linux -XX:+UseBASE64Intrinsics\n' > "$fixture/later.rc"
+TEST_BAZELRC="$fixture/later.rc" TEST_GUARD_ERROR='missing value for --host_jvm_args' assert_guard_failure
+echo 'ok   split JVM arguments are rejected before rc or environment writes'
+
+printf 'build:ci --jvmopt=-XX:+UseBASE64Intrinsics\n' > .bazelrc
+TEST_GUARD_ERROR='JVM mitigation conflict' assert_guard_failure
+echo 'ok   external named enabling controls are rejected before rc or environment writes'

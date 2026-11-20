@@ -122,25 +122,32 @@ func (guard *rcGuard) contents(input, path string, allowFixed bool) error {
 		case "try-import-if-bazel-version":
 			return fmt.Errorf("%s:%d: conditional rc imports cannot be verified by CI Java setup", path, line.number)
 		}
-		if allowFixed {
-			continue
-		}
+		scope, _, named := strings.Cut(words[0].value, ":")
 		for i := 1; i < len(words); i++ {
 			option, assignment, joined := strings.Cut(words[i].value, "=")
 			jvmOption := option == "--host_jvm_args" || option == "--jvmopt" || option == "--host_jvmopt"
 			if !jvmOption && option != "--action_env" && option != "--host_action_env" && option != "--test_env" {
 				continue
 			}
-			if !joined && i+1 < len(words) {
+			if !joined {
+				// Bazel can consume a value from another rc statement. The
+				// transformer cannot safely merge that value line by line.
+				if i+1 == len(words) {
+					return fmt.Errorf("%s:%d: missing value for %s; keep the option and value on the same rc statement", path, line.number, option)
+				}
 				i++
 				assignment = words[i].value
 			}
+			if allowFixed {
+				continue
+			}
 			if jvmOption {
 				// BAZELRC and its imports load after the managed home block.
+				// Named command configurations can also expand at CLI priority.
 				// Each option supplies one JVM argument; property values that
 				// merely contain this text are not enabling JVM arguments.
-				if guard.afterHome && assignment == "-XX:+UseBASE64Intrinsics" {
-					return fmt.Errorf("%s:%d: JVM mitigation conflict in %s; remove the enabling option from BAZELRC or its imports", path, line.number, option)
+				if (guard.afterHome || (named && scope != "startup")) && assignment == "-XX:+UseBASE64Intrinsics" {
+					return fmt.Errorf("%s:%d: JVM mitigation conflict in %s; remove the enabling option from external rc configuration", path, line.number, option)
 				}
 				continue
 			}

@@ -177,6 +177,77 @@ func TestGuardRejectsLaterJVMEnablingOptions(t *testing.T) {
 	}
 }
 
+func TestGuardRejectsValuesSplitAcrossStatements(t *testing.T) {
+	for _, flag := range []string{"--host_jvm_args", "--jvmopt", "--host_jvmopt", "--action_env", "--host_action_env", "--test_env"} {
+		for _, source := range []string{"workspace", "home", "later"} {
+			t.Run(source+flag, func(t *testing.T) {
+				workspace, home := newGuardFixture(t)
+				scope, value := "build:ci", "-XX:+UseBASE64Intrinsics"
+				if flag == "--host_jvm_args" {
+					scope = "startup:linux"
+				} else if strings.HasSuffix(flag, "_env") {
+					value = "JAVA_TOOL_OPTIONS=-Dsecret=do-not-log"
+				}
+				input := "# heading\n" + scope + " " + flag + "\n" + scope + " " + value + "\n"
+				path, inline, extra := filepath.Join(workspace, ".bazelrc"), "", ""
+				switch source {
+				case "home":
+					path, inline = filepath.Join(home, ".bazelrc"), input
+				case "later":
+					path = filepath.Join(workspace, "later.rc")
+					extra = path
+				}
+				writeRCFixture(t, path, input)
+				err := checkRCs(inline, workspace, home, nil, extra, "")
+				if err == nil || !strings.Contains(err.Error(), path+":2:") || !strings.Contains(err.Error(), "missing value for "+flag) {
+					t.Fatalf("cross-statement value accepted: %v", err)
+				}
+				if strings.Contains(err.Error(), "do-not-log") {
+					t.Fatal("option content leaked")
+				}
+			})
+		}
+	}
+}
+
+func TestGuardRejectsExternalNamedJVMEnablingOptions(t *testing.T) {
+	for _, scope := range []string{"common:ci", "build:ci", "test:fixture", "run:custom", "build:linux"} {
+		for _, flag := range []string{"--jvmopt", "--host_jvmopt"} {
+			for _, source := range []string{"workspace", "system", "home-import", "later"} {
+				t.Run(source+scope+flag, func(t *testing.T) {
+					workspace, home := newGuardFixture(t)
+					path := filepath.Join(workspace, "external.rc")
+					inline, extra, system := "", "", ""
+					switch source {
+					case "workspace":
+						writeRCFixture(t, filepath.Join(workspace, ".bazelrc"), "import "+quoteWord(path)+"\n")
+					case "system":
+						system = path
+					case "home-import":
+						inline = "import " + quoteWord(path) + "\n"
+					case "later":
+						extra = path
+					}
+					writeRCFixture(t, path, scope+" "+flag+" -XX:+UseBASE64Intrinsics\n")
+					err := checkRCs(inline, workspace, home, nil, extra, system)
+					if err == nil || !strings.Contains(err.Error(), path+":1:") || !strings.Contains(err.Error(), "JVM mitigation conflict") {
+						t.Fatalf("external named enabling option accepted: %v", err)
+					}
+					contents := scope + " " + flag + "=-Dmessage=-XX:+UseBASE64Intrinsics\n"
+					writeRCFixture(t, path, contents)
+					if err := checkRCs(inline, workspace, home, nil, extra, system); err != nil {
+						t.Fatalf("unrelated named JVM argument rejected: %v", err)
+					}
+					got, err := os.ReadFile(path)
+					if err != nil || string(got) != contents {
+						t.Fatalf("external named settings changed: %v", err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestGuardPreservesNonconflictingJVMArguments(t *testing.T) {
 	workspace, home := newGuardFixture(t)
 	late := filepath.Join(workspace, "late.rc")
