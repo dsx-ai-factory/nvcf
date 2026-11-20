@@ -3264,8 +3264,60 @@ mod tests {
         })
     }
 
-    fn is_stats_collector_panic(message: &str) -> bool {
-        message.starts_with("stats collector") && message.contains("panicked")
+    /// Pylon reports a critical task that panicked as `<task> failed: <JoinError>`
+    /// and keeps only that text. tokio documents `JoinError::is_panic`, not the
+    /// Display text, so telling a stats collector panic from another collector
+    /// failure by text relies on tokio's Display of a panic saying "panicked"
+    /// (tokio 1.52.3: "task {id} panicked with message ..."). The test
+    /// `tokio_join_error_display_of_a_panic_says_panicked` checks that text.
+    const TOKIO_JOIN_ERROR_PANIC_TEXT: &str = "panicked";
+
+    fn join_error_text_is_a_panic(text: &str) -> bool {
+        text.contains(TOKIO_JOIN_ERROR_PANIC_TEXT)
+    }
+
+    /// Checks that `message` is Pylon's critical task error for a stats
+    /// collector panic. A failure in the tokio part of the message names that
+    /// dependency, so a change in tokio's text is not taken for Pylon
+    /// reporting another task.
+    #[track_caller]
+    fn assert_reports_a_stats_collector_panic(context: &str, message: &str) {
+        let Some(join_error) = message.strip_prefix("stats collector failed: ") else {
+            panic!(
+                "{context}: Pylon should report the stats collector panic, not another task: \
+                 {message}"
+            );
+        };
+        assert!(
+            join_error_text_is_a_panic(join_error),
+            "{context}: Pylon reported the stats collector, but the tokio JoinError text in its \
+             error does not say {TOKIO_JOIN_ERROR_PANIC_TEXT:?}: {message}. This check relies on \
+             tokio's undocumented Display text for a panic; if \
+             `tokio_join_error_display_of_a_panic_says_panicked` fails too, tokio changed it."
+        );
+    }
+
+    #[tokio::test]
+    async fn tokio_join_error_display_of_a_panic_says_panicked() {
+        let task = tokio::spawn(async {
+            panic!("probe for the text of tokio's JoinError");
+        });
+        let join_error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a task that panics should end at once")
+            .expect_err("a task that panics should fail to join");
+        assert!(
+            join_error.is_panic(),
+            "the join error should be a panic: {join_error:?}"
+        );
+        let text = join_error.to_string();
+        assert!(
+            join_error_text_is_a_panic(&text),
+            "tokio's JoinError Display of a panic no longer says \
+             {TOKIO_JOIN_ERROR_PANIC_TEXT:?}: {text:?}. Pylon's critical task error for a \
+             panicked task embeds this text, and the stats collector panic checks in this module \
+             rely on it: update `join_error_text_is_a_panic`."
+        );
     }
 
     #[tokio::test]
@@ -3356,11 +3408,9 @@ mod tests {
         )
         .await
         .expect("the collector's exit should follow the supervisor's promptly");
-        let message = error.to_string();
-        assert!(
-            message.starts_with("stats collector failed") && message.contains("panicked"),
-            "the supervisor's exit should be reported as the collector panic that caused it: \
-             {message}"
+        assert_reports_a_stats_collector_panic(
+            "a supervisor exit caused by a stats collector panic",
+            &error.to_string(),
         );
         let shutdown_error =
             shutdown_without_re_raising(runtime, ShutdownCause::CriticalTaskExit).await;
@@ -3518,10 +3568,15 @@ mod tests {
                     "{branch} branch: Pylon should fail when it finds a stats collector panic"
                 ))
                 .to_string();
-            assert!(
-                is_stats_collector_panic(&message),
-                "{branch} branch: Pylon should return the collector panic: {message}"
-            );
+            if signalled {
+                // The shutdown's own report, which has no tokio text.
+                assert_eq!(
+                    message, "stats collector panicked",
+                    "signal branch: Pylon should return the collector panic its shutdown found"
+                );
+            } else {
+                assert_reports_a_stats_collector_panic("critical task branch", &message);
+            }
             assert_eq!(
                 recorded.critical_task_exits(),
                 [message],
@@ -3654,9 +3709,9 @@ mod tests {
         drop(default_guard);
 
         let message = error.to_string();
-        assert!(
-            message.starts_with("stats collector failed") && message.contains("panicked"),
-            "Pylon should report the collector panic, not the engine stats stream: {message}"
+        assert_reports_a_stats_collector_panic(
+            "a stats collector panic with a running engine stats stream",
+            &message,
         );
         assert_eq!(
             recorded.critical_task_exits(),
@@ -3665,5 +3720,126 @@ mod tests {
         );
         engine_server.abort();
         let _ = engine_server.await;
+    }
+
+    #[tokio::test]
+    async fn running_pylon_returns_its_first_critical_task_exit_when_the_shutdown_finds_a_stats_collector_panic()
+     {
+        // A critical task other than the stats collector ends on its own, and
+        // the collector panics, both before Pylon's main loop looks. With both
+        // exits ready, the main loop reports either one: tokio::select!
+        // documents that it starts polling at a random branch. When it reports
+        // the other task, its shutdown then finds the collector panic, which
+        // must neither replace the error Pylon returns nor add a second
+        // critical task exit line. Runs repeat until one reports the other
+        // task first.
+        //
+        // The other task is an engine stats stream in auto mode whose endpoint
+        // does not serve engine stats, so it enables the fallback and ends.
+        // Pylon is told the stream is required, so that end is a critical task
+        // exit that the collector did not cause.
+        const RUNS: usize = 20;
+        const ENGINE_STATS_STREAM_EXIT: &str = "engine stats stream exited unexpectedly";
+        let (engine_url, engine_server) = spawn_engine_stats_server().await;
+        for _ in 0..RUNS {
+            let config = StatsCollectorConfig::default();
+            let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
+                InferenceServerStatus::Active,
+                &[],
+                config.observation_channel_capacity,
+                None,
+            );
+            let (stats_update_tx, stats_update_rx) = stats_aggregator_update_channel(&config);
+            let stats_collector = start_stats_collector_with_engine_stats(
+                config,
+                request_observation_rx,
+                Some(stats_update_rx),
+                runtime_state.clone(),
+            );
+            let stream = start_engine_stats_stream(
+                EngineStatsStreamConfig::new(
+                    &engine_url,
+                    "/pylon/v1/stats/not-served",
+                    EngineStatsStreamMode::Auto,
+                ),
+                stats_update_tx.clone(),
+            )
+            .expect("an auto engine stats stream should start");
+            let mut runtime = test_running_pylon_with_models(
+                stats_collector,
+                runtime_state.clone(),
+                &["model-a"],
+            )
+            .await;
+            runtime.engine_stats_stream = Some(RunningEngineStatsStream {
+                mode: EngineStatsStreamMode::Required,
+                handle: stream,
+            });
+            // The stream's task holds the only other sender, so the count
+            // falls to one once the stream has ended.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while stats_update_tx.sender_count() > 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect(
+                "an auto engine stats stream should end when its endpoint does not serve engine \
+                 stats",
+            );
+            panic_stats_collector(&runtime.stats_collector).await;
+            let recorded = RecordedEvents::default();
+            let dispatch = tracing::Dispatch::new(recorded.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+            let result = run_pylon_without_re_raising(
+                runtime,
+                std::future::pending::<std::io::Result<&'static str>>(),
+            )
+            .await;
+            drop(default_guard);
+
+            let critical_task_exits = recorded.critical_task_exits();
+            let Some(first) = critical_task_exits.first() else {
+                panic!("Pylon should log the critical task exit that it reports");
+            };
+            let engine_first = first.as_str() == ENGINE_STATS_STREAM_EXIT;
+            let branch = if engine_first {
+                "engine stats stream reported first"
+            } else {
+                "stats collector reported first"
+            };
+            if !engine_first {
+                assert_reports_a_stats_collector_panic(branch, first);
+            }
+            let message = result
+                .expect_err(&format!("{branch}: a critical task exit should fail Pylon"))
+                .to_string();
+            assert_eq!(
+                &message, first,
+                "{branch}: Pylon should return the critical task exit it reported, not a stats \
+                 collector panic that its shutdown found"
+            );
+            assert_eq!(
+                critical_task_exits.len(),
+                1,
+                "{branch}: Pylon should log its critical task exit once, and not log a stats \
+                 collector panic that its shutdown found: {critical_task_exits:?}"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{branch}: the model lifecycle supervisor should retire its models in its normal \
+                 shutdown"
+            );
+            if engine_first {
+                engine_server.abort();
+                let _ = engine_server.await;
+                return;
+            }
+        }
+        panic!(
+            "Pylon reported the stats collector first in all {RUNS} runs; tokio::select! may no \
+             longer start polling at a random branch"
+        );
     }
 }
