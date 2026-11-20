@@ -3991,4 +3991,446 @@ mod tests {
         within("model lifecycle shutdown", lifecycle.shutdown()).await;
         upstream.shutdown().await;
     }
+
+    /// Where the supervisor finds its stats collector gone. Each path ends the
+    /// supervisor's run with `StatsCollectorStopped`.
+    #[derive(Clone, Copy, Debug)]
+    enum CollectorStopPath {
+        /// A discovery poll drops model-c and adds model-b. The retire request
+        /// for model-c fails first, and then the begin for model-b.
+        Discovery,
+        /// model-b begins before the collector ends, and the snapshot that
+        /// would admit it fails.
+        Admit,
+        /// model-b's calibration, which has no fallback input TPS, asks the
+        /// collector for its snapshot, and that fails (R3a).
+        Calibration,
+        /// Like `Calibration`, with a fallback input TPS that the supervisor
+        /// must not fall back to.
+        CalibrationWithFallback,
+    }
+
+    /// How long a test watches a supervisor that should keep waiting for its
+    /// stop. A supervisor that does not wait retires its generations and
+    /// exits as soon as it runs again.
+    const SUPERVISOR_WAIT_WATCH: Duration = Duration::from_millis(300);
+
+    /// A supervisor that a stats collector panic has stopped, with model-a
+    /// admitted before the panic.
+    struct SupervisorStoppedByCollector {
+        label: String,
+        lifecycle: crate::ModelLifecycleHandle,
+        runtime_state: PylonRuntimeState,
+        metrics: Arc<PylonMetrics>,
+        upstream: TestUpstream,
+        subscriber: RecordingTracingSubscriber,
+        /// Keeps `subscriber` recording until the test drops it.
+        default_guard: tracing::dispatcher::DefaultGuard,
+    }
+
+    /// Panics the stats collector and waits for it to end: a configured input
+    /// TPS of zero breaks a stats initialization invariant.
+    async fn panic_the_stats_collector(label: &str, mut stats: crate::StatsCollectorHandle) {
+        let begun = within(
+            "the request that panics the collector",
+            stats.control().begin_generation(
+                ModelGeneration::new("model-panics", 1),
+                crate::stats::ModelStatsInitialization::ConfiguredInputTps { input_tps: 0.0 },
+            ),
+        )
+        .await;
+        assert!(
+            begun.is_err(),
+            "{label}: a configured input TPS of zero should panic the collector: {begun:?}"
+        );
+        let exit = within("the collector exit", stats.wait_for_exit()).await;
+        assert!(
+            matches!(&exit, Err(error) if error.is_panic()),
+            "{label}: the collector should end with a panic: {exit:?}"
+        );
+    }
+
+    /// Starts a model lifecycle that admits model-a, and model-c for
+    /// `Discovery`. With `drain` set, it then marks a registration drain as
+    /// started. It panics the stats collector and returns once the supervisor
+    /// has found the collector gone through `path`.
+    async fn stop_the_supervisor_with_a_collector_panic(
+        path: CollectorStopPath,
+        drain: bool,
+    ) -> SupervisorStoppedByCollector {
+        let label = format!("{path:?}, drain {drain}");
+        let (initial_models, completion_behavior) = match path {
+            CollectorStopPath::Discovery => {
+                (&["model-a", "model-c"][..], CompletionBehavior::Pending)
+            }
+            CollectorStopPath::Admit => (&["model-a"][..], CompletionBehavior::Pending),
+            // Each generation's calibration completes four requests and then
+            // saturates, so model-a measures a rate at startup.
+            CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback => (
+                &["model-a"][..],
+                CompletionBehavior::SaturateAfter {
+                    completed_requests_per_generation: 4,
+                },
+            ),
+        };
+        let mut upstream = TestUpstream::spawn(initial_models, completion_behavior).await;
+        let config = match path {
+            CollectorStopPath::Discovery => discovery_config(&upstream.base_url),
+            // The initialization attempt probes the upstream's health after
+            // model-b's begin and before its admission. Active canaries stay
+            // off, so the probe is the only health traffic.
+            CollectorStopPath::Admit => ModelLifecycleConfig {
+                bringup: BringupConfig {
+                    enabled: true,
+                    active_canary_interval: Duration::ZERO,
+                    canary_timeout: Duration::from_secs(30),
+                    ..BringupConfig::default()
+                },
+                ..discovery_config(&upstream.base_url)
+            },
+            CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback => {
+                let fallback_input_tps = matches!(path, CollectorStopPath::CalibrationWithFallback)
+                    .then_some(FALLBACK_INPUT_TPS);
+                let mut config =
+                    calibration_config_with_fallback(&upstream.base_url, fallback_input_tps);
+                let ModelInitialization::Calibration(calibration) = &mut config.initialization
+                else {
+                    unreachable!("the test config calibrates")
+                };
+                // The test holds the attempt's health probe for as long as it
+                // needs, without the probe timing out.
+                calibration.health_timeout = Duration::from_secs(30);
+                config
+            }
+        };
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, stats) = start_test_stats();
+        let lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(config, runtime_state.clone(), &stats, Some(metrics.clone())),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{label}: startup should admit the initial models: {error}")
+        });
+        assert_eq!(
+            runtime_state.advertised_model_ids(),
+            initial_models,
+            "{label}: startup should admit the initial models"
+        );
+        if drain {
+            runtime_state.mark_drain_started();
+        }
+        let subscriber = RecordingTracingSubscriber::default();
+        let default_guard =
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));
+
+        match path {
+            CollectorStopPath::Discovery => {
+                panic_the_stats_collector(&label, stats).await;
+                upstream.set_models(&["model-a", "model-b"]).await;
+            }
+            CollectorStopPath::Admit
+            | CollectorStopPath::Calibration
+            | CollectorStopPath::CalibrationWithFallback => {
+                // model-b's attempt waits in its health probe until the
+                // collector has ended, so its next collector request, the
+                // admission's snapshot or the calibration's, finds it gone.
+                while upstream.calibrations.try_recv().is_ok() {}
+                upstream.hold_health();
+                upstream.set_models(&["model-a", "model-b"]).await;
+                upstream.wait_for_held_health_probe().await;
+                panic_the_stats_collector(&label, stats).await;
+                upstream.release_health();
+            }
+        }
+        wait_for(
+            "the supervisor should find its stats collector gone",
+            || lifecycle.stopped_by_stats_collector(),
+        )
+        .await;
+        SupervisorStoppedByCollector {
+            label,
+            lifecycle,
+            runtime_state,
+            metrics,
+            upstream,
+            subscriber,
+            default_guard,
+        }
+    }
+
+    /// Checks the log lines of a supervisor that a stats collector panic
+    /// stopped: one ERROR for the stop (R1a), and for a calibration path, one
+    /// WARN and one `error` outcome for model-b's calibration, which the
+    /// supervisor neither tries again nor falls back from (R3a).
+    fn assert_a_collector_panic_stopped_the_supervisor(
+        run: &SupervisorStoppedByCollector,
+        path: CollectorStopPath,
+    ) {
+        let label = &run.label;
+        let events = run.subscriber.events();
+        let failed = events_with_message(&events, SUPERVISOR_FAILED);
+        assert_eq!(
+            failed.len(),
+            1,
+            "{label}: the supervisor should report the collector panic once"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR, "{label}");
+        assert_tracing_event_field(failed[0], "error", STATS_COLLECTOR_STOPPED);
+        let errors = error_events(&events);
+        assert_eq!(
+            errors.len(),
+            1,
+            "{label}: the supervisor's report should be the only error: {errors:?}"
+        );
+        assert!(
+            events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
+            "{label}: a collector panic is not part of a shutdown"
+        );
+        if !matches!(
+            path,
+            CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback
+        ) {
+            return;
+        }
+        let warnings = events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "{label}: model-b's calibration should warn once that the collector stopped"
+        );
+        assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
+        assert_tracing_event_field(warnings[0], "model_id", "model-b");
+        assert_tracing_event_field(warnings[0], "error", CALIBRATION_COLLECTOR_STOPPED);
+        let retries = calibration_retry_warnings(&events);
+        assert!(
+            retries.is_empty(),
+            "{label}: the supervisor should not try model-b again: {retries:?}"
+        );
+        assert_eq!(
+            calibration_count(&run.metrics, "model-b", "error"),
+            1,
+            "{label}: model-b's calibration should be recorded once as an error"
+        );
+        assert_eq!(
+            calibration_count(&run.metrics, "model-b", "cancelled"),
+            0,
+            "{label}: model-b's calibration should not be recorded as cancelled"
+        );
+    }
+
+    /// During a drain, the supervisor that the collector stopped keeps model-a
+    /// admitted until its own stop, and retires it then.
+    async fn assert_a_drain_keeps_model_a_until_the_supervisor_stop(path: CollectorStopPath) {
+        let mut run = stop_the_supervisor_with_a_collector_panic(path, true).await;
+        let label = run.label.clone();
+        while run.upstream.calibrations.try_recv().is_ok() {}
+
+        let exit = tokio::time::timeout(SUPERVISOR_WAIT_WATCH, run.lifecycle.wait_for_exit()).await;
+        assert!(
+            exit.is_err(),
+            "{label}: during a drain the supervisor should keep its generations until its stop \
+             instead of exiting: {exit:?}"
+        );
+        assert_eq!(
+            run.runtime_state.advertised_model_ids(),
+            ["model-a"],
+            "{label}: model-a should stay advertised through the drain"
+        );
+        assert!(
+            matches!(
+                run.runtime_state.request_generation_admission("model-a"),
+                crate::runtime_state::RequestGenerationAdmission::Admitted(_)
+            ),
+            "{label}: requests for model-a should still be admitted during the drain"
+        );
+        if matches!(path, CollectorStopPath::Discovery) {
+            assert!(
+                run.runtime_state.current_generation("model-c").is_none(),
+                "{label}: model-c left discovery, so its generation retires although the \
+                 collector could not retire its stats"
+            );
+        }
+        assert!(
+            run.upstream.calibrations.try_recv().is_err(),
+            "{label}: the waiting supervisor should not calibrate anything"
+        );
+        assert_a_collector_panic_stopped_the_supervisor(&run, path);
+
+        let SupervisorStoppedByCollector {
+            lifecycle,
+            runtime_state,
+            upstream,
+            default_guard,
+            ..
+        } = run;
+        within("the supervisor's stop", lifecycle.shutdown()).await;
+        drop(default_guard);
+        assert!(
+            runtime_state.advertised_model_ids().is_empty()
+                && runtime_state.current_generation("model-a").is_none(),
+            "{label}: the supervisor's stop should retire model-a"
+        );
+        upstream.shutdown().await;
+    }
+
+    /// Outside a drain, the supervisor that the collector stopped retires
+    /// model-a as it stops, without waiting for its own stop.
+    async fn assert_no_drain_retires_model_a_at_once(path: CollectorStopPath) {
+        let mut run = stop_the_supervisor_with_a_collector_panic(path, false).await;
+        let label = run.label.clone();
+
+        within(
+            "the supervisor's exit without its stop",
+            run.lifecycle.wait_for_exit(),
+        )
+        .await
+        .expect("model lifecycle supervisor should not panic");
+        assert!(
+            run.runtime_state.advertised_model_ids().is_empty(),
+            "{label}: outside a drain the supervisor should retire model-a as it stops"
+        );
+        assert_eq!(
+            run.runtime_state.request_generation_admission("model-a"),
+            crate::runtime_state::RequestGenerationAdmission::Unavailable,
+            "{label}: requests for model-a should no longer be admitted"
+        );
+        assert_a_collector_panic_stopped_the_supervisor(&run, path);
+
+        let SupervisorStoppedByCollector {
+            lifecycle,
+            upstream,
+            default_guard,
+            ..
+        } = run;
+        drop(default_guard);
+        within("model lifecycle shutdown", lifecycle.shutdown()).await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_discovery_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
+     {
+        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Discovery).await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_admission_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
+     {
+        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Admit).await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_calibration_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
+     {
+        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Calibration)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_fallback_calibration_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
+     {
+        assert_a_drain_keeps_model_a_until_the_supervisor_stop(
+            CollectorStopPath::CalibrationWithFallback,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_discovery_outside_a_drain_retires_admitted_models_at_once() {
+        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Discovery).await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_admission_outside_a_drain_retires_admitted_models_at_once() {
+        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Admit).await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_calibration_outside_a_drain_retires_admitted_models_at_once() {
+        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Calibration).await;
+    }
+
+    #[tokio::test]
+    async fn collector_end_found_by_fallback_calibration_outside_a_drain_retires_admitted_models_at_once()
+     {
+        assert_no_drain_retires_model_a_at_once(CollectorStopPath::CalibrationWithFallback).await;
+    }
+
+    #[tokio::test]
+    async fn collector_shutdown_during_a_drain_logs_no_error_and_waits_for_the_supervisor_stop() {
+        let kv_cache = BlockingKvCacheServer::spawn().await;
+        let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+        let (runtime_state, stats) = start_holdable_stats(&kv_cache);
+        let mut lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                discovery_config(&upstream.base_url),
+                runtime_state.clone(),
+                &stats,
+                None,
+            ),
+        )
+        .await
+        .expect("initial discovery should initialize");
+        runtime_state.mark_drain_started();
+        let subscriber = RecordingTracingSubscriber::default();
+        let default_guard =
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));
+        hold_stats_collector(&kv_cache).await;
+
+        // A newly discovered model makes the supervisor begin a generation,
+        // and the held collector leaves that request queued until its
+        // shutdown ends it.
+        upstream.set_models(&["model-a", "model-b"]).await;
+        wait_for(
+            "the supervisor should begin a generation for model-b",
+            || runtime_state.current_generation("model-b").is_some(),
+        )
+        .await;
+        within("stats collector shutdown", stats.shutdown()).await;
+        wait_for(
+            "the supervisor should stop with the collector's shutdown",
+            || subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN) > 0,
+        )
+        .await;
+
+        let exit = tokio::time::timeout(SUPERVISOR_WAIT_WATCH, lifecycle.wait_for_exit()).await;
+        assert!(
+            exit.is_err(),
+            "during a drain the supervisor should keep its generations until its stop instead \
+             of exiting: {exit:?}"
+        );
+        assert_eq!(
+            runtime_state.advertised_model_ids(),
+            ["model-a"],
+            "model-a should stay advertised through the drain"
+        );
+        assert!(
+            !lifecycle.stopped_by_stats_collector(),
+            "a collector shutdown is not the collector ending on its own"
+        );
+        within("the supervisor's stop", lifecycle.shutdown()).await;
+        drop(default_guard);
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "the supervisor's stop should retire model-a"
+        );
+
+        let events = subscriber.events();
+        let errors = error_events(&events);
+        assert!(
+            errors.is_empty(),
+            "a stats collector shutdown during a drain should log no error: {errors:?}"
+        );
+        let stopped = events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].level, tracing::Level::DEBUG);
+        assert_tracing_event_field(stopped[0], "error", STATS_COLLECTOR_STOPPED);
+
+        kv_cache.unblock();
+        kv_cache.shutdown().await;
+        upstream.shutdown().await;
+    }
 }

@@ -286,4 +286,94 @@ mod tests {
         );
         assert_eq!(client.shutdown().await, None);
     }
+
+    fn reverse_registration_config() -> crate::InferenceServerRegistrationConfig {
+        crate::InferenceServerRegistrationConfig {
+            reverse_tunnel: true,
+            inference_server_url: "http://127.0.0.1:8090".to_string(),
+            ..super::super::tests::test_registration_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reverse_tunnel_session_marks_its_drain_in_the_runtime_state() {
+        // The model lifecycle reads this mark to keep admitted generations
+        // for requests that the drain still accepts.
+        let config = reverse_registration_config();
+        let runtime_state = config.forwarding.runtime_state.clone();
+        let mut client = InferenceServerRegistrationClient::default();
+        client
+            .start(config)
+            .expect("reverse registration config should be valid");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !runtime_state.drain_started(),
+            "a running session should not mark a drain"
+        );
+
+        let summary = tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("session should stop");
+        assert!(summary.is_some(), "a reverse tunnel session should drain");
+        assert!(
+            runtime_state.drain_started(),
+            "a reverse tunnel session should mark its drain in the runtime state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reverse_tunnel_session_that_stops_on_its_own_marks_its_drain() {
+        let config: RegistrationSessionConfig = reverse_registration_config()
+            .try_into()
+            .expect("reverse registration config should be valid");
+        let runtime_state = config.forwarding.runtime_state.clone();
+        let drain_timeout = Duration::from_secs(1);
+        let drain = Arc::new(DrainRecorder::new(
+            config.forwarding.runtime_state.drain_counters(),
+            drain_timeout,
+        ));
+        let session_drain = Arc::clone(&drain);
+        let mut client = InferenceServerRegistrationClient {
+            running: Some(OwnedTask::spawn("registration session", move |stop| {
+                // What a child task that exits on its own does to the session.
+                stop.cancel();
+                run_registration_session(config, Some(session_drain), stop)
+            })),
+            drain_timeout,
+            drain: Some(drain),
+            exited_drain: None,
+            readiness: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), client.wait_for_exit())
+            .await
+            .expect("session should stop")
+            .expect("session should not panic");
+        assert!(
+            runtime_state.drain_started(),
+            "a session that stops on its own drains, so it should mark its drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_session_marks_no_drain() {
+        // A direct session's shutdown does not drain, so the model lifecycle
+        // keeps retiring its generations as soon as it stops.
+        let config = super::super::tests::test_registration_config();
+        assert!(!config.reverse_tunnel);
+        let runtime_state = config.forwarding.runtime_state.clone();
+        let mut client = InferenceServerRegistrationClient::default();
+        client
+            .start(config)
+            .expect("direct registration config should be valid");
+
+        let summary = tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("session should stop");
+        assert!(summary.is_none(), "a direct session should not drain");
+        assert!(
+            !runtime_state.drain_started(),
+            "a direct session should not mark a drain"
+        );
+    }
 }

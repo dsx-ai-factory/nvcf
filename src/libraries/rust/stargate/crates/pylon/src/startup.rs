@@ -3044,12 +3044,14 @@ mod tests {
     }
 
     /// Upstream for a Pylon that discovers its models. `/v1/models` lists the
-    /// current models, and `/kv-cache` holds each poll while holding is on.
+    /// current models, `/kv-cache` holds each poll while holding is on, and
+    /// `/v1/chat/completions` answers at once and records each model served.
     #[derive(Clone)]
     struct DiscoveryUpstreamState {
         models: Arc<StdMutex<Vec<String>>>,
         hold: Arc<tokio::sync::watch::Sender<bool>>,
         held_polls: Arc<AtomicUsize>,
+        completions: Arc<StdMutex<Vec<String>>>,
     }
 
     struct DiscoveryUpstream {
@@ -3069,6 +3071,7 @@ mod tests {
                 )),
                 hold: Arc::new(tokio::sync::watch::Sender::new(false)),
                 held_polls: Arc::new(AtomicUsize::new(0)),
+                completions: Arc::default(),
             };
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -3082,6 +3085,7 @@ mod tests {
             let app = Router::new()
                 .route("/v1/models", get(discovered_models))
                 .route("/kv-cache", get(held_kv_cache_stats))
+                .route("/v1/chat/completions", post(answered_completion))
                 .with_state(state.clone());
             let server = tokio::spawn(async move {
                 axum::serve(listener, app)
@@ -3159,6 +3163,35 @@ mod tests {
             "kv_cache_used_tokens": 400,
             "kv_cache_free_tokens": 600
         }))
+    }
+
+    /// Answers a streamed chat completion with one token and its usage.
+    async fn answered_completion(
+        State(state): State<DiscoveryUpstreamState>,
+        Json(request): Json<serde_json::Value>,
+    ) -> AxumResponse {
+        let model = request["model"].as_str().unwrap_or_default().to_string();
+        state
+            .completions
+            .lock()
+            .expect("upstream completions should not be poisoned")
+            .push(model.clone());
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9}
+        });
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
     }
 
     /// Starts a stats collector that polls `upstream`'s KV-cache stats, so the
@@ -3905,5 +3938,348 @@ mod tests {
             "Pylon reported the stats collector first in all {RUNS} runs; tokio::select! may no \
              longer start polling at a random branch"
         );
+    }
+
+    /// A Stargate control plane for one reverse-tunnel Pylon. It lists itself
+    /// as the only Stargate and acknowledges each registration with
+    /// `reverse_tunnel_addr` as the reverse tunnel that Pylon dials.
+    #[derive(Clone)]
+    struct ReverseTunnelControlPlaneService {
+        address: String,
+        reverse_tunnel_addr: String,
+    }
+
+    #[tonic::async_trait]
+    impl StargateControlPlane for ReverseTunnelControlPlaneService {
+        type WatchStargatesStream = TestWatchStream;
+        type RegisterInferenceServerStream = TestRegistrationStream;
+
+        async fn watch_stargates(
+            &self,
+            _request: Request<WatchStargatesRequest>,
+        ) -> Result<Response<Self::WatchStargatesStream>, Status> {
+            let snapshot = WatchStargatesResponse {
+                stargates: vec![StargateInfo {
+                    stargate_id: "stargate-a".to_string(),
+                    advertise_addr: self.address.clone(),
+                    http_advertise_addr: String::new(),
+                    grpc_pylon_dial_addr: String::new(),
+                }],
+                watch_stargate_urls: Vec::new(),
+            };
+            Ok(Response::new(Box::pin(
+                tokio_stream::once(Ok(snapshot)).chain(tokio_stream::pending()),
+            )))
+        }
+
+        async fn register_inference_server(
+            &self,
+            request: Request<tonic::Streaming<InferenceServerRegistration>>,
+        ) -> Result<Response<Self::RegisterInferenceServerStream>, Status> {
+            let mut registrations = request.into_inner();
+            // Reads every update, as Stargate does, so the stream never backs up.
+            tokio::spawn(async move { while let Ok(Some(_)) = registrations.message().await {} });
+            let ack = InferenceServerAck {
+                reverse_tunnel_target: self.reverse_tunnel_addr.clone(),
+                reverse_tunnel_pylon_dial_addr: self.reverse_tunnel_addr.clone(),
+            };
+            Ok(Response::new(Box::pin(
+                tokio_stream::once(Ok(ack)).chain(tokio_stream::pending()),
+            )))
+        }
+    }
+
+    async fn spawn_reverse_tunnel_control_plane(
+        reverse_tunnel_addr: SocketAddr,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test control plane should bind");
+        let addr = listener.local_addr().expect("test control plane address");
+        let service = ReverseTunnelControlPlaneService {
+            address: format!("http://{addr}"),
+            reverse_tunnel_addr: reverse_tunnel_addr.to_string(),
+        };
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(StargateControlPlaneServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("test control plane should serve");
+        });
+        (addr, task)
+    }
+
+    /// The QUIC side of a Stargate router that one Pylon dials for its raw
+    /// QUIC reverse tunnel. The router sends Pylon requests on streams that
+    /// it opens on that connection.
+    struct ReverseTunnelRouter {
+        endpoint: quinn::Endpoint,
+    }
+
+    impl ReverseTunnelRouter {
+        fn bind() -> Self {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let server_config = stargate_tls::build_quic_server_config(
+                &pylon_lib::ServerTlsIdentity::SelfSigned,
+                TunnelTransportProtocol::RawQuic.alpn_protocols(),
+            )
+            .expect("the router's QUIC server config should build");
+            let endpoint = quinn::Endpoint::server(
+                server_config,
+                "127.0.0.1:0".parse().expect("router address should parse"),
+            )
+            .expect("the router's QUIC endpoint should bind");
+            Self { endpoint }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.endpoint
+                .local_addr()
+                .expect("the router's QUIC endpoint should have an address")
+        }
+
+        /// Accepts Pylon's reverse tunnel and answers its handshake.
+        async fn accept_tunnel(&self) -> quinn::Connection {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .expect("Pylon should dial the reverse tunnel");
+            let connection = incoming
+                .await
+                .expect("the reverse tunnel's QUIC handshake should complete");
+            let (mut send, mut recv) = connection
+                .accept_bi()
+                .await
+                .expect("Pylon should open its handshake stream");
+            let handshake = stargate_protocol::read_handshake(&mut recv)
+                .await
+                .expect("Pylon should send its handshake");
+            assert_eq!(handshake.inference_server_id, "pylon-a");
+            stargate_protocol::write_handshake_ack(
+                &mut send,
+                &stargate_protocol::HandshakeAck {
+                    accepted: true,
+                    reason: String::new(),
+                },
+            )
+            .await
+            .expect("the router should acknowledge the handshake");
+            send.finish()
+                .expect("the router should finish the handshake stream");
+            connection
+        }
+    }
+
+    /// Sends a chat completion for `model` through the reverse tunnel, as the
+    /// router does, and returns the response's `x-status` and body.
+    async fn send_through_reverse_tunnel(
+        tunnel: &quinn::Connection,
+        model: &'static str,
+        request_id: &'static str,
+    ) -> (String, String) {
+        let (send, recv) = tunnel
+            .open_bi()
+            .await
+            .expect("the router should open a request stream");
+        let mut send = stargate_protocol::SendStream::new(send);
+        let mut recv = stargate_protocol::RecvStream::new(recv);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-method", axum::http::HeaderValue::from_static("POST"));
+        headers.insert(
+            "x-path",
+            axum::http::HeaderValue::from_static("/v1/chat/completions"),
+        );
+        headers.insert(
+            HEADER_REQUEST_ID,
+            axum::http::HeaderValue::from_static(request_id),
+        );
+        headers.insert("x-model", axum::http::HeaderValue::from_static(model));
+        headers.insert("x-input-tokens", axum::http::HeaderValue::from_static("8"));
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        send.send_header(headers)
+            .await
+            .expect("the router should send the request head");
+        let body = serde_json::json!({
+            "model": model,
+            "stream": true,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": request_id}]
+        });
+        send.send_body(axum::body::Bytes::from(body.to_string()))
+            .await
+            .expect("the router should send the request body");
+        send.finish().expect("the router should finish the request");
+        let response = recv
+            .recv_header()
+            .await
+            .expect("Pylon should answer the request");
+        let status = response
+            .get("x-status")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let mut body = Vec::new();
+        while let Some(chunk) = recv
+            .recv_body()
+            .await
+            .expect("Pylon should send the response body")
+            .into_body()
+        {
+            body.extend_from_slice(&chunk);
+        }
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn wait_for_recorded(recorded: &RecordedEvents, message: &str, wait: Duration) {
+        tokio::time::timeout(wait, async {
+            while recorded.with_message(message).is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Pylon should log {message:?} within {wait:?}"));
+    }
+
+    #[tokio::test]
+    async fn running_pylon_keeps_admitted_models_routable_through_a_drain_after_a_stats_collector_panic()
+     {
+        // The stats collector panics while the supervisor is idle, so Pylon's
+        // main loop reports it and drains the reverse tunnel registration.
+        // During that drain a newly discovered model makes the supervisor find
+        // the collector gone. A request for model-a that the router sent
+        // before it saw the registration close must still reach the upstream,
+        // so the supervisor keeps model-a until Pylon stops it after the drain.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let router = ReverseTunnelRouter::bind();
+        let (control_plane_addr, control_plane) =
+            spawn_reverse_tunnel_control_plane(router.addr()).await;
+        let args = runtime_args(
+            &upstream.base_url,
+            control_plane_addr,
+            &[],
+            &[
+                "--backend-connectivity",
+                "reverse",
+                "--quic-insecure",
+                "--initial-input-tps",
+                "1",
+                "--model-discovery-poll-interval-ms",
+                "10",
+                "--pylon-shutdown-drain-timeout-ms",
+                "10000",
+            ],
+        );
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        let runtime =
+            tokio::time::timeout(Duration::from_secs(5), start_pylon_runtime(&args, &plan))
+                .await
+                .expect("Pylon should start")
+                .expect("Pylon startup should succeed");
+        assert_eq!(runtime.initial_model_ids, ["model-a"]);
+        let tunnel = tokio::time::timeout(Duration::from_secs(5), router.accept_tunnel())
+            .await
+            .expect("Pylon should connect its reverse tunnel");
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "before-drain"),
+        )
+        .await
+        .expect("a request before the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a before the drain should reach the upstream: {body}"
+        );
+
+        // The supervisor asks the collector for nothing while its model set
+        // stays the same, so it does not find the collector gone yet.
+        panic_stats_collector(&runtime.stats_collector).await;
+        let (recorded, default_guard) = record_events();
+        let run = tokio::spawn(
+            runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
+        );
+        // The registration session marks its drain before the reverse tunnel
+        // starts draining.
+        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_recorded(
+            &recorded,
+            "model lifecycle supervisor failed",
+            Duration::from_secs(2),
+        )
+        .await;
+        // The drain accepts streams for up to 2 s, so this request is in time.
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "during-drain"),
+        )
+        .await
+        .expect("a request during the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a during the drain should reach the upstream after the \
+             supervisor found the stats collector gone: {body}"
+        );
+        // Closing the tunnel ends the drain's accept window.
+        tunnel.close(0u32.into(), b"test drain done");
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("Pylon should stop soon after its drain, before the 5 s task stop timeout")
+            .expect("Pylon should not re-raise the stats collector panic")
+            .expect_err("a stats collector panic should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_reports_a_stats_collector_panic(
+            "a stats collector panic reported before a drain",
+            &message,
+        );
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the collector panic once as its critical task exit"
+        );
+        let failed = recorded.with_message("model lifecycle supervisor failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the supervisor should report the collector panic once"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        let drains = recorded.with_message("pylon drain finished");
+        assert_eq!(drains.len(), 1, "Pylon should log one drain summary");
+        assert_eq!(
+            (
+                drains[0]
+                    .fields
+                    .get("requests_accepted")
+                    .map(String::as_str),
+                drains[0].fields.get("requests_cut_off").map(String::as_str),
+            ),
+            (Some("1"), Some("0")),
+            "the drain should accept and complete the late request: {:?}",
+            drains[0]
+        );
+        let stalled = recorded.with_message("task did not stop before shutdown timeout");
+        assert!(
+            stalled.is_empty(),
+            "every task should stop when Pylon stops it after the drain: {stalled:?}"
+        );
+        assert_eq!(
+            *upstream
+                .state
+                .completions
+                .lock()
+                .expect("upstream completions should not be poisoned"),
+            ["model-a", "model-a"]
+        );
+        control_plane.abort();
+        let _ = control_plane.await;
+        upstream.shutdown().await;
     }
 }
