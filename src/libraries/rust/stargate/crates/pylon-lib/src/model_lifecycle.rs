@@ -82,6 +82,13 @@ pub enum ModelLifecycleError {
     GenerationCounterExhausted,
 }
 
+/// Owns the model lifecycle supervisor.
+///
+/// Once the supervisor finds its stats collector gone, it stops initializing
+/// models but keeps the generations it admitted, routable, until `shutdown`
+/// retires them. A caller whose collector ends should shut this down once it
+/// no longer needs those generations. Dropping the handle aborts the
+/// supervisor and leaves them as they are.
 pub struct ModelLifecycleHandle {
     task: OwnedTask,
     stopped_by_stats_collector: Arc<AtomicBool>,
@@ -93,8 +100,9 @@ impl ModelLifecycleHandle {
     }
 
     /// Whether the supervisor stopped because the stats collector ended other
-    /// than by its handle's shutdown, for example by a panic. The collector's
-    /// own exit then follows promptly.
+    /// than by its handle's shutdown, for example by a panic. The supervisor
+    /// then holds its generations until `shutdown`, and the collector's own
+    /// exit follows promptly.
     pub fn stopped_by_stats_collector(&self) -> bool {
         self.stopped_by_stats_collector.load(Ordering::Acquire)
     }
@@ -239,13 +247,11 @@ pub async fn start_model_lifecycle(
                         stopped_by_stats_collector.store(true, Ordering::Release);
                         tracing::error!(error = %error, "model lifecycle supervisor failed");
                     }
-                    // Requests that a registration drain still accepts need
-                    // the admitted generations, so they stay until this
-                    // supervisor's stop, which Pylon sends once the drain
-                    // ends. Outside a drain they are retired now.
-                    if supervisor.runtime_state.drain_started() {
-                        shutdown.stop.cancelled().await;
-                    }
+                    // The admitted generations stay routable until this
+                    // supervisor's stop. Pylon stops it only after its
+                    // registration drain, so requests that the drain still
+                    // accepts can use them.
+                    shutdown.stop.cancelled().await;
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "model lifecycle supervisor failed");
@@ -4118,9 +4124,6 @@ mod tests {
             initial_models,
             "{label}: startup should admit the initial models"
         );
-        if drain {
-            runtime_state.mark_drain_started();
-        }
         let subscriber = RecordingTracingSubscriber::default();
         let default_guard =
             tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));
@@ -4374,7 +4377,6 @@ mod tests {
         )
         .await
         .expect("initial discovery should initialize");
-        runtime_state.mark_drain_started();
         let subscriber = RecordingTracingSubscriber::default();
         let default_guard =
             tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));

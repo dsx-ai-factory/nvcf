@@ -160,9 +160,6 @@ struct AdvertisedRuntimeState {
     require_admitted_generation: bool,
     models: HashMap<String, RuntimeModelState>,
     last_upstream_progress_at: Option<Instant>,
-    /// Set when a registration drain starts. Never cleared: Pylon drains only
-    /// as it stops.
-    drain_started: bool,
 }
 
 impl AdvertisedRuntimeState {
@@ -223,7 +220,6 @@ impl PylonRuntimeState {
                 require_admitted_generation: true,
                 models,
                 last_upstream_progress_at: None,
-                drain_started: false,
             })),
             registration_changes: RegistrationChanges::default(),
             live_requests: LiveRequestState::default(),
@@ -263,19 +259,6 @@ impl PylonRuntimeState {
 
     pub(crate) fn drain_counters(&self) -> Arc<DrainCounters> {
         Arc::clone(&self.drain)
-    }
-
-    /// Marks that a registration drain has started. Requests that the drain
-    /// still accepts need their admitted model generations, so the model
-    /// lifecycle keeps them until it is stopped, even if the stats collector
-    /// ends first.
-    pub(crate) fn mark_drain_started(&self) {
-        self.advertised.lock().drain_started = true;
-    }
-
-    /// Whether a registration drain has started.
-    pub(crate) fn drain_started(&self) -> bool {
-        self.advertised.lock().drain_started
     }
 
     pub fn set_status(&self, status: InferenceServerStatus) {

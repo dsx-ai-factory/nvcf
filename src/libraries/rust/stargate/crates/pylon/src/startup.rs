@@ -509,7 +509,9 @@ impl RunningPylon {
 
     /// Reports the model lifecycle supervisor's exit. A supervisor that the
     /// stats collector's end stopped reports the collector, whose own exit
-    /// follows promptly.
+    /// follows promptly. Such a supervisor holds its generations until its
+    /// stop, which comes only in `shutdown`, so the main loop normally sees
+    /// the collector's own exit instead.
     async fn model_lifecycle_exit_error(&mut self, result: TaskExit) -> anyhow::Error {
         if self.model_lifecycle.stopped_by_stats_collector() {
             return critical_task_exit_error(
@@ -535,8 +537,8 @@ impl RunningPylon {
         } = self;
         // Requests that arrive during the registration drain need admitted
         // model generations, so the model lifecycle stops only after it. A
-        // supervisor that a stats collector end stops during the drain keeps
-        // them until that stop too.
+        // supervisor that found the stats collector gone keeps them until
+        // that stop as well.
         if let Some(summary) = registration_client.shutdown().await {
             log_drain_summary(&inference_server_id, cause, &summary);
         }
