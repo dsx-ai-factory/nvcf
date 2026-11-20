@@ -534,7 +534,9 @@ impl RunningPylon {
             ..
         } = self;
         // Requests that arrive during the registration drain need admitted
-        // model generations, so the model lifecycle stops only after it.
+        // model generations, so the model lifecycle stops only after it. A
+        // supervisor that a stats collector end stops during the drain keeps
+        // them until that stop too.
         if let Some(summary) = registration_client.shutdown().await {
             log_drain_summary(&inference_server_id, cause, &summary);
         }

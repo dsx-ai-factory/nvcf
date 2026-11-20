@@ -239,6 +239,13 @@ pub async fn start_model_lifecycle(
                         stopped_by_stats_collector.store(true, Ordering::Release);
                         tracing::error!(error = %error, "model lifecycle supervisor failed");
                     }
+                    // Requests that a registration drain still accepts need
+                    // the admitted generations, so they stay until this
+                    // supervisor's stop, which Pylon sends once the drain
+                    // ends. Outside a drain they are retired now.
+                    if supervisor.runtime_state.drain_started() {
+                        shutdown.stop.cancelled().await;
+                    }
                 }
                 Err(error) => {
                     tracing::error!(error = %error, "model lifecycle supervisor failed");

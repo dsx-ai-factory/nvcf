@@ -37,6 +37,7 @@ async fn run_registration_session(
     stop: CancellationToken,
 ) {
     let drain_timeout = config.shutdown_drain_timeout;
+    let runtime_state = config.forwarding.runtime_state.clone();
     let config = Arc::new(config);
     let (router_topology_tx, router_topology_rx) =
         watch::channel(RegistrationRouterTopology::default());
@@ -63,6 +64,7 @@ async fn run_registration_session(
     // drains without a call to `shutdown`.
     if let Some(drain) = &drain {
         drain.start();
+        runtime_state.mark_drain_started();
     }
     OwnedTask::shutdown_all(tasks, drain_timeout).await;
 }
