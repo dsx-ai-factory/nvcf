@@ -4282,4 +4282,157 @@ mod tests {
         let _ = control_plane.await;
         upstream.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn running_pylon_keeps_admitted_models_routable_when_the_stats_collector_panics_during_a_signal_drain()
+     {
+        // A termination signal drains the reverse tunnel registration, and the
+        // stats collector panics during that drain, after the supervisor has
+        // asked it for a newly discovered model's begin. A request for model-a
+        // that the router sent before it saw the registration close must still
+        // reach the upstream. Pylon then reports the panic once, as the error
+        // of a shutdown that a signal started, and retires model-a.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let router = ReverseTunnelRouter::bind();
+        let (control_plane_addr, control_plane) =
+            spawn_reverse_tunnel_control_plane(router.addr()).await;
+        let args = runtime_args(
+            &upstream.base_url,
+            control_plane_addr,
+            &[],
+            &[
+                "--backend-connectivity",
+                "reverse",
+                "--quic-insecure",
+                "--pylon-shutdown-drain-timeout-ms",
+                "10000",
+            ],
+        );
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        // A collector that polls KV-cache stats every millisecond, so the test
+        // can hold it. The registration's forwarding shares the model
+        // lifecycle's runtime state, as in `start_pylon_runtime`.
+        let (stats_collector, model_lifecycle, runtime_state) =
+            start_discovery_lifecycle(&upstream).await;
+        let mut runtime = test_running_pylon_with_lifecycle(stats_collector, model_lifecycle).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let forwarding = tunnel_forwarding_config_from_plan(&plan, runtime_state.clone(), metrics);
+        runtime
+            .registration_client
+            .start(registration_config_from_plan(
+                &args,
+                &plan,
+                forwarding,
+                plan.upstream.clone(),
+                None,
+                None,
+            ))
+            .expect("reverse registration should start");
+        let tunnel = tokio::time::timeout(Duration::from_secs(5), router.accept_tunnel())
+            .await
+            .expect("Pylon should connect its reverse tunnel");
+        assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+
+        // The held collector reads no commands, so the begin that panics it
+        // stays queued ahead of the supervisor's begin for model-b. This relies
+        // on the collector reading queued commands in the order they were
+        // sent, which flume does not document; the supervisor's report below
+        // fails if that changes.
+        upstream.hold_kv_cache_polls().await;
+        queue_stats_collector_panic(&runtime.stats_collector);
+        let (recorded, default_guard) = record_events();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(runtime.run_until_shutdown(async move {
+            let _ = signal_rx.await;
+            Ok("SIGTERM")
+        }));
+        signal_tx
+            .send(())
+            .expect("Pylon should wait for the signal");
+        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_model(&runtime_state, "model-b").await;
+        upstream.release_kv_cache_polls();
+        wait_for_recorded(
+            &recorded,
+            "model lifecycle supervisor failed",
+            Duration::from_secs(2),
+        )
+        .await;
+        // The drain accepts streams for up to 2 s, so this request is in time.
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "during-drain"),
+        )
+        .await
+        .expect("a request during the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a during the drain should reach the upstream after the stats \
+             collector panicked: {body}"
+        );
+        assert_eq!(
+            runtime_state.advertised_model_ids(),
+            ["model-a"],
+            "model-a should stay admitted until the drain ends"
+        );
+        // Closing the tunnel ends the drain's accept window.
+        tunnel.close(0u32.into(), b"test drain done");
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("Pylon should stop soon after its drain, before the 5 s task stop timeout")
+            .expect("Pylon should not re-raise the stats collector panic")
+            .expect_err("a stats collector panic found in a signal's shutdown should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_eq!(
+            message, "stats collector panicked",
+            "Pylon should return the collector panic that its shutdown found"
+        );
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the collector panic once as a critical task exit"
+        );
+        assert_eq!(
+            recorded.with_message("received shutdown signal").len(),
+            1,
+            "the signal should have started the shutdown"
+        );
+        assert_eq!(
+            recorded
+                .with_message("model lifecycle supervisor failed")
+                .len(),
+            1,
+            "the supervisor should report the collector panic once"
+        );
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "the supervisor should retire model-a when Pylon stops it after the drain"
+        );
+        let drains = recorded.with_message("pylon drain finished");
+        assert_eq!(drains.len(), 1, "Pylon should log one drain summary");
+        assert_eq!(
+            (
+                drains[0]
+                    .fields
+                    .get("requests_accepted")
+                    .map(String::as_str),
+                drains[0].fields.get("requests_cut_off").map(String::as_str),
+            ),
+            (Some("1"), Some("0")),
+            "the drain should accept and complete the late request: {:?}",
+            drains[0]
+        );
+        let stalled = recorded.with_message("task did not stop before shutdown timeout");
+        assert!(
+            stalled.is_empty(),
+            "every task should stop when Pylon stops it after the drain: {stalled:?}"
+        );
+        control_plane.abort();
+        let _ = control_plane.await;
+        upstream.shutdown().await;
+    }
 }
