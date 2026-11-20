@@ -1011,10 +1011,17 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 	if len(event.Error) == 0 || bytes.Equal(event.Error, []byte("null")) {
 		return nil
 	}
-	upstreamErr := &UpstreamStreamError{
-		Message: UpstreamErrorMessage([]byte(payload)),
-		Body:    append(append([]byte(`{"error":`), event.Error...), '}'),
+	upstreamErr := &UpstreamStreamError{Message: UpstreamErrorMessage([]byte(payload))}
+	errorObject := []byte(event.Error)
+	if len(errorObject) > MaxUpstreamErrorBodyBytes {
+		// Like an oversized 4xx head body, the object is not relayed; its capped message is.
+		message, err := json.Marshal(upstreamErr.Message)
+		if err != nil {
+			message = []byte(`""`)
+		}
+		errorObject = append(append([]byte(`{"message":`), message...), '}')
 	}
+	upstreamErr.Body = append(append([]byte(`{"error":`), errorObject...), '}')
 	var fields struct {
 		Type  json.RawMessage `json:"type"`
 		Param json.RawMessage `json:"param"`

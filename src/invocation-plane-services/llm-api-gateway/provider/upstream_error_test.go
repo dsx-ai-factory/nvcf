@@ -54,6 +54,23 @@ func TestUpstreamErrorMessageIsBounded(t *testing.T) {
 	}
 }
 
+func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("a", MaxUpstreamErrorBodyBytes)
+	upstreamErr := upstreamStreamError(`{"error":{"message":"` + long + `","code":400}}`)
+	if upstreamErr == nil {
+		t.Fatal("error event not detected")
+	}
+	if upstreamErr.Status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", upstreamErr.Status, http.StatusBadRequest)
+	}
+	want := `{"error":{"message":"` + long[:maxUpstreamErrorMessageBytes] + `"}}`
+	if string(upstreamErr.Body) != want {
+		t.Fatalf("body has %d bytes, want only the capped message (%d bytes)", len(upstreamErr.Body), len(want))
+	}
+}
+
 func TestUpstreamStreamErrorMessageIsBounded(t *testing.T) {
 	t.Parallel()
 

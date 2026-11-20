@@ -132,7 +132,10 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		{name: "unary upstream error with choices", upstreamBody: errorWithChoices},
 		// The client went away, so 499 is not the client's error to receive.
 		{name: "unary upstream 499 error event", upstreamBody: errorEvent(rejected("499"))},
-		{name: "unary upstream error event with text code", upstreamBody: errorEvent(rejected(`"context_length_exceeded"`))},
+		{
+			name:         "unary upstream error event with text code",
+			upstreamBody: errorEvent(rejected(`"context_length_exceeded"`)),
+		},
 		{name: "unary upstream error event without code", upstreamBody: errorEvent(`{"message":"bad input"}`)},
 		{name: "unary upstream error string", upstreamBody: errorEvent(`"engine failed"`)},
 		{
@@ -202,7 +205,8 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 				events := strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n")
 				last, isData := strings.CutPrefix(events[len(events)-1], "data: ")
 				require.True(t, isData, body)
-				require.NoError(t, json.Unmarshal([]byte(last), &errorBody), "last event must be an error event: %q", body)
+				require.NoError(t, json.Unmarshal([]byte(last), &errorBody),
+					"last event must be an error event: %q", body)
 			} else {
 				require.Equal(t, wantStatus, rec.Code, body)
 				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errorBody), body)
