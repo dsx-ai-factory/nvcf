@@ -46,6 +46,15 @@ Several services need a Cassandra username and password placed into OpenBao so t
 
 The shipped `job.yaml` sets a default placeholder value for this variable so the migrations run end-to-end during a fresh install. This default must be overridden in any non-trivial deployment via your cluster's secret management (External Secrets Operator, Sealed Secrets, Helm `--set` from a sealed source, etc.). Leaving the default in production is a security risk.
 
+## JWT signing plugin versions
+
+Versioned migrations require `BAO_JWT_PLUGIN_VERSIONS_FILE` from the selected
+server image. The chart supplies it automatically. An explicit
+`BAO_JWT_PLUGIN_VERSION` may select the old plugin during a bridge rollback
+window. A target-only manifest accepts only its target version. Missing or
+invalid manifests fail before migrations run, even with an explicit override.
+Legacy mode retains its unversioned behavior when no version is configured.
+
 ## Building the container
 
 The `Dockerfile` uses the public upstream OpenBao 2.6.3 image as its runtime base. It replaces the upstream `bao` binary with a reproducible build from the matching checksum-pinned source commit. The build pins x/net v0.60.0, x/crypto v0.57.0, gRPC v1.83.2, and go-archive v0.3.0, then verifies those dependency floors and the target architecture from the embedded Go build metadata.

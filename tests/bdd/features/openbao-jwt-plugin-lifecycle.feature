@@ -9,11 +9,22 @@ Feature: OpenBao JWT plugin versions preserve signing through upgrade and rollba
 
   Scenario: Recover migrations when the versioned server has no JWT mounts
     Given environment variable "OPENBAO_JWT_RECOVERY_CONTAINER" is set
-    When I successfully run command "docker exec ${OPENBAO_JWT_RECOVERY_CONTAINER} bash /test/runtime-server.sh init bridge"
+    When I successfully run command "docker exec ${OPENBAO_JWT_RECOVERY_CONTAINER} bash /test/runtime-server.sh init target-only"
     And I successfully run command:
       """
       docker exec ${OPENBAO_JWT_RECOVERY_CONTAINER} bash /test/runtime-bao.sh bash -ec '
-        jwt-plugin-lifecycle wait-ready
+        bao() {
+          if [[ $1 == plugin && $2 == list && ! -e /tmp/nvcf-jwt-runtime/catalog-not-ready-once ]]; then
+            touch /tmp/nvcf-jwt-runtime/catalog-not-ready-once
+            echo "Injected transient catalog failure" >&2
+            return 2
+          fi
+          /usr/bin/bao "$@"
+        }
+        export -f bao
+        JWT_PLUGIN_READY_ATTEMPTS=3 JWT_PLUGIN_READY_DELAY=0 jwt-plugin-lifecycle wait-ready
+        test -f /tmp/nvcf-jwt-runtime/catalog-not-ready-once
+        unset -f bao
         test "$(jwt-plugin-lifecycle status | jq length)" = 0
         jwt-plugin-lifecycle deployment-preflight
       '
@@ -53,6 +64,31 @@ Feature: OpenBao JWT plugin versions preserve signing through upgrade and rollba
         jwt-plugin-lifecycle bridge-preflight
       '
       """
+    # An authentication failure cannot establish that a bridge migration is needed.
+    When I run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        JWT_PLUGIN_DIR=/tmp/nvcf-jwt-runtime/target-only/plugins
+        JWT_PLUGIN_CONFIG_DIR=/tmp/nvcf-jwt-runtime/target-only/plugin-config
+        export JWT_PLUGIN_DIR JWT_PLUGIN_CONFIG_DIR
+        BAO_TOKEN=invalid-preflight-test-token jwt-plugin-lifecycle deployment-preflight
+      '
+      """
+    Then the command exit code should be 2
+    And the command output should contain "Error listing available plugins:"
+    And the command output should not contain "Required upgrade stop:"
+    # A candidate target-only package must reject stored legacy state before rollout.
+    When I run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        JWT_PLUGIN_DIR=/tmp/nvcf-jwt-runtime/target-only/plugins
+        JWT_PLUGIN_CONFIG_DIR=/tmp/nvcf-jwt-runtime/target-only/plugin-config
+        export JWT_PLUGIN_DIR JWT_PLUGIN_CONFIG_DIR
+        jwt-plugin-lifecycle deployment-preflight
+      '
+      """
+    Then the command exit code should be 1
+    And the command output should contain "Required upgrade stop:"
     And I successfully run command "docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-server.sh restart bridge"
     And I successfully run command:
       """
@@ -133,5 +169,41 @@ Feature: OpenBao JWT plugin versions preserve signing through upgrade and rollba
       '
       """
     Then the command exit code should be 2
+    When I run command "docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh jwt-plugin-lifecycle rollback"
+    Then the command exit code should be 1
+    # Post-removal recovery restores both packaged versions before changing selection.
+    When I successfully run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        JWT_PLUGIN_DIR=/tmp/nvcf-jwt-runtime/bridge/plugins \
+          JWT_PLUGIN_CONFIG_DIR=/tmp/nvcf-jwt-runtime/bridge/plugin-config \
+          jwt-plugin-lifecycle deployment-preflight
+      '
+      """
+    When I successfully run command "docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-server.sh restart bridge"
+    And I successfully run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        jwt-plugin-lifecycle verify
+        jwt-plugin-lifecycle rollback
+        bao plugin reload -plugin vault-plugin-secrets-jwt
+        . /openbao/jwt-plugin-versions.env
+        jwt-plugin-lifecycle status | jq -e --arg old "$JWT_PLUGIN_OLD_VERSION" ". | length > 0 and all(.[]; .value.plugin_version == \$old and .value.running_plugin_version == \$old)"
+        token=$(bao write -force -field=token jwt/sign/test)
+        /test/jwtverify "$token" "$BAO_ADDR/v1/jwt/jwks" | jq -e ".iss == \"lifecycle.example.com\""
+        curl -sf "$BAO_ADDR/v1/jwt/jwks" | jq -S . | cmp - /tmp/nvcf-jwt-runtime/original-jwks.json
+        jwt-plugin-lifecycle upgrade
+        bao plugin reload -plugin vault-plugin-secrets-jwt
+        jwt-plugin-lifecycle verify
+      '
+      """
+    And I successfully run command "docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-server.sh restart target-only"
+    And I successfully run command:
+      """
+      docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bash -ec '
+        jwt-plugin-lifecycle verify
+        jwt-plugin-lifecycle cleanup
+      '
+      """
     When I run command "docker exec ${OPENBAO_JWT_TEST_CONTAINER} bash /test/runtime-bao.sh bao plugin info secret vault-plugin-secrets-jwt"
     Then the command exit code should be 2

@@ -44,6 +44,28 @@ if BAO_JWT_PLUGIN_VERSIONS_FILE= enable_secrets_mount unversioned vault-plugin-s
     echo 'Versioned mode must not create unversioned mounts' >&2
     exit 1
 fi
+cp "$repo_root/infra/openbao/jwt-plugin-versions.env" "$test_root/target-only.env"
+printf '\nJWT_PLUGIN_BRIDGE_IMAGE=qualified-bridge\n' >> "$test_root/target-only.env"
+: > "$test_root/calls"
+if BAO_JWT_PLUGIN_VERSIONS_FILE="$test_root/target-only.env" BAO_JWT_PLUGIN_VERSION="$JWT_PLUGIN_OLD_VERSION" \
+    enable_secrets_mount retired-override vault-plugin-secrets-jwt; then
+    echo 'Target-only mode must reject the rollback version override' >&2
+    exit 1
+fi
+test ! -s "$test_root/calls"
+BAO_JWT_PLUGIN_VERSIONS_FILE="$test_root/target-only.env" BAO_JWT_PLUGIN_VERSION="$JWT_PLUGIN_TARGET_VERSION" \
+    enable_secrets_mount target-override vault-plugin-secrets-jwt
+grep -Fxq "secrets enable -path=target-override -plugin-version=$JWT_PLUGIN_TARGET_VERSION vault-plugin-secrets-jwt" "$test_root/calls"
+if BAO_JWT_PLUGIN_VERSIONS_FILE= BAO_JWT_PLUGIN_VERSION="$JWT_PLUGIN_TARGET_VERSION" jwt_plugin_version; then
+    echo 'An explicit override must not bypass missing versioned-mode inventory' >&2
+    exit 1
+fi
+printf '' > "$test_root/empty.env"
+if BAO_JWT_PLUGIN_VERSIONS_FILE="$test_root/empty.env" BAO_JWT_PLUGIN_VERSION="$JWT_PLUGIN_TARGET_VERSION" jwt_plugin_version; then
+    echo 'Inherited target variables must not satisfy an empty manifest' >&2
+    exit 1
+fi
+test "$(JWT_PLUGIN_LIFECYCLE_MODE=legacy BAO_JWT_PLUGIN_VERSIONS_FILE= BAO_JWT_PLUGIN_VERSION="$JWT_PLUGIN_OLD_VERSION" jwt_plugin_version)" = "$JWT_PLUGIN_OLD_VERSION"
 enable_secrets_mount transit transit
 grep -Fxq 'secrets enable -path=transit transit' "$test_root/calls"
 : > "$test_root/calls"

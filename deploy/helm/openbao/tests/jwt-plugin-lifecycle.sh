@@ -73,7 +73,11 @@ for mode in bridge versioned; do
         fi
     else
         grep -q 'jwt-plugin-lifecycle wait-ready' "$rendered"
-        grep -q 'Rotate member' "$rendered"
+        grep -q 'JWT member check: failed to verify' "$rendered"
+        if grep -q 'Rotate member\|Required upgrade stop:' "$rendered"; then
+            echo 'Member checks must not infer a bridge migration from a verification failure' >&2
+            exit 1
+        fi
         grep -q 'jwt-plugin-lifecycle deployment-preflight' "$rendered"
         migrations="$test_root/migrations.yaml"
         yq 'select(.kind == "Job" and .metadata.name == "openbao-server-migrations")' "$rendered" > "$migrations"
@@ -84,6 +88,22 @@ for mode in bridge versioned; do
         test "$(yq -r '.spec.template.spec.containers[0].env[] | select(.name == "BAO_JWT_PLUGIN_VERSIONS_FILE") | .value' "$migrations")" = /versions/manifest.env
         grep -q 'cp /openbao/jwt-plugin-versions.env /versions/manifest.env' "$migrations"
     fi
+done
+
+for override in literal secret; do
+    if [[ $override == literal ]]; then
+        override_env='[{"name":"BAO_JWT_PLUGIN_VERSION","value":"v99.0.0"}]'
+    else
+        override_env='[{"name":"BAO_JWT_PLUGIN_VERSION","valueFrom":{"secretKeyRef":{"name":"version-override","key":"version"}}}]'
+    fi
+    render --is-upgrade --set openbao.jwtPluginLifecycle.mode=versioned \
+        --set-json "openbao.migrations.env=$override_env" > "$test_root/override.yaml"
+    yq -o=json 'select(.kind == "Job" and .metadata.name == "openbao-server-jwt-lifecycle-preflight") | .spec.template.spec.initContainers[] | select(.name == "check-migrations-and-members") | .env[] | select(.name == "BAO_JWT_PLUGIN_VERSION")' \
+        "$test_root/override.yaml" > "$test_root/override-preflight.json"
+    yq -o=json 'select(.kind == "Job" and .metadata.name == "openbao-server-migrations") | .spec.template.spec.containers[0].env[] | select(.name == "BAO_JWT_PLUGIN_VERSION")' \
+        "$test_root/override.yaml" > "$test_root/override-migrations.json"
+    test -s "$test_root/override-preflight.json"
+    cmp "$test_root/override-preflight.json" "$test_root/override-migrations.json"
 done
 
 render --is-upgrade --set openbao.jwtPluginLifecycle.mode=versioned \
@@ -131,6 +151,8 @@ test "$(yq -r '.openbao.injector.agentImage.tag' "$upgrade")" = "$tag"
 helm package "$test_root/helm" --version 99.0.0 --app-version 99.0.0 \
     -d "$test_root" >/dev/null
 package="$test_root/$(yq -r '.name' "$chart_source/Chart.yaml")-99.0.0.tgz"
+tar -tzf "$package" > "$test_root/package-files.txt"
+grep -q '/scripts/jwt-plugin-cluster.sh$' "$test_root/package-files.txt"
 for minor in '' 1.36 1.37; do
     helm_args=(template openbao "$package" -f "$values" --is-upgrade
         --set openbao.jwtPluginLifecycle.mode=versioned)
