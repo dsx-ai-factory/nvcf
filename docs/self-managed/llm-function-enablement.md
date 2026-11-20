@@ -107,9 +107,8 @@ worker also waits for the tunnel to connect. The worker still has
   port. If the backend answers a check equal to that default with `401`, `403`,
   `404`, or `405`, `pylon` logs a warning and keeps its usual health paths, so
   readiness does not wait for the workers.
-- `pylon` also applies the declared check when it initializes a model again
-  after startup, for example after a failed canary. Until the check passes,
-  `pylon` does not admit that model again. The worker stays Ready.
+- When `pylon` discovers models, a model that appears after startup must also
+  pass the declared check before `pylon` admits it. The worker stays Ready.
 - Functions with a gRPC health check keep the current behavior and get no
   readiness probe.
 - Enable the switch only when every LLM worker on the cluster runs a `pylon`
