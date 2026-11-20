@@ -372,6 +372,20 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 				}
 			}()
 		}
+		// The NIXL KV connector of a pod that opted in, likewise. Its
+		// resume is checked: a paused engine takes no requests, so a
+		// source that runs on and does not resume is replaced.
+		nixlPaused, nixlErr := pauseNIXL(ctx, optedIntoNIXLPause(procBase, sessionPIDs(procBase, targetHostPID)), tools.gpuToolText(), hostPID, gsPIDs, log)
+		if nixlErr != nil {
+			return nil, fmt.Errorf("gpushare: %w", nixlErr)
+		}
+		if nixlPaused {
+			defer func() {
+				if sourceRunsOn(dumped, leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+					retErr = resumeNIXLSource(ctx, hostPID, gsPIDs, retErr, log)
+				}
+			}()
+		}
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
@@ -390,7 +404,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare suspend: %w", serr)
 		}
 		gpuMap = gm
-		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib, ModelExpress: paused}
+		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib, ModelExpress: paused, NIXL: nixlPaused}
 	}
 
 	final := finalOf(leaveRunning)

@@ -425,6 +425,13 @@ Limits of the move:
   library that use ModelExpress); any other process's RDMA still blocks.
   A source whose GPU resume failed gets no `mx-resume`: it is replaced.
   `internal/agent/gpushare_mx.go`.
+- NIXL KV (disaggregated vLLM): a pod annotated `nvsnap.io/nixl-pause` on a
+  cluster that enables it (`webhook.nixlPause.enabled`) has its NIXL KV
+  connector released right before the suspend (`nixl-pause`) and brought
+  back after the restore under a new engine id (`nixl-resume`), as for
+  ModelExpress, except that a paused engine serves nothing: a source that
+  does not resume is replaced, and a restore whose resume fails starts cold.
+  NIXL-PAUSE.md.
 
 ## Validation
 

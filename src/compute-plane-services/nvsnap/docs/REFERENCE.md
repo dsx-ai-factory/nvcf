@@ -104,6 +104,7 @@ where the files column says.
 | `nvsnap.io/model-uri` | `IdentityAnnotation` (internal/modelvolume/modelvolume.go) | Is the full model URI. |
 | `nvsnap.io/mount-holder` | inline: internal/checkpointstore/mount_holder.go |  |
 | `nvsnap.io/namespace` | `LabelNamespace` (internal/fnstatus/fnstatus.go)<br>`labelNamespace` (internal/checkpointstore/promoter_shared.go) |  |
+| `nvsnap.io/nixl-pause` | `NIXLPauseAnnotation` (internal/webhook/gpushare.go) | Opts a gpushare pod in to nixl-pause: a capture has its vLLM NIXL KV connector release its RDMA state right before the suspend, and a restore brings it back (docs/design/NIXL-PAUSE.md). |
 | `nvsnap.io/path` | `annPath` (internal/server/manifests.go) |  |
 | `nvsnap.io/per-capture` | inline: internal/checkpointstore/percapture_pvc.go, internal/checkpointstore/promoter_shared.go, internal/checkpointstore/promoter_snapshot.go |  |
 | `nvsnap.io/port` | `annPort` (internal/server/manifests.go) |  |

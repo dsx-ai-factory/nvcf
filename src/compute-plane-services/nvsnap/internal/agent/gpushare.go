@@ -85,6 +85,9 @@ type GPUShareInfo struct {
 	// ModelExpress: the capture paused ModelExpress in PIDs (mx-pause); a
 	// restore resumes it once their GPU launches run (gpushare_mx.go).
 	ModelExpress bool `json:"modelExpress,omitempty"`
+	// NIXL: the capture paused the NIXL KV connector in PIDs (nixl-pause);
+	// a restore resumes it, and fails if it cannot (gpushare_nixl.go).
+	NIXL bool `json:"nixl,omitempty"`
 }
 
 // gpushareProc is what the dump needs to know about one process.

@@ -56,7 +56,47 @@ const (
 	gpushareStoreVolume = "nvsnap-gpushare-store"
 	gpusharePodUIDEnv   = "NVSNAP_POD_UID"
 	gpushareFabricEnv   = "NVSNAP_GPUSHARE_FABRIC"
+
+	// NIXLPauseAnnotation opts a gpushare pod in to nixl-pause: a capture
+	// has its vLLM NIXL KV connector release its RDMA state right before
+	// the suspend, and a restore brings it back (docs/design/NIXL-PAUSE.md).
+	// Honored only with the cluster's switch on (Mutator.NIXLPause).
+	NIXLPauseAnnotation = "nvsnap.io/nixl-pause"
+	// nixlPauseEnv tells the agent the process's pod opted in.
+	nixlPauseEnv = "NVSNAP_NIXL_PAUSE"
+	// gpushareCtlOnCUDAUseEnv has the library open its control socket on
+	// a process's first CUDA entry-point lookup: vLLM's engine-core
+	// process at TP > 1 allocates no GPU memory, and nixl-pause reaches
+	// the engine through it.
+	gpushareCtlOnCUDAUseEnv = "NVSNAP_GPUSHARE_CTL_ON_CUDA_USE"
 )
+
+// nixlPauseEnvVars are the nixl-pause variables container c does not set
+// itself: a value the pod sets wins.
+func nixlPauseEnvVars(c *corev1.Container) []corev1.EnvVar {
+	var vars []corev1.EnvVar
+	for _, name := range []string{nixlPauseEnv, gpushareCtlOnCUDAUseEnv} {
+		if !hasEnv(c, name) {
+			vars = append(vars, corev1.EnvVar{Name: name, Value: "1"})
+		}
+	}
+	return vars
+}
+
+// nixlPauseWanted reports whether a gpushare pod gets the nixl-pause env:
+// annotated nvsnap.io/nixl-pause "true" with the cluster's switch on. The
+// annotation with the switch off is logged and ignored.
+func (m *Mutator) nixlPauseWanted(pod *corev1.Pod) bool {
+	if pod.Annotations[NIXLPauseAnnotation] != "true" {
+		return false
+	}
+	if !m.NIXLPause {
+		m.logger().WithField("pod", pod.Namespace+"/"+pod.Name).
+			Info("gpushare: the pod opts in to nixl-pause, which this cluster does not enable (webhook.nixlPause.enabled); ignoring it")
+		return false
+	}
+	return true
+}
 
 // gpushareMode reports whether a pod runs under the gpushare library and
 // whether the library shares its GPU memory over multi-node NVLink
@@ -167,8 +207,19 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 			Warn("gpushare: the pod references the reserved store volume itself; not placing the library or the store")
 		return nil
 	}
+	nixlPause := m.nixlPauseWanted(pod)
 	if placed {
-		return nil // already placed (re-admission, or written into the manifest)
+		// Already placed (re-admission, or written into the manifest):
+		// only the nixl-pause env, if the opt-in came after the placement.
+		if !nixlPause {
+			return nil
+		}
+		var patches []PatchOp
+		for _, i := range gpuContainers {
+			c := &pod.Spec.Containers[i]
+			patches = append(patches, setContainerEnv(i, c, nixlPauseEnvVars(c))...)
+		}
+		return patches
 	}
 	bundleRoot := m.HostBundleRoot
 	if bundleRoot == "" {
@@ -229,6 +280,9 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 		// A value the pod sets itself wins: it may switch fabric sharing off.
 		if fabric && !hasEnv(c, gpushareFabricEnv) {
 			vars = append(vars, corev1.EnvVar{Name: gpushareFabricEnv, Value: "1"})
+		}
+		if nixlPause {
+			vars = append(vars, nixlPauseEnvVars(c)...)
 		}
 		patches = append(patches, setContainerEnv(i, c, vars)...)
 	}

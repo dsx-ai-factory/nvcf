@@ -392,6 +392,76 @@ func TestGPUSharePatches_FabricAnnotation(t *testing.T) {
 	}
 }
 
+// nvsnap.io/nixl-pause adds the opt-in marker and the early control
+// socket to the GPU containers only when the cluster honors it, never to a
+// sidecar, never to a pod that is not under gpushare, and never over a
+// value the pod sets itself.
+func TestGPUSharePatches_NIXLPause(t *testing.T) {
+	both := []string{nixlPauseEnv, gpushareCtlOnCUDAUseEnv}
+	annotated := func(gpushare bool, env []corev1.EnvVar) *corev1.Pod {
+		p := gpushareTestPod(gpushare, env)
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[NIXLPauseAnnotation] = "true"
+		return p
+	}
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		pod     *corev1.Pod
+		want    map[string]string // env on the GPU container; "" = absent
+	}{
+		{"on, annotated", true, annotated(true, nil), map[string]string{nixlPauseEnv: "1", gpushareCtlOnCUDAUseEnv: "1"}},
+		{"off, annotated", false, annotated(true, nil), map[string]string{nixlPauseEnv: "", gpushareCtlOnCUDAUseEnv: ""}},
+		{"on, not annotated", true, gpushareTestPod(true, nil), map[string]string{nixlPauseEnv: "", gpushareCtlOnCUDAUseEnv: ""}},
+		{"on, annotated, own value kept", true,
+			annotated(true, []corev1.EnvVar{{Name: gpushareCtlOnCUDAUseEnv, Value: "0"}}),
+			map[string]string{nixlPauseEnv: "1", gpushareCtlOnCUDAUseEnv: "0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Mutator{NIXLPause: tc.enabled}
+			got := applyPatches(t, tc.pod, m.gpusharePatches(context.Background(), tc.pod))
+			for _, name := range both {
+				e, want := envOf(got.Spec.Containers[1], name), tc.want[name]
+				switch {
+				case want == "" && e != nil:
+					t.Errorf("%s = %q, want unset", name, e.Value)
+				case want != "" && (e == nil || e.Value != want):
+					t.Errorf("%s = %+v, want %q", name, e, want)
+				}
+				if e := envOf(got.Spec.Containers[0], name); e != nil {
+					t.Errorf("sidecar got %s=%q", name, e.Value)
+				}
+			}
+		})
+	}
+
+	// An opt-in added to a pod that already carries the placement (a
+	// manifest written from an admitted pod) adds only the env.
+	placed := applyPatches(t, gpushareTestPod(true, nil), (&Mutator{}).gpusharePatches(context.Background(), gpushareTestPod(true, nil)))
+	placed.Annotations[NIXLPauseAnnotation] = "true"
+	m0 := &Mutator{NIXLPause: true}
+	got := applyPatches(t, placed, m0.gpusharePatches(context.Background(), placed))
+	if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != "1" {
+		t.Errorf("placed pod: %s = %+v, want 1", nixlPauseEnv, e)
+	}
+	if len(got.Spec.Volumes) != len(placed.Spec.Volumes) || len(got.Spec.Containers[1].VolumeMounts) != len(placed.Spec.Containers[1].VolumeMounts) {
+		t.Errorf("placed pod: the placement was repeated: %d volumes (was %d)", len(got.Spec.Volumes), len(placed.Spec.Volumes))
+	}
+	if ops := m0.gpusharePatches(context.Background(), got); len(ops) != 0 {
+		t.Errorf("placed pod with the env: patched again: %+v", ops)
+	}
+
+	// A pod opted out of gpushare gets nothing, annotation or not.
+	m := &Mutator{NIXLPause: true, GPUShareByDefault: true}
+	pod := annotated(false, nil)
+	pod.Annotations[GPUShareAnnotation] = "false"
+	if ops := m.gpusharePatches(context.Background(), pod); len(ops) != 0 {
+		t.Errorf("a pod opted out of gpushare was patched: %+v", ops)
+	}
+}
+
 // Debug variables land on the GPU containers of the matching pods only,
 // next to the gpushare library, and never override the pod's own values.
 func TestDebugEnv(t *testing.T) {

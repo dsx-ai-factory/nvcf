@@ -69,6 +69,9 @@ type WebhookConfig struct {
 	// freeze is held out of service until its capture is settled
 	// (capture_hold.go).
 	CaptureHold bool
+	// NIXLPause is webhook.Mutator.NIXLPause: the cluster honors the
+	// nvsnap.io/nixl-pause annotation (gpushare_nixl.go).
+	NIXLPause bool
 
 	// CacheSalt is folded into every cache identity the webhook composes
 	// (rootfsonly.HashInputComposer.Salt). Bump it to start fresh captures
@@ -224,6 +227,9 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// On a CRIU cluster every GPU pod runs under the gpushare library,
 		// which keeps GPU memory out of the CRIU image.
 		GPUShareByDefault: criuIsDefault(),
+		// Pods annotated nvsnap.io/nixl-pause get the env nixl-pause
+		// needs, where the cluster enables it.
+		NIXLPause: cfg.NIXLPause,
 		// nvsnap#202: restore-prep strategy. When "init-container",
 		// the webhook emits a nvsnap-mount-prep init container instead
 		// of doing the OverlayFS mount syscalls during admission.

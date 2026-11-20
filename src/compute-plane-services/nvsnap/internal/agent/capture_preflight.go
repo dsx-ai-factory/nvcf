@@ -181,8 +181,13 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	tools, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir())
 	if err != nil {
 		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
-	} else if gpushareMXSupported(tools.gpuToolText()) {
-		fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
+	} else {
+		if gpushareMXSupported(tools.gpuToolText()) {
+			fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
+		}
+		if gpushareNIXLSupported(tools.gpuToolText()) {
+			fs = nixlPauseFindings(fs, nixlPausable(procBase, int(info.PID)), procBase, pod, container)
+		}
 	}
 	return fs, nil
 }
