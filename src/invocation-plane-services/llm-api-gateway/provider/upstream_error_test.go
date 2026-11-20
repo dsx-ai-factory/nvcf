@@ -71,9 +71,10 @@ func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
 				`","type":"invalid_request_error","code":"400"}}`,
 		},
 		{
-			name:     "oversized param",
-			event:    `{"error":{"message":"bad input","param":"` + long + `","code":400}}`,
-			wantBody: `{"error":{"message":"bad input"}}`,
+			name:  "oversized param",
+			event: `{"error":{"message":"bad input","param":"` + long + `","code":400}}`,
+			wantBody: `{"error":{"message":"bad input","param":"` + long[:maxUpstreamErrorMessageBytes] +
+				`","code":"400"}}`,
 		},
 		{name: "no message", event: `{"error":{"detail":"` + long + `","code":400}}`},
 	}
@@ -107,6 +108,23 @@ func TestUpstreamStreamErrorKeepsNullFieldsNil(t *testing.T) {
 	}
 	if upstreamErr.Param == nil || *upstreamErr.Param != "" {
 		t.Fatalf("param = %v, want the empty string the upstream sent", upstreamErr.Param)
+	}
+}
+
+func TestUpstreamStreamErrorFieldsAreBounded(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("a", maxUpstreamErrorMessageBytes) + "b"
+	event := `{"error":{"message":"bad input","type":"` + long + `","param":"` + long + `","code":"` + long + `"}}`
+	upstreamErr := upstreamStreamError(event)
+	if upstreamErr == nil {
+		t.Fatal("error event not detected")
+	}
+	fields := map[string]*string{"type": upstreamErr.Type, "param": upstreamErr.Param, "code": upstreamErr.Code}
+	for name, field := range fields {
+		if field == nil || *field != long[:maxUpstreamErrorMessageBytes] {
+			t.Fatalf("%s is not capped at %d bytes", name, maxUpstreamErrorMessageBytes)
+		}
 	}
 }
 

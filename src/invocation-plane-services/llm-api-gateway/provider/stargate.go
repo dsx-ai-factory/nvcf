@@ -1022,7 +1022,7 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 		upstreamErr.Param = jsonString(fields.Param)
 		upstreamErr.Code = jsonString(fields.Code)
 		if upstreamErr.Code == nil && len(fields.Code) > 0 && bytes.IndexFunc(fields.Code, isNotDigit) < 0 {
-			code := string(fields.Code)
+			code := truncateMessage(string(fields.Code))
 			upstreamErr.Code = &code
 		}
 		if upstreamErr.Code != nil {
@@ -1037,8 +1037,7 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 
 // streamErrorBody returns {"error":...} with the event's error object. Like an
 // oversized 4xx head body, an object over MaxUpstreamErrorBodyBytes is not
-// relayed: its capped message is, with its parsed fields when they fit, or
-// nothing without a message.
+// relayed: its capped message and fields are, or nothing without a message.
 func streamErrorBody(errorObject json.RawMessage, upstreamErr *UpstreamStreamError) []byte {
 	wrap := func(object []byte) []byte {
 		return append(append([]byte(`{"error":`), object...), '}')
@@ -1049,29 +1048,28 @@ func streamErrorBody(errorObject json.RawMessage, upstreamErr *UpstreamStreamErr
 	if upstreamErr.Message == "" {
 		return nil
 	}
-	type cappedError struct {
+	// Each field is capped at maxUpstreamErrorMessageBytes, so this stays under the limit.
+	capped, err := json.Marshal(struct {
 		Message string  `json:"message"`
 		Type    *string `json:"type,omitempty"`
 		Param   *string `json:"param,omitempty"`
 		Code    *string `json:"code,omitempty"`
-	}
-	withFields := cappedError{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code}
-	for _, object := range []cappedError{withFields, {Message: upstreamErr.Message}} {
-		capped, err := json.Marshal(object)
-		if body := wrap(capped); err == nil && len(body) <= MaxUpstreamErrorBodyBytes {
-			return body
-		}
-	}
-	return nil
-}
-
-// jsonString returns the value of a JSON string, or nil for null and any other value.
-func jsonString(raw json.RawMessage) *string {
-	var value *string
-	if json.Unmarshal(raw, &value) != nil {
+	}{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code})
+	if err != nil {
 		return nil
 	}
-	return value
+	return wrap(capped)
+}
+
+// jsonString returns the value of a JSON string, capped like an upstream error
+// message, or nil for null and any other value.
+func jsonString(raw json.RawMessage) *string {
+	var value *string
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return nil
+	}
+	capped := truncateMessage(*value)
+	return &capped
 }
 
 func isNotDigit(r rune) bool {
