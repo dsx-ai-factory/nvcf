@@ -222,6 +222,7 @@ fn proxy_app_with_request_timeout(
                 tls_reload_interval: stargate_tls::DEFAULT_TLS_RELOAD_INTERVAL,
                 quic_insecure: true,
                 tunnel_protocol: TunnelTransportProtocol::RawQuic,
+                reverse_tunnel_liveness: Default::default(),
             },
             Arc::new(OpenAuthenticator),
         )
