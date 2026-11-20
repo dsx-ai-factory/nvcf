@@ -40,7 +40,7 @@ mod metrics;
 mod projection;
 pub(crate) mod token_metrics;
 
-pub(crate) use collector::{ModelStatsInitialization, StatsCollectorControl};
+pub(crate) use collector::{ModelStatsInitialization, StatsCollectorControl, StatsCollectorExit};
 pub use collector::{
     RequestCounterUpdate, RequestCounterUpdateInput, StatsAggregatorUpdate, StatsCollectorConfig,
     StatsCollectorHandle, StatsUpdateSource, start_stats_collector,

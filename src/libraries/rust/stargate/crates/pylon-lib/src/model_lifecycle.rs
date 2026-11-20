@@ -32,7 +32,7 @@ use crate::model_discovery::{ModelDiscoveryConfig, ModelDiscoveryError, discover
 use crate::runtime_state::{ModelGeneration, PylonRuntimeState};
 use crate::stats::{
     CalibrationOutcome, ModelStatsInitialization, PylonMetrics, StatsCollectorControl,
-    StatsCollectorHandle,
+    StatsCollectorExit, StatsCollectorHandle,
 };
 use crate::upstream_health::{ReadinessGate, UpstreamHealthPaths};
 
@@ -92,9 +92,9 @@ impl ModelLifecycleHandle {
         self.task.wait_for_exit().await
     }
 
-    /// Whether the supervisor stopped because the stats collector ended
-    /// outside the collector's shutdown. The collector's own exit then follows
-    /// promptly.
+    /// Whether the supervisor stopped because the stats collector ended other
+    /// than by its handle's shutdown, for example by a panic. The collector's
+    /// own exit then follows promptly.
     pub fn stopped_by_stats_collector(&self) -> bool {
         self.stopped_by_stats_collector.load(Ordering::Acquire)
     }
@@ -104,11 +104,12 @@ impl ModelLifecycleHandle {
     }
 }
 
-/// The supervisor's view of a shutdown: its own stop, and the stats
-/// collector's shutdown mark.
+/// The supervisor's view of a shutdown: its own stop, and how the stats
+/// collector ended. Pylon stops both in one step, and the collector can stop
+/// first.
 struct SupervisorShutdown {
     stop: CancellationToken,
-    stats_collector: CancellationToken,
+    stats_collector: StatsCollectorExit,
 }
 
 struct LiveModelGeneration {
@@ -213,35 +214,33 @@ pub async fn start_model_lifecycle(
         }
     }
 
-    let stats_shutdown = stats_collector.shutdown_started();
+    let stats_collector_exit = stats_collector.exit();
     let stopped_by_stats_collector = Arc::new(AtomicBool::new(false));
     let task = OwnedTask::spawn("model lifecycle supervisor", {
         let stopped_by_stats_collector = Arc::clone(&stopped_by_stats_collector);
         move |stop| async move {
             let shutdown = SupervisorShutdown {
                 stop,
-                stats_collector: stats_shutdown,
+                stats_collector: stats_collector_exit,
             };
             match supervisor.run(&shutdown).await {
                 Ok(()) => {}
-                // Pylon stops the stats collector and this supervisor in one
-                // step, and the collector can stop first. The collector's
-                // handle sets its shutdown mark before it stops the
-                // collector, so a collector stop seen after the mark is part
-                // of that shutdown, not a supervisor failure.
-                Err(error @ ModelLifecycleError::StatsCollectorStopped)
-                    if shutdown.stats_collector.is_cancelled() =>
-                {
-                    tracing::debug!(
-                        error = %error,
-                        "model lifecycle supervisor stopped with the stats collector during shutdown"
-                    );
+                // A collector that its handle's shutdown ended stops this
+                // supervisor as part of that shutdown. One that panicked, or
+                // ended before any shutdown, is a failure, even if a shutdown
+                // started before the supervisor got here.
+                Err(error @ ModelLifecycleError::StatsCollectorStopped) => {
+                    if shutdown.stats_collector.ended_by_shutdown().await {
+                        tracing::debug!(
+                            error = %error,
+                            "model lifecycle supervisor stopped with the stats collector during shutdown"
+                        );
+                    } else {
+                        stopped_by_stats_collector.store(true, Ordering::Release);
+                        tracing::error!(error = %error, "model lifecycle supervisor failed");
+                    }
                 }
                 Err(error) => {
-                    // The collector ended outside its shutdown.
-                    if matches!(error, ModelLifecycleError::StatsCollectorStopped) {
-                        stopped_by_stats_collector.store(true, Ordering::Release);
-                    }
                     tracing::error!(error = %error, "model lifecycle supervisor failed");
                 }
             }
@@ -723,9 +722,10 @@ impl Drop for CalibrationAttemptTimer {
     }
 }
 
-/// Checks upstream health and calibrates when configured. A calibration whose
-/// stats collector request fails after the collector's shutdown mark is set
-/// is part of that shutdown: the attempt is recorded as cancelled and returns
+/// Checks upstream health and calibrates when configured. The supervisor
+/// passes how its stats collector ends. A calibration whose stats collector
+/// request fails because the collector's shutdown ended it is part of that
+/// shutdown: the attempt is recorded as cancelled and returns
 /// `ModelLifecycleError::StatsCollectorStopped` instead of an initialization
 /// failure.
 async fn initialization_attempt(
@@ -735,7 +735,7 @@ async fn initialization_attempt(
     runtime_state: PylonRuntimeState,
     generation: ModelGeneration,
     metrics: Option<Arc<PylonMetrics>>,
-    stats_shutdown: Option<CancellationToken>,
+    stats_collector: Option<StatsCollectorExit>,
 ) -> Result<(), ModelLifecycleError> {
     if let Some(health_timeout) = health_probe_timeout(&config)
         && !is_upstream_ready(&http_client, &config, health_timeout).await
@@ -753,10 +753,9 @@ async fn initialization_attempt(
             &runtime_state,
         )
         .await;
-        if matches!(result, Err(BringupError::StatsCollectorStopped))
-            && stats_shutdown
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
+        if let (Err(BringupError::StatsCollectorStopped), Some(stats_collector)) =
+            (&result, &stats_collector)
+            && stats_collector.ended_by_shutdown().await
         {
             // Dropping the timer records the attempt as cancelled.
             return Err(ModelLifecycleError::StatsCollectorStopped);

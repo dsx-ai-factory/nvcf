@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -97,10 +99,55 @@ pub struct StatsCollectorHandle {
     control: StatsCollectorControl,
     /// Cancelled when `shutdown` starts, before the collector is told to stop.
     shutdown_started: CancellationToken,
+    exit: StatsCollectorExit,
     /// Keeps the engine stats channel open while the handle lives. A collector
     /// that ends then leaves the engine stats stream waiting on a full channel
     /// instead of ending it, so the collector is the task reported as ended.
     _stats_updates: Option<flume::Receiver<StatsAggregatorUpdate>>,
+}
+
+/// How the stats collector task ended, recorded by the task as it ends.
+#[derive(Clone)]
+pub(crate) struct StatsCollectorExit {
+    /// The control's exit token: cancelled once the task has ended, after
+    /// `ended_by_shutdown` is recorded.
+    exited: CancellationToken,
+    ended_by_shutdown: Arc<AtomicBool>,
+}
+
+impl StatsCollectorExit {
+    /// Waits for the collector task to end, then returns whether its handle's
+    /// `shutdown` ended it: the shutdown had started when the task ended, and
+    /// the task did not panic. A collector that panicked, or that ended or
+    /// was aborted before any shutdown started, returns false, even if a
+    /// shutdown starts later. A request that finds the collector stopped can
+    /// wait here: the collector is already ending.
+    pub(crate) async fn ended_by_shutdown(&self) -> bool {
+        self.exited.cancelled().await;
+        self.ended_by_shutdown.load(Ordering::Acquire)
+    }
+}
+
+/// Records how the collector task ended when it drops, then cancels the exit
+/// token.
+struct StatsCollectorEnding {
+    exit: StatsCollectorExit,
+    /// The handle's shutdown mark.
+    shutdown_started: CancellationToken,
+    panicked: bool,
+}
+
+impl Drop for StatsCollectorEnding {
+    fn drop(&mut self) {
+        // The handle sets its shutdown mark before it stops the collector. A
+        // collector that ends without a panic once the mark is set saw its
+        // stop, or the shutdown's timeout aborted it.
+        let ended_by_shutdown = !self.panicked && self.shutdown_started.is_cancelled();
+        self.exit
+            .ended_by_shutdown
+            .store(ended_by_shutdown, Ordering::Release);
+        self.exit.exited.cancel();
+    }
 }
 
 impl StatsCollectorHandle {
@@ -108,12 +155,10 @@ impl StatsCollectorHandle {
         self.control.clone()
     }
 
-    /// Returns a token cancelled when `shutdown` starts, before the collector
-    /// is told to stop. A request that finds the collector stopped once this
-    /// is cancelled failed because of that shutdown, unless the collector had
-    /// already ended on its own.
-    pub(crate) fn shutdown_started(&self) -> CancellationToken {
-        self.shutdown_started.child_token()
+    /// Returns how the collector task ends, for work whose requests find it
+    /// stopped.
+    pub(crate) fn exit(&self) -> StatsCollectorExit {
+        self.exit.clone()
     }
 
     pub async fn wait_for_exit(&mut self) -> Result<(), tokio::task::JoinError> {
@@ -354,18 +399,34 @@ pub fn start_stats_collector_with_engine_stats(
     }
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
     let exited = CancellationToken::new();
-    let exited_guard = exited.clone().drop_guard();
+    let shutdown_started = CancellationToken::new();
+    let exit = StatsCollectorExit {
+        exited: exited.clone(),
+        ended_by_shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    let ending = StatsCollectorEnding {
+        exit: exit.clone(),
+        shutdown_started: shutdown_started.clone(),
+        panicked: false,
+    };
     let stats_updates = stats_update_rx.clone();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
-        let _exited = exited_guard;
-        run_stats_collector(
+        let mut ending = ending;
+        let run = run_stats_collector(
             aggregator,
             observation_rx,
             stats_update_rx,
             control_rx,
             stop,
-        )
-        .await;
+        );
+        if let Err(panic) =
+            futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await
+        {
+            // Record the panic before the task ends with it.
+            ending.panicked = true;
+            drop(ending);
+            std::panic::resume_unwind(panic);
+        }
     });
     StatsCollectorHandle {
         task,
@@ -373,7 +434,8 @@ pub fn start_stats_collector_with_engine_stats(
             tx: control_tx,
             exited,
         },
-        shutdown_started: CancellationToken::new(),
+        shutdown_started,
+        exit,
         _stats_updates: stats_updates,
     }
 }
@@ -4792,7 +4854,7 @@ mod tests {
                     None,
                     false,
                 );
-                let shutdown_started = collector.shutdown_started();
+                let shutdown_started = collector.shutdown_started.child_token();
                 let control = collector.control();
                 let generation = ModelGeneration::new("model-a", 1);
                 let answered = bounded(
@@ -4865,7 +4927,7 @@ mod tests {
             handle: collector, ..
         } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
         let control = collector.control();
-        let shutdown_started = collector.shutdown_started();
+        let shutdown_started = collector.shutdown_started.child_token();
 
         let reported = bounded(
             "the collector shutdown",
