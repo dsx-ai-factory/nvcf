@@ -93,6 +93,14 @@ func EnsureCacheMountOptionsConfigMap(ctx context.Context, c client.Client, name
 		name = DefaultCacheMountOptionsConfigMapName
 	}
 
+	// The init namespace holds every cross-namespace model cache object and
+	// nothing else provisions it on the cluster, so create it before seeding the
+	// ConfigMap rather than failing with
+	// `namespaces "nvca-modelcache-init" not found`.
+	if err := ensureModelCacheInitNamespace(ctx, c); err != nil {
+		return err
+	}
+
 	cm := NewCacheMountOptionsConfigMap(name)
 	if err := c.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create cache mount options ConfigMap %s: %w", name, err)
