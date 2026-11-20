@@ -82,43 +82,31 @@ positive number of milliseconds. The overrides apply to every LLM function on
 the cluster, so an invalid value stops `pylon` on every new LLM worker there.
 Both variables apply to worker pods created after NVCA picks up the new values.
 
-By default an LLM worker pod is Ready as soon as `pylon` starts, so a new
-function version can become `ACTIVE` before its model workers load. To hold
-readiness until the function's health check passes, set
-`PYLON_READINESS_GATE: "true"` in `agent.functionEnvOverrides`. `pylon` then
-waits for the health check declared on the function, with its path, port,
-expected status, and timeout. Only after that check passes does `pylon`
-calibrate and start to register. NVCA adds a readiness probe on `pylon`'s
-`/ready`. The worker becomes Ready, and the version `ACTIVE`, only after
-`llm-request-router` acknowledges the registration. With a reverse tunnel, the
-worker also waits for the tunnel to connect. The worker still has
-`INFERENCE_READY_TIMEOUT` to pass, as other functions do.
-`PYLON_READINESS_GATE` must be `true` or `false`; any other value stops `pylon`.
+By default an LLM worker pod is Ready as soon as `pylon` starts, so a version
+can become `ACTIVE` before its model workers load. To hold readiness until the
+function's health check passes, set `PYLON_READINESS_GATE: "true"` in
+`agent.functionEnvOverrides`. Any value other than `true` or `false` stops
+`pylon`. `pylon` then waits for the declared check, with its path, port,
+expected status, and timeout, before it calibrates and registers. NVCA adds a
+readiness probe on `pylon`'s `/ready`. It returns `200` after
+`llm-request-router` accepts the registration and the reverse tunnel connects.
 
-- Before you enable the switch, verify the health check declared on each LLM
-  function: path, port, expected status, and timeout. Until now, no component
-  enforced this check for LLM functions, so a wrong value went unnoticed. For a
-  Helm function, also verify that the `pylon` pod can reach the health port. If
-  the check never passes, the worker stays NotReady and NVCA removes it when
+Before you enable the switch:
+
+- Make sure every LLM worker runs a `pylon` that serves `/ready`. The control
+  plane sets the image with `nvcf.sidecars.llm-router-client-image`. If it is
+  empty, NVCA uses a built-in image without `/ready`. An older `pylon` exits at
+  startup with an `unexpected argument` error.
+- Verify the health check of each LLM function: path, port, expected status,
+  and timeout. For a Helm function, the `pylon` pod must reach the health port.
+  If the check never passes, NVCA removes the worker when
   `INFERENCE_READY_TIMEOUT` ends.
-- Declare a health check that waits for the model workers, for example a
-  sidecar that answers `200` only when enough workers are ready. A function with
-  no health check gets the NVCF default `/v2/health/ready` on the inference
-  port. If the backend answers a check equal to that default with `401`, `403`,
-  `404`, or `405`, `pylon` logs a warning and keeps its usual health paths, so
-  readiness does not wait for the workers.
-- When `pylon` discovers models and canaries or calibration are on, a model
-  that appears after startup must also pass the declared check before `pylon`
-  admits it. The worker stays Ready.
-- Functions with a gRPC health check keep the current behavior and get no
-  readiness probe.
-- Enable the switch only when every LLM worker on the cluster runs a `pylon`
-  that serves `/ready`. The control plane picks the `pylon` image with
-  `nvcf.sidecars.llm-router-client-image`, which reaches NVCA as
-  `LLM_ROUTER_CLIENT_IMAGE`. If that value is empty, NVCA uses a built-in
-  default image that does not serve `/ready`. NVCA passes `--readiness-gate` to
-  `pylon`, so an older `pylon` exits at startup with an `unexpected argument`
-  error. Disable the switch before you roll `pylon` back to such a version.
+
+Declare a check that waits for the model workers, for example a sidecar that
+returns `200` only when enough workers are ready. Without a declared check, the
+NVCF default `/v2/health/ready` applies. If the backend answers it with `401`,
+`403`, `404`, or `405`, `pylon` uses its usual health paths, and readiness does
+not wait for the workers. A gRPC health check gets no readiness probe.
 
 ## Enable on an Existing Installation
 
