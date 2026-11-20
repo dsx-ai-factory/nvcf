@@ -23,130 +23,19 @@ fi
 # actions also use a separate environment, including compiler/toolchain JVMs.
 bazelrc="${HOME}/.bazelrc"
 touch "$bazelrc"
-bazel_options="$(cat <<'EOF'
-# BEGIN NVCF CI Java runtime mitigation
-startup --host_jvm_args=-XX:-UseBASE64Intrinsics
-build --host_jvmopt=-XX:-UseBASE64Intrinsics
-build --jvmopt=-XX:-UseBASE64Intrinsics
-test --host_jvmopt=-XX:-UseBASE64Intrinsics
-test --jvmopt=-XX:-UseBASE64Intrinsics
-# END NVCF CI Java runtime mitigation
-EOF
-)"
-
-# Keep inherited environment defaults less specific than caller settings.
-# Fixed JAVA_TOOL_OPTIONS values receive the mitigation in their own scope.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+go_bin="$(command -v go || true)"
+if [[ -z "$go_bin" && -x /usr/local/go/bin/go ]]; then
+    go_bin=/usr/local/go/bin/go
+fi
+if [[ -z "$go_bin" ]]; then
+    echo "configure-java-runtime: install Go before configuring CI Java options" >&2
+    exit 1
+fi
 bazelrc_tmp="$(mktemp "${bazelrc}.XXXXXX")"
 trap 'rm -f "$bazelrc_tmp"' EXIT
-printf '%s\n' "$bazel_options" | awk '
-    function quote_word(value,    i, result, c) {
-        result = "\""
-        for (i = 1; i <= length(value); i++) {
-            c = substr(value, i, 1)
-            if (c == "\\" || c == "\"") result = result "\\"
-            result = result c
-        }
-        return result "\""
-    }
-    # Tokenize without evaluating rc content. Keep untouched text verbatim.
-    function merge_options(line,    result, i, start, c, word, quote, scope, flag, prefix, value, pending, key) {
-        i = 1
-        result = ""
-        scope = ""
-        while (i <= length(line)) {
-            c = substr(line, i, 1)
-            if (c ~ /[[:space:]]/) { result = result c; i++; continue }
-            if (c == "#") return result substr(line, i)
-            start = i
-            word = quote = ""
-            while (i <= length(line)) {
-                c = substr(line, i, 1)
-                if (quote == "" && c ~ /[[:space:]]/) break
-                if (quote == "" && c == "#") break
-                if (c == "\\") {
-                    i++
-                    word = word substr(line, i, 1)
-                } else if (quote == "" && (c == single_quote || c == "\"")) {
-                    quote = c
-                } else if (quote != "" && c == quote) {
-                    quote = ""
-                } else {
-                    word = word c
-                }
-                i++
-            }
-            if (quote != "") {
-                print "configure-java-runtime: unterminated quote in Bazel configuration" > "/dev/stderr"
-                failed = 1
-                exit 1
-            }
-            if (scope == "") scope = word
-            flag = word
-            sub(/=.*/, "", flag)
-            if (flag == "--jvmopt" || flag == "--host_jvmopt") {
-                key = scope " " flag
-                if (!(key in jvm_scopes)) {
-                    jvm_scopes[key] = 1
-                    extra_jvm[++jvm_count] = key
-                }
-            }
-            prefix = flag "=JAVA_TOOL_OPTIONS"
-            if (pending != "") {
-                flag = pending
-                pending = ""
-                prefix = "JAVA_TOOL_OPTIONS"
-            } else if (word == "--action_env" || word == "--host_action_env" || word == "--test_env") {
-                pending = word
-            }
-            if ((flag == "--action_env" || flag == "--host_action_env" || flag == "--test_env") &&
-                    (word == prefix || index(word, prefix "=") == 1)) {
-                if (scope == "common") common_env[flag] = 1
-                if (word != prefix) {
-                    value = substr(word, length(prefix) + 2)
-                    if (value !~ /(^|[[:space:]])-XX:-UseBASE64Intrinsics[[:space:]]*$/)
-                        value = value (value == "" ? "" : " ") "-XX:-UseBASE64Intrinsics"
-                    result = result quote_word(prefix "=" value)
-                    continue
-                }
-            }
-            result = result substr(line, start, i - start)
-        }
-        return result
-    }
-    NR == FNR {
-        if ($0 !~ /^# END/) block = block $0 "\n"
-        if ($2 ~ /^--(host_jvmopt|jvmopt)=/) {
-            flag = $2
-            sub(/=.*/, "", flag)
-            jvm_scopes[$1 " " flag] = 1
-        }
-        next
-    }
-    FNR == 1 { single_quote = sprintf("%c", 39) }
-    $0 == "# BEGIN NVCF CI Java runtime mitigation" { managed = 1; next }
-    $0 == "# END NVCF CI Java runtime mitigation" { managed = 0; next }
-    managed { next }
-    {
-        line = line $0
-        # Bazel joins backslash-newline continuations before tokenization.
-        if (line ~ /\\$/) { line = substr(line, 1, length(line) - 1); next }
-        print merge_options(line)
-        line = ""
-    }
-    END {
-        if (failed) exit 1
-        if (managed || line != "") {
-            print "configure-java-runtime: incomplete Bazel configuration" > "/dev/stderr"
-            exit 1
-        }
-        printf "%s", block
-        for (i = 1; i <= jvm_count; i++) print extra_jvm[i] "=-XX:-UseBASE64Intrinsics"
-        if (!("--action_env" in common_env)) print "common --action_env=JAVA_TOOL_OPTIONS"
-        if (!("--host_action_env" in common_env)) print "common --host_action_env=JAVA_TOOL_OPTIONS"
-        if (!("--test_env" in common_env)) print "common --test_env=JAVA_TOOL_OPTIONS"
-        print "# END NVCF CI Java runtime mitigation"
-    }
-' - "$bazelrc" > "$bazelrc_tmp"
+GOWORK=off GOTOOLCHAIN=local "$go_bin" -C "$script_dir/../java-runtime-config" run . \
+    < "$bazelrc" > "$bazelrc_tmp"
 cat "$bazelrc_tmp" > "$bazelrc"
 printf 'JAVA_TOOL_OPTIONS=%s\n' "$java_options" >> "$GITHUB_ENV"
 

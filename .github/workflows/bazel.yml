@@ -85,6 +85,14 @@ jobs:
           bash tools/scripts/test/test-check-java-import-boundaries
           bash tools/ci/check-java-import-boundaries
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+          cache: false
+
+      - name: Test CI Java configuration parser
+        run: GOWORK=off GOTOOLCHAIN=local go -C tools/java-runtime-config test ./...
+
       # Behavioral tests for the CI shell this workflow depends on. actionlint
       # covers syntax; these cover the decisions.
       - name: Test CI shell helpers
@@ -301,6 +309,7 @@ jobs:
             tools/bazel/java/
             tools/ci/stage-bazel-java-artifacts
             tools/ci/configure-java-runtime
+            tools/java-runtime-config/
             tools/scripts/test/test-configure-java-runtime
           )
           # Two of these globs fire far more often than they carry Java
@@ -1115,6 +1124,10 @@ jobs:
       # The Java tree builds with local_jdk (root .bazelrc). Unlike the fast
       # matrix, this lane runs on a bare runner rather than the bazel-ci image,
       # so provide JDK 25 explicitly for the Java requires-docker tests.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+          cache: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

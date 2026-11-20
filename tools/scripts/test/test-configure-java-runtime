@@ -7,6 +7,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 script="$repo/tools/ci/configure-java-runtime"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
+# Reuse the Go build cache while each helper call uses an isolated HOME.
+export GOCACHE="${GOCACHE:-$fixture/go-cache}"
 mkdir -p "$fixture/home"
 env_file="$fixture/github-env"
 bazelrc="$fixture/home/.bazelrc"
@@ -134,6 +136,20 @@ env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
     bash "$script" >/dev/null
 cmp "$bazelrc" "$fixture/first.bazelrc"
 echo 'ok   preserves escaped values, continuations, comments and separated flag arguments'
+
+# A quoted value continued with backslash-CRLF has the same Bazel meaning as
+# the LF fixture above, including when the managed block is rewritten again.
+cp "$bazelrc" "$fixture/lf.bazelrc"
+printf 'build:crlf --action_env="JAVA_TOOL_OPTIONS=-Dcrlf.fixture=preserved \\\r\n-Dmessage=continued"\r\n' >> "$fixture/lf.bazelrc"
+awk '{ sub(/\r$/, ""); printf "%s\r\n", $0 }' "$fixture/lf.bazelrc" > "$bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+grep -Fxq 'build:crlf "--action_env=JAVA_TOOL_OPTIONS=-Dcrlf.fixture=preserved -Dmessage=continued -XX:-UseBASE64Intrinsics"' "$bazelrc"
+cp "$bazelrc" "$fixture/first.bazelrc"
+env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+    bash "$script" >/dev/null
+cmp "$bazelrc" "$fixture/first.bazelrc"
+echo 'ok   preserves quoted CRLF continuations and repeated-run stability'
 
 # A multiline value must not inject extra GitHub environment entries or make
 # any partial changes to the rc/environment files.
