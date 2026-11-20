@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
@@ -43,6 +44,7 @@ type staticClient struct {
 	systemNamespace  string
 	gpuAllocGetter   GPUAllocationGetter
 	constGPUCapacity uint64
+	cacheMu          sync.Mutex
 	backendGPUs      []types.BackendGPU
 	lastCachedTime   time.Time
 }
@@ -158,7 +160,9 @@ func (c *staticClient) GetGPUResources(ctx context.Context, gpuName types.GPUNam
 		return types.GPUResource{}, fmt.Errorf("get allocated GPU resources: %v", err)
 	}
 
-	// query the API once and cache it for StaticGPUCacheTime duration
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	// Query the API once and cache capacity; allocation above is always current.
 	if c.lastCachedTime.IsZero() || time.Since(c.lastCachedTime) >= staticGPUCacheTime {
 		c.backendGPUs, err = c.GetAllBackendGPUs(ctx)
 		if err != nil {

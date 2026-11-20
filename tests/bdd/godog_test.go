@@ -708,6 +708,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		Options: &godog.Options{
 			Format: "pretty",
 			Paths:  []string{featurePath},
+			Tags:   "~@capacity-recovery",
 			Strict: true,
 			Output: &out,
 		},
@@ -3225,6 +3226,64 @@ func TestSingleClusterUpOneClick(t *testing.T) {
 	runLiveFeature(t, "single-cluster-up-oneclick.feature")
 }
 
+const capacityRecoveryTags = "@capacity-install,@capacity-recovery"
+
+func TestCapacityRecoveryTagsSelectInstallationAndReuse(t *testing.T) {
+	var selected []string
+	var output strings.Builder
+	status := godog.TestSuite{
+		Name: "capacity-recovery-selection",
+		ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+			ctx.Before(func(ctx context.Context, scenario *godog.Scenario) (context.Context, error) {
+				selected = append(selected, scenario.Name)
+				return ctx, fmt.Errorf("selection probe: skip execution")
+			})
+		},
+		Options: &godog.Options{
+			Format: "progress",
+			Paths:  []string{mustResolveFeaturePath(t, "single-cluster-helmfile.feature")},
+			Tags:   capacityRecoveryTags,
+			Output: &output,
+		},
+	}.Run()
+	want := []string{
+		"Operator validates the authored Helmfile environment renders",
+		"Operator installs the control plane through the local Helmfile environment",
+		"Operator registers the local cluster and installs the NVCA operator",
+		"Operator invokes the Load Tester Supreme sample function through default and vanity endpoints",
+		"Operator recovers a worker using dynamic discovery with no spare capacity",
+		"Operator recovers a worker using static discovery with no spare capacity",
+	}
+	if status != 1 || !slices.Equal(selected, want) {
+		t.Fatalf("expected installation and saturated recovery scenarios, got status=%d scenarios=%v\n%s",
+			status, selected, output.String())
+	}
+}
+
+// TestSingleClusterCapacityRecovery installs the full local stack and verifies
+// that a function can reuse released capacity before the next periodic heartbeat.
+func TestSingleClusterCapacityRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	if os.Getenv("CAPACITY_NVCA_AGENT_VERSION") == "" {
+		t.Fatal("set CAPACITY_NVCA_AGENT_VERSION to the candidate image tag built from the revision under test")
+	}
+	runLiveFeatureTags(t, "single-cluster-helmfile.feature", capacityRecoveryTags)
+}
+
+// TestExistingClusterCapacityRecovery reruns candidate validation on the local
+// stack installed by TestSingleClusterCapacityRecovery, preserving its registration.
+func TestExistingClusterCapacityRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live run skipped under -short")
+	}
+	if os.Getenv("CAPACITY_NVCA_AGENT_VERSION") == "" {
+		t.Fatal("set CAPACITY_NVCA_AGENT_VERSION to the candidate image tag built from the revision under test")
+	}
+	runLiveFeatureTags(t, "single-cluster-helmfile.feature", "@capacity-recovery")
+}
+
 // TestSingleClusterHelmfile is the live entry point for the helmfile
 // feature. Skipped under -short.
 func TestSingleClusterHelmfile(t *testing.T) {
@@ -3235,7 +3294,7 @@ func TestSingleClusterHelmfile(t *testing.T) {
 		t.Setenv(sampleLLMEchoImageEnv, "nvcr.io/"+os.Getenv("SAMPLE_NGC_ORG")+"/"+os.Getenv("SAMPLE_NGC_TEAM")+"/"+sampleLLMEchoDefaultImage)
 	}
 	tags := singleClusterHelmfileTags()
-	if tags != "" {
+	if os.Getenv(sampleLLMDecisionsImageEnv) == "" {
 		t.Logf("%s is not set, so the @llm-decision-routes scenarios are skipped", sampleLLMDecisionsImageEnv)
 	}
 	runLiveFeatureTags(t, "single-cluster-helmfile.feature", tags)
@@ -3247,13 +3306,13 @@ func TestSingleClusterHelmfile(t *testing.T) {
 // only when an operator sets this variable.
 const sampleLLMDecisionsImageEnv = "SAMPLE_LLM_DECISIONS_IMAGE"
 
-// singleClusterHelmfileTags excludes the decision route scenarios unless
-// SAMPLE_LLM_DECISIONS_IMAGE is set.
+// singleClusterHelmfileTags keeps candidate-only capacity validation in its
+// dedicated suite and excludes decision routes unless their sample is set.
 func singleClusterHelmfileTags() string {
 	if os.Getenv(sampleLLMDecisionsImageEnv) == "" {
-		return "~@llm-decision-routes"
+		return "~@llm-decision-routes && ~@capacity-recovery"
 	}
-	return ""
+	return "~@capacity-recovery"
 }
 
 // sampleLLMEchoImageEnv selects the OpenAI-compatible sample the LLM

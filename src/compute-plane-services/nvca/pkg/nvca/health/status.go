@@ -20,6 +20,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +57,7 @@ func (f GetComponentStatusFunc) GetComponentStatus(ctx context.Context) (nvcatyp
 }
 
 type BackendStatusCache struct {
+	refreshMu     sync.Mutex
 	backendStatus atomic.Value
 	getters       []ComponentStatusGetter
 
@@ -160,6 +162,8 @@ func (c *BackendStatusCache) RefreshStatus(ctx context.Context) (nvcatypes.Agent
 
 // RefreshStatusForLevel refreshes the cached status for all status getters in the cache.
 func (c *BackendStatusCache) RefreshStatusForLevel(ctx context.Context, level nvcatypes.StatusLevel) (nvcatypes.AgentHealth, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
 	log := core.GetLogger(ctx)
 
 	if c.minRefreshWait != 0 {

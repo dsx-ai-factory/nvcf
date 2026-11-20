@@ -53,6 +53,37 @@ func TestSetDefaultsDoesNotBackfillDefaultStargateAddress(t *testing.T) {
 	assert.Empty(t, cfg.Workload.DefaultStargateAddress)
 }
 
+func TestNewCommandPassesHealthRefreshWait(t *testing.T) {
+	for _, wait := range []time.Duration{0, time.Hour} {
+		t.Run(wait.String(), func(t *testing.T) {
+			a, started := newMockCLIAgent()
+			var gotOpts *AgentOptions
+			cmd := newCobraCommand(func(_ context.Context, opts *AgentOptions) (cliAgent, error) {
+				gotOpts = opts
+				return a, nil
+			}, func(cli.Generic, string) error { return nil },
+				func(*logrus.Entry) logr.Logger { return logr.Discard() })
+			config := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(config, []byte(fmt.Sprintf(
+				"agent:\n  icmsURL: https://icms.example.test\n  minHealthcheckRefreshWait: %s\n", wait)), 0600))
+			cmd.SetArgs([]string{"--config", config})
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() { result <- cmd.ExecuteContext(ctx) }()
+			select {
+			case <-started:
+				cancel()
+				require.NoError(t, <-result)
+			case err := <-result:
+				t.Fatalf("agent did not start: %v", err)
+			}
+			require.NotNil(t, gotOpts)
+			require.Equal(t, wait, gotOpts.MinHealthcheckRefreshWait)
+		})
+	}
+}
+
 func TestSetDefaultsPreservesConfiguredDefaultStargateAddress(t *testing.T) {
 	cfg := nvcaconfig.Config{}
 	cfg.Workload.DefaultStargateAddress = "llm-router.example.test:50071"
