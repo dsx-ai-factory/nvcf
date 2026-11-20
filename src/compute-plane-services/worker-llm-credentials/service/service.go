@@ -22,14 +22,13 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"strings"
-	"syscall"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
@@ -38,6 +37,12 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-llm-credentials/internal/worker"
 )
 
+// isFatalRunError reports whether a terminal error from the root command is a
+// genuine failure rather than the expected response to a shutdown signal.
+func isFatalRunError(err error) bool {
+	return err != nil && !shutdown.IsSignalError(err)
+}
+
 func Run() {
 	logger := utils.NewProductionLogger()
 	defer logger.Close()
@@ -45,8 +50,7 @@ func Run() {
 
 	rootCmd := NewRootCommand(context.Background())
 	err := rootCmd.Execute()
-	// err is returned as a string by nv-kit. type assertion is not possible.
-	if err != nil && strings.ToLower(err.Error()) != "received signal interrupt" {
+	if isFatalRunError(err) {
 		utils.ExitReason(err)
 		zap.S().Panic(err)
 	}
@@ -91,9 +95,9 @@ func NewRootCommand(ctx context.Context) *cobra.Command {
 				}
 			}()
 
-			// Wait for SIGTERM and terminate the worker gracefully
+			// Wait for shutdown signals and terminate the worker gracefully
 			signalChan := make(chan os.Signal, 1)
-			signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+			signal.Notify(signalChan, shutdown.Signals()...)
 			go func() {
 				<-signalChan
 				cancel()

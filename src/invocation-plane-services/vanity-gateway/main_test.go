@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"mime"
@@ -40,6 +41,7 @@ import (
 	"ai-api-gateway-service/gateway"
 	gatewayConfig "ai-api-gateway-service/gateway_config"
 
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/NVIDIA/nvcf-go/pkg/nvkit/config"
 	"github.com/go-logr/zapr"
 	"github.com/goccy/go-json"
@@ -2430,6 +2432,71 @@ func TestStartupRejectsInvalidRequestSizeConfigFile(t *testing.T) {
 			cmd := NewRootCommand(nil)
 			cmd.SetArgs([]string{"--config", path})
 			require.ErrorContains(t, cmd.Execute(), "MAX_REQUEST_SIZE_BYTES")
+		})
+	}
+}
+
+func TestIsFatalRunError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error is not fatal",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "typed SIGTERM is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGTERM),
+			want: false,
+		},
+		{
+			name: "typed SIGINT is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGINT),
+			want: false,
+		},
+		{
+			name: "wrapped typed SIGTERM is not fatal",
+			err:  fmt.Errorf("server group: %w", shutdown.NewSignalError(syscall.SIGTERM)),
+			want: false,
+		},
+		{
+			// vanity-gateway uses github.com/NVIDIA/nvcf-go which returns formatted
+			// string error "received signal <sig>" rather than typed SignalError.
+			// The predicate string fallback must recognize this without panicking.
+			name: "nvcf-go untyped SIGTERM is not fatal",
+			err:  errors.New("received signal terminated"),
+			want: false,
+		},
+		{
+			name: "nvcf-go untyped SIGINT is not fatal",
+			err:  errors.New("received signal interrupt"),
+			want: false,
+		},
+		{
+			name: "wrapped nvcf-go untyped SIGTERM is not fatal",
+			err:  fmt.Errorf("server group: %w", errors.New("received signal terminated")),
+			want: false,
+		},
+		{
+			name: "unrelated server error is fatal",
+			err:  errors.New("listen tcp :8080: bind: address already in use"),
+			want: true,
+		},
+		{
+			name: "generic error is fatal",
+			err:  errors.New("unexpected failure"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isFatalRunError(tt.err); got != tt.want {
+				t.Errorf("isFatalRunError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
 		})
 	}
 }

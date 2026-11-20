@@ -25,16 +25,23 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/config"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 
 	"nvcf-grpc-proxy/proxy"
 )
 
+// isFatalRunError reports whether a terminal error from the root command is a
+// genuine failure rather than the expected response to a shutdown signal.
+func isFatalRunError(err error) bool {
+	return err != nil && !shutdown.IsSignalError(err)
+}
+
 func main() {
 	logger := setupLogger()
 	defer tracing.Shutdown()
 	err := NewRootCommand(logger).Execute()
-	if err != nil && err.Error() != "received signal interrupt" {
+	if isFatalRunError(err) {
 		zap.S().Panic(err)
 	}
 }

@@ -12,7 +12,7 @@ require (
 	github.com/carlmjohnson/versioninfo v0.22.5
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/cloudevents/sdk-go/v2 v2.16.2
-	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260728185909-afca4ec2fb26
+	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260903222131-e8ff394ddc07
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-chi/cors v1.2.2
 	github.com/goccy/go-json v0.10.5

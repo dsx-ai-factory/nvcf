@@ -34,13 +34,25 @@ import (
 	"github.com/NVIDIA/nvcf-go/pkg/nvkit/config"
 	"github.com/NVIDIA/nvcf-go/pkg/nvkit/logs"
 	"github.com/NVIDIA/nvcf-go/pkg/nvkit/tracing"
+
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 )
+
+// isFatalRunError reports whether a terminal error from the root command is a
+// genuine failure rather than the expected response to a shutdown signal.
+//
+// The vanity-gateway server comes from the external nvcf-go module which
+// reports shutdown signals as formatted text ("received signal ...") rather
+// than typed SignalErrors. IsSignalError falls back to matching that wording.
+func isFatalRunError(err error) bool {
+	return err != nil && !shutdown.IsSignalError(err)
+}
 
 func main() {
 	logger := setupLogger()
 	defer tracing.Shutdown()
 	err := NewRootCommand(logger).Execute()
-	if err != nil && err.Error() != "received signal interrupt" {
+	if isFatalRunError(err) {
 		zap.S().Panic(err)
 	}
 }

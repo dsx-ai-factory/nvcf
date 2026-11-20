@@ -3,7 +3,7 @@ module github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-llm-cred
 go 1.26.10
 
 require (
-	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260710034659-973443ac16c3
+	github.com/dsx-ai-factory/nvcf/src/libraries/go/lib v0.0.0-20260903222131-e8ff394ddc07
 	github.com/dsx-ai-factory/nvcf/src/libraries/go/worker v0.0.0-20261015164739-acd237d2f0af
 	github.com/samber/lo v1.51.0
 	github.com/spf13/cobra v1.10.2

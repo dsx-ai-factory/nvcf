@@ -30,8 +30,11 @@ import (
 	"net/http/httputil"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 )
 
 const functionId = "4f463643-db0d-47a3-9f1d-5de3c1febc79"
@@ -310,5 +313,67 @@ func TestRealGrpcProxyGrpc(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		sendReqResp(ctx, apiKey, functionId, client)
 		time.Sleep(4 * time.Second)
+	}
+}
+
+func TestIsFatalRunError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error is not fatal",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "typed SIGTERM is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGTERM),
+			want: false,
+		},
+		{
+			name: "typed SIGINT is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGINT),
+			want: false,
+		},
+		{
+			name: "wrapped typed SIGTERM is not fatal",
+			err:  fmt.Errorf("server group: %w", shutdown.NewSignalError(syscall.SIGTERM)),
+			want: false,
+		},
+		{
+			name: "untyped SIGTERM string fallback is not fatal",
+			err:  errors.New("received signal terminated"),
+			want: false,
+		},
+		{
+			name: "untyped SIGINT string fallback is not fatal",
+			err:  errors.New("received signal interrupt"),
+			want: false,
+		},
+		{
+			name: "wrapped untyped SIGTERM is not fatal",
+			err:  fmt.Errorf("server group: %w", errors.New("received signal terminated")),
+			want: false,
+		},
+		{
+			name: "unrelated server error is fatal",
+			err:  errors.New("listen tcp :8080: bind: address already in use"),
+			want: true,
+		},
+		{
+			name: "generic error is fatal",
+			err:  errors.New("unexpected failure"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isFatalRunError(tt.err); got != tt.want {
+				t.Errorf("isFatalRunError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }

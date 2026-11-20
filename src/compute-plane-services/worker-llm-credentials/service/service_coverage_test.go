@@ -19,6 +19,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -27,6 +28,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -235,5 +238,67 @@ func TestRun_GracefulShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after SIGTERM within deadline")
+	}
+}
+
+func TestIsFatalRunError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error is not fatal",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "typed SIGTERM is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGTERM),
+			want: false,
+		},
+		{
+			name: "typed SIGINT is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGINT),
+			want: false,
+		},
+		{
+			name: "wrapped typed SIGTERM is not fatal",
+			err:  fmt.Errorf("run error: %w", shutdown.NewSignalError(syscall.SIGTERM)),
+			want: false,
+		},
+		{
+			name: "untyped SIGTERM string fallback is not fatal",
+			err:  errors.New("received signal terminated"),
+			want: false,
+		},
+		{
+			name: "untyped SIGINT string fallback is not fatal",
+			err:  errors.New("received signal interrupt"),
+			want: false,
+		},
+		{
+			name: "wrapped untyped SIGTERM is not fatal",
+			err:  fmt.Errorf("run error: %w", errors.New("received signal terminated")),
+			want: false,
+		},
+		{
+			name: "unrelated error is fatal",
+			err:  errors.New("listen tcp :8080: bind: address already in use"),
+			want: true,
+		},
+		{
+			name: "generic error is fatal",
+			err:  errors.New("unexpected failure"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isFatalRunError(tt.err); got != tt.want {
+				t.Errorf("isFatalRunError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
