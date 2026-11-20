@@ -58,16 +58,35 @@ func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
 	t.Parallel()
 
 	long := strings.Repeat("a", MaxUpstreamErrorBodyBytes)
-	upstreamErr := upstreamStreamError(`{"error":{"message":"` + long + `","code":400}}`)
-	if upstreamErr == nil {
-		t.Fatal("error event not detected")
+	tests := []struct {
+		name  string
+		event string
+		// wantBody empty means no body, so the client gets the status text.
+		wantBody string
+	}{
+		{
+			name:     "capped message and fields",
+			event:    `{"error":{"message":"` + long + `","type":"invalid_request_error","code":400}}`,
+			wantBody: `{"error":{"message":"` + long[:maxUpstreamErrorMessageBytes] +
+				`","type":"invalid_request_error","code":"400"}}`,
+		},
+		{name: "no message", event: `{"error":{"detail":"` + long + `","code":400}}`},
 	}
-	if upstreamErr.Status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", upstreamErr.Status, http.StatusBadRequest)
-	}
-	want := `{"error":{"message":"` + long[:maxUpstreamErrorMessageBytes] + `"}}`
-	if string(upstreamErr.Body) != want {
-		t.Fatalf("body has %d bytes, want only the capped message (%d bytes)", len(upstreamErr.Body), len(want))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamErr := upstreamStreamError(tt.event)
+			if upstreamErr == nil {
+				t.Fatal("error event not detected")
+			}
+			if upstreamErr.Status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", upstreamErr.Status, http.StatusBadRequest)
+			}
+			if string(upstreamErr.Body) != tt.wantBody {
+				t.Fatalf("body has %d bytes, want %d", len(upstreamErr.Body), len(tt.wantBody))
+			}
+		})
 	}
 }
 

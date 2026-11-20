@@ -1012,16 +1012,6 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 		return nil
 	}
 	upstreamErr := &UpstreamStreamError{Message: UpstreamErrorMessage([]byte(payload))}
-	errorObject := []byte(event.Error)
-	if len(errorObject) > MaxUpstreamErrorBodyBytes {
-		// Like an oversized 4xx head body, the object is not relayed; its capped message is.
-		message, err := json.Marshal(upstreamErr.Message)
-		if err != nil {
-			message = []byte(`""`)
-		}
-		errorObject = append(append([]byte(`{"message":`), message...), '}')
-	}
-	upstreamErr.Body = append(append([]byte(`{"error":`), errorObject...), '}')
 	var fields struct {
 		Type  json.RawMessage `json:"type"`
 		Param json.RawMessage `json:"param"`
@@ -1041,7 +1031,30 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 			}
 		}
 	}
+	upstreamErr.Body = streamErrorBody(event.Error, upstreamErr)
 	return upstreamErr
+}
+
+// streamErrorBody returns {"error":...} with the event's error object. Like an
+// oversized 4xx head body, an object over MaxUpstreamErrorBodyBytes is not
+// relayed: its capped message and parsed fields are, or nothing without a message.
+func streamErrorBody(errorObject json.RawMessage, upstreamErr *UpstreamStreamError) []byte {
+	if len(errorObject) > MaxUpstreamErrorBodyBytes {
+		if upstreamErr.Message == "" {
+			return nil
+		}
+		capped, err := json.Marshal(struct {
+			Message string  `json:"message"`
+			Type    *string `json:"type,omitempty"`
+			Param   *string `json:"param,omitempty"`
+			Code    *string `json:"code,omitempty"`
+		}{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code})
+		if err != nil {
+			return nil
+		}
+		errorObject = capped
+	}
+	return append(append([]byte(`{"error":`), errorObject...), '}')
 }
 
 // jsonString returns the value of a JSON string, or nil for any other value.
