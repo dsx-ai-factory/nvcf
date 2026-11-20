@@ -191,9 +191,8 @@ public class GrpcLlmService extends LlmGatewayImplBase {
         return Optional.of(value);
     }
 
-    // API keys get the rate limit from the LLM-specific evaluation (LlmApiKeyService). Every other
-    // caller (client JWT, invocation token, or an API key whose result carries none) is looked up
-    // by ncaId, so no token type skips the account limit.
+    // API keys: the LLM API-key evaluation returns auth and rates in one call. Client JWTs and
+    // invocation tokens are validated here, so their ncaId goes to the account rate-limit evaluation.
     private Optional<ApiKeyValidationResult.RateLimitAttributes> resolveAccountRateLimit(
             Authentication authentication,
             String ncaId) {
