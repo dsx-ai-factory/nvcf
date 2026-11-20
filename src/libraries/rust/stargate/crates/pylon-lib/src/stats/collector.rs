@@ -95,6 +95,8 @@ pub(crate) struct StatsCollectorControl {
 pub struct StatsCollectorHandle {
     task: OwnedTask,
     control: StatsCollectorControl,
+    /// Cancelled when `shutdown` starts, before the collector is told to stop.
+    shutdown_started: CancellationToken,
 }
 
 impl StatsCollectorHandle {
@@ -102,11 +104,20 @@ impl StatsCollectorHandle {
         self.control.clone()
     }
 
+    /// Returns a token cancelled when `shutdown` starts, before the collector
+    /// is told to stop. A request that finds the collector stopped once this
+    /// is cancelled failed because of that shutdown, unless the collector had
+    /// already ended on its own.
+    pub(crate) fn shutdown_started(&self) -> CancellationToken {
+        self.shutdown_started.child_token()
+    }
+
     pub async fn wait_for_exit(&mut self) -> Result<(), tokio::task::JoinError> {
         self.task.wait_for_exit().await
     }
 
     pub async fn shutdown(self) {
+        self.shutdown_started.cancel();
         self.task
             .shutdown(stargate_runtime::TASK_SHUTDOWN_TIMEOUT)
             .await;
@@ -348,6 +359,7 @@ pub fn start_stats_collector_with_engine_stats(
             tx: control_tx,
             exited,
         },
+        shutdown_started: CancellationToken::new(),
     }
 }
 

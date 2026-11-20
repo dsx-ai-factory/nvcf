@@ -197,9 +197,26 @@ pub async fn start_model_lifecycle(
         }
     }
 
+    let stats_shutdown = stats_collector.shutdown_started();
     let task = OwnedTask::spawn("model lifecycle supervisor", move |stop| async move {
-        if let Err(error) = supervisor.run(stop).await {
-            tracing::error!(error = %error, "model lifecycle supervisor failed");
+        match supervisor.run(stop).await {
+            Ok(()) => {}
+            // Pylon stops the stats collector and this supervisor in one
+            // step, and the collector can stop first. The collector's handle
+            // sets its shutdown mark before it stops the collector, so a
+            // collector stop seen after the mark is part of that shutdown,
+            // not a supervisor failure.
+            Err(error @ ModelLifecycleError::StatsCollectorStopped)
+                if stats_shutdown.is_cancelled() =>
+            {
+                tracing::debug!(
+                    error = %error,
+                    "model lifecycle supervisor stopped with the stats collector during shutdown"
+                );
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "model lifecycle supervisor failed");
+            }
         }
         supervisor.shutdown().await;
     });
