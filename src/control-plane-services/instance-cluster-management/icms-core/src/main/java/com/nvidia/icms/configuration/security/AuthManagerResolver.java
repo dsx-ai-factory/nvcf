@@ -27,11 +27,16 @@ import com.nimbusds.jose.proc.JWSVerificationKeySelector;
 import com.nimbusds.jose.proc.SecurityContext;
 import com.nimbusds.jwt.JWTParser;
 import com.nimbusds.jwt.proc.DefaultJWTProcessor;
+import com.nvidia.boot.jwt.jwks.JwksAuthenticationManager;
+import com.nvidia.boot.jwt.jwks.JwksJwtDecoder;
 import com.nvidia.icms.configuration.nvca.NvcaConfigurationProperties;
+import com.nvidia.icms.outbound.apikeys.ApiKeysService;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.apikeys.ApiKeysService;
 import com.nvidia.icms.util.AuthUtils;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
 import jakarta.servlet.http.HttpServletRequest;
 import java.text.ParseException;
 import java.time.Instant;
@@ -42,6 +47,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.context.annotation.Bean;
@@ -98,6 +105,15 @@ public class AuthManagerResolver {
     private final String adminJwkSetUri;
     private final SignatureAlgorithm jwsAlgorithm;
     private final boolean apiKeyAuthEnabled;
+    private OpenTelemetry jwksTelemetry = OpenTelemetry.noop();
+    private MeterRegistry jwksMetrics = new SimpleMeterRegistry();
+
+    @Autowired
+    void configureJwksObservability(ObjectProvider<OpenTelemetry> telemetry,
+            ObjectProvider<MeterRegistry> metrics) {
+        jwksTelemetry = telemetry.getIfAvailable(OpenTelemetry::noop);
+        jwksMetrics = metrics.getIfAvailable(SimpleMeterRegistry::new);
+    }
 
     public AuthManagerResolver(
             ApiKeysService apiKeysService,
@@ -181,7 +197,7 @@ public class AuthManagerResolver {
     private AuthenticationManager apiKeyAuthenticationManager() {
         var provider = new OpaqueTokenAuthenticationProvider(apiKeyIntrospector());
         provider.setAuthenticationConverter(apiKeyConverter());
-        return provider::authenticate;
+        return new JwksAuthenticationManager(provider::authenticate);
     }
 
     private OpaqueTokenIntrospector apiKeyIntrospector() {
@@ -210,11 +226,11 @@ public class AuthManagerResolver {
     private AuthenticationManager jwtAuthenticationManagerFor(String iss, String jwks) {
         var provider = new JwtAuthenticationProvider(jwtDecoderFor(iss, jwks));
         provider.setJwtAuthenticationConverter(jwtAuthenticationConverter());
-        return provider::authenticate;
+        return new JwksAuthenticationManager(provider::authenticate);
     }
 
     private JwtDecoder jwtDecoderFor(String iss, String jwks) {
-        var decoder = NimbusJwtDecoder.withJwkSetUri(jwks).jwsAlgorithm(jwsAlgorithm).build();
+        var decoder = JwksJwtDecoder.create(jwks, jwsAlgorithm, jwksTelemetry, jwksMetrics);
         decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(iss));
         return decoder;
     }

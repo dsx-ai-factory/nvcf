@@ -22,10 +22,11 @@ import static com.nvidia.nvcf.util.NvcfConstants.TAG_NCA_ID;
 import com.nvidia.boot.exceptions.ForbiddenException;
 import com.nvidia.boot.exceptions.ServiceUnavailableException;
 import com.nvidia.boot.exceptions.UnauthorizedException;
+import com.nvidia.boot.jwt.jwks.JwksJwtDecoder;
 import com.nvidia.nvcf.configuration.exceptions.InvalidInvocationException;
 import io.grpc.Metadata;
-import io.grpc.Status;
 import io.grpc.Status.Code;
+import io.grpc.Status;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.dao.DataAccessException;
@@ -106,6 +107,10 @@ public class GrpcConfiguration {
 
     @GrpcExceptionHandler
     public Status handleException(AuthenticationException e) {
+        if (JwksJwtDecoder.isUnavailable(e)) {
+            return handleErrorResponseException(
+                    new ServiceUnavailableException(JwksJwtDecoder.UNAVAILABLE, e));
+        }
         return handleErrorResponseException(
                 new UnauthorizedException(e.getMessage(), e.getCause()));
     }

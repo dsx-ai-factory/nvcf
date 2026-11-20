@@ -12,6 +12,8 @@ ICMS_CORE_TEST_SRCS = glob(["src/test/java/**/*.java"])
 ICMS_CORE_TEST_RESOURCES = glob(["src/test/resources/**"])
 
 ICMS_CORE_DEPS = [
+    "//src/libraries/java/nv-boot-parent/nv-boot-starter-jwt:nv_boot_jwks",
+    "@nv_third_party_deps//:io_opentelemetry_opentelemetry_api",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-audit:nv_boot_starter_audit",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-cassandra:nv_boot_starter_cassandra",
     "//src/libraries/java/nv-boot-parent/nv-boot-starter-core:nv_boot_starter_core",

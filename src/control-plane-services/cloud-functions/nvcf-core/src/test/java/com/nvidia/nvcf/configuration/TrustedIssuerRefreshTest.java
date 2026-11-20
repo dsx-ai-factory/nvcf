@@ -44,7 +44,7 @@ import org.springframework.core.env.MapPropertySource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.authentication.AuthenticationManagerResolver;
-import org.springframework.security.authentication.AuthenticationServiceException;
+import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
 import org.springframework.security.oauth2.server.resource.InvalidBearerTokenException;
 import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
 
@@ -139,7 +139,9 @@ class TrustedIssuerRefreshTest {
 
     private static void assertRouted(AssertableApplicationContext context, String issuer) {
         assertThatThrownBy(() -> authenticate(context, issuer))
-                .isInstanceOf(AuthenticationServiceException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
     }
 
     private static void assertNotTrusted(AssertableApplicationContext context, String issuer) {

@@ -98,10 +98,10 @@ public class AuthManagerResolverConfiguration {
                     || !StringUtils.hasText(entry.getJwkSetUri())) {
                 continue;
             }
-            managers.putIfAbsent(
+            managers.computeIfAbsent(
                     entry.getIssuerUri(),
-                    jwtAuthManagerConfiguration.jwtAuthenticationManager(
-                            entry.getIssuerUri(), entry.getJwkSetUri()));
+                    issuer -> jwtAuthManagerConfiguration.jwtAuthenticationManager(
+                            issuer, entry.getJwkSetUri()));
         }
         return new JwtIssuerAuthenticationManagerResolver(managers::get);
     }

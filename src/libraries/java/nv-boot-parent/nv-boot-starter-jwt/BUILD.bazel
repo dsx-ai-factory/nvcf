@@ -28,7 +28,7 @@ JWT_COMPILE_DEPS = [
 
 nv_boot_library(
     name = "nv_boot_starter_jwt",
-    srcs = glob(["src/main/java/**/*.java"]),
+    srcs = glob(["src/main/java/**/*.java"], exclude = ["src/main/java/**/jwks/*.java"]),
     resource_strip_prefix = "src/libraries/java/nv-boot-parent/nv-boot-starter-jwt/src/main/resources",
     resources = glob(["src/main/resources/**"]),
     visibility = ["//visibility:public"],
@@ -37,7 +37,7 @@ nv_boot_library(
 
 nvcf_java_test(
     name = "tests",
-    srcs = glob(["src/test/java/**/*.java"]),
+    srcs = glob(["src/test/java/**/*.java"], exclude = ["src/test/java/**/jwks/*.java"]),
     resource_strip_prefix = "src/libraries/java/nv-boot-parent/nv-boot-starter-jwt/src/test/resources",
     resources = glob(["src/test/resources/**"]),
     deps = [
@@ -50,4 +50,46 @@ nvcf_java_coverage_test(
     name = "tests_coverage",
     coverage_target = ":nv_boot_starter_jwt",
     test = ":tests",
+)
+
+nv_boot_library(
+    name = "nv_boot_jwks",
+    srcs = glob(["src/main/java/**/jwks/*.java"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@nv_third_party_deps//:com_nimbusds_nimbus_jose_jwt",
+        "@nv_third_party_deps//:io_micrometer_micrometer_core",
+        "@nv_third_party_deps//:io_opentelemetry_opentelemetry_api",
+        "@nv_third_party_deps//:io_opentelemetry_opentelemetry_context",
+        "@nv_third_party_deps//:org_slf4j_slf4j_api",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_core",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_core",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_jose",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_resource_server",
+        "@nv_third_party_deps//:org_springframework_spring_web",
+    ],
+)
+
+nvcf_java_test(
+    name = "jwks_tests",
+    srcs = glob(["src/test/java/**/jwks/*.java"]),
+    deps = [
+        ":nv_boot_jwks",
+        "@nv_third_party_deps//:io_micrometer_micrometer_core",
+        "@nv_third_party_deps//:io_opentelemetry_opentelemetry_sdk",
+        "@nv_third_party_deps//:io_opentelemetry_opentelemetry_sdk_trace",
+        "@nv_third_party_deps//:io_opentelemetry_opentelemetry_sdk_testing",
+        "@nv_third_party_deps//:jakarta_servlet_jakarta_servlet_api",
+        "@nv_third_party_deps//:org_springframework_boot_spring_boot_starter_webmvc_test",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_core",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_oauth2_resource_server",
+        "@nv_third_party_deps//:org_springframework_security_spring_security_web",
+        "@nv_third_party_deps//:org_springframework_spring_test",
+    ] + JWT_COMPILE_DEPS,
+)
+
+nvcf_java_coverage_test(
+    name = "jwks_tests_coverage",
+    coverage_target = ":nv_boot_jwks",
+    test = ":jwks_tests",
 )
