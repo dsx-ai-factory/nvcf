@@ -948,9 +948,18 @@ mod tests {
         discovery_polled: Arc<Notify>,
         discovery_failing: Arc<AtomicBool>,
         discovery_blocked: Arc<AtomicBool>,
+        health: HealthHold,
         calibrations: mpsc::UnboundedSender<ModelGeneration>,
         completed_requests: Arc<StdMutex<HashMap<ModelGeneration, usize>>>,
         completion_behavior: CompletionBehavior,
+    }
+
+    /// Holds `/health` probes while `held` is set.
+    #[derive(Clone, Default)]
+    struct HealthHold {
+        held: Arc<AtomicBool>,
+        held_probes: Arc<AtomicUsize>,
+        released: Arc<Notify>,
     }
 
     struct TestUpstream {
@@ -960,6 +969,7 @@ mod tests {
         discovery_polled: Arc<Notify>,
         discovery_failing: Arc<AtomicBool>,
         discovery_blocked: Arc<AtomicBool>,
+        health: HealthHold,
         calibrations: mpsc::UnboundedReceiver<ModelGeneration>,
         server: TestHttpServer,
     }
@@ -976,6 +986,7 @@ mod tests {
             let discovery_polled = Arc::new(Notify::new());
             let discovery_failing = Arc::new(AtomicBool::new(false));
             let discovery_blocked = Arc::new(AtomicBool::new(false));
+            let health = HealthHold::default();
             let (calibrations, calibration_rx) = mpsc::unbounded_channel();
             let state = TestUpstreamState {
                 models: models.clone(),
@@ -983,6 +994,7 @@ mod tests {
                 discovery_polled: discovery_polled.clone(),
                 discovery_failing: discovery_failing.clone(),
                 discovery_blocked: discovery_blocked.clone(),
+                health: health.clone(),
                 calibrations,
                 completed_requests: Arc::new(StdMutex::new(HashMap::new())),
                 completion_behavior,
@@ -990,7 +1002,7 @@ mod tests {
             let server = TestHttpServer::spawn(
                 Router::new()
                     .route("/v1/models", get(test_models))
-                    .route("/health", get(|| async { "ok" }))
+                    .route("/health", get(test_health))
                     .route("/v1/chat/completions", post(test_completion))
                     .with_state(state),
             )
@@ -1002,6 +1014,7 @@ mod tests {
                 discovery_polled,
                 discovery_failing,
                 discovery_blocked,
+                health,
                 calibrations: calibration_rx,
                 server,
             }
@@ -1020,6 +1033,24 @@ mod tests {
 
         fn set_discovery_blocked(&self, blocked: bool) {
             self.discovery_blocked.store(blocked, Ordering::SeqCst);
+        }
+
+        /// Holds `/health` probes until `release_health`. A model's
+        /// initialization attempt probes the upstream before it calibrates.
+        fn hold_health(&self) {
+            self.health.held.store(true, Ordering::SeqCst);
+        }
+
+        fn release_health(&self) {
+            self.health.held.store(false, Ordering::SeqCst);
+            self.health.released.notify_waiters();
+        }
+
+        async fn wait_for_held_health_probe(&self) {
+            wait_for("a held health probe should arrive", || {
+                self.health.held_probes.load(Ordering::SeqCst) > 0
+            })
+            .await;
         }
 
         async fn next_calibration(&mut self) -> ModelGeneration {
@@ -1183,6 +1214,21 @@ mod tests {
         } else {
             std::future::pending().await
         }
+    }
+
+    async fn test_health(State(state): State<TestUpstreamState>) -> &'static str {
+        let hold = state.health;
+        if hold.held.load(Ordering::SeqCst) {
+            hold.held_probes.fetch_add(1, Ordering::SeqCst);
+            loop {
+                let released = hold.released.notified();
+                if !hold.held.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+        }
+        "ok"
     }
 
     async fn test_kv_cache(State(state): State<BlockingKvCacheState>) -> Response {
@@ -3708,8 +3754,8 @@ mod tests {
         }
     }
 
-    /// How the stats collector ends while a calibration step waits for its
-    /// request, before the calibration asks the collector for a snapshot.
+    /// How the stats collector ends while the model's initialization attempt
+    /// waits for its health probe, before the calibration starts.
     #[derive(Clone, Copy, Debug)]
     enum CalibrationCollectorEnding {
         /// The collector panics.
@@ -3735,14 +3781,18 @@ mod tests {
                 let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
                 let metrics = PylonMetrics::new().expect("metrics should initialize");
                 let (runtime_state, stats) = start_test_stats();
+                let mut config =
+                    calibration_config_with_fallback(&upstream.base_url, fallback_input_tps);
+                let ModelInitialization::Calibration(calibration) = &mut config.initialization
+                else {
+                    unreachable!("the test config calibrates")
+                };
+                // The test holds the attempt's health probe for as long as it
+                // needs, without the probe timing out.
+                calibration.health_timeout = Duration::from_secs(30);
                 let mut lifecycle = within(
                     "model lifecycle startup",
-                    start_model_lifecycle(
-                        calibration_config_with_fallback(&upstream.base_url, fallback_input_tps),
-                        runtime_state,
-                        &stats,
-                        Some(metrics.clone()),
-                    ),
+                    start_model_lifecycle(config, runtime_state, &stats, Some(metrics.clone())),
                 )
                 .await
                 .expect("empty initial discovery should start");
@@ -3750,12 +3800,15 @@ mod tests {
                 let dispatch = tracing::Dispatch::new(subscriber.clone());
                 let default_guard = tracing::dispatcher::set_default(&dispatch);
 
+                // The attempt for model-a probes the upstream's health before
+                // it calibrates, and the probe waits until the test has ended
+                // the collector and, for PanicThenShutdown, started the
+                // collector's shutdown. Only then can the calibration step
+                // start, end CALIBRATION_STEP later, and ask the collector for
+                // its snapshot, however late this task runs.
+                upstream.hold_health();
                 upstream.set_models(&["model-a"]).await;
-                upstream.next_calibration().await;
-                // End the collector while the step still waits for its
-                // request. The upstream never answers, so the step ends
-                // CALIBRATION_STEP later and the calibration's snapshot then
-                // finds the collector gone.
+                upstream.wait_for_held_health_probe().await;
                 if !matches!(ending, CalibrationCollectorEnding::Abort) {
                     let begun = within(
                         "the request that panics the collector",
@@ -3793,15 +3846,10 @@ mod tests {
                             Err("stats collector panicked".to_string()),
                             "{label}"
                         );
-                        assert!(
-                            calibration_count(&metrics, "model-a", "error") == 0
-                                && calibration_count(&metrics, "model-a", "cancelled") == 0,
-                            "{label}: the calibration step ended before the collector's shutdown \
-                             started, so this run does not check a snapshot that fails after it; \
-                             CALIBRATION_STEP is too short for this machine"
-                        );
                     }
                 }
+                upstream.release_health();
+                upstream.next_calibration().await;
                 // A supervisor that tried the model again would keep running.
                 within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
                     .await
