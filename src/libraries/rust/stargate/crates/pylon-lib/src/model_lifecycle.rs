@@ -539,8 +539,9 @@ impl ModelLifecycleSupervisor {
                 result = &mut attempt => {
                     let outcome = match result {
                         Ok(()) => InitializationAttemptOutcome::Ready,
-                        // The stats collector's shutdown cut the attempt
-                        // short. The supervisor stops with it.
+                        // The calibration found the stats collector stopped.
+                        // Without it no generation can initialize, so the
+                        // supervisor stops instead of retrying.
                         Err(error @ ModelLifecycleError::StatsCollectorStopped) => {
                             return Err(error);
                         }
@@ -722,12 +723,15 @@ impl Drop for CalibrationAttemptTimer {
     }
 }
 
-/// Checks upstream health and calibrates when configured. The supervisor
-/// passes how its stats collector ends. A calibration whose stats collector
-/// request fails because the collector's shutdown ended it is part of that
-/// shutdown: the attempt is recorded as cancelled and returns
-/// `ModelLifecycleError::StatsCollectorStopped` instead of an initialization
-/// failure.
+/// Checks upstream health and calibrates when configured.
+///
+/// The supervisor passes how its stats collector ends. A calibration whose
+/// stats collector request fails then returns
+/// `ModelLifecycleError::StatsCollectorStopped`, so the supervisor stops
+/// instead of retrying against a collector that is gone. The attempt is
+/// recorded as cancelled when the collector's shutdown ended it, and as an
+/// error, with a warning, when the collector ended any other way. Startup
+/// passes nothing and keeps the calibration's own error.
 async fn initialization_attempt(
     http_client: reqwest::Client,
     config: ModelLifecycleConfig,
@@ -753,11 +757,20 @@ async fn initialization_attempt(
             &runtime_state,
         )
         .await;
-        if let (Err(BringupError::StatsCollectorStopped), Some(stats_collector)) =
+        if let (Err(error @ BringupError::StatsCollectorStopped), Some(stats_collector)) =
             (&result, &stats_collector)
-            && stats_collector.ended_by_shutdown().await
         {
-            // Dropping the timer records the attempt as cancelled.
+            if stats_collector.ended_by_shutdown().await {
+                // Part of that shutdown: dropping the timer records the
+                // attempt as cancelled.
+                return Err(ModelLifecycleError::StatsCollectorStopped);
+            }
+            timer.finish(&result);
+            tracing::warn!(
+                model_id = generation.model_id(),
+                error = %error,
+                "model calibration failed; the stats collector stopped"
+            );
             return Err(ModelLifecycleError::StatsCollectorStopped);
         }
         timer.finish(&result);
