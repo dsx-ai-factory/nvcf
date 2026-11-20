@@ -27,9 +27,78 @@ pub(crate) struct RecordedTracingEvent {
     pub(crate) fields: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct RecordingTracingSubscriber {
     events: Arc<Mutex<Vec<RecordedTracingEvent>>>,
+}
+
+impl Default for RecordingTracingSubscriber {
+    fn default() -> Self {
+        keep_callsite_interest_open();
+        Self {
+            events: Arc::default(),
+        }
+    }
+}
+
+/// Keeps two dispatchers that record nothing registered for the life of the
+/// test binary, so a recorder sees every callsite.
+///
+/// tracing-core caches whether a callsite is enabled when a thread first
+/// reaches it. While only one dispatcher is registered, it asks the default
+/// subscriber of that thread alone. A test thread without a recorder then
+/// caches "never" for a callsite, and a recording test that runs beside it
+/// loses every event from that callsite. tracing does not document this
+/// (tracing-core 0.1.36, `Rebuilder::JustOne` in `callsite.rs`). With more
+/// dispatchers registered, tracing-core asks every registered dispatcher
+/// instead. These two report every callsite as sometimes enabled, so each
+/// event asks the subscriber of the thread that logs it. The test
+/// `recorders_see_callsites_that_other_threads_reach_first` fails if this
+/// stops working.
+fn keep_callsite_interest_open() {
+    static KEPT_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+        std::sync::OnceLock::new();
+    KEPT_DISPATCHERS.get_or_init(|| {
+        [
+            tracing::Dispatch::new(SometimesEnabled),
+            tracing::Dispatch::new(SometimesEnabled),
+        ]
+    });
+}
+
+/// Records nothing and reports every callsite as sometimes enabled. See
+/// `keep_callsite_interest_open`.
+struct SometimesEnabled;
+
+impl tracing::Subscriber for SometimesEnabled {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::DEBUG)
+    }
+
+    fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {}
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 impl RecordingTracingSubscriber {
@@ -162,6 +231,28 @@ fn recording_tracing_subscriber_records_debug_but_not_trace_events() {
         .filter_map(|event| event.fields.get("message").cloned())
         .collect::<Vec<_>>();
     assert_eq!(messages, ["debug event"]);
+}
+
+#[test]
+fn recorders_see_callsites_that_other_threads_reach_first() {
+    fn probe() {
+        tracing::error!("tracing callsite interest probe");
+    }
+    let recorder = RecordingTracingSubscriber::default();
+    let dispatch = tracing::Dispatch::new(recorder.clone());
+    let default_guard = tracing::dispatcher::set_default(&dispatch);
+    // The probe first runs on a thread without a recorder.
+    std::thread::spawn(probe)
+        .join()
+        .expect("the probe thread should not panic");
+    probe();
+    drop(default_guard);
+    assert_eq!(
+        recorder.event_count("tracing callsite interest probe"),
+        1,
+        "the recorder lost an event whose callsite another thread reached first, so \
+         tracing-core no longer behaves as `keep_callsite_interest_open` relies on"
+    );
 }
 
 pub(crate) struct TestHttpServer {
