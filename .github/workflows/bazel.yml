@@ -629,9 +629,6 @@ jobs:
           # compute affected targets (see "Determine build targets").
           fetch-depth: 0
 
-      - name: Configure CI Java runtime options
-        run: bash tools/ci/configure-java-runtime
-
       # A subtree can be selected but not yet have its Bazel scaffold on
       # the mirror (its upstream OSS-flip MR is still open, or the
       # umbrella's imports.yaml pin has not been bumped past that flip).
@@ -644,6 +641,12 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Configure CI Java runtime options
+        if: steps.precheck.outputs.skip == 'false'
+        env:
+          JAVA_CI_WORKDIR: ${{ matrix.subtree.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
 
       # bazelisk is preinstalled in the bazel-ci image as `bazel`.
       - name: bazel version
@@ -1133,7 +1136,9 @@ jobs:
           distribution: temurin
           java-version: '25'
       - name: Configure CI Java runtime options
-        run: bash tools/ci/configure-java-runtime
+        env:
+          JAVA_CI_WORKDIR: ${{ matrix.subtree.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
       - name: Install bazelisk
         run: |
           sudo curl -fsSLo /usr/local/bin/bazel \

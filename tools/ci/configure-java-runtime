@@ -22,7 +22,10 @@ fi
 # Bazel clears Java option variables before starting its server. Execution
 # actions also use a separate environment, including compiler/toolchain JVMs.
 bazelrc="${HOME}/.bazelrc"
-touch "$bazelrc"
+rc_input="$bazelrc"
+if [[ ! -e "$rc_input" ]]; then
+    rc_input=/dev/null
+fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 go_bin="$(command -v go || true)"
 if [[ -z "$go_bin" && -x /usr/local/go/bin/go ]]; then
@@ -35,7 +38,7 @@ fi
 bazelrc_tmp="$(mktemp "${bazelrc}.XXXXXX")"
 trap 'rm -f "$bazelrc_tmp"' EXIT
 GOWORK=off GOTOOLCHAIN=local "$go_bin" -C "$script_dir/../java-runtime-config" run . \
-    < "$bazelrc" > "$bazelrc_tmp"
+    --cwd "$PWD" "$@" < "$rc_input" > "$bazelrc_tmp"
 cat "$bazelrc_tmp" > "$bazelrc"
 printf 'JAVA_TOOL_OPTIONS=%s\n' "$java_options" >> "$GITHUB_ENV"
 

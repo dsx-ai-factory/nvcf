@@ -159,9 +159,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure CI Java runtime options
-        run: bash tools/ci/configure-java-runtime
-
       # actions/checkout runs on the runner host; this job's steps run inside
       # the bazel-ci container, which mounts that checkout under a different
       # UID. Since git 2.35.2 (CVE-2022-24765) git refuses to operate on a
@@ -298,6 +295,11 @@ jobs:
             echo "scope=//$SVC_PATH/..." >> "$GITHUB_OUTPUT"
             echo "layout: root module, scoped to //$SVC_PATH/..."
           fi
+
+      - name: Configure CI Java runtime options
+        env:
+          JAVA_CI_WORKDIR: ${{ steps.layout.outputs.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
 
       - name: Build and push multi-arch image(s)
         working-directory: ${{ steps.layout.outputs.workdir }}

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -16,12 +17,29 @@ const (
 	blockEnd   = "# END NVCF CI Java runtime mitigation"
 )
 
-var defaultControls = []string{
-	"startup --host_jvm_args=" + mitigation,
-	"build --host_jvmopt=" + mitigation,
-	"build --jvmopt=" + mitigation,
-	"test --host_jvmopt=" + mitigation,
-	"test --jvmopt=" + mitigation,
+var platforms = []string{"linux", "macos", "windows", "freebsd", "openbsd"}
+
+var defaultControls = makeDefaultControls()
+
+func makeDefaultControls() []string {
+	controls := []string{
+		"startup --host_jvm_args=" + mitigation,
+		"build --host_jvmopt=" + mitigation,
+		"build --jvmopt=" + mitigation,
+		"test --host_jvmopt=" + mitigation,
+		"test --jvmopt=" + mitigation,
+	}
+	// Startup platform sections always apply after generic startup settings.
+	// Command platform sections expand after generic build/test/run settings.
+	for _, platform := range platforms {
+		controls = append(controls, "startup:"+platform+" --host_jvm_args="+mitigation)
+		for _, command := range []string{"build", "test", "run"} {
+			for _, option := range []string{"--jvmopt", "--host_jvmopt"} {
+				controls = append(controls, command+":"+platform+" "+option+"="+mitigation)
+			}
+		}
+	}
+	return controls
 }
 
 type word struct {
@@ -217,9 +235,18 @@ func transformRC(input string) (string, error) {
 }
 
 func run(in io.Reader, out io.Writer) error {
+	return configure(in, out, nil)
+}
+
+func configure(in io.Reader, out io.Writer, check func(string) error) error {
 	input, err := io.ReadAll(in)
 	if err != nil {
 		return err
+	}
+	if check != nil {
+		if err := check(string(input)); err != nil {
+			return err
+		}
 	}
 	updated, err := transformRC(string(input))
 	if err != nil {
@@ -230,7 +257,11 @@ func run(in io.Reader, out io.Writer) error {
 }
 
 func main() {
-	if err := run(os.Stdin, os.Stdout); err != nil {
+	cwd := flag.String("cwd", "", "caller directory for relative workspace paths")
+	var workspaces workspaceList
+	flag.Var(&workspaces, "workspace", "Bazel working directory to check (repeatable)")
+	flag.Parse()
+	if err := runCLI(os.Stdin, os.Stdout, *cwd, workspaces); err != nil {
 		fmt.Fprintf(os.Stderr, "configure-java-runtime: %v\n", err)
 		os.Exit(1)
 	}

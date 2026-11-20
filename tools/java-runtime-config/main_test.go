@@ -184,6 +184,35 @@ func TestCommonFixedValueIsNotOverridden(t *testing.T) {
 	}
 }
 
+func TestPlatformMitigationsAreLastAndStable(t *testing.T) {
+	var input strings.Builder
+	expected := []string{}
+	for _, platform := range []string{"linux", "macos", "windows", "freebsd", "openbsd"} {
+		input.WriteString("startup:" + platform + " --host_jvm_args=-XX:+UseBASE64Intrinsics\n")
+		expected = append(expected, "startup:"+platform+" --host_jvm_args="+mitigation)
+		for _, command := range []string{"build", "test", "run"} {
+			for _, flag := range []string{"--jvmopt", "--host_jvmopt"} {
+				input.WriteString(command + ":" + platform + " " + flag + "=-XX:+UseBASE64Intrinsics\n")
+				expected = append(expected, command+":"+platform+" "+flag+"="+mitigation)
+			}
+		}
+	}
+	got, err := transformRC(input.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, control := range expected {
+		key, _, _ := strings.Cut(control, "=")
+		if strings.LastIndex(got, control) < 0 || strings.LastIndex(got, control) < strings.LastIndex(got, key+"=-XX:+UseBASE64Intrinsics") {
+			t.Fatalf("platform mitigation not last: %s", key)
+		}
+	}
+	repeated, err := transformRC(got)
+	if err != nil || repeated != got {
+		t.Fatalf("platform block unstable: %v", err)
+	}
+}
+
 func TestRunWritesNothingOnInvalidConfiguration(t *testing.T) {
 	for _, input := range []string{blockBegin, blockEnd, blockBegin + "\n" + blockBegin, `test --test_env="unterminated`} {
 		var output bytes.Buffer

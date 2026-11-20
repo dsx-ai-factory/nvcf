@@ -10,6 +10,10 @@ trap 'rm -rf "$fixture"' EXIT
 # Reuse the Go build cache while each helper call uses an isolated HOME.
 export GOCACHE="${GOCACHE:-$fixture/go-cache}"
 mkdir -p "$fixture/home"
+mkdir -p "$fixture/workspace"
+touch "$fixture/workspace/MODULE.bazel"
+cd "$fixture/workspace"
+unset BAZELRC
 env_file="$fixture/github-env"
 bazelrc="$fixture/home/.bazelrc"
 expected_controls=(
@@ -182,3 +186,51 @@ fi
 cmp "$env_file" "$fixture/first.env"
 cmp "$bazelrc" "$fixture/invalid.bazelrc"
 echo 'ok   malformed rc input does not partially rewrite configuration'
+
+cp "$fixture/first.bazelrc" "$bazelrc"
+assert_guard_failure() {
+    cp "$bazelrc" "$fixture/before-guard.bazelrc"
+    cp "$env_file" "$fixture/before-guard.env"
+    if env HOME="$fixture/home" GITHUB_ENV="$env_file" JAVA_TOOL_OPTIONS="$options" \
+        BAZELRC="${TEST_BAZELRC:-}" bash "$script" "$@" >"$fixture/output" 2>&1; then
+        echo 'FAIL external fixed options were accepted' >&2
+        exit 1
+    fi
+    cmp "$bazelrc" "$fixture/before-guard.bazelrc"
+    cmp "$env_file" "$fixture/before-guard.env"
+    grep -Fq 'fixed JAVA_TOOL_OPTIONS' "$fixture/output"
+    if grep -Fq 'secret-must-not-appear' "$fixture/output"; then
+        echo 'FAIL fixed option contents leaked into the error' >&2
+        exit 1
+    fi
+}
+
+printf 'common --action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > .bazelrc
+assert_guard_failure
+echo 'ok   rejects fixed workspace values without changing rc or environment'
+
+printf 'try-import %%workspace%%/nested.rc\n' > .bazelrc
+printf 'import %%user.home%%/external.rc\n' > nested.rc
+printf 'common --host_action_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/home/external.rc"
+assert_guard_failure
+printf '# workspace has no fixed options\n' > .bazelrc
+printf 'import %%user.home%%/external.rc\n' >> "$bazelrc"
+assert_guard_failure
+cp "$fixture/first.bazelrc" "$bazelrc"
+echo 'ok   rejects fixed values in workspace and home import chains'
+
+mkdir -p "$fixture/child"
+touch "$fixture/child/MODULE.bazel"
+printf 'test --test_env=JAVA_TOOL_OPTIONS=-Dfoo=secret-must-not-appear\n' > "$fixture/child/.bazelrc"
+assert_guard_failure --workspace "$fixture/workspace" --workspace "$fixture/child"
+TEST_BAZELRC="$fixture/child/.bazelrc" assert_guard_failure
+echo 'ok   checks every selected workspace and BAZELRC file'
+
+mkdir -p "$fixture/empty-home"
+if env HOME="$fixture/empty-home" GITHUB_ENV="$fixture/absent-env" \
+    bash "$script" --workspace "$fixture/child" >"$fixture/output" 2>&1; then
+    echo 'FAIL unsafe first-time setup was accepted' >&2
+    exit 1
+fi
+[[ ! -e "$fixture/empty-home/.bazelrc" && ! -e "$fixture/absent-env" ]]
+echo 'ok   rejected first-time setup creates neither rc nor environment files'
