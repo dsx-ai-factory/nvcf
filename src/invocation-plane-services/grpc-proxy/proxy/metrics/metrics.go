@@ -25,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/samber/lo"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/sdk/metric"
 )
@@ -539,7 +540,7 @@ var NatsErrorReasons = []string{
 func init() {
 	// Set up OpenTelemetry metrics with Prometheus exporter
 	exporter := lo.Must(otelprom.New())
-	provider := metric.NewMeterProvider(metric.WithReader(exporter))
+	provider := newMeterProvider(exporter)
 	otel.SetMeterProvider(provider)
 
 	// Pre-initialise every close reason and CONNECT outcome so the series
@@ -579,4 +580,18 @@ func SetNatsStatsConnection(newNc *nats.Conn) {
 
 func IncrFunctionRequest(functionID, functionVersionID, ncaID string) {
 	expiringMetrics.IncrFunctionRequest(functionID, functionVersionID, ncaID)
+}
+
+func newMeterProvider(reader metric.Reader) *metric.MeterProvider {
+	return metric.NewMeterProvider(
+		metric.WithReader(reader),
+		metric.WithView(metric.NewView(
+			metric.Instrument{Name: "http.server.*"},
+			metric.Stream{
+				// Host is caller-controlled. Drop it before aggregation to prevent
+				// invalid UTF-8 from breaking scrapes and unbounded host cardinality.
+				AttributeFilter: attribute.NewDenyKeysFilter("server.address"),
+			},
+		)),
+	)
 }
