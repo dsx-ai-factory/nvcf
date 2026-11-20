@@ -97,6 +97,10 @@ pub struct StatsCollectorHandle {
     control: StatsCollectorControl,
     /// Cancelled when `shutdown` starts, before the collector is told to stop.
     shutdown_started: CancellationToken,
+    /// Keeps the engine stats channel open while the handle lives. A collector
+    /// that ends then leaves the engine stats stream waiting on a full channel
+    /// instead of ending it, so the collector is the task reported as ended.
+    _stats_updates: Option<flume::Receiver<StatsAggregatorUpdate>>,
 }
 
 impl StatsCollectorHandle {
@@ -121,6 +125,15 @@ impl StatsCollectorHandle {
         self.task
             .shutdown(stargate_runtime::TASK_SHUTDOWN_TIMEOUT)
             .await;
+    }
+
+    /// Like `shutdown`, but returns an error if the collector task panicked
+    /// instead of resuming the panic in the caller, which can then finish
+    /// stopping its other tasks. The panic hook has already printed the panic.
+    pub async fn shutdown_reporting_panic(self) -> anyhow::Result<()> {
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.shutdown()))
+            .await
+            .map_err(|_| anyhow::anyhow!("stats collector panicked"))
     }
 }
 
@@ -342,6 +355,7 @@ pub fn start_stats_collector_with_engine_stats(
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
     let exited = CancellationToken::new();
     let exited_guard = exited.clone().drop_guard();
+    let stats_updates = stats_update_rx.clone();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
         let _exited = exited_guard;
         run_stats_collector(
@@ -360,6 +374,7 @@ pub fn start_stats_collector_with_engine_stats(
             exited,
         },
         shutdown_started: CancellationToken::new(),
+        _stats_updates: stats_updates,
     }
 }
 

@@ -462,7 +462,10 @@ impl RunningPylon {
                     if let Ok(signal) = &result {
                         info!(signal, "received shutdown signal");
                     }
-                    self.shutdown(ShutdownCause::Signal).await;
+                    if let Some(error) = self.shutdown(ShutdownCause::Signal).await {
+                        error!(error = %error, "critical pylon task exited");
+                        return Err(error);
+                    }
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
@@ -485,7 +488,7 @@ impl RunningPylon {
                 result = self.stats_collector.wait_for_exit() => critical_task_exit_error("stats collector", result),
                 result = async {
                     self.model_lifecycle.wait_for_exit().await
-                } => critical_task_exit_error("model lifecycle supervisor", result),
+                } => self.model_lifecycle_exit_error(result).await,
                 result = self.metrics_server.wait_for_exit() => critical_task_exit_error("metrics server", result),
                 result = async {
                     match self.tunnel.as_mut() {
@@ -497,12 +500,29 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown(ShutdownCause::CriticalTaskExit).await;
+            // A stats collector panic found while stopping is secondary to
+            // `error`, and the panic hook has printed it.
+            let _ = self.shutdown(ShutdownCause::CriticalTaskExit).await;
             return Err(error);
         }
     }
 
-    async fn shutdown(self, cause: ShutdownCause) {
+    /// Reports the model lifecycle supervisor's exit. A supervisor that the
+    /// stats collector's end stopped reports the collector, whose own exit
+    /// follows promptly.
+    async fn model_lifecycle_exit_error(&mut self, result: TaskExit) -> anyhow::Error {
+        if self.model_lifecycle.stopped_by_stats_collector() {
+            return critical_task_exit_error(
+                "stats collector",
+                self.stats_collector.wait_for_exit().await,
+            );
+        }
+        critical_task_exit_error("model lifecycle supervisor", result)
+    }
+
+    /// Stops every task. Returns an error if the stats collector panicked and
+    /// its exit was not reported before.
+    async fn shutdown(self, cause: ShutdownCause) -> Option<anyhow::Error> {
         let Self {
             inference_server_id,
             mut registration_client,
@@ -518,13 +538,15 @@ impl RunningPylon {
         if let Some(summary) = registration_client.shutdown().await {
             log_drain_summary(&inference_server_id, cause, &summary);
         }
-        tokio::join!(
+        // The stats collector stops without resuming a panic, so the other
+        // tasks still get their normal shutdown.
+        let (_, stats_collector, ..) = tokio::join!(
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
                 }
             },
-            stats_collector.shutdown(),
+            stats_collector.shutdown_reporting_panic(),
             model_lifecycle.shutdown(),
             metrics_server.shutdown(),
             async move {
@@ -533,6 +555,7 @@ impl RunningPylon {
                 }
             },
         );
+        stats_collector.err()
     }
 }
 

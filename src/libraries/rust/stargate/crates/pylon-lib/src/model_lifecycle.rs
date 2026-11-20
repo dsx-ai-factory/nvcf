@@ -16,6 +16,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
@@ -83,11 +84,19 @@ pub enum ModelLifecycleError {
 
 pub struct ModelLifecycleHandle {
     task: OwnedTask,
+    stopped_by_stats_collector: Arc<AtomicBool>,
 }
 
 impl ModelLifecycleHandle {
     pub async fn wait_for_exit(&mut self) -> Result<(), tokio::task::JoinError> {
         self.task.wait_for_exit().await
+    }
+
+    /// Whether the supervisor stopped because the stats collector ended
+    /// outside the collector's shutdown. The collector's own exit then follows
+    /// promptly.
+    pub fn stopped_by_stats_collector(&self) -> bool {
+        self.stopped_by_stats_collector.load(Ordering::Acquire)
     }
 
     pub async fn shutdown(self) {
@@ -198,29 +207,40 @@ pub async fn start_model_lifecycle(
     }
 
     let stats_shutdown = stats_collector.shutdown_started();
-    let task = OwnedTask::spawn("model lifecycle supervisor", move |stop| async move {
-        match supervisor.run(stop).await {
-            Ok(()) => {}
-            // Pylon stops the stats collector and this supervisor in one
-            // step, and the collector can stop first. The collector's handle
-            // sets its shutdown mark before it stops the collector, so a
-            // collector stop seen after the mark is part of that shutdown,
-            // not a supervisor failure.
-            Err(error @ ModelLifecycleError::StatsCollectorStopped)
-                if stats_shutdown.is_cancelled() =>
-            {
-                tracing::debug!(
-                    error = %error,
-                    "model lifecycle supervisor stopped with the stats collector during shutdown"
-                );
+    let stopped_by_stats_collector = Arc::new(AtomicBool::new(false));
+    let task = OwnedTask::spawn("model lifecycle supervisor", {
+        let stopped_by_stats_collector = Arc::clone(&stopped_by_stats_collector);
+        move |stop| async move {
+            match supervisor.run(stop).await {
+                Ok(()) => {}
+                // Pylon stops the stats collector and this supervisor in one
+                // step, and the collector can stop first. The collector's
+                // handle sets its shutdown mark before it stops the
+                // collector, so a collector stop seen after the mark is part
+                // of that shutdown, not a supervisor failure.
+                Err(error @ ModelLifecycleError::StatsCollectorStopped)
+                    if stats_shutdown.is_cancelled() =>
+                {
+                    tracing::debug!(
+                        error = %error,
+                        "model lifecycle supervisor stopped with the stats collector during shutdown"
+                    );
+                }
+                Err(error) => {
+                    // The collector ended outside its shutdown.
+                    if matches!(error, ModelLifecycleError::StatsCollectorStopped) {
+                        stopped_by_stats_collector.store(true, Ordering::Release);
+                    }
+                    tracing::error!(error = %error, "model lifecycle supervisor failed");
+                }
             }
-            Err(error) => {
-                tracing::error!(error = %error, "model lifecycle supervisor failed");
-            }
+            supervisor.shutdown().await;
         }
-        supervisor.shutdown().await;
     });
-    Ok(ModelLifecycleHandle { task })
+    Ok(ModelLifecycleHandle {
+        task,
+        stopped_by_stats_collector,
+    })
 }
 
 fn observe_discovery_poll(
