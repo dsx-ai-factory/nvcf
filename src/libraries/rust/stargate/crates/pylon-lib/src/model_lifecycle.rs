@@ -2872,4 +2872,601 @@ mod tests {
         stats.shutdown().await;
         upstream.shutdown().await;
     }
+
+    /// Waits at most two seconds for `future`, well below the supervisor's
+    /// 5 s stop timeout, so a hang fails the test instead of stalling it.
+    async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish within 2 s"))
+    }
+
+    /// Starts a stats collector whose KV-cache poll the test can hold open.
+    /// While the poll is held, the collector reads no commands, so lifecycle
+    /// requests stay queued and unread when the collector ends.
+    fn start_holdable_stats(
+        kv_cache: &BlockingKvCacheServer,
+    ) -> (PylonRuntimeState, crate::StatsCollectorHandle) {
+        let stats_config = StatsCollectorConfig {
+            kv_cache_stats_url: Some(kv_cache.url()),
+            kv_cache_poll_interval: Duration::from_millis(1),
+            kv_cache_request_timeout: Duration::from_secs(60),
+            ..StatsCollectorConfig::default()
+        };
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            stats_config.observation_channel_capacity,
+            None,
+        );
+        let stats = start_stats_collector(stats_config, observations, runtime_state.clone());
+        (runtime_state, stats)
+    }
+
+    async fn hold_stats_collector(kv_cache: &BlockingKvCacheServer) {
+        let blocked_polls = kv_cache.blocked_poll_count();
+        kv_cache.block();
+        kv_cache.wait_for_blocked_poll_after(blocked_polls).await;
+    }
+
+    /// Queues a begin that panics the collector, without waiting for it: a
+    /// configured input TPS of zero breaks a stats initialization invariant.
+    /// The command stays queued after its request is dropped.
+    fn queue_stats_collector_panic(stats: &crate::StatsCollectorHandle) {
+        let control = stats.control();
+        let trigger = std::pin::pin!(control.begin_generation(
+            ModelGeneration::new("model-panics", 1),
+            crate::stats::ModelStatsInitialization::ConfiguredInputTps { input_tps: 0.0 },
+        ));
+        let polled = std::future::Future::poll(
+            trigger,
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        );
+        assert!(
+            polled.is_pending(),
+            "the held collector should leave the panic trigger unread"
+        );
+    }
+
+    fn events_with_message<'a>(
+        events: &'a [RecordedTracingEvent],
+        message: &str,
+    ) -> Vec<&'a RecordedTracingEvent> {
+        events
+            .iter()
+            .filter(|event| event.fields.get("message").map(String::as_str) == Some(message))
+            .collect()
+    }
+
+    fn error_events(events: &[RecordedTracingEvent]) -> Vec<&RecordedTracingEvent> {
+        events
+            .iter()
+            .filter(|event| event.level == tracing::Level::ERROR)
+            .collect()
+    }
+
+    const SUPERVISOR_FAILED: &str = "model lifecycle supervisor failed";
+    const SUPERVISOR_STOPPED_IN_SHUTDOWN: &str =
+        "model lifecycle supervisor stopped with the stats collector during shutdown";
+    const STATS_COLLECTOR_STOPPED: &str =
+        "stats collector stopped during model lifecycle transition";
+
+    #[tokio::test]
+    async fn collector_shutdown_during_a_lifecycle_request_logs_no_error() {
+        let kv_cache = BlockingKvCacheServer::spawn().await;
+        let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+        let (runtime_state, stats) = start_holdable_stats(&kv_cache);
+        let mut lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                discovery_config(&upstream.base_url),
+                runtime_state.clone(),
+                &stats,
+                None,
+            ),
+        )
+        .await
+        .expect("initial discovery should initialize");
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        hold_stats_collector(&kv_cache).await;
+
+        // A newly discovered model makes the supervisor begin a generation,
+        // and the held collector leaves that request queued.
+        upstream.set_models(&["model-a", "model-b"]).await;
+        wait_for(
+            "the supervisor should begin a generation for model-b",
+            || runtime_state.current_generation("model-b").is_some(),
+        )
+        .await;
+        // Only the collector shuts down, so the failed request alone ends the
+        // supervisor's run. The shutdown is polled once and then left alone
+        // until the supervisor has exited, so a shutdown mark set after that
+        // first poll would still be unset when the supervisor reads it.
+        let shutdown = stats.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            futures::poll!(&mut shutdown).is_pending(),
+            "the held collector should not end within the first poll of its shutdown"
+        );
+        within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
+            .await
+            .expect("model lifecycle supervisor should not panic");
+        within("stats collector shutdown", shutdown).await;
+        drop(default_guard);
+
+        let events = subscriber.events();
+        let errors = error_events(&events);
+        assert!(
+            errors.is_empty(),
+            "a stats collector shutdown should log no error: {errors:?}"
+        );
+        let stopped = events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN);
+        assert_eq!(
+            stopped.len(),
+            1,
+            "the in-flight request should end the supervisor with the collector's shutdown"
+        );
+        assert_eq!(stopped[0].level, tracing::Level::DEBUG);
+        assert_tracing_event_field(stopped[0], "error", STATS_COLLECTOR_STOPPED);
+        assert!(
+            !lifecycle.stopped_by_stats_collector(),
+            "a supervisor that stopped with the collector's shutdown should not report the \
+             collector as the reason it stopped"
+        );
+
+        kv_cache.unblock();
+        kv_cache.shutdown().await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collector_ending_outside_a_shutdown_during_a_lifecycle_request_logs_an_error() {
+        for panics in [false, true] {
+            let ending = if panics { "panic" } else { "abort" };
+            let kv_cache = BlockingKvCacheServer::spawn().await;
+            let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+            let (runtime_state, mut stats) = start_holdable_stats(&kv_cache);
+            let mut lifecycle = within(
+                "model lifecycle startup",
+                start_model_lifecycle(
+                    discovery_config(&upstream.base_url),
+                    runtime_state.clone(),
+                    &stats,
+                    None,
+                ),
+            )
+            .await
+            .expect("initial discovery should initialize");
+            let subscriber = RecordingTracingSubscriber::default();
+            let dispatch = tracing::Dispatch::new(subscriber.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+            hold_stats_collector(&kv_cache).await;
+            assert!(
+                !lifecycle.stopped_by_stats_collector(),
+                "{ending}: a running supervisor should not report a collector stop"
+            );
+
+            if panics {
+                // The panic trigger is queued ahead of the supervisor's
+                // request. This relies on the collector reading queued
+                // commands in the order they were sent, which flume does not
+                // document; the supervisor exit below fails if that changes.
+                queue_stats_collector_panic(&stats);
+            }
+            upstream.set_models(&["model-a", "model-b"]).await;
+            wait_for(
+                "the supervisor should begin a generation for model-b",
+                || runtime_state.current_generation("model-b").is_some(),
+            )
+            .await;
+            if panics {
+                kv_cache.unblock();
+                let exit = within("the collector exit", stats.wait_for_exit()).await;
+                assert!(
+                    matches!(&exit, Err(error) if error.is_panic()),
+                    "the panic trigger should end the collector with a panic: {exit:?}"
+                );
+            } else {
+                // Dropping the handle aborts the collector without a shutdown.
+                drop(stats);
+            }
+            let supervisor_exit = if panics {
+                "model lifecycle supervisor exit (if it does not exit, the collector may have \
+                 answered its begin before the command queued ahead of it)"
+            } else {
+                "model lifecycle supervisor exit"
+            };
+            within(supervisor_exit, lifecycle.wait_for_exit())
+                .await
+                .expect("model lifecycle supervisor should not panic");
+            drop(default_guard);
+
+            let events = subscriber.events();
+            let failed = events_with_message(&events, SUPERVISOR_FAILED);
+            assert_eq!(
+                failed.len(),
+                1,
+                "{ending}: the supervisor should report the collector that ended outside a shutdown"
+            );
+            assert_eq!(failed[0].level, tracing::Level::ERROR, "{ending}");
+            assert_tracing_event_field(failed[0], "error", STATS_COLLECTOR_STOPPED);
+            assert!(
+                events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
+                "{ending}: a collector that ended outside a shutdown is not part of one"
+            );
+            assert!(
+                lifecycle.stopped_by_stats_collector(),
+                "{ending}: the supervisor should report that the collector's end stopped it, so \
+                 Pylon names the collector"
+            );
+
+            kv_cache.unblock();
+            kv_cache.shutdown().await;
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn other_lifecycle_failure_during_a_collector_shutdown_logs_an_error() {
+        // Only a collector stop is part of the collector's shutdown. To fail
+        // the supervisor another way while the shutdown mark is set, the test
+        // takes model-b's runtime slot, so the supervisor's begin for model-b
+        // reports a stale generation before it sends the collector anything.
+        let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+        let (runtime_state, stats) = start_test_stats();
+        let mut lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                discovery_config(&upstream.base_url),
+                runtime_state.clone(),
+                &stats,
+                None,
+            ),
+        )
+        .await
+        .expect("initial discovery should initialize");
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        within("stats collector shutdown", stats.shutdown()).await;
+        assert!(runtime_state.begin_generation(ModelGeneration::new("model-b", 1)));
+        upstream.set_models(&["model-a", "model-b"]).await;
+        within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
+            .await
+            .expect("model lifecycle supervisor should not panic");
+        drop(default_guard);
+
+        let events = subscriber.events();
+        let failed = events_with_message(&events, SUPERVISOR_FAILED);
+        assert_eq!(
+            failed.len(),
+            1,
+            "the supervisor should report the stale generation"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        assert_tracing_event_field(
+            failed[0],
+            "error",
+            "model generation transition lost exact ownership",
+        );
+        assert!(
+            events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
+            "a failure other than a collector stop is not part of the collector's shutdown"
+        );
+        // Pylon waits for the collector's exit when this is set.
+        assert!(
+            !lifecycle.stopped_by_stats_collector(),
+            "a supervisor that failed on its own should not report the collector as the reason"
+        );
+
+        upstream.shutdown().await;
+    }
+
+    const PENDING_WARNING: &str = "model initialization failed; keeping generation pending";
+    /// How long a calibration step waits for its requests before it asks the
+    /// stats collector for a snapshot. With an upstream that never answers,
+    /// every step ends after this long.
+    const CALIBRATION_STEP: Duration = Duration::from_millis(300);
+    const CALIBRATION_STATS_STOPPED: &str =
+        "model initialization failed: stats collector stopped during model initialization";
+
+    fn calibration_config_with_fallback(
+        base_url: &str,
+        fallback_input_tps: Option<f64>,
+    ) -> ModelLifecycleConfig {
+        let mut config = calibration_discovery_config(base_url, CALIBRATION_STEP);
+        let ModelInitialization::Calibration(calibration) = &mut config.initialization else {
+            unreachable!("the test config calibrates")
+        };
+        calibration.fallback_input_tps = fallback_input_tps;
+        config
+    }
+
+    /// Reads one calibration duration count, or zero when it was never recorded.
+    fn calibration_count(metrics: &PylonMetrics, model_id: &str, outcome: &str) -> u64 {
+        let prefix = format!(
+            "pylon_model_calibration_duration_ms_count{{model=\"{model_id}\",outcome=\"{outcome}\"}} "
+        );
+        metrics
+            .gather_text()
+            .expect("metrics should encode")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    fn calibration_failure_warnings(events: &[RecordedTracingEvent]) -> Vec<&RecordedTracingEvent> {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.fields.get("message").map(String::as_str),
+                    Some(FALLBACK_WARNING | PENDING_WARNING)
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn calibration_cut_short_by_a_collector_shutdown_is_cancelled_without_a_warning() {
+        // Each mode has its own warning for a failed calibration.
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let label = format!("fallback input TPS {fallback_input_tps:?}");
+            let kv_cache = BlockingKvCacheServer::spawn().await;
+            let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+            let metrics = PylonMetrics::new().expect("metrics should initialize");
+            let (runtime_state, stats) = start_holdable_stats(&kv_cache);
+            let mut lifecycle = within(
+                "model lifecycle startup",
+                start_model_lifecycle(
+                    calibration_config_with_fallback(&upstream.base_url, fallback_input_tps),
+                    runtime_state,
+                    &stats,
+                    Some(metrics.clone()),
+                ),
+            )
+            .await
+            .expect("empty initial discovery should start");
+            let subscriber = RecordingTracingSubscriber::default();
+            let dispatch = tracing::Dispatch::new(subscriber.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+            upstream.set_models(&["model-a"]).await;
+            upstream.next_calibration().await;
+            // The upstream never answers, so the step ends and the calibration
+            // asks the collector for a snapshot, which the held collector
+            // leaves unread. Had the snapshot not been sent yet, it would fail
+            // the same way once the collector is gone.
+            hold_stats_collector(&kv_cache).await;
+            tokio::time::sleep(CALIBRATION_STEP * 2).await;
+            within("stats collector shutdown", stats.shutdown()).await;
+            // A supervisor that took the cut-short calibration for a failure
+            // warns and keeps the model pending instead of exiting, so the
+            // warnings are checked before the exit.
+            let exit =
+                tokio::time::timeout(Duration::from_secs(2), lifecycle.wait_for_exit()).await;
+            drop(default_guard);
+
+            let events = subscriber.events();
+            let warnings = calibration_failure_warnings(&events);
+            assert!(
+                warnings.is_empty(),
+                "{label}: a calibration cut short by a collector shutdown should not warn: \
+                 {warnings:?}"
+            );
+            exit.unwrap_or_else(|_| {
+                panic!(
+                    "{label}: the supervisor should stop with the collector's shutdown within 2 s"
+                )
+            })
+            .expect("model lifecycle supervisor should not panic");
+            let errors = error_events(&events);
+            assert!(
+                errors.is_empty(),
+                "{label}: a collector shutdown should log no error: {errors:?}"
+            );
+            let stopped = events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN);
+            assert_eq!(
+                stopped.len(),
+                1,
+                "{label}: the calibration should stop the supervisor with the collector's shutdown"
+            );
+            assert_eq!(stopped[0].level, tracing::Level::DEBUG, "{label}");
+            assert_eq!(
+                calibration_count(&metrics, "model-a", "cancelled"),
+                1,
+                "{label}: the calibration should be recorded as cancelled"
+            );
+            assert_eq!(
+                calibration_count(&metrics, "model-a", "error"),
+                0,
+                "{label}: the calibration should not be recorded as an error"
+            );
+            assert!(
+                !lifecycle.stopped_by_stats_collector(),
+                "{label}: a collector shutdown is not the collector ending on its own"
+            );
+
+            kv_cache.unblock();
+            kv_cache.shutdown().await;
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_cut_short_by_a_collector_ending_outside_a_shutdown_keeps_its_warning_and_error()
+     {
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            for panics in [false, true] {
+                let ending = if panics { "panic" } else { "abort" };
+                let label = format!("{ending}, fallback input TPS {fallback_input_tps:?}");
+                let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+                let metrics = PylonMetrics::new().expect("metrics should initialize");
+                let (runtime_state, mut stats) = start_test_stats();
+                let lifecycle = within(
+                    "model lifecycle startup",
+                    start_model_lifecycle(
+                        calibration_config_with_fallback(&upstream.base_url, fallback_input_tps),
+                        runtime_state,
+                        &stats,
+                        Some(metrics.clone()),
+                    ),
+                )
+                .await
+                .expect("empty initial discovery should start");
+                let subscriber = RecordingTracingSubscriber::default();
+                let dispatch = tracing::Dispatch::new(subscriber.clone());
+                let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+                upstream.set_models(&["model-a"]).await;
+                upstream.next_calibration().await;
+                // End the collector while the step still waits for its
+                // request, so the calibration's snapshot finds it gone.
+                if panics {
+                    let begun = within(
+                        "the request that panics the collector",
+                        stats.control().begin_generation(
+                            ModelGeneration::new("model-panics", 1),
+                            crate::stats::ModelStatsInitialization::ConfiguredInputTps {
+                                input_tps: 0.0,
+                            },
+                        ),
+                    )
+                    .await;
+                    assert!(
+                        begun.is_err(),
+                        "{label}: a configured input TPS of zero should panic the collector: \
+                         {begun:?}"
+                    );
+                    let exit = within("the collector exit", stats.wait_for_exit()).await;
+                    assert!(
+                        matches!(&exit, Err(error) if error.is_panic()),
+                        "{label}: the panic trigger should end the collector with a panic: \
+                         {exit:?}"
+                    );
+                } else {
+                    // Dropping the handle aborts the collector without a shutdown.
+                    drop(stats);
+                }
+                let warning = if fallback_input_tps.is_some() {
+                    FALLBACK_WARNING
+                } else {
+                    PENDING_WARNING
+                };
+                wait_for(
+                    &format!("{label}: the failed calibration should warn"),
+                    || subscriber.event_count(warning) >= 1,
+                )
+                .await;
+                drop(default_guard);
+
+                let events = subscriber.events();
+                let warnings = events_with_message(&events, warning);
+                assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
+                assert_tracing_event_field(warnings[0], "error", CALIBRATION_STATS_STOPPED);
+                assert!(
+                    events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
+                    "{label}: a collector that ended outside a shutdown is not part of one"
+                );
+                assert!(
+                    calibration_count(&metrics, "model-a", "error") >= 1,
+                    "{label}: the calibration should be recorded as an error"
+                );
+                assert_eq!(
+                    calibration_count(&metrics, "model-a", "cancelled"),
+                    0,
+                    "{label}: the calibration should be recorded as an error, not as cancelled"
+                );
+
+                within("model lifecycle shutdown", lifecycle.shutdown()).await;
+                upstream.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_failing_on_its_own_during_a_collector_shutdown_keeps_its_warning_and_error()
+     {
+        // Only a calibration whose stats request fails is part of the
+        // collector's shutdown. This upstream rejects every calibration
+        // request, so attempts keep failing on their own after the shutdown
+        // mark is set, without asking the collector for a snapshot.
+        let upstream = TestUpstream::spawn(
+            &[],
+            CompletionBehavior::FailModel {
+                model_id: "model-a",
+                failing: Arc::new(AtomicBool::new(true)),
+                completed_requests_per_generation: 0,
+            },
+        )
+        .await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, stats) = start_test_stats();
+        let lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                calibration_config_with_fallback(&upstream.base_url, None),
+                runtime_state,
+                &stats,
+                Some(metrics.clone()),
+            ),
+        )
+        .await
+        .expect("empty initial discovery should start");
+        upstream.set_models(&["model-a"]).await;
+        wait_for(
+            "the rejected calibration should be recorded as an error",
+            || calibration_count(&metrics, "model-a", "error") >= 1,
+        )
+        .await;
+
+        within("stats collector shutdown", stats.shutdown()).await;
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        // Two more failures, so at least one attempt ran entirely after the mark.
+        let failed_before = calibration_count(&metrics, "model-a", "error");
+        wait_for(
+            "calibrations rejected after the collector's shutdown mark should be recorded as \
+             errors",
+            || calibration_count(&metrics, "model-a", "error") >= failed_before + 2,
+        )
+        .await;
+        drop(default_guard);
+
+        let events = subscriber.events();
+        let warnings = events_with_message(&events, PENDING_WARNING);
+        assert!(
+            !warnings.is_empty(),
+            "a calibration that failed on its own should warn during a collector shutdown"
+        );
+        for warning in &warnings {
+            assert_eq!(warning.level, tracing::Level::WARN);
+            assert!(
+                warning
+                    .fields
+                    .get("error")
+                    .is_some_and(|error| error.contains("upstream rejected request")),
+                "the warning should report the upstream rejection: {warning:?}"
+            );
+        }
+        assert!(
+            events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
+            "a calibration that failed on its own should not stop the supervisor"
+        );
+        assert_eq!(
+            calibration_count(&metrics, "model-a", "cancelled"),
+            0,
+            "a calibration that failed on its own should be recorded as an error"
+        );
+
+        within("model lifecycle shutdown", lifecycle.shutdown()).await;
+        upstream.shutdown().await;
+    }
 }

@@ -4751,4 +4751,143 @@ mod tests {
              parent's lock while it wakes a child. Results: {skipped:?}"
         );
     }
+
+    /// Sends the begin that panics the collector: a configured input TPS of
+    /// zero breaks a stats initialization invariant. The trigger is a product
+    /// invariant, not a test hook, so the caller checks that it still panics.
+    async fn begin_generation_that_panics_the_collector(
+        control: &StatsCollectorControl,
+    ) -> Result<bool, StatsCollectorStopped> {
+        control
+            .begin_generation(
+                ModelGeneration::new("model-panics", 1),
+                ModelStatsInitialization::ConfiguredInputTps { input_tps: 0.0 },
+            )
+            .await
+    }
+
+    #[test]
+    fn shutdown_is_marked_before_a_request_can_see_the_collector_stop() {
+        // The model lifecycle supervisor reads this mark when a request fails
+        // because the collector stopped, to tell a shutdown from a crash. The
+        // shutdown is polled once and then left alone until a request has seen
+        // the collector stop, so a mark set after that first poll would still
+        // be unset then, in whatever order the runtime runs its tasks.
+        let runtimes = [
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build(),
+        ];
+        for runtime in runtimes {
+            let runtime = runtime.expect("the test runtime should build");
+            runtime.block_on(async {
+                let RunningCollector {
+                    handle: collector, ..
+                } = RunningCollector::spawn_empty(
+                    config!(observation_channel_capacity: 16),
+                    None,
+                    false,
+                );
+                let shutdown_started = collector.shutdown_started();
+                let control = collector.control();
+                let generation = ModelGeneration::new("model-a", 1);
+                let answered = bounded(
+                    "a request to the running collector",
+                    control.retire_generation(&generation),
+                )
+                .await;
+                assert!(
+                    answered.is_ok(),
+                    "the running collector should answer: {answered:?}"
+                );
+                assert!(
+                    !shutdown_started.is_cancelled(),
+                    "a running collector should not be marked as shutting down"
+                );
+
+                let shutdown = collector.shutdown();
+                tokio::pin!(shutdown);
+                let shutdown_finished = futures::poll!(&mut shutdown).is_ready();
+                let marked = bounded("a request that sees the collector stop", async {
+                    // A collector on another worker can still answer requests
+                    // sent before it sees its stop.
+                    while control.retire_generation(&generation).await.is_ok() {}
+                    shutdown_started.is_cancelled()
+                })
+                .await;
+                assert!(
+                    marked,
+                    "the shutdown should be marked before a request can see the collector stop"
+                );
+                if !shutdown_finished {
+                    bounded("the collector shutdown", shutdown).await;
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reporting_panic_returns_a_collector_panic_instead_of_resuming_it() {
+        let RunningCollector {
+            handle: collector, ..
+        } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
+        let control = collector.control();
+        let begun = bounded(
+            "the request that panics the collector",
+            begin_generation_that_panics_the_collector(&control),
+        )
+        .await;
+        assert!(
+            matches!(begun, Err(StatsCollectorStopped)),
+            "a configured input TPS of zero should panic the collector: {begun:?}"
+        );
+
+        // A resumed panic would end the task that runs the shutdown.
+        let shutdown = bounded(
+            "the shutdown of a collector that panicked",
+            tokio::spawn(collector.shutdown_reporting_panic()),
+        )
+        .await;
+        let reported = shutdown.unwrap_or_else(|error| {
+            panic!("the shutdown should return the collector panic instead of resuming it: {error}")
+        });
+        let error = reported.expect_err("the shutdown should report that the collector panicked");
+        assert_eq!(error.to_string(), "stats collector panicked");
+    }
+
+    #[tokio::test]
+    async fn shutdown_reporting_panic_stops_a_running_collector_without_an_error() {
+        let RunningCollector {
+            handle: collector, ..
+        } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
+        let control = collector.control();
+        let shutdown_started = collector.shutdown_started();
+
+        let reported = bounded(
+            "the collector shutdown",
+            collector.shutdown_reporting_panic(),
+        )
+        .await;
+        assert!(
+            reported.is_ok(),
+            "a collector that stopped normally should not be reported: {reported:?}"
+        );
+        assert!(
+            shutdown_started.is_cancelled(),
+            "the shutdown should be marked, so a request it fails is not reported as a crash"
+        );
+        let probed = bounded(
+            "a request after the shutdown",
+            control.flush_and_snapshot(&ModelGeneration::new("model-a", 1)),
+        )
+        .await;
+        assert!(
+            matches!(probed, Err(StatsCollectorStopped)),
+            "the shutdown should stop the collector: {probed:?}"
+        );
+    }
 }
