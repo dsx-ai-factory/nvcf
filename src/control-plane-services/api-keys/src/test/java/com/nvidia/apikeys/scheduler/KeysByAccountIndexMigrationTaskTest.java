@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -131,6 +132,14 @@ class KeysByAccountIndexMigrationTaskTest {
         });
 
         task.run(() -> { });
+
+        var order = inOrder(dao, markers);
+        order.verify(dao).ownerPage(null, 500);
+        order.verify(dao).accountPage(null, 500);
+        order.verify(dao).ownerPage(null, 500);
+        order.verify(dao).accountPage(null, 500);
+        order.verify(markers).markCompleted("keys_by_account_index_copy", "completed", TEST_TIME);
+
         task.run(() -> { });
 
         verify(dao, times(3)).ownerPage(null, 500);
@@ -157,9 +166,10 @@ class KeysByAccountIndexMigrationTaskTest {
         var staticRow = KeyByOwnerAndServiceModel.builder()
                 .ownerType(KeyOwnerType.USER).ownerId("owner").build();
         when(dao.ownerPage(null, 500))
-                .thenThrow(new IllegalStateException("temporary fetch failure"))
                 .thenReturn(new Page<>(List.of(new TimedRow<>(staticRow, 0)), nextPage));
-        when(dao.ownerPage(nextPage, 500)).thenReturn(new Page<>(List.of(), null));
+        when(dao.ownerPage(nextPage, 500))
+                .thenThrow(new IllegalStateException("temporary fetch failure"))
+                .thenReturn(new Page<>(List.of(), null));
         when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
         when(markers.markCompleted(anyString(), anyString(), any())).thenAnswer(invocation -> {
             completed.set(true);
@@ -168,8 +178,8 @@ class KeysByAccountIndexMigrationTaskTest {
 
         task.run(() -> { });
 
-        verify(dao, times(3)).ownerPage(null, 500);
-        verify(dao, times(2)).ownerPage(nextPage, 500);
+        verify(dao, times(2)).ownerPage(null, 500);
+        verify(dao, times(3)).ownerPage(nextPage, 500);
         assertThat(completed).isTrue();
         assertThat(result("skipped")).isEqualTo(2);
     }
