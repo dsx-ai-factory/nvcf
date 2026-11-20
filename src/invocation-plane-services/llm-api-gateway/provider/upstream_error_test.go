@@ -65,8 +65,8 @@ func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
 		wantBody string
 	}{
 		{
-			name:     "capped message and fields",
-			event:    `{"error":{"message":"` + long + `","type":"invalid_request_error","code":400}}`,
+			name:  "capped message and fields",
+			event: `{"error":{"message":"` + long + `","type":"invalid_request_error","code":400}}`,
 			wantBody: `{"error":{"message":"` + long[:maxUpstreamErrorMessageBytes] +
 				`","type":"invalid_request_error","code":"400"}}`,
 		},
