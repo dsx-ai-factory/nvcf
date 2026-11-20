@@ -79,11 +79,12 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		// wantStatus is the client status of a unary request, or the status that
 		// logs and metrics record for a stream; 0 means 502.
 		wantStatus int
-		// wantMessage, wantType and wantParam are the error fields; empty means
-		// msgUpstreamStreamIncomplete, server_error and null.
+		// wantMessage and wantType are the error fields; empty means
+		// msgUpstreamStreamIncomplete and server_error.
 		wantMessage string
 		wantType    string
-		wantParam   string
+		// wantParam is the error param as raw JSON; empty means null.
+		wantParam string
 		// wantCode is the error code as raw JSON; empty means null.
 		wantCode string
 	}
@@ -111,13 +112,13 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		{
 			name: "stream upstream 4xx error event", stream: true, upstreamBody: errorEvent(rejected("400")),
 			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
-			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
 		},
 		{
 			name:   "stream upstream 4xx error event with string code",
 			stream: true, upstreamBody: errorEvent(rejected(`"400"`)),
 			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
-			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
 		},
 		{
 			name:   "stream upstream 4xx error event without type",
@@ -141,12 +142,12 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		{
 			name: "unary upstream 4xx error event after output", upstreamBody: upstreamError(rejected("400")),
 			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
-			wantType: "invalid_request_error", wantParam: "image", wantCode: "400",
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: "400",
 		},
 		{
 			name: "unary upstream 4xx error event with string code", upstreamBody: errorEvent(rejected(`"400"`)),
 			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
-			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: `"400"`,
 		},
 	}
 	// A 4xx error event reaches a unary client with that status and the backend's error object.
@@ -155,7 +156,7 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		tests = append(tests, testCase{
 			name: "unary upstream " + code + " error event", upstreamBody: errorEvent(rejected(code)),
 			wantStatus: status, wantMessage: "bad input",
-			wantType: "invalid_request_error", wantParam: "image", wantCode: code,
+			wantType: "invalid_request_error", wantParam: `"image"`, wantCode: code,
 		})
 	}
 
@@ -190,7 +191,7 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 				Error struct {
 					Message string          `json:"message"`
 					Type    string          `json:"type"`
-					Param   *string         `json:"param"`
+					Param   json.RawMessage `json:"param"`
 					Code    json.RawMessage `json:"code"`
 				} `json:"error"`
 			}
@@ -213,7 +214,7 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 			}
 			require.Equal(t, cmp.Or(tt.wantMessage, msgUpstreamStreamIncomplete), errorBody.Error.Message)
 			require.Equal(t, cmp.Or(tt.wantType, "server_error"), errorBody.Error.Type)
-			require.Equal(t, tt.wantParam, ptr.Deref(errorBody.Error.Param))
+			require.JSONEq(t, cmp.Or(tt.wantParam, "null"), cmp.Or(string(errorBody.Error.Param), "null"))
 			require.JSONEq(t, cmp.Or(tt.wantCode, "null"), cmp.Or(string(errorBody.Error.Code), "null"))
 		})
 	}

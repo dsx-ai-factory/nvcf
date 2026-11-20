@@ -1037,33 +1037,41 @@ func upstreamStreamError(payload string) *UpstreamStreamError {
 
 // streamErrorBody returns {"error":...} with the event's error object. Like an
 // oversized 4xx head body, an object over MaxUpstreamErrorBodyBytes is not
-// relayed: its capped message and parsed fields are, or nothing without a message.
+// relayed: its capped message is, with its parsed fields when they fit, or
+// nothing without a message.
 func streamErrorBody(errorObject json.RawMessage, upstreamErr *UpstreamStreamError) []byte {
-	if len(errorObject) > MaxUpstreamErrorBodyBytes {
-		if upstreamErr.Message == "" {
-			return nil
-		}
-		capped, err := json.Marshal(struct {
-			Message string  `json:"message"`
-			Type    *string `json:"type,omitempty"`
-			Param   *string `json:"param,omitempty"`
-			Code    *string `json:"code,omitempty"`
-		}{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code})
-		if err != nil {
-			return nil
-		}
-		errorObject = capped
+	wrap := func(object []byte) []byte {
+		return append(append([]byte(`{"error":`), object...), '}')
 	}
-	return append(append([]byte(`{"error":`), errorObject...), '}')
+	if body := wrap(errorObject); len(body) <= MaxUpstreamErrorBodyBytes {
+		return body
+	}
+	if upstreamErr.Message == "" {
+		return nil
+	}
+	type cappedError struct {
+		Message string  `json:"message"`
+		Type    *string `json:"type,omitempty"`
+		Param   *string `json:"param,omitempty"`
+		Code    *string `json:"code,omitempty"`
+	}
+	withFields := cappedError{upstreamErr.Message, upstreamErr.Type, upstreamErr.Param, upstreamErr.Code}
+	for _, object := range []cappedError{withFields, {Message: upstreamErr.Message}} {
+		capped, err := json.Marshal(object)
+		if body := wrap(capped); err == nil && len(body) <= MaxUpstreamErrorBodyBytes {
+			return body
+		}
+	}
+	return nil
 }
 
-// jsonString returns the value of a JSON string, or nil for any other value.
+// jsonString returns the value of a JSON string, or nil for null and any other value.
 func jsonString(raw json.RawMessage) *string {
-	var value string
+	var value *string
 	if json.Unmarshal(raw, &value) != nil {
 		return nil
 	}
-	return &value
+	return value
 }
 
 func isNotDigit(r rune) bool {

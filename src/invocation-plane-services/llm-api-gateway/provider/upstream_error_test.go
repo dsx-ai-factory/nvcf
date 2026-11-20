@@ -70,6 +70,11 @@ func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
 			wantBody: `{"error":{"message":"` + long[:maxUpstreamErrorMessageBytes] +
 				`","type":"invalid_request_error","code":"400"}}`,
 		},
+		{
+			name:     "oversized param",
+			event:    `{"error":{"message":"bad input","param":"` + long + `","code":400}}`,
+			wantBody: `{"error":{"message":"bad input"}}`,
+		},
 		{name: "no message", event: `{"error":{"detail":"` + long + `","code":400}}`},
 	}
 	for _, tt := range tests {
@@ -87,6 +92,21 @@ func TestUpstreamStreamErrorBodyIsBounded(t *testing.T) {
 				t.Fatalf("body has %d bytes, want %d", len(upstreamErr.Body), len(tt.wantBody))
 			}
 		})
+	}
+}
+
+func TestUpstreamStreamErrorKeepsNullFieldsNil(t *testing.T) {
+	t.Parallel()
+
+	upstreamErr := upstreamStreamError(`{"error":{"message":"bad input","type":null,"param":"","code":null}}`)
+	if upstreamErr == nil {
+		t.Fatal("error event not detected")
+	}
+	if upstreamErr.Type != nil || upstreamErr.Code != nil {
+		t.Fatalf("type = %v, code = %v, want nil for JSON null", upstreamErr.Type, upstreamErr.Code)
+	}
+	if upstreamErr.Param == nil || *upstreamErr.Param != "" {
+		t.Fatalf("param = %v, want the empty string the upstream sent", upstreamErr.Param)
 	}
 }
 
