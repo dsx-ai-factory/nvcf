@@ -1039,6 +1039,8 @@ mod tests {
         blocked: Arc<AtomicBool>,
         blocked_polls: Arc<AtomicUsize>,
         released: Arc<Notify>,
+        /// Answers each poll, once released, with a server error.
+        rejecting: bool,
     }
 
     struct BlockingKvCacheServer {
@@ -1050,6 +1052,16 @@ mod tests {
 
     impl BlockingKvCacheServer {
         async fn spawn() -> Self {
+            Self::spawn_answering(false).await
+        }
+
+        /// Like `spawn`, but each poll ends with a server error, which the
+        /// stats collector logs as a warning.
+        async fn spawn_rejecting() -> Self {
+            Self::spawn_answering(true).await
+        }
+
+        async fn spawn_answering(rejecting: bool) -> Self {
             let blocked = Arc::new(AtomicBool::new(false));
             let blocked_polls = Arc::new(AtomicUsize::new(0));
             let released = Arc::new(Notify::new());
@@ -1057,6 +1069,7 @@ mod tests {
                 blocked: blocked.clone(),
                 blocked_polls: blocked_polls.clone(),
                 released: released.clone(),
+                rejecting,
             };
             let server = TestHttpServer::spawn(
                 Router::new()
@@ -1182,6 +1195,9 @@ mod tests {
                 }
                 released.await;
             }
+        }
+        if state.rejecting {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         Json(json!({
             "model": "model-a",
@@ -3192,29 +3208,136 @@ mod tests {
 
     const KV_CACHE_STATS_REJECTED: &str = "KV-cache stats endpoint returned non-success status";
 
-    type CollectorShutdown =
-        std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+    /// A shutdown that `CollectorPanicHook` starts.
+    type ArmedShutdown<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
-    /// Records events like `RecordingTracingSubscriber`. Once armed with a
-    /// stats collector's shutdown, it panics that collector from inside the
-    /// collector's own run, after the shutdown has started: on the collector's
-    /// next KV-cache warning it polls the shutdown once, which sets the
-    /// shutdown mark and the collector's stop, and then it panics. The
-    /// collector is busy logging, so it cannot see its stop first.
+    /// Keeps two dispatchers that record nothing registered for the life of
+    /// the test binary, so a recorder sees every callsite.
+    ///
+    /// tracing-core caches whether a callsite is enabled when a thread first
+    /// reaches it. While only one dispatcher is registered, it asks the
+    /// default subscriber of that thread alone. A test thread without a
+    /// recorder then caches "never" for a callsite, and a recording test that
+    /// runs beside it loses every event from that callsite. tracing does not
+    /// document this (tracing-core 0.1.36, `Rebuilder::JustOne` in
+    /// `callsite.rs`). With more dispatchers registered, tracing-core asks
+    /// every registered dispatcher instead. These two report every callsite as
+    /// sometimes enabled, so each event asks the subscriber of the thread that
+    /// logs it. The test `recorders_see_callsites_that_other_threads_reach_first`
+    /// fails if this stops working.
+    fn keep_callsite_interest_open() {
+        static KEPT_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        KEPT_DISPATCHERS.get_or_init(|| {
+            [
+                tracing::Dispatch::new(SometimesEnabled),
+                tracing::Dispatch::new(SometimesEnabled),
+            ]
+        });
+    }
+
+    /// Records nothing and reports every callsite as sometimes enabled. See
+    /// `keep_callsite_interest_open`.
+    struct SometimesEnabled;
+
+    impl tracing::Subscriber for SometimesEnabled {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn recorders_see_callsites_that_other_threads_reach_first() {
+        fn probe() {
+            tracing::error!("tracing callsite interest probe");
+        }
+        keep_callsite_interest_open();
+        let recorder = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(recorder.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        // The probe first runs on a thread without a recorder.
+        std::thread::spawn(probe)
+            .join()
+            .expect("the probe thread should not panic");
+        probe();
+        drop(default_guard);
+        assert_eq!(
+            recorder.event_count("tracing callsite interest probe"),
+            1,
+            "the recorder lost an event whose callsite another thread reached first, so \
+             tracing-core no longer behaves as `keep_callsite_interest_open` relies on"
+        );
+    }
+
+    /// Records events like `RecordingTracingSubscriber`, with every callsite
+    /// kept open by `keep_callsite_interest_open`. Once armed with a shutdown,
+    /// it panics the stats collector from inside the collector's own run,
+    /// after that shutdown has started: on the collector's next KV-cache
+    /// warning it polls the shutdown once, and then it panics. The first poll
+    /// of a stats collector's shutdown sets its shutdown mark and its stop,
+    /// and that of a model lifecycle's shutdown cancels the supervisor's stop.
+    /// The collector is busy logging, so it cannot see its own stop first, and
+    /// on this single-threaded runtime the supervisor cannot run before the
+    /// collector has ended.
     ///
     /// This relies on tracing calling the subscriber inside the call that logs
     /// the event, and on a panic there unwinding through that call, which
-    /// tracing does not document. The test checks that the collector panicked,
-    /// so it fails if that changes.
-    #[derive(Clone, Default)]
-    struct CollectorPanicHook {
+    /// tracing does not document. The tests check that the collector panicked,
+    /// so they fail if that changes.
+    struct CollectorPanicHook<T> {
         recorder: RecordingTracingSubscriber,
-        armed: Arc<StdMutex<Option<CollectorShutdown>>>,
-        started: Arc<StdMutex<Option<CollectorShutdown>>>,
+        armed: Arc<StdMutex<Option<ArmedShutdown<T>>>>,
+        started: Arc<StdMutex<Option<ArmedShutdown<T>>>>,
     }
 
-    impl CollectorPanicHook {
-        fn arm(&self, shutdown: CollectorShutdown) {
+    impl<T> Default for CollectorPanicHook<T> {
+        fn default() -> Self {
+            keep_callsite_interest_open();
+            Self {
+                recorder: RecordingTracingSubscriber::default(),
+                armed: Arc::default(),
+                started: Arc::default(),
+            }
+        }
+    }
+
+    impl<T> Clone for CollectorPanicHook<T> {
+        fn clone(&self) -> Self {
+            Self {
+                recorder: self.recorder.clone(),
+                armed: Arc::clone(&self.armed),
+                started: Arc::clone(&self.started),
+            }
+        }
+    }
+
+    impl<T> CollectorPanicHook<T> {
+        fn arm(&self, shutdown: ArmedShutdown<T>) {
             *self
                 .armed
                 .lock()
@@ -3223,7 +3346,7 @@ mod tests {
 
         /// Returns the shutdown that the hook started once it has panicked the
         /// collector.
-        async fn started_shutdown(&self) -> CollectorShutdown {
+        async fn started_shutdown(&self) -> ArmedShutdown<T> {
             loop {
                 if let Some(shutdown) = self
                     .started
@@ -3249,7 +3372,7 @@ mod tests {
         }
     }
 
-    impl tracing::Subscriber for CollectorPanicHook {
+    impl<T: 'static> tracing::Subscriber for CollectorPanicHook<T> {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             tracing::Subscriber::enabled(&self.recorder, metadata)
         }
@@ -3285,15 +3408,15 @@ mod tests {
                 .as_mut()
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
             if polled.is_ready() {
-                // The collector is still running here, so its shutdown cannot
-                // have finished; started_shutdown then times out.
+                // Neither shutdown can finish while the collector runs here,
+                // so this does not happen; started_shutdown then times out.
                 return;
             }
             *self
                 .started
                 .lock()
                 .expect("started shutdown should not be poisoned") = Some(shutdown);
-            panic!("test panic in the stats collector after its shutdown started");
+            panic!("test panic in the stats collector after the armed shutdown started");
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
@@ -3342,7 +3465,7 @@ mod tests {
             )
             .await
             .expect("initial discovery should initialize");
-            let hook = CollectorPanicHook::default();
+            let hook = CollectorPanicHook::<anyhow::Result<()>>::default();
             let dispatch = tracing::Dispatch::new(hook.clone());
             let default_guard = tracing::dispatcher::set_default(&dispatch);
 
@@ -3438,6 +3561,81 @@ mod tests {
             upstream.shutdown().await;
         }
         rejecting_kv_cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn collector_panic_found_after_the_supervisor_stop_logs_an_error() {
+        // Pylon's shutdown cancels the supervisor's own stop too. A collector
+        // that panics then, with a supervisor request in flight, was not ended
+        // by its shutdown, so the supervisor reports it as an error although
+        // its stop is cancelled by then. The supervisor handles the failed
+        // request instead of taking its stop because the request runs under
+        // `run_until_cancelled`, which tokio-util documents as biased toward
+        // the future when the future completes as the token is cancelled.
+        let kv_cache = BlockingKvCacheServer::spawn_rejecting().await;
+        let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+        let (runtime_state, mut stats) = start_holdable_stats(&kv_cache);
+        let lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                discovery_config(&upstream.base_url),
+                runtime_state.clone(),
+                &stats,
+                None,
+            ),
+        )
+        .await
+        .expect("initial discovery should initialize");
+        let hook = CollectorPanicHook::<()>::default();
+        let dispatch = tracing::Dispatch::new(hook.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        hold_stats_collector(&kv_cache).await;
+
+        // A newly discovered model makes the supervisor begin a generation,
+        // and the held collector leaves that request queued.
+        upstream.set_models(&["model-a", "model-b"]).await;
+        wait_for(
+            "the supervisor should begin a generation for model-b",
+            || runtime_state.current_generation("model-b").is_some(),
+        )
+        .await;
+        // The released poll is rejected. In that warning the hook cancels the
+        // supervisor's stop and then panics the collector.
+        hook.arm(Box::pin(lifecycle.shutdown()));
+        kv_cache.unblock();
+        let supervisor_shutdown = within(
+            "the hook's panic in the collector's KV-cache warning",
+            hook.started_shutdown(),
+        )
+        .await;
+        let exit = within("the collector exit", stats.wait_for_exit()).await;
+        assert!(
+            matches!(&exit, Err(error) if error.is_panic()),
+            "the hook's panic should end the collector; if it did not, tracing may no longer \
+             unwind a subscriber panic into the caller: {exit:?}"
+        );
+        within("the supervisor shutdown", supervisor_shutdown).await;
+        drop(default_guard);
+
+        let events = hook.recorder.events();
+        let failed = events_with_message(&events, SUPERVISOR_FAILED);
+        let stopped = events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN);
+        assert_eq!(
+            failed.len(),
+            1,
+            "a collector panic that the supervisor finds after its own stop should be an error, \
+             not part of a shutdown: {stopped:?}. Neither line means that the supervisor took \
+             its stop before its failed request, against tokio-util's documented bias"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        assert_tracing_event_field(failed[0], "error", STATS_COLLECTOR_STOPPED);
+        assert!(
+            stopped.is_empty(),
+            "a collector panic is not part of the supervisor's shutdown: {stopped:?}"
+        );
+
+        kv_cache.shutdown().await;
+        upstream.shutdown().await;
     }
 
     const PENDING_WARNING: &str = "model initialization failed; keeping generation pending";

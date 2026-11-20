@@ -2848,9 +2848,96 @@ mod tests {
     const CRITICAL_TASK_EXITED: &str = "critical pylon task exited";
 
     /// Records the level, message and other fields of every event at DEBUG or
-    /// above on the thread that installs it.
+    /// above on the thread that installs it. Install it with `record_events`.
     #[derive(Clone, Default)]
     struct RecordedEvents(Arc<StdMutex<Vec<RecordedEvent>>>);
+
+    /// Makes a `RecordedEvents` this thread's default subscriber until the
+    /// guard drops.
+    ///
+    /// tracing-core caches whether a callsite is enabled when a thread first
+    /// reaches it. While only one dispatcher is registered, it asks the
+    /// default subscriber of that thread alone. A test thread without a
+    /// recorder then caches "never" for a callsite, and a recording test that
+    /// runs beside it loses every event from that callsite. tracing does not
+    /// document this (tracing-core 0.1.36, `Rebuilder::JustOne` in
+    /// `callsite.rs`). Two dispatchers that live as long as the test binary
+    /// make tracing-core ask every registered dispatcher instead. They report
+    /// every callsite as sometimes enabled, so each event asks the subscriber
+    /// of the thread that logs it. The test
+    /// `recorders_see_callsites_that_other_threads_reach_first` fails if this
+    /// stops working.
+    fn record_events() -> (RecordedEvents, tracing::dispatcher::DefaultGuard) {
+        static KEPT_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        KEPT_DISPATCHERS.get_or_init(|| {
+            [
+                tracing::Dispatch::new(SometimesEnabled),
+                tracing::Dispatch::new(SometimesEnabled),
+            ]
+        });
+        let recorded = RecordedEvents::default();
+        let default_guard =
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(recorded.clone()));
+        (recorded, default_guard)
+    }
+
+    /// Records nothing and reports every callsite as sometimes enabled. See
+    /// `record_events`.
+    struct SometimesEnabled;
+
+    impl tracing::Subscriber for SometimesEnabled {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn recorders_see_callsites_that_other_threads_reach_first() {
+        fn probe() {
+            tracing::error!("tracing callsite interest probe");
+        }
+        let (recorded, default_guard) = record_events();
+        // The probe first runs on a thread without a recorder.
+        std::thread::spawn(probe)
+            .join()
+            .expect("the probe thread should not panic");
+        probe();
+        drop(default_guard);
+        assert_eq!(
+            recorded
+                .with_message("tracing callsite interest probe")
+                .len(),
+            1,
+            "the recorder lost an event whose callsite another thread reached first, so \
+             tracing-core no longer behaves as `record_events` relies on"
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct RecordedEvent {
@@ -3330,9 +3417,7 @@ mod tests {
         // held KV-cache poll keeps the collector from reading the request.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
         let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
-        let recorded = RecordedEvents::default();
-        let dispatch = tracing::Dispatch::new(recorded.clone());
-        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        let (recorded, default_guard) = record_events();
 
         upstream.hold_kv_cache_polls().await;
         upstream.set_models(&["model-a", "model-b"]);
@@ -3429,9 +3514,8 @@ mod tests {
             PylonRuntimeState::default(),
         );
         let runtime = test_running_pylon_with_lifecycle(pylon_stats, model_lifecycle).await;
-        let recorded = RecordedEvents::default();
-        let dispatch = tracing::Dispatch::new(recorded.clone());
-        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        let (recorded, default_guard) = record_events();
+        assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
 
         // Dropping the handle aborts the collector without a shutdown. The
         // supervisor's begin for model-b then finds it stopped.
@@ -3441,16 +3525,14 @@ mod tests {
         let run = tokio::spawn(
             runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
         );
+        // The failed supervisor retires model-a as it stops.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while recorded
-                .with_message("model lifecycle supervisor failed")
-                .is_empty()
-            {
+            while !runtime_state.advertised_model_ids().is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
-        .expect("the supervisor should fail when its collector has stopped");
+        .expect("the supervisor should stop and retire model-a when its collector has stopped");
         // Give the main loop time to see the supervisor's exit. A main loop
         // that reported the supervisor would have finished by now.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3540,9 +3622,7 @@ mod tests {
             )
             .await;
             panic_stats_collector(&runtime.stats_collector).await;
-            let recorded = RecordedEvents::default();
-            let dispatch = tracing::Dispatch::new(recorded.clone());
-            let default_guard = tracing::dispatcher::set_default(&dispatch);
+            let (recorded, default_guard) = record_events();
 
             let result = run_pylon_without_re_raising(runtime, async { Ok("SIGTERM") }).await;
             drop(default_guard);
@@ -3683,9 +3763,7 @@ mod tests {
         .await
         .expect("the engine stats stream should fill the channel after the stats collector ended");
 
-        let recorded = RecordedEvents::default();
-        let dispatch = tracing::Dispatch::new(recorded.clone());
-        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        let (recorded, default_guard) = record_events();
         let error = run_pylon_without_re_raising(
             runtime,
             std::future::pending::<std::io::Result<&'static str>>(),
@@ -3774,9 +3852,7 @@ mod tests {
                  stats",
             );
             panic_stats_collector(&runtime.stats_collector).await;
-            let recorded = RecordedEvents::default();
-            let dispatch = tracing::Dispatch::new(recorded.clone());
-            let default_guard = tracing::dispatcher::set_default(&dispatch);
+            let (recorded, default_guard) = record_events();
 
             let result = run_pylon_without_re_raising(
                 runtime,
