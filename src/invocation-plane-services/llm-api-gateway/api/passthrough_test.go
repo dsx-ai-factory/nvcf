@@ -559,10 +559,22 @@ func TestResponsesUnaryMapsFailedResponseToStatus(t *testing.T) {
 		wantStatus int
 		wantType   string
 	}{
-		{name: "invalid prompt", errorMember: `{"code":"invalid_prompt","message":"bad input"}`, wantStatus: http.StatusBadRequest, wantType: "invalid_request_error"},
-		{name: "rate limit exceeded", errorMember: `{"code":"rate_limit_exceeded","message":"bad input"}`, wantStatus: http.StatusTooManyRequests, wantType: "rate_limit_error"},
-		{name: "server error", errorMember: `{"code":"server_error","message":"bad input"}`, wantStatus: http.StatusBadGateway, wantType: "server_error"},
-		{name: "other code", errorMember: `{"code":"vector_store_timeout","message":"bad input"}`, wantStatus: http.StatusOK},
+		{
+			name: "invalid prompt", errorMember: `{"code":"invalid_prompt","message":"upstream message"}`,
+			wantStatus: http.StatusBadRequest, wantType: "invalid_request_error",
+		},
+		{
+			name: "rate limit exceeded", errorMember: `{"code":"rate_limit_exceeded","message":"upstream message"}`,
+			wantStatus: http.StatusTooManyRequests, wantType: "rate_limit_error",
+		},
+		{
+			name: "server error", errorMember: `{"code":"server_error","message":"upstream message"}`,
+			wantStatus: http.StatusBadGateway, wantType: "server_error",
+		},
+		{
+			name: "other code", errorMember: `{"code":"vector_store_timeout","message":"upstream message"}`,
+			wantStatus: http.StatusOK,
+		},
 		{name: "no error object", errorMember: `null`, wantStatus: http.StatusOK},
 	}
 
@@ -595,7 +607,7 @@ func TestResponsesUnaryMapsFailedResponseToStatus(t *testing.T) {
 			require.Equal(t, tt.wantStatus, httpErr.Code)
 			var errBody openAIErrorResponse
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errBody), body)
-			require.Equal(t, "bad input", errBody.Error.Message)
+			require.Equal(t, "upstream message", errBody.Error.Message)
 			require.Equal(t, tt.wantType, errBody.Error.Type)
 			var upstreamError struct {
 				Code string `json:"code"`

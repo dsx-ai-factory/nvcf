@@ -100,22 +100,30 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 			name: "stream upstream error string after output", stream: true,
 			upstreamBody: upstreamError(`"engine failed"`), wantMessage: "engine failed",
 		},
-		{name: "stream upstream error event without message", stream: true, upstreamBody: upstreamError(`{"code":500}`), wantCode: `"500"`},
+		{
+			name: "stream upstream error event without message", stream: true,
+			upstreamBody: upstreamError(`{"code":500}`), wantCode: `"500"`,
+		},
 		{
 			name: "stream upstream error with choices", stream: true, upstreamBody: errorWithChoices,
 			wantMessage: "engine failed", wantCode: `"502"`,
 		},
 		{
 			name: "stream upstream 4xx error event", stream: true, upstreamBody: errorEvent(rejected("400")),
-			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
 		},
 		{
-			name: "stream upstream 4xx error event with string code", stream: true, upstreamBody: errorEvent(rejected(`"400"`)),
-			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			name:   "stream upstream 4xx error event with string code",
+			stream: true, upstreamBody: errorEvent(rejected(`"400"`)),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
 		},
 		{
-			name: "stream upstream 4xx error event without type", stream: true, upstreamBody: errorEvent(`{"message":"bad input","code":400}`),
-			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error", wantCode: `"400"`,
+			name:   "stream upstream 4xx error event without type",
+			stream: true, upstreamBody: errorEvent(`{"message":"bad input","code":400}`),
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error",
+			wantCode: `"400"`,
 		},
 		{name: "unary clean end after output", upstreamBody: partial},
 		{name: "unary clean end n=2 one choice finished", upstreamBody: siblingFinished},
@@ -125,21 +133,26 @@ func TestChatCompletionsFailsWhenUpstreamStreamEndsEarly(t *testing.T) {
 		// The client went away, so 499 is not the client's error to receive.
 		{name: "unary upstream 499 error event", upstreamBody: errorEvent(rejected("499"))},
 		{name: "unary upstream error event with text code", upstreamBody: errorEvent(rejected(`"context_length_exceeded"`))},
+		{name: "unary upstream error event without code", upstreamBody: errorEvent(`{"message":"bad input"}`)},
+		{name: "unary upstream error string", upstreamBody: errorEvent(`"engine failed"`)},
 		{
 			name: "unary upstream 4xx error event after output", upstreamBody: upstreamError(rejected("400")),
-			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error", wantParam: "image", wantCode: "400",
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: "image", wantCode: "400",
 		},
 		{
 			name: "unary upstream 4xx error event with string code", upstreamBody: errorEvent(rejected(`"400"`)),
-			wantStatus: http.StatusBadRequest, wantMessage: "bad input", wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
+			wantStatus: http.StatusBadRequest, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: "image", wantCode: `"400"`,
 		},
 	}
-	// A backend error event with a 4xx code reaches a unary client with that status and the backend's error object.
+	// A 4xx error event reaches a unary client with that status and the backend's error object.
 	for _, status := range []int{400, 401, 403, 404, 413, 415, 422, 429} {
 		code := strconv.Itoa(status)
 		tests = append(tests, testCase{
 			name: "unary upstream " + code + " error event", upstreamBody: errorEvent(rejected(code)),
-			wantStatus: status, wantMessage: "bad input", wantType: "invalid_request_error", wantParam: "image", wantCode: code,
+			wantStatus: status, wantMessage: "bad input",
+			wantType: "invalid_request_error", wantParam: "image", wantCode: code,
 		})
 	}
 
