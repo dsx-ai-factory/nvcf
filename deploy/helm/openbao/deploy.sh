@@ -29,6 +29,7 @@ fi
 
 source "$DEPLOY_SCRIPT_DIR/utils/utils.sh"
 source "$DEPLOY_SCRIPT_DIR/helm/scripts/utils/jwt-plugin.sh"
+source "$DEPLOY_SCRIPT_DIR/helm/scripts/utils/bootstrap.sh"
 
 if ! check_kubernetes; then
     log_error "kubernetes check failed"
@@ -53,9 +54,10 @@ fi
 
 # Helper function to get root token
 get_root_token() {
-    local namespace=$1
-    local statefulset=$2
-    kubectl get secret ${statefulset}-root-token -n ${namespace} -o jsonpath='{.data.root_token}' | base64 -d
+    local namespace=$1 statefulset=$2 encoded
+    encoded=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" \
+        -o jsonpath='{.data.root_token}') || return 1
+    printf '%s' "$encoded" | base64 -d
 }
 
 # Step 0: Pre-checks
@@ -114,99 +116,49 @@ install_openbao() {
 initialize_cluster() {
     local namespace=$1
     local statefulset=$2
+    local bootstrap_deadline="" bootstrap_request_timeout=5
 
     log_section "Initializing OpenBao nodes"
 
-    # Wait for pods to be ready with 2-minute timeout
-    log_info "Waiting for OpenBao pods to be ready (timeout: 2 minutes)..."
-    local end=$((SECONDS + 120)) # 120 seconds = 2 minutes
-
-    for i in {0..2}; do
-        while [[ $(kubectl get pod $statefulset-${i} -n ${namespace} -o jsonpath='{.status.containerStatuses[0].ready}') != "true" ]]; do
-            if [ $SECONDS -gt $end ]; then
-                log_error "Timeout waiting for pod ${statefulset}-${i} to be ready"
-                return 1
-            fi
-            log_info "Waiting for pod ${statefulset}-${i} to be ready..."
-            sleep 5
-        done
-    done
-    log_info "All OpenBao pods are ready"
-
+    wait_for_openbao_api "$namespace" "$statefulset" || return 1
+    check_bootstrap_credentials "$namespace" "$statefulset" shamir || return 1
+    if [ "$BOOTSTRAP_INITIALIZED" = true ]; then
+        return 0
+    fi
+    bootstrap_prepare_initialization "$namespace" || return 1
     log_info "Initializing OpenBao cluster"
-    local init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-        bao operator init \
-        -key-shares=1 \
-        -key-threshold=1 \
-        -format=json)
+    local init_output
+    if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+        env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init -key-shares=1 -key-threshold=1 -format=json); then
+        log_error "OpenBao initialization failed"
+        return 1
+    fi
 
     # Extract keys
     local unseal_key=$(echo ${init_output} | jq -r '.unseal_keys_b64[0]')
     local root_token=$(echo ${init_output} | jq -r '.root_token')
 
     # Check if unseal key is empty
-    if [ -z "${unseal_key}" ]; then
+    if [ -z "${unseal_key}" ] || [ "${unseal_key}" = null ] || [ -z "${root_token}" ] || [ "${root_token}" = null ]; then
         log_error "Failed to get unseal key from initialization output"
         return 1
     fi
 
-    # Update the secret with the new unseal key
-    kubectl patch secret ${statefulset}-unseal \
-        --patch "data:
-    unseal_key: $(echo -n "${unseal_key}" | base64)" \
-        -n ${namespace}
-
-    log_info "Updated Kubernetes secret '${statefulset}-unseal' with unseal key"
-
-    # Store root token in a new secret
-    log_info "Creating secret '${statefulset}-root-token' with root token..."
-    kubectl create secret generic ${statefulset}-root-token \
-        -n ${namespace} \
-        --from-literal=root_token=${root_token}
+    persist_bootstrap_credentials "$namespace" "$statefulset" unseal unseal_key \
+        "$unseal_key" "$root_token" patch
 }
 
 get_unseal_key() {
-    local namespace=$1
-    local statefulset=$2
-    kubectl get secret ${statefulset}-unseal -n ${namespace} -o jsonpath='{.data.unseal_key}' | base64 -d
+    local namespace=$1 statefulset=$2 encoded
+    encoded=$(bootstrap_kubectl get secret "$statefulset-unseal" -n "$namespace" \
+        -o jsonpath='{.data.unseal_key}') || return 1
+    printf '%s' "$encoded" | base64 -d
 }
 
 # Step 4: Unseal the cluster
 unseal_cluster() {
-    local namespace=$1
-    local statefulset=$2
-    local unseal_key=$(get_unseal_key "${namespace}" "${statefulset}")
-
-    log_section "Unsealing OpenBao cluster"
-
-    # First unseal the primary node (pod 0)
-    log_info "Unsealing primary pod ${statefulset}-0"
-    if ! kubectl exec ${statefulset}-0 -n ${namespace} -- \
-        bao operator unseal ${unseal_key}; then
-        log_error "Failed to unseal primary pod ${statefulset}-0"
-        return 1
-    fi
-
-    # Wait a moment for the primary to be ready
-    sleep 5
-
-    # Join and unseal remaining pods
-    for i in {1..2}; do
-        log_info "Joining pod ${statefulset}-${i} to Raft cluster"
-        if ! kubectl exec ${statefulset}-${i} -c openbao -n ${namespace} -- \
-            bao operator raft join http://${statefulset}-0.${statefulset}-internal:8200; then
-            log_error "Failed to join pod ${statefulset}-${i} to Raft cluster"
-            return 1
-        fi
-
-        log_info "Unsealing pod ${statefulset}-${i}"
-        if ! kubectl exec ${statefulset}-${i} -c openbao -n ${namespace} -- \
-            bao operator unseal ${unseal_key}; then
-            log_error "Failed to unseal pod ${statefulset}-${i}"
-            return 1
-        fi
-    done
-    log_info "All pods joined Raft cluster and unsealed successfully"
+    local namespace=$1 statefulset=$2
+    unseal_openbao_members "$namespace" "$statefulset" shamir
 }
 
 get_and_save_jwt_signing_key() {
@@ -223,7 +175,7 @@ get_and_save_jwt_signing_key() {
         printenv KUBERNETES_SERVICE_HOST)
 
     # get svc account token to access kubernetes api
-    local svc_token=$(kubectl exec openbao-server-0 -c openbao -n ${namespace} -- \
+    local svc_token=$(kubectl exec "${statefulset}-0" -c openbao -n "${namespace}" -- \
         cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 
     # call kubernetes api to get the jwt signing key and decode it to a pem
