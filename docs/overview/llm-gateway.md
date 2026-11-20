@@ -199,9 +199,22 @@ The upstream stream fails when it ends before `data: [DONE]`, the connection
 fails, the gateway request timeout expires, or the upstream sends an error
 event such as `data: {"error":{...}}`. A non-streaming client receives HTTP 502.
 A streaming client already has HTTP 200, so the stream ends with this event
-instead of `data: [DONE]`, with the upstream message when there is one:
+instead of `data: [DONE]`:
 `data: {"error":{"message":"upstream stream ended before completion","type":"server_error","param":null,"code":null}}`.
-The gateway records these failures as 502.
+For an upstream error event, the gateway event takes the upstream `message`,
+`type`, `param`, and `code` when they are present. The gateway records these
+failures as 502.
+
+An upstream that rejects the request after it opens the stream can put the
+HTTP status in the error event, for example
+`data: {"error":{"message":"...","type":"invalid_request_error","code":400}}`.
+When `code` is a number or a decimal string from 400 to 498, a non-streaming
+client receives that status with the upstream error object, and the gateway
+records a streaming request with that status. Other codes keep 502. Dynamo
+releases before 1.6.0 send code 500 for every such error. To have the upstream
+return the 4xx status before the stream starts, set
+`DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS` on the Dynamo frontend (Dynamo 1.5.0 and
+later).
 
 ### Routing checks versus token-generation tests
 
@@ -233,7 +246,7 @@ The gateway requires the routed model to declare `/v1/responses` in `llmConfig.u
 
 For upstream compatibility, the gateway sends native Responses requests to the router as streaming requests. If the client requested streaming, the gateway relays SSE. If the client requested a non-streaming response, the gateway consumes the upstream SSE stream and returns the terminal Responses JSON object.
 
-The gateway treats the upstream stream as failed when it closes without a `response.completed`, `response.failed`, or `response.incomplete` event, when the upstream connection fails, or when the upstream sends an `error` event before a terminal event. A non-streaming client receives HTTP 502. A streaming client has already received HTTP 200, so the gateway ends the stream with a `response.failed` event whose `error.code` is `server_error`. The gateway does not relay an upstream `error` event; its message becomes the `response.failed` message. The gateway records these cases as 502 in its logs and metrics.
+The gateway treats the upstream stream as failed when it closes without a `response.completed`, `response.failed`, or `response.incomplete` event, when the upstream connection fails, or when the upstream sends an `error` event before a terminal event. A non-streaming client receives HTTP 502. A non-streaming client also receives an HTTP error for a `response.failed` event whose `error.code` is `invalid_prompt` (400), `rate_limit_exceeded` (429), or `server_error` (502), with the upstream message; a failed response with any other code is returned with HTTP 200. A streaming client has already received HTTP 200, so the gateway ends the stream with a `response.failed` event whose `error.code` is `server_error`. The gateway does not relay an upstream `error` event; its message becomes the `response.failed` message. The gateway records these cases as 502 in its logs and metrics.
 
 ### Embeddings
 
