@@ -815,6 +815,7 @@ mod tests {
             &config,
             &stats_control,
             &runtime_state,
+            &AtomicBool::new(false),
         )
         .await
         .expect("calibration should continue below the rejected prompt frontier");
@@ -859,6 +860,7 @@ mod tests {
             },
             &stats.control(),
             &runtime_state,
+            &AtomicBool::new(false),
         )
         .await
         .expect("calibration should step down again instead of restarting");
@@ -899,6 +901,7 @@ mod tests {
             },
             &stats.control(),
             &runtime_state,
+            &AtomicBool::new(false),
         )
         .await
         .expect_err("the minimum calibration prompt rejection must fail");
@@ -1059,6 +1062,7 @@ mod tests {
                 },
                 &stats_control,
                 &runtime_state,
+                &AtomicBool::new(false),
             )
             .await
         });
@@ -1138,6 +1142,7 @@ mod tests {
                 },
                 &stats.control(),
                 &runtime_state,
+                &AtomicBool::new(false),
             ),
         )
         .await

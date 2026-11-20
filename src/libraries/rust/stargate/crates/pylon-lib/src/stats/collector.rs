@@ -126,6 +126,12 @@ impl StatsCollectorExit {
         self.exited.cancelled().await;
         self.ended_by_shutdown.load(Ordering::Acquire)
     }
+
+    /// Whether the collector task has already ended other than by its
+    /// handle's `shutdown`. False while it runs.
+    pub(crate) fn ended_outside_shutdown(&self) -> bool {
+        self.exited.is_cancelled() && !self.ended_by_shutdown.load(Ordering::Acquire)
+    }
 }
 
 /// Records how the collector task ended when it drops, then cancels the exit

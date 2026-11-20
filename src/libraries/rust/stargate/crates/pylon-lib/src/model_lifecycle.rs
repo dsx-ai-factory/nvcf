@@ -16,6 +16,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use stargate_runtime::{OwnedTask, TASK_SHUTDOWN_TIMEOUT};
@@ -500,6 +501,7 @@ impl ModelLifecycleSupervisor {
         if !self.is_current(generation) {
             return Ok(InitializationAttemptOutcome::Retired);
         }
+        let awaiting_snapshot = AtomicBool::new(false);
         let attempt = initialization_attempt(
             self.http_client.clone(),
             self.config.clone(),
@@ -508,6 +510,7 @@ impl ModelLifecycleSupervisor {
             generation.clone(),
             self.metrics.clone(),
             shutdown.map(|shutdown| shutdown.stats_collector.clone()),
+            &awaiting_snapshot,
         );
         tokio::pin!(attempt);
         let mut deferred_desired = Vec::new();
@@ -517,6 +520,21 @@ impl ModelLifecycleSupervisor {
             tokio::select! {
                 biased;
                 _ = wait_for_cancellation(shutdown.map(|shutdown| &shutdown.stop)) => {
+                    // If the collector ended outside a shutdown while the
+                    // calibration waited for its snapshot, that request has
+                    // already failed. The attempt still records the failure
+                    // and its warning: the request returns at once, so one
+                    // more poll ends the attempt without a new request or
+                    // step.
+                    if awaiting_snapshot.load(Ordering::Relaxed)
+                        && shutdown.is_some_and(|shutdown| {
+                            shutdown.stats_collector.ended_outside_shutdown()
+                        })
+                        && let Some(Err(error @ ModelLifecycleError::StatsCollectorStopped)) =
+                            futures::FutureExt::now_or_never(&mut attempt)
+                    {
+                        return Err(error);
+                    }
                     return Ok(InitializationAttemptOutcome::Cancelled);
                 }
                 result = &mut poll => {
@@ -726,7 +744,9 @@ impl Drop for CalibrationAttemptTimer {
 /// instead of retrying against a collector that is gone. The attempt is
 /// recorded as cancelled when the collector's shutdown ended it, and as an
 /// error, with a warning, when the collector ended any other way. Startup
-/// passes nothing and keeps the calibration's own error.
+/// passes nothing and keeps the calibration's own error. `awaiting_snapshot`
+/// is set when the calibration waits for its stats snapshot.
+#[allow(clippy::too_many_arguments)]
 async fn initialization_attempt(
     http_client: reqwest::Client,
     config: ModelLifecycleConfig,
@@ -735,6 +755,7 @@ async fn initialization_attempt(
     generation: ModelGeneration,
     metrics: Option<Arc<PylonMetrics>>,
     stats_collector: Option<StatsCollectorExit>,
+    awaiting_snapshot: &AtomicBool,
 ) -> Result<(), ModelLifecycleError> {
     if let Some(health_timeout) = health_probe_timeout(&config)
         && !is_upstream_ready(&http_client, &config, health_timeout).await
@@ -750,6 +771,7 @@ async fn initialization_attempt(
             calibration,
             &stats,
             &runtime_state,
+            awaiting_snapshot,
         )
         .await;
         if let (Err(error @ BringupError::StatsCollectorStopped), Some(stats_collector)) =
