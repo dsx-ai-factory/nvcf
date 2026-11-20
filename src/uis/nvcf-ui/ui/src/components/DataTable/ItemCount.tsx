@@ -16,7 +16,9 @@
  */
 
 import { Text } from "@nvidia/foundations-react-core";
+import { useMemo } from "react";
 import { useDataTable } from "./DataTableContext";
+import { getActiveGroup, getGroupedColumn, isInGroup } from "./utils/groups";
 
 interface ItemCountProps {
 	label: string;
@@ -29,10 +31,23 @@ export function ItemCount({
 }: ItemCountProps) {
 	const table = useDataTable("ItemCount");
 	const count = table.getRowCount();
+	const rows = table.getCoreRowModel().rows;
+	const grouped = getGroupedColumn(table);
+	const group = grouped && getActiveGroup(grouped);
+	// Totals count the active group's rows.
+	const total = useMemo(
+		() =>
+			grouped && group?.values
+				? rows.filter((row) => isInGroup(row.getValue(grouped.id), group))
+						.length
+				: rows.length,
+		[rows, grouped, group],
+	);
+	const noun = total === 1 ? label : pluralLabel;
 
 	return (
-		<Text className="whitespace-nowrap" kind="label/regular/md">
-			{count} {count === 1 ? label : pluralLabel}
+		<Text className="whitespace-nowrap" kind="body/regular/sm">
+			{count === total ? `${total} ${noun}` : `${count} of ${total} ${noun}`}
 		</Text>
 	);
 }

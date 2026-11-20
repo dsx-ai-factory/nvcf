@@ -116,7 +116,7 @@ function renderTable(data: TestRow[] = defaultData) {
 				<DataTable.Search />
 				<DataTable.ItemCount label="item" />
 				<DataTable.Sort />
-				<DataTable.Filters />
+				<DataTable.FilterMenu />
 				<DataTable.ColumnVisibility />
 			</DataTable.Toolbar>
 			<DataTable.ActiveFilters />
@@ -260,7 +260,7 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "speech-to-text" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("1 item")).toBeInTheDocument();
+				expect(screen.getByText("1 of 3 items")).toBeInTheDocument();
 			});
 
 			await user.clear(screen.getByRole("textbox"));
@@ -352,7 +352,7 @@ describe("DataTable", () => {
 			renderTable();
 
 			await user.click(
-				screen.getByRole("menuitemcheckbox", { name: "Active" }),
+				screen.getByRole("menuitemcheckbox", { name: /^Active/ }),
 			);
 			await waitFor(() => {
 				expect(
@@ -364,11 +364,11 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "image-gen" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("2 items")).toBeInTheDocument();
+				expect(screen.getByText("2 of 3 items")).toBeInTheDocument();
 			});
 
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: "Inactive" })[1],
+				screen.getAllByRole("menuitemcheckbox", { name: /^Inactive/ })[1],
 			);
 			await waitFor(() => {
 				expect(
@@ -388,7 +388,7 @@ describe("DataTable", () => {
 			const user = userEvent.setup();
 			renderTable();
 
-			await user.click(screen.getByRole("menuitemradio", { name: "US East" }));
+			await user.click(screen.getByRole("menuitemradio", { name: /^US East/ }));
 			await waitFor(() => {
 				expect(
 					screen.getByRole("cell", { name: "llm-gateway" }),
@@ -399,12 +399,10 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "image-gen" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("2 items")).toBeInTheDocument();
+				expect(screen.getByText("2 of 3 items")).toBeInTheDocument();
 			});
 
-			await user.click(
-				screen.getAllByRole("menuitemradio", { name: "US West" })[1],
-			);
+			await user.click(screen.getByRole("menuitemradio", { name: /^US West/ }));
 			await waitFor(() => {
 				expect(
 					screen.queryByRole("cell", { name: "llm-gateway" }),
@@ -415,7 +413,7 @@ describe("DataTable", () => {
 				expect(
 					screen.queryByRole("cell", { name: "speech-to-text" }),
 				).not.toBeInTheDocument();
-				expect(screen.getByText("1 item")).toBeInTheDocument();
+				expect(screen.getByText("1 of 3 items")).toBeInTheDocument();
 			});
 		});
 	});
@@ -458,10 +456,10 @@ describe("DataTable", () => {
 			renderTable();
 
 			await user.click(
-				screen.getByRole("menuitemcheckbox", { name: "Active" }),
+				screen.getByRole("menuitemcheckbox", { name: /^Active/ }),
 			);
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: "Inactive" })[0],
+				screen.getAllByRole("menuitemcheckbox", { name: /^Inactive/ })[0],
 			);
 			await waitFor(() => {
 				expect(
@@ -471,7 +469,7 @@ describe("DataTable", () => {
 				).toBeInTheDocument();
 			});
 
-			await user.click(screen.getByRole("button", { name: "Clear Filters" }));
+			await user.click(screen.getByRole("button", { name: "Clear filters" }));
 			await waitFor(() => {
 				expect(
 					screen.queryByText(
