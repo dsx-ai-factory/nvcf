@@ -104,6 +104,13 @@ impl ModelLifecycleHandle {
     }
 }
 
+/// The supervisor's view of a shutdown: its own stop, and the stats
+/// collector's shutdown mark.
+struct SupervisorShutdown {
+    stop: CancellationToken,
+    stats_collector: CancellationToken,
+}
+
 struct LiveModelGeneration {
     generation: ModelGeneration,
     canary: Option<OwnedTask>,
@@ -211,7 +218,11 @@ pub async fn start_model_lifecycle(
     let task = OwnedTask::spawn("model lifecycle supervisor", {
         let stopped_by_stats_collector = Arc::clone(&stopped_by_stats_collector);
         move |stop| async move {
-            match supervisor.run(stop).await {
+            let shutdown = SupervisorShutdown {
+                stop,
+                stats_collector: stats_shutdown,
+            };
+            match supervisor.run(&shutdown).await {
                 Ok(()) => {}
                 // Pylon stops the stats collector and this supervisor in one
                 // step, and the collector can stop first. The collector's
@@ -219,7 +230,7 @@ pub async fn start_model_lifecycle(
                 // collector, so a collector stop seen after the mark is part
                 // of that shutdown, not a supervisor failure.
                 Err(error @ ModelLifecycleError::StatsCollectorStopped)
-                    if stats_shutdown.is_cancelled() =>
+                    if shutdown.stats_collector.is_cancelled() =>
                 {
                     tracing::debug!(
                         error = %error,
@@ -258,15 +269,16 @@ fn observe_discovery_poll(
 }
 
 impl ModelLifecycleSupervisor {
-    async fn run(&mut self, stop: CancellationToken) -> Result<(), ModelLifecycleError> {
-        self.start_admitted_canaries(&stop);
+    async fn run(&mut self, shutdown: &SupervisorShutdown) -> Result<(), ModelLifecycleError> {
+        let stop = &shutdown.stop;
+        self.start_admitted_canaries(stop);
         loop {
             if stop.is_cancelled() {
                 return Ok(());
             }
 
             if let Some(pending) = self.pop_ready_pending() {
-                self.run_pending(pending, &stop).await?;
+                self.run_pending(pending, shutdown).await?;
                 continue;
             }
 
@@ -289,10 +301,14 @@ impl ModelLifecycleSupervisor {
     async fn run_pending(
         &mut self,
         pending: PendingInitialization,
-        stop: &CancellationToken,
+        shutdown: &SupervisorShutdown,
     ) -> Result<(), ModelLifecycleError> {
         let generation = pending.generation;
-        match self.drive_initialization(&generation, Some(stop)).await? {
+        let stop = &shutdown.stop;
+        match self
+            .drive_initialization(&generation, Some(shutdown))
+            .await?
+        {
             InitializationAttemptOutcome::Ready => {
                 self.admit(&generation).await?;
                 self.start_canary(&generation, stop)?;
@@ -480,10 +496,12 @@ impl ModelLifecycleSupervisor {
         Ok(generation)
     }
 
+    /// Runs an initialization attempt while it applies discovery polls.
+    /// Startup passes no `shutdown`, as nothing cancels its attempts.
     async fn drive_initialization(
         &mut self,
         generation: &ModelGeneration,
-        stop: Option<&CancellationToken>,
+        shutdown: Option<&SupervisorShutdown>,
     ) -> Result<InitializationAttemptOutcome, ModelLifecycleError> {
         if !self.is_current(generation) {
             return Ok(InitializationAttemptOutcome::Retired);
@@ -495,6 +513,7 @@ impl ModelLifecycleSupervisor {
             self.runtime_state.clone(),
             generation.clone(),
             self.metrics.clone(),
+            shutdown.map(|shutdown| shutdown.stats_collector.clone()),
         );
         tokio::pin!(attempt);
         let mut deferred_desired = Vec::new();
@@ -503,7 +522,7 @@ impl ModelLifecycleSupervisor {
             tokio::pin!(poll);
             tokio::select! {
                 biased;
-                _ = wait_for_cancellation(stop) => {
+                _ = wait_for_cancellation(shutdown.map(|shutdown| &shutdown.stop)) => {
                     return Ok(InitializationAttemptOutcome::Cancelled);
                 }
                 result = &mut poll => {
@@ -521,6 +540,11 @@ impl ModelLifecycleSupervisor {
                 result = &mut attempt => {
                     let outcome = match result {
                         Ok(()) => InitializationAttemptOutcome::Ready,
+                        // The stats collector's shutdown cut the attempt
+                        // short. The supervisor stops with it.
+                        Err(error @ ModelLifecycleError::StatsCollectorStopped) => {
+                            return Err(error);
+                        }
                         Err(error) => InitializationAttemptOutcome::Failed(error),
                     };
                     for desired in deferred_desired {
@@ -699,6 +723,11 @@ impl Drop for CalibrationAttemptTimer {
     }
 }
 
+/// Checks upstream health and calibrates when configured. A calibration whose
+/// stats collector request fails after the collector's shutdown mark is set
+/// is part of that shutdown: the attempt is recorded as cancelled and returns
+/// `ModelLifecycleError::StatsCollectorStopped` instead of an initialization
+/// failure.
 async fn initialization_attempt(
     http_client: reqwest::Client,
     config: ModelLifecycleConfig,
@@ -706,6 +735,7 @@ async fn initialization_attempt(
     runtime_state: PylonRuntimeState,
     generation: ModelGeneration,
     metrics: Option<Arc<PylonMetrics>>,
+    stats_shutdown: Option<CancellationToken>,
 ) -> Result<(), ModelLifecycleError> {
     if let Some(health_timeout) = health_probe_timeout(&config)
         && !is_upstream_ready(&http_client, &config, health_timeout).await
@@ -723,6 +753,14 @@ async fn initialization_attempt(
             &runtime_state,
         )
         .await;
+        if matches!(result, Err(BringupError::StatsCollectorStopped))
+            && stats_shutdown
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            // Dropping the timer records the attempt as cancelled.
+            return Err(ModelLifecycleError::StatsCollectorStopped);
+        }
         timer.finish(&result);
         result?;
     }
