@@ -45,11 +45,11 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
         initialised.countDown();
     }
 
-    @Scheduled(initialDelayString = "${account-index-migration.initial-delay:PT30M}",
-            fixedDelayString = "${account-index-migration.fixed-delay:PT5M}")
+    @Scheduled(initialDelayString = "${apikeys.account-index-migration.initial-delay:PT30M}",
+            fixedDelayString = "${apikeys.account-index-migration.fixed-delay:PT5M}")
     @SchedulerLock(name = KEYS_BY_ACCOUNT_INDEX_COPY,
-            lockAtLeastFor = "${account-index-migration.lock-at-least-for:PT1S}",
-            lockAtMostFor = "${account-index-migration.lock-at-most-for:PT5M}")
+            lockAtLeastFor = "${apikeys.account-index-migration.lock-at-least-for:PT1S}",
+            lockAtMostFor = "${apikeys.account-index-migration.lock-at-most-for:PT5M}")
     public void keysByAccountIndexCopy() throws InterruptedException {
         initialised.await();
         LockAssert.assertLocked();

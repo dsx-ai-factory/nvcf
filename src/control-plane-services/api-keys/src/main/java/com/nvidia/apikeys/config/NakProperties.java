@@ -39,7 +39,7 @@ import org.springframework.validation.annotation.Validated;
 @AllArgsConstructor
 @Configuration
 @Validated
-@ConfigurationProperties(prefix = "apikeys", ignoreUnknownFields = false)
+@ConfigurationProperties(prefix = "apikeys", ignoreUnknownFields = true)
 public class NakProperties {
 
     // service metadata

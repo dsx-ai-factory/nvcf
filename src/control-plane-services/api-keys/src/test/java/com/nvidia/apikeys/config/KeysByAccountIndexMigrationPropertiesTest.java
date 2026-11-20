@@ -53,11 +53,11 @@ class KeysByAccountIndexMigrationPropertiesTest {
     @Test
     void bindsOperatorSettingsAndKeepsSafeDefaults() {
         var binder = new Binder(new MapConfigurationPropertySource(Map.of(
-                "account-index-migration.page-size", "17",
-                "account-index-migration.fixed-delay", "2m",
-                "account-index-migration.lock-consistency", "QUORUM",
-                "account-index-migration.lock-serial-consistency", "SERIAL")));
-        var config = binder.bind("account-index-migration", Bindable.of(KeysByAccountIndexMigrationProperties.class))
+                "apikeys.account-index-migration.page-size", "17",
+                "apikeys.account-index-migration.fixed-delay", "2m",
+                "apikeys.account-index-migration.lock-consistency", "QUORUM",
+                "apikeys.account-index-migration.lock-serial-consistency", "SERIAL")));
+        var config = binder.bind("apikeys.account-index-migration", Bindable.of(KeysByAccountIndexMigrationProperties.class))
                 .orElseThrow(IllegalStateException::new);
         assertThat(config.getPageSize()).isEqualTo(17);
         assertThat(config.getFixedDelay()).isEqualTo(Duration.ofMinutes(2));
@@ -94,14 +94,14 @@ class KeysByAccountIndexMigrationPropertiesTest {
     @Test
     void standaloneSettingsRefreshThroughInjectedBean() {
         var values = new HashMap<String, Object>();
-        values.put("account-index-migration.page-size", "17");
+        values.put("apikeys.account-index-migration.page-size", "17");
         contextRunner.withInitializer(context -> context.getEnvironment().getPropertySources()
                 .addFirst(new MapPropertySource("migration-test", values))).run(context -> {
                     assertThat(context).hasNotFailed();
                     var config = context.getBean(KeysByAccountIndexMigrationProperties.class);
                     assertThat(config.getPageSize()).isEqualTo(17);
 
-                    values.put("account-index-migration.page-size", "23");
+                    values.put("apikeys.account-index-migration.page-size", "23");
                     context.getBean(RefreshScope.class).refreshAll();
 
                     assertThat(config.getPageSize()).isEqualTo(23);
@@ -110,7 +110,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
 
     @Test
     void invalidBoundSettingsFailStartup() {
-        contextRunner.withPropertyValues("account-index-migration.page-size=0").run(context -> {
+        contextRunner.withPropertyValues("apikeys.account-index-migration.page-size=0").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(BindValidationException.class);
         });
@@ -118,7 +118,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
 
     @Test
     void unknownMigrationSettingsFailStartup() {
-        contextRunner.withPropertyValues("account-index-migration.page-szie=17").run(context -> {
+        contextRunner.withPropertyValues("apikeys.account-index-migration.page-szie=17").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(UnboundConfigurationPropertiesException.class);
         });
@@ -129,7 +129,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
         contextRunner.withUserConfiguration(DistributedLockConfiguration.class,
                         ScheduledTaskService.class)
                 .withBean(CqlSession.class, () -> mock(CqlSession.class))
-                .withPropertyValues("apikeys.scheduler.enabled=false", "account-index-migration.enabled=true").run(context -> {
+                .withPropertyValues("apikeys.scheduler.enabled=false", "apikeys.account-index-migration.enabled=true").run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).isEnabled()).isTrue();
                     assertThat(context).doesNotHaveBean(ScheduledTaskService.class)
@@ -156,7 +156,7 @@ class KeysByAccountIndexMigrationPropertiesTest {
         contextRunner.withUserConfiguration(DistributedLockConfiguration.class, ScheduledTaskService.class)
                 .withBean(CqlSession.class, () -> mock(CqlSession.class))
                 .withBean(KeysByAccountIndexMigrationTask.class, () -> mock(KeysByAccountIndexMigrationTask.class))
-                .withPropertyValues("account-index-migration.enabled=false").run(context -> {
+                .withPropertyValues("apikeys.account-index-migration.enabled=false").run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).isEnabled()).isFalse();
                     assertThat(context).hasSingleBean(ScheduledTaskService.class).hasSingleBean(LockProvider.class);
@@ -178,12 +178,12 @@ class KeysByAccountIndexMigrationPropertiesTest {
 
     @Test
     void standaloneMigrationSettingsCoexistWithStrictServiceSettings() {
-        serviceContext().withPropertyValues("account-index-migration.page-size=17").run(context -> {
+        serviceContext().withPropertyValues("apikeys.account-index-migration.page-size=17").run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(context.getBean(NakProperties.class).getNcaId()).isEqualTo("test-account");
             assertThat(context.getBean(KeysByAccountIndexMigrationProperties.class).getPageSize()).isEqualTo(17);
         });
-        serviceContext().withPropertyValues("apikeys.unknown-setting=unexpected").run(context -> {
+        serviceContext().withPropertyValues("apikeys.account-index-migration.page-szie=17").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(UnboundConfigurationPropertiesException.class);
         });

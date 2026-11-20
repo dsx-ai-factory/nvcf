@@ -38,7 +38,7 @@ import org.springframework.validation.annotation.Validated;
 @Configuration
 @RefreshScope
 @Validated
-@ConfigurationProperties(prefix = "account-index-migration", ignoreUnknownFields = false)
+@ConfigurationProperties(prefix = "apikeys.account-index-migration", ignoreUnknownFields = false)
 public class KeysByAccountIndexMigrationProperties {
     @Builder.Default
     private boolean enabled = true;
