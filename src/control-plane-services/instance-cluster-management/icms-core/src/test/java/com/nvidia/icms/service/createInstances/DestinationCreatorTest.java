@@ -35,8 +35,7 @@ import com.nvidia.icms.configuration.bean.IcmsConfigurationProperties;
 import com.nvidia.icms.configuration.byoc.ByocConfigurationProperties;
 import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
@@ -67,7 +66,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
     @Mock private ByocConfigurationProperties byocConfigurationProperties;
 
     private DestinationCreator creator;
-    private ClusterByGroupIdAndIdEntity clusterEntity;
+    private ClusterEntity clusterEntity;
 
     @BeforeEach
     void setUp() {
@@ -76,7 +75,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
     }
 
     // -------------------------------------------------------------------------
-    // createDestination — targeted (ClusterByGroupIdAndIdEntity source)
+    // createDestination - targeted (ClusterEntity source)
     // -------------------------------------------------------------------------
 
     @Test
@@ -206,12 +205,12 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
     }
 
     // -------------------------------------------------------------------------
-    // createDestination — non-targeted (ClustersByAuthorizedAccountsEntity source)
+    // createDestination - non-targeted (ClusterEntity source)
     // -------------------------------------------------------------------------
 
     @Test
     void createDestination_nonTargeted_withValidInputs_createsCorrectDestination() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         InstanceTypeUdt instanceType = createInstanceTypeUdt();
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
@@ -233,7 +232,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void createDestination_nonTargeted_withCustomGpuCount_appliesRequiredGpuCount() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         InstanceTypeUdt instanceType = createInstanceTypeWithCustomGpuCount(4);
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
@@ -250,7 +249,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void createDestination_nonTargeted_withCustomInstanceTypeValue_preservesValue() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         InstanceTypeUdt instanceType = createInstanceTypeWithCustomValue(CUSTOM_INSTANCE_TYPE_VALUE);
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
@@ -264,7 +263,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void createDestination_nonTargeted_withAuthorizedNcaIds_preservesNcaIds() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         entity.setAuthorizedNcaIds(Set.of(NCA_1, NCA_2, NCA_3));
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
@@ -278,7 +277,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void createDestination_nonTargeted_withGcpProvider_setsCorrectProvider() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
         InstanceTypeV5Udt instanceTypeV5 = createInstanceTypeV5();
@@ -291,7 +290,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void createDestination_nonTargeted_withAzureProvider_setsCorrectProvider() {
-        ClustersByAuthorizedAccountsEntity entity =
+        ClusterEntity entity =
                 createClusterForByoc(DUMMY_BYOC_NCA_ID, CLUSTER_GROUP, CLUSTER_GROUP, DUMMY_CLUSTER_ID);
         DestinationClusterData data = new DestinationClusterData(entity, Map.of(DUMMY_GPU, "queueUrl"));
         InstanceTypeV5Udt instanceTypeV5 = createInstanceTypeV5();
@@ -308,7 +307,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_withMatchingGpuAndInstanceType_returnsDestination() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         GpuUsageFilter filter = GpuUsageFilter.builder()
                 .gpuNames(Set.of(DUMMY_GPU))
@@ -325,7 +324,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenCloudProviderIsNull_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         GpuUsageFilter filter = GpuUsageFilter.builder()
                 .gpuNames(Set.of(DUMMY_GPU))
@@ -340,7 +339,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenGpuNameNotAllowed_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         GpuUsageFilter filter = GpuUsageFilter.builder()
                 .gpuNames(Set.of("different-gpu"))
@@ -355,7 +354,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenQueueUrlMissing_skipsDestinationAndReturnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         // Queue map does not contain an entry for DUMMY_GPU — get() returns null
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of());
         GpuUsageFilter filter = GpuUsageFilter.builder()
@@ -371,7 +370,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenInstanceTypeNotAllowed_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         GpuUsageFilter filter = GpuUsageFilter.builder()
                 .gpuNames(Set.of(DUMMY_GPU))
@@ -386,7 +385,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenQueueUrlMapIsEmpty_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         // Explicitly empty map — no GPU has a queue URL registered
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of());
         GpuUsageFilter filter = GpuUsageFilter.builder()
@@ -402,7 +401,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenClusterGroupNameNotAllowed_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         cluster.setClusterGroupName("byoc-group");
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         GpuUsageFilter filter = GpuUsageFilter.builder()
@@ -419,7 +418,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_whenGpusV5IsNull_returnsEmpty() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         cluster.setGpusV5(null);
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of());
         GpuUsageFilter filter = GpuUsageFilter.builder()
@@ -435,7 +434,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_withMultipleMatchingGpus_returnsOneDestinationPerGpu() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         GpuV5Udt gpu2 = new GpuV5Udt();
         gpu2.setName("gpu-2");
         gpu2.setInstanceTypes(Set.of(createInstanceTypeV5()));
@@ -457,7 +456,7 @@ class DestinationCreatorTest extends CreateInstancesTestBase {
 
     @Test
     void addAvailableDestinations_withEmptyFilter_returnsDestination() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         DestinationClusterData data = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
         // No GPU names or instance types specified — filter imposes no restriction
         GpuUsageFilter filter = GpuUsageFilter.builder().build();

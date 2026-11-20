@@ -19,7 +19,7 @@ package com.nvidia.icms.service.extensions.impl;
 import com.nvidia.icms.service.extensions.api.InstanceDestinationProvider;
 
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.service.createInstances.RequestInstanceDestination;
 import java.util.Collections;
 import java.util.Set;
@@ -49,7 +49,7 @@ public class NoOpInstanceDestinationProvider implements InstanceDestinationProvi
 
     @Override
     public Set<String> getAuthorizedZones(
-            Set<ClusterByGroupIdAndIdEntity> readyClusters, String ncaId) {
+            Set<ClusterEntity> readyClusters, String ncaId) {
         log.debug("NoOpInstanceDestinationProvider.getAuthorizedZones called — returning empty set");
         return Collections.emptySet();
     }

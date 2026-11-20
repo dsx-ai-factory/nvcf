@@ -125,9 +125,6 @@ public class IcmsConfigurationProperties {
 
     private boolean findInstancesByRequestIdForGpuUsageInParallel;
 
-    private int gpusV5PopulationTaskLockTtlInSeconds;
-    private boolean gpuV5PopulationTaskEnabled;
-
     private int databaseReadPageSize;
 
     private boolean shuttingDownInstanceTerminationTaskEnabled;

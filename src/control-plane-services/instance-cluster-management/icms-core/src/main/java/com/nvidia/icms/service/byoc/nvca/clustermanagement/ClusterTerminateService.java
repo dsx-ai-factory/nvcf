@@ -33,10 +33,7 @@ import com.nvidia.icms.errors.IcmsNotFoundException;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupByGroupIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.sqs.QueueManager;
@@ -159,7 +156,7 @@ public class ClusterTerminateService {
             Map<String, Object> auditProps) {
 
         // GET all clusters in cluster group
-        List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList = clusterRepository
+        List<ClusterEntity> clusterByGroupIdList = clusterRepository
                 .getClustersFromClusterGroup(clusterEntity.getClusterGroupId());
 
         // If single cluster in cluster group then we want to clear all creation queues before we delete cluster group
@@ -210,12 +207,12 @@ public class ClusterTerminateService {
 
     private void deleteAllClusterCreationQueues(@NotNull ClusterEntity clusterEntity) {
         // Check if cluster group is present
-        Optional<ClusterGroupByGroupIdEntity> optionalClusterGroupByGroupIdEntity =
+        Optional<ClusterEntity> remainingGroupCluster =
                 clusterRepository.getClusterGroupInfoByClusterGroupId(
                         clusterEntity.getClusterGroupId());
 
         // Cas1: Cluster group is deleted then delete all queues
-        if (optionalClusterGroupByGroupIdEntity.isEmpty() &&
+        if (remainingGroupCluster.isEmpty() &&
                 clusterEntity.getCreationQueues() != null) {
             // If cluster group has been deleted then creation queues can be deleted
             for (CreationQueueUdt creationQueue : clusterEntity.getCreationQueues().values()) {
@@ -239,7 +236,7 @@ public class ClusterTerminateService {
                 deleteClusterCreationQueuesForTasks(clusterEntity);
             }
 
-        } else if (!isSetEmptyOrNull(NvcaConverter.getGpusV5(clusterEntity))) {
+        } else if (!isSetEmptyOrNull(clusterEntity.getGpusV5())) {
             // Case 2: Cluster group is not yet deleted
             // Check if there is any non-shared GPU in this cluster among all clusters
             // Fetch allCluster info when Gpus are not empty and find non-shared gpus
@@ -260,12 +257,12 @@ public class ClusterTerminateService {
     }
 
     private void deleteNonSharedCreationQueue(ClusterEntity clusterEntity) {
-        List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList =
+        List<ClusterEntity> clusterByGroupIdList =
                 clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId());
 
         // Find non-shared GPUs set
         Set<GpuV5Udt> nonSharedGpus = getNonSharedGpus(clusterByGroupIdList,
-                                                    NvcaConverter.getGpusV5(clusterEntity));
+                                                    clusterEntity.getGpusV5());
 
         // Delete creation queues for non-shared GPUs set
         for (GpuV5Udt gpuV5 : nonSharedGpus) {
@@ -333,13 +330,13 @@ public class ClusterTerminateService {
     }
 
     private Set<GpuV5Udt> getNonSharedGpus(
-            List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList,
+            List<ClusterEntity> clusterByGroupIdList,
             Set<GpuV5Udt> clusterGpus) {
 
         var copyGpuSet = new HashSet<>(clusterGpus);
-        for (ClusterByGroupIdAndIdEntity clusterInGroup : clusterByGroupIdList) {
+        for (ClusterEntity clusterInGroup : clusterByGroupIdList) {
             // Remove shared GPUs from copy set
-            copyGpuSet.removeAll(NvcaConverter.getGpusV5(clusterInGroup));
+            copyGpuSet.removeAll(clusterInGroup.getGpusV5());
         }
         // Now copy set contains only GPUs which are not shared among clusters
         return copyGpuSet;

@@ -43,10 +43,8 @@ import com.nvidia.icms.inbound.rest.model.nvca.SisConfig;
 import com.nvidia.icms.inbound.rest.model.nvca.VaultConfig;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
@@ -230,14 +228,14 @@ public class ClusterListingService {
             String ncaId,
             Boolean includeNonByocInAuthorizedClusters) {
         // Get all authorized clusters for ncaId
-        List<ClustersByAuthorizedAccountsEntity> allClustersInAuthorizedAccount =
+        List<ClusterEntity> allClustersInAuthorizedAccount =
                 new ArrayList<>(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ncaId));
         allClustersInAuthorizedAccount.addAll(
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount(
                         ClusterRepository.WILDCARD));
 
         List<GetClusterResponse> clusterResponseList = new ArrayList<>();
-        for (ClustersByAuthorizedAccountsEntity authorizedClusterEntity : allClustersInAuthorizedAccount) {
+        for (ClusterEntity authorizedClusterEntity : allClustersInAuthorizedAccount) {
 
             // Skip first-party platform clusters if includeNonByocInAuthorizedClusters=false
             if (computePlatformService.isPlatformCluster(authorizedClusterEntity.getClusterGroupName()) &&
@@ -245,21 +243,13 @@ public class ClusterListingService {
                 continue;
             }
 
-            // Get cluster entity from authorized ncaId
-            Optional<ClusterEntity> optionalClusterEntity = clusterRepository.getClusterInfoByClusterId(
-                    authorizedClusterEntity.getKey().getClusterId(), false);
-            if (optionalClusterEntity.isPresent()) {
-                ClusterEntity clusterEntity = optionalClusterEntity.get();
-
-                // Validating cluster meant for NVCA2.0
-                if (clusterEntity.getNvcaVersion() != null) {
-
-                    GetClusterResponse clusterResponse = toGetClusterResponse(clusterEntity);
-                    setClusterConfigurations(clusterResponse);
-                    fetchAndUpdateClusterInfoFromCloudHealthEntity(clusterResponse,
-                                                                   clusterEntity.getClusterStatus());
-                    clusterResponseList.add(clusterResponse);
-                }
+            // Validating cluster meant for NVCA2.0
+            if (authorizedClusterEntity.getNvcaVersion() != null) {
+                GetClusterResponse clusterResponse = toGetClusterResponse(authorizedClusterEntity);
+                setClusterConfigurations(clusterResponse);
+                fetchAndUpdateClusterInfoFromCloudHealthEntity(clusterResponse,
+                                                               authorizedClusterEntity.getClusterStatus());
+                clusterResponseList.add(clusterResponse);
             }
         }
 
@@ -327,7 +317,7 @@ public class ClusterListingService {
                 .capabilities(clusterEntity.getCapabilities())
                 .attributes(clusterEntity.getAttributes())
                 .customAttributes(customAttributes)
-                .gpus(toGpuRequestSchemas(NvcaConverter.getGpusV5(clusterEntity)))
+                .gpus(toGpuRequestSchemas(clusterEntity.getGpusV5()))
                 .nvcaVersion(clusterEntity.getNvcaVersion())
                 .oAuthClientId(clusterEntity.getAuthClientId())
                 .clusterId(clusterEntity.getClusterId())

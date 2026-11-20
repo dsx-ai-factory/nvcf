@@ -38,10 +38,10 @@ import static org.mockito.Mockito.when;
 
 import com.nvidia.icms.inbound.rest.model.CloudHealthStatus;
 import com.nvidia.icms.inbound.rest.model.ResourceProvider;
+import com.nvidia.icms.inbound.rest.model.byoc.ClusterStatusEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.CloudHealthRepository;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.util.TestUtil;
@@ -79,7 +79,7 @@ class ClusterTargetingHelperTest {
 
         String ncaId = DUMMY_BYOC_NCA_ID;
 
-        ClustersByAuthorizedAccountsEntity clustersByAuthorizedAccountsEntity =
+        ClusterEntity clustersByAuthorizedAccountsEntity =
                 getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
                                                         DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                                                         ncaId, DUMMY_BYOC_INSTANCE_TYPE,
@@ -87,7 +87,7 @@ class ClusterTargetingHelperTest {
                                                         DUMMY_GPU_NAME, 8,
                                                         DUMMY_BYOC_AUTHORIZED_NCA_ID);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
+        ClusterEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
                 DUMMY_CLUSTER_ID, DUMMY_BYOC_CLUSTER_NAME, DUMMY_CLUSTER_GROUP_ID,
                 DUMMY_BYOC_CLUSTER_GROUP_NAME,
                 ncaId, Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 8,
@@ -100,13 +100,37 @@ class ClusterTargetingHelperTest {
                 List.of(clusterByGroupIdAndIdEntity));
 
         // Act
-        Set<ClusterByGroupIdAndIdEntity> resp = clusterTargetingHelper.getReadyClusterEntitiesForNcaId(
+        Set<ClusterEntity> resp = clusterTargetingHelper.getReadyClusterEntitiesForNcaId(
                 ncaId);
 
         // Assert
         assertEquals(Set.of(clusterByGroupIdAndIdEntity), resp);
         verify(nvcaClusterRepository).getAllClustersInAuthorizedAccount(ncaId);
         verify(clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
+    }
+
+    @Test
+    void getReadyClusterEntitiesForNcaId_expandsAuthorizedClusterToReadyGroupMembers() {
+        ClusterEntity authorized = getClusterByGroupIdAndIdEntity(
+                "authorized", DUMMY_BYOC_CLUSTER_NAME, DUMMY_CLUSTER_GROUP_ID,
+                DUMMY_BYOC_CLUSTER_GROUP_NAME, DUMMY_BYOC_NCA_ID,
+                Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE,
+                        DUMMY_BYOC_INSTANCE_TYPE_VALUE, 8, DUMMY_GPU_NAME)));
+        ClusterEntity sibling = authorized.toBuilder()
+                .clusterId("sibling")
+                .authorizedNcaIds(Set.of())
+                .build();
+        ClusterEntity notReady = authorized.toBuilder()
+                .clusterId("not-ready")
+                .clusterStatus(ClusterStatusEnum.NOT_READY)
+                .build();
+        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
+                .thenReturn(List.of(authorized));
+        when(clusterRepository.getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID))
+                .thenReturn(List.of(authorized, sibling, notReady));
+
+        assertEquals(Set.of(authorized, sibling),
+                clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID));
     }
 
     @Test

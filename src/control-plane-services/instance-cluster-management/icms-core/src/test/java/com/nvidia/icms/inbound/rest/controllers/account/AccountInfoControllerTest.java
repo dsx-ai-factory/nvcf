@@ -48,10 +48,7 @@ import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
 import com.nvidia.icms.integration.IntegrationTest;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsKey;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
@@ -125,13 +122,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -173,13 +170,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String azureClusterId = UUID.randomUUID().toString();
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -220,13 +217,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -266,13 +263,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -312,13 +309,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -360,13 +357,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String azureClusterId = UUID.randomUUID().toString();
         String ociClusterGroupId = UUID.randomUUID().toString();
         String ociClusterId = UUID.randomUUID().toString();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterByGroupIdAndIdEntityAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityAzure);
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
@@ -410,13 +407,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         var instanceType2 = getDummyInstanceTypeV5("instance_type_2", "instance_type_value_2", 1, NodeTypeEnum.MULTI);
         var dummyGpuV5 = getDummyGpuV5(Set.of(instanceType1, instanceType2), DUMMY_OCI_GPU_NAME);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
         // Setting nodeType as MULTI
         clusterByGroupIdAndIdEntityOci.setGpusV5(Set.of(dummyGpuV5));
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);
@@ -460,13 +457,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         var instanceType2 = getDummyInstanceTypeV5("instance_type_2", "instance_type_value_2", 1, NodeTypeEnum.MULTI);
         var dummyGpuV5 = getDummyGpuV5(Set.of(instanceType1, instanceType2), DUMMY_OCI_GPU_NAME);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
         // Setting nodeType as MULTI
         clusterByGroupIdAndIdEntityOci.setGpusV5(Set.of(dummyGpuV5));
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);
@@ -510,13 +507,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         var instanceType2 = getDummyInstanceTypeV5("instance_type_2", "instance_type_value_2", 1, NodeTypeEnum.MULTI);
         var dummyGpuV5 = getDummyGpuV5(Set.of(instanceType1, instanceType2), DUMMY_OCI_GPU_NAME);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
         // Setting nodeType as MULTI
         clusterByGroupIdAndIdEntityOci.setGpusV5(Set.of(dummyGpuV5));
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);
@@ -581,13 +578,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         var instanceType2 = getDummyInstanceTypeV5("instance_type_2", "instance_type_value_2", 1, NodeTypeEnum.MULTI);
         var dummyGpuV5 = getDummyGpuV5(Set.of(instanceType1, instanceType2), DUMMY_OCI_GPU_NAME);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
         // Setting nodeType as MULTI
         clusterByGroupIdAndIdEntityOci.setGpusV5(Set.of(dummyGpuV5));
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);
@@ -629,13 +626,13 @@ public class AccountInfoControllerTest extends IntegrationTest {
         var instanceType2 = getDummyInstanceTypeV5("instance_type_2", "instance_type_value_2", 1, NodeTypeEnum.MULTI);
         var dummyGpuV5 = getDummyGpuV5(Set.of(instanceType1, instanceType2), DUMMY_OCI_GPU_NAME);
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
+        ClusterEntity clusterByGroupIdAndIdEntityOci = getClusterByGroupIdAndIdEntityForOci(
                 ociClusterGroupId, ociClusterId);
 
         // Setting nodeType as MULTI
         clusterByGroupIdAndIdEntityOci.setGpusV5(Set.of(dummyGpuV5));
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterByGroupIdAndIdEntityOci);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);
@@ -666,7 +663,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
     }
 
     @NotNull
-    private static ClusterByGroupIdAndIdEntity getClusterByGroupIdAndIdEntityForAzure(
+    private static ClusterEntity getClusterByGroupIdAndIdEntityForAzure(
             String clusterGroupId, String clusterId) {
         return getDummyClusterGroup("AZURE", clusterGroupId, clusterId,
                                     "azure_cluster_name",
@@ -678,7 +675,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
     }
 
     @NotNull
-    private static ClusterByGroupIdAndIdEntity getClusterByGroupIdAndIdEntityForOci(
+    private static ClusterEntity getClusterByGroupIdAndIdEntityForOci(
             String clusterGroupId, String clusterId) {
         return getDummyClusterGroup("OCI", clusterGroupId, clusterId,
                                     "oci_cluster_name",
@@ -689,7 +686,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
                                     "dummy_region_2", ClusterProviderEnum.OCI);
     }
 
-    private static ClustersByAuthorizedAccountsEntity getDummyClustersByAuthorizedAccountRespForAzure(
+    private static ClusterEntity getDummyClustersByAuthorizedAccountRespForAzure(
             String clusterGroupId, String clusterId) {
         return getDummyClustersByAuthorizedAccountResp(clusterGroupId, clusterId,
                                                        DUMMY_AZURE_INSTANCE_TYPE,
@@ -697,7 +694,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
                                                        DUMMY_AZURE_GPU_NAME);
     }
 
-    private static ClustersByAuthorizedAccountsEntity getDummyClustersByAuthorizedAccountRespForOci(
+    private static ClusterEntity getDummyClustersByAuthorizedAccountRespForOci(
             String clusterGroupId, String clusterId) {
         return getDummyClustersByAuthorizedAccountResp(clusterGroupId, clusterId,
                                                        DUMMY_OCI_INSTANCE_TYPE,
@@ -705,7 +702,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
                                                        DUMMY_OCI_GPU_NAME);
     }
 
-    private static ClustersByAuthorizedAccountsEntity getDummyClustersByAuthorizedAccountResp(
+    private static ClusterEntity getDummyClustersByAuthorizedAccountResp(
             String clusterGroupId, String clusterId, String instanceType, String instanceTypeValue, String gpuName) {
 
         Map<String, CreationQueueUdt> creationQueueMap = new HashMap<>();
@@ -714,11 +711,8 @@ public class AccountInfoControllerTest extends IntegrationTest {
                 .queueType(QueueAttributeName.FifoQueue.toString())
                 .build());
         GpuV5Udt gpuV5 = getDummyGpuV5(instanceType, instanceTypeValue, 8, gpuName);
-        return ClustersByAuthorizedAccountsEntity.builder()
-                .key(ClustersByAuthorizedAccountsKey.builder()
-                             .ncaIdKey(DUMMY_BYOC_AUTHORIZED_NCA_ID)
-                             .clusterId(clusterId)
-                             .build())
+        return ClusterEntity.builder()
+                .clusterId(clusterId)
                 .ncaId(DUMMY_BYOC_NCA_ID)
                 .clusterGroupName(DUMMY_BYOC_CLUSTER_GROUP_NAME)
                 .clusterGroupId(clusterGroupId)
@@ -728,7 +722,7 @@ public class AccountInfoControllerTest extends IntegrationTest {
                 .build();
     }
 
-    private static ClusterByGroupIdAndIdEntity getDummyClusterGroup(String clusterGroupName,
+    private static ClusterEntity getDummyClusterGroup(String clusterGroupName,
                                                                     String clusterGroupId,
                                                                     String clusterId,
                                                                     String clusterName,
@@ -738,11 +732,9 @@ public class AccountInfoControllerTest extends IntegrationTest {
                                                                     String region,
                                                                     ClusterProviderEnum clusterProviderEnum) {
 
-        return ClusterByGroupIdAndIdEntity.builder()
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterGroupId(clusterGroupId)
-                             .clusterId(clusterId)
-                             .build())
+        return ClusterEntity.builder()
+                .clusterGroupId(clusterGroupId)
+                .clusterId(clusterId)
                 .clusterGroupName(clusterGroupName)
                 .clusterDescription("dummy_cluster_description").k8sVersion("v1.25.9")
                 .clusterStatus(ClusterStatusEnum.READY).clusterName(clusterName)
@@ -884,10 +876,10 @@ public class AccountInfoControllerTest extends IntegrationTest {
         String azureClusterGroupId = UUID.randomUUID().toString();
         String azureClusterId = UUID.randomUUID().toString();
 
-        ClusterByGroupIdAndIdEntity clusterAzure = getClusterByGroupIdAndIdEntityForAzure(
+        ClusterEntity clusterAzure = getClusterByGroupIdAndIdEntityForAzure(
                 azureClusterGroupId, azureClusterId);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
         readyClusterEntities.add(clusterAzure);
         Mockito.when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID))
                 .thenReturn(readyClusterEntities);

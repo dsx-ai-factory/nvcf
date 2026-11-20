@@ -21,9 +21,6 @@ import static com.nvidia.icms.util.TestUtil.getDummyClusterEntity;
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterStatusEnum;
 import com.nvidia.icms.integration.IntegrationTest;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupByGroupIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -51,6 +48,12 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         nvcaClusterRepository.updateClusterConfiguration(entity);
 
         assertNoUnusedRows(entity);
+        var storedCluster = CQL_SESSION.execute(
+                "SELECT gpus_v4, gpus_v5 FROM test.cluster_by_cluster_id WHERE cluster_id = ?",
+                entity.getClusterId()).one();
+        Assertions.assertNotNull(storedCluster);
+        Assertions.assertTrue(storedCluster.isNull("gpus_v4"));
+        Assertions.assertFalse(storedCluster.isNull("gpus_v5"));
     }
 
     @Test
@@ -62,13 +65,13 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         ClusterEntity unrelated = saveCluster("owner-d", Set.of("other"));
 
         // Act
-        List<ClustersByAuthorizedAccountsEntity> forAuthorizedAccount =
+        List<ClusterEntity> forAuthorizedAccount =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount("auth-a");
-        List<ClustersByAuthorizedAccountsEntity> forOwnerAccount =
+        List<ClusterEntity> forOwnerAccount =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount("owner-a");
-        List<ClustersByAuthorizedAccountsEntity> forWildcardKey =
+        List<ClusterEntity> forWildcardKey =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD);
-        List<ClustersByAuthorizedAccountsEntity> forUnrelatedAccount =
+        List<ClusterEntity> forUnrelatedAccount =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount("nobody");
 
         // Assert
@@ -93,12 +96,12 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         ClusterEntity cluster = saveCluster("owner-e", Set.of("owner-e"));
 
         // Act
-        List<ClustersByAuthorizedAccountsEntity> result =
+        List<ClusterEntity> result =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount("owner-e");
 
         // Assert
         Assertions.assertEquals(1, result.size());
-        Assertions.assertEquals(cluster.getClusterId(), result.get(0).getKey().getClusterId());
+        Assertions.assertEquals(cluster.getClusterId(), result.get(0).getClusterId());
         Assertions.assertEquals(cluster.getClusterName(), result.get(0).getClusterName());
         Assertions.assertEquals(cluster.getClusterGroupId(), result.get(0).getClusterGroupId());
         Assertions.assertEquals(cluster.getNcaId(), result.get(0).getNcaId());
@@ -115,9 +118,9 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         // Act
         Set<ClusterEntity> clustersInGroup =
                 clusterRepository.getAllClustersInAGroup(entity.getClusterGroupId());
-        Optional<ClusterGroupByGroupIdEntity> groupById =
+        Optional<ClusterEntity> groupById =
                 clusterRepository.getClusterGroupInfoByClusterGroupId(entity.getClusterGroupId());
-        Optional<ClusterGroupsByAccountEntity> groupByAccount =
+        Optional<ClusterEntity> groupByAccount =
                 clusterRepository.getClusterGroupInfoByAccountAndNameInMainAccount(
                         entity.getNcaId(), entity.getClusterGroupName());
         Optional<ClusterEntity> byAccountAndName =
@@ -131,15 +134,17 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         Assertions.assertEquals(Set.of(entity.getClusterId()), toEntityClusterIds(clustersInGroup));
         Assertions.assertTrue(groupById.isPresent());
         Assertions.assertEquals(entity.getClusterGroupId(), groupById.get().getClusterGroupId());
+        Assertions.assertEquals(entity.getClusterId(), groupById.get().getClusterId());
         Assertions.assertTrue(groupByAccount.isPresent());
         Assertions.assertEquals(entity.getClusterGroupId(),
                                 groupByAccount.get().getClusterGroupId());
+        Assertions.assertEquals(entity.getClusterId(), groupByAccount.get().getClusterId());
         Assertions.assertTrue(byAccountAndName.isPresent());
         Assertions.assertEquals(entity.getClusterId(), byAccountAndName.get().getClusterId());
         Assertions.assertEquals(List.of(entity.getClusterId()),
                                 allInAccount.stream().map(ClusterEntity::getClusterId).toList());
         Assertions.assertEquals(1, fromGroup.size());
-        Assertions.assertEquals(entity.getClusterId(), fromGroup.get(0).getKey().getClusterId());
+        Assertions.assertEquals(entity.getClusterId(), fromGroup.get(0).getClusterId());
     }
 
     @Test
@@ -177,9 +182,9 @@ public class ClusterByIdReadsIntegrationTest extends IntegrationTest {
         return entity;
     }
 
-    private static Set<String> toClusterIds(List<ClustersByAuthorizedAccountsEntity> entities) {
+    private static Set<String> toClusterIds(List<ClusterEntity> entities) {
         return entities.stream()
-                .map(entity -> entity.getKey().getClusterId())
+                .map(ClusterEntity::getClusterId)
                 .collect(Collectors.toSet());
     }
 

@@ -32,10 +32,8 @@ import com.nvidia.icms.inbound.rest.model.nvca.NvcaRegistrationResponse;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterConfigurationByClusterIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthKey;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.GpuCapacity;
@@ -76,7 +74,7 @@ import static com.nvidia.icms.util.TestUtil.DUMMY_NON_BYOC_ZONE_NAME;
 import static com.nvidia.icms.util.TestUtil.DUMMY_GPU_NAME;
 import static com.nvidia.icms.util.TestUtil.buildGpuUdts;
 import static com.nvidia.icms.util.TestUtil.getDummyClustersByAuthorizedAccountResp;
-import static com.nvidia.icms.util.TestUtil.getDummyGpuV4;
+import static com.nvidia.icms.util.TestUtil.getDummyGpuV5;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -201,34 +199,13 @@ class ClusterListingServiceTest {
     void getClustersByNcaId_withAllAuthorizedClustersFilter_returnsSuccess() {
 
         // Prepare
-        ClustersByAuthorizedAccountsEntity nonByocCluster1 =
-                getDummyClustersByAuthorizedAccountResp(PLATFORM_CLUSTER_GROUP_NAME,
-                                                        PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
-                                                        DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
-                                                        DUMMY_BYOC_INSTANCE_TYPE_VALUE,
-                                                        DUMMY_GPU_NAME, 8,
-                                                        DUMMY_BYOC_AUTHORIZED_NCA_ID);
-        String clusterGroupId = UUID.randomUUID().toString();
-        ClustersByAuthorizedAccountsEntity cluster2 =
-                getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
-                                                        clusterGroupId, DUMMY_CLUSTER_ID + "_1",
-                                                        DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
-                                                        DUMMY_BYOC_INSTANCE_TYPE_VALUE,
-                                                        DUMMY_GPU_NAME, 8, "*");
-
-        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(
-                new ArrayList<>(List.of(cluster2)));
-
-        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(WILDCARD)).thenReturn(
-                new ArrayList<>(List.of(nonByocCluster1)));
-
-        // Send clusterEntity for Non BYOC as well
+        // Use the full rows returned by the cluster-by-id query.
         ClusterEntity nonByocClusterEntity = getDummyClusterEntityForNonByocRegistration();
         ClusterEntity clusterEntity = TestUtil.getDummyClusterEntity();
-        when(clusterRepository.getClusterInfoByClusterId(cluster2.getKey().getClusterId(), false))
-                .thenReturn(Optional.of(clusterEntity));
-        when(clusterRepository.getClusterInfoByClusterId(nonByocCluster1.getKey().getClusterId(), false))
-                .thenReturn(Optional.of(nonByocClusterEntity));
+        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
+                .thenReturn(new ArrayList<>(List.of(clusterEntity)));
+        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(WILDCARD))
+                .thenReturn(new ArrayList<>(List.of(nonByocClusterEntity)));
 
         // Mock nested configuration objects
         var mockSisConfig = new NvcaConfigurationProperties.SisConfig();
@@ -704,7 +681,7 @@ class ClusterListingServiceTest {
     @Test
     void getClustersByNcaId_withAuthorizedNonByocClusterAndIncludeFalse_skipsNonByocCluster() {
         // Prepare
-        ClustersByAuthorizedAccountsEntity nonByocCluster =
+        ClusterEntity nonByocCluster =
                 getDummyClustersByAuthorizedAccountResp(PLATFORM_CLUSTER_GROUP_NAME,
                         PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -728,7 +705,7 @@ class ClusterListingServiceTest {
     @Test
     void getClustersByNcaId_withAuthorizedNonByocClusterAndIncludeNull_skipsNonByocCluster() {
         // Prepare
-        ClustersByAuthorizedAccountsEntity nonByocCluster =
+        ClusterEntity nonByocCluster =
                 getDummyClustersByAuthorizedAccountResp(PLATFORM_CLUSTER_GROUP_NAME,
                         PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -752,7 +729,7 @@ class ClusterListingServiceTest {
     @Test
     void getClustersByNcaId_withAuthorizedClusters_appliesGpuGating() {
         // Prepare
-        ClustersByAuthorizedAccountsEntity authorizedCluster =
+        ClusterEntity authorizedCluster =
                 getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
                         PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -912,23 +889,13 @@ class ClusterListingServiceTest {
     @Test
     void getClustersByNcaId_withAuthorizedNvca1Cluster_skipsCluster() {
         // Prepare - authorized cluster that is NVCA 1.0 (nvcaVersion = null)
-        String clusterGroupId = UUID.randomUUID().toString();
-        ClustersByAuthorizedAccountsEntity authorizedCluster =
-                getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
-                        clusterGroupId, DUMMY_CLUSTER_ID,
-                        DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
-                        DUMMY_BYOC_INSTANCE_TYPE_VALUE, DUMMY_GPU_NAME, 8,
-                        DUMMY_BYOC_AUTHORIZED_NCA_ID);
-
         ClusterEntity nvca1Cluster = TestUtil.getDummyClusterEntity();
         nvca1Cluster.setNvcaVersion(null);
 
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
-                .thenReturn(new ArrayList<>(List.of(authorizedCluster)));
+                .thenReturn(new ArrayList<>(List.of(nvca1Cluster)));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(WILDCARD))
                 .thenReturn(new ArrayList<>());
-        when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false))
-                .thenReturn(Optional.of(nvca1Cluster));
 
         // Act
         var response = clusterListingService.getClustersByNcaId(DUMMY_BYOC_NCA_ID, true, false);
@@ -1130,12 +1097,8 @@ class ClusterListingServiceTest {
                 .nvcaVersion("1.0.0")
                 .authClientId("dummy_auth_client_id")
                 .nvcaLastConnected(Instant.now())
-                .gpusV4(Set.of(
-                        getDummyGpuV4(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1,
-                                      "AZURE")))
-                .gpusV5(NvcaConverter.getGpusV5(Collections.emptySet(), Set.of(
-                        getDummyGpuV4(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1,
-                                      "AZURE"))))
+                .gpusV5(Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE,
+                        DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1, "AZURE")))
                 .allowClusterTargeting(Boolean.TRUE)
                 .build();
     }

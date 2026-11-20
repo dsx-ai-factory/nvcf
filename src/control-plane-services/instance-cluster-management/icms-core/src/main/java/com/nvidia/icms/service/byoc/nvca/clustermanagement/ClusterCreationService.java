@@ -16,7 +16,6 @@
  */
 package com.nvidia.icms.service.byoc.nvca.clustermanagement;
 
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.getGpusV5;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateAuthorizedNcaIdsForNewCluster;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateNcaId;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateNcaIdDoNotBelongsToAuthorizedNcaIds;
@@ -67,7 +66,6 @@ import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepositor
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
@@ -293,7 +291,7 @@ public class ClusterCreationService {
                          clusterEntity.getAuthorizedNcaIds());
         }
 
-        Set<GpuV5Udt> gpusV5 = getGpusV5(clusterEntity);
+        Set<GpuV5Udt> gpusV5 = clusterEntity.getGpusV5();
         if (!isSetEmptyOrNull(gpusV5)) {
             metaData.put(GPU.getName(), GsonCompatMapper.toJson(clusterEntity.getGpusV5()));
         }
@@ -370,16 +368,16 @@ public class ClusterCreationService {
 
         // Check if provided cluster group is present for nca ID
         // If cluster group exists then create cluster inside cluster group
-        Optional<ClusterGroupsByAccountEntity> optionalClusterGroupsByAccountEntity =
+        Optional<ClusterEntity> existingGroupCluster =
                 clusterRepository.getClusterGroupInfoByAccountAndNameInMainAccount(
                         ncaId,
                         clusterCreationRequest.getClusterGroupName());
-        if (optionalClusterGroupsByAccountEntity.isPresent()) {
+        if (existingGroupCluster.isPresent()) {
             log.info(
                     "Specified cluster group {} for cluster {} already exists, adding cluster to the same group",
                     clusterCreationRequest.getClusterGroupName(),
                     clusterCreationRequest.getClusterName());
-            return createClusterInGroup(optionalClusterGroupsByAccountEntity.get(),
+            return createClusterInGroup(existingGroupCluster.get(),
                                         clusterCreationRequest, ncaId, auditProps);
         }
 
@@ -455,12 +453,12 @@ public class ClusterCreationService {
         }
     }
 
-    public void validateClusterGroupForNvca2Flow(ClusterGroupsByAccountEntity clusterGroupEntity) {
+    public void validateClusterGroupForNvca2Flow(ClusterEntity clusterGroupEntity) {
 
         if (clusterGroupEntity.getGpus() != null && !clusterGroupEntity.getGpus().isEmpty()) {
             String errorMsg = String.format(
                     "This cluster group %s can not be used since it was already registered with old flow",
-                    clusterGroupEntity.getKey().getClusterGroupName());
+                    clusterGroupEntity.getClusterGroupName());
             log.error(errorMsg);
             throw new PreConditionFailedException(errorMsg);
         }
@@ -586,7 +584,7 @@ public class ClusterCreationService {
     }
 
     private ClusterCreationResponse createClusterInGroup(
-            ClusterGroupsByAccountEntity clusterGroupEntity,
+            ClusterEntity clusterGroupEntity,
             ClusterCreationRequest clusterCreationRequest,
             String ncaId, Map<String, Object> auditProps) {
         // New cluster can not be added to cluster group registered in old flow
@@ -594,7 +592,7 @@ public class ClusterCreationService {
 
         // Validate NcaId of cluster to be added in cluster group
         // Nca ID of cluster should be same as ncaId of cluster group
-        validateNcaId(clusterGroupEntity.getKey().getNcaId(), ncaId);
+        validateNcaId(clusterGroupEntity.getNcaId(), ncaId);
 
         // For JWT we will get client ID in request which needs to be used as clusterId
         // If JWT is not provided then generate UUID as clusterId for supporting ApiKey
@@ -665,7 +663,7 @@ public class ClusterCreationService {
     }
 
     private void validateAuthorizedNcaIdsAgainstExistingClusters(
-            ClusterGroupsByAccountEntity clusterGroupEntity,
+            ClusterEntity clusterGroupEntity,
             ClusterCreationRequest clusterCreationRequest) {
         // Fetch clusters from cluster group and
         // validate if gpus are shared, then authorized nca ids should be same
@@ -673,7 +671,7 @@ public class ClusterCreationService {
                 clusterRepository.getAllClustersInAGroup(clusterGroupEntity.getClusterGroupId());
         Set<GpuV5Udt> providedGpus = NvcaRequestSchemaToUdtConverter.toGpuV5Udts(clusterCreationRequest.getGpus());
         for (ClusterEntity clusterEntity : clusterEntities) {
-            Set<GpuV5Udt> existingGpus = getGpusV5(clusterEntity);
+            Set<GpuV5Udt> existingGpus = clusterEntity.getGpusV5();
             boolean isGpuShared = isGpuSharedBetweenClusters(providedGpus, existingGpus);
             if (isGpuShared) {
                 //Generate authorized nca ID key set with ncaId
@@ -719,7 +717,6 @@ public class ClusterCreationService {
                     .clusterProvider(clusterCreationRequest.getCloudProvider())
                     .clusterStatus(ClusterStatusEnum.NOT_READY)
                     .gpusV5(NvcaRequestSchemaToUdtConverter.toGpuV5Udts(clusterCreationRequest.getGpus()))
-                    .gpusV4(NvcaRequestSchemaToUdtConverter.toGpuV4Udts(clusterCreationRequest.getGpus()))
                     .authorizedNcaIds(clusterCreationRequest.getAuthorizedNCAIds())
                     .capabilities(clusterCreationRequest.getCapabilities())
                     .attributes(clusterCreationRequest.getAttributes())

@@ -17,7 +17,7 @@
 package com.nvidia.icms.service.extensions.api;
 
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.service.createInstances.RequestInstanceDestination;
 import jakarta.validation.constraints.NotNull;
 
@@ -47,7 +47,7 @@ public interface InstanceDestinationProvider {
      * authorized for {@code ncaId} (i.e. the cluster's {@code authorizedNcaIds} contains the NCA).
      */
     @NotNull Set<String> getAuthorizedZones(
-            @NotNull Set<ClusterByGroupIdAndIdEntity> readyClusters,
+            @NotNull Set<ClusterEntity> readyClusters,
             @NotNull String ncaId);
 
     /**

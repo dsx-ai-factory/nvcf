@@ -17,8 +17,6 @@
 package com.nvidia.icms.service.byoc.nvca.clustermanagement;
 
 import static com.nvidia.icms.inbound.rest.model.byoc.ClusterCapabilitiesEnum.DYNAMIC_GPU_DISCOVERY;
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.getGpusV5;
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.toGpusV4;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateAuthorizedNcaIdsForNewCluster;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateNcaId;
 import static com.nvidia.icms.service.byoc.ClusterValidation.validateNcaIdDoNotBelongsToAuthorizedNcaIds;
@@ -44,9 +42,7 @@ import com.nvidia.icms.inbound.rest.model.nvca.ClusterUpdateRequest;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.instance.entity.InstanceByZoneEntity;
 import com.nvidia.icms.service.AppAuditService;
@@ -141,11 +137,11 @@ public class ClusterReconfigurationService {
                      existingClusterEntity.getClusterId(),
                      existingClusterEntity.getCapabilities(),
                      clusterUpdateRequest.getCapabilities());
-            newlyAddedGpus = getNewlyAddedGpus(getGpusV5(existingClusterEntity),
+            newlyAddedGpus = getNewlyAddedGpus(existingClusterEntity.getGpusV5(),
                                                requestedGpus);
-            removedInstanceTypeNames = getRemovedInstanceTypeName(getGpusV5(existingClusterEntity),
+            removedInstanceTypeNames = getRemovedInstanceTypeName(existingClusterEntity.getGpusV5(),
                                                                   requestedGpus);
-            removedGpuNames = getRemovedGpuNames(getGpusV5(existingClusterEntity),
+            removedGpuNames = getRemovedGpuNames(existingClusterEntity.getGpusV5(),
                                                  requestedGpus);
             logUpdatedGpus(clusterUpdateRequest, existingClusterEntity, newlyAddedGpus,
                            removedGpuNames, removedInstanceTypeNames);
@@ -210,7 +206,7 @@ public class ClusterReconfigurationService {
 
         // Fetching allCluster info ONLY if needed
         if (!isSetEmptyOrNull(removedGpuNames)) {
-            List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList = clusterRepository
+            List<ClusterEntity> clusterByGroupIdList = clusterRepository
                     .getClustersFromClusterGroup(existingClusterEntity.getClusterGroupId());
 
             // Deleting creation queue for removed GPU
@@ -244,7 +240,6 @@ public class ClusterReconfigurationService {
         Set<GpuV5Udt> requestedGpus = NvcaRequestSchemaToUdtConverter.toGpuV5Udts(clusterUpdateRequest.getGpus());
         if (!(clusterUpdateRequest.getCapabilities().contains(DYNAMIC_GPU_DISCOVERY.toString()) &&
                 clusterEntity.getCapabilities().contains(DYNAMIC_GPU_DISCOVERY.toString()))) {
-            clusterEntity.setGpusV4(toGpusV4(requestedGpus));
             clusterEntity.setGpusV5(requestedGpus);
         }
         clusterEntity.setCapabilities(clusterUpdateRequest.getCapabilities());
@@ -325,7 +320,7 @@ public class ClusterReconfigurationService {
                 existingClusterEntity.getClusterId(), existingClusterEntity.getClusterName(),
                 existingClusterEntity.getClusterGroupId(),
                 existingClusterEntity.getClusterGroupName(),
-                setToJson(getGpusV5(existingClusterEntity)),
+                setToJson(existingClusterEntity.getGpusV5()),
                 setToJson(clusterUpdateRequest.getGpus()),
                 setToJson(newlyAddedNcaIds),
                 setToJson(removedGpusNames),
@@ -463,7 +458,7 @@ public class ClusterReconfigurationService {
             List<String> activeInstances) {
 
         // Check if new cluster group exists for the ncaId
-        Optional<ClusterGroupsByAccountEntity> optionalClusterGroupForNewGroupName =
+        Optional<ClusterEntity> optionalClusterGroupForNewGroupName =
                 clusterRepository.getClusterGroupInfoByAccountAndNameInMainAccount(
                         ncaId,
                         clusterUpdateRequest.getClusterGroupName());
@@ -611,14 +606,14 @@ public class ClusterReconfigurationService {
 
     private void validateClusterForClusterGroup(
             ClusterUpdateRequest clusterUpdateRequest,
-            ClusterGroupsByAccountEntity clusterGroupForNewGroupName,
+            ClusterEntity clusterGroupForNewGroupName,
             String ncaId) {
         // validate cluster group for new flow
         clusterCreationService.validateClusterGroupForNvca2Flow(clusterGroupForNewGroupName);
 
         // Validate NcaId of cluster to be added in cluster group
         // Nca ID of cluster should be same as ncaId of cluster group
-        validateNcaId(clusterGroupForNewGroupName.getKey().getNcaId(), ncaId);
+        validateNcaId(clusterGroupForNewGroupName.getNcaId(), ncaId);
 
         // validate cloud provider is same as cluster provider of cluster group
         clusterCreationService.validateClusterProvider(

@@ -16,9 +16,7 @@
  */
 package com.nvidia.icms.service.createInstances;
 
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotNull;
@@ -61,26 +59,21 @@ public class DestinationClusterData {
     private Map<String, String> queueUrlByGpuNameMap;
 
 
-    public DestinationClusterData(@NotNull ClustersByAuthorizedAccountsEntity clusterAccounts, @NotNull Map<String, String> queueUrlByGpuNameMap) {
-        this.clusterGroupId = clusterAccounts.getClusterGroupId();
-        this.clusterGroupName =clusterAccounts.getClusterGroupName();
-        this.ncaId = clusterAccounts.getNcaId();
-        this.authorizedNcaIds = new HashSet<>(clusterAccounts.getAuthorizedNcaIds());
-        this.clusterName = clusterAccounts.getClusterName();
-        this.clusterId = clusterAccounts.getKey().getClusterId();
-        this.region = null;
-        this.gpusV5 =  NvcaConverter.getGpusV5(clusterAccounts);
-        this.queueUrlByGpuNameMap = queueUrlByGpuNameMap;
+    public DestinationClusterData(@NotNull ClusterEntity cluster,
+                                  @NotNull Map<String, String> queueUrlByGpuNameMap) {
+        this(cluster, queueUrlByGpuNameMap, true);
     }
 
-    public DestinationClusterData(@NotNull ClusterByGroupIdAndIdEntity cluster, @NotNull Map<String, String> queueUrlByGpuNameMap) {
-        this.clusterGroupId = cluster.getKey().getClusterGroupId();
+    public DestinationClusterData(@NotNull ClusterEntity cluster,
+                                  @NotNull Map<String, String> queueUrlByGpuNameMap,
+                                  boolean includeRegion) {
+        this.clusterGroupId = cluster.getClusterGroupId();
         this.clusterGroupName = cluster.getClusterGroupName();
         this.ncaId = cluster.getNcaId();
         this.authorizedNcaIds = new HashSet<>(cluster.getAuthorizedNcaIds());
         this.clusterName = cluster.getClusterName();
-        this.clusterId = cluster.getKey().getClusterId();
-        this.region = cluster.getRegion();
+        this.clusterId = cluster.getClusterId();
+        this.region = includeRegion ? cluster.getRegion() : null;
         this.gpusV5 = cluster.getGpusV5();
         this.queueUrlByGpuNameMap = queueUrlByGpuNameMap;
     }

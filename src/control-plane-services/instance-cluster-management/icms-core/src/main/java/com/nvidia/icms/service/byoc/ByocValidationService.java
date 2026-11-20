@@ -30,11 +30,9 @@ import com.nvidia.icms.errors.IcmsInternalServerException;
 import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.service.platform.ComputePlatformService;
 import com.nvidia.icms.service.extensions.api.InstanceLifecycleHelper;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.service.InstanceServiceHelper;
 import io.micrometer.observation.annotation.Observed;
@@ -115,7 +113,7 @@ public class ByocValidationService {
     @Observed
     public @Nullable String getCreationQueueForReadyCluster(
             SpotInstanceRequestSchema instanceRequest,
-            ClusterByGroupIdAndIdEntity entity,
+            ClusterEntity entity,
             String providedGpuName) {
 
         // If Nats is enabled then return queue creation as empty for cluster as stream will be used
@@ -135,7 +133,7 @@ public class ByocValidationService {
 
     private String getCreationQueueForNvca(
             SpotInstanceRequestSchema instanceRequest,
-            ClusterByGroupIdAndIdEntity entity,
+            ClusterEntity entity,
             String providedGpuName) {
 
         // If request is for task and task specific queues are enabled from SIS and NVCA
@@ -151,7 +149,7 @@ public class ByocValidationService {
 
     private String getCreationQueueForNonByoc(
             SpotInstanceRequestSchema instanceRequest,
-            ClusterByGroupIdAndIdEntity entity,
+            ClusterEntity entity,
             String providedGpuName) {
 
         if (instanceServiceHelper.isNatsEnabled()) {
@@ -171,7 +169,7 @@ public class ByocValidationService {
         return getCusterCreationQueueUrlForGpu(entity, providedGpuName);
     }
 
-    private static String getCusterCreationQueueUrlForGpu(ClusterByGroupIdAndIdEntity entity,
+    private static String getCusterCreationQueueUrlForGpu(ClusterEntity entity,
                                                    String gpuName) {
         Map<String, CreationQueueUdt> clusterCreationQueueMap =
                 entity.getClusterCreationQueues() == null
@@ -184,7 +182,7 @@ public class ByocValidationService {
 
         String errMsg = String.format(
                 "For %s GPU in %s clusterId and %s clusterGroupId cluster creation queue doesn't exists",
-                gpuName, entity.getKey().getClusterId(), entity.getKey().getClusterGroupId());
+                gpuName, entity.getClusterId(), entity.getClusterGroupId());
         log.error(errMsg);
 
         throw new PreConditionFailedException(
@@ -192,7 +190,7 @@ public class ByocValidationService {
                               entity.getClusterGroupName()));
     }
 
-    private static String getTasksCusterCreationQueueUrlForGpu(ClusterByGroupIdAndIdEntity entity,
+    private static String getTasksCusterCreationQueueUrlForGpu(ClusterEntity entity,
                                                                String gpuName) {
         Map<String, CreationQueueUdt> clusterCreationQueueMapForTasks =
                 entity.getClusterCreationQueuesForTasks() == null
@@ -205,7 +203,7 @@ public class ByocValidationService {
 
         String errMsg = String.format(
                 "For %s GPU in %s clusterId and %s clusterGroupId tasks cluster creation queue doesn't exists. Existing queues: %s",
-                gpuName, entity.getKey().getClusterId(), entity.getKey().getClusterGroupId(), clusterCreationQueueMapForTasks.toString());
+                gpuName, entity.getClusterId(), entity.getClusterGroupId(), clusterCreationQueueMapForTasks.toString());
         log.error(errMsg);
 
         throw new PreConditionFailedException(
@@ -214,7 +212,7 @@ public class ByocValidationService {
     }
 
     public String getByocCreationQueueUrlForGpu(
-            ClustersByAuthorizedAccountsEntity entity,
+            ClusterEntity entity,
             String gpuName) {
 
         if (instanceServiceHelper.isNatsEnabled()) {
@@ -229,7 +227,7 @@ public class ByocValidationService {
 
         String errMsg = String.format(
                 "For %s GPU in %s clusterId and %s clusterGroupId creation queue doesn't exists",
-                gpuName, entity.getKey().getClusterId(), entity.getClusterGroupId());
+                gpuName, entity.getClusterId(), entity.getClusterGroupId());
         log.error(errMsg);
 
         throw new PreConditionFailedException(

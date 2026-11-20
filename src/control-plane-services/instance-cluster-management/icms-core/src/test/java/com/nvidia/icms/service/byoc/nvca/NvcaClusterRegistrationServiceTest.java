@@ -17,7 +17,6 @@
 package com.nvidia.icms.service.byoc.nvca;
 
 import static com.nvidia.icms.inbound.rest.model.byoc.ClusterCapabilitiesEnum.DYNAMIC_GPU_DISCOVERY;
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.toGpusV4;
 import static com.nvidia.icms.service.byoc.nvca.clustermanagement.ClusterCreationService.getMetadataForCluster;
 import static com.nvidia.icms.util.TestUtil.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -54,7 +53,6 @@ import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV4Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.sqs.QueueManager;
@@ -373,7 +371,7 @@ class NvcaClusterRegistrationServiceTest {
                 .updateClusterRegistration(updatedClusterEntity);
         doReturn(getDummyNvcaAccessCreds(updatedClusterEntity)).when(clusterQueueAccessCredsService)
                 .generateCredsForNvcaQueues(updatedClusterEntity);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doNothing().when(auditService)
                 .sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(), Mockito.any());
@@ -449,7 +447,7 @@ class NvcaClusterRegistrationServiceTest {
                 .updateClusterRegistration(updatedClusterEntity);
         doReturn(getDummyNvcaAccessCreds(updatedClusterEntity)).when(clusterQueueAccessCredsService)
                 .generateCredsForNvcaQueues(updatedClusterEntity);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doNothing().when(auditService)
                 .sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(), Mockito.any());
@@ -596,7 +594,7 @@ class NvcaClusterRegistrationServiceTest {
                 .updateClusterRegistration(updatedClusterEntity);
         doReturn(getDummyNvcaAccessCreds(updatedClusterEntity)).when(clusterQueueAccessCredsService)
                 .generateCredsForNvcaQueues(updatedClusterEntity);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doNothing().when(queueManager).deleteQueue(queueUrlToBeDeleted);
         doReturn(Map.of()).when(instanceServiceHelper)
@@ -667,7 +665,7 @@ class NvcaClusterRegistrationServiceTest {
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
 
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doReturn(Map.of("Standard_ND96amsr_A100_v4_1x", Set.of("instance_id_1", "instance_id2")))
                 .when(instanceServiceHelper)
@@ -712,7 +710,7 @@ class NvcaClusterRegistrationServiceTest {
 
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doReturn(Map.of()).when(instanceServiceHelper)
                 .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
@@ -751,7 +749,7 @@ class NvcaClusterRegistrationServiceTest {
 
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doReturn(Map.of("Standard_ND96amsr_A100_v4_1x", Set.of("instance_id_1")))
                 .when(instanceServiceHelper)
@@ -822,7 +820,7 @@ class NvcaClusterRegistrationServiceTest {
                 .updateClusterRegistration(updatedClusterEntity);
         doReturn(getDummyNvcaAccessCreds(updatedClusterEntity)).when(clusterQueueAccessCredsService)
                 .generateCredsForNvcaQueues(updatedClusterEntity);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doNothing().when(auditService)
                 .sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(), Mockito.any());
@@ -910,7 +908,7 @@ class NvcaClusterRegistrationServiceTest {
                 .updateClusterRegistration(updatedClusterEntity);
         doReturn(getDummyNvcaAccessCreds(updatedClusterEntity)).when(clusterQueueAccessCredsService)
                 .generateCredsForNvcaQueues(updatedClusterEntity);
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+        doReturn(List.of(existingClusterEntity)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doReturn(false).when(instanceServiceHelper).isTaskClusterCreationQueuesAllowed(Mockito.any());
         doReturn(Map.of()).when(instanceServiceHelper)
@@ -980,8 +978,7 @@ class NvcaClusterRegistrationServiceTest {
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
 
-        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(
-                otherClusterWithDifferentAuthorizedNcaId))).when(
+        doReturn(List.of(otherClusterWithDifferentAuthorizedNcaId)).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
 
         var request = NvcaRegistrationRequest.builder()
@@ -1403,7 +1400,6 @@ class NvcaClusterRegistrationServiceTest {
                 .registrationTime(dummyInstant)
                 .authorizedNcaIds(Set.of("ncaId1", "ncaId2"))
                 .requestDump("request")
-                .gpusV4(toGpusV4(Set.of(getDummyA100GpuV5())))
                 .gpusV5(Set.of(getDummyA100GpuV5()))
                 .region(DUMMY_REGION)
                 .customAttributes(DUMMY_CUSTOM_ATTRIBUTES)
@@ -1412,14 +1408,14 @@ class NvcaClusterRegistrationServiceTest {
                 .build();
 
         Map<String, CreationQueueUdt> creationQueueMap = new HashMap<>();
-        for (GpuV4Udt gpu : entity.getGpusV4()) {
+        for (GpuV5Udt gpu : entity.getGpusV5()) {
             creationQueueMap.put(gpu.getName(),
                                  getCreationQueue(gpu.getName(), DUMMY_CLUSTER_GROUP_ID));
         }
         entity.setCreationQueues(creationQueueMap);
 
         Map<String, CreationQueueUdt> clusterCeationQueueMap = new HashMap<>();
-        for (GpuV4Udt gpu : entity.getGpusV4()) {
+        for (GpuV5Udt gpu : entity.getGpusV5()) {
             clusterCeationQueueMap.put(gpu.getName(),
                                  getCreationQueue(gpu.getName(), DUMMY_CLUSTER_ID));
         }
@@ -1450,7 +1446,6 @@ class NvcaClusterRegistrationServiceTest {
 
         if (gpuV5Set != null && !gpuV5Set.isEmpty()) {
             entity.setGpusV5(gpuV5Set);
-            entity.setGpusV4(toGpusV4(gpuV5Set));
 
             Map<String, CreationQueueUdt> creationQueueMap = new HashMap<>();
             Map<String, CreationQueueUdt> clusterCreationQueueMap = new HashMap<>();

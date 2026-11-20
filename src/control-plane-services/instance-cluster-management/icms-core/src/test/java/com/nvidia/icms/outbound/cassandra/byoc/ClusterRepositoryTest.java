@@ -57,8 +57,8 @@ class ClusterRepositoryTest extends IntegrationTest {
                     entity.getNcaId(), entity.getClusterGroupName()).isPresent());
             assertEquals(entity.getClusterId(), nvcaClusterRepository
                     .getAllClustersInAuthorizedAccount("ncaId1").stream()
-                    .filter(cluster -> entity.getClusterId().equals(cluster.getKey().getClusterId()))
-                    .findFirst().orElseThrow().getKey().getClusterId());
+                    .filter(cluster -> entity.getClusterId().equals(cluster.getClusterId()))
+                    .findFirst().orElseThrow().getClusterId());
 
             entity.setClusterStatus(ClusterStatusEnum.ABANDONED);
             clusterRepository.updateClusterInfo(entity);
@@ -68,7 +68,7 @@ class ClusterRepositoryTest extends IntegrationTest {
             assertEquals(ClusterStatusEnum.ABANDONED,
                     clusterRepository.getClustersFromClusterGroup(entity.getClusterGroupId())
                             .stream().filter(cluster -> entity.getClusterId().equals(
-                                    cluster.getKey().getClusterId())).findFirst().orElseThrow()
+                                    cluster.getClusterId())).findFirst().orElseThrow()
                             .getClusterStatus());
         } finally {
             nvcaClusterRepository.deleteClusterInfo(entity);

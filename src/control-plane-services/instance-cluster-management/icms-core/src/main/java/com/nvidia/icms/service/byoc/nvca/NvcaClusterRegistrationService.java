@@ -17,8 +17,6 @@
 package com.nvidia.icms.service.byoc.nvca;
 
 import static com.nvidia.icms.inbound.rest.model.byoc.ClusterCapabilitiesEnum.DYNAMIC_GPU_DISCOVERY;
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.getGpusV5;
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.toGpusV4;
 import static com.nvidia.icms.service.byoc.nvca.clustermanagement.ClusterCreationService.defaultGpuValidation;
 import static com.nvidia.icms.service.byoc.nvca.clustermanagement.ClusterCreationService.getMetadataForCluster;
 import static com.nvidia.icms.service.telemetry.TelemetryEventClient.EventMetaData.TERMINATION_QUEUE;
@@ -43,7 +41,6 @@ import com.nvidia.icms.inbound.rest.model.nvca.NvcaRegistrationRequest;
 import com.nvidia.icms.inbound.rest.model.nvca.NvcaRegistrationResponse;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
@@ -276,7 +273,6 @@ public class NvcaClusterRegistrationService {
 
         // Updating GPUs from NVCA
         if (!isSetEmptyOrNull(providedGpus)) {
-            clusterInfo.setGpusV4(toGpusV4(providedGpus));
             clusterInfo.setGpusV5(providedGpus);
         }
 
@@ -349,7 +345,7 @@ public class NvcaClusterRegistrationService {
             Set<GpuV5Udt> existingGpus,
             Set<GpuV5Udt> providedGpus,
             Set<String> removedGpuNames,
-            List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList,
+            List<ClusterEntity> clusterByGroupIdList,
             @Nullable String jwksFingerprint) {
     }
 
@@ -370,7 +366,7 @@ public class NvcaClusterRegistrationService {
         // If DynamicGpuDiscovery is disabled then providedGpus = existing GPUs
         Set<GpuV5Udt> providedGpus = getGpusFromRequest(nvcaRegistrationRequest, clusterInfo);
         Set<GpuV5Udt> existingGpus = getGpuFromEntity(clusterInfo);
-        List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList = new ArrayList<>();
+        List<ClusterEntity> clusterByGroupIdList = new ArrayList<>();
 
         Set<GpuV5Udt> newlyAddedGpus = getNewlyAddedGpus(existingGpus, providedGpus);
         Set<String> removedGpuNames = getRemovedGpuNames(existingGpus, providedGpus);
@@ -731,20 +727,20 @@ public class NvcaClusterRegistrationService {
     public void validateNewlyAddedGpusWithClusterGroup(
             ClusterEntity clusterInfo,
             Set<GpuV5Udt> newlyAddedGpus,
-            List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList) {
+            List<ClusterEntity> clusterByGroupIdList) {
         /*
          1. Find all cluster from clusterGroup
          2. Check if any cluster has same GPUs as that of new registred cluster
          3. Validate if authorizedNcaId are same
          */
-        for (ClusterByGroupIdAndIdEntity existingClusterInfo : clusterByGroupIdList) {
+        for (ClusterEntity existingClusterInfo : clusterByGroupIdList) {
 
             // Same cluster will be ignored to compare authorized nca-id as it is being updated by NVCA
-            if (!existingClusterInfo.getKey().getClusterId().equals(clusterInfo.getClusterId())) {
+            if (!existingClusterInfo.getClusterId().equals(clusterInfo.getClusterId())) {
 
                 Set<String> existingAuthorizedNcaId = existingClusterInfo.getAuthorizedNcaIds();
                 String existingClusterName = existingClusterInfo.getClusterName();
-                Set<GpuV5Udt> existingGpuV5 = getGpusV5(existingClusterInfo);
+                Set<GpuV5Udt> existingGpuV5 = existingClusterInfo.getGpusV5();
                 String clusterGroupName = existingClusterInfo.getClusterGroupName();
                 Set<String> registeredClusterAuthorizedNcaId = clusterInfo.getAuthorizedNcaIds();
 
@@ -781,7 +777,7 @@ public class NvcaClusterRegistrationService {
     // TODO: Discuss with team about creating a separate class for queue management needed in NVCA cluster registration
     public void deleteQueueForRemovedGpus(
             @Nullable Set<String> removedGpuNames,
-            @NotNull List<ClusterByGroupIdAndIdEntity> clusterByGroupIdList,
+            @NotNull List<ClusterEntity> clusterByGroupIdList,
             @NotNull ClusterEntity clusterInfo) {
 
         /*
@@ -800,12 +796,12 @@ public class NvcaClusterRegistrationService {
 
         // 1. Find active GPUs from all clusters in the same cluster group (excluding current cluster)
         Set<String> activeGpuName = new HashSet<>();
-        for (ClusterByGroupIdAndIdEntity existingClusterInfo : clusterByGroupIdList) {
+        for (ClusterEntity existingClusterInfo : clusterByGroupIdList) {
 
             // Same cluster will be ignored to find active GPUs as it is being updated by NVCA
-            if (!existingClusterInfo.getKey().getClusterId().equals(clusterInfo.getClusterId())) {
+            if (!existingClusterInfo.getClusterId().equals(clusterInfo.getClusterId())) {
 
-                for (GpuV5Udt gpu : getGpusV5(existingClusterInfo)) {
+                for (GpuV5Udt gpu : existingClusterInfo.getGpusV5()) {
                     activeGpuName.add(gpu.getName());
                 }
             }
@@ -895,10 +891,10 @@ public class NvcaClusterRegistrationService {
     }
 
     private Set<GpuV5Udt> getGpuFromEntity(ClusterEntity clusterEntity) {
-        if (isSetEmptyOrNull(getGpusV5(clusterEntity))) {
+        if (isSetEmptyOrNull(clusterEntity.getGpusV5())) {
             return new HashSet<>();
         }
-        return getGpusV5(clusterEntity);
+        return clusterEntity.getGpusV5();
     }
 
     /*
@@ -918,7 +914,7 @@ public class NvcaClusterRegistrationService {
         }
 
         // If DynamicGpuDiscovery is disabled then providedGpus = existing GPUs
-        return getGpusV5(clusterEntity);
+        return clusterEntity.getGpusV5();
     }
 
     private ClusterEntity validateClusterId(@NotNull String clusterId) {

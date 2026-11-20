@@ -44,10 +44,7 @@ import com.nvidia.icms.service.extensions.api.InstanceLifecycleHelper;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeUdt;
@@ -317,11 +314,11 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         CreateSpotInstancesResponse expectedResponse = new CreateSpotInstancesResponse();
 
         // Setup common mocks for non-targeted request
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, DUMMY_BYOC_CLUSTER_GROUP_NAME, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, DUMMY_BYOC_CLUSTER_GROUP_NAME, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -378,7 +375,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                                   DUMMY_BYOC_CLUSTER_GROUP_NAME, DUMMY_GPU, "instance-type");
 
         // Mock the dependencies that RequestDestinationProvider.getAllTargetedDestinations() uses
-        ClusterByGroupIdAndIdEntity clusterEntity = getDummyClusterGroup(
+        ClusterEntity clusterEntity = getDummyClusterGroup(
                 DUMMY_BYOC_CLUSTER_GROUP_NAME,
             ClusterStatusEnum.READY,
             "cluster-id",
@@ -726,11 +723,11 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         var clusterGroupName = ClusterProviderEnum.AWS.toString();
         doNothing().when(instanceValidationService).validateTaskWorkload(any());
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_OCI_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_OCI_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_OCI_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -768,11 +765,11 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         // Prepare
         var clusterGroupName = ClusterProviderEnum.GDN.toString();
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(null);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -812,11 +809,11 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                 DUMMY_GPU_NAME,
                 DUMMY_BYOC_NCA_ID);
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, PLATFORM_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -939,11 +936,11 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                 DUMMY_BYOC_NCA_ID);
         instanceRequest.setHelmChart("https://abc.def.zyx.com/zyx/charts/name-dummy-v12.3.4.tgz");
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -983,13 +980,13 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                 DUMMY_GPU_NAME,
                 DUMMY_BYOC_NCA_ID);
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, clusterGroupName, DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID, DUMMY_GPU_NAME, DUMMY_BYOC_INSTANCE_TYPE);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID)).thenReturn(List.of(cluster));
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD)).thenReturn(List.of());
 
 
         // Mocking NVCA call for NOT_READY cluster
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.NOT_READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false)).thenReturn(
@@ -1061,7 +1058,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                 clusterGroupName, DUMMY_GPU_NAME,
                 DUMMY_BYOC_NCA_ID);
 
-        ClustersByAuthorizedAccountsEntity dummyResp =
+        ClusterEntity dummyResp =
                 getDummyClustersByAuthorizedAccountResp(clusterGroupName, DUMMY_CLUSTER_GROUP_ID,
                                                         DUMMY_CLUSTER_ID,
                                                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -1261,7 +1258,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
 
     }
 
-    private ClusterByGroupIdAndIdEntity getDummyClusterGroup(
+    private ClusterEntity getDummyClusterGroup(
             String clusterGroupName,
             ClusterStatusEnum clusterStatusEnum,
             String clusterId,
@@ -1287,12 +1284,10 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                                          .url("dummy_task_url")
                                          .build()));
 
-        return ClusterByGroupIdAndIdEntity.builder()
+        return ClusterEntity.builder()
                 .clusterGroupName(clusterGroupName)
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
-                             .clusterId(clusterId)
-                             .build())
+                .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
+                .clusterId(clusterId)
                 .clusterDescription("dummy_cluster_description")
                 .k8sVersion("v1.25.9")
                 .clusterStatus(clusterStatusEnum)
@@ -1399,7 +1394,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
     private void setupTargetedRequestMocks(String ncaId, String clusterId, String clusterName,
                                          String clusterGroupName, String gpuName, String instanceType) {
         // Mock cluster targeting helper to return a ready cluster
-        ClusterByGroupIdAndIdEntity clusterEntity = getDummyClusterGroup(
+        ClusterEntity clusterEntity = getDummyClusterGroup(
             clusterGroupName,
             ClusterStatusEnum.READY,
             clusterId,
@@ -1529,7 +1524,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
     @Test
     void createNonByocOrBartNonTargetedInstanceDestination_WithCustomClusterGroupName_CreatesDestinationWithCorrectName() {
         // Setup
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, CUSTOM_GROUP, CUSTOM_GROUP, DUMMY_CLUSTER_ID);
+        ClusterEntity cluster = createClusterForByoc(DUMMY_BYOC_NCA_ID, CUSTOM_GROUP, CUSTOM_GROUP, DUMMY_CLUSTER_ID);
 
         DestinationClusterData destinationClusterData = new DestinationClusterData(cluster, Map.of(DUMMY_GPU, "queueUrl"));
 
@@ -1605,7 +1600,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         Map<String, Object> auditProps = new HashMap<>();
 
         // Create a cluster that will be filtered out due to unhealthy status
-        ClusterByGroupIdAndIdEntity clusterEntity = getDummyClusterGroup(
+        ClusterEntity clusterEntity = getDummyClusterGroup(
             "cluster-group",
             ClusterStatusEnum.READY,
             "cluster-id",
@@ -1663,7 +1658,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         Map<String, Object> auditProps = new HashMap<>();
 
         // Compute-platform (OCI) cluster carrying the requested GPU.
-        ClusterByGroupIdAndIdEntity clusterEntity = getDummyClusterGroup(
+        ClusterEntity clusterEntity = getDummyClusterGroup(
                 DUMMY_BYOC_CLUSTER_GROUP_NAME,
                 ClusterStatusEnum.READY,
                 "cluster-id",
@@ -1823,7 +1818,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
                 DUMMY_BYOC_NCA_ID, false);
         Map<String, Object> auditProps = new HashMap<>();
 
-        ClustersByAuthorizedAccountsEntity cluster = createClusterForByoc(
+        ClusterEntity cluster = createClusterForByoc(
                 DUMMY_BYOC_NCA_ID, DUMMY_BYOC_CLUSTER_GROUP_NAME, PLATFORM_CLUSTER_GROUP_ID,
                 DUMMY_CLUSTER_ID);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
@@ -1831,7 +1826,7 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD))
                 .thenReturn(List.of());
 
-        ClusterEntity clusterEntity = toClusterEntity(cluster);
+        ClusterEntity clusterEntity = cluster;
         clusterEntity.setClusterStatus(ClusterStatusEnum.READY);
         clusterEntity.setClusterProvider(ClusterProviderEnum.GDN);
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false))
