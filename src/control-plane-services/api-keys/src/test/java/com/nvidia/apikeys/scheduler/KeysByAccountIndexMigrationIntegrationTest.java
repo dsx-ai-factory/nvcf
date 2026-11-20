@@ -145,7 +145,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 source.getOwnerType().name(), source.getOwnerId());
         var task = task(dao);
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         var copied = account(source);
         assertThat(copied.getKeyStatus()).isEqualTo(KeyStatus.ACTIVE);
@@ -164,7 +164,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         assertThat(credentialAfter.timestamp()).isEqualTo(timestamp);
         assertThat(completed()).isFalse();
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
         assertThat(completed()).isTrue();
         assertThat(result("already_copied")).isEqualTo(2);
     }
@@ -186,7 +186,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 source.getOwnerId(), source.getIssuerServiceId(), source.getKeyId());
         setOwnerNcaId(source, savedNcaId, timestamp + 100);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         var copied = dao.account(accountModel(source)).orElseThrow();
         assertThat(copied.writeTimes()).containsEntry("key_status", timestamp)
@@ -194,7 +194,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 .containsEntry("key_details", timestamp + 20).containsEntry("created_at", timestamp + 20);
         assertThat(copied.timestamp()).isEqualTo(timestamp + 20);
         assertThat(account(source).getDescription()).isEqualTo("updated details");
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -212,12 +212,12 @@ class KeysByAccountIndexMigrationIntegrationTest {
             throw new IllegalStateException("interrupted between column writes");
         }).when(interrupted).copy(any(), anyLong());
 
-        task(interrupted).run(() -> { });
+        task(interrupted).runUnchecked(() -> { });
 
         assertThat(dao.account(accountModel(source)).orElseThrow().model().getKeyDetails()).isNotBlank();
         assertThat(completed()).isFalse();
-        task(dao).run(() -> { });
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         var copied = dao.account(accountModel(source)).orElseThrow();
         assertThat(copied.model().getKeyStatus()).isEqualTo(KeyStatus.SUSPENDED);
@@ -236,7 +236,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         dao.copy(accountConverter.voToModel(newer), timestamp + 50);
         setOwnerNcaId(source, savedNcaId, timestamp + 100);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         var stored = account(source);
         assertThat(stored.getKeyStatus()).isEqualTo(newer.getKeyStatus());
@@ -260,7 +260,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 target.getIssuerServiceId(), target.getKeyId());
         setOwnerNcaId(source, savedNcaId, timestamp + 100);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         assertThat(dao.account(target).orElseThrow().model().getExpiresAt()).isNull();
         assertThat(completed()).isFalse();
@@ -275,7 +275,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 + "WHERE owner_type=? AND owner_id=?", "ACTIVE", "USER", "status-only");
         var task = task(dao);
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         for (var i = 0; i < 4; i++) {
             assertThat(account(source().toBuilder().keyId("key-" + i).keyHash("hash-" + i).build())
@@ -284,7 +284,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         assertThat(result("copied")).isEqualTo(4);
         assertThat(result("skipped")).isEqualTo(1);
         assertThat(completed()).isFalse();
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -293,14 +293,14 @@ class KeysByAccountIndexMigrationIntegrationTest {
         var source = source().toBuilder().issuerServiceId("unregistered-issuer").build();
         seed(source, false);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         assertThat(account(source).getIssuerServiceId()).isEqualTo("unregistered-issuer");
         assertThat(dao.credential(source.getKeyHash())).isEmpty();
         assertThat(result("unmapped")).isEqualTo(1);
         assertThat(adminFacade.listKeysInAllServices(source.getOwnerType(), source.getOwnerId()).getKeys())
                 .extracting("id").containsExactly(source.getKeyId());
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -310,7 +310,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         seed(source, true);
         properties.setNcaId("new-default");
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         var target = accountModel(source).toBuilder().ncaId("assigned").build();
         assertThat(dao.account(target)).isPresent();
@@ -319,7 +319,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         session.execute("UPDATE keys USING TIMESTAMP ? SET nca_id=? WHERE api_key_hash=?",
                 timestamp + 1, "conflicting", source.getKeyHash());
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         assertThat(result("conflict")).isEqualTo(1);
         assertThat(completed()).isFalse();
@@ -338,7 +338,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 .description("stale").build();
         dao.copy(accountConverter.voToModel(stale), timestamp - 1);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
 
         var copied = accountConverter.modelToVo(dao.account(accountConverter.voToModel(stale))
                 .orElseThrow().model());
@@ -346,7 +346,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         assertThat(copied.getNcaIdInDetails()).isEqualTo("assigned");
         assertThat(copied.getDescription()).isEqualTo(source.getDescription());
         assertThat(dao.credential(source.getKeyHash()).orElseThrow().model().getNcaId()).isEqualTo("assigned");
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -357,14 +357,14 @@ class KeysByAccountIndexMigrationIntegrationTest {
         var interrupted = spy(dao);
         doAnswer(call -> { throw new IllegalStateException("restart before account scan"); })
                 .when(interrupted).accountPage(any(), anyInt());
-        task(interrupted).run(() -> { });
+        task(interrupted).runUnchecked(() -> { });
         assertThat(completed()).isFalse();
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isTrue();
         var second = first.toBuilder().keyId("second-key").keyHash("second-hash").build();
         seed(second, true);
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(account(second).getKeyId()).isEqualTo("second-key");
         assertThat(completed()).isTrue();
     }
@@ -381,15 +381,15 @@ class KeysByAccountIndexMigrationIntegrationTest {
             return call.callRealMethod();
         }).when(racing).copy(any(), any(TimedRow.class));
 
-        task(racing).run(() -> { });
+        task(racing).runUnchecked(() -> { });
 
         assertThat(account(source).getKeyStatus()).isEqualTo(KeyStatus.SUSPENDED);
         assertThat(account(source).getDescription()).isEqualTo("concurrent update");
         assertThat(result("retry")).isEqualTo(1);
         assertThat(completed()).isFalse();
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isFalse();
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -405,7 +405,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
             return call.callRealMethod();
         }).when(racing).copy(any(), any(TimedRow.class));
 
-        task(racing).run(() -> { });
+        task(racing).runUnchecked(() -> { });
 
         assertThat(dao.account(accountModel(source))).isEmpty();
         assertThat(dao.credential(source.getKeyHash())).isEmpty();
@@ -423,7 +423,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
             return call.callRealMethod();
         }).when(racing).setCredentialNcaId(anyString(), anyString(), anyLong());
 
-        task(racing).run(() -> { });
+        task(racing).runUnchecked(() -> { });
 
         assertThat(dao.credential(source.getKeyHash())).isEmpty();
         assertThat(result("retry")).isEqualTo(1);
@@ -436,7 +436,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         var model = accountModel(source);
         dao.copy(model, timestamp);
 
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(dao.account(model)).isEmpty();
         assertThat(result("orphan")).isEqualTo(1);
         dao.copy(model, timestamp);
@@ -450,7 +450,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         var source = source();
         var model = accountModel(source);
         dao.copy(model, Instant.now().toEpochMilli() * 1000);
-        task(dao).run(() -> { });
+        task(dao).runUnchecked(() -> { });
         assertThat(dao.account(model)).isPresent();
         assertThat(completed()).isFalse();
 
@@ -464,7 +464,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
             }
             return call.callRealMethod();
         }).when(racing).ownerExists(any(), any());
-        task(racing).run(() -> { });
+        task(racing).runUnchecked(() -> { });
         assertThat(dao.account(model)).isPresent();
         assertThat(completed()).isFalse();
     }
@@ -472,7 +472,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
     @Test
     void markerHasNoTtlAndDeletionIsObservedWithoutCaching() {
         var task = task(dao);
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
         assertThat(completed()).isTrue();
         var row = session.execute("SELECT TTL(updated_at) AS ttl FROM row_update_lock "
                 + "WHERE table_name=? AND record_key=?", KeysByAccountIndexMigrationTask.MARKER_TABLE,
@@ -483,7 +483,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         session.execute("DELETE FROM row_update_lock WHERE table_name=? AND record_key=?",
                 KeysByAccountIndexMigrationTask.MARKER_TABLE, KeysByAccountIndexMigrationTask.MARKER_RECORD);
         assertThat(completed()).isFalse();
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
         assertThat(completed()).isTrue();
     }
 
@@ -503,7 +503,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
         }).when(racing).credential(anyString());
         var executor = new DefaultLockingTaskExecutor(lockProvider);
         executor.executeWithLock((Runnable) () -> {
-            var renewal = new ScheduledTaskService.LockRenewal(() -> {
+            var renewal = new KeysByAccountIndexMigrationTask.LockRenewal(() -> {
                 var before = session.execute("SELECT lockuntil FROM lock WHERE name=?", "slow-page-test")
                         .one().getInstant("lockuntil");
                 LockExtender.extendActiveLock(Duration.ofMinutes(1), Duration.ZERO);
@@ -515,7 +515,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                 renewals.incrementAndGet();
             }, Duration.ofSeconds(20), nanos::get);
 
-            task(racing).run(renewal);
+            task(racing).runUnchecked(renewal);
         }, new LockConfiguration(Instant.now(), "slow-page-test", Duration.ofSeconds(30), Duration.ZERO));
 
         assertThat(renewals.get()).isEqualTo(4);
@@ -536,7 +536,7 @@ class KeysByAccountIndexMigrationIntegrationTest {
                     .one().getInstant("lockuntil");
             assertThat(after).isAfter(before);
             return null;
-        }).when(migrationTask).run(any(Runnable.class));
+        }).when(migrationTask).run();
         ClockProvider.setClock(Clock.fixed(lockTime, ZoneOffset.UTC));
         try {
             scheduler.keysByAccountIndexCopy();

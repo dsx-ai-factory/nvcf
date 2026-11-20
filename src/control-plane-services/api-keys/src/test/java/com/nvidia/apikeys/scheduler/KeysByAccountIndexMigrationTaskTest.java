@@ -118,7 +118,7 @@ class KeysByAccountIndexMigrationTaskTest {
     void disabledTaskDoesNotScan() {
         migrationProperties.setEnabled(false);
 
-        task.run(() -> { });
+        task.runUnchecked();
 
         verifyNoInteractions(dao);
     }
@@ -131,7 +131,7 @@ class KeysByAccountIndexMigrationTaskTest {
             return true;
         });
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         var order = inOrder(dao, markers);
         order.verify(dao).ownerPage(null, 500);
@@ -140,7 +140,7 @@ class KeysByAccountIndexMigrationTaskTest {
         order.verify(dao).accountPage(null, 500);
         order.verify(markers).markCompleted("keys_by_account_index_copy", "completed", TEST_TIME);
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, times(3)).ownerPage(null, 500);
         verify(dao, times(3)).accountPage(null, 500);
@@ -152,7 +152,7 @@ class KeysByAccountIndexMigrationTaskTest {
     void pageFetchRetriesAreBoundedAndFailureDoesNotMarkCompletion() {
         when(dao.ownerPage(null, 500)).thenThrow(new IllegalStateException("fetch failed"));
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, times(3)).ownerPage(null, 500);
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
@@ -176,7 +176,7 @@ class KeysByAccountIndexMigrationTaskTest {
             return true;
         });
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, times(2)).ownerPage(null, 500);
         verify(dao, times(3)).ownerPage(nextPage, 500);
@@ -194,7 +194,7 @@ class KeysByAccountIndexMigrationTaskTest {
                 .ncaId("column-nca").ncaIdInDetails("details-nca").build());
         when(dao.credential(anyString())).thenReturn(Optional.empty());
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, never()).copy(any(), any(TimedRow.class));
         verify(dao, never()).setCredentialNcaId(anyString(), anyString(), anyLong());
@@ -210,7 +210,7 @@ class KeysByAccountIndexMigrationTaskTest {
                 new TimedRow<>(model, TEST_TIME.toEpochMilli() * 1000)), null));
         when(services.storedServiceIds("service")).thenReturn(Set.of("service"));
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, never()).deleteOrphan(any(), anyLong());
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
@@ -226,7 +226,7 @@ class KeysByAccountIndexMigrationTaskTest {
         when(services.storedServiceIds("service")).thenReturn(Set.of("service"));
         when(dao.ownerExists(model, Set.of("service"))).thenReturn(false, true);
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao, never()).deleteOrphan(any(), anyLong());
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
@@ -241,7 +241,7 @@ class KeysByAccountIndexMigrationTaskTest {
         when(services.storedServiceIds("service")).thenReturn(Set.of("service"));
         when(dao.account(model)).thenReturn(Optional.empty());
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         verify(dao).deleteOrphan(model, timestamp + 1);
         assertThat(result("orphan")).isEqualTo(1);
@@ -256,7 +256,7 @@ class KeysByAccountIndexMigrationTaskTest {
         when(dao.accountPage(null, 500)).thenReturn(new Page<>(List.of(), null));
         when(ownerConverter.modelToVo(model)).thenThrow(new IllegalStateException("cannot decrypt"));
 
-        task.run(() -> { });
+        task.runUnchecked(() -> { });
 
         assertThat(result("failed")).isEqualTo(1);
         assertThat(registry.get("nvcf_api_keys_keys_by_account_index_copy_runs_total")
@@ -266,7 +266,7 @@ class KeysByAccountIndexMigrationTaskTest {
 
     @Test
     void lostLockStopsTheScanAndBlocksCompletion() {
-        task.run(() -> { throw new IllegalStateException("lock lost"); });
+        task.runUnchecked(() -> { throw new IllegalStateException("lock lost"); });
 
         verifyNoInteractions(dao);
         verify(markers, never()).markCompleted(anyString(), anyString(), any());
@@ -280,7 +280,7 @@ class KeysByAccountIndexMigrationTaskTest {
         var row = new TimedRow<>(model, 0);
         when(dao.ownerPage(null, 500)).thenReturn(new Page<>(List.of(row, row, row), null));
 
-        task.run(() -> {
+        task.runUnchecked(() -> {
             if (result("skipped") > 0) {
                 throw new IllegalStateException("lock lost during page");
             }
@@ -300,7 +300,7 @@ class KeysByAccountIndexMigrationTaskTest {
             throw new IllegalStateException("fetch failed");
         });
 
-        task.run(() -> {
+        task.runUnchecked(() -> {
             if (attempts.get() > 0) {
                 throw new IllegalStateException("lock lost between retries");
             }
@@ -314,7 +314,7 @@ class KeysByAccountIndexMigrationTaskTest {
     void renewalUsesElapsedTimeAndThrottlesRepeatedChecks() {
         var nanos = new AtomicLong(-Duration.ofSeconds(5).toNanos());
         var extensions = new AtomicInteger();
-        var renewal = new ScheduledTaskService.LockRenewal(
+        var renewal = new KeysByAccountIndexMigrationTask.LockRenewal(
                 extensions::incrementAndGet, Duration.ofSeconds(1), nanos::get);
         renewal.run();
         for (var i = 0; i < 500; i++) {

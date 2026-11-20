@@ -19,13 +19,11 @@ package com.nvidia.apikeys.scheduler;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
-import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
@@ -43,8 +41,7 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 
 class ScheduledTaskServiceTest {
     private final KeysByAccountIndexMigrationTask task = mock(KeysByAccountIndexMigrationTask.class);
-    private final ScheduledTaskService scheduler = new ScheduledTaskService(
-            task, new KeysByAccountIndexMigrationProperties());
+    private final ScheduledTaskService scheduler = new ScheduledTaskService(task);
 
     @Test
     void waitsForApplicationReadinessAndAllowsSubsequentRuns() throws Exception {
@@ -68,7 +65,7 @@ class ScheduledTaskServiceTest {
 
             first.get(5, TimeUnit.SECONDS);
             worker.submit(invoke).get(5, TimeUnit.SECONDS);
-            verify(task, times(2)).run(any());
+            verify(task, times(2)).run();
         } finally {
             worker.shutdownNow();
             assertThat(worker.awaitTermination(5, TimeUnit.SECONDS)).isTrue();

@@ -17,6 +17,7 @@
 
 package com.nvidia.apikeys.scheduler;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
 import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
@@ -46,11 +47,13 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import net.javacrumbs.shedlock.core.LockExtender;
 import org.apache.commons.collections4.SetUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
@@ -96,11 +99,24 @@ public class KeysByAccountIndexMigrationTask {
         completed.set(markers.isCompleted(MARKER_TABLE, MARKER_RECORD) ? 1 : 0);
     }
 
-    public void run(Runnable renewLock) {
-        var config = migrationProperties;
-        if (!config.isEnabled()) {
+    public void run() {
+        if (!migrationProperties.isEnabled()) {
             return;
         }
+        runUnchecked();
+    }
+
+    @VisibleForTesting
+    public void runUnchecked() {
+        var atMost = migrationProperties.getLockAtMostFor();
+        var atLeast = migrationProperties.getLockAtLeastFor();
+        runUnchecked(new LockRenewal(() -> LockExtender.extendActiveLock(atMost, atLeast),
+                atMost.dividedBy(3), System::nanoTime));
+    }
+
+    @VisibleForTesting
+    void runUnchecked(Runnable renewLock) {
+        var config = migrationProperties;
         var span = openTelemetry.getTracer("com.nvidia.apikeys.migration")
                 .spanBuilder("apikeys.keys-by-account-index-copy.run").startSpan();
         span.setAttribute("nvcf.org.id", properties.getNcaId());
@@ -286,5 +302,29 @@ public class KeysByAccountIndexMigrationTask {
     private static class Summary {
         private final Map<String, Long> counts = new HashMap<>();
         private boolean clean = true;
+    }
+
+    static final class LockRenewal implements Runnable {
+        private final Runnable extend;
+        private final long intervalNanos;
+        private final LongSupplier nanoTime;
+        private long lastRenewal;
+        private boolean renewed;
+
+        LockRenewal(Runnable extend, Duration interval, LongSupplier nanoTime) {
+            this.extend = extend;
+            this.intervalNanos = interval.toNanos();
+            this.nanoTime = nanoTime;
+        }
+
+        @Override
+        public void run() {
+            var now = nanoTime.getAsLong();
+            if (!renewed || now - lastRenewal >= intervalNanos) {
+                extend.run();
+                lastRenewal = now;
+                renewed = true;
+            }
+        }
     }
 }

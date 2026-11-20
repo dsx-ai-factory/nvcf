@@ -17,14 +17,10 @@
 
 package com.nvidia.apikeys.scheduler;
 
-import com.nvidia.apikeys.config.KeysByAccountIndexMigrationProperties;
-import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
-import java.util.function.LongSupplier;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.core.LockAssert;
-import net.javacrumbs.shedlock.core.LockExtender;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -43,7 +39,6 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
     private static final String KEYS_BY_ACCOUNT_INDEX_COPY = "keys-by-account-index-copy";
     private final CountDownLatch initialised = new CountDownLatch(1);
     private final KeysByAccountIndexMigrationTask task;
-    private final KeysByAccountIndexMigrationProperties properties;
 
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
@@ -59,34 +54,7 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
         initialised.await();
         LockAssert.assertLocked();
         log.debug("Begin task: '{}'", KEYS_BY_ACCOUNT_INDEX_COPY);
-        var atMost = properties.getLockAtMostFor();
-        var atLeast = properties.getLockAtLeastFor();
-        task.run(new LockRenewal(() -> LockExtender.extendActiveLock(atMost, atLeast),
-                atMost.dividedBy(3), System::nanoTime));
+        task.run();
         log.debug("End task: '{}'", KEYS_BY_ACCOUNT_INDEX_COPY);
-    }
-
-    static final class LockRenewal implements Runnable {
-        private final Runnable extend;
-        private final long intervalNanos;
-        private final LongSupplier nanoTime;
-        private long lastRenewal;
-        private boolean renewed;
-
-        LockRenewal(Runnable extend, Duration interval, LongSupplier nanoTime) {
-            this.extend = extend;
-            this.intervalNanos = interval.toNanos();
-            this.nanoTime = nanoTime;
-        }
-
-        @Override
-        public void run() {
-            var now = nanoTime.getAsLong();
-            if (!renewed || now - lastRenewal >= intervalNanos) {
-                extend.run();
-                lastRenewal = now;
-                renewed = true;
-            }
-        }
     }
 }
