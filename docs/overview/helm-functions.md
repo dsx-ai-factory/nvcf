@@ -5,6 +5,7 @@ Cloud functions support helm-based functions for orchestration across multiple c
 ## Prerequisites
 
 <Warning>
+
 Ensure that your helm charts version does not contain `-` For example `v1` is ok but `v1-test` will cause issues.
 
 </Warning>
@@ -13,6 +14,7 @@ Ensure that your helm charts version does not contain `-` For example `v1` is ok
 2. The name of this service in your helm chart should be supplied by setting `helmChartServiceName` during the function definition. This allows Cloud Functions to communicate and make inference requests to the "mini-service" endpoint.
 
 <Warning>
+
 The `servicePort` defined within the helm chart should be used as the `inferencePort` supplied during function creation. Otherwise, Cloud Functions will not be able to reach the "mini-service".
 
 </Warning>
@@ -66,6 +68,7 @@ curl -s -X POST "http://${GATEWAY_ADDR}/v2/nvcf/functions" \
 ```
 
 <Note>
+
 For gRPC-based functions, set `"inferenceURL" : "/gRPC"`. This signals to Cloud Functions that the function is using gRPC protocol and is not expected to have a `/gRPC` endpoint exposed for inferencing requests.
 
 </Note>
@@ -82,8 +85,10 @@ A sample helm chart for a multi-node deployment can be found [in the multi-node 
 ### Multi-node NVLink scheduling
 
 <Note>
+
 The compute cluster must have the `NVLinkOptimized` attribute. See
 [NVLink-optimized clusters](../compute-plane/cluster-management/configuration.md#nvlink-optimized-clusters).
+
 </Note>
 
 NVCF can place the Pods from one multi-node Helm function in a single NVLink
@@ -97,7 +102,9 @@ NVCA will create a
 to connect GPU workload Pods through IMEX.
 
 <Note>
+
 Each GPU-enabled Pod that uses the `ComputeDomain` must request a full node of GPUs.
+
 </Note>
 
 A function that does not need cross-node NVLink memory sharing can opt out of
@@ -124,6 +131,7 @@ of a node can share nodes while decode workers span nodes over NVLink.
 #### Legacy NVCA NVLink partition annotation
 
 <Warning>
+
 NVLink partition placement through these legacy affinity rules is best-effort
 without KAI Scheduler or Grove topology-aware scheduling. The rules do not
 provide atomic gang placement. Concurrent Pods can initially land in different
@@ -132,6 +140,7 @@ cliques, and distinct logical groups can land in the same clique. Use
 [Topology-Aware Scheduling](../compute-plane/cluster-management/topology-aware-scheduling.md)
 when the workload requires all Pods to fit and start in a specific topology
 domain.
+
 </Warning>
 
 For charts that do not use KAI Scheduler or Grove topology constraints, NVCA
@@ -232,6 +241,7 @@ Any standard that cannot be enforced by modification will result in error(s) dur
 - No [chart hooks](https://helm.sh/docs/topics/charts_hooks/) are allowed; if specified in the chart, they will not be executed.
 
 <Note>
+
 CustomResourceDefinitions in helm charts will be skipped on installation. There is no need to modify your chart to remove them from `helm template` output for NVCF.
 
 </Note>
