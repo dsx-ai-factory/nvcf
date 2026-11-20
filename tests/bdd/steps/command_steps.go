@@ -41,6 +41,7 @@ func registerCommandSteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I run command:$`, sc.iRunCommandDoc)
 	ctx.Step(`^I successfully run command "([^"]*)"$`, sc.iSuccessfullyRunCommandLine)
 	ctx.Step(`^I successfully run command:$`, sc.iSuccessfullyRunCommandDoc)
+	ctx.Step(`^I successfully run executable "([^"]*)" with arguments:$`, sc.iSuccessfullyRunExecutable)
 	ctx.Step(`^I poll command for up to (\d+) seconds until output contains "([^"]*)":$`, sc.iPollCommandUntilOutputContains)
 	ctx.Step(`^I run command with a terminal:$`, sc.iRunCommandWithTTYDoc)
 	ctx.Step(`^command has succeeded:$`, sc.commandHasSucceededDoc)
@@ -62,6 +63,20 @@ func (sc *ScenarioContext) iSuccessfullyRunCommandLine(ctx context.Context, comm
 
 func (sc *ScenarioContext) iSuccessfullyRunCommandDoc(ctx context.Context, doc *godog.DocString) error {
 	return sc.runSuccessfully(ctx, doc.Content)
+}
+
+func (sc *ScenarioContext) iSuccessfullyRunExecutable(ctx context.Context, executable string, table *godog.Table) error {
+	if table == nil || len(table.Rows) < 2 || len(table.Rows[0].Cells) != 1 || table.Rows[0].Cells[0].Value != "argument" {
+		return fmt.Errorf("argument table requires an argument header and at least one data row")
+	}
+	args := []string{dsl.Interpolate(executable)}
+	for i, row := range table.Rows[1:] {
+		if len(row.Cells) != 1 {
+			return fmt.Errorf("argument row %d must contain exactly one cell", i+1)
+		}
+		args = append(args, dsl.Interpolate(row.Cells[0].Value))
+	}
+	return sc.runResolvedSuccessfully(ctx, dsl.BuildCommand(args...))
 }
 
 func (sc *ScenarioContext) iPollCommandUntilOutputContains(

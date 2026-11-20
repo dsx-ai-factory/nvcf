@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Validate rendered release manifests against the images they actually select.
+set -euo pipefail
+
+fail() { echo "openbao-ui-jwt-version: $*" >&2; exit 1; }
+[[ $# == 2 ]] || fail 'usage: check-openbao-ui-jwt-version OPENBAO_MANIFEST UI_MANIFEST'
+server_manifest=$1 ui_manifest=$2
+[[ -s $server_manifest && -s $ui_manifest ]] || fail 'both rendered release manifests are required'
+
+server_images=$(yq -rN 'select(.kind == "StatefulSet") | .spec.template.spec.containers[] | select(.name == "openbao") | .image' "$server_manifest")
+[[ -n $server_images && $server_images != *$'\n'* ]] || fail 'expected exactly one OpenBao server image in the rendered StatefulSet'
+server_image=$server_images
+
+# Run only inspection commands. Never start the server or contact a cluster.
+isolation=(--rm --pull always --network none --read-only --cap-drop ALL --security-opt no-new-privileges)
+# Authenticate lazily. Keep Docker context metadata, but never copy credential
+# stores into the temporary NGC config. Mirror pulls retain the original config.
+if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+  umask 077
+  temp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
+  NVCF_RELEASE_NGC_DOCKER_CONFIG=$(mktemp -d "$temp_base/openbao-ui-jwt-docker.XXXXXX")
+  export NVCF_RELEASE_NGC_DOCKER_CONFIG
+  trap 'rm -rf "$NVCF_RELEASE_NGC_DOCKER_CONFIG"' EXIT
+fi
+docker_image() {
+  local image=$1
+  shift
+  if [[ $image == nvcr.io/* && -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+    local original_config=${DOCKER_CONFIG:-$HOME/.docker}
+    local config=$NVCF_RELEASE_NGC_DOCKER_CONFIG
+    if [[ ! -f $config/logged-in ]]; then
+      if [[ -f $original_config/config.json ]]; then
+        yq -o=json '{"auths": {"nvcr.io": {}}, "currentContext": (.currentContext // "")}' \
+          "$original_config/config.json" > "$config/config.json" || return 1
+      else
+        printf '{"auths":{"nvcr.io":{}}}\n' > "$config/config.json" || return 1
+      fi
+      if [[ -d $original_config/contexts ]]; then
+        cp -RH "$original_config/contexts" "$config/contexts" || return 1
+      fi
+      printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | DOCKER_CONFIG="$config" \
+        docker login nvcr.io --username '$oauthtoken' --password-stdin >&2 || return 1
+      touch "$config/logged-in" || return 1
+    fi
+    DOCKER_CONFIG="$config" docker "$@"
+  else
+    docker "$@"
+  fi
+}
+# The inspection script expands variables inside the selected image.
+# shellcheck disable=SC2016
+layout=$(docker_image "$server_image" run "${isolation[@]}" --entrypoint /bin/sh "$server_image" -ec '
+  if test -x /openbao/plugins/vault-plugin-secrets-jwt; then
+    echo legacy-or-bridge
+  else
+    test -r /openbao/jwt-plugin-versions.env
+    . /openbao/jwt-plugin-versions.env
+    test -n "${JWT_PLUGIN_TARGET_VERSION:-}"
+    test -x "/openbao/plugins/vault-plugin-secrets-jwt-$JWT_PLUGIN_TARGET_VERSION"
+    printf "%s\n" "$JWT_PLUGIN_TARGET_VERSION"
+  fi
+') || fail "cannot inspect JWT plugin layout in selected server image $server_image; verify image access, manifest and plugin files"
+if [[ $layout == legacy-or-bridge ]]; then
+  echo "openbao-ui-jwt-version: legacy/bridge image $server_image retains unversioned mount support"
+  exit 0
+fi
+target=$layout
+[[ $target =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || fail "invalid JWT_PLUGIN_TARGET_VERSION in $server_image"
+
+container='select(.kind == "Job") | .spec.template.spec.containers[] | select(.name == "openbao-migrations")'
+count=$(yq ea -r "[. | $container] | length" "$ui_manifest")
+[[ $count == 1 ]] || fail 'expected exactly one rendered UI OpenBao migration container; use a UI chart with JWT version selection'
+versions=$(yq -rN "$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value" "$ui_manifest")
+export OPENBAO_UI_JWT_EXPECTED_VERSION=$target
+[[ $(yq ea -r "[. | $container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\" and .value == strenv(OPENBAO_UI_JWT_EXPECTED_VERSION))] | length" "$ui_manifest") == 1 ]] || fail "UI BAO_JWT_PLUGIN_VERSION is '${versions:-missing or empty}', expected $target from $server_image; set addons.nvcfUi.openbaoMigrations.jwtPluginVersion in the release environment and select a UI chart that forwards it"
+version_count=$(yq ea -r "[. | $container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\")] | length" "$ui_manifest")
+[[ $version_count == 1 ]] || fail 'UI migration Job must contain exactly one BAO_JWT_PLUGIN_VERSION'
+migration_image=$(yq -rN "$container | .image" "$ui_manifest")
+[[ -n $migration_image && $migration_image != null ]] || fail 'UI migration image is missing'
+
+# Exercise the selected image's mount helper with a fake bao. The probe fails
+# for old images that ignore BAO_JWT_PLUGIN_VERSION, even if their tag is newer.
+# shellcheck disable=SC2016
+probe_output=$(docker_image "$migration_image" run "${isolation[@]}" --env "BAO_JWT_PLUGIN_VERSION=$target" \
+  --entrypoint /bin/bash "$migration_image" -ec '
+    exec 3>&1
+    source /app/migrations/utils/functions.sh
+    log_info() { :; }; log_step() { :; }; log_success() { :; }
+    log_error() { echo "$*" >&2; }
+    bao() {
+      if [[ $1 == secrets && $2 == list ]]; then
+        printf "{}\n"
+      else
+        [[ $# == 5 && $1 == secrets && $2 == enable &&
+           $3 == -path=ci/ui-jwt && $4 == "-plugin-version=$BAO_JWT_PLUGIN_VERSION" &&
+           $5 == vault-plugin-secrets-jwt ]] || return 1
+        printf "jwt-version-selected\n" >&3
+      fi
+    }
+    enable_secrets_mount ci/ui-jwt vault-plugin-secrets-jwt
+  ') || fail "selected UI migration image $migration_image does not support explicit JWT plugin version selection; select a compatible migration image"
+[[ $probe_output == jwt-version-selected ]] || fail "selected UI migration image $migration_image did not create the mount with an explicit JWT plugin version"
+echo "openbao-ui-jwt-version: target-only $server_image -> $migration_image uses $target"

@@ -3271,7 +3271,7 @@ func TestSingleClusterHA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeature(t, "single-cluster-ha.feature")
+	runLiveFeature(t, "single-cluster-ha.feature", harness.WithoutCLI())
 }
 
 // TestSingleClusterHelmfileLLMPKI is the live entry point for the
@@ -3289,7 +3289,7 @@ func TestObservabilityControl(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeature(t, "observability-control.feature")
+	runLiveFeature(t, "observability-control.feature", harness.WithoutCLI())
 }
 
 // TestObservabilityCompute is the live entry point for the compute
@@ -3317,7 +3317,7 @@ func TestSingleClusterHelmfileUpstreamImages(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeature(t, "single-cluster-helmfile-upstream-images.feature")
+	runLiveFeature(t, "single-cluster-helmfile-upstream-images.feature", harness.WithoutCLI())
 }
 
 // TestObservabilityDisabled is the live entry point for the render-only
@@ -3326,7 +3326,7 @@ func TestObservabilityDisabled(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeature(t, "observability-disabled.feature")
+	runLiveFeature(t, "observability-disabled.feature", harness.WithoutCLI())
 }
 
 // TestBYOORender is the live entry point for the render-only BYOO gate
@@ -3335,7 +3335,7 @@ func TestBYOORender(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live run skipped under -short")
 	}
-	runLiveFeature(t, "byoo-render.feature")
+	runLiveFeature(t, "byoo-render.feature", harness.WithoutCLI(), harness.WithTempWorkspace())
 }
 
 // TestBYOO is the live entry point for the BYOO feature. It installs the
@@ -3460,24 +3460,24 @@ func TestMultiClusterEKSHelmfile(t *testing.T) {
 // runLiveFeature is the shared live-run path: build CLI, register
 // every step, drive the feature, restore the ledger. Most live entry
 // points differ only in the feature file they name.
-func runLiveFeature(t *testing.T, feature string) {
+func runLiveFeature(t *testing.T, feature string, options ...harness.SuiteOption) {
 	t.Helper()
-	runLiveFeatureTags(t, feature, "")
+	runLiveFeatureTags(t, feature, "", options...)
 }
 
 // runLiveFeatureTags is runLiveFeature with an optional godog tag
 // expression (for example "~@skip" to exclude a scenario from the
 // live run while leaving it in the feature file for documentation and
 // for the wiring test). An empty tags string runs every scenario.
-func runLiveFeatureTags(t *testing.T, feature, tags string) {
+func runLiveFeatureTags(t *testing.T, feature, tags string, options ...harness.SuiteOption) {
 	t.Helper()
-	suite, err := harness.NewSuite(t)
+	suite, err := harness.NewSuite(t, options...)
 	if err != nil {
 		t.Fatalf("new suite: %v", err)
 	}
 	stopSignalCleanup := suite.InstallSignalCleanup()
 	defer func() {
-		stopSignalCleanup()
+		defer stopSignalCleanup()
 		if err := suite.Teardown(); err != nil {
 			t.Errorf("teardown: %v", err)
 		}

@@ -30,6 +30,8 @@ import (
 
 	"github.com/cucumber/godog"
 	messages "github.com/cucumber/messages/go/v21"
+	"github.com/google/shlex"
+	"slices"
 
 	"nvcf-bdd/harness"
 )
@@ -690,6 +692,54 @@ func TestISuccessfullyRunCommandDocPreservesOutput(t *testing.T) {
 	}
 	if err := sc.commandOutputShouldContain("rendered output"); err != nil {
 		t.Fatalf("assert preserved output: %v", err)
+	}
+}
+
+func TestISuccessfullyRunExecutablePreservesArguments(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	t.Setenv("EXECUTABLE", `/tmp/tool "quoted"`)
+	t.Setenv("LITERAL", "unexpected-second-expansion")
+	t.Setenv("QUOTED_PATH", `/tmp/release\candidate 'quoted' "value" ${LITERAL}`)
+	table := &godog.Table{Rows: []*messages.PickleTableRow{
+		{Cells: []*messages.PickleTableCell{{Value: "argument"}}},
+		{Cells: []*messages.PickleTableCell{{Value: "${QUOTED_PATH}"}}},
+		{Cells: []*messages.PickleTableCell{{Value: "release"}}},
+		{Cells: []*messages.PickleTableCell{{Value: ""}}},
+		{Cells: []*messages.PickleTableCell{{Value: "  "}}},
+	}}
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "${EXECUTABLE}", table); err != nil {
+		t.Fatal(err)
+	}
+	args, err := shlex.Split(fake.runs[0].command)
+	if err != nil || !slices.Equal(args, []string{os.Getenv("EXECUTABLE"), os.Getenv("QUOTED_PATH"), "release", "", "  "}) {
+		t.Fatalf("args=%q err=%v", args, err)
+	}
+	fake.result.ExitCode = 1
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted command failure")
+	}
+	fake.result.ExitCode = 0
+	calls := len(fake.runs)
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", nil); err == nil {
+		t.Fatal("accepted missing argument table")
+	}
+	if len(fake.runs) != calls {
+		t.Fatal("missing argument table invoked runner")
+	}
+	table.Rows[0].Cells[0].Value = "wrong-header"
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted wrong argument header")
+	}
+	if len(fake.runs) != calls {
+		t.Fatal("wrong header invoked runner")
+	}
+	table.Rows[0].Cells[0].Value = "argument"
+	table.Rows[1].Cells = append(table.Rows[1].Cells, &messages.PickleTableCell{Value: "extra"})
+	if err := sc.iSuccessfullyRunExecutable(context.Background(), "qualifier", table); err == nil {
+		t.Fatal("accepted extra argument cell")
+	}
+	if len(fake.runs) != calls {
+		t.Fatal("extra cell invoked runner")
 	}
 }
 

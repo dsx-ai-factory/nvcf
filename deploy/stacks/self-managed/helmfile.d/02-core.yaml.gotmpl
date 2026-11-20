@@ -22,7 +22,7 @@ repositories:
     password: {{ dig "global" "helm" "sources" "password" "" .Values | quote }}
     {{- end }}
 {{- else }}
-    url: {{ .Values.global.helm.sources.registry }}/{{ .Values.global.helm.sources.repository }}
+    url: {{ printf "%s/%s" (.Values.global.helm.sources.registry | toString | trimPrefix "oci://") (.Values.global.helm.sources.repository | toString) | quote }}
     oci: true
 {{- end }}
 

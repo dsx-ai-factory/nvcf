@@ -22,6 +22,7 @@ test:
 	@tests/llm-pki-openbao-migration.sh
 	@tests/openbao-injector-image-overrides.sh
 	@tests/openbao-jwt-lifecycle-wiring.sh
+	@tests/openbao-ui-jwt-version-wiring.sh
 	@tests/service-pki-wiring.sh
 	@tests/nonroot-llm-migrations.sh
 	@tests/api-keys-startup-probe.sh

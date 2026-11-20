@@ -326,10 +326,65 @@ versions and running SHA values. Check every member is on the intended image.
 Qualify a later target-only image built with `JWT_INCLUDE_LEGACY=false`.
 It must retain exactly the same target binary and catalog digest as the bridge.
 The target-only image omits old command paths and old registration stanzas.
+
+When the UI is enabled, set
+`addons.nvcfUi.openbaoMigrations.jwtPluginVersion` in the stack environment to
+`JWT_PLUGIN_TARGET_VERSION` from the selected server image's
+`/openbao/jwt-plugin-versions.env`. Select a UI chart that forwards this value
+as `BAO_JWT_PLUGIN_VERSION` and a migrations image that supports it. Keep this
+an explicit release setting when the server target changes.
+
+Before qualifying that release, run from the source checkout with Helm 3,
+Helmfile 1.1.x, yq 4 and Docker. For NGC, export
+`NVCF_RELEASE_NGC_API_KEY`. The qualifier uses it for a temporary `nvcr.io`
+Docker login when a selected image uses NGC, and for NGC chart authentication
+(HTTPS at `helm.ngc.nvidia.com` or OCI at `nvcr.io`). It does not reuse
+`helm repo add` entries. For chart mirrors, configure credentials in
+`global.helm.sources`; authenticate Docker to image mirrors before running.
+Mirror image pulls retain the existing Docker config and credential helpers.
+NGC image pulls preserve the selected Docker context and its TLS metadata.
+The qualifier suppresses Helmfile debug output to protect saved passwords.
+Use the actual release environment, including its image, chart and plugin
+version settings. Complete this check before deploying the target-only image:
+
+```bash
+tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed "$HELMFILE_ENV"
+```
+
+The check resolves effective state values once with native Helmfile path and
+template-include rules, then shares that snapshot across both releases. Unused
+state references do not block a disabled-UI check. Qualification leaves the
+supplied stack unchanged, including symlinked paths. It freezes each selected
+chart and its embedded values before rendering. Changes to external values
+files cannot redirect its chart credentials.
+It renders the selected published charts, reads the target from the
+selected server image and exercises the selected migration image's mount
+helper without a server connection. Missing, empty or mismatched UI versions
+and incompatible migration images fail qualification. PR tests check stack
+propagation and rejection cases with simulated images. The self-managed tag
+workflow checks the published artifacts with the optional UI enabled before
+publishing release notes and inventory assets. Dry runs skip this check.
+CI uses `NVCF_RELEASE_NGC_API_KEY` for NGC authentication with temporary Helm
+and Docker configurations. The chart origin must match
+`NVCF_RELEASE_HELM_REGISTRY`. NGC chart origins support the default HTTPS port or
+explicit port 443. OCI registry settings accept a bare host or one `oci://`
+prefix; installation and qualification use the same normalization. For manual
+runs, other private OCI origins use the operator's Helm or Docker credentials,
+including native credential helpers. Helm's chart pull decides
+whether authentication succeeds and reports host-specific login guidance on
+failure. The bundled release job supplies only NGC credentials. A private
+non-NGC CI origin needs a separate authentication step before qualification;
+the hosted runner does not inherit an operator's local credentials. Leading and trailing whitespace and all trailing registry slashes
+are removed; empty, `.` and `..` path components are rejected.
+Legacy and bridge images retain unversioned mount support; a disabled UI has
+no UI migration check.
+
 Deploy and rotate it with the same health checks, without changing the target
 plugin version. Keep `openbao.jwtPluginLifecycle.mode=versioned` and use hooks
 so the target-only preflight verifies mounts before the rollout. Verify again
 after leadership changes.
+
+Continue with runtime signing and rollback validation before cleanup.
 
 ```bash
 bao_admin jwt-plugin-lifecycle verify
@@ -352,7 +407,7 @@ flowchart LR
   H --> C[Separate window: pin old and rotate members]
   C --> D[Tune target and rotate members]
   D --> E[Validate all mounts and retain rollback window]
-  E --> F[Later target-only image]
+  E --> F[Qualify UI and deploy later target-only image]
   F --> G[Verify then remove old catalog entries]
   D --> C
 ```
