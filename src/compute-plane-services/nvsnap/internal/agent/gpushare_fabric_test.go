@@ -796,6 +796,89 @@ func TestDriveFabric_RetriesLostDeliveries(t *testing.T) {
 	})
 }
 
+// blockedFabricMember refuses verdicts while block is set, as an agent
+// that cannot be reached for a moment.
+type blockedFabricMember struct {
+	*fakeFabricMember
+	block atomic.Bool
+}
+
+func (b *blockedFabricMember) Verdict(ctx context.Context, attempt int, verdict string) error {
+	if b.block.Load() {
+		return errors.New("unreachable")
+	}
+	return b.fakeFabricMember.Verdict(ctx, attempt, verdict)
+}
+
+// A "go" that reached one member is not overtaken by an "abort" when a
+// member ends while the go is still on its way to another: a member that
+// got "go" releases, so every member must get it.
+func TestDriveFabric_GoInFlightIsNotOvertakenByAbort(t *testing.T) {
+	a, c := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "c"}
+	b := &blockedFabricMember{fakeFabricMember: &fakeFabricMember{name: "b"}}
+	b.block.Store(true)
+	ds, res, cancel := startDrive([]fabricMember{a, b, c})
+	defer cancel()
+	a.vote(0, true)
+	b.vote(0, true)
+	c.vote(0, true)
+	eventually(t, "go reaches a", func() bool { v, _ := a.sent(); return len(v) == 1 })
+	ds.set(2) // c ends before b has the go
+	time.Sleep(3 * fabricPollInterval)
+	b.block.Store(false)
+	eventually(t, "a verdict reaches b", func() bool { v, _ := b.sent(); return len(v) == 1 })
+	if v, _ := b.sent(); !reflect.DeepEqual(v, []string{"0 go"}) {
+		t.Errorf("b verdicts = %v, want the go a already has", v)
+	}
+	if v, _ := a.sent(); !reflect.DeepEqual(v, []string{"0 go"}) {
+		t.Errorf("a verdicts = %v, want one go", v)
+	}
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; !out.Went {
+		t.Errorf("outcome = %+v, want went", out)
+	}
+}
+
+// A "retry" that reached some members is finished before an abort: the
+// others get the same "retry" for that attempt, never "abort", and the
+// abort answers the next attempt.
+func TestDriveFabric_RetryInFlightIsNotOvertakenByAbort(t *testing.T) {
+	a, c := &fakeFabricMember{name: "a"}, &fakeFabricMember{name: "c"}
+	b := &blockedFabricMember{fakeFabricMember: &fakeFabricMember{name: "b"}}
+	b.block.Store(true)
+	ds, res, cancel := startDrive([]fabricMember{a, b, c})
+	defer cancel()
+	a.vote(0, true)
+	b.vote(0, false)
+	c.vote(0, true)
+	eventually(t, "retry reaches a", func() bool { v, _ := a.sent(); return len(v) == 1 })
+	ds.set(2) // c ends before b has the retry: later votes are aborted
+	time.Sleep(3 * fabricPollInterval)
+	b.block.Store(false)
+	eventually(t, "a verdict reaches b", func() bool { v, _ := b.sent(); return len(v) == 1 })
+	if v, _ := b.sent(); !reflect.DeepEqual(v, []string{"0 retry"}) {
+		t.Errorf("b verdicts = %v, want the retry a already has", v)
+	}
+	a.vote(1, true)
+	b.vote(1, true)
+	eventually(t, "abort", func() bool {
+		va, _ := a.sent()
+		vb, _ := b.sent()
+		return len(va) == 2 && len(vb) == 2
+	})
+	for _, m := range []*fakeFabricMember{a, b.fakeFabricMember} {
+		if v, _ := m.sent(); !reflect.DeepEqual(v, []string{"0 retry", "1 abort"}) {
+			t.Errorf("%s verdicts = %v, want [0 retry, 1 abort]", m.name, v)
+		}
+	}
+	ds.set(0)
+	ds.set(1)
+	if out := <-res; out.Went {
+		t.Errorf("outcome = %+v, want not went", out)
+	}
+}
+
 // A vote that keeps finding a node busy is aborted at the deadline, for
 // every member at its next vote, so all roll back at the same attempt
 // instead of retrying for as long as their tools would.

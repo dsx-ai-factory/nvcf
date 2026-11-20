@@ -61,8 +61,7 @@ const (
 	fabricEnv = "NVSNAP_GPUSHARE_FABRIC"
 
 	// fabricVerdictAbort answers a vote once the session cannot succeed.
-	// The tool treats any verdict but "go" as "retry" and gives up at its
-	// own timeout, rolling the workload back.
+	// The tool rolls the workload back as soon as it reads it.
 	fabricVerdictAbort = "abort"
 	// fabricVerdictUnlock tells a restored rank that every pod of its
 	// instance has resumed.
@@ -517,8 +516,10 @@ type fabricDriveOpts struct {
 // Vote: once every member still running has voted the same attempt, the
 // answer is "go" if all are quiesced, else "retry". A member whose
 // checkpoint returned before the go cannot release: every later vote is
-// answered "abort", and the others roll back. So is every vote once
-// VoteDeadline has passed.
+// answered "abort", and the others roll back as soon as they read it. So
+// is every vote once VoteDeadline has passed. A verdict that some members
+// already have reaches the rest first, so no member gets "go" while another
+// gets "abort" for the same attempt.
 //
 // Unlock: once every member has reported its CRIU restore done, all get
 // "unlock". A member that returns first has failed; the rest get "abort".
@@ -681,9 +682,13 @@ type fabricVoter struct {
 func (v *fabricVoter) goPending() bool { return v.pending != nil && v.pending.value == "go" }
 
 func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running []int, states map[int]fabricState, aborted bool, out *fabricOutcome, log *logrus.Entry) {
-	// A go reaches every member, even past the deadline: a member that has it
-	// may be suspending, and an abort to the others would split the capture.
-	if aborted && !v.goPending() {
+	// A verdict some members already have is finished before an abort:
+	// a member that got "go" releases, so the others must get "go" too,
+	// not "abort" for the same attempt.
+	if v.pending != nil && !v.finish(ctx, members, running, out, log) {
+		return
+	}
+	if aborted {
 		// An abort answers each member's own attempt as it votes.
 		for _, i := range running {
 			st, ok := states[i]
@@ -725,14 +730,21 @@ func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running
 		}
 		v.pending, v.attempt = &fabricDelivery{what: "verdict", value: verdict, sent: map[int]bool{}}, attempt
 	}
+	v.finish(ctx, members, running, out, log)
+}
+
+// finish delivers the pending verdict and reports whether every running
+// member now has it.
+func (v *fabricVoter) finish(ctx context.Context, members []fabricMember, running []int, out *fabricOutcome, log *logrus.Entry) bool {
 	p := v.pending
 	if !p.deliver(running, func(i int) error { return members[i].Verdict(ctx, v.attempt, p.value) }, members, log) {
-		return
+		return false
 	}
 	v.decided, v.pending = v.attempt, nil
 	out.Attempts = v.attempt + 1
 	out.Went = p.value == "go"
 	log.WithFields(logrus.Fields{"attempt": v.attempt, "verdict": p.value}).Info("gpushare fabric: quiesce vote")
+	return true
 }
 
 // memberStates asks the running members for their state in parallel, each

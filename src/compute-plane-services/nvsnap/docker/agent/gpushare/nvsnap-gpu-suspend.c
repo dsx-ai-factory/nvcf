@@ -655,10 +655,11 @@ static void thaw_all(struct frozen *fz, int n)
 
 /* ── Shared GPU memory (libnvsnap_gpushare control socket) ─────────────── */
 
-/* Send cmd to pid's control thread. Returns 1 if pid has none (it shares
- * no GPU memory), 0 on "ok", -2 on "busy" (retry), -3 if its library
- * predates cmd, -1 on error. */
-static int ctl(int pid, const char *cmd)
+/* Send cmd to pid's control thread; its reply goes to rep (if not NULL),
+ * and is printed unless quiet. Returns 1 if pid has none (it shares no GPU
+ * memory), 0 on "ok", -2 on "busy" (retry), -3 if its library predates
+ * cmd, -1 on error. */
+static int ctl_rep(int pid, const char *cmd, char *out, size_t outlen, int quiet)
 {
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     int n = snprintf(a.sun_path + 1, sizeof(a.sun_path) - 1, GPUSHARE_SOCK_FMT, pid);
@@ -693,10 +694,21 @@ static int ctl(int pid, const char *cmd)
         else snprintf(rep, sizeof(rep), "err no reply (%s)", r < 0 ? strerror(errno) : "closed");
     }
     close(s);
-    printf("pid=%d %s: %s\n", pid, cmd, rep);
+    if (!quiet || strncmp(rep, "ok", 2)) printf("pid=%d %s: %s\n", pid, cmd, rep);
+    if (out) snprintf(out, outlen, "%s", rep);
     if (!strncmp(rep, "err busy", 8)) return -2;
     if (!strcmp(rep, "err unknown command")) return -3;
     return strncmp(rep, "ok", 2) ? -1 : 0;
+}
+
+static int ctl(int pid, const char *cmd) { return ctl_rep(pid, cmd, NULL, 0, 0); }
+
+/* Reopen every pid's gates after a failed or abandoned quiesce: each pid,
+ * even after one fails (ctl_all would stop there and leave the rest held).
+ * Failures are printed by ctl. */
+static void resume_all(const int *pids, int n)
+{
+    for (int i = 0; i < n; i++) ctl(pids[i], "resume");
 }
 
 /* Run cmd on every pid that shares GPU memory. Returns the first error
@@ -1103,32 +1115,143 @@ static void undo(const int *pids, int n, int locked, int shared)
  * collectives wait for the ranks other nodes hold. So each attempt to
  * quiesce is a vote: write DIR/q ("<attempt> ok" or "<attempt> busy") and
  * wait for DIR/d, written by whoever drives the nodes once every node has
- * voted: "<attempt> go" if all are quiesced, else "<attempt> retry".
- * Returns 1 for go, 0 for retry, -1 on timeout. */
-static int node_vote(int attempt, int quiesced)
+ * voted: "<attempt> go" if all are quiesced, else "<attempt> retry", or
+ * "<attempt> abort" once the session cannot succeed (a node is gone, or the
+ * driver's quiesce deadline passed: it keeps the nodes' deadline, so they
+ * stop at the same attempt). Returns 1 for go, 0 for retry, -1 on abort or
+ * when deadline (now_ms() time) passes with no verdict.
+ *
+ * A node that gives up at its deadline first takes back an "ok" vote: left
+ * in DIR/q, a late driver could still count it and send "go" to the other
+ * nodes, which would release while this one rolls back. It then waits a
+ * while for a verdict the driver may already be sending: a "go" decided
+ * before the vote was taken back is followed, not rolled back. The wait
+ * covers a delivery the driver retries for a while (an agent unreachable
+ * for a moment); it ends as soon as any verdict arrives. */
+static double now_ms(void);
+
+#define VOTE_WITHDRAW_MS 20000  /* the driver retries a verdict each poll: every 200 ms to an agent that
+                                  * refuses, about every 20 s to one that does not answer */
+
+static int write_vote(const char *q, const char *tmp, int attempt, int quiesced)
 {
-    char q[512], tmp[520], d[512], line[64];
-    snprintf(q, sizeof(q), "%s/q", fabric_dir);
-    snprintf(tmp, sizeof(tmp), "%s/q.tmp", fabric_dir);
-    snprintf(d, sizeof(d), "%s/d", fabric_dir);
     FILE *fp = fopen(tmp, "we");
     if (!fp || fprintf(fp, "%d %s\n", attempt, quiesced ? "ok" : "busy") < 0 || fclose(fp) != 0 || rename(tmp, q) != 0) {
         fprintf(stderr, "%s: %s\n", q, strerror(errno));
         return -1;
     }
-    for (int t = 0; t < 6000; t++) {
+    return 0;
+}
+
+static int node_vote(int attempt, int quiesced, double deadline)
+{
+    char q[512], tmp[520], d[512], line[64];
+    snprintf(q, sizeof(q), "%s/q", fabric_dir);
+    snprintf(tmp, sizeof(tmp), "%s/q.tmp", fabric_dir);
+    snprintf(d, sizeof(d), "%s/d", fabric_dir);
+    if (write_vote(q, tmp, attempt, quiesced) < 0) return -1;
+    int withdrawn = 0;
+    for (;;) {
         int a = -1;
         char verdict[16] = "";
+        FILE *fp;
         if ((fp = fopen(d, "re"))) {
             if (fgets(line, sizeof(line), fp)) sscanf(line, "%d %15s", &a, verdict);
             fclose(fp);
         }
-        if (a == attempt) return !strcmp(verdict, "go");
+        if (a == attempt) {
+            if (!strcmp(verdict, "abort")) {
+                printf("quiesce: the vote was aborted at attempt %d: rolling back\n", attempt);
+                return -1;
+            }
+            if (!strcmp(verdict, "go") && withdrawn)
+                printf("quiesce: \"go\" for attempt %d came after the deadline, before the vote was taken back: "
+                       "going on\n", attempt);
+            /* A "retry" after the deadline: the caller rolls back. */
+            return !strcmp(verdict, "go");
+        }
+        if (now_ms() >= deadline) {
+            if (withdrawn || !quiesced) break;
+            if (write_vote(q, tmp, attempt, 0) < 0) return -1;
+            withdrawn = 1;
+            deadline = now_ms() + VOTE_WITHDRAW_MS;
+        }
         usleep(100000);
     }
-    fprintf(stderr, "no verdict in %s after 600 s\n", d);
+    fprintf(stderr, "no verdict in %s for attempt %d by the deadline\n", d, attempt);
     return -1;
 }
+
+static double now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
+
+/* Bring the held ranks (see "hold" in gpushare.c) to a point where all
+ * have drained at once, then quiesce them: while any rank is busy, let one
+ * held launch through on each drained one. A drained rank has seen every
+ * collective it launched complete, so it is behind or level with every
+ * peer, and one launch at a time never takes it past them. nudge: these
+ * ranks had all drained but another node's had not (they wait for these):
+ * let one launch through on each first. Returns what ctl_all returns for
+ * "quiesce", -2 if they did not all drain (a busy rank waits for another
+ * node, or for work the gate does not hold), -1 on error. */
+static int catch_up(const int *pids, int n, int nudge)
+{
+    char rep[GPUSHARE_REPLY_MAX];
+    int *st = calloc(n, sizeof(*st));  /* -2 busy, -1 no control socket, else launches held */
+    double t0 = now_ms(), last = t0;
+    int steps = 0, r = -2;
+    for (;;) {
+        int busy = 0, err = 0;
+        for (int i = 0; i < n && !err; i++) {
+            int c = ctl_rep(pids[i], "poll", rep, sizeof(rep), 1);
+            if (c == 1) st[i] = -1;
+            else if (c < 0) err = c;
+            else if (sscanf(rep, "ok idle %d", &st[i]) != 1) st[i] = -2, busy++;
+        }
+        if (err) { r = err; break; }
+        /* One at a time: a quiescing process asks its peers' control
+         * threads about imports it has not matched yet ("whose"). */
+        if (!busy && !nudge) { r = ctl_all(pids, n, "quiesce"); break; }
+        int stepped = 0;
+        for (int i = 0; i < n && !err; i++) {
+            if (st[i] <= 0) continue;
+            int c = ctl_rep(pids[i], "step", rep, sizeof(rep), 1);
+            if (c < 0) err = c;
+            else stepped += !strcmp(rep, "ok stepped");
+        }
+        if (err) { r = err; break; }
+        nudge = 0;
+        double t = now_ms();
+        if (stepped) steps += stepped, last = t;
+        else if (t - last > 2000) break;  /* stuck */
+        else usleep(1000);
+        if (t - t0 > 10000) break;
+    }
+    printf("catch-up: %d launch(es) let through in %.0f ms: %s\n", steps, now_ms() - t0,
+           r >= 0 ? "quiesced" : r == -2 ? "busy" : "failed");
+    free(st);
+    return r;
+}
+
+/* Wait for the next whole second of the wall clock at least 300 ms away.
+ * Nodes that read a verdict at about the same time hold their ranks at the
+ * same instant, so the ranks of one node are not far ahead of another's. */
+static void wait_slot(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_sec += t.tv_nsec >= 700000000L ? 2 : 1;
+    t.tv_nsec = 0;
+    while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &t, NULL) == EINTR) {}
+}
+
+/* Attempts in a row that keep the ranks held (catching up across nodes)
+ * before all are let go and held again at a common instant. */
+#define HOLD_ROUNDS 8
 
 static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
 {
@@ -1139,10 +1262,14 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
     if (load_api() < 0) goto out;
 
     /* Processes that share GPU memory drop their shared mappings first:
-     * CUDA calls block once locked. "quiesce" holds the app's launches in
-     * libnvsnap_gpushare's gate (until "resume") and checks every process can
-     * release; only then does any process "release". Busy: GPU work waits on
-     * work not launched yet (e.g. a peer's NCCL kernel) — reopen and retry. */
+     * CUDA calls block once locked. "hold" holds the app's launches in
+     * libnvsnap_gpushare's gate (until "resume"), catch_up lets the ranks
+     * behind catch up, and "quiesce" checks every process can release; only
+     * then does any process "release". Busy: GPU work waits on work not
+     * launched yet (e.g. a peer's NCCL kernel on another node). With other
+     * nodes, the ranks stay held and catch up over the next attempts. A
+     * library without "hold" quiesces one process at a time: busy reopens
+     * and retries. */
     int shared = 0;
     if (fabric_dir) {  /* a previous suspend's votes */
         snprintf(path, sizeof(path), "%s/q", fabric_dir);
@@ -1150,21 +1277,50 @@ static int holder(const int *pids, int n, unsigned timeout_ms, int report_fd)
         snprintf(path, sizeof(path), "%s/d", fabric_dir);
         unlink(path);
     }
+    /* The deadline is wall-clock time: an attempt takes far longer than its
+     * 250 ms pause (a busy pid waits up to 2 s to drain, a catch-up up to
+     * 10 s, and a node's vote waits for every other node's), so counting
+     * attempts let a 120 s timeout run for 27 minutes. With --fabric-map the
+     * driver ends the session at the deadline with an "abort" verdict, the
+     * same attempt on every node; this node's own deadline, a minute later,
+     * only covers a driver that never answers. */
+    /* --timeout-ms 0 waits forever, on one node only: main refuses it with
+     * --fabric-map. */
+    double deadline = timeout_ms ? now_ms() + timeout_ms + (fabric_dir ? 60000 : 0) : 1e300;
+    int catchup = 1, holding = 0, nudge = 0;
     for (int tries = 0;; tries++) {
-        int r = ctl_all(pids, n, "quiesce");
-        if (r < 0) ctl_all(pids, n, "resume");
-        if (r < 0 && r != -2) goto out;
+        int r = -3;
+        if (catchup) {
+            if (!holding && fabric_dir) wait_slot();
+            r = ctl_all_par(pids, n, "hold");  /* after a quiesce: launches only */
+            if (r == -3) catchup = 0;  /* nothing held */
+            else if (r >= 0) holding = 1, r = catch_up(pids, n, nudge);
+        }
+        if (!catchup) r = ctl_all(pids, n, "quiesce");
+        nudge = 0;
+        if (r < 0 && r != -2) { resume_all(pids, n); goto out; }
+        /* Busy with no other node to wait for (or an older library): start over. */
+        if (r == -2 && (!holding || !fabric_dir)) resume_all(pids, n), holding = 0;
         if (fabric_dir) {  /* every node must be quiesced before any releases */
-            int v = node_vote(tries, r >= 0);
-            if (v < 0) { if (r >= 0) ctl_all(pids, n, "resume"); goto out; }
+            int v = node_vote(tries, r >= 0, deadline);
+            if (v < 0) { resume_all(pids, n); goto out; }
             if (v == 1) { shared = r > 0; break; }
-            if (r >= 0) ctl_all(pids, n, "resume");
+            if (holding && (tries + 1) % HOLD_ROUNDS) nudge = r >= 0;  /* keep holding: catch up */
+            else {
+                if (r >= 0 || holding) resume_all(pids, n);
+                holding = 0;
+            }
         } else if (r >= 0) {
             shared = r > 0;
             break;
         }
-        if (tries * 250 >= (int)timeout_ms) goto out;
-        usleep(250000);
+        if (now_ms() >= deadline) {
+            if (holding) resume_all(pids, n);
+            printf("quiesce: not quiesced after %d attempt(s) in %u ms: rolling back\n", tries + 1,
+                   timeout_ms + (fabric_dir ? 60000 : 0));
+            goto out;
+        }
+        if (!holding) usleep(250000);
     }
     char release[600] = "release";
     if (store_dir) snprintf(release, sizeof(release), "release %s %s%s%s", store_dir, ckpt_dir,
@@ -1576,7 +1732,7 @@ static void usage(const char *prog)
         "         probe        (is the one visible GPU usable? prints ok or the failing\n"
         "                       step and CUDA error; exit 0, 2 on a failure, 1 if it cannot ask)\n"
         "--libcuda PATH: (probe) the driver library to load (default libcuda.so.1)\n"
-        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever)\n"
+        "--timeout-ms N: lock timeout per pid (default 10000, 0 = wait forever; not with --fabric-map)\n"
         "--gpu-map FILE: restore GPUs listed in FILE onto the GPUs visible here\n"
         "--store S --ckpt-dir C: (suspend) libnvsnap_gpushare processes save GPU memory\n"
         "         to chunk store S; C lists the chunks of this checkpoint\n"
@@ -1626,6 +1782,14 @@ int main(int argc, char **argv)
     }
     if (!store_dir != !ckpt_dir) {
         fprintf(stderr, "--store and --ckpt-dir go together\n");
+        return 1;
+    }
+    /* A node that votes must give up shortly after the driver does. With no
+     * deadline it would hold its ranks forever if the driver never answers;
+     * with one shorter than the driver's, it would roll back while the driver
+     * can still send "go" to the other nodes. */
+    if (fabric_dir && timeout_ms == 0) {
+        fprintf(stderr, "--fabric-map needs --timeout-ms above 0\n");
         return 1;
     }
 
