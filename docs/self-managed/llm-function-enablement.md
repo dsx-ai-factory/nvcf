@@ -89,7 +89,8 @@ function's health check passes, set `PYLON_READINESS_GATE: "true"` in
 `pylon`. `pylon` then waits for the declared check, with its path, port,
 expected status, and timeout, before it calibrates and registers. NVCA adds a
 readiness probe on `pylon`'s `/ready`. It returns `200` after
-`llm-request-router` accepts the registration and the reverse tunnel connects.
+`llm-request-router` accepts the registration. NVCA runs `pylon` with a reverse
+tunnel, so `/ready` also waits until the tunnel connects.
 
 Before you enable the switch:
 
@@ -101,6 +102,8 @@ Before you enable the switch:
   and timeout. For a Helm function, the `pylon` pod must reach the health port.
   If the check never passes, NVCA removes the worker when
   `INFERENCE_READY_TIMEOUT` ends.
+- If you override `INFERENCE_HEALTH_TIMEOUT`, use an ISO-8601 value such as
+  `PT10S`. `pylon` stops at startup on a Go duration such as `1m30s`.
 
 Declare a check that waits for the model workers, for example a sidecar that
 returns `200` only when enough workers are ready. Without a declared check, the
