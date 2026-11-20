@@ -253,6 +253,9 @@ class UpgradeGuide111Checks(unittest.TestCase):
             +             value: hunter2
             -           - name: NVCF_API_SIDECARS_IMAGE_PULL_SECRET
             -             value: "YWJjOnN1cGVyc2VjcmV0"
+                        - name: ROTATED_ADMIN_TOKEN
+            -             value: oldtoken1
+            +             value: newtoken2
                         - name: ADDONS_LLM_ENABLED
                           value: "false"
             """)
@@ -260,7 +263,10 @@ class UpgradeGuide111Checks(unittest.TestCase):
                              input=sample, capture_output=True, text=True, check=True).stdout
         self.assertNotIn("hunter2", out)
         self.assertNotIn("YWJjOn", out)
-        self.assertEqual(2, out.count("value: [REDACTED]"))
+        # A rotated credential shows an unchanged name line, then a removed and an added value line.
+        self.assertNotIn("oldtoken1", out)
+        self.assertNotIn("newtoken2", out)
+        self.assertEqual(4, out.count("value: [REDACTED]"))
         self.assertIn("- name: DEFAULT_CASSANDRA_PASSWORD", out)
         self.assertIn('value: "false"', out)
         self.assertEqual(len(sample.splitlines()), len(out.splitlines()))
