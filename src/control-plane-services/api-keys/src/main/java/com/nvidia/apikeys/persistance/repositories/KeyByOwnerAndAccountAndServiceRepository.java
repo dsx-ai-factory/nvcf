@@ -33,6 +33,7 @@ import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.vo.KeyOwnerType;
 import java.util.List;
+import java.util.Optional;
 import org.springframework.data.cassandra.repository.Consistency;
 import org.springframework.data.cassandra.repository.MapIdCassandraRepository;
 import org.springframework.data.cassandra.repository.Query;
@@ -45,6 +46,20 @@ public interface KeyByOwnerAndAccountAndServiceRepository extends
 
     List<KeyByOwnerAndAccountAndServiceModel> findByNcaIdAndOwnerTypeAndOwnerId(
             String ncaId, KeyOwnerType ownerType, String ownerId);
+
+    List<KeyByOwnerAndAccountAndServiceModel> findByNcaIdAndOwnerTypeAndOwnerIdAndIssuerServiceId(
+            String ncaId, KeyOwnerType ownerType, String ownerId, String issuerServiceId);
+
+    @Query("SELECT * FROM " + TABLE_NAME
+            + " WHERE " + COLUMN_NCA_ID + "=:ncaId"
+            + " AND " + COLUMN_OWNER_TYPE + "=:ownerType"
+            + " AND " + COLUMN_OWNER_ID + "=:ownerId"
+            + " AND " + COLUMN_ISSUER_SERVICE_ID + "=:issuerServiceId"
+            + " AND " + COLUMN_KEY_ID + "=:keyId")
+    Optional<KeyByOwnerAndAccountAndServiceModel> findKey(
+            @Param("ncaId") String ncaId, @Param("ownerType") KeyOwnerType ownerType,
+            @Param("ownerId") String ownerId, @Param("issuerServiceId") String issuerServiceId,
+            @Param("keyId") String keyId);
 
     @Consistency(DefaultConsistencyLevel.LOCAL_QUORUM)
     @Query("SELECT " + COLUMN_NCA_ID
