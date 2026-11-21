@@ -19,7 +19,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -321,7 +320,7 @@ func (ctx *RateLimitContext) calculateStats() {
 			if result == nil {
 				continue
 			}
-			if !result.Allowed() && result.ExceedsLimit() && ctx.oversizedResult == nil {
+			if !result.Allowed() && result.ExceedsLimit() && tighterOversized(dim, result, ctx.oversizedDimension, ctx.oversizedResult) {
 				ctx.oversizedDimension = dim
 				ctx.oversizedResult = result
 			}
@@ -517,13 +516,11 @@ func (p *AdmissionPlan) CheckRequests(ctx context.Context) error {
 
 	for _, group := range p.groups {
 		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, requestsOnly, p.requestID)
+		if rlCtx != nil {
+			lastCtx = rlCtx
+		}
 		if err != nil {
-			if keepRetryableLimitError(lastErr, err) {
-				lastErr = err
-				if rlCtx != nil {
-					lastCtx = rlCtx
-				}
-			}
+			lastErr = err
 			continue
 		}
 
@@ -559,13 +556,11 @@ func (p *AdmissionPlan) CheckTokensAndFinalize(ctx context.Context) (*RateLimitC
 		group := p.groups[i]
 		rlCtx, err := checkRateLimit(ctx, p.rl, group.limits, tokenOnly, p.requestID)
 		combinedCtx := mergeRateLimitContexts(rlCtx, firstPassCtx)
+		if combinedCtx != nil {
+			lastCtx = combinedCtx
+		}
 		if err != nil {
-			if keepRetryableLimitError(lastErr, err) {
-				lastErr = err
-				if combinedCtx != nil {
-					lastCtx = combinedCtx
-				}
-			}
+			lastErr = err
 			continue
 		}
 
@@ -716,19 +711,13 @@ func oversizedRequestError(dim ratelimit.LimitDimension, result *ratelimit.RateL
 	)
 }
 
-// keepRetryableLimitError reports whether err should replace prev as the
-// error for the whole plan. A 429 from one group outranks a 413 from another,
-// because the first group can admit the request later.
-func keepRetryableLimitError(prev, err error) bool {
-	return !(httpStatus(prev) == http.StatusTooManyRequests && httpStatus(err) == http.StatusRequestEntityTooLarge)
-}
-
-func httpStatus(err error) int {
-	var httpErr *echo.HTTPError
-	if errors.As(err, &httpErr) {
-		return httpErr.Code
+// tighterOversized picks the smallest exceeded limit, so the 413 names the
+// same dimension whatever the map order.
+func tighterOversized(dim ratelimit.LimitDimension, result *ratelimit.RateLimitResult, prevDim ratelimit.LimitDimension, prev *ratelimit.RateLimitResult) bool {
+	if prev == nil || result.RateLimit.Limit != prev.RateLimit.Limit {
+		return prev == nil || result.RateLimit.Limit < prev.RateLimit.Limit
 	}
-	return 0
+	return dim < prevDim
 }
 
 func mergeRateLimitContexts(first *RateLimitContext, second *RateLimitContext) *RateLimitContext {

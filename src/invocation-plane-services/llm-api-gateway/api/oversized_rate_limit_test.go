@@ -18,16 +18,21 @@ limitations under the License.
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	echo "github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/ratelimit"
 	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
 )
 
@@ -74,14 +79,86 @@ func TestNormalizeChatRequestRejectsRequestLargerThanTokenLimit(t *testing.T) {
 	}
 }
 
-func TestKeepRetryableLimitErrorPrefers429Over413(t *testing.T) {
+func TestOversizedRequestNamesTheSmallestExceededLimit(t *testing.T) {
 	t.Parallel()
 
-	tooMany := echo.NewHTTPError(http.StatusTooManyRequests, "rate limit exceeded")
-	tooLarge := echo.NewHTTPError(http.StatusRequestEntityTooLarge, "request needs more")
+	for range 50 {
+		rlCtx := &RateLimitContext{Results: rateLimitResults{{
+			ratelimit.TokensPerMinute: {CurrentValue: 5000, Requested: 6000, RateLimit: ratelimit.RateLimit{Limit: 5000, Period: time.Minute}},
+			ratelimit.TokensPerSecond: {CurrentValue: 1000, Requested: 6000, RateLimit: ratelimit.RateLimit{Limit: 1000, Period: time.Second}},
+		}}}
+		rlCtx.calculateStats()
+		err := oversizedRequestError(rlCtx.oversizedDimension, rlCtx.oversizedResult)
+		require.EqualError(t, err, "code=413, message=request needs 6000 tokens, more than the rate limit of 1000 tokens per second")
+	}
+}
 
-	require.True(t, keepRetryableLimitError(nil, tooLarge))
-	require.True(t, keepRetryableLimitError(tooLarge, tooMany))
-	require.True(t, keepRetryableLimitError(tooMany, tooMany))
-	require.False(t, keepRetryableLimitError(tooMany, tooLarge))
+func TestNormalizeChatRequestAtExactlyTheTokenLimitStaysRetryable(t *testing.T) {
+	t.Parallel()
+
+	request := func() *models.ChatCompletionRequest {
+		return &models.ChatCompletionRequest{
+			Model: "fn-chat/company-name/model-name",
+			Messages: &[]models.ChatMessage{
+				{Role: models.ChatCompletionRoleUser, Content: models.SingleTextContent("hello world")},
+			},
+			MaxCompletionTokens: ptr.To(uint32(1000)),
+		}
+	}
+	admit := func(tokenLimit string, limiter *recordingRateLimiter) (error, *httptest.ResponseRecorder) {
+		handlers := NewHandlers(rateLimitConfig(), nil, limiter)
+		gc, rec := newRateLimitGatewayContext()
+		gc.store.Set(contextKeyRequestContext, &requestctx.RequestContext{
+			RequestID:  "req-boundary",
+			OrgID:      "nca-456",
+			RoutingKey: "fn-chat",
+			Model:      "company-name/model-name",
+			ModelSpecs: map[string]nvcf.ModelSpec{
+				"company-name/model-name": {TokenRateLimit: tokenLimit},
+			},
+		})
+		_, err := handlers.normalizeChatRequest(gc, request(), nil)
+		return err, rec
+	}
+
+	probe := &recordingRateLimiter{}
+	err, _ := admit("1000000-M", probe)
+	require.NoError(t, err)
+	var requested int64
+	for _, call := range probe.Calls() {
+		if call.testOnly && strings.HasSuffix(call.key, ":"+string(ratelimit.TokensPerMinute)) {
+			requested = call.tokensRequested
+		}
+	}
+	require.Positive(t, requested)
+
+	limiter := &recordingRateLimiter{
+		currentValueFn: func(call rateLimitCall) int64 {
+			return call.limit.Limit - 1
+		},
+	}
+	err, rec := admit(fmt.Sprintf("%d-M", requested), limiter)
+	var httpErr *echo.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.StatusTooManyRequests, httpErr.Code, err.Error())
+	require.NotEmpty(t, rec.Header().Get("Retry-After"))
+}
+
+func TestMessagesRequestLargerThanTokenLimitIsTooLarge(t *testing.T) {
+	t.Parallel()
+
+	hits := make(chan struct{}, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits <- struct{}{} }))
+	defer backend.Close()
+	limiter := &recordingRateLimiter{currentValueFn: func(call rateLimitCall) int64 { return call.limit.Limit }}
+	e, _ := messagesTestAPI(t, backend.URL, config.Default(), limiter, nil)
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, messagesHTTPRequest(`{"model":"fn-alpha/company-name/model-name","max_tokens":20000,"messages":[{"role":"user","content":"hello"}]}`))
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), `"type":"request_too_large"`)
+	require.Contains(t, rec.Body.String(), "more than the rate limit of 10000 tokens per minute")
+	require.Empty(t, rec.Header().Get("Retry-After"))
+	require.Empty(t, hits)
 }
