@@ -3554,7 +3554,11 @@ mod tests {
         let error = shutdown_without_re_raising(runtime, ShutdownCause::Signal)
             .await
             .expect("the shutdown should return the stats collector panic it found");
-        assert_eq!(error.to_string(), "stats collector panicked");
+        assert_eq!(
+            error.to_string(),
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\""
+        );
         assert!(
             runtime_state.advertised_model_ids().is_empty(),
             "the model lifecycle supervisor should retire its models in its normal shutdown"
@@ -3592,7 +3596,9 @@ mod tests {
             if signalled {
                 // The shutdown's own report, which has no tokio text.
                 assert_eq!(
-                    message, "stats collector panicked",
+                    message,
+                    "stats collector panicked with message \"configured input TPS must be \
+                     positive and finite\"",
                     "signal branch: Pylon should return the collector panic its shutdown found"
                 );
             } else {
@@ -4342,7 +4348,9 @@ mod tests {
 
         let message = error.to_string();
         assert_eq!(
-            message, "stats collector panicked",
+            message,
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\"",
             "Pylon should return the collector panic that its shutdown found"
         );
         assert_eq!(

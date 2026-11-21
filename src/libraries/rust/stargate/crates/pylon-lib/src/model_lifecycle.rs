@@ -3553,7 +3553,9 @@ mod tests {
                         within("the collector shutdown", stats.shutdown_reporting_panic()).await;
                     assert_eq!(
                         reported.map_err(|error| error.to_string()),
-                        Err("stats collector panicked".to_string()),
+                        Err("stats collector panicked with message \"configured input \
+                             TPS must be positive and finite\""
+                            .to_string()),
                         "{ending:?}"
                     );
                 }
@@ -3585,7 +3587,11 @@ mod tests {
                     let reported = within("the collector shutdown", shutdown).await;
                     assert_eq!(
                         reported.map_err(|error| error.to_string()),
-                        Err("stats collector panicked".to_string()),
+                        Err(
+                            "stats collector panicked with message \"test panic in the stats \
+                             collector after the armed shutdown started\""
+                                .to_string()
+                        ),
                         "{ending:?}: the hook's panic should end the collector; if it did not, \
                          tracing may no longer unwind a subscriber panic into the caller"
                     );
@@ -3967,7 +3973,9 @@ mod tests {
                                 .await;
                         assert_eq!(
                             reported.map_err(|error| error.to_string()),
-                            Err("stats collector panicked".to_string()),
+                            Err("stats collector panicked with message \"configured input \
+                                 TPS must be positive and finite\""
+                                .to_string()),
                             "{label}"
                         );
                     }

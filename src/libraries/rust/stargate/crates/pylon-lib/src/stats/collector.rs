@@ -180,12 +180,29 @@ impl StatsCollectorHandle {
 
     /// Like `shutdown`, but returns an error if the collector task panicked
     /// instead of resuming the panic in the caller, which can then finish
-    /// stopping its other tasks. The panic hook has already printed the panic.
+    /// stopping its other tasks. Like tokio's text for a task that panicked,
+    /// the error carries the panic message when the payload is a string. The
+    /// panic hook has already printed the panic.
     pub async fn shutdown_reporting_panic(self) -> anyhow::Result<()> {
         futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.shutdown()))
             .await
-            .map_err(|_| anyhow::anyhow!("stats collector panicked"))
+            .map_err(|panic| match panic_message(&*panic) {
+                Some(message) => {
+                    anyhow::anyhow!("stats collector panicked with message {message:?}")
+                }
+                None => anyhow::anyhow!("stats collector panicked"),
+            })
     }
+}
+
+/// Returns a panic payload's message when it is a string, read the way tokio
+/// reads it for a `JoinError`: a `String` from a formatted panic, then a
+/// `&'static str` from a literal one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4930,7 +4947,11 @@ mod tests {
             panic!("the shutdown should return the collector panic instead of resuming it: {error}")
         });
         let error = reported.expect_err("the shutdown should report that the collector panicked");
-        assert_eq!(error.to_string(), "stats collector panicked");
+        assert_eq!(
+            error.to_string(),
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\""
+        );
     }
 
     #[tokio::test]
