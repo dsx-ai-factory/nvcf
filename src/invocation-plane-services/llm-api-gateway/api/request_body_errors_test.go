@@ -85,6 +85,7 @@ func TestJSONRoutesDescribeBadBodiesWithoutInternals(t *testing.T) {
 		{name: "responses empty body", path: "/v1/responses", body: "", wantStatus: http.StatusBadRequest, wantMessage: "request body must be a JSON object"},
 		{name: "embeddings empty body", path: "/v1/embeddings", body: "", wantStatus: http.StatusBadRequest, wantMessage: "request body must be a JSON object"},
 		{name: "embeddings array body", path: "/v1/embeddings", body: "[]", wantStatus: http.StatusBadRequest, wantMessage: "request body must be a JSON object"},
+		{name: "embeddings without model", path: "/v1/embeddings", body: "{}", wantStatus: http.StatusBadRequest, wantMessage: "model prefix is required"},
 	}
 
 	for _, tt := range tests {
@@ -105,6 +106,36 @@ func TestJSONRoutesDescribeBadBodiesWithoutInternals(t *testing.T) {
 			for _, internal := range []string{"internal=", "code=", "json:", "Go ", "map[string]"} {
 				require.NotContains(t, message, internal)
 			}
+		})
+	}
+}
+
+func TestUnroutedJSONHandlersCheckBodyBeforeRouting(t *testing.T) {
+	t.Parallel()
+
+	handlers := NewHandlers(config.Default(), nil, nil).AsOpenAIProxyHandlers()
+	tests := []struct {
+		name        string
+		handler     echo.HandlerFunc
+		body        string
+		wantMessage string
+	}{
+		{name: "reranking array body", handler: handlers.Reranking, body: "[]", wantMessage: "request body must be a JSON object"},
+		{name: "text to speech trailing data", handler: handlers.TextToSpeech, body: "{}x", wantMessage: "request body must be valid JSON"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tt.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			c := NewGatewayContext(echo.New().NewContext(req, httptest.NewRecorder()))
+
+			err := tt.handler(c)
+			var httpErr *echo.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			require.Equal(t, http.StatusBadRequest, httpErr.Code)
+			require.Equal(t, tt.wantMessage, httpErr.Message)
 		})
 	}
 }
