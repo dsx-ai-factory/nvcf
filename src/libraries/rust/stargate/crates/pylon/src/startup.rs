@@ -462,7 +462,10 @@ impl RunningPylon {
                     if let Ok(signal) = &result {
                         info!(signal, "received shutdown signal");
                     }
-                    self.shutdown(ShutdownCause::Signal).await;
+                    if let Some(error) = self.shutdown(ShutdownCause::Signal).await {
+                        error!(error = %error, "critical pylon task exited");
+                        return Err(error);
+                    }
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
@@ -497,12 +500,16 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown(ShutdownCause::CriticalTaskExit).await;
+            // A stats collector panic found while stopping is secondary to
+            // `error`, and the panic hook has printed it.
+            let _ = self.shutdown(ShutdownCause::CriticalTaskExit).await;
             return Err(error);
         }
     }
 
-    async fn shutdown(self, cause: ShutdownCause) {
+    /// Stops every task. Returns an error if the stats collector panicked and
+    /// its exit was not reported before.
+    async fn shutdown(self, cause: ShutdownCause) -> Option<anyhow::Error> {
         let Self {
             inference_server_id,
             mut registration_client,
@@ -514,17 +521,21 @@ impl RunningPylon {
             ..
         } = self;
         // Requests that arrive during the registration drain need admitted
-        // model generations, so the model lifecycle stops only after it.
+        // model generations, so the model lifecycle stops only after it. A
+        // supervisor that found the stats collector gone keeps them until
+        // that stop as well.
         if let Some(summary) = registration_client.shutdown().await {
             log_drain_summary(&inference_server_id, cause, &summary);
         }
-        tokio::join!(
+        // The stats collector stops without resuming a panic, so the other
+        // tasks still get their normal shutdown.
+        let (_, stats_collector, ..) = tokio::join!(
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
                 }
             },
-            stats_collector.shutdown(),
+            stats_collector.shutdown_reporting_panic(),
             model_lifecycle.shutdown(),
             metrics_server.shutdown(),
             async move {
@@ -533,6 +544,7 @@ impl RunningPylon {
                 }
             },
         );
+        stats_collector.err()
     }
 }
 
@@ -1589,26 +1601,52 @@ mod tests {
     }
 
     async fn test_running_pylon(stats_collector: StatsCollectorHandle) -> RunningPylon {
-        let metrics = PylonMetrics::new().expect("metrics should initialize");
-        let model_lifecycle = start_model_lifecycle(
-            ModelLifecycleConfig {
-                upstream_http_base_url: "http://127.0.0.1:1".to_string(),
-                source: ModelSource::Static(BTreeSet::new()),
-                initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
-                bringup: BringupConfig {
-                    enabled: false,
-                    ..BringupConfig::default()
+        test_running_pylon_with_models(stats_collector, PylonRuntimeState::default(), &[]).await
+    }
+
+    /// Starts a test Pylon whose model lifecycle admits `model_ids` at a
+    /// configured input TPS through `stats_collector`.
+    async fn test_running_pylon_with_models(
+        stats_collector: StatsCollectorHandle,
+        runtime_state: PylonRuntimeState,
+        model_ids: &[&str],
+    ) -> RunningPylon {
+        let model_lifecycle = tokio::time::timeout(
+            Duration::from_secs(3),
+            start_model_lifecycle(
+                ModelLifecycleConfig {
+                    upstream_http_base_url: "http://127.0.0.1:1".to_string(),
+                    source: ModelSource::Static(
+                        model_ids
+                            .iter()
+                            .map(|model_id| (*model_id).to_string())
+                            .collect(),
+                    ),
+                    initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
+                    bringup: BringupConfig {
+                        enabled: false,
+                        ..BringupConfig::default()
+                    },
+                    health_paths: UpstreamHealthPaths::default(),
+                    readiness_gate: None,
+                    startup_health_wait: Duration::ZERO,
                 },
-                health_paths: UpstreamHealthPaths::default(),
-                readiness_gate: None,
-                startup_health_wait: Duration::ZERO,
-            },
-            PylonRuntimeState::default(),
-            &stats_collector,
-            None,
+                runtime_state,
+                &stats_collector,
+                None,
+            ),
         )
         .await
+        .expect("test model lifecycle startup should finish")
         .expect("test model lifecycle should start");
+        test_running_pylon_with_lifecycle(stats_collector, model_lifecycle).await
+    }
+
+    async fn test_running_pylon_with_lifecycle(
+        stats_collector: StatsCollectorHandle,
+        model_lifecycle: ModelLifecycleHandle,
+    ) -> RunningPylon {
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
         RunningPylon {
             inference_server_id: "test-pylon".to_string(),
             registration_client: InferenceServerRegistrationClient::default(),
@@ -2794,5 +2832,1569 @@ mod tests {
             plan.auth_token_provider.as_deref(),
             Some(AuthTokenProvider::File(path)) if path == std::path::Path::new("/tmp/pylon-token")
         ));
+    }
+
+    const CRITICAL_TASK_EXITED: &str = "critical pylon task exited";
+
+    /// Records the level, message and other fields of every event at DEBUG or
+    /// above on the thread that installs it. Install it with `record_events`.
+    #[derive(Clone, Default)]
+    struct RecordedEvents(Arc<StdMutex<Vec<RecordedEvent>>>);
+
+    /// Makes a `RecordedEvents` this thread's default subscriber until the
+    /// guard drops.
+    ///
+    /// tracing-core caches whether a callsite is enabled when a thread first
+    /// reaches it. While only one dispatcher is registered, it asks the
+    /// default subscriber of that thread alone. A test thread without a
+    /// recorder then caches "never" for a callsite, and a recording test that
+    /// runs beside it loses every event from that callsite. tracing does not
+    /// document this (tracing-core 0.1.36, `Rebuilder::JustOne` in
+    /// `callsite.rs`). Two dispatchers that live as long as the test binary
+    /// make tracing-core ask every registered dispatcher instead. They report
+    /// every callsite as sometimes enabled, so each event asks the subscriber
+    /// of the thread that logs it. The test
+    /// `recorders_see_callsites_that_other_threads_reach_first` fails if this
+    /// stops working.
+    fn record_events() -> (RecordedEvents, tracing::dispatcher::DefaultGuard) {
+        static KEPT_DISPATCHERS: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        KEPT_DISPATCHERS.get_or_init(|| {
+            [
+                tracing::Dispatch::new(SometimesEnabled),
+                tracing::Dispatch::new(SometimesEnabled),
+            ]
+        });
+        let recorded = RecordedEvents::default();
+        let default_guard =
+            tracing::dispatcher::set_default(&tracing::Dispatch::new(recorded.clone()));
+        (recorded, default_guard)
+    }
+
+    /// Records nothing and reports every callsite as sometimes enabled. See
+    /// `record_events`.
+    struct SometimesEnabled;
+
+    impl tracing::Subscriber for SometimesEnabled {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn recorders_see_callsites_that_other_threads_reach_first() {
+        fn probe() {
+            tracing::error!("tracing callsite interest probe");
+        }
+        let (recorded, default_guard) = record_events();
+        // The probe first runs on a thread without a recorder.
+        std::thread::spawn(probe)
+            .join()
+            .expect("the probe thread should not panic");
+        probe();
+        drop(default_guard);
+        assert_eq!(
+            recorded
+                .with_message("tracing callsite interest probe")
+                .len(),
+            1,
+            "the recorder lost an event whose callsite another thread reached first, so \
+             tracing-core no longer behaves as `record_events` relies on"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl RecordedEvents {
+        fn events(&self) -> Vec<RecordedEvent> {
+            self.0
+                .lock()
+                .expect("recorded events should not be poisoned")
+                .clone()
+        }
+
+        fn errors(&self) -> Vec<RecordedEvent> {
+            self.events()
+                .into_iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect()
+        }
+
+        fn with_message(&self, message: &str) -> Vec<RecordedEvent> {
+            self.events()
+                .into_iter()
+                .filter(|event| event.message == message)
+                .collect()
+        }
+
+        /// The `error` field of each `critical pylon task exited` line.
+        fn critical_task_exits(&self) -> Vec<String> {
+            self.with_message(CRITICAL_TASK_EXITED)
+                .into_iter()
+                .map(|event| {
+                    assert_eq!(event.level, tracing::Level::ERROR, "{event:?}");
+                    event.fields.get("error").cloned().unwrap_or_default()
+                })
+                .collect()
+        }
+    }
+
+    #[derive(Default)]
+    struct EventFields {
+        message: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    impl EventFields {
+        fn insert(&mut self, field: &tracing::field::Field, value: String) {
+            if field.name() == "message" {
+                self.message = value;
+            } else {
+                self.fields.insert(field.name().to_string(), value);
+            }
+        }
+    }
+
+    impl tracing::field::Visit for EventFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.insert(field, value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.insert(field, format!("{value:?}"));
+        }
+    }
+
+    impl tracing::Subscriber for RecordedEvents {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.level() <= &tracing::Level::DEBUG
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::DEBUG)
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = EventFields::default();
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .expect("recorded events should not be poisoned")
+                .push(RecordedEvent {
+                    level: *event.metadata().level(),
+                    message: fields.message,
+                    fields: fields.fields,
+                });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Upstream for a Pylon that discovers its models. `/v1/models` lists the
+    /// current models, `/kv-cache` holds each poll while holding is on, and
+    /// `/v1/chat/completions` answers at once and records each model served.
+    #[derive(Clone)]
+    struct DiscoveryUpstreamState {
+        models: Arc<StdMutex<Vec<String>>>,
+        hold: Arc<tokio::sync::watch::Sender<bool>>,
+        held_polls: Arc<AtomicUsize>,
+        completions: Arc<StdMutex<Vec<String>>>,
+    }
+
+    struct DiscoveryUpstream {
+        base_url: String,
+        state: DiscoveryUpstreamState,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl DiscoveryUpstream {
+        async fn spawn(model_ids: &[&str]) -> Self {
+            let state = DiscoveryUpstreamState {
+                models: Arc::new(StdMutex::new(
+                    model_ids
+                        .iter()
+                        .map(|model_id| (*model_id).to_string())
+                        .collect(),
+                )),
+                hold: Arc::new(tokio::sync::watch::Sender::new(false)),
+                held_polls: Arc::new(AtomicUsize::new(0)),
+                completions: Arc::default(),
+            };
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("upstream listener should bind");
+            let base_url = format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .expect("upstream listener should have an address")
+            );
+            let app = Router::new()
+                .route("/v1/models", get(discovered_models))
+                .route("/kv-cache", get(held_kv_cache_stats))
+                .route("/v1/chat/completions", post(answered_completion))
+                .with_state(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("upstream server should run");
+            });
+            Self {
+                base_url,
+                state,
+                server,
+            }
+        }
+
+        fn set_models(&self, model_ids: &[&str]) {
+            *self
+                .state
+                .models
+                .lock()
+                .expect("upstream models should not be poisoned") = model_ids
+                .iter()
+                .map(|model_id| (*model_id).to_string())
+                .collect();
+        }
+
+        /// Holds KV-cache polls and waits until the stats collector is inside
+        /// one. While it is, the collector reads no commands.
+        async fn hold_kv_cache_polls(&self) {
+            let held = self.state.held_polls.load(Ordering::SeqCst);
+            self.state.hold.send_replace(true);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.state.held_polls.load(Ordering::SeqCst) == held {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the stats collector should poll KV-cache stats");
+        }
+
+        /// Ends held KV-cache polls, so the stats collector reads its commands
+        /// again.
+        fn release_kv_cache_polls(&self) {
+            self.state.hold.send_replace(false);
+        }
+
+        async fn shutdown(self) {
+            self.server.abort();
+            let _ = self.server.await;
+        }
+    }
+
+    async fn discovered_models(
+        State(state): State<DiscoveryUpstreamState>,
+    ) -> Json<serde_json::Value> {
+        let data = state
+            .models
+            .lock()
+            .expect("upstream models should not be poisoned")
+            .iter()
+            .map(|model_id| serde_json::json!({ "id": model_id }))
+            .collect::<Vec<_>>();
+        Json(serde_json::json!({ "data": data }))
+    }
+
+    async fn held_kv_cache_stats(
+        State(state): State<DiscoveryUpstreamState>,
+    ) -> Json<serde_json::Value> {
+        let mut hold = state.hold.subscribe();
+        if *hold.borrow_and_update() {
+            state.held_polls.fetch_add(1, Ordering::SeqCst);
+            let _ = hold.wait_for(|held| !held).await;
+        }
+        Json(serde_json::json!({
+            "model": "model-a",
+            "kv_cache_capacity_tokens": 1000,
+            "kv_cache_used_tokens": 400,
+            "kv_cache_free_tokens": 600
+        }))
+    }
+
+    /// Answers a streamed chat completion with one token and its usage.
+    async fn answered_completion(
+        State(state): State<DiscoveryUpstreamState>,
+        Json(request): Json<serde_json::Value>,
+    ) -> AxumResponse {
+        let model = request["model"].as_str().unwrap_or_default().to_string();
+        state
+            .completions
+            .lock()
+            .expect("upstream completions should not be poisoned")
+            .push(model.clone());
+        let chunk = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9}
+        });
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    }
+
+    /// Starts a stats collector that polls `upstream`'s KV-cache stats, so the
+    /// test can hold it, and a model lifecycle on it that discovers its models
+    /// from `upstream`.
+    async fn start_discovery_lifecycle(
+        upstream: &DiscoveryUpstream,
+    ) -> (
+        StatsCollectorHandle,
+        ModelLifecycleHandle,
+        PylonRuntimeState,
+    ) {
+        let config = StatsCollectorConfig {
+            kv_cache_stats_url: Some(format!("{}/kv-cache", upstream.base_url)),
+            kv_cache_poll_interval: Duration::from_millis(1),
+            kv_cache_request_timeout: Duration::from_secs(60),
+            ..StatsCollectorConfig::default()
+        };
+        let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            config.observation_channel_capacity,
+            None,
+        );
+        let stats_collector = start_stats_collector_with_engine_stats(
+            config,
+            request_observation_rx,
+            None,
+            runtime_state.clone(),
+        );
+        let model_lifecycle = tokio::time::timeout(
+            Duration::from_secs(3),
+            start_model_lifecycle(
+                ModelLifecycleConfig {
+                    upstream_http_base_url: upstream.base_url.clone(),
+                    source: ModelSource::Discovered(ModelDiscoveryConfig {
+                        provider: pylon_lib::ModelDiscoveryProvider::Dynamo,
+                        poll_interval: Duration::from_millis(10),
+                        request_timeout: Duration::from_secs(1),
+                    }),
+                    initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
+                    bringup: BringupConfig {
+                        enabled: false,
+                        ..BringupConfig::default()
+                    },
+                    health_paths: UpstreamHealthPaths::default(),
+                    readiness_gate: None,
+                    startup_health_wait: Duration::ZERO,
+                },
+                runtime_state.clone(),
+                &stats_collector,
+                None,
+            ),
+        )
+        .await
+        .expect("model lifecycle startup should finish")
+        .expect("model lifecycle should start");
+        (stats_collector, model_lifecycle, runtime_state)
+    }
+
+    async fn start_discovery_pylon(
+        upstream: &DiscoveryUpstream,
+    ) -> (RunningPylon, PylonRuntimeState) {
+        let (stats_collector, model_lifecycle, runtime_state) =
+            start_discovery_lifecycle(upstream).await;
+        let runtime = test_running_pylon_with_lifecycle(stats_collector, model_lifecycle).await;
+        (runtime, runtime_state)
+    }
+
+    async fn wait_for_model(runtime_state: &PylonRuntimeState, model_id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime_state.model_stats(model_id).is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the supervisor should begin a generation for the discovered {model_id}")
+        });
+    }
+
+    fn stats_collector_with_runtime_state() -> (StatsCollectorHandle, PylonRuntimeState) {
+        let config = StatsCollectorConfig::default();
+        let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            config.observation_channel_capacity,
+            None,
+        );
+        let stats_collector = start_stats_collector_with_engine_stats(
+            config,
+            request_observation_rx,
+            None,
+            runtime_state.clone(),
+        );
+        (stats_collector, runtime_state)
+    }
+
+    /// Starts a second model lifecycle on `stats_collector` with a configured
+    /// input TPS of zero. That breaks a stats initialization invariant, so the
+    /// collector panics on the lifecycle's first begin. pylon-lib keeps the
+    /// collector's requests crate-private, so this is how these tests panic it.
+    fn start_lifecycle_that_panics_the_stats_collector(
+        stats_collector: &StatsCollectorHandle,
+    ) -> impl Future<Output = Result<ModelLifecycleHandle, pylon_lib::ModelLifecycleError>> + '_
+    {
+        start_model_lifecycle(
+            ModelLifecycleConfig {
+                upstream_http_base_url: "http://127.0.0.1:1".to_string(),
+                source: ModelSource::Static(BTreeSet::from(["model-panics".to_string()])),
+                initialization: ModelInitialization::ConfiguredInputTps { input_tps: 0.0 },
+                bringup: BringupConfig {
+                    enabled: false,
+                    ..BringupConfig::default()
+                },
+                health_paths: UpstreamHealthPaths::default(),
+                readiness_gate: None,
+                startup_health_wait: Duration::ZERO,
+            },
+            PylonRuntimeState::default(),
+            stats_collector,
+            None,
+        )
+    }
+
+    /// Panics the stats collector and returns once its begin has failed. If
+    /// the trigger stops panicking, this fails instead of waiting.
+    async fn panic_stats_collector(stats_collector: &StatsCollectorHandle) {
+        let started = tokio::time::timeout(
+            Duration::from_secs(2),
+            start_lifecycle_that_panics_the_stats_collector(stats_collector),
+        )
+        .await
+        .expect("the begin that panics the stats collector should finish");
+        assert!(
+            matches!(
+                started,
+                Err(pylon_lib::ModelLifecycleError::StatsCollectorStopped)
+            ),
+            "a configured input TPS of zero should panic the stats collector: {:?}",
+            started.map(drop)
+        );
+    }
+
+    /// Queues the begin that panics the stats collector without waiting for
+    /// it. The command stays queued after its request is dropped.
+    fn queue_stats_collector_panic(stats_collector: &StatsCollectorHandle) {
+        let mut trigger = std::pin::pin!(start_lifecycle_that_panics_the_stats_collector(
+            stats_collector
+        ));
+        let polled = trigger
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(
+            polled.is_pending(),
+            "the begin that panics the stats collector should wait for its reply"
+        );
+    }
+
+    /// Runs Pylon in its own task, so a resumed panic fails the test with a
+    /// message instead of unwinding through it.
+    async fn run_pylon_without_re_raising<S>(runtime: RunningPylon, signal: S) -> Result<()>
+    where
+        S: Future<Output = std::io::Result<&'static str>> + Send + 'static,
+    {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::spawn(runtime.run_until_shutdown(signal)),
+        )
+        .await
+        .expect("Pylon should stop well before the 5 s task stop timeout")
+        .unwrap_or_else(|error| {
+            panic!("Pylon should not re-raise a stats collector panic while it shuts down: {error}")
+        })
+    }
+
+    /// Runs Pylon's shutdown in its own task, like `run_pylon_without_re_raising`.
+    async fn shutdown_without_re_raising(
+        runtime: RunningPylon,
+        cause: ShutdownCause,
+    ) -> Option<anyhow::Error> {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::spawn(runtime.shutdown(cause)),
+        )
+        .await
+        .expect("the shutdown should finish well before the 5 s task stop timeout")
+        .unwrap_or_else(|error| {
+            panic!("the shutdown should not re-raise a stats collector panic: {error}")
+        })
+    }
+
+    /// Pylon reports a critical task that panicked as `<task> failed: <JoinError>`
+    /// and keeps only that text. tokio documents `JoinError::is_panic`, not the
+    /// Display text, so telling a stats collector panic from another collector
+    /// failure by text relies on tokio's Display of a panic saying "panicked"
+    /// (tokio 1.52.3: "task {id} panicked with message ..."). The test
+    /// `tokio_join_error_display_of_a_panic_says_panicked` checks that text.
+    const TOKIO_JOIN_ERROR_PANIC_TEXT: &str = "panicked";
+
+    fn join_error_text_is_a_panic(text: &str) -> bool {
+        text.contains(TOKIO_JOIN_ERROR_PANIC_TEXT)
+    }
+
+    /// Checks that `message` is Pylon's critical task error for a stats
+    /// collector panic. A failure in the tokio part of the message names that
+    /// dependency, so a change in tokio's text is not taken for Pylon
+    /// reporting another task.
+    #[track_caller]
+    fn assert_reports_a_stats_collector_panic(context: &str, message: &str) {
+        let Some(join_error) = message.strip_prefix("stats collector failed: ") else {
+            panic!(
+                "{context}: Pylon should report the stats collector panic, not another task: \
+                 {message}"
+            );
+        };
+        assert!(
+            join_error_text_is_a_panic(join_error),
+            "{context}: Pylon reported the stats collector, but the tokio JoinError text in its \
+             error does not say {TOKIO_JOIN_ERROR_PANIC_TEXT:?}: {message}. This check relies on \
+             tokio's undocumented Display text for a panic; if \
+             `tokio_join_error_display_of_a_panic_says_panicked` fails too, tokio changed it."
+        );
+    }
+
+    #[tokio::test]
+    async fn tokio_join_error_display_of_a_panic_says_panicked() {
+        let task = tokio::spawn(async {
+            panic!("probe for the text of tokio's JoinError");
+        });
+        let join_error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a task that panics should end at once")
+            .expect_err("a task that panics should fail to join");
+        assert!(
+            join_error.is_panic(),
+            "the join error should be a panic: {join_error:?}"
+        );
+        let text = join_error.to_string();
+        assert!(
+            join_error_text_is_a_panic(&text),
+            "tokio's JoinError Display of a panic no longer says \
+             {TOKIO_JOIN_ERROR_PANIC_TEXT:?}: {text:?}. Pylon's critical task error for a \
+             panicked task embeds this text, and the stats collector panic checks in this module \
+             rely on it: update `join_error_text_is_a_panic`."
+        );
+    }
+
+    #[tokio::test]
+    async fn running_pylon_shutdown_with_a_lifecycle_request_in_flight_logs_no_error() {
+        // Pylon stops the stats collector and the model lifecycle supervisor in
+        // the same join, in no fixed order. If the collector stops first, a
+        // lifecycle request in flight fails because of the shutdown, which is
+        // not an error; if the supervisor stops first, it drops the request.
+        // Either way the shutdown logs no error. The pylon-lib test
+        // `collector_shutdown_during_a_lifecycle_request_logs_no_error_and_keeps_admitted_models_until_the_supervisor_stop`
+        // stops only the collector and pins the debug line for the first
+        // case. A held KV-cache poll keeps the collector from reading the
+        // request.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
+        let (recorded, default_guard) = record_events();
+
+        upstream.hold_kv_cache_polls().await;
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_model(&runtime_state, "model-b").await;
+        let shutdown_error = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.shutdown(ShutdownCause::Signal),
+        )
+        .await
+        .expect("shutdown should not wait for the model lifecycle stop timeout");
+        drop(default_guard);
+
+        assert!(
+            shutdown_error.is_none(),
+            "a normal Pylon shutdown should report no error: {shutdown_error:?}"
+        );
+        let errors = recorded.errors();
+        assert!(
+            errors.is_empty(),
+            "a normal Pylon shutdown should log no error: {errors:?}"
+        );
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_pylon_reports_a_supervisor_exit_that_the_stats_collector_did_not_cause_as_the_supervisor()
+     {
+        // A second model lifecycle on Pylon's collector takes model-b's stats
+        // slot, so the supervisor's begin for a newly discovered model-b
+        // reports a stale generation while the collector keeps running. The
+        // supervisor fails on its own and exits, and Pylon reports that exit
+        // as the supervisor's, without waiting for the collector.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
+        let other_lifecycle = tokio::time::timeout(
+            Duration::from_secs(3),
+            start_model_lifecycle(
+                ModelLifecycleConfig {
+                    upstream_http_base_url: "http://127.0.0.1:1".to_string(),
+                    source: ModelSource::Static(BTreeSet::from(["model-b".to_string()])),
+                    initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
+                    bringup: BringupConfig {
+                        enabled: false,
+                        ..BringupConfig::default()
+                    },
+                    health_paths: UpstreamHealthPaths::default(),
+                    readiness_gate: None,
+                    startup_health_wait: Duration::ZERO,
+                },
+                PylonRuntimeState::default(),
+                &runtime.stats_collector,
+                None,
+            ),
+        )
+        .await
+        .expect("the second model lifecycle should start")
+        .expect("the second model lifecycle should take model-b's stats slot");
+        assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+        let (recorded, default_guard) = record_events();
+
+        let run = tokio::spawn(
+            runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
+        );
+        upstream.set_models(&["model-a", "model-b"]);
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect(
+                "Pylon should report the supervisor's exit without waiting for the stats \
+                 collector, which keeps running",
+            )
+            .expect("Pylon should not panic")
+            .expect_err("a supervisor exit should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_eq!(message, "model lifecycle supervisor exited unexpectedly");
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the supervisor once as its critical task exit"
+        );
+        let failed = recorded.with_message("model lifecycle supervisor failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the supervisor should report its own failure once"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        assert_eq!(
+            failed[0].fields.get("error").map(String::as_str),
+            Some("model generation transition lost exact ownership"),
+            "the supervisor should fail on the stale generation, not on the stats collector"
+        );
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "a supervisor that failed on its own should retire model-a as it exits"
+        );
+        other_lifecycle.shutdown().await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_pylon_shutdown_returns_a_stats_collector_panic_and_stops_its_other_tasks() {
+        let (stats_collector, runtime_state) = stats_collector_with_runtime_state();
+        let runtime =
+            test_running_pylon_with_models(stats_collector, runtime_state.clone(), &["model-a"])
+                .await;
+        assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+        panic_stats_collector(&runtime.stats_collector).await;
+
+        let error = shutdown_without_re_raising(runtime, ShutdownCause::Signal)
+            .await
+            .expect("the shutdown should return the stats collector panic it found");
+        assert_eq!(
+            error.to_string(),
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\""
+        );
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "the model lifecycle supervisor should retire its models in its normal shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_pylon_fails_when_a_signal_started_shutdown_finds_a_stats_collector_panic() {
+        // With the signal and the collector exit both ready, the main loop
+        // takes either branch: tokio::select! documents that it starts polling
+        // at a random branch. Every run must report the collector panic. Runs
+        // repeat until one takes the signal branch.
+        const RUNS: usize = 40;
+        for _ in 0..RUNS {
+            let (stats_collector, runtime_state) = stats_collector_with_runtime_state();
+            let runtime = test_running_pylon_with_models(
+                stats_collector,
+                runtime_state.clone(),
+                &["model-a"],
+            )
+            .await;
+            panic_stats_collector(&runtime.stats_collector).await;
+            let (recorded, default_guard) = record_events();
+
+            let result = run_pylon_without_re_raising(runtime, async { Ok("SIGTERM") }).await;
+            drop(default_guard);
+
+            let signalled = !recorded.with_message("received shutdown signal").is_empty();
+            let branch = if signalled { "signal" } else { "critical task" };
+            let message = result
+                .expect_err(&format!(
+                    "{branch} branch: Pylon should fail when it finds a stats collector panic"
+                ))
+                .to_string();
+            if signalled {
+                // The shutdown's own report, which has no tokio text.
+                assert_eq!(
+                    message,
+                    "stats collector panicked with message \"configured input TPS must be \
+                     positive and finite\"",
+                    "signal branch: Pylon should return the collector panic its shutdown found"
+                );
+            } else {
+                assert_reports_a_stats_collector_panic("critical task branch", &message);
+            }
+            assert_eq!(
+                recorded.critical_task_exits(),
+                [message],
+                "{branch} branch: Pylon should log the collector panic once as a critical task exit"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{branch} branch: the model lifecycle supervisor should retire its models in its \
+                 normal shutdown"
+            );
+            if signalled {
+                return;
+            }
+        }
+        panic!(
+            "Pylon took the critical task branch in all {RUNS} runs; tokio::select! may no \
+             longer start polling at a random branch"
+        );
+    }
+
+    /// Serves engine stats lines. Each connection gets a batch and then ends,
+    /// so the stream reconnects and keeps sending.
+    async fn spawn_engine_stats_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("engine stats listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("engine stats listener should have an address")
+        );
+        let app = Router::new().route(
+            "/pylon/v1/stats/stream",
+            get(|| async {
+                (0..32)
+                    .map(|index| {
+                        format!(
+                            "{{\"v\":1,\"type\":\"stats\",\"request_id\":\"engine-{index}\",\
+                             \"model\":\"model-a\",\"tokens_processed\":64}}\n"
+                        )
+                    })
+                    .collect::<String>()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("engine stats server should run");
+        });
+        (base_url, server)
+    }
+
+    #[tokio::test]
+    async fn engine_stats_stream_keeps_running_after_a_stats_collector_panic_that_pylon_reports() {
+        let (engine_url, engine_server) = spawn_engine_stats_server().await;
+        let config = StatsCollectorConfig {
+            observation_channel_capacity: 8,
+            ..StatsCollectorConfig::default()
+        };
+        let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            config.observation_channel_capacity,
+            None,
+        );
+        let (stats_update_tx, stats_update_rx) = stats_aggregator_update_channel(&config);
+        let stats_collector = start_stats_collector_with_engine_stats(
+            config,
+            request_observation_rx,
+            Some(stats_update_rx),
+            runtime_state.clone(),
+        );
+        let stream = start_engine_stats_stream(
+            EngineStatsStreamConfig {
+                initial_reconnect_backoff: Duration::from_millis(1),
+                max_reconnect_backoff: Duration::from_millis(1),
+                ..EngineStatsStreamConfig::new(
+                    &engine_url,
+                    "/pylon/v1/stats/stream",
+                    EngineStatsStreamMode::Required,
+                )
+            },
+            stats_update_tx.clone(),
+        )
+        .expect("a required engine stats stream should start");
+        let mut runtime =
+            test_running_pylon_with_models(stats_collector, runtime_state, &["model-a"]).await;
+        runtime.engine_stats_stream = Some(RunningEngineStatsStream {
+            mode: EngineStatsStreamMode::Required,
+            handle: stream,
+        });
+
+        panic_stats_collector(&runtime.stats_collector).await;
+        // The stream keeps sending after the collector ended: it reconnects
+        // every millisecond and sends a batch on each connection. Its sends
+        // must wait in the full channel instead of failing, or the stream ends
+        // and Pylon can report it in place of the collector.
+        let stream = &mut runtime
+            .engine_stats_stream
+            .as_mut()
+            .expect("the test Pylon should have an engine stats stream")
+            .handle;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                biased;
+                result = stream.wait_for_exit() => panic!(
+                    "the engine stats stream ended after the stats collector ended: {result:?}"
+                ),
+                () = async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while !stats_update_tx.is_full() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("the engine stats stream should fill the channel after the stats collector ended");
+
+        let (recorded, default_guard) = record_events();
+        let error = run_pylon_without_re_raising(
+            runtime,
+            std::future::pending::<std::io::Result<&'static str>>(),
+        )
+        .await
+        .expect_err("a stats collector panic should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_reports_a_stats_collector_panic(
+            "a stats collector panic with a running engine stats stream",
+            &message,
+        );
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the collector panic once as its critical task exit"
+        );
+        engine_server.abort();
+        let _ = engine_server.await;
+    }
+
+    #[tokio::test]
+    async fn running_pylon_returns_its_first_critical_task_exit_when_the_shutdown_finds_a_stats_collector_panic()
+     {
+        // A critical task other than the stats collector ends on its own, and
+        // the collector panics, both before Pylon's main loop looks. With both
+        // exits ready, the main loop reports either one: tokio::select!
+        // documents that it starts polling at a random branch. When it reports
+        // the other task, its shutdown then finds the collector panic, which
+        // must neither replace the error Pylon returns nor add a second
+        // critical task exit line. Runs repeat until one reports the other
+        // task first.
+        //
+        // The other task is an engine stats stream in auto mode whose endpoint
+        // does not serve engine stats, so it enables the fallback and ends.
+        // Pylon is told the stream is required, so that end is a critical task
+        // exit that the collector did not cause.
+        const RUNS: usize = 20;
+        const ENGINE_STATS_STREAM_EXIT: &str = "engine stats stream exited unexpectedly";
+        let (engine_url, engine_server) = spawn_engine_stats_server().await;
+        for _ in 0..RUNS {
+            let config = StatsCollectorConfig::default();
+            let (runtime_state, request_observation_rx) = PylonRuntimeState::observed(
+                InferenceServerStatus::Active,
+                &[],
+                config.observation_channel_capacity,
+                None,
+            );
+            let (stats_update_tx, stats_update_rx) = stats_aggregator_update_channel(&config);
+            let stats_collector = start_stats_collector_with_engine_stats(
+                config,
+                request_observation_rx,
+                Some(stats_update_rx),
+                runtime_state.clone(),
+            );
+            let stream = start_engine_stats_stream(
+                EngineStatsStreamConfig::new(
+                    &engine_url,
+                    "/pylon/v1/stats/not-served",
+                    EngineStatsStreamMode::Auto,
+                ),
+                stats_update_tx.clone(),
+            )
+            .expect("an auto engine stats stream should start");
+            let mut runtime = test_running_pylon_with_models(
+                stats_collector,
+                runtime_state.clone(),
+                &["model-a"],
+            )
+            .await;
+            runtime.engine_stats_stream = Some(RunningEngineStatsStream {
+                mode: EngineStatsStreamMode::Required,
+                handle: stream,
+            });
+            // The stream's task holds the only other sender, so the count
+            // falls to one once the stream has ended.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while stats_update_tx.sender_count() > 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect(
+                "an auto engine stats stream should end when its endpoint does not serve engine \
+                 stats",
+            );
+            panic_stats_collector(&runtime.stats_collector).await;
+            let (recorded, default_guard) = record_events();
+
+            let result = run_pylon_without_re_raising(
+                runtime,
+                std::future::pending::<std::io::Result<&'static str>>(),
+            )
+            .await;
+            drop(default_guard);
+
+            let critical_task_exits = recorded.critical_task_exits();
+            let Some(first) = critical_task_exits.first() else {
+                panic!("Pylon should log the critical task exit that it reports");
+            };
+            let engine_first = first.as_str() == ENGINE_STATS_STREAM_EXIT;
+            let branch = if engine_first {
+                "engine stats stream reported first"
+            } else {
+                "stats collector reported first"
+            };
+            if !engine_first {
+                assert_reports_a_stats_collector_panic(branch, first);
+            }
+            let message = result
+                .expect_err(&format!("{branch}: a critical task exit should fail Pylon"))
+                .to_string();
+            assert_eq!(
+                &message, first,
+                "{branch}: Pylon should return the critical task exit it reported, not a stats \
+                 collector panic that its shutdown found"
+            );
+            assert_eq!(
+                critical_task_exits.len(),
+                1,
+                "{branch}: Pylon should log its critical task exit once, and not log a stats \
+                 collector panic that its shutdown found: {critical_task_exits:?}"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{branch}: the model lifecycle supervisor should retire its models in its normal \
+                 shutdown"
+            );
+            if engine_first {
+                engine_server.abort();
+                let _ = engine_server.await;
+                return;
+            }
+        }
+        panic!(
+            "Pylon reported the stats collector first in all {RUNS} runs; tokio::select! may no \
+             longer start polling at a random branch"
+        );
+    }
+
+    /// A Stargate control plane for one reverse-tunnel Pylon. It lists itself
+    /// as the only Stargate and acknowledges each registration with
+    /// `reverse_tunnel_addr` as the reverse tunnel that Pylon dials.
+    #[derive(Clone)]
+    struct ReverseTunnelControlPlaneService {
+        address: String,
+        reverse_tunnel_addr: String,
+    }
+
+    #[tonic::async_trait]
+    impl StargateControlPlane for ReverseTunnelControlPlaneService {
+        type WatchStargatesStream = TestWatchStream;
+        type RegisterInferenceServerStream = TestRegistrationStream;
+
+        async fn watch_stargates(
+            &self,
+            _request: Request<WatchStargatesRequest>,
+        ) -> Result<Response<Self::WatchStargatesStream>, Status> {
+            let snapshot = WatchStargatesResponse {
+                stargates: vec![StargateInfo {
+                    stargate_id: "stargate-a".to_string(),
+                    advertise_addr: self.address.clone(),
+                    http_advertise_addr: String::new(),
+                    grpc_pylon_dial_addr: String::new(),
+                }],
+                watch_stargate_urls: Vec::new(),
+            };
+            Ok(Response::new(Box::pin(
+                tokio_stream::once(Ok(snapshot)).chain(tokio_stream::pending()),
+            )))
+        }
+
+        async fn register_inference_server(
+            &self,
+            request: Request<tonic::Streaming<InferenceServerRegistration>>,
+        ) -> Result<Response<Self::RegisterInferenceServerStream>, Status> {
+            let mut registrations = request.into_inner();
+            // Reads every update, as Stargate does, so the stream never backs up.
+            tokio::spawn(async move { while let Ok(Some(_)) = registrations.message().await {} });
+            let ack = InferenceServerAck {
+                reverse_tunnel_target: self.reverse_tunnel_addr.clone(),
+                reverse_tunnel_pylon_dial_addr: self.reverse_tunnel_addr.clone(),
+            };
+            Ok(Response::new(Box::pin(
+                tokio_stream::once(Ok(ack)).chain(tokio_stream::pending()),
+            )))
+        }
+    }
+
+    async fn spawn_reverse_tunnel_control_plane(
+        reverse_tunnel_addr: SocketAddr,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test control plane should bind");
+        let addr = listener.local_addr().expect("test control plane address");
+        let service = ReverseTunnelControlPlaneService {
+            address: format!("http://{addr}"),
+            reverse_tunnel_addr: reverse_tunnel_addr.to_string(),
+        };
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(StargateControlPlaneServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("test control plane should serve");
+        });
+        (addr, task)
+    }
+
+    /// The QUIC side of a Stargate router that one Pylon dials for its raw
+    /// QUIC reverse tunnel. The router sends Pylon requests on streams that
+    /// it opens on that connection.
+    struct ReverseTunnelRouter {
+        endpoint: quinn::Endpoint,
+    }
+
+    impl ReverseTunnelRouter {
+        fn bind() -> Self {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let server_config = stargate_tls::build_quic_server_config(
+                &pylon_lib::ServerTlsIdentity::SelfSigned,
+                TunnelTransportProtocol::RawQuic.alpn_protocols(),
+            )
+            .expect("the router's QUIC server config should build");
+            let endpoint = quinn::Endpoint::server(
+                server_config,
+                "127.0.0.1:0".parse().expect("router address should parse"),
+            )
+            .expect("the router's QUIC endpoint should bind");
+            Self { endpoint }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.endpoint
+                .local_addr()
+                .expect("the router's QUIC endpoint should have an address")
+        }
+
+        /// Accepts Pylon's reverse tunnel and answers its handshake.
+        async fn accept_tunnel(&self) -> quinn::Connection {
+            let incoming = self
+                .endpoint
+                .accept()
+                .await
+                .expect("Pylon should dial the reverse tunnel");
+            let connection = incoming
+                .await
+                .expect("the reverse tunnel's QUIC handshake should complete");
+            let (mut send, mut recv) = connection
+                .accept_bi()
+                .await
+                .expect("Pylon should open its handshake stream");
+            let handshake = stargate_protocol::read_handshake(&mut recv)
+                .await
+                .expect("Pylon should send its handshake");
+            assert_eq!(handshake.inference_server_id, "pylon-a");
+            stargate_protocol::write_handshake_ack(
+                &mut send,
+                &stargate_protocol::HandshakeAck {
+                    accepted: true,
+                    reason: String::new(),
+                },
+            )
+            .await
+            .expect("the router should acknowledge the handshake");
+            send.finish()
+                .expect("the router should finish the handshake stream");
+            connection
+        }
+    }
+
+    /// Sends a chat completion for `model` through the reverse tunnel, as the
+    /// router does, and returns the response's `x-status` and body.
+    async fn send_through_reverse_tunnel(
+        tunnel: &quinn::Connection,
+        model: &'static str,
+        request_id: &'static str,
+    ) -> (String, String) {
+        let (send, recv) = tunnel
+            .open_bi()
+            .await
+            .expect("the router should open a request stream");
+        let mut send = stargate_protocol::SendStream::new(send);
+        let mut recv = stargate_protocol::RecvStream::new(recv);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-method", axum::http::HeaderValue::from_static("POST"));
+        headers.insert(
+            "x-path",
+            axum::http::HeaderValue::from_static("/v1/chat/completions"),
+        );
+        headers.insert(
+            HEADER_REQUEST_ID,
+            axum::http::HeaderValue::from_static(request_id),
+        );
+        headers.insert("x-model", axum::http::HeaderValue::from_static(model));
+        headers.insert("x-input-tokens", axum::http::HeaderValue::from_static("8"));
+        headers.insert(
+            "content-type",
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        send.send_header(headers)
+            .await
+            .expect("the router should send the request head");
+        let body = serde_json::json!({
+            "model": model,
+            "stream": true,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": request_id}]
+        });
+        send.send_body(axum::body::Bytes::from(body.to_string()))
+            .await
+            .expect("the router should send the request body");
+        send.finish().expect("the router should finish the request");
+        let response = recv
+            .recv_header()
+            .await
+            .expect("Pylon should answer the request");
+        let status = response
+            .get("x-status")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let mut body = Vec::new();
+        while let Some(chunk) = recv
+            .recv_body()
+            .await
+            .expect("Pylon should send the response body")
+            .into_body()
+        {
+            body.extend_from_slice(&chunk);
+        }
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn wait_for_recorded(recorded: &RecordedEvents, message: &str, wait: Duration) {
+        tokio::time::timeout(wait, async {
+            while recorded.with_message(message).is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("Pylon should log {message:?} within {wait:?}"));
+    }
+
+    /// The accept window that the reverse tunnel drain logged as it started.
+    fn logged_accept_window(recorded: &RecordedEvents) -> Duration {
+        let draining = recorded.with_message("reverse tunnel draining");
+        let window_ms = draining
+            .first()
+            .and_then(|event| event.fields.get("accept_window_ms"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("the reverse tunnel drain should log its accept window");
+        Duration::from_millis(window_ms)
+    }
+
+    #[tokio::test]
+    async fn running_pylon_keeps_admitted_models_routable_through_a_drain_after_a_stats_collector_panic()
+     {
+        // The stats collector panics, and the supervisor finds it gone through
+        // a newly discovered model before Pylon's main loop has seen the
+        // collector's exit. The main loop then reports the panic and drains
+        // the reverse tunnel registration. Requests for model-a that the
+        // router sends early and late in the drain's accept window must still
+        // reach the upstream, so the supervisor keeps model-a until Pylon
+        // stops it after the drain.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let router = ReverseTunnelRouter::bind();
+        let (control_plane_addr, control_plane) =
+            spawn_reverse_tunnel_control_plane(router.addr()).await;
+        let args = runtime_args(
+            &upstream.base_url,
+            control_plane_addr,
+            &[],
+            &[
+                "--backend-connectivity",
+                "reverse",
+                "--quic-insecure",
+                "--initial-input-tps",
+                "1",
+                "--model-discovery-poll-interval-ms",
+                "10",
+                "--pylon-shutdown-drain-timeout-ms",
+                "10000",
+            ],
+        );
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        let runtime =
+            tokio::time::timeout(Duration::from_secs(5), start_pylon_runtime(&args, &plan))
+                .await
+                .expect("Pylon should start")
+                .expect("Pylon startup should succeed");
+        assert_eq!(runtime.initial_model_ids, ["model-a"]);
+        let tunnel = tokio::time::timeout(Duration::from_secs(5), router.accept_tunnel())
+            .await
+            .expect("Pylon should connect its reverse tunnel");
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "before-drain"),
+        )
+        .await
+        .expect("a request before the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a before the drain should reach the upstream: {body}"
+        );
+
+        // The supervisor asks the collector for nothing while its model set
+        // stays the same, so it finds the collector gone only through the
+        // newly discovered model-b. Pylon's main loop does not run yet, so the
+        // supervisor finds the collector gone first, and that wait ends before
+        // the drain's accept window opens.
+        panic_stats_collector(&runtime.stats_collector).await;
+        let (recorded, default_guard) = record_events();
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_recorded(
+            &recorded,
+            "model lifecycle supervisor failed",
+            Duration::from_secs(2),
+        )
+        .await;
+        let run = tokio::spawn(
+            runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
+        );
+        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
+        let drain_seen_at = tokio::time::Instant::now();
+        let accept_window = logged_accept_window(&recorded);
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "early-in-drain"),
+        )
+        .await
+        .expect("a request early in the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a early in the drain should reach the upstream after the \
+             supervisor found the stats collector gone: {body}"
+        );
+        // Three fifths into the accept window, 1.2 s of the 2 s window, the
+        // drain still accepts the request, and model-a must still be
+        // admitted.
+        tokio::time::sleep_until(drain_seen_at + accept_window * 3 / 5).await;
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "late-in-drain"),
+        )
+        .await
+        .expect("a request late in the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a late in the drain's accept window should reach the upstream: \
+             {body}"
+        );
+        // Closing the tunnel ends the drain's accept window.
+        tunnel.close(0u32.into(), b"test drain done");
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("Pylon should stop soon after its drain, before the 5 s task stop timeout")
+            .expect("Pylon should not re-raise the stats collector panic")
+            .expect_err("a stats collector panic should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_reports_a_stats_collector_panic(
+            "a stats collector panic that the supervisor found first",
+            &message,
+        );
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the collector panic once as its critical task exit"
+        );
+        let failed = recorded.with_message("model lifecycle supervisor failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the supervisor should report the collector panic once"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        let drains = recorded.with_message("pylon drain finished");
+        assert_eq!(drains.len(), 1, "Pylon should log one drain summary");
+        assert_eq!(
+            (
+                drains[0]
+                    .fields
+                    .get("requests_accepted")
+                    .map(String::as_str),
+                drains[0].fields.get("requests_cut_off").map(String::as_str),
+            ),
+            (Some("2"), Some("0")),
+            "the drain should accept and complete both requests: {:?}",
+            drains[0]
+        );
+        let stalled = recorded.with_message("task did not stop before shutdown timeout");
+        assert!(
+            stalled.is_empty(),
+            "every task should stop when Pylon stops it after the drain: {stalled:?}"
+        );
+        assert_eq!(
+            *upstream
+                .state
+                .completions
+                .lock()
+                .expect("upstream completions should not be poisoned"),
+            ["model-a", "model-a", "model-a"]
+        );
+        control_plane.abort();
+        let _ = control_plane.await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_pylon_keeps_admitted_models_routable_when_the_stats_collector_panics_during_a_signal_drain()
+     {
+        // A termination signal drains the reverse tunnel registration, and the
+        // stats collector panics during that drain, after the supervisor has
+        // asked it for a newly discovered model's begin. A request for model-a
+        // that the router sends after the supervisor found the collector gone
+        // must still reach the upstream. Pylon then reports the panic once, as
+        // the error of a shutdown that a signal started, and retires model-a.
+        let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
+        let router = ReverseTunnelRouter::bind();
+        let (control_plane_addr, control_plane) =
+            spawn_reverse_tunnel_control_plane(router.addr()).await;
+        let args = runtime_args(
+            &upstream.base_url,
+            control_plane_addr,
+            &[],
+            &[
+                "--backend-connectivity",
+                "reverse",
+                "--quic-insecure",
+                "--pylon-shutdown-drain-timeout-ms",
+                "10000",
+            ],
+        );
+        let plan = PylonStartupPlan::from_args_and_inference_ready_timeout(&args, None)
+            .expect("startup plan should build");
+        // A collector that polls KV-cache stats every millisecond, so the test
+        // can hold it. The registration's forwarding shares the model
+        // lifecycle's runtime state, as in `start_pylon_runtime`.
+        let (stats_collector, model_lifecycle, runtime_state) =
+            start_discovery_lifecycle(&upstream).await;
+        let mut runtime = test_running_pylon_with_lifecycle(stats_collector, model_lifecycle).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let forwarding = tunnel_forwarding_config_from_plan(&plan, runtime_state.clone(), metrics);
+        runtime
+            .registration_client
+            .start(registration_config_from_plan(
+                &args,
+                &plan,
+                forwarding,
+                plan.upstream.clone(),
+                None,
+                None,
+            ))
+            .expect("reverse registration should start");
+        let tunnel = tokio::time::timeout(Duration::from_secs(5), router.accept_tunnel())
+            .await
+            .expect("Pylon should connect its reverse tunnel");
+        assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+
+        // The held collector reads no commands, so the begin that panics it
+        // stays queued ahead of the supervisor's begin for model-b. This relies
+        // on the collector reading queued commands in the order they were
+        // sent, which flume does not document; the supervisor's report below
+        // fails if that changes. The supervisor's begin is queued before the
+        // signal, so this wait ends before the drain's accept window opens.
+        upstream.hold_kv_cache_polls().await;
+        queue_stats_collector_panic(&runtime.stats_collector);
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_model(&runtime_state, "model-b").await;
+        let (recorded, default_guard) = record_events();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(runtime.run_until_shutdown(async move {
+            let _ = signal_rx.await;
+            Ok("SIGTERM")
+        }));
+        signal_tx
+            .send(())
+            .expect("Pylon should wait for the signal");
+        // The held collector is still running, so the main loop takes the
+        // signal. Once the drain has started, the released collector reads
+        // the begin that panics it, and the supervisor's begin fails.
+        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
+        upstream.release_kv_cache_polls();
+        wait_for_recorded(
+            &recorded,
+            "model lifecycle supervisor failed",
+            Duration::from_secs(2),
+        )
+        .await;
+        // The drain accepts streams for 2 s, and only the collector's panic
+        // and the supervisor's report came first, so this request is in time.
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "during-drain"),
+        )
+        .await
+        .expect("a request during the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a during the drain should reach the upstream after the stats \
+             collector panicked: {body}"
+        );
+        assert_eq!(
+            runtime_state.advertised_model_ids(),
+            ["model-a"],
+            "model-a should stay admitted until the drain ends"
+        );
+        // Closing the tunnel ends the drain's accept window.
+        tunnel.close(0u32.into(), b"test drain done");
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
+            .await
+            .expect("Pylon should stop soon after its drain, before the 5 s task stop timeout")
+            .expect("Pylon should not re-raise the stats collector panic")
+            .expect_err("a stats collector panic found in a signal's shutdown should fail Pylon");
+        drop(default_guard);
+
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\"",
+            "Pylon should return the collector panic that its shutdown found"
+        );
+        assert_eq!(
+            recorded.critical_task_exits(),
+            [message],
+            "Pylon should log the collector panic once as a critical task exit"
+        );
+        assert_eq!(
+            recorded.with_message("received shutdown signal").len(),
+            1,
+            "the signal should have started the shutdown"
+        );
+        assert_eq!(
+            recorded
+                .with_message("model lifecycle supervisor failed")
+                .len(),
+            1,
+            "the supervisor should report the collector panic once"
+        );
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "the supervisor should retire model-a when Pylon stops it after the drain"
+        );
+        let drains = recorded.with_message("pylon drain finished");
+        assert_eq!(drains.len(), 1, "Pylon should log one drain summary");
+        assert_eq!(
+            (
+                drains[0]
+                    .fields
+                    .get("requests_accepted")
+                    .map(String::as_str),
+                drains[0].fields.get("requests_cut_off").map(String::as_str),
+            ),
+            (Some("1"), Some("0")),
+            "the drain should accept and complete the late request: {:?}",
+            drains[0]
+        );
+        let stalled = recorded.with_message("task did not stop before shutdown timeout");
+        assert!(
+            stalled.is_empty(),
+            "every task should stop when Pylon stops it after the drain: {stalled:?}"
+        );
+        control_plane.abort();
+        let _ = control_plane.await;
+        upstream.shutdown().await;
     }
 }

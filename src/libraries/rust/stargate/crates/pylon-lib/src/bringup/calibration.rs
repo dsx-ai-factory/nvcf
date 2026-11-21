@@ -29,6 +29,9 @@ use super::upstream::{BringupError, send_completion_request};
 
 pub(super) const CALIBRATION_PROMPT_UNITS_FLOOR: usize = 256;
 
+/// Runs the calibration ramp. `awaiting_snapshot` is set when the calibration
+/// starts waiting for the stats collector's snapshot, its last request, so a
+/// caller that stops it can tell whether the stop found it on that request.
 pub(crate) async fn run_calibration(
     http_client: &reqwest::Client,
     upstream_http_base_url: &str,
@@ -36,6 +39,7 @@ pub(crate) async fn run_calibration(
     config: &CalibrationConfig,
     stats_control: &StatsCollectorControl,
     runtime_state: &PylonRuntimeState,
+    awaiting_snapshot: &AtomicBool,
 ) -> Result<(), BringupError> {
     let model_id = generation.model_id();
     if config.calibration_requests == 0 {
@@ -81,6 +85,7 @@ pub(crate) async fn run_calibration(
                 last_completed = Some(step);
             }
             Ok(CalibrationStepOutcome::Saturated) => {
+                awaiting_snapshot.store(true, Ordering::Relaxed);
                 let stats = stats_control
                     .flush_and_snapshot(generation)
                     .await

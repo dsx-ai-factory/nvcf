@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -95,6 +97,63 @@ pub(crate) struct StatsCollectorControl {
 pub struct StatsCollectorHandle {
     task: OwnedTask,
     control: StatsCollectorControl,
+    /// Cancelled when `shutdown` starts, before the collector is told to stop.
+    shutdown_started: CancellationToken,
+    exit: StatsCollectorExit,
+    /// Keeps the engine stats channel open while the handle lives. A collector
+    /// that ends then leaves the engine stats stream waiting on a full channel
+    /// instead of ending it, so the collector is the task reported as ended.
+    _stats_updates: Option<flume::Receiver<StatsAggregatorUpdate>>,
+}
+
+/// How the stats collector task ended, recorded by the task as it ends.
+#[derive(Clone)]
+pub(crate) struct StatsCollectorExit {
+    /// The control's exit token: cancelled once the task has ended, after
+    /// `ended_by_shutdown` is recorded.
+    exited: CancellationToken,
+    ended_by_shutdown: Arc<AtomicBool>,
+}
+
+impl StatsCollectorExit {
+    /// Waits for the collector task to end, then returns whether its handle's
+    /// `shutdown` ended it: the shutdown had started when the task ended, and
+    /// the task did not panic. A collector that panicked, or that ended or
+    /// was aborted before any shutdown started, returns false, even if a
+    /// shutdown starts later. A request that finds the collector stopped can
+    /// wait here: the collector is already ending.
+    pub(crate) async fn ended_by_shutdown(&self) -> bool {
+        self.exited.cancelled().await;
+        self.ended_by_shutdown.load(Ordering::Acquire)
+    }
+
+    /// Whether the collector task has already ended other than by its
+    /// handle's `shutdown`. False while it runs.
+    pub(crate) fn ended_outside_shutdown(&self) -> bool {
+        self.exited.is_cancelled() && !self.ended_by_shutdown.load(Ordering::Acquire)
+    }
+}
+
+/// Records how the collector task ended when it drops, then cancels the exit
+/// token.
+struct StatsCollectorEnding {
+    exit: StatsCollectorExit,
+    /// The handle's shutdown mark.
+    shutdown_started: CancellationToken,
+    panicked: bool,
+}
+
+impl Drop for StatsCollectorEnding {
+    fn drop(&mut self) {
+        // The handle sets its shutdown mark before it stops the collector. A
+        // collector that ends without a panic once the mark is set saw its
+        // stop, or the shutdown's timeout aborted it.
+        let ended_by_shutdown = !self.panicked && self.shutdown_started.is_cancelled();
+        self.exit
+            .ended_by_shutdown
+            .store(ended_by_shutdown, Ordering::Release);
+        self.exit.exited.cancel();
+    }
 }
 
 impl StatsCollectorHandle {
@@ -102,15 +161,48 @@ impl StatsCollectorHandle {
         self.control.clone()
     }
 
+    /// Returns how the collector task ends, for work whose requests find it
+    /// stopped.
+    pub(crate) fn exit(&self) -> StatsCollectorExit {
+        self.exit.clone()
+    }
+
     pub async fn wait_for_exit(&mut self) -> Result<(), tokio::task::JoinError> {
         self.task.wait_for_exit().await
     }
 
     pub async fn shutdown(self) {
+        self.shutdown_started.cancel();
         self.task
             .shutdown(stargate_runtime::TASK_SHUTDOWN_TIMEOUT)
             .await;
     }
+
+    /// Like `shutdown`, but returns an error if the collector task panicked
+    /// instead of resuming the panic in the caller, which can then finish
+    /// stopping its other tasks. Like tokio's text for a task that panicked,
+    /// the error carries the panic message when the payload is a string. The
+    /// panic hook has already printed the panic.
+    pub async fn shutdown_reporting_panic(self) -> anyhow::Result<()> {
+        futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.shutdown()))
+            .await
+            .map_err(|panic| match panic_message(&*panic) {
+                Some(message) => {
+                    anyhow::anyhow!("stats collector panicked with message {message:?}")
+                }
+                None => anyhow::anyhow!("stats collector panicked"),
+            })
+    }
+}
+
+/// Returns a panic payload's message when it is a string, read the way tokio
+/// reads it for a `JoinError`: a `String` from a formatted panic, then a
+/// `&'static str` from a literal one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -330,17 +422,34 @@ pub fn start_stats_collector_with_engine_stats(
     }
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
     let exited = CancellationToken::new();
-    let exited_guard = exited.clone().drop_guard();
+    let shutdown_started = CancellationToken::new();
+    let exit = StatsCollectorExit {
+        exited: exited.clone(),
+        ended_by_shutdown: Arc::new(AtomicBool::new(false)),
+    };
+    let ending = StatsCollectorEnding {
+        exit: exit.clone(),
+        shutdown_started: shutdown_started.clone(),
+        panicked: false,
+    };
+    let stats_updates = stats_update_rx.clone();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
-        let _exited = exited_guard;
-        run_stats_collector(
+        let mut ending = ending;
+        let run = run_stats_collector(
             aggregator,
             observation_rx,
             stats_update_rx,
             control_rx,
             stop,
-        )
-        .await;
+        );
+        if let Err(panic) =
+            futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await
+        {
+            // Record the panic before the task ends with it.
+            ending.panicked = true;
+            drop(ending);
+            std::panic::resume_unwind(panic);
+        }
     });
     StatsCollectorHandle {
         task,
@@ -348,6 +457,9 @@ pub fn start_stats_collector_with_engine_stats(
             tx: control_tx,
             exited,
         },
+        shutdown_started,
+        exit,
+        _stats_updates: stats_updates,
     }
 }
 
@@ -4821,5 +4933,247 @@ mod tests {
              was never opened. tokio-util's CancellationToken may no longer hold the \
              parent's lock while it wakes a child. Results: {skipped:?}"
         );
+    }
+
+    /// Sends the begin that panics the collector: a configured input TPS of
+    /// zero breaks a stats initialization invariant. The trigger is a product
+    /// invariant, not a test hook, so the caller checks that it still panics.
+    async fn begin_generation_that_panics_the_collector(
+        control: &StatsCollectorControl,
+    ) -> Result<bool, StatsCollectorStopped> {
+        control
+            .begin_generation(
+                ModelGeneration::new("model-panics", 1),
+                ModelStatsInitialization::ConfiguredInputTps { input_tps: 0.0 },
+            )
+            .await
+    }
+
+    #[test]
+    fn a_request_failed_by_a_collector_shutdown_finds_the_collector_ended_by_it() {
+        // The model lifecycle supervisor reads the collector's exit record when
+        // a request fails because the collector stopped, to tell a shutdown
+        // from a crash. The shutdown is polled once and then left alone until a
+        // request has seen the collector stop, as in Pylon's shutdown, where
+        // the supervisor's request can fail first. A shutdown mark set after
+        // that first poll would leave the shutdown out of the record.
+        let runtimes = [
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build(),
+        ];
+        for runtime in runtimes {
+            let runtime = runtime.expect("the test runtime should build");
+            runtime.block_on(async {
+                let RunningCollector {
+                    handle: collector, ..
+                } = RunningCollector::spawn_empty(
+                    config!(observation_channel_capacity: 16),
+                    None,
+                    false,
+                );
+                let control = collector.control();
+                let exit = collector.exit();
+                let generation = ModelGeneration::new("model-a", 1);
+                let answered = bounded(
+                    "a request to the running collector",
+                    control.retire_generation(&generation),
+                )
+                .await;
+                assert!(
+                    answered.is_ok(),
+                    "the running collector should answer: {answered:?}"
+                );
+                // The record is read only once the collector has ended, so a
+                // request that fails while the collector is ending cannot read
+                // it before the collector writes it.
+                let early_record = exit.ended_by_shutdown();
+                tokio::pin!(early_record);
+                assert!(
+                    futures::poll!(&mut early_record).is_pending(),
+                    "a running collector should not report how it ended"
+                );
+
+                let shutdown = collector.shutdown();
+                tokio::pin!(shutdown);
+                let shutdown_finished = futures::poll!(&mut shutdown).is_ready();
+                bounded("a request that sees the collector stop", async {
+                    // A collector on another worker can still answer requests
+                    // sent before it sees its stop.
+                    while control.retire_generation(&generation).await.is_ok() {}
+                })
+                .await;
+                assert!(
+                    bounded("the collector's exit record", exit.ended_by_shutdown()).await,
+                    "a request that the collector's shutdown failed should find the collector \
+                     ended by that shutdown"
+                );
+                if !shutdown_finished {
+                    bounded("the collector shutdown", shutdown).await;
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_reporting_panic_returns_a_collector_panic_instead_of_resuming_it() {
+        let RunningCollector {
+            handle: collector, ..
+        } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
+        let control = collector.control();
+        let begun = bounded(
+            "the request that panics the collector",
+            begin_generation_that_panics_the_collector(&control),
+        )
+        .await;
+        assert!(
+            matches!(begun, Err(StatsCollectorStopped)),
+            "a configured input TPS of zero should panic the collector: {begun:?}"
+        );
+
+        // A resumed panic would end the task that runs the shutdown.
+        let shutdown = bounded(
+            "the shutdown of a collector that panicked",
+            tokio::spawn(collector.shutdown_reporting_panic()),
+        )
+        .await;
+        let reported = shutdown.unwrap_or_else(|error| {
+            panic!("the shutdown should return the collector panic instead of resuming it: {error}")
+        });
+        let error = reported.expect_err("the shutdown should report that the collector panicked");
+        assert_eq!(
+            error.to_string(),
+            "stats collector panicked with message \"configured input TPS must be \
+             positive and finite\""
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reporting_panic_stops_a_running_collector_without_an_error() {
+        let RunningCollector {
+            handle: collector, ..
+        } = RunningCollector::spawn_empty(config!(observation_channel_capacity: 16), None, false);
+        let control = collector.control();
+        let exit = collector.exit();
+
+        let reported = bounded(
+            "the collector shutdown",
+            collector.shutdown_reporting_panic(),
+        )
+        .await;
+        assert!(
+            reported.is_ok(),
+            "a collector that stopped normally should not be reported: {reported:?}"
+        );
+        assert!(
+            bounded("the collector's exit record", exit.ended_by_shutdown()).await,
+            "the collector should record that this shutdown ended it, so a request it fails is \
+             not reported as a crash"
+        );
+        let probed = bounded(
+            "a request after the shutdown",
+            control.flush_and_snapshot(&ModelGeneration::new("model-a", 1)),
+        )
+        .await;
+        assert!(
+            matches!(probed, Err(StatsCollectorStopped)),
+            "the shutdown should stop the collector: {probed:?}"
+        );
+    }
+
+    /// How a collector ends in
+    /// `exit_record_tells_an_end_outside_a_shutdown_without_waiting`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ExitRecordEnding {
+        Shutdown,
+        Panic,
+        OwnEnd,
+        Abort,
+    }
+
+    #[tokio::test]
+    async fn exit_record_tells_an_end_outside_a_shutdown_without_waiting() {
+        // A model lifecycle supervisor asks this when its stop wins over a
+        // stats request that may have failed, so it must answer at once: false
+        // while the collector runs and once its handle's shutdown ended it,
+        // true once it panicked, ended on its own, or was aborted.
+        for ending in [
+            ExitRecordEnding::Shutdown,
+            ExitRecordEnding::Panic,
+            ExitRecordEnding::OwnEnd,
+            ExitRecordEnding::Abort,
+        ] {
+            let (observations, observation_rx) = flume::bounded(16);
+            let collector = start_stats_collector(
+                config!(observation_channel_capacity: 16),
+                observation_rx,
+                PylonRuntimeState::default(),
+            );
+            let control = collector.control();
+            let exit = collector.exit();
+            let answered = bounded(
+                "a request to the running collector",
+                control.retire_generation(&ModelGeneration::new("model-a", 1)),
+            )
+            .await;
+            assert!(
+                answered.is_ok(),
+                "{ending:?}: the collector should run: {answered:?}"
+            );
+            assert!(
+                !exit.ended_outside_shutdown(),
+                "{ending:?}: a running collector has not ended outside a shutdown"
+            );
+
+            match ending {
+                ExitRecordEnding::Shutdown => {
+                    bounded("the collector shutdown", collector.shutdown()).await;
+                }
+                ExitRecordEnding::Panic => {
+                    let mut collector = collector;
+                    let begun = bounded(
+                        "the request that panics the collector",
+                        begin_generation_that_panics_the_collector(&control),
+                    )
+                    .await;
+                    assert!(
+                        matches!(begun, Err(StatsCollectorStopped)),
+                        "{ending:?}: a configured input TPS of zero should panic the collector: \
+                         {begun:?}"
+                    );
+                    let exited = bounded("the collector exit", collector.wait_for_exit()).await;
+                    assert!(
+                        matches!(&exited, Err(error) if error.is_panic()),
+                        "{ending:?}: {exited:?}"
+                    );
+                }
+                ExitRecordEnding::OwnEnd => {
+                    let mut collector = collector;
+                    // Its only observation sender closes, so it ends on its own.
+                    drop(observations);
+                    let exited = bounded("the collector exit", collector.wait_for_exit()).await;
+                    assert!(exited.is_ok(), "{ending:?}: {exited:?}");
+                    drop(collector);
+                }
+                ExitRecordEnding::Abort => drop(collector),
+            }
+            let ended_by_shutdown =
+                bounded("the collector's exit record", exit.ended_by_shutdown()).await;
+
+            assert_eq!(
+                ended_by_shutdown,
+                ending == ExitRecordEnding::Shutdown,
+                "{ending:?}: only the handle's shutdown ends the collector by a shutdown"
+            );
+            assert_eq!(
+                exit.ended_outside_shutdown(),
+                ending != ExitRecordEnding::Shutdown,
+                "{ending:?}: an ended collector that its shutdown did not end ended outside one"
+            );
+        }
     }
 }
