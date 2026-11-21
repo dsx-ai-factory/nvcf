@@ -83,6 +83,22 @@ describe("buildFilterItems", () => {
 			expect(countSlot(item)).toHaveTextContent("3");
 		});
 
+		it("sums counts for a numeric and string key that normalize to the same value", () => {
+			const [item] = buildFilterItems(
+				mockColumn(
+					"multi-select",
+					undefined,
+					new Map<unknown, number>([
+						[8, 3],
+						["8", 2],
+					]),
+				),
+				"test",
+				[{ label: "8", value: "8" }],
+			);
+			expect(countSlot(item)).toHaveTextContent("5");
+		});
+
 		it("keeps a selected option at 0 enabled", () => {
 			const items = buildFilterItems(
 				mockColumn("multi-select", ["inactive"]),
