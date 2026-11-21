@@ -147,6 +147,8 @@ They preserve the real command output for subsequent assertions.
 | Step | Command |
 |------|---------|
 | `When I successfully observe WatchStargates at {string} with TLS authority {string} using CA secret {string} in namespace {string} and context {string} for {string} seconds` | Reads the named CA certificate from the explicit Kubernetes secret and context, runs the public `WatchStargates` gRPC method against the visible endpoint and TLS authority with W3C trace context propagated through a generated `traceparent` header, and requires a streamed response before accepting the expected client deadline. |
+| `When I successfully observe plaintext WatchStargates rejection at {string} for {string} seconds` | Sends one plaintext `WatchStargates` call to the visible endpoint with the visible duration as the grpcurl deadline. The step requires a failed call whose complete output is the grpcurl 1.9.3 dial-stage deadline for that endpoint, then prints `plaintext-watch-rejected=tls-listener-timeout`. It does not prove that a TLS listener is present, so pair it with a TLS probe or a trusted call on the same endpoint. The raw grpcurl output stays on stderr. |
+| `When I successfully probe the TLS listener at {string} with TLS server name {string} and ALPN {string} using CA secret {string} in namespace {string} and context {string} within {string} seconds` | Reads the named CA certificate from the explicit Kubernetes secret and context and runs one `openssl s_client` handshake against the visible endpoint. It sends the visible server name as SNI, offers the visible ALPN protocol, fails on certificate chain errors, and stops at the visible timeout. It does not verify the certificate hostname. The combined openssl output is preserved, so assert `Verify return code` and the negotiated `ALPN protocol` in Gherkin. |
 
 #### Function and task lifecycle command adapters
 
@@ -612,6 +614,16 @@ func JSONContainsRows(raw string, rows []map[string]string) error
 // WatchStargatesCommand builds a TLS WatchStargates observation with an
 // explicit endpoint, authority, CA source, Kubernetes context, and duration.
 func WatchStargatesCommand(endpoint, authority, caSecret, namespace, kubeContext, durationSeconds string) (string, error)
+
+// PlaintextWatchStargatesRejectionCommand builds a plaintext WatchStargates
+// call that a TLS listener at an explicit endpoint must reject within an
+// explicit duration.
+func PlaintextWatchStargatesRejectionCommand(endpoint, durationSeconds string) (string, error)
+
+// TLSListenerProbeCommand builds one TLS handshake probe with an explicit
+// endpoint, SNI server name, offered ALPN protocol, CA source, Kubernetes
+// context, and timeout.
+func TLSListenerProbeCommand(endpoint, serverName, alpn, caSecret, namespace, kubeContext, timeoutSeconds string) (string, error)
 
 // PylonMetricExpectation describes an expected count of connected metric
 // series exposed by one Pylon sidecar.

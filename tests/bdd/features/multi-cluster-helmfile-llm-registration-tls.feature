@@ -64,23 +64,16 @@ Feature: Register an LLM worker securely with a local split-cluster routing plan
       Then the command output should contain "worker-address: https://llm-request-router.nvcf.svc.cluster.local:50071"
 
       # openssl verifies the externally reachable listener against the same
-      # stack-issued CA and DNS identity that a compute-plane Pylon uses.
-      # Explore a readable shared BDD DSL for this TLS listener probe: https://github.com/NVIDIA/nvcf/issues/1412
-      When I successfully run command:
-        """
-        /bin/bash -c 'openssl s_client -connect 127.0.0.1:50071 -servername llm-request-router.nvcf.svc.cluster.local -alpn h2 -verify_return_error -CAfile <(kubectl --context k3d-ncp-local-cp get secret stargate-quic-tls -n nvcf -o jsonpath="{.data.ca\.crt}" | base64 -d) </dev/null 2>&1'
-        """
+      # stack-issued CA that a compute-plane Pylon uses. The DNS name is sent
+      # as SNI only; this probe does not verify the certificate hostname.
+      When I successfully probe the TLS listener at "127.0.0.1:50071" with TLS server name "llm-request-router.nvcf.svc.cluster.local" and ALPN "h2" using CA secret "stargate-quic-tls" in namespace "nvcf" and context "k3d-ncp-local-cp" within "10" seconds
       Then the command output should contain "Verify return code: 0 (ok)"
       And the command output should contain "ALPN protocol: h2"
 
       # grpcurl reports a client-side dial deadline when plaintext HTTP/2 is
       # sent to this verified TLS listener. The trusted Watch below proves
       # that the same endpoint remains healthy.
-      # Explore a readable shared BDD DSL for this plaintext rejection probe: https://github.com/NVIDIA/nvcf/issues/1412
-      When I successfully run command:
-        """
-        /bin/bash -c 'set -u; output=$(grpcurl -plaintext -max-time 5 -import-path src/libraries/rust/stargate/crates/proto/proto -proto stargate.proto 127.0.0.1:50071 stargate.StargateControlPlane/WatchStargates 2>&1); rc=$?; if [ "$rc" -eq 0 ]; then printf "%s\n" "plaintext Watch unexpectedly succeeded" >&2; exit 1; fi; printf "%s\n" "$output" | bash tests/bdd/scripts/assert-grpcurl-plaintext-tls-rejection.sh'
-        """
+      When I successfully observe plaintext WatchStargates rejection at "127.0.0.1:50071" for "5" seconds
       Then the command output should contain "plaintext-watch-rejected=tls-listener-timeout"
 
       When I successfully observe WatchStargates at "127.0.0.1:50071" with TLS authority "llm-request-router.nvcf.svc.cluster.local" using CA secret "stargate-quic-tls" in namespace "nvcf" and context "k3d-ncp-local-cp" for "3" seconds

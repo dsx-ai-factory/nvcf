@@ -1973,17 +1973,11 @@ func TestMultiClusterHelmfileLLMRegistrationTLSFeatureFileWiresToSteps(t *testin
 	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
 
 	const (
-		tlsHandshakeCommand = `/bin/bash -c 'openssl s_client -connect 127.0.0.1:50071 ` +
-			`-servername llm-request-router.nvcf.svc.cluster.local -alpn h2 -verify_return_error ` +
-			`-CAfile <(kubectl --context k3d-ncp-local-cp get secret stargate-quic-tls -n nvcf ` +
-			`-o jsonpath="{.data.ca\.crt}" | base64 -d) </dev/null 2>&1'`
-		plaintextWatchCommand = `/bin/bash -c 'set -u; output=$(grpcurl -plaintext -max-time 5 ` +
-			`-import-path src/libraries/rust/stargate/crates/proto/proto -proto stargate.proto ` +
-			`127.0.0.1:50071 stargate.StargateControlPlane/WatchStargates 2>&1); rc=$?; ` +
-			`if [ "$rc" -eq 0 ]; then printf "%s\n" "plaintext Watch unexpectedly succeeded" >&2; ` +
-			`exit 1; fi; printf "%s\n" "$output" | ` +
-			`bash tests/bdd/scripts/assert-grpcurl-plaintext-tls-rejection.sh'`
-		tlsWatchCommand = "bash tests/bdd/scripts/observe-watch-stargates.sh" +
+		tlsHandshakeCommand = "bash tests/bdd/scripts/probe-tls-listener.sh" +
+			" 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local h2" +
+			" stargate-quic-tls nvcf k3d-ncp-local-cp 10"
+		plaintextWatchCommand = "bash tests/bdd/scripts/observe-plaintext-watch-rejection.sh 127.0.0.1:50071 5"
+		tlsWatchCommand       = "bash tests/bdd/scripts/observe-watch-stargates.sh" +
 			" 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local" +
 			" stargate-quic-tls nvcf k3d-ncp-local-cp 3"
 		pylonMetricsCommand = "bash tests/bdd/scripts/wait-pylon-metrics.sh" +
@@ -2079,6 +2073,9 @@ func TestMultiClusterHelmfileLLMRegistrationTLSFeatureFileWiresToSteps(t *testin
 	}
 	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, pylonMetricsCommand) {
 		t.Fatal("Pylon registration and reverse-tunnel metrics were not observed")
+	}
+	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, tlsHandshakeCommand) {
+		t.Fatal("TLS listener handshake was not probed with the stack-issued CA")
 	}
 	if !commandRanExactly(suite.Runner.(*fakeRunner).runs, tlsWatchCommand) {
 		t.Fatal("WatchStargates was not observed over the trusted TLS listener")

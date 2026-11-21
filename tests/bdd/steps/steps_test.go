@@ -1903,6 +1903,77 @@ func TestISuccessfullyObserveWatchStargatesRunsExplicitCommand(t *testing.T) {
 	}
 }
 
+func TestISuccessfullyObservePlaintextWatchStargatesRejectionRunsExplicitCommand(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	fake.result = harness.Result{
+		ExitCode: 0,
+		Stdout:   "plaintext-watch-rejected=tls-listener-timeout\n",
+		Stderr:   `Failed to dial target host "127.0.0.1:50071": context deadline exceeded` + "\n",
+	}
+
+	if err := sc.iSuccessfullyObservePlaintextWatchStargatesRejection(context.Background(), "127.0.0.1:50071", "5"); err != nil {
+		t.Fatalf("observe plaintext WatchStargates rejection: %v", err)
+	}
+	want := "bash tests/bdd/scripts/observe-plaintext-watch-rejection.sh 127.0.0.1:50071 5"
+	if len(fake.runs) != 1 || fake.runs[0].command != want {
+		t.Fatalf("runs = %#v, want %q", fake.runs, want)
+	}
+	if sc.LastResult != fake.result {
+		t.Fatalf("last result = %#v, want preserved plaintext Watch result %#v", sc.LastResult, fake.result)
+	}
+}
+
+func TestISuccessfullyProbeTLSListenerRunsExplicitCommand(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	fake.result = harness.Result{ExitCode: 0, Stdout: "ALPN protocol: h2\nVerify return code: 0 (ok)\n"}
+
+	err := sc.iSuccessfullyProbeTLSListener(
+		context.Background(),
+		"127.0.0.1:50071",
+		"llm-request-router.nvcf.svc.cluster.local",
+		"h2",
+		"stargate-quic-tls",
+		"nvcf",
+		"k3d-ncp-local-cp",
+		"10",
+	)
+	if err != nil {
+		t.Fatalf("probe TLS listener: %v", err)
+	}
+	want := "bash tests/bdd/scripts/probe-tls-listener.sh 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local h2 stargate-quic-tls nvcf k3d-ncp-local-cp 10"
+	if len(fake.runs) != 1 || fake.runs[0].command != want {
+		t.Fatalf("runs = %#v, want %q", fake.runs, want)
+	}
+	if sc.LastResult != fake.result {
+		t.Fatalf("last result = %#v, want preserved handshake result %#v", sc.LastResult, fake.result)
+	}
+}
+
+func TestISuccessfullyProbeTLSListenerKeepsFailedHandshakeResult(t *testing.T) {
+	sc, fake := newScenarioContext(t)
+	fake.result = harness.Result{ExitCode: 1, Stdout: "Verify return code: 19 (self-signed certificate in certificate chain)\n"}
+
+	err := sc.iSuccessfullyProbeTLSListener(
+		context.Background(),
+		"127.0.0.1:50071",
+		"llm-request-router.nvcf.svc.cluster.local",
+		"h2",
+		"stargate-quic-tls",
+		"nvcf",
+		"k3d-ncp-local-cp",
+		"10",
+	)
+	if err == nil {
+		t.Fatal("expected a failed handshake to fail the step")
+	}
+	if !strings.Contains(err.Error(), `"127.0.0.1:50071"`) {
+		t.Fatalf("error = %q, want the probed endpoint", err)
+	}
+	if sc.LastResult != fake.result {
+		t.Fatalf("last result = %#v, want preserved handshake result %#v", sc.LastResult, fake.result)
+	}
+}
+
 func TestEveryPylonForFunctionShouldReportMetricsRunsVisibleExpectations(t *testing.T) {
 	sc, fake := newScenarioContext(t)
 	fake.result = harness.Result{ExitCode: 0}
