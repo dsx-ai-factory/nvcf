@@ -4965,4 +4965,96 @@ mod tests {
             "the shutdown should stop the collector: {probed:?}"
         );
     }
+
+    /// How a collector ends in
+    /// `exit_record_tells_an_end_outside_a_shutdown_without_waiting`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ExitRecordEnding {
+        Shutdown,
+        Panic,
+        OwnEnd,
+        Abort,
+    }
+
+    #[tokio::test]
+    async fn exit_record_tells_an_end_outside_a_shutdown_without_waiting() {
+        // A model lifecycle supervisor asks this when its stop wins over a
+        // stats request that may have failed, so it must answer at once: false
+        // while the collector runs and once its handle's shutdown ended it,
+        // true once it panicked, ended on its own, or was aborted.
+        for ending in [
+            ExitRecordEnding::Shutdown,
+            ExitRecordEnding::Panic,
+            ExitRecordEnding::OwnEnd,
+            ExitRecordEnding::Abort,
+        ] {
+            let (observations, observation_rx) = flume::bounded(16);
+            let collector = start_stats_collector(
+                config!(observation_channel_capacity: 16),
+                observation_rx,
+                PylonRuntimeState::default(),
+            );
+            let control = collector.control();
+            let exit = collector.exit();
+            let answered = bounded(
+                "a request to the running collector",
+                control.retire_generation(&ModelGeneration::new("model-a", 1)),
+            )
+            .await;
+            assert!(
+                answered.is_ok(),
+                "{ending:?}: the collector should run: {answered:?}"
+            );
+            assert!(
+                !exit.ended_outside_shutdown(),
+                "{ending:?}: a running collector has not ended outside a shutdown"
+            );
+
+            match ending {
+                ExitRecordEnding::Shutdown => {
+                    bounded("the collector shutdown", collector.shutdown()).await;
+                }
+                ExitRecordEnding::Panic => {
+                    let mut collector = collector;
+                    let begun = bounded(
+                        "the request that panics the collector",
+                        begin_generation_that_panics_the_collector(&control),
+                    )
+                    .await;
+                    assert!(
+                        matches!(begun, Err(StatsCollectorStopped)),
+                        "{ending:?}: a configured input TPS of zero should panic the collector: \
+                         {begun:?}"
+                    );
+                    let exited = bounded("the collector exit", collector.wait_for_exit()).await;
+                    assert!(
+                        matches!(&exited, Err(error) if error.is_panic()),
+                        "{ending:?}: {exited:?}"
+                    );
+                }
+                ExitRecordEnding::OwnEnd => {
+                    let mut collector = collector;
+                    // Its only observation sender closes, so it ends on its own.
+                    drop(observations);
+                    let exited = bounded("the collector exit", collector.wait_for_exit()).await;
+                    assert!(exited.is_ok(), "{ending:?}: {exited:?}");
+                    drop(collector);
+                }
+                ExitRecordEnding::Abort => drop(collector),
+            }
+            let ended_by_shutdown =
+                bounded("the collector's exit record", exit.ended_by_shutdown()).await;
+
+            assert_eq!(
+                ended_by_shutdown,
+                ending == ExitRecordEnding::Shutdown,
+                "{ending:?}: only the handle's shutdown ends the collector by a shutdown"
+            );
+            assert_eq!(
+                exit.ended_outside_shutdown(),
+                ending != ExitRecordEnding::Shutdown,
+                "{ending:?}: an ended collector that its shutdown did not end ended outside one"
+            );
+        }
+    }
 }

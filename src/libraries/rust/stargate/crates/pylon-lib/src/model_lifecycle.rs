@@ -3042,8 +3042,58 @@ mod tests {
     const STATS_COLLECTOR_STOPPED: &str =
         "stats collector stopped during model lifecycle transition";
 
+    /// How long, on a paused clock, a test watches a supervisor that should
+    /// keep waiting for its stop: far longer than any registration drain. The
+    /// clock jumps, so this takes no real time.
+    const SUPERVISOR_HOLD_WATCH: Duration = Duration::from_secs(60 * 60);
+
+    /// Checks that a supervisor that found its stats collector gone keeps
+    /// model-a admitted, and does not exit, while an hour passes on a paused
+    /// clock. Every timer due in that hour fires, so a supervisor that retires
+    /// its generations after any delay fails this.
+    async fn assert_model_a_is_kept_until_the_supervisor_stop(
+        label: &str,
+        lifecycle: &mut crate::ModelLifecycleHandle,
+        runtime_state: &PylonRuntimeState,
+    ) {
+        tokio::time::pause();
+        let exit = tokio::time::timeout(SUPERVISOR_HOLD_WATCH, lifecycle.wait_for_exit()).await;
+        tokio::time::resume();
+        assert!(
+            exit.is_err(),
+            "{label}: the supervisor should keep its generations until its stop instead of \
+             exiting: {exit:?}"
+        );
+        assert_eq!(
+            runtime_state.advertised_model_ids(),
+            ["model-a"],
+            "{label}: model-a should stay advertised until the supervisor's stop"
+        );
+        assert!(
+            matches!(
+                runtime_state.request_generation_admission("model-a"),
+                crate::runtime_state::RequestGenerationAdmission::Admitted(_)
+            ),
+            "{label}: requests for model-a should still be admitted until the supervisor's stop"
+        );
+    }
+
+    fn assert_model_a_is_retired(label: &str, runtime_state: &PylonRuntimeState) {
+        assert!(
+            runtime_state.advertised_model_ids().is_empty()
+                && runtime_state.current_generation("model-a").is_none(),
+            "{label}: the supervisor's stop should retire model-a"
+        );
+        assert_eq!(
+            runtime_state.request_generation_admission("model-a"),
+            crate::runtime_state::RequestGenerationAdmission::Unavailable,
+            "{label}: requests for model-a should no longer be admitted after the stop"
+        );
+    }
+
     #[tokio::test]
-    async fn collector_shutdown_during_a_lifecycle_request_logs_no_error() {
+    async fn collector_shutdown_during_a_lifecycle_request_logs_no_error_and_keeps_admitted_models_until_the_supervisor_stop()
+     {
         let kv_cache = BlockingKvCacheServer::spawn().await;
         let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
         let (runtime_state, stats) = start_holdable_stats(&kv_cache);
@@ -3073,20 +3123,32 @@ mod tests {
         .await;
         // Only the collector shuts down, so the failed request alone ends the
         // supervisor's run. The shutdown is polled once and then left alone
-        // until the supervisor has exited. The supervisor reads the
-        // collector's record of why it ended, so a shutdown mark set after
-        // that first poll would leave the shutdown out of that record.
+        // until the supervisor has logged how it found the collector. The
+        // supervisor reads the collector's record of why it ended, so a
+        // shutdown mark set after that first poll would leave the shutdown
+        // out of that record.
         let shutdown = stats.shutdown();
         tokio::pin!(shutdown);
         assert!(
             futures::poll!(&mut shutdown).is_pending(),
             "the held collector should not end within the first poll of its shutdown"
         );
-        within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
-            .await
-            .expect("model lifecycle supervisor should not panic");
+        wait_for("the supervisor should find the collector stopped", || {
+            subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN)
+                + subscriber.event_count(SUPERVISOR_FAILED)
+                > 0
+        })
+        .await;
         within("stats collector shutdown", shutdown).await;
+        assert_model_a_is_kept_until_the_supervisor_stop(
+            "collector shutdown",
+            &mut lifecycle,
+            &runtime_state,
+        )
+        .await;
+        within("the supervisor's stop", lifecycle.shutdown()).await;
         drop(default_guard);
+        assert_model_a_is_retired("collector shutdown", &runtime_state);
 
         let events = subscriber.events();
         let errors = error_events(&events);
@@ -3115,7 +3177,7 @@ mod tests {
             let kv_cache = BlockingKvCacheServer::spawn().await;
             let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
             let (runtime_state, mut stats) = start_holdable_stats(&kv_cache);
-            let mut lifecycle = within(
+            let lifecycle = within(
                 "model lifecycle startup",
                 start_model_lifecycle(
                     discovery_config(&upstream.base_url),
@@ -3135,7 +3197,8 @@ mod tests {
                 // The panic trigger is queued ahead of the supervisor's
                 // request. This relies on the collector reading queued
                 // commands in the order they were sent, which flume does not
-                // document; the supervisor exit below fails if that changes.
+                // document; the wait for the supervisor's report below fails
+                // if that changes.
                 queue_stats_collector_panic(&stats);
             }
             upstream.set_models(&["model-a", "model-b"]).await;
@@ -3155,16 +3218,21 @@ mod tests {
                 // Dropping the handle aborts the collector without a shutdown.
                 drop(stats);
             }
-            let supervisor_exit = if panics {
-                "model lifecycle supervisor exit (if it does not exit, the collector may have \
-                 answered its begin before the command queued ahead of it)"
+            let supervisor_report = if panics {
+                "the supervisor should find the collector gone (if it does not, the collector \
+                 may have answered its begin before the command queued ahead of it)"
             } else {
-                "model lifecycle supervisor exit"
+                "the supervisor should find the collector gone"
             };
-            within(supervisor_exit, lifecycle.wait_for_exit())
-                .await
-                .expect("model lifecycle supervisor should not panic");
+            wait_for(supervisor_report, || {
+                subscriber.event_count(SUPERVISOR_FAILED)
+                    + subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN)
+                    > 0
+            })
+            .await;
+            within("the supervisor's stop", lifecycle.shutdown()).await;
             drop(default_guard);
+            assert_model_a_is_retired(ending, &runtime_state);
 
             let events = subscriber.events();
             let failed = events_with_message(&events, SUPERVISOR_FAILED);
@@ -3251,72 +3319,118 @@ mod tests {
     }
 
     const KV_CACHE_STATS_REJECTED: &str = "KV-cache stats endpoint returned non-success status";
+    const DISCOVERY_POLL_FAILED: &str =
+        "model discovery poll failed; retaining last-known-good set";
 
-    /// A shutdown that `CollectorPanicHook` starts.
+    /// A shutdown that an `EventHook` action starts.
     type ArmedShutdown<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
+    /// An action that an `EventHook` runs once.
+    type HookAction = Box<dyn FnOnce() + Send>;
+
     /// Records events with a `RecordingTracingSubscriber`. Once armed with a
-    /// shutdown, it panics the stats collector from inside the collector's own
-    /// run, after that shutdown has started: on the collector's next KV-cache
-    /// warning it polls the shutdown once, and then it panics. The first poll
-    /// of a stats collector's shutdown sets its shutdown mark and its stop,
-    /// and that of a model lifecycle's shutdown cancels the supervisor's stop.
-    /// The collector is busy logging, so it cannot see its own stop first, and
-    /// on this single-threaded runtime the supervisor cannot run before the
-    /// collector has ended.
+    /// trigger message and an action, it runs the action inside the call that
+    /// logs the first event with that message, in the task that logs it. That
+    /// task is busy logging, so no other task on this single-threaded runtime
+    /// runs between the event and the action, and the logging task itself
+    /// resumes only once the action returns. An action that panics unwinds
+    /// through the logging call into that task.
     ///
     /// This relies on tracing calling the subscriber inside the call that logs
     /// the event, and on a panic there unwinding through that call, which
-    /// tracing does not document. The tests check that the collector panicked,
-    /// so they fail if that changes.
-    struct CollectorPanicHook<T> {
+    /// tracing does not document. The tests check that the hook fired, and
+    /// that a collector it panics ended with a panic, so they fail if that
+    /// changes.
+    #[derive(Clone, Default)]
+    struct EventHook {
         recorder: RecordingTracingSubscriber,
-        armed: Arc<StdMutex<Option<ArmedShutdown<T>>>>,
-        started: Arc<StdMutex<Option<ArmedShutdown<T>>>>,
+        armed: Arc<StdMutex<Option<(&'static str, HookAction)>>>,
+        fired: Arc<AtomicBool>,
     }
 
-    impl<T> Default for CollectorPanicHook<T> {
-        fn default() -> Self {
-            Self {
-                recorder: RecordingTracingSubscriber::default(),
-                armed: Arc::default(),
-                started: Arc::default(),
-            }
-        }
-    }
-
-    impl<T> Clone for CollectorPanicHook<T> {
-        fn clone(&self) -> Self {
-            Self {
-                recorder: self.recorder.clone(),
-                armed: Arc::clone(&self.armed),
-                started: Arc::clone(&self.started),
-            }
-        }
-    }
-
-    impl<T> CollectorPanicHook<T> {
-        fn arm(&self, shutdown: ArmedShutdown<T>) {
+    impl EventHook {
+        fn arm(&self, trigger: &'static str, action: impl FnOnce() + Send + 'static) {
             *self
                 .armed
                 .lock()
-                .expect("armed shutdown should not be poisoned") = Some(shutdown);
+                .expect("armed hook should not be poisoned") = Some((trigger, Box::new(action)));
         }
 
-        /// Returns the shutdown that the hook started once it has panicked the
-        /// collector.
-        async fn started_shutdown(&self) -> ArmedShutdown<T> {
+        async fn wait_until_fired(&self, what: &str) {
+            within(what, async {
+                while !self.fired.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+        }
+    }
+
+    /// A shutdown that a hook action starts with one poll, kept for the test
+    /// to finish.
+    struct StartedShutdown<T>(Arc<StdMutex<Option<ArmedShutdown<T>>>>);
+
+    impl<T> Clone for StartedShutdown<T> {
+        fn clone(&self) -> Self {
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl<T: 'static> StartedShutdown<T> {
+        fn new() -> Self {
+            Self(Arc::default())
+        }
+
+        /// Polls `shutdown` once, which starts it, and keeps it. The first
+        /// poll of a stats collector's shutdown sets its shutdown mark and its
+        /// stop, and that of a model lifecycle's shutdown cancels the
+        /// supervisor's stop. Neither shutdown can finish in that poll while
+        /// the task that logs the trigger event runs, so a shutdown that does
+        /// is not kept, and `take` then fails.
+        fn start(&self, mut shutdown: ArmedShutdown<T>) {
+            let polled = shutdown
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            if polled.is_pending() {
+                *self
+                    .0
+                    .lock()
+                    .expect("started shutdown should not be poisoned") = Some(shutdown);
+            }
+        }
+
+        /// Returns the started shutdown once a hook action has started it,
+        /// waiting at most two seconds, like `within`.
+        async fn take(&self, what: &str) -> ArmedShutdown<T> {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
                 if let Some(shutdown) = self
-                    .started
+                    .0
                     .lock()
                     .expect("started shutdown should not be poisoned")
                     .take()
                 {
                     return shutdown;
                 }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{what} did not finish within 2 s"
+                );
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+        }
+    }
+
+    /// An action that starts `shutdown` and then panics the stats collector,
+    /// when it runs inside the collector's own run.
+    fn start_and_panic_the_collector<T: Send + 'static>(
+        started: &StartedShutdown<T>,
+        shutdown: ArmedShutdown<T>,
+    ) -> impl FnOnce() + Send + 'static {
+        let started = started.clone();
+        move || {
+            started.start(shutdown);
+            panic!("test panic in the stats collector after the armed shutdown started");
         }
     }
 
@@ -3331,7 +3445,7 @@ mod tests {
         }
     }
 
-    impl<T: 'static> tracing::Subscriber for CollectorPanicHook<T> {
+    impl tracing::Subscriber for EventHook {
         fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
             tracing::Subscriber::enabled(&self.recorder, metadata)
         }
@@ -3352,30 +3466,20 @@ mod tests {
             tracing::Subscriber::event(&self.recorder, event);
             let mut message = EventMessage::default();
             event.record(&mut message);
-            if message.0.as_deref() != Some(KV_CACHE_STATS_REJECTED) {
-                return;
-            }
-            let Some(mut shutdown) = self
-                .armed
-                .lock()
-                .expect("armed shutdown should not be poisoned")
-                .take()
-            else {
-                return;
+            let action = {
+                let mut armed = self
+                    .armed
+                    .lock()
+                    .expect("armed hook should not be poisoned");
+                match armed.as_ref() {
+                    Some((trigger, _)) if message.0.as_deref() == Some(*trigger) => armed.take(),
+                    _ => None,
+                }
             };
-            let polled = shutdown
-                .as_mut()
-                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-            if polled.is_ready() {
-                // Neither shutdown can finish while the collector runs here,
-                // so this does not happen; started_shutdown then times out.
-                return;
+            if let Some((_, action)) = action {
+                self.fired.store(true, Ordering::SeqCst);
+                action();
             }
-            *self
-                .started
-                .lock()
-                .expect("started shutdown should not be poisoned") = Some(shutdown);
-            panic!("test panic in the stats collector after the armed shutdown started");
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
@@ -3413,7 +3517,7 @@ mod tests {
                 observation_rx,
                 runtime_state.clone(),
             );
-            let mut lifecycle = within(
+            let lifecycle = within(
                 "model lifecycle startup",
                 start_model_lifecycle(
                     discovery_config(&upstream.base_url),
@@ -3424,7 +3528,7 @@ mod tests {
             )
             .await
             .expect("initial discovery should initialize");
-            let hook = CollectorPanicHook::<anyhow::Result<()>>::default();
+            let hook = EventHook::default();
             let dispatch = tracing::Dispatch::new(hook.clone());
             let default_guard = tracing::dispatcher::set_default(&dispatch);
 
@@ -3467,12 +3571,17 @@ mod tests {
                     assert!(reported.is_ok(), "{ending:?}: {reported:?}");
                 }
                 CollectorEndOutsideShutdown::PanicDuringShutdown => {
-                    hook.arm(Box::pin(stats.shutdown_reporting_panic()));
-                    let shutdown = within(
-                        "the hook's panic in the collector's KV-cache warning",
-                        hook.started_shutdown(),
-                    )
-                    .await;
+                    let started = StartedShutdown::new();
+                    hook.arm(
+                        KV_CACHE_STATS_REJECTED,
+                        start_and_panic_the_collector(
+                            &started,
+                            Box::pin(stats.shutdown_reporting_panic()),
+                        ),
+                    );
+                    let shutdown = started
+                        .take("the hook's panic in the collector's KV-cache warning")
+                        .await;
                     let reported = within("the collector shutdown", shutdown).await;
                     assert_eq!(
                         reported.map_err(|error| error.to_string()),
@@ -3492,9 +3601,15 @@ mod tests {
             );
 
             upstream.set_models(&["model-a", "model-b"]).await;
-            within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
-                .await
-                .expect("model lifecycle supervisor should not panic");
+            // The supervisor logs how it found the collector, and then keeps
+            // model-a until its stop.
+            wait_for("the supervisor should find the collector gone", || {
+                hook.recorder.event_count(SUPERVISOR_FAILED)
+                    + hook.recorder.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN)
+                    > 0
+            })
+            .await;
+            within("the supervisor's stop", lifecycle.shutdown()).await;
             drop(default_guard);
 
             let events = hook.recorder.events();
@@ -3541,7 +3656,7 @@ mod tests {
         )
         .await
         .expect("initial discovery should initialize");
-        let hook = CollectorPanicHook::<()>::default();
+        let hook = EventHook::default();
         let dispatch = tracing::Dispatch::new(hook.clone());
         let default_guard = tracing::dispatcher::set_default(&dispatch);
         hold_stats_collector(&kv_cache).await;
@@ -3556,13 +3671,15 @@ mod tests {
         .await;
         // The released poll is rejected. In that warning the hook cancels the
         // supervisor's stop and then panics the collector.
-        hook.arm(Box::pin(lifecycle.shutdown()));
+        let started = StartedShutdown::new();
+        hook.arm(
+            KV_CACHE_STATS_REJECTED,
+            start_and_panic_the_collector(&started, Box::pin(lifecycle.shutdown())),
+        );
         kv_cache.unblock();
-        let supervisor_shutdown = within(
-            "the hook's panic in the collector's KV-cache warning",
-            hook.started_shutdown(),
-        )
-        .await;
+        let supervisor_shutdown = started
+            .take("the hook's panic in the collector's KV-cache warning")
+            .await;
         let exit = within("the collector exit", stats.wait_for_exit()).await;
         assert!(
             matches!(&exit, Err(error) if error.is_panic()),
@@ -3671,7 +3788,7 @@ mod tests {
             let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
             let metrics = PylonMetrics::new().expect("metrics should initialize");
             let (runtime_state, stats) = start_holdable_stats(&kv_cache);
-            let mut lifecycle = within(
+            let lifecycle = within(
                 "model lifecycle startup",
                 start_model_lifecycle(
                     calibration_config_with_fallback(&upstream.base_url, fallback_input_tps),
@@ -3696,10 +3813,18 @@ mod tests {
             tokio::time::sleep(CALIBRATION_STEP * 2).await;
             within("stats collector shutdown", stats.shutdown()).await;
             // A supervisor that took the cut-short calibration for a failure
-            // warns and keeps the model pending instead of exiting, so the
-            // warnings are checked before the exit.
-            let exit =
-                tokio::time::timeout(Duration::from_secs(2), lifecycle.wait_for_exit()).await;
+            // warns and keeps the model pending instead of stopping, so the
+            // warnings are checked before the wait for the stop's log line.
+            let stopped_in_time = tokio::time::timeout(Duration::from_secs(2), async {
+                while subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN)
+                    + subscriber.event_count(SUPERVISOR_FAILED)
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            within("the supervisor's stop", lifecycle.shutdown()).await;
             drop(default_guard);
 
             let events = subscriber.events();
@@ -3709,12 +3834,11 @@ mod tests {
                 "{label}: a calibration cut short by a collector shutdown should not warn: \
                  {warnings:?}"
             );
-            exit.unwrap_or_else(|_| {
+            stopped_in_time.unwrap_or_else(|_| {
                 panic!(
                     "{label}: the supervisor should stop with the collector's shutdown within 2 s"
                 )
-            })
-            .expect("model lifecycle supervisor should not panic");
+            });
             let errors = error_events(&events);
             assert!(
                 errors.is_empty(),
@@ -3780,7 +3904,7 @@ mod tests {
                 // The test holds the attempt's health probe for as long as it
                 // needs, without the probe timing out.
                 calibration.health_timeout = Duration::from_secs(30);
-                let mut lifecycle = within(
+                let lifecycle = within(
                     "model lifecycle startup",
                     start_model_lifecycle(config, runtime_state, &stats, Some(metrics.clone())),
                 )
@@ -3840,13 +3964,31 @@ mod tests {
                 }
                 upstream.release_health();
                 upstream.next_calibration().await;
-                // A supervisor that tried the model again would keep running.
-                within("model lifecycle supervisor exit", lifecycle.wait_for_exit())
-                    .await
-                    .expect("model lifecycle supervisor should not panic");
+                // A supervisor that tried the model again would keep trying
+                // instead of stopping, so the retry warnings are checked
+                // before the wait for the stop's log line.
+                let stopped_in_time = tokio::time::timeout(Duration::from_secs(2), async {
+                    while subscriber.event_count(SUPERVISOR_FAILED)
+                        + subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN)
+                        == 0
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+                within("the supervisor's stop", lifecycle.shutdown()).await;
                 drop(default_guard);
 
                 let events = subscriber.events();
+                let retries = calibration_retry_warnings(&events);
+                assert!(
+                    retries.is_empty(),
+                    "{label}: the supervisor should not try the model again against a collector \
+                     that is gone: {retries:?}"
+                );
+                stopped_in_time.unwrap_or_else(|_| {
+                    panic!("{label}: the failed calibration should stop the supervisor within 2 s")
+                });
                 let warnings = events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
                 assert_eq!(
                     warnings.len(),
@@ -3856,12 +3998,6 @@ mod tests {
                 assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
                 assert_tracing_event_field(warnings[0], "error", CALIBRATION_COLLECTOR_STOPPED);
                 assert_tracing_event_field(warnings[0], "model_id", "model-a");
-                let retries = calibration_retry_warnings(&events);
-                assert!(
-                    retries.is_empty(),
-                    "{label}: the supervisor should not try the model again against a collector \
-                     that is gone: {retries:?}"
-                );
                 assert_eq!(
                     calibration_count(&metrics, "model-a", "error"),
                     1,
@@ -3981,17 +4117,17 @@ mod tests {
         /// would admit it fails.
         Admit,
         /// model-b's calibration, which has no fallback input TPS, asks the
-        /// collector for its snapshot, and that fails (R3a).
+        /// collector for its snapshot, and that fails.
         Calibration,
         /// Like `Calibration`, with a fallback input TPS that the supervisor
         /// must not fall back to.
         CalibrationWithFallback,
+        /// model-b's calibration fails on its own, so the supervisor starts
+        /// model-b at the fallback input TPS. The collector panics as the
+        /// supervisor warns about that fallback, so the begin of the fallback
+        /// generation finds it gone.
+        FallbackAdmission,
     }
-
-    /// How long a test watches a supervisor that should keep waiting for its
-    /// stop. A supervisor that does not wait retires its generations and
-    /// exits as soon as it runs again.
-    const SUPERVISOR_WAIT_WATCH: Duration = Duration::from_millis(300);
 
     /// A supervisor that a stats collector panic has stopped, with model-a
     /// admitted before the panic.
@@ -4028,15 +4164,34 @@ mod tests {
         );
     }
 
+    /// An action that queues the begin that panics the stats collector, ahead
+    /// of every request that the logging task sends after the event. `queued`
+    /// records that the begin was sent and waits for its reply. The command
+    /// stays queued after its request is dropped.
+    fn queue_the_collector_panic(
+        control: crate::stats::StatsCollectorControl,
+        queued: Arc<AtomicBool>,
+    ) -> impl FnOnce() + Send + 'static {
+        move || {
+            let trigger = std::pin::pin!(control.begin_generation(
+                ModelGeneration::new("model-panics", 1),
+                crate::stats::ModelStatsInitialization::ConfiguredInputTps { input_tps: 0.0 },
+            ));
+            let polled = std::future::Future::poll(
+                trigger,
+                &mut std::task::Context::from_waker(std::task::Waker::noop()),
+            );
+            queued.store(polled.is_pending(), Ordering::SeqCst);
+        }
+    }
+
     /// Starts a model lifecycle that admits model-a, and model-c for
-    /// `Discovery`. With `drain` set, it then marks a registration drain as
-    /// started. It panics the stats collector and returns once the supervisor
-    /// has found the collector gone through `path`.
+    /// `Discovery`. It panics the stats collector and returns once the
+    /// supervisor has found the collector gone through `path`.
     async fn stop_the_supervisor_with_a_collector_panic(
         path: CollectorStopPath,
-        drain: bool,
     ) -> SupervisorStoppedByCollector {
-        let label = format!("{path:?}, drain {drain}");
+        let label = format!("{path:?}");
         let (initial_models, completion_behavior) = match path {
             CollectorStopPath::Discovery => {
                 (&["model-a", "model-c"][..], CompletionBehavior::Pending)
@@ -4047,6 +4202,16 @@ mod tests {
             CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback => (
                 &["model-a"][..],
                 CompletionBehavior::SaturateAfter {
+                    completed_requests_per_generation: 4,
+                },
+            ),
+            // model-a measures a rate as above. Every calibration request for
+            // model-b is rejected, so its calibration measures no rate.
+            CollectorStopPath::FallbackAdmission => (
+                &["model-a"][..],
+                CompletionBehavior::FailModel {
+                    model_id: "model-b",
+                    failing: Arc::new(AtomicBool::new(true)),
                     completed_requests_per_generation: 4,
                 },
             ),
@@ -4080,6 +4245,9 @@ mod tests {
                 calibration.health_timeout = Duration::from_secs(30);
                 config
             }
+            CollectorStopPath::FallbackAdmission => {
+                calibration_config_with_fallback(&upstream.base_url, Some(FALLBACK_INPUT_TPS))
+            }
         };
         let metrics = PylonMetrics::new().expect("metrics should initialize");
         let (runtime_state, stats) = start_test_stats();
@@ -4096,9 +4264,8 @@ mod tests {
             initial_models,
             "{label}: startup should admit the initial models"
         );
-        let subscriber = RecordingTracingSubscriber::default();
-        let default_guard =
-            tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));
+        let hook = EventHook::default();
+        let default_guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(hook.clone()));
 
         match path {
             CollectorStopPath::Discovery => {
@@ -4118,10 +4285,38 @@ mod tests {
                 panic_the_stats_collector(&label, stats).await;
                 upstream.release_health();
             }
+            CollectorStopPath::FallbackAdmission => {
+                // As the supervisor warns that it starts model-b at the
+                // fallback input TPS, the hook queues the begin that panics
+                // the collector ahead of the supervisor's next requests, which
+                // retire model-b's failed generation and begin its fallback
+                // generation. This relies on the collector reading queued
+                // commands in the order they were sent, which flume does not
+                // document; the checks of model-b's fallback generation below
+                // fail if that changes.
+                let queued = Arc::new(AtomicBool::new(false));
+                hook.arm(
+                    FALLBACK_WARNING,
+                    queue_the_collector_panic(stats.control(), Arc::clone(&queued)),
+                );
+                upstream.set_models(&["model-a", "model-b"]).await;
+                hook.wait_until_fired("the supervisor's fallback warning for model-b")
+                    .await;
+                assert!(
+                    queued.load(Ordering::SeqCst),
+                    "{label}: the hook should queue the begin that panics the collector"
+                );
+                let mut stats = stats;
+                let exit = within("the collector exit", stats.wait_for_exit()).await;
+                assert!(
+                    matches!(&exit, Err(error) if error.is_panic()),
+                    "{label}: the queued begin should end the collector with a panic: {exit:?}"
+                );
+            }
         }
         wait_for(
             "the supervisor should find its stats collector gone",
-            || subscriber.event_count(SUPERVISOR_FAILED) >= 1,
+            || hook.recorder.event_count(SUPERVISOR_FAILED) >= 1,
         )
         .await;
         SupervisorStoppedByCollector {
@@ -4130,15 +4325,17 @@ mod tests {
             runtime_state,
             metrics,
             upstream,
-            subscriber,
+            subscriber: hook.recorder.clone(),
             default_guard,
         }
     }
 
     /// Checks the log lines of a supervisor that a stats collector panic
-    /// stopped: one ERROR for the stop (R1a), and for a calibration path, one
-    /// WARN and one `error` outcome for model-b's calibration, which the
-    /// supervisor neither tries again nor falls back from (R3a).
+    /// stopped: one ERROR for the stop. For the calibration paths, model-b's
+    /// calibration warns once and is recorded once as an error, and the
+    /// supervisor neither tries it again nor falls back from it. For the
+    /// fallback admission, model-b's own calibration failure and its fallback
+    /// are logged once each.
     fn assert_a_collector_panic_stopped_the_supervisor(
         run: &SupervisorStoppedByCollector,
         path: CollectorStopPath,
@@ -4163,63 +4360,77 @@ mod tests {
             events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN).is_empty(),
             "{label}: a collector panic is not part of a shutdown"
         );
-        if !matches!(
-            path,
-            CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback
-        ) {
-            return;
+        match path {
+            CollectorStopPath::Discovery | CollectorStopPath::Admit => {}
+            CollectorStopPath::Calibration | CollectorStopPath::CalibrationWithFallback => {
+                let warnings = events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
+                assert_eq!(
+                    warnings.len(),
+                    1,
+                    "{label}: model-b's calibration should warn once that the collector stopped"
+                );
+                assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
+                assert_tracing_event_field(warnings[0], "model_id", "model-b");
+                assert_tracing_event_field(warnings[0], "error", CALIBRATION_COLLECTOR_STOPPED);
+                let retries = calibration_retry_warnings(&events);
+                assert!(
+                    retries.is_empty(),
+                    "{label}: the supervisor should not try model-b again: {retries:?}"
+                );
+                assert_eq!(
+                    calibration_count(&run.metrics, "model-b", "error"),
+                    1,
+                    "{label}: model-b's calibration should be recorded once as an error"
+                );
+                assert_eq!(
+                    calibration_count(&run.metrics, "model-b", "cancelled"),
+                    0,
+                    "{label}: model-b's calibration should not be recorded as cancelled"
+                );
+            }
+            CollectorStopPath::FallbackAdmission => {
+                let fallbacks = events_with_message(&events, FALLBACK_WARNING);
+                assert_eq!(
+                    fallbacks.len(),
+                    1,
+                    "{label}: the supervisor should start model-b at the fallback input TPS once"
+                );
+                assert_tracing_event_field(fallbacks[0], "model_id", "model-b");
+                assert!(
+                    events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING).is_empty(),
+                    "{label}: model-b's calibration failed on its own, with the collector running"
+                );
+                assert!(
+                    events_with_message(&events, PENDING_WARNING).is_empty(),
+                    "{label}: the supervisor should not keep model-b pending to try again"
+                );
+                assert_eq!(
+                    calibration_count(&run.metrics, "model-b", "error"),
+                    1,
+                    "{label}: model-b's calibration should be recorded once as an error"
+                );
+                assert_eq!(
+                    calibration_count(&run.metrics, "model-b", "cancelled"),
+                    0,
+                    "{label}: model-b's calibration should not be recorded as cancelled"
+                );
+            }
         }
-        let warnings = events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
-        assert_eq!(
-            warnings.len(),
-            1,
-            "{label}: model-b's calibration should warn once that the collector stopped"
-        );
-        assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
-        assert_tracing_event_field(warnings[0], "model_id", "model-b");
-        assert_tracing_event_field(warnings[0], "error", CALIBRATION_COLLECTOR_STOPPED);
-        let retries = calibration_retry_warnings(&events);
-        assert!(
-            retries.is_empty(),
-            "{label}: the supervisor should not try model-b again: {retries:?}"
-        );
-        assert_eq!(
-            calibration_count(&run.metrics, "model-b", "error"),
-            1,
-            "{label}: model-b's calibration should be recorded once as an error"
-        );
-        assert_eq!(
-            calibration_count(&run.metrics, "model-b", "cancelled"),
-            0,
-            "{label}: model-b's calibration should not be recorded as cancelled"
-        );
     }
 
-    /// During a drain, the supervisor that the collector stopped keeps model-a
-    /// admitted until its own stop, and retires it then.
-    async fn assert_a_drain_keeps_model_a_until_the_supervisor_stop(path: CollectorStopPath) {
-        let mut run = stop_the_supervisor_with_a_collector_panic(path, true).await;
+    /// The supervisor that the collector stopped keeps model-a admitted until
+    /// its own stop, however late that comes, and retires it then.
+    async fn assert_model_a_is_kept_after_a_collector_panic_found_by(path: CollectorStopPath) {
+        let mut run = stop_the_supervisor_with_a_collector_panic(path).await;
         let label = run.label.clone();
         while run.upstream.calibrations.try_recv().is_ok() {}
 
-        let exit = tokio::time::timeout(SUPERVISOR_WAIT_WATCH, run.lifecycle.wait_for_exit()).await;
-        assert!(
-            exit.is_err(),
-            "{label}: during a drain the supervisor should keep its generations until its stop \
-             instead of exiting: {exit:?}"
-        );
-        assert_eq!(
-            run.runtime_state.advertised_model_ids(),
-            ["model-a"],
-            "{label}: model-a should stay advertised through the drain"
-        );
-        assert!(
-            matches!(
-                run.runtime_state.request_generation_admission("model-a"),
-                crate::runtime_state::RequestGenerationAdmission::Admitted(_)
-            ),
-            "{label}: requests for model-a should still be admitted during the drain"
-        );
+        assert_model_a_is_kept_until_the_supervisor_stop(
+            &label,
+            &mut run.lifecycle,
+            &run.runtime_state,
+        )
+        .await;
         if matches!(path, CollectorStopPath::Discovery) {
             assert!(
                 run.runtime_state.current_generation("model-c").is_none(),
@@ -4242,165 +4453,409 @@ mod tests {
         } = run;
         within("the supervisor's stop", lifecycle.shutdown()).await;
         drop(default_guard);
-        assert!(
-            runtime_state.advertised_model_ids().is_empty()
-                && runtime_state.current_generation("model-a").is_none(),
-            "{label}: the supervisor's stop should retire model-a"
-        );
-        upstream.shutdown().await;
-    }
-
-    /// Outside a drain, the supervisor that the collector stopped retires
-    /// model-a as it stops, without waiting for its own stop.
-    async fn assert_no_drain_retires_model_a_at_once(path: CollectorStopPath) {
-        let mut run = stop_the_supervisor_with_a_collector_panic(path, false).await;
-        let label = run.label.clone();
-
-        within(
-            "the supervisor's exit without its stop",
-            run.lifecycle.wait_for_exit(),
-        )
-        .await
-        .expect("model lifecycle supervisor should not panic");
-        assert!(
-            run.runtime_state.advertised_model_ids().is_empty(),
-            "{label}: outside a drain the supervisor should retire model-a as it stops"
-        );
-        assert_eq!(
-            run.runtime_state.request_generation_admission("model-a"),
-            crate::runtime_state::RequestGenerationAdmission::Unavailable,
-            "{label}: requests for model-a should no longer be admitted"
-        );
-        assert_a_collector_panic_stopped_the_supervisor(&run, path);
-
-        let SupervisorStoppedByCollector {
-            lifecycle,
-            upstream,
-            default_guard,
-            ..
-        } = run;
-        drop(default_guard);
-        within("model lifecycle shutdown", lifecycle.shutdown()).await;
+        assert_model_a_is_retired(&label, &runtime_state);
         upstream.shutdown().await;
     }
 
     #[tokio::test]
-    async fn collector_end_found_by_discovery_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
-     {
-        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Discovery).await;
+    async fn collector_end_found_by_discovery_keeps_admitted_models_until_the_supervisor_stop() {
+        assert_model_a_is_kept_after_a_collector_panic_found_by(CollectorStopPath::Discovery).await;
     }
 
     #[tokio::test]
-    async fn collector_end_found_by_admission_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
-     {
-        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Admit).await;
+    async fn collector_end_found_by_admission_keeps_admitted_models_until_the_supervisor_stop() {
+        assert_model_a_is_kept_after_a_collector_panic_found_by(CollectorStopPath::Admit).await;
     }
 
     #[tokio::test]
-    async fn collector_end_found_by_calibration_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
-     {
-        assert_a_drain_keeps_model_a_until_the_supervisor_stop(CollectorStopPath::Calibration)
+    async fn collector_end_found_by_calibration_keeps_admitted_models_until_the_supervisor_stop() {
+        assert_model_a_is_kept_after_a_collector_panic_found_by(CollectorStopPath::Calibration)
             .await;
     }
 
     #[tokio::test]
-    async fn collector_end_found_by_fallback_calibration_during_a_drain_keeps_admitted_models_until_the_supervisor_stop()
+    async fn collector_end_found_by_fallback_calibration_keeps_admitted_models_until_the_supervisor_stop()
      {
-        assert_a_drain_keeps_model_a_until_the_supervisor_stop(
+        assert_model_a_is_kept_after_a_collector_panic_found_by(
             CollectorStopPath::CalibrationWithFallback,
         )
         .await;
     }
 
     #[tokio::test]
-    async fn collector_end_found_by_discovery_outside_a_drain_retires_admitted_models_at_once() {
-        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Discovery).await;
-    }
-
-    #[tokio::test]
-    async fn collector_end_found_by_admission_outside_a_drain_retires_admitted_models_at_once() {
-        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Admit).await;
-    }
-
-    #[tokio::test]
-    async fn collector_end_found_by_calibration_outside_a_drain_retires_admitted_models_at_once() {
-        assert_no_drain_retires_model_a_at_once(CollectorStopPath::Calibration).await;
-    }
-
-    #[tokio::test]
-    async fn collector_end_found_by_fallback_calibration_outside_a_drain_retires_admitted_models_at_once()
+    async fn collector_end_found_by_fallback_admission_keeps_admitted_models_until_the_supervisor_stop()
      {
-        assert_no_drain_retires_model_a_at_once(CollectorStopPath::CalibrationWithFallback).await;
+        assert_model_a_is_kept_after_a_collector_panic_found_by(
+            CollectorStopPath::FallbackAdmission,
+        )
+        .await;
     }
 
-    #[tokio::test]
-    async fn collector_shutdown_during_a_drain_logs_no_error_and_waits_for_the_supervisor_stop() {
-        let kv_cache = BlockingKvCacheServer::spawn().await;
-        let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
-        let (runtime_state, stats) = start_holdable_stats(&kv_cache);
-        let mut lifecycle = within(
+    /// How long each calibration step of the stop race tests waits for its
+    /// requests: so long that a step ends only when the test moves a paused
+    /// clock past it.
+    const PAUSED_CALIBRATION_STEP: Duration = Duration::from_secs(30);
+
+    /// A config that calibrates newly discovered models in steps of
+    /// `PAUSED_CALIBRATION_STEP`, with discovery requests that time out after
+    /// `discovery_request_timeout`.
+    fn paused_step_calibration_config(
+        base_url: &str,
+        fallback_input_tps: Option<f64>,
+        discovery_request_timeout: Duration,
+    ) -> ModelLifecycleConfig {
+        let mut config = calibration_discovery_config(base_url, PAUSED_CALIBRATION_STEP);
+        let ModelInitialization::Calibration(calibration) = &mut config.initialization else {
+            unreachable!("the test config calibrates")
+        };
+        calibration.fallback_input_tps = fallback_input_tps;
+        // The test holds the attempt's health probe for as long as it needs,
+        // without the probe timing out.
+        calibration.health_timeout = Duration::from_secs(30);
+        let ModelSource::Discovered(discovery) = &mut config.source else {
+            unreachable!("the test config discovers its models")
+        };
+        discovery.request_timeout = discovery_request_timeout;
+        config
+    }
+
+    /// How the stats collector ends while model-a's calibration waits for its
+    /// snapshot.
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotCollectorEnding {
+        /// The collector panics.
+        Panic,
+        /// The collector's handle shuts it down.
+        Shutdown,
+    }
+
+    /// A supervisor stopped while model-a's calibration snapshot had already
+    /// failed.
+    struct SnapshotStopRace {
+        label: String,
+        metrics: Arc<PylonMetrics>,
+        runtime_state: PylonRuntimeState,
+        upstream: TestUpstream,
+        events: Vec<RecordedTracingEvent>,
+    }
+
+    /// Brings model-a's calibration to its snapshot request and leaves that
+    /// request unread in a held collector. Then, inside the collector's own
+    /// run, it starts the supervisor's stop and ends the collector as
+    /// `ending` says. The supervisor next runs with its stop requested and
+    /// the snapshot request already failed, and the biased select of its
+    /// attempt loop takes the stop.
+    async fn stop_the_supervisor_after_a_failed_snapshot(
+        ending: SnapshotCollectorEnding,
+        fallback_input_tps: Option<f64>,
+    ) -> SnapshotStopRace {
+        let label = format!("{ending:?}, fallback input TPS {fallback_input_tps:?}");
+        let kv_cache = BlockingKvCacheServer::spawn_rejecting().await;
+        let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        // A held KV-cache poll that does not time out while the paused clock
+        // moves. The probe reads the collector's request observation queue,
+        // which nothing reads while the collector is held.
+        let stats_config = StatsCollectorConfig {
+            kv_cache_stats_url: Some(kv_cache.url()),
+            kv_cache_poll_interval: Duration::from_millis(1),
+            kv_cache_request_timeout: SUPERVISOR_HOLD_WATCH,
+            ..StatsCollectorConfig::default()
+        };
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            stats_config.observation_channel_capacity,
+            None,
+        );
+        let observation_probe = observations.clone();
+        let mut stats = Some(start_stats_collector(
+            stats_config,
+            observations,
+            runtime_state.clone(),
+        ));
+        let lifecycle = within(
             "model lifecycle startup",
             start_model_lifecycle(
-                discovery_config(&upstream.base_url),
+                paused_step_calibration_config(
+                    &upstream.base_url,
+                    fallback_input_tps,
+                    SUPERVISOR_HOLD_WATCH,
+                ),
                 runtime_state.clone(),
-                &stats,
-                None,
+                stats
+                    .as_ref()
+                    .expect("the collector handle is kept until here"),
+                Some(metrics.clone()),
             ),
         )
         .await
-        .expect("initial discovery should initialize");
-        let subscriber = RecordingTracingSubscriber::default();
-        let default_guard =
-            tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber.clone()));
+        .expect("empty initial discovery should start");
+        let hook = EventHook::default();
+        let default_guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(hook.clone()));
+
+        upstream.set_models(&["model-a"]).await;
+        upstream.next_calibration().await;
         hold_stats_collector(&kv_cache).await;
-
-        // A newly discovered model makes the supervisor begin a generation,
-        // and the held collector leaves that request queued until its
-        // shutdown ends it.
-        upstream.set_models(&["model-a", "model-b"]).await;
-        wait_for(
-            "the supervisor should begin a generation for model-b",
-            || runtime_state.current_generation("model-b").is_some(),
+        // The upstream never answers, and the step ends only when the paused
+        // clock moves past it. The supervisor then ends the step's request,
+        // which queues that request's observation, and asks the held
+        // collector for its snapshot in the same run, without waiting on
+        // anything in between.
+        let observed = observation_probe.len();
+        tokio::time::pause();
+        tokio::time::advance(PAUSED_CALIBRATION_STEP + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        within(
+            "the end of model-a's calibration step, seen as its request's observation",
+            async {
+                while observation_probe.len() == observed {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            },
         )
         .await;
-        within("stats collector shutdown", stats.shutdown()).await;
-        wait_for(
-            "the supervisor should stop with the collector's shutdown",
-            || subscriber.event_count(SUPERVISOR_STOPPED_IN_SHUTDOWN) > 0,
-        )
-        .await;
 
-        let exit = tokio::time::timeout(SUPERVISOR_WAIT_WATCH, lifecycle.wait_for_exit()).await;
-        assert!(
-            exit.is_err(),
-            "during a drain the supervisor should keep its generations until its stop instead \
-             of exiting: {exit:?}"
-        );
-        assert_eq!(
-            runtime_state.advertised_model_ids(),
-            ["model-a"],
-            "model-a should stay advertised through the drain"
-        );
-        within("the supervisor's stop", lifecycle.shutdown()).await;
-        drop(default_guard);
-        assert!(
-            runtime_state.advertised_model_ids().is_empty(),
-            "the supervisor's stop should retire model-a"
-        );
-
-        let events = subscriber.events();
-        let errors = error_events(&events);
-        assert!(
-            errors.is_empty(),
-            "a stats collector shutdown during a drain should log no error: {errors:?}"
-        );
-        let stopped = events_with_message(&events, SUPERVISOR_STOPPED_IN_SHUTDOWN);
-        assert_eq!(stopped.len(), 1);
-        assert_eq!(stopped[0].level, tracing::Level::DEBUG);
-        assert_tracing_event_field(stopped[0], "error", STATS_COLLECTOR_STOPPED);
-
+        // The released poll is rejected. In that warning the hook starts the
+        // supervisor's stop, and then ends the collector.
+        let started = StartedShutdown::new();
+        match ending {
+            SnapshotCollectorEnding::Panic => hook.arm(
+                KV_CACHE_STATS_REJECTED,
+                start_and_panic_the_collector(&started, Box::pin(lifecycle.shutdown())),
+            ),
+            SnapshotCollectorEnding::Shutdown => {
+                let stats = stats
+                    .take()
+                    .expect("the collector handle is kept until here");
+                let started = started.clone();
+                hook.arm(KV_CACHE_STATS_REJECTED, move || {
+                    started.start(Box::pin(async move {
+                        tokio::join!(lifecycle.shutdown(), stats.shutdown());
+                    }));
+                });
+            }
+        }
         kv_cache.unblock();
+        let shutdown = started
+            .take("the hook's action in the collector's KV-cache warning")
+            .await;
+        within("the supervisor's stop", shutdown).await;
+        if let Some(mut stats) = stats {
+            let exit = within("the collector exit", stats.wait_for_exit()).await;
+            assert!(
+                matches!(&exit, Err(error) if error.is_panic()),
+                "{label}: the hook's panic should end the collector; if it did not, tracing may \
+                 no longer unwind a subscriber panic into the caller: {exit:?}"
+            );
+        }
+        drop(default_guard);
         kv_cache.shutdown().await;
+        SnapshotStopRace {
+            label,
+            metrics,
+            runtime_state,
+            upstream,
+            events: hook.recorder.events(),
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_snapshot_failed_by_a_collector_panic_records_its_error_when_the_stop_wins()
+    {
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let SnapshotStopRace {
+                label,
+                metrics,
+                runtime_state,
+                mut upstream,
+                events,
+            } = stop_the_supervisor_after_a_failed_snapshot(
+                SnapshotCollectorEnding::Panic,
+                fallback_input_tps,
+            )
+            .await;
+
+            assert_eq!(
+                (
+                    calibration_count(&metrics, "model-a", "error"),
+                    calibration_count(&metrics, "model-a", "cancelled"),
+                ),
+                (1, 0),
+                "{label}: a snapshot that a collector panic failed should be recorded as an \
+                 error, not as cancelled, although the stop won. A cancelled count can also mean \
+                 that the calibration had not asked for its snapshot when the collector ended"
+            );
+            let warnings = events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
+            assert_eq!(
+                warnings.len(),
+                1,
+                "{label}: the calibration should warn once that the collector stopped"
+            );
+            assert_eq!(warnings[0].level, tracing::Level::WARN, "{label}");
+            assert_tracing_event_field(warnings[0], "model_id", "model-a");
+            assert_tracing_event_field(warnings[0], "error", CALIBRATION_COLLECTOR_STOPPED);
+            let retries = calibration_retry_warnings(&events);
+            assert!(
+                retries.is_empty(),
+                "{label}: the supervisor should not try model-a again: {retries:?}"
+            );
+            let failed = events_with_message(&events, SUPERVISOR_FAILED);
+            assert_eq!(
+                failed.len(),
+                1,
+                "{label}: the supervisor should report the collector panic once"
+            );
+            assert_eq!(failed[0].level, tracing::Level::ERROR, "{label}");
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{label}: model-a's failed calibration should not admit it"
+            );
+            assert!(
+                upstream.calibrations.try_recv().is_err(),
+                "{label}: the stop should not start another calibration step"
+            );
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_snapshot_failed_by_a_collector_shutdown_is_cancelled_when_the_stop_wins() {
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let SnapshotStopRace {
+                label,
+                metrics,
+                runtime_state,
+                mut upstream,
+                events,
+            } = stop_the_supervisor_after_a_failed_snapshot(
+                SnapshotCollectorEnding::Shutdown,
+                fallback_input_tps,
+            )
+            .await;
+
+            assert_eq!(
+                (
+                    calibration_count(&metrics, "model-a", "cancelled"),
+                    calibration_count(&metrics, "model-a", "error"),
+                ),
+                (1, 0),
+                "{label}: a snapshot that the collector's shutdown failed should be recorded as \
+                 cancelled"
+            );
+            let warnings = calibration_failure_warnings(&events);
+            assert!(
+                warnings.is_empty(),
+                "{label}: a calibration cut short by a shutdown should not warn: {warnings:?}"
+            );
+            let errors = error_events(&events);
+            assert!(
+                errors.is_empty(),
+                "{label}: a shutdown should log no error: {errors:?}"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{label}: the cut-short calibration should not admit model-a"
+            );
+            assert!(
+                upstream.calibrations.try_recv().is_err(),
+                "{label}: the stop should not start another calibration step"
+            );
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_that_wins_before_a_calibration_asks_for_its_snapshot_cancels_it_without_a_new_request()
+     {
+        // The collector panics before model-a's calibration starts, so the
+        // calibration's snapshot request would fail at once. The stop comes
+        // after the step's end is ready but before the calibration has seen
+        // it, so the calibration has not asked for its snapshot yet. Honoring
+        // the stop must not let it do so.
+        const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+        let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, stats) = start_test_stats();
+        let lifecycle = within(
+            "model lifecycle startup",
+            start_model_lifecycle(
+                paused_step_calibration_config(&upstream.base_url, None, DISCOVERY_REQUEST_TIMEOUT),
+                runtime_state.clone(),
+                &stats,
+                Some(metrics.clone()),
+            ),
+        )
+        .await
+        .expect("empty initial discovery should start");
+        let hook = EventHook::default();
+        let default_guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(hook.clone()));
+
+        upstream.hold_health();
+        upstream.set_models(&["model-a"]).await;
+        upstream.wait_for_held_health_probe().await;
+        panic_the_stats_collector("stop before the snapshot", stats).await;
+        // The supervisor's next discovery request waits at the upstream until
+        // it times out. A request counted after the hold was set saw the hold.
+        upstream.set_discovery_blocked(true);
+        let polls = upstream.discovery_polls.load(Ordering::SeqCst);
+        wait_for("a held discovery request", || {
+            upstream.discovery_polls.load(Ordering::SeqCst) > polls
+        })
+        .await;
+        upstream.release_health();
+        upstream.next_calibration().await;
+
+        // Moving the paused clock past both makes the discovery request's
+        // timeout and the step's end ready together, so the supervisor next
+        // runs with both. Its attempt loop handles the discovery result
+        // before it polls the attempt, and the hook starts the supervisor's
+        // stop in the warning for that result. The loop then takes the stop
+        // before the calibration has seen its step end. This relies on tokio
+        // completing every sleep that `advance` moves past at the same time,
+        // as it documents, and on the earlier deadline, the discovery
+        // timeout's, never being left for later; if tokio woke the supervisor
+        // for the step's end alone, the calibration would record an error.
+        let started = StartedShutdown::new();
+        let start = started.clone();
+        hook.arm(DISCOVERY_POLL_FAILED, move || {
+            start.start(Box::pin(lifecycle.shutdown()));
+        });
+        tokio::time::pause();
+        tokio::time::advance(PAUSED_CALIBRATION_STEP + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let shutdown = started
+            .take("the hook's stop in the supervisor's discovery warning")
+            .await;
+        within("the supervisor's stop", shutdown).await;
+        drop(default_guard);
+
+        let events = hook.recorder.events();
+        assert_eq!(
+            (
+                calibration_count(&metrics, "model-a", "cancelled"),
+                calibration_count(&metrics, "model-a", "error"),
+            ),
+            (1, 0),
+            "a stop before the calibration asked for its snapshot should cancel it without \
+             letting it ask the collector, which had ended. This also fails if tokio no longer \
+             completes the sleeps that `advance` passes at the same time; see the comment above"
+        );
+        let warnings = calibration_failure_warnings(&events);
+        assert!(
+            warnings.is_empty(),
+            "a calibration that the stop cut short should not warn: {warnings:?}"
+        );
+        assert!(
+            events_with_message(&events, SUPERVISOR_FAILED).is_empty(),
+            "the stop should end the supervisor before it finds the collector gone"
+        );
+        assert!(
+            upstream.calibrations.try_recv().is_err(),
+            "the stop should not start another calibration step"
+        );
+        assert!(runtime_state.advertised_model_ids().is_empty());
+        upstream.set_discovery_blocked(false);
         upstream.shutdown().await;
     }
 }

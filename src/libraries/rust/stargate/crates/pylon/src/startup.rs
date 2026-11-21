@@ -3465,69 +3465,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_pylon_waits_for_and_reports_the_stats_collector_that_stopped_its_supervisor() {
-        // In Pylon the supervisor and the main loop share one collector, whose
-        // exit follows the supervisor's promptly, so the main loop can see
-        // either exit first. Here the supervisor runs on a collector that the
-        // test aborts, while Pylon holds a second collector that keeps
-        // running, so the supervisor's exit is the only one the main loop can
-        // see. Pylon must then wait for its collector and report it, not the
-        // supervisor.
+    async fn running_pylon_reports_a_supervisor_exit_that_the_stats_collector_did_not_cause_as_the_supervisor()
+     {
+        // A second model lifecycle on Pylon's collector takes model-b's stats
+        // slot, so the supervisor's begin for a newly discovered model-b
+        // reports a stale generation while the collector keeps running. The
+        // supervisor fails on its own and exits, and Pylon reports that exit
+        // as the supervisor's, without waiting for the collector.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
-        let (lifecycle_stats, model_lifecycle, runtime_state) =
-            start_discovery_lifecycle(&upstream).await;
-        let (observation_tx, observation_rx) =
-            flume::bounded::<pylon_lib::RequestObservationEvent>(1);
-        let pylon_stats = start_stats_collector_with_engine_stats(
-            StatsCollectorConfig::default(),
-            observation_rx,
-            None,
-            PylonRuntimeState::default(),
-        );
-        let runtime = test_running_pylon_with_lifecycle(pylon_stats, model_lifecycle).await;
-        let (recorded, default_guard) = record_events();
+        let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
+        let other_lifecycle = tokio::time::timeout(
+            Duration::from_secs(3),
+            start_model_lifecycle(
+                ModelLifecycleConfig {
+                    upstream_http_base_url: "http://127.0.0.1:1".to_string(),
+                    source: ModelSource::Static(BTreeSet::from(["model-b".to_string()])),
+                    initialization: ModelInitialization::ConfiguredInputTps { input_tps: 1.0 },
+                    bringup: BringupConfig {
+                        enabled: false,
+                        ..BringupConfig::default()
+                    },
+                    health_paths: UpstreamHealthPaths::default(),
+                    readiness_gate: None,
+                    startup_health_wait: Duration::ZERO,
+                },
+                PylonRuntimeState::default(),
+                &runtime.stats_collector,
+                None,
+            ),
+        )
+        .await
+        .expect("the second model lifecycle should start")
+        .expect("the second model lifecycle should take model-b's stats slot");
         assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+        let (recorded, default_guard) = record_events();
 
-        // Dropping the handle aborts the collector without a shutdown. The
-        // supervisor's begin for model-b then finds it stopped.
-        drop(lifecycle_stats);
-        upstream.set_models(&["model-a", "model-b"]);
-        wait_for_model(&runtime_state, "model-b").await;
         let run = tokio::spawn(
             runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
         );
-        // The failed supervisor retires model-a as it stops.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !runtime_state.advertised_model_ids().is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("the supervisor should stop and retire model-a when its collector has stopped");
-        // Give the main loop time to see the supervisor's exit. A main loop
-        // that reported the supervisor would have finished by now.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !run.is_finished(),
-            "Pylon should wait for the stats collector's exit after the collector stopped the \
-             supervisor"
-        );
-
-        // Closing its observation channel ends Pylon's collector on its own.
-        drop(observation_tx);
-        let error = tokio::time::timeout(Duration::from_secs(2), run)
+        upstream.set_models(&["model-a", "model-b"]);
+        let error = tokio::time::timeout(Duration::from_secs(3), run)
             .await
-            .expect("Pylon should report the collector as soon as it exits")
+            .expect(
+                "Pylon should report the supervisor's exit without waiting for the stats \
+                 collector, which keeps running",
+            )
             .expect("Pylon should not panic")
-            .expect_err("a stats collector exit should fail Pylon");
+            .expect_err("a supervisor exit should fail Pylon");
         drop(default_guard);
+
         let message = error.to_string();
-        assert_eq!(message, "stats collector exited unexpectedly");
+        assert_eq!(message, "model lifecycle supervisor exited unexpectedly");
         assert_eq!(
             recorded.critical_task_exits(),
             [message],
-            "Pylon should log the collector once as its critical task exit"
+            "Pylon should log the supervisor once as its critical task exit"
         );
+        let failed = recorded.with_message("model lifecycle supervisor failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the supervisor should report its own failure once"
+        );
+        assert_eq!(failed[0].level, tracing::Level::ERROR);
+        assert_eq!(
+            failed[0].fields.get("error").map(String::as_str),
+            Some("model generation transition lost exact ownership"),
+            "the supervisor should fail on the stale generation, not on the stats collector"
+        );
+        assert!(
+            runtime_state.advertised_model_ids().is_empty(),
+            "a supervisor that failed on its own should retire model-a as it exits"
+        );
+        other_lifecycle.shutdown().await;
         upstream.shutdown().await;
     }
 
@@ -4054,15 +4064,27 @@ mod tests {
         .unwrap_or_else(|_| panic!("Pylon should log {message:?} within {wait:?}"));
     }
 
+    /// The accept window that the reverse tunnel drain logged as it started.
+    fn logged_accept_window(recorded: &RecordedEvents) -> Duration {
+        let draining = recorded.with_message("reverse tunnel draining");
+        let window_ms = draining
+            .first()
+            .and_then(|event| event.fields.get("accept_window_ms"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("the reverse tunnel drain should log its accept window");
+        Duration::from_millis(window_ms)
+    }
+
     #[tokio::test]
     async fn running_pylon_keeps_admitted_models_routable_through_a_drain_after_a_stats_collector_panic()
      {
-        // The stats collector panics while the supervisor is idle, so Pylon's
-        // main loop reports it and drains the reverse tunnel registration.
-        // During that drain a newly discovered model makes the supervisor find
-        // the collector gone. A request for model-a that the router sent
-        // before it saw the registration close must still reach the upstream,
-        // so the supervisor keeps model-a until Pylon stops it after the drain.
+        // The stats collector panics, and the supervisor finds it gone through
+        // a newly discovered model before Pylon's main loop has seen the
+        // collector's exit. The main loop then reports the panic and drains
+        // the reverse tunnel registration. Requests for model-a that the
+        // router sends early and late in the drain's accept window must still
+        // reach the upstream, so the supervisor keeps model-a until Pylon
+        // stops it after the drain.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
         let router = ReverseTunnelRouter::bind();
         let (control_plane_addr, control_plane) =
@@ -4106,15 +4128,12 @@ mod tests {
         );
 
         // The supervisor asks the collector for nothing while its model set
-        // stays the same, so it does not find the collector gone yet.
+        // stays the same, so it finds the collector gone only through the
+        // newly discovered model-b. Pylon's main loop does not run yet, so the
+        // supervisor finds the collector gone first, and that wait ends before
+        // the drain's accept window opens.
         panic_stats_collector(&runtime.stats_collector).await;
         let (recorded, default_guard) = record_events();
-        let run = tokio::spawn(
-            runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
-        );
-        // The registration session marks its drain before the reverse tunnel
-        // starts draining.
-        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
         upstream.set_models(&["model-a", "model-b"]);
         wait_for_recorded(
             &recorded,
@@ -4122,17 +4141,37 @@ mod tests {
             Duration::from_secs(2),
         )
         .await;
-        // The drain accepts streams for up to 2 s, so this request is in time.
+        let run = tokio::spawn(
+            runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
+        );
+        wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
+        let drain_seen_at = tokio::time::Instant::now();
+        let accept_window = logged_accept_window(&recorded);
         let (status, body) = tokio::time::timeout(
             Duration::from_secs(2),
-            send_through_reverse_tunnel(&tunnel, "model-a", "during-drain"),
+            send_through_reverse_tunnel(&tunnel, "model-a", "early-in-drain"),
         )
         .await
-        .expect("a request during the drain should finish");
+        .expect("a request early in the drain should finish");
         assert_eq!(
             status, "200",
-            "a request for model-a during the drain should reach the upstream after the \
+            "a request for model-a early in the drain should reach the upstream after the \
              supervisor found the stats collector gone: {body}"
+        );
+        // Three fifths into the accept window, 1.2 s of the 2 s window, the
+        // drain still accepts the request, and model-a must still be
+        // admitted.
+        tokio::time::sleep_until(drain_seen_at + accept_window * 3 / 5).await;
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_through_reverse_tunnel(&tunnel, "model-a", "late-in-drain"),
+        )
+        .await
+        .expect("a request late in the drain should finish");
+        assert_eq!(
+            status, "200",
+            "a request for model-a late in the drain's accept window should reach the upstream: \
+             {body}"
         );
         // Closing the tunnel ends the drain's accept window.
         tunnel.close(0u32.into(), b"test drain done");
@@ -4145,7 +4184,7 @@ mod tests {
 
         let message = error.to_string();
         assert_reports_a_stats_collector_panic(
-            "a stats collector panic reported before a drain",
+            "a stats collector panic that the supervisor found first",
             &message,
         );
         assert_eq!(
@@ -4170,8 +4209,8 @@ mod tests {
                     .map(String::as_str),
                 drains[0].fields.get("requests_cut_off").map(String::as_str),
             ),
-            (Some("1"), Some("0")),
-            "the drain should accept and complete the late request: {:?}",
+            (Some("2"), Some("0")),
+            "the drain should accept and complete both requests: {:?}",
             drains[0]
         );
         let stalled = recorded.with_message("task did not stop before shutdown timeout");
@@ -4185,7 +4224,7 @@ mod tests {
                 .completions
                 .lock()
                 .expect("upstream completions should not be poisoned"),
-            ["model-a", "model-a"]
+            ["model-a", "model-a", "model-a"]
         );
         control_plane.abort();
         let _ = control_plane.await;
@@ -4198,9 +4237,9 @@ mod tests {
         // A termination signal drains the reverse tunnel registration, and the
         // stats collector panics during that drain, after the supervisor has
         // asked it for a newly discovered model's begin. A request for model-a
-        // that the router sent before it saw the registration close must still
-        // reach the upstream. Pylon then reports the panic once, as the error
-        // of a shutdown that a signal started, and retires model-a.
+        // that the router sends after the supervisor found the collector gone
+        // must still reach the upstream. Pylon then reports the panic once, as
+        // the error of a shutdown that a signal started, and retires model-a.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
         let router = ReverseTunnelRouter::bind();
         let (control_plane_addr, control_plane) =
@@ -4247,9 +4286,12 @@ mod tests {
         // stays queued ahead of the supervisor's begin for model-b. This relies
         // on the collector reading queued commands in the order they were
         // sent, which flume does not document; the supervisor's report below
-        // fails if that changes.
+        // fails if that changes. The supervisor's begin is queued before the
+        // signal, so this wait ends before the drain's accept window opens.
         upstream.hold_kv_cache_polls().await;
         queue_stats_collector_panic(&runtime.stats_collector);
+        upstream.set_models(&["model-a", "model-b"]);
+        wait_for_model(&runtime_state, "model-b").await;
         let (recorded, default_guard) = record_events();
         let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(runtime.run_until_shutdown(async move {
@@ -4259,9 +4301,10 @@ mod tests {
         signal_tx
             .send(())
             .expect("Pylon should wait for the signal");
+        // The held collector is still running, so the main loop takes the
+        // signal. Once the drain has started, the released collector reads
+        // the begin that panics it, and the supervisor's begin fails.
         wait_for_recorded(&recorded, "reverse tunnel draining", Duration::from_secs(5)).await;
-        upstream.set_models(&["model-a", "model-b"]);
-        wait_for_model(&runtime_state, "model-b").await;
         upstream.release_kv_cache_polls();
         wait_for_recorded(
             &recorded,
@@ -4269,7 +4312,8 @@ mod tests {
             Duration::from_secs(2),
         )
         .await;
-        // The drain accepts streams for up to 2 s, so this request is in time.
+        // The drain accepts streams for 2 s, and only the collector's panic
+        // and the supervisor's report came first, so this request is in time.
         let (status, body) = tokio::time::timeout(
             Duration::from_secs(2),
             send_through_reverse_tunnel(&tunnel, "model-a", "during-drain"),
