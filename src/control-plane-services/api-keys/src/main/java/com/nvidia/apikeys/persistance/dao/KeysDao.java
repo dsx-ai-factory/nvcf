@@ -17,13 +17,18 @@
 
 package com.nvidia.apikeys.persistance.dao;
 
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_RECORD;
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_TABLE;
+
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
-import com.nvidia.apikeys.converters.KeyOwnerVoBuilder;
+import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.config.exceptions.CassandraException;
+import com.nvidia.apikeys.converters.KeyOwnerVoBuilder;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyModel;
+import com.nvidia.apikeys.persistance.repositories.KeyByOwnerAndAccountAndServiceRepository;
 import com.nvidia.apikeys.persistance.repositories.KeyByOwnerAndServiceRepository;
 import com.nvidia.apikeys.persistance.repositories.KeyRepository;
 import com.nvidia.apikeys.services.KeyNcaIdResolver;
@@ -61,6 +66,9 @@ import org.springframework.stereotype.Service;
 public class KeysDao {
 
     private final KeyRepository keyRepository;
+    private final KeyByOwnerAndAccountAndServiceRepository accountRepository;
+    private final RowUpdateLockDao rowUpdateLockDao;
+    private final NakProperties properties;
     private final KeyByOwnerAndServiceRepository keyByOwnerAndServiceRepository;
     private final KeyModelConverter keyConverter;
     private final KeyByOwnerAndServiceModelConverter keyByOwnerAndServiceConverter;
@@ -189,6 +197,11 @@ public class KeysDao {
 
     public Optional<KeyByOwnerAndServiceVo> getKeyByOwnerAndServiceAndId(
             KeyOwnerType type, String ownerId, String serviceId, String keyId) {
+        if (rowUpdateLockDao.isCompleted(MARKER_TABLE, MARKER_RECORD)) {
+            return accountRepository.findKey(properties.getNcaId(), type, ownerId,
+                            servicesService.toCanonicalId(serviceId), keyId)
+                    .map(keyByAccountConverter::modelToVo);
+        }
         return keyByOwnerAndServiceRepository.findByOwnerTypeAndOwnerIdAndIssuerServiceIdAndKeyId(
                         type, ownerId, serviceId, keyId)
                 .map(this::modelToValidatedVo);
@@ -214,13 +227,17 @@ public class KeysDao {
                 .build();
 
         var keyByOwnerAndServiceModel = keyByOwnerAndServiceConverter.voToModel(key);
+        // Account rows use canonical issuers; legacy rows may still use any stored alias.
+        var ownerModels = servicesService.storedServiceIds(key.getIssuerServiceId()).stream()
+                .map(issuer -> keyByOwnerAndServiceModel.toBuilder().issuerServiceId(issuer).build())
+                .toList();
         var keyByAccountModel = toAccountModel(key);
 
         long timestamp = writeTimestamp();
         CassandraBatchOperations batchOperations = cassandraTemplate.batchOps()
                 .withTimestamp(timestamp)
                 .delete(List.of(keyModel))
-                .delete(List.of(keyByOwnerAndServiceModel))
+                .delete(ownerModels)
                 .delete(List.of(keyByAccountModel));
 
         try {
@@ -240,9 +257,11 @@ public class KeysDao {
             writeDirectly(
                     () -> cassandraTemplate.delete(keyModel, options),
                     KeyModel.TABLE_NAME);
-            writeDirectly(
-                    () -> cassandraTemplate.delete(keyByOwnerAndServiceModel, options),
-                    KeyByOwnerAndServiceModel.TABLE_NAME);
+            for (var ownerModel : ownerModels) {
+                writeDirectly(
+                        () -> cassandraTemplate.delete(ownerModel, options),
+                        KeyByOwnerAndServiceModel.TABLE_NAME);
+            }
             writeDirectly(
                     () -> cassandraTemplate.delete(keyByAccountModel, options),
                     KeyByOwnerAndAccountAndServiceModel.TABLE_NAME);
@@ -282,6 +301,14 @@ public class KeysDao {
 
     public List<KeyByOwnerAndServiceVo> list(
             KeyOwnerType ownerType, String ownerId, String serviceId) {
+        if (rowUpdateLockDao.isCompleted(MARKER_TABLE, MARKER_RECORD)) {
+            return listByAccount(ownerType, ownerId, servicesService.toCanonicalId(serviceId));
+        }
+        return listByService(ownerType, ownerId, serviceId);
+    }
+
+    private List<KeyByOwnerAndServiceVo> listByService(
+            KeyOwnerType ownerType, String ownerId, String serviceId) {
         return keyByOwnerAndServiceRepository
                 .findByOwnerTypeAndOwnerIdAndIssuerServiceId(ownerType, ownerId, serviceId)
                 .stream()
@@ -292,12 +319,33 @@ public class KeysDao {
 
     public List<KeyByOwnerAndServiceVo> list(
             KeyOwnerType ownerType, String ownerId, Collection<String> serviceIds) {
+        if (rowUpdateLockDao.isCompleted(MARKER_TABLE, MARKER_RECORD)) {
+            return serviceIds.stream()
+                    .map(servicesService::toCanonicalId)
+                    .distinct()
+                    .flatMap(serviceId -> listByAccount(ownerType, ownerId, serviceId).stream())
+                    .toList();
+        }
         return serviceIds.stream()
-                .flatMap(serviceId -> list(ownerType, ownerId, serviceId).stream())
+                .flatMap(serviceId -> listByService(ownerType, ownerId, serviceId).stream())
+                .toList();
+    }
+
+    private List<KeyByOwnerAndServiceVo> listByAccount(
+            KeyOwnerType ownerType, String ownerId, String serviceId) {
+        return accountRepository.findByNcaIdAndOwnerTypeAndOwnerIdAndIssuerServiceId(
+                        properties.getNcaId(), ownerType, ownerId, serviceId).stream()
+                .map(keyByAccountConverter::modelToVo)
                 .toList();
     }
 
     public List<KeyByOwnerAndServiceVo> list(KeyOwnerType ownerType, String ownerId) {
+        if (rowUpdateLockDao.isCompleted(MARKER_TABLE, MARKER_RECORD)) {
+            return accountRepository.findByNcaIdAndOwnerTypeAndOwnerId(
+                            properties.getNcaId(), ownerType, ownerId).stream()
+                    .map(keyByAccountConverter::modelToVo)
+                    .toList();
+        }
         return keyByOwnerAndServiceRepository
                 .findByOwnerTypeAndOwnerId(ownerType, ownerId)
                 .stream()

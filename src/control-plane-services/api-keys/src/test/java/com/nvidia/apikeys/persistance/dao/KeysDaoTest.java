@@ -28,7 +28,10 @@ import static com.nvidia.apikeys.TestData.USER_KEY_OWNER_ID_1;
 import static com.nvidia.apikeys.utils.TestUtils.assertThrowsExceptionWithDetails;
 import static com.nvidia.apikeys.vo.KeyOwnerType.USER;
 import static com.nvidia.apikeys.vo.KeyStatus.ACTIVE;
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_RECORD;
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_TABLE;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
@@ -39,6 +42,9 @@ import static org.mockito.Mockito.when;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.nvidia.apikeys.config.exceptions.CassandraException;
+import com.nvidia.apikeys.config.NakProperties;
+import com.nvidia.apikeys.converters.KeyOwnerVoBuilder;
+import com.nvidia.apikeys.persistance.repositories.KeyByOwnerAndAccountAndServiceRepository;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyModel;
 import com.nvidia.apikeys.persistance.repositories.KeyByOwnerAndServiceRepository;
@@ -54,6 +60,7 @@ import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
 import java.time.Clock;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -93,6 +100,14 @@ class KeysDaoTest {
     private static final DeleteOptions DIRECT_DELETE_OPTIONS =
             DeleteOptions.builder().timestamp(NOW_MICROS).idempotent(true).build();
 
+    @Mock
+    private RowUpdateLockDao markers;
+    @Mock
+    private NakProperties properties;
+    @Mock
+    private KeyByOwnerAndAccountAndServiceRepository accountRepository;
+    @Mock
+    private KeyOwnerVoBuilder keyOwnerVoBuilder;
     @Mock
     private KeyModel modelMock;
     @Mock
@@ -365,6 +380,87 @@ class KeysDaoTest {
         }
     }
 
+    @Test
+    void managementReadsSwitchOnEveryMarkerChange() {
+        when(markers.isCompleted(MARKER_TABLE, MARKER_RECORD)).thenReturn(false, true, false);
+        when(properties.getNcaId()).thenReturn(NCA_ID);
+        when(servicesServiceMock.toCanonicalId(SERVICE_ID_1)).thenReturn(SERVICE_ID_1);
+        when(keyByOwnerAndServiceRepositoryMock.findByOwnerTypeAndOwnerIdAndIssuerServiceId(
+                USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+                .thenReturn(List.of(KEY_BY_OWNER_AND_SERVICE_MODEL_1));
+        when(keyByOwnerAndServiceConverterMock.modelToVo(KEY_BY_OWNER_AND_SERVICE_MODEL_1))
+                .thenReturn(KEY_BY_OWNER_AND_SERVICE_VO_1);
+        when(accountRepository.findByNcaIdAndOwnerTypeAndOwnerIdAndIssuerServiceId(
+                NCA_ID, USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1)).thenReturn(List.of(KEY_BY_ACCOUNT_MODEL_1));
+        var accountKey = KEY_BY_OWNER_AND_SERVICE_VO_1.toBuilder().description("account row").build();
+        when(keyByAccountConverterMock.modelToVo(KEY_BY_ACCOUNT_MODEL_1)).thenReturn(accountKey);
+
+        assertThat(dao.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+                .containsExactly(KEY_BY_OWNER_AND_SERVICE_VO_1);
+        assertThat(dao.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1)).containsExactly(accountKey);
+        assertThat(dao.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1))
+                .containsExactly(KEY_BY_OWNER_AND_SERVICE_VO_1);
+    }
+
+    @Test
+    void accountReadsDeduplicateCanonicalAliases() {
+        when(markers.isCompleted(MARKER_TABLE, MARKER_RECORD)).thenReturn(true);
+        when(properties.getNcaId()).thenReturn(NCA_ID);
+        when(servicesServiceMock.toCanonicalId("legacy")).thenReturn(SERVICE_ID_1);
+        when(servicesServiceMock.toCanonicalId(SERVICE_ID_1)).thenReturn(SERVICE_ID_1);
+        when(accountRepository.findByNcaIdAndOwnerTypeAndOwnerIdAndIssuerServiceId(
+                NCA_ID, USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1)).thenReturn(List.of(KEY_BY_ACCOUNT_MODEL_1));
+        when(keyByAccountConverterMock.modelToVo(KEY_BY_ACCOUNT_MODEL_1))
+                .thenReturn(KEY_BY_OWNER_AND_SERVICE_VO_1);
+
+        assertThat(dao.list(USER, USER_KEY_OWNER_ID_1, List.of("legacy", SERVICE_ID_1)))
+                .containsExactly(KEY_BY_OWNER_AND_SERVICE_VO_1);
+        verify(accountRepository).findByNcaIdAndOwnerTypeAndOwnerIdAndIssuerServiceId(
+                NCA_ID, USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1);
+        verifyNoInteractions(keyByOwnerAndServiceRepositoryMock);
+    }
+
+    @Test
+    void managementPointReadUsesAccountPartitionAndCanonicalIssuer() {
+        when(markers.isCompleted(MARKER_TABLE, MARKER_RECORD)).thenReturn(true);
+        when(properties.getNcaId()).thenReturn(NCA_ID);
+        when(servicesServiceMock.toCanonicalId("legacy")).thenReturn(SERVICE_ID_1);
+        when(accountRepository.findKey(NCA_ID, USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1, KEY_ID_1))
+                .thenReturn(Optional.of(KEY_BY_ACCOUNT_MODEL_1));
+        when(keyByAccountConverterMock.modelToVo(KEY_BY_ACCOUNT_MODEL_1))
+                .thenReturn(KEY_BY_OWNER_AND_SERVICE_VO_1);
+
+        assertThat(dao.getKeyByOwnerAndServiceAndId(USER, USER_KEY_OWNER_ID_1, "legacy", KEY_ID_1))
+                .contains(KEY_BY_OWNER_AND_SERVICE_VO_1);
+        verifyNoInteractions(keyByOwnerAndServiceRepositoryMock);
+    }
+
+    @Test
+    void accountReadFailureDoesNotFallBack() {
+        when(markers.isCompleted(MARKER_TABLE, MARKER_RECORD)).thenReturn(true);
+        when(properties.getNcaId()).thenReturn(NCA_ID);
+        var failure = new IllegalStateException("account read failed");
+        when(accountRepository.findByNcaIdAndOwnerTypeAndOwnerId(NCA_ID, USER, USER_KEY_OWNER_ID_1))
+                .thenThrow(failure);
+
+        assertThatThrownBy(() -> dao.list(USER, USER_KEY_OWNER_ID_1)).isSameAs(failure);
+        verifyNoInteractions(keyByOwnerAndServiceRepositoryMock);
+    }
+
+    @Test
+    void markerFailureDoesNotFallBack() {
+        var failure = new IllegalStateException("marker read failed");
+        when(markers.isCompleted(MARKER_TABLE, MARKER_RECORD)).thenThrow(failure);
+
+        assertThatThrownBy(() -> dao.list(USER, USER_KEY_OWNER_ID_1)).isSameAs(failure);
+        assertThatThrownBy(() -> dao.list(USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1)).isSameAs(failure);
+        assertThatThrownBy(() -> dao.list(USER, USER_KEY_OWNER_ID_1, List.of(SERVICE_ID_1)))
+                .isSameAs(failure);
+        assertThatThrownBy(() -> dao.getKeyByOwnerAndServiceAndId(
+                USER, USER_KEY_OWNER_ID_1, SERVICE_ID_1, KEY_ID_1)).isSameAs(failure);
+        verifyNoInteractions(keyByOwnerAndServiceRepositoryMock, accountRepository);
+    }
+
     private void mockBatch() {
         when(sessionMock.getContext().getTimestampGenerator().next()).thenReturn(NOW_MICROS);
         when(cassandraTemplateMock.batchOps()).thenReturn(cassandraBatchOperationsMock);
@@ -402,6 +498,7 @@ class KeysDaoTest {
 
     private void mockDeleteBatch() {
         mockBatch();
+        when(servicesServiceMock.storedServiceIds(SERVICE_ID_1)).thenReturn(Set.of(SERVICE_ID_1));
         when(keyByOwnerAndServiceConverterMock.voToModel(KEY_BY_OWNER_AND_SERVICE_VO_1))
                 .thenReturn(KEY_BY_OWNER_AND_SERVICE_MODEL_1);
         when(cassandraBatchOperationsMock.delete(List.of(expectedDeletedKeyModel)))

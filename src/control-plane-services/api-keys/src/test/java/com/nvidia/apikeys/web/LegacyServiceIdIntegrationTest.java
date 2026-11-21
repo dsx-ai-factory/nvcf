@@ -24,13 +24,17 @@ import static com.nvidia.apikeys.TestData.KEY_VO_1;
 import static com.nvidia.apikeys.TestData.SERVICE_ID_1;
 import static com.nvidia.apikeys.TestData.TEST_TIME;
 import static com.nvidia.apikeys.TestData.USER_KEY_OWNER_ID_1;
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_RECORD;
+import static com.nvidia.apikeys.scheduler.KeysByAccountIndexMigrationTask.MARKER_TABLE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
 import static org.springframework.http.HttpStatus.OK;
 
+import com.datastax.oss.driver.api.core.CqlSession;
 import com.nvidia.apikeys.App;
 import com.nvidia.apikeys.config.IntegrationTestConfiguration;
 import com.nvidia.apikeys.persistance.dao.KeysDao;
+import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.repositories.KeyByOwnerAndAccountAndServiceRepository;
 import com.nvidia.apikeys.utils.TestClock;
@@ -87,6 +91,12 @@ class LegacyServiceIdIntegrationTest extends BaseIntegrationTest {
     private EncryptedModelConverter<KeyByOwnerAndAccountAndServiceModel,
             KeyByOwnerAndAccountAndServiceVo> accountConverter;
 
+    @Autowired
+    private RowUpdateLockDao markers;
+
+    @Autowired
+    private CqlSession session;
+
     @BeforeEach
     void storeKeyUnderLegacyIds() {
         TestClock.setBaseClock(TestClock.fixed(TEST_TIME, ZoneId.systemDefault()));
@@ -101,6 +111,27 @@ class LegacyServiceIdIntegrationTest extends BaseIntegrationTest {
     @AfterEach
     void resetClock() {
         TestClock.resetToDefaults();
+    }
+
+    @Test
+    void markerSwitchesAliasReadsAndDeleteRemovesLegacyRowsBeforeRollback() {
+        markers.markCompleted(MARKER_TABLE, MARKER_RECORD, TEST_TIME);
+
+        for (var issuerId : new String[] {CANONICAL_ID, SERVICE_ID_1}) {
+            var listed = exchange("/v1/keys", HttpMethod.GET, issuerId, null);
+            assertThat(listed.getStatusCode()).isEqualTo(OK);
+            assertThat(listed.getBody()).contains(KEY_ID_1).contains(CANONICAL_ID);
+            var loaded = exchange("/v1/keys/" + KEY_ID_1, HttpMethod.GET, issuerId, null);
+            assertThat(loaded.getStatusCode()).isEqualTo(OK);
+        }
+        var deleted = exchange("/v1/keys/" + KEY_ID_1, HttpMethod.DELETE, CANONICAL_ID, null);
+        assertThat(deleted.getStatusCode().is2xxSuccessful()).isTrue();
+        assertThat(keysDao.getKeyByHash(KEY_VO_1.getKeyHash())).isEmpty();
+        session.execute("DELETE FROM row_update_lock WHERE table_name=? AND record_key=?",
+                MARKER_TABLE, MARKER_RECORD);
+        assertThat(keysDao.list(KEY_VO_1.getOwnerType(), KEY_VO_1.getOwnerId())).isEmpty();
+        assertThat(accountRepository.findByNcaIdAndOwnerTypeAndOwnerId(nakProperties.getNcaId(),
+                KEY_VO_1.getOwnerType(), KEY_VO_1.getOwnerId())).isEmpty();
     }
 
     @Test

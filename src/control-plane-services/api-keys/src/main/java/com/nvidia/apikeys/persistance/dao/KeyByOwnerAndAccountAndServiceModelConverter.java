@@ -17,7 +17,9 @@
 package com.nvidia.apikeys.persistance.dao;
 
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
+import com.nvidia.apikeys.validators.KeyExpirationValidator;
 import com.nvidia.apikeys.vo.KeyByOwnerAndAccountAndServiceVo;
+import com.nvidia.apikeys.vo.KeyByOwnerAndServiceVo;
 import com.nvidia.boot.jwt.services.mapping.EncryptedModelConverter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -29,7 +31,29 @@ public class KeyByOwnerAndAccountAndServiceModelConverter {
     private final EncryptedModelConverter<KeyByOwnerAndAccountAndServiceModel,
             KeyByOwnerAndAccountAndServiceVo> converter;
 
+    private final KeyExpirationValidator expirationValidator;
+
     public KeyByOwnerAndAccountAndServiceModel voToModel(KeyByOwnerAndAccountAndServiceVo vo) {
         return converter.voToModel(vo);
+    }
+
+    public KeyByOwnerAndServiceVo modelToVo(KeyByOwnerAndAccountAndServiceModel model) {
+        var key = converter.modelToVo(model);
+        return expirationValidator.validateStatus(KeyByOwnerAndServiceVo.builder()
+                .ncaId(key.getNcaId())
+                .ncaIdInDetails(key.getNcaIdInDetails())
+                .ownerType(key.getOwnerType())
+                .ownerId(key.getOwnerId())
+                .issuerServiceId(key.getIssuerServiceId())
+                .keyId(key.getKeyId())
+                .keyStatus(key.getKeyStatus())
+                .createdAt(key.getCreatedAt())
+                .expiresAt(key.getExpiresAt())
+                .deletesAt(key.getDeletesAt())
+                .keyHash(key.getKeyHash())
+                .apiKeySuffix(key.getApiKeySuffix())
+                .description(key.getDescription())
+                .audienceServiceIds(key.getAudienceServiceIds())
+                .build());
     }
 }
