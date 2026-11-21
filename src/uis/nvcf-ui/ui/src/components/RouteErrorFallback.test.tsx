@@ -20,7 +20,8 @@ import {
 	createRootRouteWithContext,
 	createRoute,
 } from "@tanstack/react-router";
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TROUBLESHOOTING_DOCS_URL } from "~/components/UnreachableServiceFallback";
 import { HttpError } from "~/lib/fetch";
@@ -32,22 +33,26 @@ function httpError(status: number, statusText: string) {
 
 // The fallback reads router context, so the error is raised from a real route
 // loader and caught by the router's defaultErrorComponent.
-function renderWithLoaderError(error: unknown) {
+function renderWithLoader(loader: () => void) {
 	const rootRoute = createRootRouteWithContext<{ queryClient: QueryClient }>()(
 		{},
 	);
 	const indexRoute = createRoute({
 		getParentRoute: () => rootRoute,
 		path: "/",
-		loader: () => {
-			throw error;
-		},
+		loader,
 		component: () => null,
 	});
 
 	return renderWithRouter({
 		routeTree: rootRoute.addChildren([indexRoute]),
 		initialLocation: "/",
+	});
+}
+
+function renderWithLoaderError(error: unknown) {
+	return renderWithLoader(() => {
+		throw error;
 	});
 }
 
@@ -80,6 +85,24 @@ describe("RouteErrorFallback", () => {
 			name: /View Documentation/,
 		});
 		expect(link).toHaveAttribute("href", TROUBLESHOOTING_DOCS_URL);
+	});
+
+	it("retries the loader from the unreachable state", async () => {
+		const user = userEvent.setup();
+		let attempts = 0;
+		renderWithLoader(() => {
+			attempts += 1;
+			if (attempts === 1) throw httpError(502, "Bad Gateway");
+		});
+
+		await user.click(await screen.findByRole("button", { name: "Try again" }));
+
+		await waitFor(() =>
+			expect(
+				screen.queryByText("Unable to reach the deployed service"),
+			).not.toBeInTheDocument(),
+		);
+		expect(attempts).toBe(2);
 	});
 
 	it("keeps the generic fallback for other HTTP errors", async () => {

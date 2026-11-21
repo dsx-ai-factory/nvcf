@@ -113,7 +113,6 @@ function ClusterStatsPanelContent({ ncaId }: { ncaId: string }) {
 										value: [
 											getStatusLabel(GetClusterResponseStatus.NOT_READY),
 											getStatusLabel(GetClusterResponseStatus.CORDON),
-											getStatusLabel(GetClusterResponseStatus.CORDON_AND_DRAIN),
 										],
 									},
 								],

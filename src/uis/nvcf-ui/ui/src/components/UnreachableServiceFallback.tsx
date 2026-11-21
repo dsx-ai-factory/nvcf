@@ -23,17 +23,32 @@ import { ExternalLinkIcon, OctagonAlertIcon } from "lucide-react";
 export const TROUBLESHOOTING_DOCS_URL =
 	"https://docs.nvidia.com/nvcf/self-hosted/troubleshooting";
 
-export function UnreachableServiceFallback() {
+interface UnreachableServiceFallbackProps {
+	onRetry: () => void;
+}
+
+export function UnreachableServiceFallback({
+	onRetry,
+}: UnreachableServiceFallbackProps) {
 	return (
 		<div className="grid h-full place-items-center p-8">
 			<StatusMessage
 				size="medium"
 				slotFooter={
-					<Button asChild kind="secondary">
-						<a href={TROUBLESHOOTING_DOCS_URL} rel="noreferrer" target="_blank">
-							<ExternalLinkIcon size="1em" /> View Documentation
-						</a>
-					</Button>
+					<div className="flex gap-2">
+						<Button kind="secondary" onClick={onRetry}>
+							Try again
+						</Button>
+						<Button asChild kind="secondary">
+							<a
+								href={TROUBLESHOOTING_DOCS_URL}
+								rel="noreferrer"
+								target="_blank"
+							>
+								<ExternalLinkIcon size="1em" /> View Documentation
+							</a>
+						</Button>
+					</div>
 				}
 				slotHeading="Unable to reach the deployed service"
 				slotMedia={<OctagonAlertIcon size={32} />}

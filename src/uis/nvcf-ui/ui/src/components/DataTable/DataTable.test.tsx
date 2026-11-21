@@ -368,7 +368,7 @@ describe("DataTable", () => {
 			});
 
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: /^Inactive/ })[1],
+				screen.getByRole("menuitemcheckbox", { name: /^Inactive/ }),
 			);
 			await waitFor(() => {
 				expect(
@@ -459,7 +459,7 @@ describe("DataTable", () => {
 				screen.getByRole("menuitemcheckbox", { name: /^Active/ }),
 			);
 			await user.click(
-				screen.getAllByRole("menuitemcheckbox", { name: /^Inactive/ })[0],
+				screen.getByRole("menuitemcheckbox", { name: /^Inactive/ }),
 			);
 			await waitFor(() => {
 				expect(

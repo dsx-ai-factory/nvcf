@@ -36,11 +36,12 @@ type Selection = string | string[];
 type GroupFilterValue = { group?: string; selected?: Selection };
 type AnyColumn = Column<RowData, unknown>;
 
-/** A plain value, such as from a link, is a selection in the default group. */
-function parseFilterValue(value: unknown): GroupFilterValue {
-	return isPlainObject(value)
+/** The group id and selections. A plain value, such as from a link, is a selection in the default group. */
+function parseFilterValue(value: unknown) {
+	const { group, selected }: GroupFilterValue = isPlainObject(value)
 		? (value as GroupFilterValue)
 		: { selected: value as Selection | undefined };
+	return { group, selected: castArray(selected ?? []) };
 }
 
 /** The active group and the selections within it. Selections outside the group are dropped. */
@@ -50,7 +51,7 @@ function readFilterValue(value: unknown, groups: ColumnGroup[]) {
 		groups.find((g) => g.id === id) ?? groups.find((g) => !g.values);
 	return {
 		group,
-		selected: castArray(selected ?? []).filter(
+		selected: selected.filter(
 			(v) => !group?.values || group.values.includes(v),
 		),
 	};
@@ -102,7 +103,7 @@ export function getSelectedValues(column: AnyColumn): string[] {
 	const groups = column.columnDef.meta?.groups;
 	return groups
 		? readFilterValue(value, groups).selected
-		: castArray(parseFilterValue(value).selected ?? []);
+		: parseFilterValue(value).selected;
 }
 
 /** Updater for `column.setFilterValue` that sets selections and keeps the column's group. */
