@@ -3788,14 +3788,17 @@ mod tests {
             let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
             let metrics = PylonMetrics::new().expect("metrics should initialize");
             let (runtime_state, stats) = start_holdable_stats(&kv_cache);
+            let mut config =
+                calibration_config_with_fallback(&upstream.base_url, fallback_input_tps);
+            let ModelInitialization::Calibration(calibration) = &mut config.initialization else {
+                unreachable!("the test config calibrates")
+            };
+            // The test holds the attempt's health probe for as long as it
+            // needs, without the probe timing out.
+            calibration.health_timeout = Duration::from_secs(30);
             let lifecycle = within(
                 "model lifecycle startup",
-                start_model_lifecycle(
-                    calibration_config_with_fallback(&upstream.base_url, fallback_input_tps),
-                    runtime_state,
-                    &stats,
-                    Some(metrics.clone()),
-                ),
+                start_model_lifecycle(config, runtime_state, &stats, Some(metrics.clone())),
             )
             .await
             .expect("empty initial discovery should start");
@@ -3803,13 +3806,20 @@ mod tests {
             let dispatch = tracing::Dispatch::new(subscriber.clone());
             let default_guard = tracing::dispatcher::set_default(&dispatch);
 
+            // The attempt for model-a probes the upstream's health before it
+            // calibrates, and the probe waits until the collector is held. The
+            // held collector reads no commands, so the calibration's snapshot
+            // request stays unread until the collector's shutdown, however
+            // late this task runs: no running collector can answer it.
+            upstream.hold_health();
             upstream.set_models(&["model-a"]).await;
+            upstream.wait_for_held_health_probe().await;
+            hold_stats_collector(&kv_cache).await;
+            upstream.release_health();
             upstream.next_calibration().await;
             // The upstream never answers, so the step ends and the calibration
-            // asks the collector for a snapshot, which the held collector
-            // leaves unread. Had the snapshot not been sent yet, it would fail
-            // the same way once the collector is gone.
-            hold_stats_collector(&kv_cache).await;
+            // asks the held collector for a snapshot. Had the snapshot not been
+            // sent yet, it would fail the same way once the collector is gone.
             tokio::time::sleep(CALIBRATION_STEP * 2).await;
             within("stats collector shutdown", stats.shutdown()).await;
             // A supervisor that took the cut-short calibration for a failure
@@ -4519,18 +4529,22 @@ mod tests {
         config
     }
 
-    /// How the stats collector ends while model-a's calibration waits for its
-    /// snapshot.
+    /// What becomes of model-a's snapshot request, unread in a held collector,
+    /// as the supervisor's stop starts.
     #[derive(Clone, Copy, Debug)]
     enum SnapshotCollectorEnding {
-        /// The collector panics.
+        /// The collector panics before it reads the request.
         Panic,
-        /// The collector's handle shuts it down.
+        /// The collector's handle shuts it down before it reads the request.
         Shutdown,
+        /// The collector answers the request and keeps running.
+        AnswerAndRun,
+        /// The collector answers the request and then panics.
+        AnswerThenPanic,
     }
 
-    /// A supervisor stopped while model-a's calibration snapshot had already
-    /// failed.
+    /// A supervisor stopped while model-a's calibration waited for its
+    /// snapshot.
     struct SnapshotStopRace {
         label: String,
         metrics: Arc<PylonMetrics>,
@@ -4541,17 +4555,30 @@ mod tests {
 
     /// Brings model-a's calibration to its snapshot request and leaves that
     /// request unread in a held collector. Then, inside the collector's own
-    /// run, it starts the supervisor's stop and ends the collector as
-    /// `ending` says. The supervisor next runs with its stop requested and
-    /// the snapshot request already failed, and the biased select of its
-    /// attempt loop takes the stop.
-    async fn stop_the_supervisor_after_a_failed_snapshot(
+    /// run, it starts the supervisor's stop, and the collector fails or
+    /// answers the request as `ending` says before the supervisor runs again.
+    /// The supervisor next runs with its stop requested, and the biased select
+    /// of its attempt loop takes the stop.
+    async fn stop_the_supervisor_while_its_calibration_waits_for_a_snapshot(
         ending: SnapshotCollectorEnding,
         fallback_input_tps: Option<f64>,
     ) -> SnapshotStopRace {
         let label = format!("{ending:?}, fallback input TPS {fallback_input_tps:?}");
         let kv_cache = BlockingKvCacheServer::spawn_rejecting().await;
-        let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+        // An answer that lets the calibration complete needs a measured rate.
+        // Each calibration then completes four requests and saturates: one in
+        // the first step, two in the second, and one in the third, whose
+        // second request waits for the step to end.
+        let (completion_behavior, calibration_requests) = match ending {
+            SnapshotCollectorEnding::AnswerAndRun => (
+                CompletionBehavior::SaturateAfter {
+                    completed_requests_per_generation: 4,
+                },
+                5,
+            ),
+            _ => (CompletionBehavior::Pending, 1),
+        };
+        let mut upstream = TestUpstream::spawn(&[], completion_behavior).await;
         let metrics = PylonMetrics::new().expect("metrics should initialize");
         // A held KV-cache poll that does not time out while the paused clock
         // moves. The probe reads the collector's request observation queue,
@@ -4595,11 +4622,13 @@ mod tests {
         let default_guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(hook.clone()));
 
         upstream.set_models(&["model-a"]).await;
-        upstream.next_calibration().await;
+        for _ in 0..calibration_requests {
+            upstream.next_calibration().await;
+        }
         hold_stats_collector(&kv_cache).await;
-        // The upstream never answers, and the step ends only when the paused
-        // clock moves past it. The supervisor then ends the step's request,
-        // which queues that request's observation, and asks the held
+        // The step's last request is never answered, and the step ends only
+        // when the paused clock moves past it. The supervisor then ends that
+        // request, which queues the request's observation, and asks the held
         // collector for its snapshot in the same run, without waiting on
         // anything in between.
         let observed = observation_probe.len();
@@ -4617,7 +4646,11 @@ mod tests {
         .await;
 
         // The released poll is rejected. In that warning the hook starts the
-        // supervisor's stop, and then ends the collector.
+        // supervisor's stop. A panic in the hook, or the collector shutdown
+        // that the hook also starts, ends the collector before it reads the
+        // snapshot request. Otherwise the collector reads that request next,
+        // and for `AnswerThenPanic` then reads the begin queued behind it,
+        // which panics it. The supervisor runs only once the collector waits.
         let started = StartedShutdown::new();
         match ending {
             SnapshotCollectorEnding::Panic => hook.arm(
@@ -4635,19 +4668,41 @@ mod tests {
                     }));
                 });
             }
+            SnapshotCollectorEnding::AnswerAndRun | SnapshotCollectorEnding::AnswerThenPanic => {
+                if matches!(ending, SnapshotCollectorEnding::AnswerThenPanic) {
+                    // This relies on the collector reading queued commands in
+                    // the order they were sent, which flume does not document;
+                    // the test's checks fail if that changes.
+                    queue_stats_collector_panic(
+                        stats
+                            .as_ref()
+                            .expect("the collector handle is kept until here"),
+                    );
+                }
+                let started = started.clone();
+                hook.arm(KV_CACHE_STATS_REJECTED, move || {
+                    started.start(Box::pin(lifecycle.shutdown()));
+                });
+            }
         }
         kv_cache.unblock();
         let shutdown = started
             .take("the hook's action in the collector's KV-cache warning")
             .await;
         within("the supervisor's stop", shutdown).await;
-        if let Some(mut stats) = stats {
-            let exit = within("the collector exit", stats.wait_for_exit()).await;
-            assert!(
-                matches!(&exit, Err(error) if error.is_panic()),
-                "{label}: the hook's panic should end the collector; if it did not, tracing may \
-                 no longer unwind a subscriber panic into the caller: {exit:?}"
-            );
+        match stats {
+            Some(stats) if matches!(ending, SnapshotCollectorEnding::AnswerAndRun) => {
+                within("the running collector's shutdown", stats.shutdown()).await;
+            }
+            Some(mut stats) => {
+                let exit = within("the collector exit", stats.wait_for_exit()).await;
+                assert!(
+                    matches!(&exit, Err(error) if error.is_panic()),
+                    "{label}: the collector should end with a panic; for `Panic`, if it did not, \
+                     tracing may no longer unwind a subscriber panic into the caller: {exit:?}"
+                );
+            }
+            None => {}
         }
         drop(default_guard);
         kv_cache.shutdown().await;
@@ -4670,7 +4725,7 @@ mod tests {
                 runtime_state,
                 mut upstream,
                 events,
-            } = stop_the_supervisor_after_a_failed_snapshot(
+            } = stop_the_supervisor_while_its_calibration_waits_for_a_snapshot(
                 SnapshotCollectorEnding::Panic,
                 fallback_input_tps,
             )
@@ -4728,7 +4783,7 @@ mod tests {
                 runtime_state,
                 mut upstream,
                 events,
-            } = stop_the_supervisor_after_a_failed_snapshot(
+            } = stop_the_supervisor_while_its_calibration_waits_for_a_snapshot(
                 SnapshotCollectorEnding::Shutdown,
                 fallback_input_tps,
             )
@@ -4756,6 +4811,125 @@ mod tests {
             assert!(
                 runtime_state.advertised_model_ids().is_empty(),
                 "{label}: the cut-short calibration should not admit model-a"
+            );
+            assert!(
+                upstream.calibrations.try_recv().is_err(),
+                "{label}: the stop should not start another calibration step"
+            );
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_snapshot_answered_while_the_collector_runs_is_cancelled_when_the_stop_wins()
+     {
+        // The collector answers the snapshot request and keeps running, and
+        // the supervisor's stop wins before the calibration sees the answer.
+        // No collector failure is ready, so the stop stays immediate: the
+        // calibration does not complete on that answer.
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let SnapshotStopRace {
+                label,
+                metrics,
+                runtime_state,
+                mut upstream,
+                events,
+            } = stop_the_supervisor_while_its_calibration_waits_for_a_snapshot(
+                SnapshotCollectorEnding::AnswerAndRun,
+                fallback_input_tps,
+            )
+            .await;
+
+            assert_eq!(
+                (
+                    calibration_count(&metrics, "model-a", "cancelled"),
+                    calibration_count(&metrics, "model-a", "completed"),
+                    calibration_count(&metrics, "model-a", "error"),
+                ),
+                (1, 0, 0),
+                "{label}: a stop that wins while the collector runs should cancel the \
+                 calibration, although the collector had answered its snapshot"
+            );
+            let warnings = calibration_failure_warnings(&events);
+            assert!(
+                warnings.is_empty(),
+                "{label}: a calibration cut short by a stop should not warn: {warnings:?}"
+            );
+            let errors = error_events(&events);
+            assert!(
+                errors.is_empty(),
+                "{label}: a stop should log no error: {errors:?}"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{label}: the cancelled calibration should not admit model-a"
+            );
+            assert!(
+                upstream.calibrations.try_recv().is_err(),
+                "{label}: the stop should not start another calibration step"
+            );
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn calibration_snapshot_answered_before_a_collector_panic_logs_no_supervisor_failure_when_the_stop_wins()
+     {
+        // The collector answers the snapshot request and then panics, and the
+        // supervisor's stop wins before the calibration sees the answer. The
+        // answer came before the collector ended, so the calibration may
+        // finish with its own result, here too little data for a rate. That
+        // result is not the collector's failure, and the stop ends the
+        // supervisor without reporting one.
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let SnapshotStopRace {
+                label,
+                metrics,
+                runtime_state,
+                mut upstream,
+                events,
+            } = stop_the_supervisor_while_its_calibration_waits_for_a_snapshot(
+                SnapshotCollectorEnding::AnswerThenPanic,
+                fallback_input_tps,
+            )
+            .await;
+
+            let collector_warnings =
+                events_with_message(&events, CALIBRATION_COLLECTOR_STOPPED_WARNING);
+            assert!(
+                collector_warnings.is_empty(),
+                "{label}: the collector answered the snapshot before it panicked, so its end did \
+                 not fail the calibration. If it did, the collector may no longer read queued \
+                 commands in the order they were sent: {collector_warnings:?}"
+            );
+            let failed = events_with_message(&events, SUPERVISOR_FAILED);
+            assert!(
+                failed.is_empty(),
+                "{label}: a calibration that fails on its own as the stop wins should not make \
+                 the supervisor report a failure during its stop: {failed:?}"
+            );
+            let errors = error_events(&events);
+            assert!(
+                errors.is_empty(),
+                "{label}: the stop should log no error: {errors:?}"
+            );
+            let retries = calibration_retry_warnings(&events);
+            assert!(
+                retries.is_empty(),
+                "{label}: the stopped supervisor should not try model-a again: {retries:?}"
+            );
+            let completed = calibration_count(&metrics, "model-a", "completed");
+            let ended = calibration_count(&metrics, "model-a", "error")
+                + calibration_count(&metrics, "model-a", "cancelled");
+            assert_eq!(
+                (completed, ended),
+                (0, 1),
+                "{label}: the calibration, which measured no rate, should be recorded once, and \
+                 not as completed"
+            );
+            assert!(
+                runtime_state.advertised_model_ids().is_empty(),
+                "{label}: the failed calibration should not admit model-a"
             );
             assert!(
                 upstream.calibrations.try_recv().is_err(),

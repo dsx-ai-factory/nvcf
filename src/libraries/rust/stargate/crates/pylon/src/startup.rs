@@ -3434,9 +3434,10 @@ mod tests {
         // lifecycle request in flight fails because of the shutdown, which is
         // not an error; if the supervisor stops first, it drops the request.
         // Either way the shutdown logs no error. The pylon-lib test
-        // `collector_shutdown_during_a_lifecycle_request_logs_no_error` stops
-        // only the collector and pins the debug line for the first case. A
-        // held KV-cache poll keeps the collector from reading the request.
+        // `collector_shutdown_during_a_lifecycle_request_logs_no_error_and_keeps_admitted_models_until_the_supervisor_stop`
+        // stops only the collector and pins the debug line for the first
+        // case. A held KV-cache poll keeps the collector from reading the
+        // request.
         let upstream = DiscoveryUpstream::spawn(&["model-a"]).await;
         let (runtime, runtime_state) = start_discovery_pylon(&upstream).await;
         let (recorded, default_guard) = record_events();
