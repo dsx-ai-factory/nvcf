@@ -27,7 +27,7 @@ export function RouteErrorFallback({ error }: ErrorComponentProps) {
 	// The BFF answers 502 when it can't dial the upstream; an upstream's own
 	// 502 is proxied through verbatim. Both mean the service isn't responding.
 	if (error instanceof HttpError && error.status === 502) {
-		return <UnreachableServiceFallback />;
+		return <UnreachableServiceFallback onRetry={() => router.invalidate()} />;
 	}
 
 	// `error` is typed `unknown` because anything can be thrown, not just an

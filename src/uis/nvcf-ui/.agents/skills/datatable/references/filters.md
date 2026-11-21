@@ -40,9 +40,9 @@ with; dropdowns narrow within it.
 The pills and the dropdown share the column's TanStack filter value:
 `{ group: "<group id>", selected: ["<value>"] }`.
 
-- Read and write selections through `getSelectedValues` and
-  `setSelectedValues` in `utils/groups.ts`, never `getFilterValue` directly.
-  They keep the group intact.
+- Read selections with `getSelectedValues` and write them with
+  `column.setFilterValue(withSelected(next))`, both from `utils/groups.ts`.
+  Never read `getFilterValue` directly. `withSelected` keeps the group intact.
 - Selections outside the active group's `values` are ignored: no effect on
   rows, no chip, no trigger count.
 - A plain value, such as `filters=[{"id":"<column id>","value":["<value>"]}]`

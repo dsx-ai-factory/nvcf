@@ -56,12 +56,10 @@ export function buildFilterItems(
 	options = getColumnOptions(column),
 ): (DropdownCheckboxItemEntry | DropdownRadioGroupEntry)[] {
 	const filterVariant = column.columnDef.meta?.filterVariant;
-	const counts = new Map(
-		[...column.getFacetedUniqueValues()].map(([value, n]) => [
-			String(value),
-			n,
-		]),
-	);
+	const counts = new Map<string, number>();
+	for (const [value, n] of column.getFacetedUniqueValues()) {
+		counts.set(String(value), (counts.get(String(value)) ?? 0) + n);
+	}
 	const selected = getSelectedValues(column);
 	const items = options.map((opt) => {
 		const count = counts.get(opt.value) ?? 0;
