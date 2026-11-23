@@ -22,10 +22,9 @@ Common operator questions and where to look on this page or in linked references
 ## Overview
 
 <Warning>
-Observability is experimental for multi-cluster AWS deployments, where the
-control plane and the GPU compute clusters run in separate clusters or regions.
-This topology is not qualified, and compute-plane metric collection across
-clusters is not guaranteed to work as documented. See
+Observability is supported on a single cluster, and on the control-plane cluster
+of a split deployment. Collecting compute-plane metrics across clusters in a
+multi-cluster AWS deployment is experimental and has not been qualified. See
 [Example dashboards](./example-dashboards.md) for the supported topologies.
 </Warning>
 
