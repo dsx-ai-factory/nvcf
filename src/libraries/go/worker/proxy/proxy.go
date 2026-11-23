@@ -333,7 +333,11 @@ func (p *HttpProxy) keepaliveReconnectRegistration(ctx context.Context, work *pb
 			if err != nil {
 				return err
 			}
-			_, err = p.js.Publish(ctx, subject, body)
+			// Not cancelled with ctx: a publish that was already sent must be
+			// acked before the purge below, or the server can store it after.
+			pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_, err = p.js.Publish(pubCtx, subject, body)
 			return err
 		}, backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(0)), ctx))
 		utils.SleepWithContext(ctx, 20*time.Minute)
