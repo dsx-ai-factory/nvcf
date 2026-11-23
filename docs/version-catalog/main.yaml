@@ -240,36 +240,115 @@ publications:
     type: resource
     version: 1.1.0
     registry: public-resources
+  - name: byoo-otel-collector
+    type: image
+    version: 0.160.0-nv-0.4.9
+    registry: public-images
+  - name: icms-service-oss
+    type: image
+    version: 0.8.6
+    registry: public-images
+  - name: nvca
+    type: image
+    version: 3.18.10
+    registry: public-images
+  - name: nvca-operator
+    type: image
+    version: 3.18.10
+    registry: public-images
+  - name: nvcf-ai-api-gateway-service
+    type: image
+    version: 1.42.2
+    registry: public-images
+  - name: nvcf-event-ledger
+    type: image
+    version: 0.21.2
+    registry: public-images
+  - name: nvcf-function-autoscaler
+    type: image
+    version: 1.23.2
+    registry: public-images
+  - name: nvcf-invocation-service
+    type: image
+    version: 0.15.1
+    registry: public-images
+  - name: nvcf-openbao
+    type: image
+    version: 2.6.3-nv-1.3.9
+    registry: public-images
+  - name: nvcf-openbao-migrations
+    type: image
+    version: 0.23.4
+    registry: public-images
+  - name: nvcf-otel-collector
+    type: image
+    version: 0.160.0-nv-0.4.9
+    registry: public-images
+  - name: nvcf-worker-llm-credentials-oss
+    type: image
+    version: 1.2.3
+    registry: public-images
+  - name: nvcf_worker_niclls
+    type: image
+    version: 2.118.5
+    registry: public-images
+  - name: pylon
+    type: image
+    version: 0.29.3
+    registry: public-images
+  - name: stargate
+    type: image
+    version: 0.29.3
+    registry: public-images
+  - name: helm-nvcf-cert-manager
+    type: chart
+    version: 0.2.0
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-event-ledger
+    type: chart
+    version: 0.10.2
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-function-autoscaler
+    type: chart
+    version: 0.8.1
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-invocation-service
+    type: chart
+    version: 1.10.0
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-nats
+    type: chart
+    version: 0.9.1
+    registry: public-helm
+    chart_format: http
+  - name: helm-nvcf-openbao-server
+    type: chart
+    version: 0.37.1
+    registry: public-helm
+    chart_format: http
+  - name: nvcf-compute-plane-stack
+    type: resource
+    version: 1.1.1
+    registry: public-resources
+  - name: nvcf-self-managed-stack
+    type: resource
+    version: 1.1.9
+    registry: public-resources
+  - name: helm-nvcf-worker-callback-proxy
+    type: chart
+    version: 0.1.0
+    registry: public-helm
+    chart_format: http
 version_overrides:
   - name: nvcf-cli
     type: resource
     version: 1.16.8
     source: independent source release; not pinned by stack
-publication_pending:
-  - byoo-otel-collector
-  - helm-nvcf-cert-manager
-  - helm-nvcf-event-ledger
-  - helm-nvcf-function-autoscaler
-  - helm-nvcf-invocation-service
-  - helm-nvcf-nats
-  - helm-nvcf-openbao-server
-  - helm-nvcf-worker-callback-proxy
-  - icms-service-oss
-  - nvca
-  - nvca-operator
-  - nvcf-ai-api-gateway-service
-  - nvcf-compute-plane-stack
-  - nvcf-event-ledger
-  - nvcf-function-autoscaler
-  - nvcf-invocation-service
-  - nvcf-openbao
-  - nvcf-openbao-migrations
-  - nvcf-otel-collector-image
-  - nvcf-self-managed-stack
-  - nvcf-worker-llm-credentials-oss
-  - nvcf_worker_niclls
-  - pylon
-  - stargate-image-0.29.3
+publication_pending: []
 manifest:
   entries:
     - artifact_id: helm-nvcf-api-keys
