@@ -43,11 +43,17 @@ export function ItemCount({
 				: rows.length,
 		[rows, grouped, group],
 	);
-	const noun = total === 1 ? label : pluralLabel;
+	// Server-side pagination: loaded rows are one page, so only the server total is meaningful.
+	const serverTotal =
+		table.options.manualPagination && table.options.rowCount !== undefined;
+	const shown = serverTotal ? count : total;
+	const noun = shown === 1 ? label : pluralLabel;
 
 	return (
 		<Text className="whitespace-nowrap" kind="body/regular/sm">
-			{count === total ? `${total} ${noun}` : `${count} of ${total} ${noun}`}
+			{serverTotal || count === total
+				? `${shown} ${noun}`
+				: `${count} of ${total} ${noun}`}
 		</Text>
 	);
 }
