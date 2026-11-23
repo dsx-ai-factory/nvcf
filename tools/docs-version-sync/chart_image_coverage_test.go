@@ -25,7 +25,7 @@ func TestChartImageCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := evaluateChartImageCoverage(repoRoot, chartImageExclusionsFile, stackImageExclusionsFile, t.TempDir)
+	report, err := evaluateChartImageCoverage(repoRoot, chartImageExclusionsFile, t.TempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,9 +49,8 @@ func isolateHelmConfiguration(t *testing.T) {
 
 // evaluateChartImageCoverage resolves which released stacks deploy each chart,
 // validates the matrix, then classifies and checks every tracked chart.
-// stackExclusionsPath names the stack matrix, which lists the dev-only
-// stacks. workspace returns a fresh temporary directory per call.
-func evaluateChartImageCoverage(repoRoot, exclusionsPath, stackExclusionsPath string, workspace func() string) (*imageGateReport, error) {
+// workspace returns a fresh temporary directory per call.
+func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func() string) (*imageGateReport, error) {
 	charts, err := discoverTrackedCharts(repoRoot)
 	if err != nil {
 		return nil, err
@@ -61,7 +60,7 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath, stackExclusionsPath st
 		return nil, err
 	}
 	report := newChartCoverageReport()
-	stacks, stackFindings, err := loadChartStacks(repoRoot, stackExclusionsPath, charts, workspace)
+	stacks, stackFindings, err := loadChartStacks(repoRoot, charts, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -310,11 +309,9 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 			"charts/wrapped/charts/sub: {reason: vendored-subchart}\n" +
 			"charts/no-image-ok: {reason: no-runtime-image}\n" +
 			"charts/gone: {reason: test-fixture}\n" +
-			"charts/outside: {reason: dev-only}\n" +
 			"deploy/stacks/dev/charts/dev-tool: {reason: dev-only}\n" +
 			"deploy/stacks/dev/charts/dev-shared: {reason: dev-only}\n" +
 			"deploy/stacks/devinv/charts/dev-tool: {reason: dev-only}\n",
-		stackImageExclusionsFile: "deploy/stacks/dev: {reason: dev-only}\ndeploy/stacks/devinv: {reason: dev-only}\n",
 	}
 	// The released stack deploys every chart that pins a stack-deployed rule,
 	// one by relative path, and one as a release that is not installed: the
@@ -338,19 +335,22 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	devInventoryTool := coverageFixtureChart("devinv-tool", "{}\n")
 	for _, stack := range []map[string]string{
 		fixtureStack("released", "{}\n", released),
-		// Helmfile build rejects a state without releases.
-		fixtureStack("devinv", "{}\n", "releases:\n  - {name: no-image-ok, namespace: devinv, chart: nvcf/no-image-ok}\n"),
+		// A stack with release-inventory.yaml that deploys its own dev-only
+		// chart: once a dev-only stack gains an inventory, its charts are no
+		// longer excluded.
+		fixtureStack("devinv", "{}\n", "releases:\n  - {name: tool, namespace: devinv, chart: ../charts/dev-tool}\n"),
 		// Its charts cannot be classified, so the run fails: the state does
 		// not build, a release names no tracked chart, or a local chart path
 		// is not a chart.
 		fixtureStack("broken", "{}\n", "{{ fail \"broken state\" }}\n"),
 		fixtureStack("unresolved", "{}\n", "releases:\n  - {name: missing, namespace: missing, chart: nvcf/missing}\n"),
 		fixtureStack("not-a-chart", "{}\n", "releases:\n  - {name: typo, namespace: typo, chart: ../../../../charts}\n"),
-		{"deploy/stacks/dev/helmfile.yaml.gotmpl": "releases: []\n"},
+		// An unreleased stack is not built, so the chart it deploys stays
+		// dev-only.
+		{"deploy/stacks/dev/helmfile.yaml.gotmpl": "releases:\n  - {name: tool, namespace: dev, chart: ./charts/dev-tool}\n"},
 		movedChart(devTool, "charts/dev-tool/", "deploy/stacks/dev/charts/dev-tool/"),
 		movedChart(devShared, "charts/dev-shared/", "deploy/stacks/dev/charts/dev-shared/"),
 		movedChart(devInventoryTool, "charts/devinv-tool/", "deploy/stacks/devinv/charts/dev-tool/"),
-		coverageFixtureChart("outside", "{}\n"),
 	} {
 		for name, content := range stack {
 			files[name] = content
@@ -439,7 +439,7 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	report, err := evaluateChartImageCoverage(root, filepath.Join(root, chartImageExclusionsFile), filepath.Join(root, stackImageExclusionsFile), t.TempDir)
+	report, err := evaluateChartImageCoverage(root, filepath.Join(root, chartImageExclusionsFile), t.TempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,16 +479,15 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		standalone("charts/standalone-empty"): {findingCoverage, "server.image.registry: standalone chart leaves image source empty"},
 		standalone("charts/standalone-repository-host"): {findingCoverage,
 			"server.image.repository: repository \"docker.io/team/server\" contains registry host docker.io"},
-		standalone("charts/standalone-template-default"):   {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
-		standalone("charts/standalone-template-host"):      {findingCoverage, "image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
-		standalone("charts/standalone-unguarded"):          {findingCoverage, "server.image.registry: scenario standalone-unguarded.yaml renders with an empty registry"},
-		standalone("charts/standalone-hidden"):             {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},
-		standalone("charts/outside"):                       {findingInvalidEntry, "not under deploy/stacks/<stack>/"},
-		stack("deploy/stacks/dev/charts/dev-shared"):       {findingInvalidEntry, "released stack deploy/stacks/released deploys the chart"},
-		standalone("deploy/stacks/devinv/charts/dev-tool"): {findingInvalidEntry, "has release-inventory.yaml"},
-		"deploy/stacks/broken":                             {findingStackConfig, "deploy/stacks/broken/helmfile.d/01.yaml.gotmpl: build"},
-		"deploy/stacks/unresolved":                         {findingStackConfig, "release missing/missing: chart nvcf/missing matches no tracked Chart.yaml name"},
-		"deploy/stacks/not-a-chart":                        {findingStackConfig, "release typo/typo: chart ../../../../charts is not a tracked chart directory"},
+		standalone("charts/standalone-template-default"): {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
+		standalone("charts/standalone-template-host"):    {findingCoverage, "image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
+		standalone("charts/standalone-unguarded"):        {findingCoverage, "server.image.registry: scenario standalone-unguarded.yaml renders with an empty registry"},
+		standalone("charts/standalone-hidden"):           {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},
+		stack("deploy/stacks/dev/charts/dev-shared"):     {findingInvalidEntry, "chart is deployed by released stacks deploy/stacks/released"},
+		stack("deploy/stacks/devinv/charts/dev-tool"):    {findingInvalidEntry, "chart is deployed by released stacks deploy/stacks/devinv"},
+		"deploy/stacks/broken":                           {findingStackConfig, "deploy/stacks/broken/helmfile.d/01.yaml.gotmpl: build"},
+		"deploy/stacks/unresolved":                       {findingStackConfig, "release missing/missing: chart nvcf/missing matches no tracked Chart.yaml name"},
+		"deploy/stacks/not-a-chart":                      {findingStackConfig, "release typo/typo: chart ../../../../charts is not a tracked chart directory"},
 	}
 	for chart, expectation := range want {
 		if !got[chart][expectation.category] || len(got[chart]) != 1 {

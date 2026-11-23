@@ -46,8 +46,8 @@ var chartImageReasons = map[string]bool{
 //   - issue on a test-fixture: only pending work has a tracking issue.
 //   - an indexed chart under test-fixture: an index declares runtime images,
 //     so the chart must be checked, not skipped. A dev-only chart may be
-//     indexed: no released stack or direct install ships it.
-//   - dev-only outside a dev-only stack: see validateDevOnlyChart.
+//     indexed: no released stack ships it.
+//   - dev-only for a chart a released stack deploys: see validateDevOnlyChart.
 func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, charts map[string]bool, indexed bool, stacks chartStacks) error {
 	if !chartImageReasons[entry.Reason] {
 		return fmt.Errorf("unknown reason %q; use one of %s", entry.Reason, strings.Join(sortedKeys(chartImageReasons), ", "))
@@ -70,32 +70,22 @@ func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, c
 	return nil
 }
 
-// validateDevOnlyChart allows dev-only only for a chart that lives in a
-// dev-only stack and that no released stack deploys. Example: stargate-dev's
-// charts/stargate-dev-auth passes; once self-managed deploys it, or once
-// stargate-dev gains release-inventory.yaml, the entry fails and the chart is
-// checked.
+// validateDevOnlyChart allows dev-only only for a chart that no released
+// stack deploys, resolved from the released stacks' Helmfile states. Example:
+// stargate-dev's charts/stargate-dev-auth passes; once self-managed deploys
+// it, or once stargate-dev gains release-inventory.yaml and is built as a
+// released stack, the entry fails and the chart is checked.
 //
-// Membership is by path, not by resolving the dev-only stack's releases:
-// stargate-dev loads STARGATE_DEV_VALUES_FILE with requiredEnv from a
-// protected file outside the repository, so CI cannot build it. A chart under
-// the stack directory that the stack does not deploy is therefore accepted.
-// Resolve the stack's releases instead once CI can build it.
+// Where the chart lives is deliberately not checked: a path rule would break
+// when a chart moves or is referenced from elsewhere, and it would not prove
+// that a dev-only stack deploys the chart either. CI cannot build the
+// dev-only stacks (stargate-dev reads a protected values file), so whether
+// one of them deploys the chart is not verified. Nor is whether users install
+// the chart directly: review keeps dev-only off a chart that ships on its own.
 func validateDevOnlyChart(chart string, stacks chartStacks) error {
-	rest, ok := strings.CutPrefix(chart, stacksRoot+"/")
-	name, _, nested := strings.Cut(rest, "/")
-	if !ok || !nested {
-		return fmt.Errorf("chart is not under %s/<stack>/; use %s only for a chart of a dev-only stack", stacksRoot, reasonDevOnly)
-	}
-	stack := stacksRoot + "/" + name
-	switch {
-	case !stacks.devOnly[stack]:
-		return fmt.Errorf("stack %s is not listed as %s in %s; check the chart instead", stack, reasonDevOnly, stackImageExclusionsFile)
-	case stacks.released[stack]:
-		return fmt.Errorf("stack %s has %s, so it is released; remove the %s entry so the chart is checked", stack, stackInventoryFile, reasonDevOnly)
-	case len(stacks.deployedBy[chart]) > 0:
-		return fmt.Errorf("released stack %s deploys the chart; remove the %s entry so the chart is checked",
-			strings.Join(stacks.deployedBy[chart], ", "), reasonDevOnly)
+	if deployers := stacks.deployedBy[chart]; len(deployers) > 0 {
+		return fmt.Errorf("chart is deployed by released stacks %s; remove the %s entry so the chart is checked",
+			strings.Join(deployers, ", "), reasonDevOnly)
 	}
 	return nil
 }

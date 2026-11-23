@@ -23,15 +23,11 @@ const (
 )
 
 // chartStacks is what the chart gate knows about stacks: which released
-// stacks deploy each tracked chart, and which stacks are dev-only.
+// stacks deploy each tracked chart.
 type chartStacks struct {
 	// deployedBy maps a tracked chart directory to the released stacks whose
 	// states declare a release of it.
 	deployedBy map[string][]string
-	// devOnly holds the stacks listed dev-only in stack-image-exclusions.yaml.
-	devOnly map[string]bool
-	// released holds the stacks that have release-inventory.yaml.
-	released map[string]bool
 }
 
 func (s chartStacks) class(chart string) string {
@@ -47,35 +43,19 @@ func chartSubject(chart, class string) string {
 	return chart + " (" + class + ")"
 }
 
-// loadChartStacks resolves the charts every released stack deploys and reads
-// the dev-only stacks from the stack exclusion matrix. A state that cannot be
-// built or a release whose chart cannot be located is returned as a finding:
-// classifying its charts as standalone would wrongly allow them to prefill.
+// loadChartStacks resolves the charts every released stack deploys. A state
+// that cannot be built or a release whose chart cannot be located is returned
+// as a finding: classifying its charts as standalone would wrongly allow them
+// to prefill.
 //
 // directories holds every tracked chart directory.
-func loadChartStacks(repoRoot, stackExclusionsPath string, directories []string, workspace func() string) (chartStacks, []imageGateFinding, error) {
-	stacks := chartStacks{deployedBy: make(map[string][]string), devOnly: make(map[string]bool), released: make(map[string]bool)}
-	entries, err := loadImageExclusions(stackExclusionsPath)
-	if err != nil {
-		return stacks, nil, err
-	}
-	for stack, entry := range entries {
-		if entry.Reason == reasonDevOnly {
-			stacks.devOnly[stack] = true
-		}
-	}
+func loadChartStacks(repoRoot string, directories []string, workspace func() string) (chartStacks, []imageGateFinding, error) {
 	tracked, err := discoverTrackedStacks(repoRoot)
 	if err != nil {
-		return stacks, nil, err
+		return chartStacks{}, nil, err
 	}
-	for _, stack := range tracked.stacks {
-		if tracked.hasFile(stack, stackInventoryFile) {
-			stacks.released[stack] = true
-		}
-	}
-	var findings []imageGateFinding
-	stacks.deployedBy, findings, err = releasedStackCharts(repoRoot, tracked, directories, workspace)
-	return stacks, findings, err
+	deployedBy, findings, err := releasedStackCharts(repoRoot, tracked, directories, workspace)
+	return chartStacks{deployedBy: deployedBy}, findings, err
 }
 
 // releasedStackCharts maps each tracked chart directory to the released

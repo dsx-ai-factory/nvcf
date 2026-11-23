@@ -29,13 +29,15 @@
 #                      by rendering.
 #   vendored-subchart  Lives at <parent>/charts/<name>, where <parent> is
 #                      itself a chart. Skipped.
-#   dev-only           Lives under deploy/stacks/<stack>/, where <stack> is
-#                      listed dev-only in stack-image-exclusions.yaml and has
-#                      no release-inventory.yaml, and no released stack
-#                      deploys the chart. Skipped, and may declare an image
-#                      index. Membership is by path because CI cannot build a
-#                      dev-only stack (stargate-dev reads a protected values
-#                      file), so a chart the stack does not deploy is accepted.
+#   dev-only           Deployed only by an unreleased development stack, such
+#                      as stargate-dev. Skipped, and may declare an image
+#                      index. The entry fails when a released stack deploys
+#                      the chart, including a dev-only stack that gains
+#                      release-inventory.yaml. CI cannot build a dev-only
+#                      stack (stargate-dev reads a protected values file), so
+#                      whether one deploys the chart is not verified. Never
+#                      use it for a chart users install directly; review
+#                      enforces this.
 #
 # issue (optional, pending-fix only): a free-form note, such as a tracking
 # link. It is not validated. This file is public, so keep private tracker IDs

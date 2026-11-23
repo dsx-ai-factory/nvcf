@@ -50,12 +50,12 @@ The test downloads remote dependencies into test-owned directories. It does
 not create a cluster or verify registry publication. Keep the chart probe and
 override helpers test-only; installation uses native Helm values.
 
-A chart that lives in a `dev-only` stack and that no released stack deploys
-is listed as `dev-only`. The entry requires the chart to live under a stack
-listed `dev-only` in `stack-image-exclusions.yaml` that has no
-`release-inventory.yaml`, and no released stack to deploy it. Membership is by
-path, because CI cannot build a `dev-only` stack, so the check does not prove
-that the stack deploys the chart.
+A chart that only an unreleased development stack deploys is listed as
+`dev-only`. The entry fails when a released stack deploys the chart. Where the
+chart lives is not checked. CI cannot build a `dev-only` stack, so whether one
+deploys the chart is not verified. Never list a chart that users install
+directly as `dev-only`; it must pass the standalone checks instead. Review
+enforces this.
 
 A chart that declares an image index cannot be listed as `test-fixture` or
 `no-runtime-image`, so do not commit an indexed fixture chart. Build it in a
