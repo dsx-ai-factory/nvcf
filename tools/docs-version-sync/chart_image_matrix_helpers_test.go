@@ -16,8 +16,10 @@ import (
 
 const chartImageExclusionsFile = "chart-image-exclusions.yaml"
 
-// Chart exclusion reasons, with reasonPendingFix. Every tracked chart that is not covered by an image
-// index carries exactly one of them in chart-image-exclusions.yaml.
+// Chart exclusion reasons, with reasonPendingFix and reasonDevOnly (a chart
+// only an unreleased stack deploys, shared with the stack matrix). Every
+// tracked chart that is not covered by an image index carries exactly one of
+// them in chart-image-exclusions.yaml.
 const (
 	// reasonTestFixture: testdata, validator test charts and samples that no
 	// NVCF stack deploys.
@@ -31,20 +33,22 @@ const (
 )
 
 var chartImageReasons = map[string]bool{
-	reasonPendingFix: true, reasonTestFixture: true, reasonNoRuntimeImage: true, reasonVendoredSubchart: true,
+	reasonPendingFix: true, reasonTestFixture: true, reasonNoRuntimeImage: true, reasonVendoredSubchart: true, reasonDevOnly: true,
 }
 
 // validateChartImageExclusion checks one matrix entry. charts holds every
-// tracked chart directory, and indexed reports whether the chart declares an
-// image index.
+// tracked chart directory, indexed reports whether the chart declares an
+// image index, and stacks says which stacks deploy it.
 //
 // Rejected, with the reason:
 //   - reason "skip": not in the enum, so nothing says how the chart is handled.
 //   - a chart directory with no tracked Chart.yaml: the entry is stale.
 //   - issue on a test-fixture: only pending work has a tracking issue.
 //   - an indexed chart under test-fixture: an index declares runtime images,
-//     so the chart must be checked, not skipped.
-func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, charts map[string]bool, indexed bool) error {
+//     so the chart must be checked, not skipped. A dev-only chart may be
+//     indexed: no released stack or direct install ships it.
+//   - dev-only outside a dev-only stack: see validateDevOnlyChart.
+func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, charts map[string]bool, indexed bool, stacks chartStacks) error {
 	if !chartImageReasons[entry.Reason] {
 		return fmt.Errorf("unknown reason %q; use one of %s", entry.Reason, strings.Join(sortedKeys(chartImageReasons), ", "))
 	}
@@ -54,11 +58,44 @@ func validateChartImageExclusion(repoRoot, chart string, entry imageExclusion, c
 	if entry.Issue != "" && entry.Reason != reasonPendingFix {
 		return fmt.Errorf("issue is allowed only on %s entries", reasonPendingFix)
 	}
+	if entry.Reason == reasonDevOnly {
+		return validateDevOnlyChart(chart, stacks)
+	}
 	if indexed && entry.Reason != reasonPendingFix {
 		return fmt.Errorf("chart declares an image index but is listed as %s; remove the entry so the chart is checked", entry.Reason)
 	}
 	if entry.Reason == reasonVendoredSubchart {
 		return validateVendoredSubchart(repoRoot, chart)
+	}
+	return nil
+}
+
+// validateDevOnlyChart allows dev-only only for a chart that lives in a
+// dev-only stack and that no released stack deploys. Example: stargate-dev's
+// charts/stargate-dev-auth passes; once self-managed deploys it, or once
+// stargate-dev gains release-inventory.yaml, the entry fails and the chart is
+// checked.
+//
+// Membership is by path, not by resolving the dev-only stack's releases:
+// stargate-dev loads STARGATE_DEV_VALUES_FILE with requiredEnv from a
+// protected file outside the repository, so CI cannot build it. A chart under
+// the stack directory that the stack does not deploy is therefore accepted.
+// Resolve the stack's releases instead once CI can build it.
+func validateDevOnlyChart(chart string, stacks chartStacks) error {
+	rest, ok := strings.CutPrefix(chart, stacksRoot+"/")
+	name, _, nested := strings.Cut(rest, "/")
+	if !ok || !nested {
+		return fmt.Errorf("chart is not under %s/<stack>/; use %s only for a chart of a dev-only stack", stacksRoot, reasonDevOnly)
+	}
+	stack := stacksRoot + "/" + name
+	switch {
+	case !stacks.devOnly[stack]:
+		return fmt.Errorf("stack %s is not listed as %s in %s; check the chart instead", stack, reasonDevOnly, stackImageExclusionsFile)
+	case stacks.released[stack]:
+		return fmt.Errorf("stack %s has %s, so it is released; remove the %s entry so the chart is checked", stack, stackInventoryFile, reasonDevOnly)
+	case len(stacks.deployedBy[chart]) > 0:
+		return fmt.Errorf("released stack %s deploys the chart; remove the %s entry so the chart is checked",
+			strings.Join(stacks.deployedBy[chart], ", "), reasonDevOnly)
 	}
 	return nil
 }
@@ -114,7 +151,8 @@ const (
 	// actionExpectedFailure: pending-fix without an index; decided statically
 	// so unremediated charts never fetch dependencies.
 	actionExpectedFailure
-	// actionSkip: test-fixture or vendored-subchart, after entry validation.
+	// actionSkip: test-fixture, vendored-subchart or dev-only, after entry
+	// validation.
 	actionSkip
 	// actionConfirmNoImage: render defaults and every scenario; any image fails.
 	actionConfirmNoImage
