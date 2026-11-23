@@ -36,6 +36,7 @@ trap cleanup EXIT
 
 git -C "$repo" worktree add --detach --force "$worktree" "$commit" >/dev/null
 mkdir -p "$out"
+out="$(cd "$out" && pwd)"
 (
   cd "$worktree/src/libraries/rust/stargate"
   cargo build --locked --release -p stargate -p pylon --bins

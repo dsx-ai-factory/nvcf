@@ -179,7 +179,7 @@ stream_request() {
         -H "x-model: ${model}" \
         -H 'x-input-tokens: 8' \
         -H "x-cache-affinity-key: ${key}" \
-        -d "{\"model\":\"${model}\",\"stream\":true,\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}") || true
+        -d "{\"model\":\"${model}\",\"stream\":true,\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}") || return 0
     [[ "${status}" == "200" ]] || return 0
     grep -q '^data: \[DONE\]' "${body}" || return 0
     tr -d '\r' <"${headers}" | awk -F': ' 'tolower($1) == "x-inference-server-id" {print $2}'
