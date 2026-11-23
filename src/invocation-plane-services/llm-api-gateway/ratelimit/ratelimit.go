@@ -271,6 +271,15 @@ func (rl *rateLimiter) leakyBucket(
 		}
 		newValue := saturatingConsume(currentValue, tokensRequested, floor, rate)
 
+		// Advance lastRefill only by the time turned into whole tokens, so the
+		// remainder still counts on the next write. Resetting it to now would
+		// drop that remainder on every write and never refill a key written
+		// more often than once per period/rate. A full bucket keeps no remainder.
+		newLastRefill := nowMs
+		if elapsed > 0 && periodMs > 0 && currentValue < rate {
+			newLastRefill = lastRefill + mulDivCeilInt64(refill, periodMs, rate)
+		}
+
 		var expected *bucketState
 		if exists {
 			expected = &state
@@ -280,7 +289,7 @@ func (rl *rateLimiter) leakyBucket(
 			ctx,
 			key,
 			expected,
-			bucketState{Value: newValue, LastRefill: nowMs},
+			bucketState{Value: newValue, LastRefill: newLastRefill},
 			ttl,
 		)
 		if err != nil {
@@ -332,6 +341,23 @@ func mulDivInt64(a, b, c int64) int64 {
 		return math.MaxInt64 // quotient itself would overflow; caller saturates
 	}
 	q, _ := bits.Div64(hi, lo, uint64(c))
+	if q > uint64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(q)
+}
+
+// mulDivCeilInt64 is mulDivInt64 rounded up. Rounding the time charged for a
+// refill up keeps the next refill from crediting the same time twice.
+func mulDivCeilInt64(a, b, c int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi >= uint64(c) {
+		return math.MaxInt64
+	}
+	q, r := bits.Div64(hi, lo, uint64(c))
+	if r != 0 {
+		q++
+	}
 	if q > uint64(math.MaxInt64) {
 		return math.MaxInt64
 	}
