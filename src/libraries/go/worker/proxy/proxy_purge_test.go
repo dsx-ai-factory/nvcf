@@ -58,10 +58,11 @@ func TestPurgeFromStream_MissingStreamReturnsError(t *testing.T) {
 // released even if the caller stopped waiting.
 type heldPublishJS struct {
 	jetstream.JetStream
-	once    sync.Once
-	sent    chan struct{}
-	release chan struct{}
-	stored  chan struct{}
+	once     sync.Once
+	sent     chan struct{}
+	release  chan struct{}
+	stored   chan struct{}
+	storeErr error // set before stored is closed
 }
 
 func (h *heldPublishJS) Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
@@ -79,6 +80,7 @@ func (h *heldPublishJS) Publish(ctx context.Context, subject string, data []byte
 	go func() {
 		<-h.release
 		ack, err := h.JetStream.Publish(context.Background(), subject, data, opts...)
+		h.storeErr = err
 		close(h.stored)
 		done <- result{ack, err}
 	}()
@@ -131,6 +133,7 @@ func TestRegistrationRemovedAfterInFlightPublish(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	close(held.release)
 	<-held.stored
+	require.NoError(t, held.storeErr, "the held publish must be stored, or an empty stream proves nothing")
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
