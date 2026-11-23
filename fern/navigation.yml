@@ -315,6 +315,9 @@ navigation:
     - page: BYOO Telemetry Compatibility
       path: ../docs/compute-plane/cluster-management/byoo-telemetry-compatibility.md
       slug: byoo-telemetry-compatibility
+    - page: Utils Provenance Protection
+      path: ../docs/compute-plane/cluster-management/utils-provenance.md
+      slug: utils-provenance
   - section: Caching
     skip-slug: true
     contents:

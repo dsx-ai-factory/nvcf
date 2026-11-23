@@ -69,6 +69,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/miniservice/chartcache"
 	nvcaotel "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/otel"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/utilsprovenance/readiness"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
 	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
 	nvcfdra "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/dra"
@@ -116,6 +117,9 @@ type Reconciler struct {
 	// Cache of failed workload update attempts by revision to avoid unnecessary expensive operations like rendering.
 	failedWorkloadUpdateRevisionCache     map[string]error
 	failedWorkloadUpdateRevisionCacheLock sync.RWMutex
+
+	// HA instances serving fewer utils replicas than desired, for the degraded-instances gauge.
+	utilsDegraded utilsDegradedTracker
 }
 
 // permissionCheckerFunc checks if c can perform a minimal set of actions on an object
@@ -160,6 +164,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := r.Client.Get(ctx, req.NamespacedName, ms); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("MiniService was deleted, skipping requeue")
+			r.Metrics.SetUtilsReplicasDegradedInstances(r.utilsDegraded.set(req.NamespacedName, false))
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -209,6 +214,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	)
 	if msCopy.DeletionTimestamp == nil && srerr == nil {
 		controllerutil.AddFinalizer(msCopy, finalizer)
+
+		// Evaluate the utils replica gate on every reconcile. The utils Deployment path does not exist yet, so one bare utils
+		// pod is created whatever the answer. The plan makes a refused request visible in the log, and reports an HA
+		// instance that lost its safety proof as degraded without shrinking it. Cleanup is not gated, it is the other branch.
+		utilsPlan := r.effectiveUtilsReplicas(log, msCopy)
+		if SetUtilsProvenanceDegraded(msCopy, utilsPlan) {
+			log.Info("Updated the utils provenance degraded condition")
+		}
 
 		// Detect spec changes (e.g., helm values update) that require a re-render.
 		if err := r.prepareUpdateIfNeeded(ctx, msCopy); err != nil {
@@ -266,6 +279,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		}
 
 		msCopy.Status.ObservedGeneration = msCopy.Generation
+		if rerr == nil {
+			res = requeueWhileUtilsDegraded(utilsPlan, res)
+		}
 	} else {
 		log.V(1).Info("Performing cleanup action")
 		res, rerr = r.doCleanup(ctx, msCopy)
@@ -664,8 +680,11 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		r.ClusterRegion, r.ClusterName, functionName, taskName, true)
 
 	// Only add labels and annotations to workload objects. The pod webhook will handle applying metadata to pods.
-	genericWorkloadMutator := newGenericMutator(r.FeatureFlagFetcher, ms, icmsReq,
-		r.ClusterRegion, r.ClusterName, functionName, taskName, false)
+	genericWorkloadMutator := chainMutators(
+		newReservedMetadataMutator(r.UtilsProvenanceMode, log),
+		newGenericMutator(r.FeatureFlagFetcher, ms, icmsReq,
+			r.ClusterRegion, r.ClusterName, functionName, taskName, false),
+	)
 
 	if err := r.ensureInstanceNamespace(ctx, ms, icmsReq); err != nil {
 		return reconcile.Result{}, err
@@ -851,7 +870,15 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		return reconcile.Result{}, reconcile.TerminalError(err)
 	}
 
-	infraObjs = append(infraObjs, utilsPod)
+	// One bare utils pod, or the HA Deployment when that path is enabled and allowed (see utilsInfraObject).
+	hautils, err := r.utilsInfraObject(ctx, log, ms, utilsPod)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	utilsHA := hautils.Plan
+	if hautils.Apply != nil {
+		infraObjs = append(infraObjs, hautils.Apply)
+	}
 
 	if r.FeatureFlagFetcher.IsAttributeEnabled(featureflag.AttrNVLinkOptimized) &&
 		!workloadConfig.IsFeatureFlagEnabled(featureflag.DisableNVLinkComputeDomain) {
@@ -870,31 +897,23 @@ func (r *Reconciler) doInstall(ctx context.Context,
 		return reconcile.Result{}, err
 	}
 
-	// The utils pod has several init containers that may write files needed by workload pods,
-	// like secrets.json. These init containers should complete before applying workload objects.
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(utilsPod), utilsPod); err == nil {
-		// Ensure pod is in a healthy state so an initialized but errored pod
-		// does not result in workload apply.
-		schedulingTimeout := getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig)
-		if status := getPodStatus(utilsPod, r.K8sTimeConfig, schedulingTimeout); status.TerminalBad {
-			return reconcile.Result{}, reconcile.TerminalError(fmt.Errorf("utils pod is %s: %s", status.Status, status.Reason))
+	// The utils pods have init containers that may write files needed by workload pods, like secrets.json. These init
+	// containers should complete before applying workload objects.
+	if utilsHA.Replicas > 1 && hautils.Deployment != nil {
+		// Record the HA instance only after the Deployment exists, and only because the gate allowed it. An existing
+		// Deployment is recorded too, in case NVCA restarted before the record was saved.
+		dep := hautils.Deployment
+		if stored, err := getOwnedUtilsDeployment(ctx, r.Client, ms); err == nil && stored != nil {
+			dep = stored // the stored object has the defaults, so its digest is what a later scan will see
 		}
-		if !isInitContainersComplete(utilsPod) {
-			log.V(1).Info("Utils pod init containers have not completed, waiting for initialization event")
-			return reconcile.Result{}, nil
-		}
-		log.V(1).Info("Utils pod init containers have completed, proceeding with install")
-	} else if apierrors.IsNotFound(err) {
-		// Utils pod not found yet - may still be creating, wait for it.
-		log.V(1).Info("Utils pod not found yet, waiting for creation")
-		return reconcile.Result{Requeue: true}, nil
-	} else if k8sutil.IsTransientK8sError(err) {
-		log.V(1).Info("Transient error getting utils pod, will retry", "error", err)
-		return reconcile.Result{Requeue: true}, nil
-	} else {
-		log.Error(err, "Non-transient error getting utils pod")
-		return reconcile.Result{}, err
+		old, hadOld := recordedUtilsHA(ms)
+		rec := mergeTrustedDigests(old, hadOld, newUtilsHARecord(utilsHA.Replicas, dep), hautils.Apply != nil, readiness.Open(r.UtilsProvenanceGate))
+		recordUtilsHA(ms, rec)
 	}
+	if proceed, res, err := r.utilsInitState(ctx, ms, icmsReq, log, false); err != nil || !proceed {
+		return res, err
+	}
+	log.V(1).Info("Utils init containers have completed, proceeding with install")
 
 	err = r.applyWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...)
 	if err != nil {
@@ -1018,38 +1037,20 @@ func (r *Reconciler) doUpdateWorkload(ctx context.Context,
 	updateResourcesStatus(ms, resources)
 
 	// Only add labels and annotations to workload objects. The pod webhook will handle applying metadata to pods.
-	genericWorkloadMutator := newGenericMutator(r.FeatureFlagFetcher, ms, icmsReq,
-		r.ClusterRegion, r.ClusterName, functionName, taskName, false)
+	genericWorkloadMutator := chainMutators(
+		newReservedMetadataMutator(r.UtilsProvenanceMode, log),
+		newGenericMutator(r.FeatureFlagFetcher, ms, icmsReq,
+			r.ClusterRegion, r.ClusterName, functionName, taskName, false),
+	)
 
 	// The utils pod has several init containers that may write files needed by workload pods,
 	// like secrets.json. These init containers should complete before updating workload objects.
-	utilsPod := &corev1.Pod{}
-	utilsPodKey := client.ObjectKey{Namespace: ms.Spec.Namespace, Name: common.UtilsPodName}
-	switch err := r.Client.Get(ctx, utilsPodKey, utilsPod); {
-	case err == nil:
-		// Ensure pod is in a healthy state so an initialized but errored pod
-		// does not result in workload apply.
-		schedulingTimeout := getPodSchedulingTimeout(ctx, icmsReq, r.K8sTimeConfig)
-		if status := getPodStatus(utilsPod, r.K8sTimeConfig, schedulingTimeout); status.TerminalBad {
-			return reconcile.Result{}, reconcile.TerminalError(fmt.Errorf("utils pod is %s: %s", status.Status, status.Reason))
-		}
-		if !isInitContainersComplete(utilsPod) {
-			log.V(1).Info("Utils pod init containers have not completed, waiting for initialization event to update workload")
-			return reconcile.Result{}, nil
-		}
-		log.V(1).Info("Utils pod init containers have completed, proceeding with workload update")
-	case apierrors.IsNotFound(err):
-		// The utils pod must exist at this point in the instance's lifecycle,
-		// so NotFound errors are considered non-transient.
-		log.Error(err, "Utils pod expected to be found but was not during workload update")
-		return reconcile.Result{}, reconcile.TerminalError(err)
-	case k8sutil.IsTransientK8sError(err):
-		log.V(1).Info("Transient error getting utils pod, will retry", "error", err)
-		return reconcile.Result{Requeue: true}, nil
-	default:
-		log.Error(err, "Non-transient error getting utils pod during workload update")
-		return reconcile.Result{}, err
+	// The utils pod, or the replicas of an HA instance, must exist at this point in the instance's lifecycle, so a missing
+	// one is terminal.
+	if proceed, res, err := r.utilsInitState(ctx, ms, icmsReq, log, true); err != nil || !proceed {
+		return res, err
 	}
+	log.V(1).Info("Utils init containers have completed, proceeding with workload update")
 
 	if err := r.applySSAWorkload(ctx, ms, genericWorkloadMutator, workloadObjs...); err != nil {
 		if isTerminal(err) {
@@ -1341,7 +1342,8 @@ func (r *Reconciler) doCleanup(ctx context.Context, //nolint:gocyclo
 				if nvcatypes.IsInfraOwnedObject(lobjs[i]) {
 					lobjs = slices.Delete(lobjs, i, i+1)
 					i--
-				} else if t, ok := lobjs[i].(*corev1.Pod); ok && (t.Name == nvcastorage.SMBServerPodName || k8sutil.IsUtilsPod(t)) {
+				} else if t, ok := lobjs[i].(*corev1.Pod); ok && (t.Name == nvcastorage.SMBServerPodName ||
+					r.utilsPodRecognized(ms, t)) {
 					lobjs = slices.Delete(lobjs, i, i+1)
 					i--
 				}
@@ -1405,12 +1407,7 @@ func (r *Reconciler) doCleanup(ctx context.Context, //nolint:gocyclo
 
 	// The utils pod will have some termination grace period set for whichever workload it monitors.
 	// This will determine how long to allow workload objects to delete before infra is deleted.
-	var termGP time.Duration
-	utilsPod := &corev1.Pod{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ms.Spec.Namespace, Name: common.UtilsPodName}, utilsPod); err == nil &&
-		utilsPod.Spec.TerminationGracePeriodSeconds != nil {
-		termGP = time.Duration(*utilsPod.Spec.TerminationGracePeriodSeconds) * time.Second
-	}
+	termGP, _ := r.utilsTerminationGracePeriod(ctx, ms)
 
 	// Wait for workload objects to terminate before terminating infra objects unless a grace period is reached.
 	cleanupCond := meta.FindStatusCondition(ms.Status.Conditions, v1alpha1.MiniServiceConditionCleanupSuccessful)

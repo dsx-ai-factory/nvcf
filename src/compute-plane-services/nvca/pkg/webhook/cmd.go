@@ -53,6 +53,7 @@ import (
 	nvcametrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/cmdutil"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/utilsprovenance"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/sharedcluster"
@@ -66,6 +67,7 @@ const (
 
 func NewCommand() *cobra.Command {
 	var configFile string
+	var provenanceMode, rsControllerUser, depControllerUser string
 	cmd := &cobra.Command{
 		Use:     "webhook-server",
 		Short:   "NVIDIA Cluster Agent webhook server",
@@ -144,8 +146,22 @@ func NewCommand() *cobra.Command {
 				return err
 			}
 
+			mode, err := ParseUtilsProvenanceMode(provenanceMode)
+			if err != nil {
+				return err
+			}
+			// The provenance webhook is additive and its registration uses failurePolicy Ignore, so a setup failure
+			// is logged and the webhook is left unregistered instead of stopping the other webhooks.
+			provenance, err := newUtilsProvenanceConfig(ctx, cfg.Agent.KubeconfigPath, k8sClient, mode,
+				rsControllerUser, depControllerUser)
+			if err != nil {
+				log.WithError(err).Error("Failed to set up the utils provenance webhook, continuing without it")
+				provenance = nil
+			}
+
 			m := &webhookManager{
 				cfg:              cfg,
+				utilsProvenance:  provenance,
 				k8sClient:        k8sClient,
 				dcgmMetrics:      dcgmMetricsCfg,
 				readTimeout:      5 * time.Second,
@@ -173,6 +189,12 @@ func NewCommand() *cobra.Command {
 	}
 
 	cmd.PersistentFlags().StringVar(&configFile, "config", "", "Config file path")
+	cmd.PersistentFlags().StringVar(&provenanceMode, "utils-provenance-mode", string(UtilsProvenanceAudit),
+		"Utils provenance webhook mode: audit logs and counts what would be refused, enforce refuses it")
+	cmd.PersistentFlags().StringVar(&rsControllerUser, "utils-provenance-replicaset-controller-user",
+		utilsprovenance.DefaultReplicaSetController, "Username of the kube ReplicaSet controller as seen by admission")
+	cmd.PersistentFlags().StringVar(&depControllerUser, "utils-provenance-deployment-controller-user",
+		utilsprovenance.DefaultDeploymentController, "Username of the kube Deployment controller as seen by admission")
 
 	return cmd
 }
@@ -192,6 +214,9 @@ type webhookManager struct {
 	attrFetcher featureflag.AttributeFetcher
 
 	k8sClient kubernetes.Interface
+
+	// utilsProvenance configures the utils provenance validating webhook. Nil leaves it unregistered.
+	utilsProvenance *utilsProvenanceConfig
 
 	// sharedClusterOn is true when at least one node in the cluster has the "schedule" label,
 	// and false in all other cases.
@@ -355,14 +380,32 @@ func (m *webhookManager) startWebhooks(ctx context.Context, cancel context.Cance
 	}
 	handleWebhook(ctx, r, "/nvca-mutating-webhook", nvcaMutatingWebhook)
 
+	var miniserviceOpts []MiniserviceWebhookOption
+	if m.utilsProvenance != nil {
+		// Recognize utils pods of an HA instance by verified provenance, with the same identities and lookups the
+		// provenance webhook uses.
+		miniserviceOpts = append(miniserviceOpts, WithUtilsClassifier(m.utilsProvenance.engine))
+	}
 	miniserviceMuWH, err := NewMiniserviceMutatingWebhook(ctx,
 		"mutate-miniservice",
-		m.k8sClient)
+		m.k8sClient, miniserviceOpts...)
 	if err != nil {
 		log.WithError(err).Error("Error creating miniservice mutating webhook")
 		return err
 	}
 	handleWebhook(ctx, r, "/mutate-miniservice", miniserviceMuWH)
+
+	if m.utilsProvenance != nil {
+		provenanceWH, err := NewUtilsProvenanceWebhook(ctx,
+			utilsprovenance.WebhookName,
+			m.utilsProvenance.engine, m.utilsProvenance.mode)
+		if err != nil {
+			log.WithError(err).Error("Error creating utils provenance validating webhook")
+			return err
+		}
+		handleWebhook(ctx, r, "/validate-utils-provenance", provenanceWH)
+		log.WithField("mode", m.utilsProvenance.mode).Info("Registered the utils provenance webhook")
+	}
 
 	server := &http.Server{
 		Handler:      r,

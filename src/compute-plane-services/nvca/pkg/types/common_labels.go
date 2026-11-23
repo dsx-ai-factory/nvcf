@@ -68,8 +68,25 @@ const (
 	// WorkloadInstanceTypeLabel denotes what instance type will exist in a given namespace.
 	WorkloadInstanceTypeLabel = labelFQDNPrefix + "/workload-instance-type"
 
+	// PodRoleLabelKey is reserved for NVCA. It marks the role of an NVCF infrastructure pod. It is a discovery hint and
+	// grants no trust. Nothing sets or reads it yet.
+	PodRoleLabelKey = labelFQDNPrefix + "/pod-role"
+	// PodRoleValueUtils is the PodRoleLabelKey value of a worker utils pod.
+	PodRoleValueUtils = "utils"
+
 	WorkloadInstanceTypeValuePodSpec     = "pod_spec"
 	WorkloadInstanceTypeValueMiniService = "miniservice"
+
+	// UtilsProvenanceModeEnv is set by the operator on the NVCA container. Empty or "audit" only logs chart objects that
+	// carry reserved utils metadata, "enforce" strips it.
+	UtilsProvenanceModeEnv = "NVCA_UTILS_PROVENANCE_MODE"
+	// UtilsReplicasEnv is the requested number of utils pods per instance. Default 2 when UtilsHAEnabledEnv is true, 1
+	// otherwise. Values above 1 also need the rollout gate.
+	UtilsReplicasEnv = "NVCA_UTILS_REPLICAS"
+	// UtilsHAEnabledEnv turns on the utils Deployment path. Default false. It must stay off until the HA enablement
+	// blockers are resolved (duplicate infrastructure metering, credential compatibility across replicas, shared file
+	// safety) and the status, update and webhook paths are HA aware.
+	UtilsHAEnabledEnv = "NVCA_UTILS_HA_ENABLED"
 
 	// NVCFInstIDEnvKey is the function's instance ID.(podName/miniservice-name)
 	NVCFInstIDEnvKey = "NVCF_INSTANCE_ID"

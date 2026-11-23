@@ -80,7 +80,17 @@ const (
 
 	// Cluster attribute metrics
 	KataRuntimeIsolationEnabledMetricName = "nvca_kata_runtime_isolation_enabled"
-	MaintenanceModeStateMetricName        = "nvca_maintenance_mode_state"
+
+	// Utils provenance readiness metrics, set by the readiness check that proves enforcement and the scale RBAC.
+	UtilsProvenanceEnforcementVerifiedMetricName = "nvca_utils_provenance_enforcement_verified"
+	UtilsProvenanceRBACVerifiedMetricName        = "nvca_utils_provenance_rbac_verified"
+	UtilsProvenanceReadinessChecksMetricName     = "nvca_utils_provenance_readiness_checks_total"
+	UtilsProvenanceInventoryClearedMetricName    = "nvca_utils_provenance_inventory_cleared"
+	UtilsProvenanceInventorySuspectsMetricName   = "nvca_utils_provenance_inventory_suspects"
+	MaintenanceModeStateMetricName               = "nvca_maintenance_mode_state"
+
+	// UtilsReplicasDegradedInstancesMetricName is the number of HA utils instances serving fewer replicas than desired.
+	UtilsReplicasDegradedInstancesMetricName = "nvca_utils_replicas_degraded_instances"
 
 	// BYOO metrics
 	BYOOPlatformMetricsFederationStateMetricName = "nvca_byoo_platform_metrics_federation_state"
@@ -182,6 +192,21 @@ const (
 	UpstreamOperationRegister    = "register"
 	UpstreamOperationCredentials = "credentials"
 	UpstreamOperationJWKSPush    = "jwks-push"
+)
+
+// Readiness check names and outcomes for UtilsProvenanceReadinessChecksTotal. The readiness package asserts its own
+// outcome list equals AllUtilsProvenanceCheckOutcomes.
+const (
+	UtilsProvenanceCheckCanary = "canary"
+	UtilsProvenanceCheckRBAC   = "rbac"
+)
+
+// AllUtilsProvenanceChecks and AllUtilsProvenanceCheckOutcomes are the complete label value sets.
+var (
+	AllUtilsProvenanceChecks        = []string{UtilsProvenanceCheckCanary, UtilsProvenanceCheckRBAC}
+	AllUtilsProvenanceCheckOutcomes = []string{
+		"refused", "accepted", "other_denial", "inconclusive", "error", "verified", "exposed", "unverified",
+	}
 )
 
 // AllUpstreamOperations is the complete set of upstream operation label values.
@@ -304,6 +329,20 @@ type Metrics struct {
 	// Cluster attribute metrics
 	KataRuntimeIsolationEnabled *prometheus.GaugeVec
 
+	// Utils provenance readiness. EnforcementVerified is 1 only while the canary has been refused by the provenance
+	// webhook enough times in a row and recently. RBACVerified is 1 only while no instance account holds the
+	// protected scale or ephemeral container rights. Both stay 0 when the check is not running.
+	UtilsProvenanceEnforcementVerified *prometheus.GaugeVec
+	UtilsProvenanceRBACVerified        *prometheus.GaugeVec
+	UtilsProvenanceReadinessChecks     *prometheus.CounterVec
+	// UtilsProvenanceInventoryCleared is 1 only while a clean post-enforcement inventory scan covers the current state.
+	// UtilsProvenanceInventorySuspects is the number of reserved-metadata objects created while enforcement was not
+	// known to hold, at the last scan.
+	UtilsProvenanceInventoryCleared  *prometheus.GaugeVec
+	UtilsProvenanceInventorySuspects *prometheus.GaugeVec
+	// UtilsReplicasDegradedInstances is the number of HA utils instances that serve fewer replicas than desired.
+	UtilsReplicasDegradedInstances *prometheus.GaugeVec
+
 	// MaintenanceModeState reports the active maintenance mode: the series
 	// whose mode label matches the active mode is set to 1 and every other
 	// mode series is 0 (one-hot encoding). See SetMaintenanceModeState() for
@@ -392,6 +431,12 @@ func (m *Metrics) Destroy() {
 	prometheus.Unregister(m.ModelCacheReuseTotal)
 	prometheus.Unregister(m.ModelCacheReclaimedTotal)
 	prometheus.Unregister(m.KataRuntimeIsolationEnabled)
+	prometheus.Unregister(m.UtilsProvenanceEnforcementVerified)
+	prometheus.Unregister(m.UtilsProvenanceRBACVerified)
+	prometheus.Unregister(m.UtilsProvenanceReadinessChecks)
+	prometheus.Unregister(m.UtilsProvenanceInventoryCleared)
+	prometheus.Unregister(m.UtilsProvenanceInventorySuspects)
+	prometheus.Unregister(m.UtilsReplicasDegradedInstances)
 	prometheus.Unregister(m.MaintenanceModeState)
 	prometheus.Unregister(m.BYOOPlatformMetricsFederationState)
 	prometheus.Unregister(m.ClusterValidatorReady)
@@ -775,6 +820,41 @@ func NewDefaultMetrics(ncaID, clusterName, clusterGroup, version string, opts ..
 	}, withDefaultLabels())
 	// Initialize to 0 (disabled) so it appears on first Prometheus scrape
 	m.KataRuntimeIsolationEnabled.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+
+	m.UtilsProvenanceEnforcementVerified = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: UtilsProvenanceEnforcementVerifiedMetricName,
+		Help: "Whether the utils provenance webhook is proven to be enforcing (1=verified, 0=not verified)",
+	}, withDefaultLabels())
+	m.UtilsProvenanceEnforcementVerified.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+	m.UtilsProvenanceRBACVerified = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: UtilsProvenanceRBACVerifiedMetricName,
+		Help: "Whether no instance account holds the protected scale or ephemeral container rights (1=verified, 0=not verified)",
+	}, withDefaultLabels())
+	m.UtilsProvenanceRBACVerified.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+	m.UtilsProvenanceReadinessChecks = promFactory.NewCounterVec(prometheus.CounterOpts{
+		Name: UtilsProvenanceReadinessChecksMetricName,
+		Help: "Total utils provenance readiness checks by check (canary, rbac) and outcome.",
+	}, withDefaultLabels("check", "outcome"))
+	m.UtilsProvenanceInventoryCleared = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: UtilsProvenanceInventoryClearedMetricName,
+		Help: "Whether a clean post-enforcement inventory scan covers the current state (1=cleared, 0=not cleared)",
+	}, withDefaultLabels())
+	m.UtilsProvenanceInventoryCleared.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+	m.UtilsProvenanceInventorySuspects = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: UtilsProvenanceInventorySuspectsMetricName,
+		Help: "Reserved-metadata objects created while enforcement was not known to hold, at the last inventory scan",
+	}, withDefaultLabels())
+	m.UtilsProvenanceInventorySuspects.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+	m.UtilsReplicasDegradedInstances = promFactory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: UtilsReplicasDegradedInstancesMetricName,
+		Help: "HA utils instances serving fewer utils replicas than desired",
+	}, withDefaultLabels())
+	m.UtilsReplicasDegradedInstances.WithLabelValues(m.WithDefaultLabelValues()...).Set(0)
+	for _, check := range AllUtilsProvenanceChecks {
+		for _, outcome := range AllUtilsProvenanceCheckOutcomes {
+			m.UtilsProvenanceReadinessChecks.WithLabelValues(m.WithDefaultLabelValues(check, outcome)...)
+		}
+	}
 
 	m.MaintenanceModeState = promFactory.NewGaugeVec(prometheus.GaugeOpts{
 		Name: MaintenanceModeStateMetricName,
@@ -1212,6 +1292,50 @@ func (m *Metrics) SetKataRuntimeIsolationEnabled(enabled bool) {
 		val = 1.0
 	}
 	m.KataRuntimeIsolationEnabled.WithLabelValues(m.WithDefaultLabelValues()...).Set(val)
+}
+
+// SetUtilsProvenanceReadiness publishes the readiness gauges. Safe on a nil receiver.
+func (m *Metrics) SetUtilsProvenanceReadiness(enforcementVerified, rbacVerified bool) {
+	if m == nil {
+		return
+	}
+	b2f := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	m.UtilsProvenanceEnforcementVerified.WithLabelValues(m.WithDefaultLabelValues()...).Set(b2f(enforcementVerified))
+	m.UtilsProvenanceRBACVerified.WithLabelValues(m.WithDefaultLabelValues()...).Set(b2f(rbacVerified))
+}
+
+// SetUtilsProvenanceInventory publishes the inventory gauges. Safe on a nil receiver.
+func (m *Metrics) SetUtilsProvenanceInventory(cleared bool, suspects int) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if cleared {
+		v = 1
+	}
+	m.UtilsProvenanceInventoryCleared.WithLabelValues(m.WithDefaultLabelValues()...).Set(v)
+	m.UtilsProvenanceInventorySuspects.WithLabelValues(m.WithDefaultLabelValues()...).Set(float64(suspects))
+}
+
+// SetUtilsReplicasDegradedInstances publishes the number of degraded HA utils instances. Safe on a nil receiver.
+func (m *Metrics) SetUtilsReplicasDegradedInstances(n int) {
+	if m == nil {
+		return
+	}
+	m.UtilsReplicasDegradedInstances.WithLabelValues(m.WithDefaultLabelValues()...).Set(float64(n))
+}
+
+// IncUtilsProvenanceCheck counts one readiness check. Safe on a nil receiver.
+func (m *Metrics) IncUtilsProvenanceCheck(check, outcome string) {
+	if m == nil {
+		return
+	}
+	m.UtilsProvenanceReadinessChecks.WithLabelValues(m.WithDefaultLabelValues(check, outcome)...).Inc()
 }
 
 // SetMaintenanceModeState updates the maintenance-mode gauge: the series for

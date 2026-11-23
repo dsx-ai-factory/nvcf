@@ -2701,3 +2701,145 @@ func TestClusterValidatorMetrics_NetpolDirectionalSeries(t *testing.T) {
 	assert.Empty(t, gatherClusterValidatorSeries(t, reg, ClusterValidatorNetpolPairPassedMetricName),
 		"netpol series from the prior run must be pruned when the pair is gone")
 }
+
+func TestUtilsProvenanceReadinessMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	ctx := WithDefaultMetrics(context.Background(), "nca-123", "test-cluster", "test-group", "v1.0.0", WithRegisterer(reg))
+	m := FromContext(ctx)
+	t.Cleanup(func() { m.Destroy() })
+
+	value := func(name string, labels map[string]string) (float64, bool) {
+		mfs, err := reg.Gather()
+		require.NoError(t, err)
+		for _, mf := range mfs {
+			if mf.GetName() != name {
+				continue
+			}
+		metric:
+			for _, mt := range mf.Metric {
+				for k, v := range labels {
+					found := false
+					for _, l := range mt.Label {
+						if l.GetName() == k && l.GetValue() == v {
+							found = true
+						}
+					}
+					if !found {
+						continue metric
+					}
+				}
+				if mt.Gauge != nil {
+					return mt.Gauge.GetValue(), true
+				}
+				return mt.Counter.GetValue(), true
+			}
+		}
+		return 0, false
+	}
+
+	t.Run("initialized to zero on the first scrape", func(t *testing.T) {
+		for _, name := range []string{UtilsProvenanceEnforcementVerifiedMetricName, UtilsProvenanceRBACVerifiedMetricName,
+			UtilsProvenanceInventoryClearedMetricName, UtilsProvenanceInventorySuspectsMetricName,
+			UtilsReplicasDegradedInstancesMetricName} {
+			v, ok := value(name, nil)
+			assert.True(t, ok, name)
+			assert.Equal(t, 0.0, v, name)
+		}
+		for _, check := range AllUtilsProvenanceChecks {
+			for _, outcome := range AllUtilsProvenanceCheckOutcomes {
+				v, ok := value(UtilsProvenanceReadinessChecksMetricName, map[string]string{"check": check, "outcome": outcome})
+				assert.True(t, ok, "%s %s", check, outcome)
+				assert.Equal(t, 0.0, v)
+			}
+		}
+	})
+
+	t.Run("set and count", func(t *testing.T) {
+		m.SetUtilsProvenanceReadiness(true, false)
+		v, _ := value(UtilsProvenanceEnforcementVerifiedMetricName, nil)
+		assert.Equal(t, 1.0, v)
+		v, _ = value(UtilsProvenanceRBACVerifiedMetricName, nil)
+		assert.Equal(t, 0.0, v)
+
+		m.IncUtilsProvenanceCheck(UtilsProvenanceCheckCanary, "refused")
+		v, _ = value(UtilsProvenanceReadinessChecksMetricName, map[string]string{"check": "canary", "outcome": "refused"})
+		assert.Equal(t, 1.0, v)
+	})
+
+	t.Run("inventory gauges", func(t *testing.T) {
+		m.SetUtilsProvenanceInventory(true, 3)
+		v, _ := value(UtilsProvenanceInventoryClearedMetricName, nil)
+		assert.Equal(t, 1.0, v)
+		v, _ = value(UtilsProvenanceInventorySuspectsMetricName, nil)
+		assert.Equal(t, 3.0, v)
+	})
+
+	t.Run("degraded instances gauge", func(t *testing.T) {
+		m.SetUtilsReplicasDegradedInstances(2)
+		v, _ := value(UtilsReplicasDegradedInstancesMetricName, nil)
+		assert.Equal(t, 2.0, v)
+		m.SetUtilsReplicasDegradedInstances(0)
+		v, _ = value(UtilsReplicasDegradedInstancesMetricName, nil)
+		assert.Equal(t, 0.0, v)
+	})
+
+	t.Run("nil receiver is safe", func(t *testing.T) {
+		var nilMetrics *Metrics
+		assert.NotPanics(t, func() {
+			nilMetrics.SetUtilsReplicasDegradedInstances(1)
+			nilMetrics.SetUtilsProvenanceInventory(true, 1)
+			nilMetrics.SetUtilsProvenanceReadiness(true, true)
+			nilMetrics.IncUtilsProvenanceCheck("canary", "refused")
+		})
+	})
+}
+
+// TestUtilsProvenanceMetricsInitializedToZero checks that the utils provenance series exist on the first scrape, so
+// absent() alerts and rate() do not misfire before the first readiness check runs.
+func TestUtilsProvenanceMetricsInitializedToZero(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	ctx := WithDefaultMetrics(context.Background(), "nca-123", "test-cluster", "test-group", "v1.0.0", WithRegisterer(reg))
+	m := FromContext(ctx)
+	t.Cleanup(func() { m.Destroy() })
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	byName := map[string]*promdto.MetricFamily{}
+	for _, mf := range families {
+		byName[mf.GetName()] = mf
+	}
+
+	for _, name := range []string{
+		UtilsProvenanceEnforcementVerifiedMetricName,
+		UtilsProvenanceRBACVerifiedMetricName,
+		UtilsProvenanceInventoryClearedMetricName,
+		UtilsProvenanceInventorySuspectsMetricName,
+		UtilsReplicasDegradedInstancesMetricName,
+	} {
+		mf, ok := byName[name]
+		require.True(t, ok, "%s must be exported before any check runs", name)
+		require.Len(t, mf.Metric, 1, name)
+		assert.Equal(t, float64(0), mf.Metric[0].GetGauge().GetValue(), name)
+	}
+
+	mf, ok := byName[UtilsProvenanceReadinessChecksMetricName]
+	require.True(t, ok)
+	seen := map[string]bool{}
+	for _, metric := range mf.Metric {
+		var check, outcome string
+		for _, l := range metric.Label {
+			switch l.GetName() {
+			case "check":
+				check = l.GetValue()
+			case "outcome":
+				outcome = l.GetValue()
+			}
+		}
+		seen[check+"/"+outcome] = true
+		assert.Equal(t, float64(0), metric.GetCounter().GetValue(), "%s/%s", check, outcome)
+	}
+	for _, check := range AllUtilsProvenanceChecks {
+		for _, outcome := range AllUtilsProvenanceCheckOutcomes {
+			assert.True(t, seen[check+"/"+outcome], "missing series check=%s outcome=%s", check, outcome)
+		}
+	}
+}

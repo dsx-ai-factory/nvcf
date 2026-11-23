@@ -103,6 +103,9 @@ type AgentOptions struct {
 	NVCARunAsUserID  int64
 	NVCARunAsGroupID int64
 
+	// UtilsProvenance configures the utils provenance webhook.
+	UtilsProvenance UtilsProvenanceSettings
+
 	// gxcache Namespace
 	GXCacheNamespace     string
 	HelmRepositoryPrefix string
@@ -241,6 +244,7 @@ func (o *AgentOptions) sanitizedString() string {
 	sanitized.NVCAImageRepo = o.NVCAImageRepo
 	sanitized.NVCARunAsUserID = o.NVCARunAsUserID
 	sanitized.NVCARunAsGroupID = o.NVCARunAsGroupID
+	sanitized.UtilsProvenance = o.UtilsProvenance
 	sanitized.GXCacheNamespace = o.GXCacheNamespace
 	sanitized.CrowdstrikeNamespace = o.CrowdstrikeNamespace
 	sanitized.HelmRepositoryPrefix = o.HelmRepositoryPrefix
@@ -371,6 +375,7 @@ func (a *Agent) backendK8sCacheBuilder(
 		WithNGCServiceKeyFetcher(a.TokenFetcher).
 		WithNVCAImageRepo(a.NVCAImageRepo).
 		WithUIDGIDOverride(a.NVCARunAsUserID, a.NVCARunAsGroupID).
+		WithUtilsProvenance(a.UtilsProvenance).
 		WithGXCache(a.GXCacheNamespace, a.EnableGXCache).
 		WithCrowdstrike(a.CrowdstrikeNamespace).
 		WithHelmRepositoryPrefix(a.HelmRepositoryPrefix).

@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/utilsprovenance"
 	nvcfdra "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/dra"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/storage"
@@ -86,20 +87,39 @@ type miniserviceMutatingWebhook struct {
 	lastAccessedMu   sync.Mutex
 	metaLastAccessed map[string]time.Time
 
+	// classifier verifies the provenance of Deployment-managed utils pods. Nil means only the legacy bare utils pod is
+	// recognized, which is today's behavior.
+	classifier utilsprovenance.Classifier
+	// classifyBackoffs are the waits between re-verifications of a retryable classification. Nil means the default.
+	classifyBackoffs []time.Duration
+	// classifyBudget bounds one classification, retries included. Zero means the default.
+	classifyBudget time.Duration
+
 	// For testing.
 	now func() time.Time
 }
 
+// MiniserviceWebhookOption configures the miniservice mutating webhook.
+type MiniserviceWebhookOption func(*miniserviceMutatingWebhook)
+
+// WithUtilsClassifier makes the webhook recognize utils pods created by NVCA's utils Deployment, by verified provenance.
+// Without it only the legacy bare pod named utils is a utils pod.
+func WithUtilsClassifier(c utilsprovenance.Classifier) MiniserviceWebhookOption {
+	return func(w *miniserviceMutatingWebhook) { w.classifier = c }
+}
+
 // NewMiniserviceMutatingWebhook returns an HTTP handler for mutating miniservice objects.
-func NewMiniserviceMutatingWebhook(ctx context.Context, name string, k8sClient kubernetes.Interface) (http.Handler, error) {
-	wh, err := newMiniserviceMutatingWebhook(ctx, k8sClient)
+func NewMiniserviceMutatingWebhook(ctx context.Context, name string, k8sClient kubernetes.Interface,
+	opts ...MiniserviceWebhookOption) (http.Handler, error) {
+	wh, err := newMiniserviceMutatingWebhook(ctx, k8sClient, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return newStandaloneWebhook(ctx, name, wh)
 }
 
-func newMiniserviceMutatingWebhook(ctx context.Context, k8sClient kubernetes.Interface) (admission.Handler, error) {
+func newMiniserviceMutatingWebhook(ctx context.Context, k8sClient kubernetes.Interface,
+	opts ...MiniserviceWebhookOption) (admission.Handler, error) {
 	scheme := runtime.NewScheme()
 	registerScheme(scheme, corev1.SchemeGroupVersion,
 		&corev1.Pod{},
@@ -115,6 +135,9 @@ func newMiniserviceMutatingWebhook(ctx context.Context, k8sClient kubernetes.Int
 		metaCache:            make(map[string]nvcatypes.MiniserviceMetadata),
 		metaLastAccessed:     make(map[string]time.Time),
 		now:                  time.Now,
+	}
+	for _, o := range opts {
+		o(wh)
 	}
 
 	go wh.metaCacheCleanup(ctx)
@@ -240,7 +263,14 @@ func (w *miniserviceMutatingWebhook) Handle(ctx context.Context, req admission.R
 
 	isCreate := req.Operation == admissionv1.Create
 
-	if pod, ok := obj.(*corev1.Pod); ok && pod.Name == translatecommon.UtilsPodName {
+	isUtils := false
+	if pod, ok := obj.(*corev1.Pod); ok {
+		var retryResp *admission.Response
+		if isUtils, retryResp = w.isUtilsPod(ctx, req, pod, isCreate); retryResp != nil {
+			return *retryResp
+		}
+	}
+	if isUtils {
 		if isCreate {
 			// Shared storage mutation does not need metadata.
 			if _, _, err := w.sharedStorageMutator.mutate(ctx, obj, nvcatypes.MiniserviceMetadata{}); err != nil {
@@ -286,6 +316,77 @@ func (w *miniserviceMutatingWebhook) Handle(ctx context.Context, req admission.R
 			fmt.Errorf("marshal mutated %s: %w", gvk, err))
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, mutated)
+}
+
+// defaultClassifyBackoffs mirror the provenance webhook: short waits that resolve a ReplicaSet that is not visible yet.
+var defaultClassifyBackoffs = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond}
+
+// classifyBudget bounds one classification, retries included.
+const classifyBudget = 3 * time.Second
+
+func retryableClassification(err error) utilsprovenance.Decision {
+	return utilsprovenance.Decision{
+		Reason: utilsprovenance.ReasonRetryLookup, Retryable: true,
+		Message: "could not verify the pod within the time budget, retry: " + err.Error(),
+	}
+}
+
+// isUtilsPod reports whether pod is a utils pod. The legacy bare pod is recognized by its name, as before. A pod that
+// claims the reserved label is a utils pod only when its provenance verifies (see utilsprovenance.Engine.ClassifyUtilsPod),
+// never because of the label. If verification cannot complete, the returned response refuses the request with a
+// retryable error: treating the pod as a chart pod would inject the wrong metadata and cannot be repaired afterward.
+func (w *miniserviceMutatingWebhook) isUtilsPod(ctx context.Context, req admission.Request, pod *corev1.Pod,
+	create bool) (bool, *admission.Response) {
+	if pod.Name == translatecommon.UtilsPodName {
+		return true, nil
+	}
+	if w.classifier == nil || pod.Labels[nvcatypes.PodRoleLabelKey] != nvcatypes.PodRoleValueUtils {
+		return false, nil
+	}
+	backoffs := w.classifyBackoffs
+	if backoffs == nil {
+		backoffs = defaultClassifyBackoffs
+	}
+	// One deadline bounds the whole sequence, retries and waits included, and leaves the rest of the admission timeout
+	// (10 seconds unless configured) for the mutation that follows. Each attempt's own lookup timeout is capped by it.
+	budget := w.classifyBudget
+	if budget <= 0 {
+		budget = classifyBudget
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	isUtils, d := w.classifier.ClassifyUtilsPod(ctx, req.UserInfo.Username, req.Namespace, pod, create)
+	for _, wait := range backoffs {
+		if !d.Retryable {
+			break
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			// Cancelled or out of time: stop now and refuse retryably. Never fall through to another attempt.
+			timer.Stop()
+			isUtils, d = false, retryableClassification(ctx.Err())
+		case <-timer.C:
+			isUtils, d = w.classifier.ClassifyUtilsPod(ctx, req.UserInfo.Username, req.Namespace, pod, create)
+		}
+		if d.Retryable && ctx.Err() != nil {
+			isUtils, d = false, retryableClassification(ctx.Err())
+			break
+		}
+	}
+	if d.Retryable {
+		core.GetLogger(ctx).WithFields(logrus.Fields{"namespace": req.Namespace, "name": req.Name, "reason": d.Reason}).
+			Warn("Could not verify a pod that claims to be a utils pod, refusing so it can be retried")
+		resp := admission.Response{AdmissionResponse: admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusServiceUnavailable, Reason: metav1.StatusReasonServiceUnavailable,
+				Message: utilsprovenance.FormatDenial(d),
+			},
+		}}
+		return false, &resp
+	}
+	return isUtils, nil
 }
 
 // decodeObject decodes raw admission bytes into a typed client.Object for known GVKs,
