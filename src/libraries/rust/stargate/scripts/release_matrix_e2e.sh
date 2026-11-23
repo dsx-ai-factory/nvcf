@@ -211,8 +211,8 @@ check_phase() {
             *) fail "${phase}: steady request ${index} did not complete (backend '${served}', body: $(head -c 300 "${run_dir}/last-body.txt"))" ;;
         esac
     done
-    [[ ${release_seen} -gt 0 && ${candidate_seen} -gt 0 ]] ||
-        fail "${phase}: steady traffic used one Pylon (release=${release_seen} candidate=${candidate_seen})"
+    # Both Pylons already served in the warm-up loop. Routing weights may send
+    # all steady requests to one of them, so only completion is required here.
     echo "    ok: release=${release_seen} candidate=${candidate_seen}"
 }
 
