@@ -276,6 +276,9 @@ func (p *HttpProxy) Proxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequ
 			}
 			var work pb.WorkerInvokeFunctionRequest
 			err = proto.Unmarshal(msg.Data, &work)
+			if err == nil && work.StatefulConfig == nil {
+				err = errors.New("no stateful config")
+			}
 			if err != nil {
 				zap.L().Warn("malformed stateful session reconnect message", zap.String("req id", work.RequestId), zap.Error(err))
 				continue

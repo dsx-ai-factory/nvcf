@@ -91,7 +91,15 @@ func TestProxy_EndToEnd(t *testing.T) {
 	inferenceServer.Start()
 	defer inferenceServer.Close()
 
-	httpProxy, err := NewHttpProxy(nc, js, functionId, functionVersionId,
+	// The worker gets its own connection so the test can close it as soon as
+	// Proxy returns, like a worker that is shutting down.
+	workerNc, err := nats.Connect(cluster.Clusters[0].Servers[0].ClientURL())
+	require.NoError(t, err)
+	defer workerNc.Close()
+	workerJs, err := jetstream.New(workerNc)
+	require.NoError(t, err)
+
+	httpProxy, err := NewHttpProxy(workerNc, workerJs, functionId, functionVersionId,
 		func(request *httputil.ProxyRequest) {
 			request.Out.URL.Scheme = "http"
 			request.Out.URL.Host = inferenceServer.Listener.Addr().String()
@@ -154,6 +162,8 @@ func TestProxy_EndToEnd(t *testing.T) {
 
 	// A malformed reconnect message must be skipped without crashing the loop.
 	require.NoError(t, nc.Publish("stateful_session.reconnect."+requestId, []byte{0xff, 0xff, 0xff}))
+	// So must one that decodes but has no connection details.
+	require.NoError(t, nc.Publish("stateful_session.reconnect."+requestId, nil))
 	require.NoError(t, nc.Flush())
 
 	// Send a reconnect for this request id as a request. The reconnect goroutine
@@ -185,7 +195,9 @@ func TestProxy_EndToEnd(t *testing.T) {
 		t.Fatal("Proxy did not return after teardown")
 	}
 
-	// Proxy removes the registration before it returns.
+	// Proxy removes the registration before it returns, so it is gone even
+	// when the worker closes NATS right away.
+	workerNc.Close()
 	infoCtx, infoCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer infoCancel()
 	info, err := stream.Info(infoCtx)
