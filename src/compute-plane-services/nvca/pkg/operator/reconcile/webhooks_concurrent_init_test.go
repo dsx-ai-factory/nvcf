@@ -420,6 +420,103 @@ func TestRotateTLSCert_AdoptsCertOnUpdateConflict(t *testing.T) {
 	assertWebhookCABundles(ctx, t, bc, winner.CACertBytes)
 }
 
+// A cluster left with webhooks trusting a different CA than the one that signed
+// the stored serving cert must have the stored CA republished, while the stored
+// cert itself is kept.
+func TestRepairWebhookCAMismatch_RepublishesStoredCA(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.updateWebhookCABundles(ctx, other.CACertBytes))
+	require.Error(t, webhookCAConsistency(ctx, bc, nb, now))
+
+	secrets := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb))
+	before, err := secrets.Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	assertWebhookCABundles(ctx, t, bc, before.Data[TLSCAName])
+
+	after, err := secrets.Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, before.Data, after.Data)
+}
+
+// A caBundle edited by hand on a single webhook must be detected and repaired.
+func TestRepairWebhookCAMismatch_RepairsHandEditedCABundle(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+
+	mwcs := bc.clients.K8s.AdmissionregistrationV1().MutatingWebhookConfigurations()
+	mwc, err := mwcs.Get(ctx, nvcaoptypes.NVCAModuleName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Greater(t, len(mwc.Webhooks), 1)
+	last := len(mwc.Webhooks) - 1
+	mwc.Webhooks[last].ClientConfig.CABundle = other.CACertBytes
+	_, err = mwcs.Update(ctx, mwc, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+}
+
+// Consistent certs and caBundles must be left alone, without any writes.
+func TestRepairWebhookCAMismatch_NoOpWhenConsistent(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	cs := bc.clients.K8s.(*fake.Clientset)
+	cs.ClearActions()
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.False(t, repaired)
+	for _, a := range cs.Actions() {
+		assert.Equal(t, "get", a.GetVerb(), "unexpected %s of %s", a.GetVerb(), a.GetResource().Resource)
+	}
+}
+
+// When the stored cert is itself unusable, the repair must replace it and publish
+// the replacement's CA, rather than republish a CA for a cert that can't be served.
+func TestRepairWebhookCAMismatch_ReplacesUnusableCert(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now.AddDate(-2, 0, 0)))
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+}
+
+// Before setup has published any webhook configuration there is nothing to repair,
+// and the repair must not create cert material on its own.
+func TestRepairWebhookCAMismatch_SkipsBeforeWebhooksArePublished(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, time.Now().UTC())
+	require.NoError(t, err)
+	assert.False(t, repaired)
+	_, err = bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb)).
+		Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	assert.True(t, k8serrors.IsNotFound(err))
+}
+
 // A newly minted certificate is stored together with its CA in the serving cert
 // Secret, so the pair can never be written half by one reconcile and half by another.
 func TestEnsureWebhookCert_StoresCAWithServingCert(t *testing.T) {

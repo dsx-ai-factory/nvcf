@@ -23,6 +23,8 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
@@ -121,6 +123,105 @@ func (bc *BackendK8sCache) rotateTLSCert(ctx context.Context, nb *nvidiaiov1.NVC
 		return fmt.Errorf("update webhook caBundles: %w", err)
 	}
 	return nil
+}
+
+// repairWebhookCAMismatch republishes the webhook CA when the stored serving cert
+// does not verify against the caBundle of an NVCA webhook. Setup publishes them
+// together, but only runs when the configuration changes, so a mismatch left by an
+// earlier operator or a manual edit otherwise persists. A stored cert that is still
+// usable is kept and only the caBundles are rewritten; an unusable one is replaced
+// through ensureWebhookCert. It reports whether anything was repaired.
+func (bc *BackendK8sCache) repairWebhookCAMismatch(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) (bool, error) {
+	log := core.GetLogger(ctx)
+
+	bundles, err := bc.webhookCABundles(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(bundles) == 0 {
+		return false, nil
+	}
+
+	stored, _, ok, err := bc.reusableWebhookCert(ctx, nb, now)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		servingCert, err := parseCertPEM(stored.TLSCert)
+		if err != nil {
+			return false, fmt.Errorf("decode stored webhook serving cert: %w", err)
+		}
+		mismatched := mismatchedWebhookCABundles(servingCert, bundles, nb, now)
+		if len(mismatched) == 0 {
+			return false, nil
+		}
+		log.Warnf("Webhook serving cert does not verify against the caBundle of %v, republishing the stored CA",
+			strings.Join(mismatched, ", "))
+		if err := bc.updateWebhookCABundles(ctx, stored.CACertBytes); err != nil {
+			return false, fmt.Errorf("republish webhook CA: %w", err)
+		}
+		return true, nil
+	}
+
+	log.Warn("Stored webhook TLS certs are unusable while webhooks are published, replacing them")
+	webhookCert, err := bc.ensureWebhookCert(ctx, nb, now)
+	if err != nil {
+		return false, err
+	}
+	if err := bc.setupWebhookSecrets(ctx, nb, webhookCert); err != nil {
+		return false, fmt.Errorf("update webhook secrets: %w", err)
+	}
+	if err := bc.updateWebhookCABundles(ctx, webhookCert.CACertBytes); err != nil {
+		return false, fmt.Errorf("update webhook caBundles: %w", err)
+	}
+	return true, nil
+}
+
+// webhookCABundles returns the caBundle of every webhook in the NVCA validating and
+// mutating webhook configurations, keyed by configuration kind and webhook name.
+// Configurations that do not exist yet are skipped.
+func (bc *BackendK8sCache) webhookCABundles(ctx context.Context) (map[string][]byte, error) {
+	admission := bc.clients.K8s.AdmissionregistrationV1()
+	name := nvcaoptypes.NVCAModuleName
+	bundles := map[string][]byte{}
+
+	vwc, err := admission.ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case k8serrors.IsNotFound(err):
+	case err != nil:
+		return nil, fmt.Errorf("get %v ValidatingWebhookConfiguration: %w", name, err)
+	default:
+		for _, w := range vwc.Webhooks {
+			bundles["ValidatingWebhookConfiguration/"+w.Name] = w.ClientConfig.CABundle
+		}
+	}
+
+	mwc, err := admission.MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case k8serrors.IsNotFound(err):
+	case err != nil:
+		return nil, fmt.Errorf("get %v MutatingWebhookConfiguration: %w", name, err)
+	default:
+		for _, w := range mwc.Webhooks {
+			bundles["MutatingWebhookConfiguration/"+w.Name] = w.ClientConfig.CABundle
+		}
+	}
+	return bundles, nil
+}
+
+// mismatchedWebhookCABundles returns, sorted, the webhooks whose caBundle the
+// serving cert does not verify against.
+func mismatchedWebhookCABundles(servingCert *x509.Certificate, bundles map[string][]byte,
+	nb *nvidiaiov1.NVCFBackend, now time.Time) []string {
+	var mismatched []string
+	for webhook, caBundle := range bundles {
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caBundle) || verifyWebhookServingCert(servingCert, roots, nb, now) != nil {
+			mismatched = append(mismatched, webhook)
+		}
+	}
+	sort.Strings(mismatched)
+	return mismatched
 }
 
 // updateWebhookCABundles sets caBundle on every webhook in the NVCA validating and
