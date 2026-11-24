@@ -3014,7 +3014,10 @@ struct rt { int oif, type, len, family; unsigned char dst[16]; };
 /* The routes of address family FAM in every table, as UCX reads them
  * (RTM_GETROUTE dump; a route without an interface or a destination it
  * needs is left out): each to EACH as it arrives, however many there are.
- * Their count, or -1. */
+ * Their count, -1, or RT_DUMP_INTR when the kernel marked the dump
+ * interrupted (NLM_F_DUMP_INTR: the tables changed during it, and a route
+ * may be missing): what went to EACH is then incomplete. */
+#define RT_DUMP_INTR (-2)
 static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
 {
     struct { struct nlmsghdr h; struct rtmsg r; } req = {
@@ -3022,7 +3025,7 @@ static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
         { .rtm_family = (unsigned char)fam } };
     char buf[16384] __attribute__((aligned(8)));
     struct timeval tv = { 1, 0 };
-    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE), k = 0, done = 0;
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE), k = 0, done = 0, intr = 0;
     if (fd < 0) return -1;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (send(fd, &req, req.h.nlmsg_len, 0) != (ssize_t)req.h.nlmsg_len) done = 1, k = -1;
@@ -3031,6 +3034,7 @@ static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
         int left = (int)got;
         if (got <= 0) { k = -1; break; }
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_flags & NLM_F_DUMP_INTR) intr = 1;
             if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR) {
                 if (h->nlmsg_type == NLMSG_ERROR) k = -1;
                 done = 1;
@@ -3051,7 +3055,7 @@ static int rt_dump(int fam, void (*each)(const struct rt *, void *), void *arg)
         }
     }
     close(fd);
-    return k;
+    return k >= 0 && intr ? RT_DUMP_INTR : k;
 }
 
 struct rt_match { const unsigned char *a; int bits, oif, type, best, dev; };
@@ -3069,7 +3073,8 @@ static void rt_match(const struct rt *e, void *arg)
 
 /* The longest prefix among the routes that hold SA, out of interface OIF
  * (any when < 0) and of type TYPE (any when 0); its interface in *DEV.
- * -1 if none. */
+ * -1 if none, or if every dump was interrupted (read up to 3 times: a
+ * partial one could miss the longer prefix and name the wrong interface). */
 static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
 {
     struct rt_match q = {
@@ -3077,7 +3082,13 @@ static int rt_len(const struct sockaddr *sa, int oif, int type, int *dev)
         : sa->sa_family == AF_INET6 ? (const unsigned char *)&((const struct sockaddr_in6 *)sa)->sin6_addr
         : NULL,
         sa->sa_family == AF_INET ? 32 : 128, oif, type, -1, -1 };
-    if (!q.a || rt_dump(sa->sa_family, rt_match, &q) < 0) return -1;
+    if (!q.a) return -1;
+    int k = RT_DUMP_INTR;
+    for (int i = 0; i < 3 && k == RT_DUMP_INTR; i++) {
+        q.best = q.dev = -1;
+        k = rt_dump(sa->sa_family, rt_match, &q);
+    }
+    if (k < 0) return -1;
     if (q.best >= 0) *dev = q.dev;
     return q.best;
 }

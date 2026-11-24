@@ -16,7 +16,10 @@ again. The test checks that
     local, a TEST-NET address has no route, and one with a route only in
     table 200, as the RoCE interfaces in a pod have, has one), for UCX 1.22;
   * any other UCX version keeps UCX's answers;
-  * a route the kernel lists after more than 1,024 others still counts.
+  * a route the kernel lists after more than 1,024 others still counts;
+  * a dump the kernel marks interrupted (the tables changed during it) is
+    read again, and is never used: a partial one could miss the longest
+    prefix (RouteDumpInterrupted, no root needed).
 
 Needs root, or passwordless sudo, for the network namespace.
 Run: python3 -I tests/gpushare/host/test_ucx_routes.py
@@ -32,7 +35,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_mx_host import CUDA_INC, build  # noqa: E402
+from test_mx_host import CUDA_INC, SRC, build  # noqa: E402
 
 # UCX's answers: route length 99 and local interface 42, which the kernel never gives.
 UCS = r"""
@@ -211,6 +214,77 @@ class UcxRoutes(unittest.TestCase):
         out, err = self.run_probe(21, True)
         self.assert_ucx(out, "then")
         self.assertIn("is not 1.22", err)
+
+
+# Calls the route lookup in the library's own code, with recv wrapped: the
+# first N dumps (argv[1]) come back marked interrupted, as the kernel marks
+# a dump the routing tables changed under.
+INTR_PROBE = r"""
+#define _GNU_SOURCE
+#include <sys/types.h>
+#include <sys/socket.h>
+static ssize_t probe_recv(int fd, void *b, size_t n, int f);
+#define recv probe_recv
+#include "gpushare.c"
+#undef recv
+
+static int intr_left;
+static ssize_t probe_recv(int fd, void *b, size_t n, int f)
+{
+    ssize_t r = recv(fd, b, n, f);
+    int dom = 0;
+    socklen_t l = sizeof(dom);
+    if (r <= 0 || !intr_left || getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &dom, &l) || dom != AF_NETLINK) return r;
+    int left = (int)r;
+    for (struct nlmsghdr *h = b; NLMSG_OK(h, left); h = NLMSG_NEXT(h, left)) {
+        h->nlmsg_flags |= NLM_F_DUMP_INTR;
+        if (h->nlmsg_type == NLMSG_DONE) intr_left--;
+    }
+    return r;
+}
+
+int main(int argc, char **argv)
+{
+    intr_left = argc > 1 ? atoi(argv[1]) : 0;
+    struct sockaddr_in lo = { .sin_family = AF_INET, .sin_addr = { htonl(INADDR_LOOPBACK) } };
+    int dev = -1, len = rt_len((struct sockaddr *)&lo, -1, RTN_LOCAL, &dev);
+    printf("len=%d dev=%d intr_left=%d\n", len, dev, intr_left);
+    return 0;
+}
+"""
+
+
+class RouteDumpInterrupted(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("gcc") or not os.path.exists(os.path.join(CUDA_INC, "cuda.h")):
+            raise unittest.SkipTest("needs gcc and cuda.h (CUDA_INC)")
+        cls.tmp = tempfile.mkdtemp()
+        build(cls.tmp)
+        with open(os.path.join(cls.tmp, "intr.c"), "w") as f:
+            f.write(INTR_PROBE)
+        cls.probe_bin = os.path.join(cls.tmp, "intr")
+        subprocess.run(["gcc", "-O2", "-Wall", "-Werror", "-Wno-unused-function", "-I", SRC, "-I", CUDA_INC,
+                        "-o", cls.probe_bin, os.path.join(cls.tmp, "intr.c"), os.path.join(cls.tmp, "libcuda.so.1"),
+                        "-Wl,-rpath," + cls.tmp, "-ldl", "-lpthread"], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def lookup(self, interrupted):
+        p = subprocess.run([self.probe_bin, str(interrupted)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return dict(kv.split("=", 1) for kv in p.stdout.split())
+
+    def test_interrupted_dump_is_read_again(self):
+        self.assertEqual(self.lookup(0), {"len": "32", "dev": "1", "intr_left": "0"})  # 127.0.0.1, local, on lo
+        self.assertEqual(self.lookup(1), {"len": "32", "dev": "1", "intr_left": "0"})
+
+    def test_dump_interrupted_every_time_is_not_used(self):
+        out = self.lookup(100)
+        self.assertEqual(out["len"], "-1", "an interrupted dump's partial result was used: %s" % out)
+        self.assertEqual(out["intr_left"], "97", "the dump was not read 3 times: %s" % out)
 
 
 if __name__ == "__main__":
