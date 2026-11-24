@@ -14,10 +14,12 @@ the node's DIR/resumed marker in DIR/o. Each test runs the sequence the
 agent runs for a capture left running: suspend, stop (the holder hands the
 processes over stopped and exits), resume. The test checks that
 
-  * with --sync-open the resume holds the launches ("resume hold"), writes
-    DIR/resumed, and sends "open" only after the driver's "<token> open",
-    and only for its own token (a verdict for another token, as from an
-    earlier round, is ignored);
+  * with --sync-open the resume holds the launches and takes the tool's
+    lease on them in one request ("resume hold lease"; a library without
+    it gets "resume hold", then "lease"), writes DIR/resumed, and sends
+    "open" only after the driver's "<token> open", and only for its own
+    token (a verdict for another token, as from an earlier round, is
+    ignored);
   * a process whose library has no "resume hold" (it opens at its resume)
     makes the resume say it was not synced;
   * an "abort" verdict, or no verdict by the --sync-open deadline (also
@@ -68,6 +70,8 @@ RANK = r"""
 import ctypes, os, socket, sys, threading, time
 log = open(sys.argv[1], "a")
 old_lib = len(sys.argv) > 2 and sys.argv[2] == "old"  # a library without "resume hold"
+# A library with "resume hold" and "lease", but not "resume hold lease".
+no_hold_lease = old_lib or (len(sys.argv) > 2 and sys.argv[2] == "nolease")
 libc = ctypes.CDLL(None, use_errno=True)
 libc.prctl(0x59616d61, ctypes.c_ulong(-1 & 0xffffffffffffffff), 0, 0, 0)  # PR_SET_PTRACER, any
 s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -88,6 +92,8 @@ def serve():
         elif cmd == "quiesce":
             rep = "ok quiesced"
         elif cmd == "resume hold" and not old_lib:
+            held, rep = True, "ok resumed (0 multicast bind(s), 0 multicast mapping(s)); launches held until open"
+        elif cmd == "resume hold lease" and not no_hold_lease:
             held, rep = True, "ok resumed (0 multicast bind(s), 0 multicast mapping(s)); launches held until open"
         elif cmd == "resume":
             held, rep = False, "ok resumed (0 multicast bind(s), 0 multicast mapping(s))"
@@ -258,16 +264,15 @@ class SyncOpen(unittest.TestCase):
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         names = [c for _, c in cmds]
-        self.assertIn("resume hold", names, "the in-place resume did not hold the launches: %s\n%s" % (names, out))
+        # One request holds the launches and takes this tool's lease on them.
+        self.assertIn("resume hold lease", names, "the in-place resume did not hold the launches: %s\n%s" % (names, out))
         self.assertNotIn("resume", names, "a plain resume opened the gates at once: %s" % names)
+        self.assertNotIn("lease", names, "a lease taken apart from the held resume: %s" % names)
         self.assertEqual(len(self.at(cmds, "open")), 1, "%s\n%s" % (names, out))
         self.assertIsNotNone(drv.verdict_at, "the node never wrote its resumed marker:\n" + out)
         self.assertGreaterEqual(self.at(cmds, "open")[0], drv.verdict_at,
                                 "the gates opened before every node had resumed:\n" + out)
-        self.assertLess(self.at(cmds, "resume hold")[0], drv.verdict_at)
-        lease = self.at(cmds, "lease")
-        self.assertEqual(len(lease), 1, "the held launches have no lease on this tool: %s" % names)
-        self.assertTrue(self.at(cmds, "resume hold")[0] <= lease[0] <= drv.verdict_at, names)
+        self.assertLess(self.at(cmds, "resume hold lease")[0], drv.verdict_at)
         self.assertRegex(drv.token, r"^[0-9]+-[0-9]+$")
         self.assertNotIn(UNSYNCED, out)
         self.assertIn("sync-open: every node resumed", out)
@@ -336,10 +341,24 @@ class SyncOpen(unittest.TestCase):
         names = [c for _, c in cmds]
         self.assertIn("resume", names, out)
         self.assertNotIn("resume hold", names, out)
+        self.assertNotIn("resume hold lease", names, out)
         self.assertNotIn("open", names, out)
         self.assertNotIn("lease", names, out)
         self.assertFalse(os.path.exists(os.path.join(self.fabric, "resumed")), "a marker without --sync-open")
         self.assertNotIn("sync-open", out)
+
+    def test_library_without_resume_hold_lease_gets_a_lease_after_resume_hold(self):
+        self.start_rank("nolease")
+        drv = Driver(self.fabric, "open", delay=1.5)
+        r, _, cmds = self.cycle(drv, 30000)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        names = [c for _, c in cmds]
+        held, lease = self.at(cmds, "resume hold"), self.at(cmds, "lease")
+        self.assertEqual((len(held), len(lease)), (1, 1), "the held launches have no lease on this tool: %s" % names)
+        self.assertTrue(held[0] <= lease[0] <= drv.verdict_at, names)
+        self.assertEqual(len(self.at(cmds, "open")), 1, out)
+        self.assertIn("sync-open: every node resumed", out)
 
     def test_library_without_resume_hold_is_not_synced(self):
         self.start_rank("old")

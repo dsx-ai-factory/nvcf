@@ -904,18 +904,25 @@ static int remap_all(const int *pids, int n)
 }
 
 /* --hold-gate: "resume hold" each pid; a library that predates it resumes
- * and opens its gate at once, as before. */
+ * and opens its gate at once, as before. --sync-open: "resume hold lease",
+ * which takes this tool's lease on the held launches in the same request,
+ * so that there is no moment where they are held and this tool's death
+ * would not open them; a library without it gets "resume hold", then
+ * "lease". */
 static int resume_held(const int *pids, int n)
 {
     int count = 0;
     for (int i = 0; i < n; i++) {
-        int r = ctl(pids[i], "resume hold");
-        if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
-        else if (r == 0 && sync_gate && ctl(pids[i], "lease") < 0)
-            /* An older library has no "lease": if this tool dies before
-             * open_synced, that pid's launches stay held. */
-            fprintf(stderr, "pid=%d: no lease on its held launches; they stay held if this tool dies before it opens them\n",
-                    pids[i]);
+        int r = sync_gate ? ctl(pids[i], "resume hold lease") : -3;
+        if (r == -3) {
+            r = ctl(pids[i], "resume hold");
+            if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
+            else if (r == 0 && sync_gate && ctl(pids[i], "lease") < 0)
+                /* An older library has no "lease": if this tool dies before
+                 * open_synced, that pid's launches stay held. */
+                fprintf(stderr, "pid=%d: no lease on its held launches; they stay held if this tool dies before it opens them\n",
+                        pids[i]);
+        }
         if (r < 0) return r;
         count += r == 0;
     }

@@ -16,6 +16,9 @@ SYNC_MS and counts its calls. The test checks that
     it was called;
   * a quiesce that finds the GPU busy while launches are held keeps them
     held (the ranks are catching up), and opens the gates otherwise;
+  * a held resume with a lease ("resume hold lease") keeps the gates
+    closed while its sender lives, and opens them once it exits, also when
+    it was gone before the library took the lease;
   * when the process that sent "hold" exits, the gates open again, also
     when the state lock is busy at that moment (retried until it is free),
     and also after a "resume" from it that failed, or an "open" that found
@@ -228,6 +231,47 @@ int main(int argc, char **argv)
         printf("closed_after_exit=%d\n", closed(&lgate));
         return 0;
     }
+    if (argc > 1 && (!strcmp(argv[1], "holdlease") || !strcmp(argv[1], "holdleasegone"))) {
+        /* --sync-open's resume: one request resumes with the launches held
+         * and takes the sender's lease. holdlease: the sender lives on
+         * after the reply, then exits. holdleasegone: the sender is gone
+         * (exited and reaped) before the library gets to its request (the
+         * state lock is busy until then). Each way the gates open once
+         * the sender is gone, and not before. */
+        int gone = !strcmp(argv[1], "holdleasegone");
+        start_ctl();
+        hold_launches();
+        if (gone) pthread_mutex_lock(&mu);
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b;
+            if (gone) {
+                alarm(1);  /* dies waiting for the reply */
+                request(getppid(), "resume hold lease", -1, rep, sizeof(rep), NULL);
+                _exit(1);
+            }
+            int ok = request(getppid(), "resume hold lease", -1, rep, sizeof(rep), NULL) == 0 && !strncmp(rep, "ok resumed", 10);
+            if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        if (gone) {
+            waitpid(c, NULL, 0);
+            printf("closed_while_locked=%d\n", closed(&lgate));
+            pthread_mutex_unlock(&mu);
+        } else {
+            char b = 0;
+            if (read(up[0], &b, 1) != 1) return 4;
+            usleep(300000);
+            printf("resume=%c closed_while_alive=%d\n", b, closed(&lgate));
+            if (write(down[1], "x", 1) != 1) return 5;
+            waitpid(c, NULL, 0);
+        }
+        for (int i = 0; i < 300 && closed(&lgate); i++) usleep(10000);
+        printf("closed_after_exit=%d\n", closed(&lgate));
+        return 0;
+    }
     if (argc > 1 && (!strcmp(argv[1], "leasebusy") || !strcmp(argv[1], "resumefail") || !strcmp(argv[1], "releasefail"))) {
         /* leasebusy: the holder exits while the state lock is busy.
          * resumefail: the holder's "resume" fails on the busy state lock,
@@ -386,6 +430,17 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["closed_while_alive"], "1", out)
         self.assertEqual(out["closed_after_exit"], "0",
                          "launches held by \"resume hold\" stayed held after the tool that would open them exited")
+
+    def test_held_resume_takes_the_lease_of_its_sender(self):
+        out = self.probe("holdlease")
+        self.assertEqual(out["resume"], "1", out)
+        self.assertEqual(out["closed_while_alive"], "1", "the held resume let the launches through")
+        self.assertEqual(out["closed_after_exit"], "0", "the tool that sent the held resume exited: launches stayed held")
+
+    def test_held_resume_from_a_sender_already_gone_opens(self):
+        out = self.probe("holdleasegone")
+        self.assertEqual(out["closed_while_locked"], "1", out)
+        self.assertEqual(out["closed_after_exit"], "0", "a held resume whose sender was gone left the launches held")
 
     def test_open_ends_the_lease(self):
         out = self.probe("resumeleaseopen")
