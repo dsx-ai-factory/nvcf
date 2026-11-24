@@ -25,7 +25,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 func guardLog() *logrus.Entry {
@@ -237,6 +239,36 @@ func TestWatchMembersAfterResume_Sidecars(t *testing.T) {
 	err := watchMembersAfterResume(context.Background(), cs, []memberBaseline{baselineOf(a)}, fastWatch)
 	if !errors.Is(err, errResumeStalled) || !strings.Contains(err.Error(), "container proxy restarted") {
 		t.Fatalf("a sidecar restarted after the resume: %v, want a stall naming it", err)
+	}
+}
+
+// A pod read that never returns (an API server that accepts and does not
+// answer) ends at the watch's deadline, and the watch fails as stalled.
+func TestWatchMembersAfterResume_ReadEndsAtTheDeadline(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-stop: // the test is over: let Close return
+		}
+	}))
+	defer srv.Close()
+	defer close(stop)
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- watchMembersAfterResume(context.Background(), cs, []memberBaseline{baselineOf(memberPod("a", true, 0))}, fastWatch)
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errResumeStalled) {
+			t.Fatalf("a read that never returned: %v, want stalled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watch ran past its deadline on a read that never returned")
 	}
 }
 

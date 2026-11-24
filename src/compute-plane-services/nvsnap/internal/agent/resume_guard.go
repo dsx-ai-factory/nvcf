@@ -164,16 +164,20 @@ func lastTermination(t *corev1.ContainerStateTerminated) string {
 // watchMembersAfterResume watches the members' pods after a leave-running
 // group capture resumed them: every one Ready within o.ReadyWait, then all
 // of them Ready for o.Steady, with no container restarted or ended and no
-// pod replaced. A failure, or a watch cut short, is errResumeStalled.
+// pod replaced. A failure, or a watch cut short, is errResumeStalled. Each
+// pod read ends at the watch's deadline (the kube client has no timeout of
+// its own); a read it ends counts as not Ready.
 func watchMembersAfterResume(ctx context.Context, cs kubernetes.Interface, members []memberBaseline, o resumeWatchOpts) error {
 	start := time.Now()
 	deadline := start.Add(o.ReadyWait + o.Steady)
+	readCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	var readySince time.Time
 	for {
 		allReady := true
 		var notReady []string
 		for _, b := range members {
-			fatal, ready, why := memberState(ctx, cs, b)
+			fatal, ready, why := memberState(readCtx, cs, b)
 			if fatal != "" {
 				return fmt.Errorf("%w: %s/%s: %s", errResumeStalled, b.ns, b.name, fatal)
 			}
