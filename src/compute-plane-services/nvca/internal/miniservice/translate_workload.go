@@ -65,7 +65,7 @@ func (r *Reconciler) translateWorkload(
 	switch icmsReq.Spec.Action {
 	case common.FunctionCreationAction:
 		if cmi := icmsReq.Spec.CreationMsgInfo; cmi.FunctionLaunchSpecification == nil ||
-			cmi.FunctionLaunchSpecification.HelmChartLaunchSpecification == nil {
+			!cmi.FunctionLaunchSpecification.HelmChartLaunchSpecification.Defined() {
 			return nil, fmt.Errorf("ICMSRequest %s creation message is invalid: missing function launch specification",
 				icmsReq.Name,
 			)
@@ -73,7 +73,7 @@ func (r *Reconciler) translateWorkload(
 		objs, err = r.translateFunctionWorkload(cmnTCfg, icmsReq)
 	case common.TaskCreationAction:
 		if cmi := icmsReq.Spec.CreationMsgInfo; cmi.TaskLaunchSpecification == nil ||
-			cmi.TaskLaunchSpecification.HelmChartLaunchSpecification == nil {
+			!cmi.TaskLaunchSpecification.HelmChartLaunchSpecification.Defined() {
 			return nil, fmt.Errorf("ICMSRequest %s creation message is invalid: missing task launch specification",
 				icmsReq.Name,
 			)

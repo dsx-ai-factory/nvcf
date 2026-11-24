@@ -261,13 +261,13 @@ func toLegacyAction(action common.MessageAction) common.MessageAction {
 
 func (c K8sComputeBackend) detectRequestType(req *nvcav2beta1.ICMSRequest) string {
 	if ls := req.Spec.CreationMsgInfo.FunctionLaunchSpecification; ls != nil {
-		if ls.HelmChartLaunchSpecification != nil {
+		if ls.HelmChartLaunchSpecification.Defined() {
 			return ftMiniService
 		}
 		return ftContainer
 	}
 	if ls := req.Spec.CreationMsgInfo.TaskLaunchSpecification; ls != nil {
-		if ls.HelmChartLaunchSpecification != nil {
+		if ls.HelmChartLaunchSpecification.Defined() {
 			return ftMiniService
 		}
 		return ftContainer
@@ -407,7 +407,7 @@ func (c K8sComputeBackend) translateFunctionLaunchSpecification(
 		out.Reset()
 	}
 
-	if msg.LaunchSpecification.HelmChartLaunchSpecification != nil {
+	if msg.LaunchSpecification.HelmChartLaunchSpecification.Defined() {
 		hchartArtSpec := nvcatypes.HelmChartArtifactSpec{}
 		hcCfg, err := common.ExtractHelmConfiguration(
 			msg.LaunchSpecification.EnvironmentB64,

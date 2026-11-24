@@ -41,7 +41,7 @@ func Translate(t CreationQueueMessage, tcfg TranslateConfig) (objs []metav1.Obje
 	tcfg.Default()
 
 	switch {
-	case t.LaunchSpecification.HelmChartLaunchSpecification != nil:
+	case t.LaunchSpecification.HelmChartLaunchSpecification.Defined():
 		objs, err = translateHelmChart(t, tcfg)
 	default:
 		objs, err = translateContainer(t, tcfg)

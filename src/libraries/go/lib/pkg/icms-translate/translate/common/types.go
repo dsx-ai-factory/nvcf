@@ -132,6 +132,15 @@ type HelmChartLaunchSpecification struct {
 	Values []byte `json:"configuration,omitempty"`
 }
 
+// Defined reports whether the message carries a Helm chart. The struct is
+// embedded by pointer in the launch specifications, so encoding/json allocates
+// it whenever any of its keys appears, including "helmChart": "" or null on a
+// container workload message. A nil check alone therefore misclassifies such a
+// workload as Helm; callers must use this method instead.
+func (h *HelmChartLaunchSpecification) Defined() bool {
+	return h != nil && h.HelmChartURL != ""
+}
+
 // Telemetry is the telemetry configuration for a specific protocol.
 // Each telemetry config has a protocol (http, grpc), provider (grafana-cloud, datadog, etc.), endpoint (url to send data to), and name (secret name used to send data).
 // It is used by the consolidated otelconfig renderer under pkg/otelconfig/config.

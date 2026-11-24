@@ -42,7 +42,7 @@ func isMiniServiceType(req *nvcav2beta1.ICMSRequest) bool {
 	}
 	// TODO(mcamp): move this detection to the translate library
 	return (req.Spec.CreationMsgInfo.FunctionLaunchSpecification != nil &&
-		req.Spec.CreationMsgInfo.FunctionLaunchSpecification.HelmChartLaunchSpecification != nil) ||
+		req.Spec.CreationMsgInfo.FunctionLaunchSpecification.HelmChartLaunchSpecification.Defined()) ||
 		(req.Spec.CreationMsgInfo.TaskLaunchSpecification != nil &&
-			req.Spec.CreationMsgInfo.TaskLaunchSpecification.HelmChartLaunchSpecification != nil)
+			req.Spec.CreationMsgInfo.TaskLaunchSpecification.HelmChartLaunchSpecification.Defined())
 }

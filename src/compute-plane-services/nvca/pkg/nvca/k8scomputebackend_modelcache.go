@@ -104,7 +104,7 @@ func (c K8sComputeBackend) CleanupModelCachingSetupArtifacts(ctx context.Context
 
 	_, _, _, _, icjDecoded, bdDecode := getArtifactsFromReq(req)
 	isMiniServiceType := req.Spec.CreationMsgInfo.FunctionLaunchSpecification != nil &&
-		req.Spec.CreationMsgInfo.FunctionLaunchSpecification.HelmChartLaunchSpecification != nil
+		req.Spec.CreationMsgInfo.FunctionLaunchSpecification.HelmChartLaunchSpecification.Defined()
 
 	if !c.bk8s.cachingSupportEnabled || isMiniServiceType || icjDecoded.Specification == "" {
 		return nil
