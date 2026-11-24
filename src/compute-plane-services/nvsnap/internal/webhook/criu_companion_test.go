@@ -217,3 +217,32 @@ func TestCRIUGroupRestore_MountsTheRecordedBundle(t *testing.T) {
 		t.Errorf("no version: %q, want the legacy tree", b)
 	}
 }
+
+// The companion's admission is asked against the record the companion
+// would restore from, with the captured pods it lists as leaving: a
+// companion replacement created before a rank's delete is accepted
+// restores with its instance.
+func TestCRIUGroupRestore_CompanionAdmissionGetsRecord(t *testing.T) {
+	g := CRIUGroup{Checkpoints: []string{"w__1", "etcd__1"}, Nodes: []string{"n0", "n1"},
+		Companion: []bool{false, true}, Slots: []int{1}, Leaving: []string{"uid-w0"}}
+	m, _ := groupMutator(t, g, "")
+	asked := false
+	m.CRIUCompanionAdmits = func(_ context.Context, _ *corev1.Pod, got CRIUGroup) (bool, string) {
+		asked = true
+		if !reflect.DeepEqual(got.Leaving, g.Leaving) || !reflect.DeepEqual(got.Checkpoints, g.Checkpoints) {
+			t.Errorf("companion admission asked with group %+v, want the record's %+v", got, g)
+		}
+		return true, ""
+	}
+	pod := etcdPod()
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !asked {
+		t.Fatal("companion admission not consulted")
+	}
+	if a := applyPatches(t, pod, patches).Annotations; a[CRIURestoreAnnotation] != "etcd__1" {
+		t.Errorf("admitted companion not a placeholder: %v", a)
+	}
+}
