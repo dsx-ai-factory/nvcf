@@ -4572,11 +4572,22 @@ EXPORT(CUresult, cuCtxEnablePeerAccess, w_peer_on, (CUcontext c, unsigned f), (c
 EXPORT(CUresult, cuCtxDisablePeerAccess, w_peer_off, (CUcontext c), (c))
 EXPORT(CUresult, cuGetProcAddress_v2, w_gpa2, (const char *s, void **p, int v, cuuint64_t f, CUdriverProcAddressQueryResult *q), (s, p, v, f, q))
 
+/* glibc resolves RTLD_NEXT relative to the object that calls its dlsym, so
+ * that lookup is a tail call (-O2; musttail where the compiler has it): our
+ * caller's, not ours. A library after this one asking for the next
+ * definition of a function it interposes would otherwise get its own back.
+ * It is not wrapped: callers linking the driver reach the exports above,
+ * and an interposer after this library wants the driver's. */
 void *dlsym(void *handle, const char *name)
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, init_real_dlsym);
-    void *real = real_dlsym(handle, name);
-    if (real && name[0] == 'c' && name[1] == 'u') return wrapper_for(name, real, 0, 0);
-    return real;
+    if (handle != RTLD_NEXT && name[0] == 'c' && name[1] == 'u') {
+        void *real = real_dlsym(handle, name);
+        return real ? wrapper_for(name, real, 0, 0) : NULL;
+    }
+#if __has_attribute(musttail)
+    __attribute__((musttail))
+#endif
+    return real_dlsym(handle, name);
 }
