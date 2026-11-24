@@ -1317,8 +1317,9 @@ static int nccl_rdma_fds(int *own)
 }
 
 /* rdma_files with the files in own[n_own] left out. -1 (errno set) when
- * the file table or the mappings could not be read through: the counts
- * then prove nothing. */
+ * the file table or the mappings could not be read through, or a listed
+ * file could not be looked at (other than one closed meanwhile): the
+ * counts then prove nothing. */
 static int rdma_scan(int *open, int *mapped, const int *own, int n_own)
 {
     enum { MAX_OWN = RDMA_MAX_OWN };
@@ -1330,9 +1331,17 @@ static int rdma_scan(int *open, int *mapped, const int *own, int n_own)
     if (!d) return -1;
     errno = 0;
     for (struct dirent *e; (e = readdir(d)); errno = 0) {
+        if (e->d_name[0] == '.') continue;  /* "." and ".." */
         snprintf(p, sizeof(p), GPUSHARE_PROC_SELF "/fd/%s", e->d_name);
-        ssize_t k = readlink(p, l, sizeof(l) - 1);
-        if (k <= 0) continue;
+        ssize_t k;
+        while ((k = readlink(p, l, sizeof(l) - 1)) < 0 && errno == EINTR) {}
+        if (k < 0 && errno == ENOENT) continue;  /* closed since it was listed */
+        if (k <= 0) {
+            int err = k < 0 ? errno : EIO;
+            closedir(d);
+            errno = err;
+            return -1;
+        }
         l[k] = 0;
         int dev = !strncmp(l, GPUSHARE_RDMA_DIR, dl);
         if (!dev && strcmp(l, GPUSHARE_RDMA_EVENT)) continue;

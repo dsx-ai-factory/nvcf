@@ -27,6 +27,7 @@ NCCL's context would. The test checks that
   * "quiesce" refuses the same RDMA the pauses refuse, before anything
     stops, and passes with NCCL's only;
   * a check that cannot read the process's files fails the pause;
+  * so does one that cannot look at a file the process has open;
   * once a quiesce has held NCCL's verbs calls, every path that lets the
     app run again without a release ("hold" again, the gates opening) lets
     them run too.
@@ -258,6 +259,20 @@ class RdmaNCCL(unittest.TestCase):
         # A process whose files cannot be listed.
         cc("-Wno-unused-function", "-DGPUSHARE_PROC_SELF=\"%s/noproc\"" % t, "-o", os.path.join(t, "probe-noproc"),
            os.path.join(t, "probe.c"), os.path.join(t, "libcuda.so.1"), "-Wl,-rpath," + t, "-ldl", "-lpthread")
+        # A process whose file table lists a file that cannot be looked at
+        # (a regular file stands for it: readlink fails), and one whose
+        # table, "." and ".." included, reads cleanly.
+        for name, target in (("badproc", None), ("fakeproc", "/dev/null")):
+            fd = os.path.join(t, name, "fd")
+            os.makedirs(fd)
+            if target:
+                os.symlink(target, os.path.join(fd, "3"))
+            else:
+                open(os.path.join(fd, "3"), "w").close()
+            open(os.path.join(t, name, "maps"), "w").close()
+            cc("-Wno-unused-function", "-DGPUSHARE_PROC_SELF=\"%s/%s\"" % (t, name), "-o",
+               os.path.join(t, "probe-" + name), os.path.join(t, "probe.c"), os.path.join(t, "libcuda.so.1"),
+               "-Wl,-rpath," + t, "-ldl", "-lpthread")
         cc("-fpatchable-function-entry=4", "-shared", "-fPIC", "-o", os.path.join(t, "libnvsnap_gpushare.so"),
            os.path.join(SRC, "gpushare.c"), "-ldl", "-lpthread")
         cc("-o", os.path.join(t, "nvsnap-gpu-suspend"), os.path.join(SRC, "nvsnap-gpu-suspend.c"), "-ldl", "-lpthread")
@@ -289,6 +304,14 @@ class RdmaNCCL(unittest.TestCase):
         self.assertEqual(out["scanned"], "0", out)
         self.assertEqual(out["mx_pause_ok"], "0", "a pause passed without looking at the process's files")
         self.assertEqual(out["quiesce_ok"], "0", "a quiesce passed without looking at the process's files")
+
+    def test_a_file_that_cannot_be_looked_at_fails_the_pause_and_quiesce(self):
+        out = self.probe("owned", prog="probe-badproc")
+        self.assertEqual(out["scanned"], "0", "a file the check could not look at was taken for no RDMA: %s" % out)
+        self.assertEqual(out["mx_pause_ok"], "0", out)
+        self.assertEqual(out["quiesce_ok"], "0", out)
+        out = self.probe("owned", prog="probe-fakeproc")
+        self.assertEqual((out["scanned"], out["pause_open"], out["pause_mapped"]), ("1", "0", "0"), out)
 
     def test_running_again_without_a_release_lets_nccls_verbs_run(self):
         out = self.probe("owned")
