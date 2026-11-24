@@ -1422,7 +1422,12 @@ static int open_synced(const int *pids, int n)
         printf("sync-open: resumed with launches held (%s); waiting up to %u ms for every node\n", tok, sync_open_ms);
         double t0 = now_ms();
         while (!got) {
-            int fd = openat(dfd, "o", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            /* Non-blocking, and a regular file only: the workload could
+             * put a FIFO there, whose open or read would block past the
+             * deadline. Anything else is no verdict yet. */
+            int fd = openat(dfd, "o", O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            struct stat st;
+            if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))) close(fd), fd = -1;
             if (fd >= 0) {
                 ssize_t r = read(fd, line, sizeof(line) - 1);
                 close(fd);

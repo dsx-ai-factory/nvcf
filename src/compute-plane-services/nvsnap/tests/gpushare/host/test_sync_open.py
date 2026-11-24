@@ -20,9 +20,9 @@ processes over stopped and exits), resume. The test checks that
     earlier round, is ignored);
   * a process whose library has no "resume hold" (it opens at its resume)
     makes the resume say it was not synced;
-  * an "abort" verdict, or no verdict by the --sync-open deadline, still
-    opens the gates (no node is left with its launches held), and the
-    resume says so ("GPU launches let through before every node
+  * an "abort" verdict, or no verdict by the --sync-open deadline (also
+    when the verdict's name is a FIFO no one writes), still opens the gates
+    (no node is left with its launches held), and the resume says so ("GPU launches let through before every node
     resumed");
   * without --sync-open the resume is as before: plain "resume", no
     marker, no wait.
@@ -130,11 +130,12 @@ class Driver(threading.Thread):
     """The agent's side of one node's session directory. verdict: "open",
     "abort" or None (never answers the resumed marker); delay: seconds
     between seeing the marker and answering it; stale: first write a
-    verdict for another token."""
+    verdict for another token; fifo: put a FIFO with no writer where the
+    verdict goes (the directory is the workload's to write)."""
 
-    def __init__(self, fabric, verdict, delay=0.0, stale=False):
+    def __init__(self, fabric, verdict, delay=0.0, stale=False, fifo=False):
         super().__init__(daemon=True)
-        self.fabric, self.verdict, self.delay, self.stale = fabric, verdict, delay, stale
+        self.fabric, self.verdict, self.delay, self.stale, self.fifo = fabric, verdict, delay, stale, fifo
         self.stop = threading.Event()
         self.token = None
         self.stale_at = self.verdict_at = None
@@ -165,6 +166,8 @@ class Driver(threading.Thread):
                 if self.stale:
                     write_atomic(os.path.join(self.fabric, "o"), "999999-7 open\n")
                     self.stale_at = time.monotonic()
+                if self.fifo:
+                    os.mkfifo(os.path.join(self.fabric, "o"))
             if seen is not None and self.verdict and self.verdict_at is None and time.monotonic() - seen >= self.delay:
                 self.verdict_at = time.monotonic()
                 write_atomic(os.path.join(self.fabric, "o"), "%s %s\n" % (self.token, self.verdict))
@@ -299,6 +302,15 @@ class SyncOpen(unittest.TestCase):
         self.assertIn("no verdict", out)
         self.assertGreaterEqual(took, 2.0, "opened before its deadline with no verdict:\n" + out)
         self.assertLess(took, 20, out)
+
+    def test_fifo_for_a_verdict_does_not_block_past_the_deadline(self):
+        drv = Driver(self.fabric, None, fifo=True)
+        r, took, cmds = self.cycle(drv, 2000)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(len(self.at(cmds, "open")), 1, "a FIFO for a verdict left the launches held:\n" + out)
+        self.assertIn("no verdict", out)
+        self.assertLess(took, 20, "the wait for a verdict blocked on a FIFO:\n" + out)
 
     def test_resume_through_the_holder_is_not_synced(self):
         # The stop failed after a good suspend: the holder is still there,
