@@ -775,6 +775,25 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "refusefenced") || !strcmp(c, "refuseunfenced")) {
+        /* The release refuses (a queue pair with a failed completion),
+         * after a fence that succeeded (its peers may be releasing now) or
+         * with none before it. Then whatever would let the process run
+         * again opens NCCL's verbs. */
+        up(1);
+        int f = !strcmp(c, "refusefenced") ? nvsnap_ibv_fence(rep, sizeof(rep)) : 0;
+        ((struct vqp *)qa)->failed = 1;
+        int s = nvsnap_ibv_suspend(rep, sizeof(rep));
+        int after_refusal = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        nvsnap_ibv_open();
+        int after_open = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        pthread_create(&t, NULL, send_t, NULL);
+        usleep(200000);
+        int (*doomed_q)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "nvsnap_ibv_doomed");
+        printf("fence=%d suspend=%d held_after_refusal=%d held_after_open=%d sent=%d doomed=%d\n", f, s,
+               after_refusal, after_open, __atomic_load_n(&sent, __ATOMIC_SEQ_CST), doomed_q ? doomed_q() : -1);
+        return 0;  /* a held send stays blocked */
+    }
     if (!strcmp(c, "destroyfail")) {
         /* The release cannot destroy one queue pair (qa); its peer (qb) is
          * destroyed. After the restore, qa must reach the new qb. */
@@ -870,7 +889,8 @@ class Ibv(unittest.TestCase):
         with open(os.path.join(t, "probe.c"), "w") as f:
             f.write(PROBE)
         subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", *inc, "-I", CUDA_INC,
-                        "-I", SRC, "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"), "-ldl", "-lpthread"],
+                        "-I", SRC, "-rdynamic", "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"), "-ldl",
+                        "-lpthread"],
                        check=True)
 
     @classmethod
@@ -973,6 +993,20 @@ class Ibv(unittest.TestCase):
 
     def test_receive_with_too_many_entries_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5")["fence"], "0")
+
+    def test_release_refused_after_the_fence_keeps_nccl_held(self):
+        out = self.probe("refusefenced")
+        self.assertEqual(out["fence"], "0", out)
+        self.assertNotEqual(out["suspend"], "0", out)
+        self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("1", "1", "0"),
+                         "a rank whose peers may be releasing let NCCL post again: %s" % out)
+        self.assertEqual(out["doomed"], "1", out)
+
+    def test_release_refused_without_a_fence_lets_nccl_run(self):
+        out = self.probe("refuseunfenced")
+        self.assertNotEqual(out["suspend"], "0", out)
+        self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("0", "0", "1"), out)
+        self.assertEqual(out["doomed"], "0", out)
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")

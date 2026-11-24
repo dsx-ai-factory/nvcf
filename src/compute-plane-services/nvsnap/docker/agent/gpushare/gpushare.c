@@ -978,9 +978,30 @@ static int gate_close(struct gate *g, int ms)
 
 static void ibv_unfence(void);
 
-/* Open both gates, and NCCL's verbs if a "quiesce" left them held. */
+/* Set for good by a "release" that NCCL's verbs refused after the fence
+ * (libnvsnap_ibv's nvsnap_ibv_doomed): every rank fenced, so the others
+ * may be destroying their queue pairs, and this one's are not re-created
+ * by a rollback (it released nothing). The process must not run again:
+ * its gates stay closed, and every command that would let it run answers
+ * DOOMED_REPLY (the tool's rollback fails, and the workload is replaced). */
+static int ibv_doomed_here;
+#define DOOMED_REPLY "err this process refused its RDMA release after its peers were fenced; " \
+                     "it cannot run again (replace it)"
+
+/* mu held: 1 (reply set, mu released) once a release was refused so. */
+static int refuse_doomed(char *reply, size_t n)
+{
+    if (!ibv_doomed_here) return 0;
+    snprintf(reply, n, DOOMED_REPLY);
+    pthread_mutex_unlock(&mu);
+    return 1;
+}
+
+/* Open both gates, and NCCL's verbs if a "quiesce" left them held. Never
+ * after a refused release (ibv_doomed_here). */
 static void gate_open(void)
 {
+    if (ibv_doomed_here) return;
     pthread_mutex_lock(&gate_mu);
     lgate.closed = mgate.closed = 0;
     lgate.pass = mgate.pass = 0;
@@ -1182,6 +1203,7 @@ static void hold_launches(void)
 static void do_hold(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     held = 0;  /* an "open" from a restore is no longer due */
     hold_launches();
     snprintf(reply, n, "ok held");
@@ -1213,6 +1235,7 @@ static int drained(int ms, CUresult *r)
 static void do_poll(char *reply, size_t n, int step)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     CUresult r;
     int d = lgate.closed ? drained(step ? 20 : 2, &r) : -2;
     pthread_mutex_lock(&gate_mu);
@@ -1251,6 +1274,7 @@ static struct {
     int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
     int (*connect)(const char *, char *, size_t), (*count)(void), (*fds)(int *, int);
     void (*open)(void);
+    int (*doomed)(void);
 } ibv;
 
 /* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
@@ -1262,7 +1286,7 @@ static int ibv_devices(void);
  * them held until its objects are back). */
 static void ibv_unfence(void)
 {
-    if (ibv_devices() > 0) ibv.open();
+    if (!ibv_doomed_here && ibv_devices() > 0) ibv.open();
 }
 
 static int ibv_devices(void)
@@ -1281,6 +1305,9 @@ static int ibv_devices(void)
         if (!ibv.fence || !ibv.suspend || !ibv.restore || !ibv.map || !ibv.connect || !ibv.open) return 0;
         /* Optional: without it, the pause checks count NCCL's files too. */
         *(void **)&ibv.fds = real_dlsym(h, "nvsnap_ibv_fds");
+        /* Optional: without it, a refused release is not known to have
+         * come after the fence (an older library reopens NCCL's calls). */
+        *(void **)&ibv.doomed = real_dlsym(h, "nvsnap_ibv_doomed");
         *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
         if (!ibv.count) return 0;
     }
@@ -1390,6 +1417,7 @@ static int rdma_files(int *open, int *mapped, int nccl)
 static void do_quiesce(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     /* Busy: GPU work waits on work a gated thread has not launched yet
      * (e.g. a peer's NCCL kernel). Reopen the gate; the tool retries. If
      * "hold" held the launches, hold them again instead: the tool is
@@ -1508,6 +1536,7 @@ static int void_export_copies(void)
 static void do_release(char *reply, size_t n, const char *args)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     if (!gated) {
         snprintf(reply, n, "err not quiesced");
         pthread_mutex_unlock(&mu);
@@ -1515,6 +1544,10 @@ static void do_release(char *reply, size_t n, const char *args)
     }
     /* Before any memory goes: NCCL's registrations of it come first. */
     if (ibv_devices() > 0 && ibv.suspend(reply, n) < 0) {
+        if (ibv.doomed && ibv.doomed()) {
+            ibv_doomed_here = 1;
+            logf_("release: NCCL's verbs refused after the fence (%s): this process cannot run again", reply);
+        }
         pthread_mutex_unlock(&mu);
         return;
     }
@@ -2029,6 +2062,7 @@ static void do_resume(char *reply, size_t n, int hold)
     CUresult r = CUDA_SUCCESS;
     int nb = 0, nm = 0;
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     int dev = push_any_ctx();
     for (int i = 0; r == CUDA_SUCCESS && i < n_mcbinds; i++) {
         struct mcbind *b = &mcbinds[i];
@@ -2060,7 +2094,7 @@ static void do_resume(char *reply, size_t n, int hold)
         snprintf(reply, n, "ok resumed (%d multicast bind(s), %d multicast mapping(s))%s", nb, nm,
                  hold ? "; launches held until open" : "");
         held = hold;
-        if (ibv_devices() > 0) ibv.open();  /* NCCL's verbs calls run again */
+        ibv_unfence();  /* NCCL's verbs calls run again */
         if (!hold) gate_open();
     }
     pop_ctx(dev);
@@ -2071,6 +2105,7 @@ static void do_resume(char *reply, size_t n, int hold)
 static void do_open(char *reply, size_t n)
 {
     if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (refuse_doomed(reply, n)) return;
     if (held) {
         held = 0;
         gate_open();
@@ -2339,7 +2374,10 @@ static int lease_recover(void)
     pid_t pid = expiry_pid;
     if (!pid) return 0;
     if (lock_ctl()) return -1;
-    if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
+    if (ibv_doomed_here) {
+        logf_("hold: pid %d, which held the launches, exited: launches stay held (a release was refused after the "
+              "fence)", pid);
+    } else if (__atomic_load_n(&lgate.closed, __ATOMIC_SEQ_CST)) {
         gate_open();
         logf_("hold: pid %d, which held the launches, exited: launches run again", pid);
     }

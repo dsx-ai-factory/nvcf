@@ -27,7 +27,10 @@
  * A shared receive queue, an address handle or another queue pair type, a
  * receive with more than RECV_SGE scatter entries, a queue pair with a
  * failed completion, or an async event NCCL does not acknowledge makes the
- * suspend refuse: the workload runs on.
+ * suspend refuse. A refusal at the fence ("quiesce"), or at a release with no
+ * fence before it, lets the workload run on. One at a release after a fence
+ * (every rank fenced, its peers may be releasing) keeps NCCL's calls held
+ * for good, and the process must be replaced (nvsnap_ibv_doomed).
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -1048,6 +1051,27 @@ static void reopen(void)
 /* Set by nvsnap_ibv_fence, cleared when NCCL's verbs open again. */
 static int fenced;
 
+/* Set for good when a release refuses after a fence that succeeded. Every
+ * rank fenced, so the others may be destroying their queue pairs now, and
+ * a rollback does not re-create this rank's (it released nothing): its
+ * queue pairs would keep targeting peers that are gone. NCCL's verbs calls
+ * then stay held, whatever asks to open them, and the process must be
+ * replaced (gpushare refuses to let it run again: nvsnap_ibv_doomed). */
+static int doomed;
+
+/* A release refused: let NCCL's calls run again, unless it had been fenced. */
+static void release_refused(void)
+{
+    if (!fenced) {
+        reopen();
+        return;
+    }
+    __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_exchange_n(&doomed, 1, __ATOMIC_SEQ_CST))
+        logf_("release refused after the fence: NCCL's verbs calls stay held for good (its peers may be releasing); "
+              "the process cannot run again");
+}
+
 /* Stop NCCL's verbs calls and wait for those in progress, without omu: a
  * call in progress may need it to finish (see suspended). */
 static int stop_calls(char *reply, size_t n)
@@ -1102,6 +1126,10 @@ static int untracked(char *reply, size_t n)
  * process run again without a release calls nvsnap_ibv_open. */
 EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
 {
+    if (__atomic_load_n(&doomed, __ATOMIC_SEQ_CST)) {
+        snprintf(reply, n, "err a release refused after the fence: NCCL's verbs calls stay held");
+        return -1;
+    }
     int r = stop_calls(reply, n);
     if (r < 0) return r;
     pthread_mutex_lock(&omu);
@@ -1119,21 +1147,24 @@ EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
  * NCCL has posted nothing since (its calls stayed held). */
 EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
 {
-    if (stop_calls(reply, n) < 0) return -1;
+    if (stop_calls(reply, n) < 0) {
+        release_refused();
+        return -1;
+    }
     /* The provider's destroy waits for every event of the object to be
      * acknowledged: give NCCL's event thread the time it takes. */
     double t0 = now_s();
     int ua;
     while ((ua = unacked_count()) && now_s() - t0 < 2) usleep(1000);
     if (ua) {
-        reopen();
+        release_refused();
         snprintf(reply, n, "err NCCL has not acknowledged %d async event(s) of a queue pair or completion queue", ua);
         return -1;
     }
     pthread_mutex_lock(&omu);
     if (untracked(reply, n) < 0 || fence(reply, n, !fenced) < 0) {
         pthread_mutex_unlock(&omu);
-        reopen();
+        release_refused();
         return -1;
     }
     fenced = 0;
@@ -1521,6 +1552,12 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
  * the real objects are gone: a call would use a destroyed one. */
 EXPORT void nvsnap_ibv_open(void)
 {
+    if (__atomic_load_n(&doomed, __ATOMIC_SEQ_CST)) {
+        static int said;
+        if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST))
+            logf_("open: a release refused after the fence: NCCL's verbs calls stay held");
+        return;
+    }
     pthread_mutex_lock(&omu);
     int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST);
     if (!gone) fenced = 0;
@@ -1528,6 +1565,10 @@ EXPORT void nvsnap_ibv_open(void)
     if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
     reopen();
 }
+
+/* 1 once a release refused after a fence (see doomed): the process must
+ * not run again. */
+EXPORT int nvsnap_ibv_doomed(void) { return __atomic_load_n(&doomed, __ATOMIC_SEQ_CST); }
 
 /* The files NCCL's open devices hold (each real context's command and
  * event file), at most max of them in fds; returns how many there are.

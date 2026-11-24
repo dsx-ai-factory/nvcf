@@ -72,6 +72,10 @@ log = open(sys.argv[1], "a")
 old_lib = len(sys.argv) > 2 and sys.argv[2] == "old"  # a library without "resume hold"
 # A library with "resume hold" and "lease", but not "resume hold lease".
 no_hold_lease = old_lib or (len(sys.argv) > 2 and sys.argv[2] == "nolease")
+# A library whose NCCL release refused after the fence: it answers every
+# command that would let it run again with an error (gpushare.c, DOOMED_REPLY).
+doomed = len(sys.argv) > 2 and sys.argv[2] == "doomed"
+DOOMED = "err this process refused its RDMA release after its peers were fenced; it cannot run again (replace it)"
 libc = ctypes.CDLL(None, use_errno=True)
 libc.prctl(0x59616d61, ctypes.c_ulong(-1 & 0xffffffffffffffff), 0, 0, 0)  # PR_SET_PTRACER, any
 s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -79,13 +83,18 @@ s.bind("\0nvsnap-gpushare.%d" % os.getpid())
 s.listen(16)
 def serve():
     libc.prctl(15, b"nvsnap-gpushare", 0, 0, 0)  # PR_SET_NAME: the library's control thread
-    held = False
+    held = refused = False
     while True:
         c, _ = s.accept()
         cmd = c.recv(4096).rstrip(b"\0").decode()
         log.write("%.6f %s\n" % (time.monotonic(), cmd)); log.flush()
         verb = cmd.split(" ")[0]
-        if cmd == "hold":
+        if doomed and verb == "release":
+            refused = True
+            rep = "err NCCL has not acknowledged 1 async event(s) of a queue pair or completion queue"
+        elif refused and verb in ("resume", "open", "hold", "quiesce"):
+            rep = DOOMED
+        elif cmd == "hold":
             rep = "ok held"
         elif cmd == "poll":
             rep = "ok idle 0"
@@ -369,6 +378,17 @@ class SyncOpen(unittest.TestCase):
         self.assertIn("resume", [c for _, c in cmds], out)
         self.assertIn(UNSYNCED, out, "a process that opened at its resume was reported synced")
         self.assertIn('without "resume hold"', out, out)
+
+    def test_release_refused_after_the_fence_fails_the_rollback(self):
+        # The process cannot run again: the suspend's rollback fails, and
+        # says so in the words the agent replaces the workload on
+        # (internal/agent/gpushare.go, suspendRollbackFailed).
+        self.start_rank("doomed")
+        s = self.tool_run("--timeout-ms", "10000", "suspend", str(self.pid))
+        out = s.stdout + s.stderr
+        self.assertNotEqual(s.returncode, 0, out)
+        self.assertIn("suspend failed and so did the rollback", out)
+        self.assertIn("cannot run again", out)
 
     def test_sync_open_usage_is_checked(self):
         for args, want in ((["--sync-open", "1000", "resume"], "--sync-open goes with --fabric-map"),

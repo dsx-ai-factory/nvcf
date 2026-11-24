@@ -88,6 +88,7 @@ __attribute__((constructor)) static void init(void) { up(); }
 int nvsnap_ibv_fence(char *r, size_t n) { snprintf(r, n, "ok"); return 0; }
 int nvsnap_ibv_suspend(char *r, size_t n)
 {
+    if (getenv("REFUSE")) { snprintf(r, n, "err refused"); return -1; }
     if (map0 != MAP_FAILED) munmap(map0, 4096);
     if (fd0 >= 0) close(fd0);
     if (ev0 >= 0) close(ev0);
@@ -102,6 +103,10 @@ int nvsnap_ibv_connect(const char *p, char *r, size_t n) { (void)p; snprintf(r, 
 int shim_opens;  /* nvsnap_ibv_open calls */
 void nvsnap_ibv_open(void) { shim_opens++; }
 int nvsnap_ibv_count(void) { return 1; }
+#ifndef NODOOM
+/* REFUSE: the release refused after the fence; NCCL's calls stay held. */
+int nvsnap_ibv_doomed(void) { return getenv("REFUSE") != NULL; }
+#endif
 #ifndef OLD
 int nvsnap_ibv_fds(int *fds, int max)
 {
@@ -129,6 +134,8 @@ PROBE = r"""
 #include "gpushare.c"
 #include <sys/timerfd.h>
 
+static int closed_gate(struct gate *g) { return __atomic_load_n(&g->closed, __ATOMIC_SEQ_CST); }
+
 static void open_map(const char *dev, int keep)
 {
     char p[512];
@@ -142,6 +149,35 @@ int main(int argc, char **argv)
 {
     const char *c = argc > 2 ? argv[1] : "";
     if (strcmp(c, "noshim") && !dlopen(argv[2], RTLD_NOW | RTLD_LOCAL)) { puts(dlerror()); return 3; }
+    if (!strcmp(c, "refused")) {
+        /* Quiesce, then a release whose NCCL verbs refuse (REFUSE), then
+         * every command that would let the process run again. */
+        char rep[GPUSHARE_REPLY_MAX], r2[GPUSHARE_REPLY_MAX];
+        int *opens = dlsym(dlopen(argv[2], RTLD_NOW | RTLD_NOLOAD), "shim_opens");
+        do_quiesce(rep, sizeof(rep));
+        int q = !strcmp(rep, "ok quiesced");
+        do_release(rep, sizeof(rep), NULL);
+        int rel = !strncmp(rep, "ok", 2), o0 = *opens, refused = 0;
+        const char *cmds[] = { "resume", "resume hold", "open", "hold", "step", "quiesce", "release" };
+        for (int i = 0; i < 7; i++) {
+            r2[0] = 0;
+            if (i == 0) do_resume(r2, sizeof(r2), 0);
+            else if (i == 1) do_resume(r2, sizeof(r2), 1);
+            else if (i == 2) do_open(r2, sizeof(r2));
+            else if (i == 3) do_hold(r2, sizeof(r2));
+            else if (i == 4) do_poll(r2, sizeof(r2), 1);
+            else if (i == 5) do_quiesce(r2, sizeof(r2));
+            else do_release(r2, sizeof(r2), NULL);
+            int no = !!strstr(r2, "cannot run again");
+            refused += no;
+            if (!no) fprintf(stderr, "%s: %s\n", cmds[i], r2);
+        }
+        gate_open();
+        ibv_unfence();
+        printf("quiesce_ok=%d release_ok=%d refused=%d launch_closed=%d memory_closed=%d verbs_opens=%d\n", q, rel,
+               refused, closed_gate(&lgate), closed_gate(&mgate), *opens - o0);
+        return 0;
+    }
     if (!strcmp(c, "noshim")) {
         char p[512];
         snprintf(p, sizeof(p), "%s/uverbs0", getenv("IBDIR"));
@@ -250,7 +286,8 @@ class RdmaNCCL(unittest.TestCase):
             with open(os.path.join(t, name), "w") as f:
                 f.write(text)
         cc("-shared", "-fPIC", "-o", os.path.join(t, "libcuda.so.1"), os.path.join(t, "stub.c"))
-        for out, extra in (("libnvsnap_ibv.so", []), ("old/libnvsnap_ibv.so", ["-DOLD"])):
+        for out, extra in (("libnvsnap_ibv.so", []), ("old/libnvsnap_ibv.so", ["-DOLD"]),
+                           ("nodoom/libnvsnap_ibv.so", ["-DNODOOM"])):
             os.makedirs(os.path.dirname(os.path.join(t, out)), exist_ok=True)
             cc("-shared", "-fPIC", "-Wl,-soname,libnvsnap_ibv.so", *extra, "-o", os.path.join(t, out),
                os.path.join(t, "shim.c"))
@@ -318,6 +355,19 @@ class RdmaNCCL(unittest.TestCase):
         self.assertEqual(out["quiesce_ok"], "1", out)
         self.assertEqual(out["opens_at_hold"], "1", "a hold after a quiesce left NCCL's verbs calls held")
         self.assertEqual(out["opens_at_open"], "1", "opening the gates after a quiesce left NCCL's verbs calls held")
+
+    def test_release_refused_after_the_fence_never_runs_again(self):
+        out = self.probe("refused", REFUSE="1")
+        self.assertEqual((out["quiesce_ok"], out["release_ok"]), ("1", "0"), out)
+        self.assertEqual(out["refused"], "7", "a command let a process run again after its NCCL release refused: %s" % out)
+        self.assertEqual((out["launch_closed"], out["memory_closed"], out["verbs_opens"]), ("1", "1", "0"), out)
+
+    def test_release_refused_by_an_older_verbs_library_rolls_back(self):
+        # No nvsnap_ibv_doomed: the refusal is taken as before, and the
+        # process runs again.
+        out = self.probe("refused", shim="nodoom/libnvsnap_ibv.so", REFUSE="1")
+        self.assertEqual((out["quiesce_ok"], out["release_ok"], out["refused"]), ("1", "0", "0"), out)
+        self.assertEqual((out["launch_closed"], out["memory_closed"]), ("0", "0"), out)
 
     def test_another_file_on_nccls_device_counts(self):
         out = self.probe("foreignfd")
