@@ -89,11 +89,17 @@ logic into `dsl/`.
   shadowed. Its session keys and first messages are chosen for fixed hash
   buckets on either side of 50 percent; if the sampling hash or canonical
   first-message form changes, pick new values and update the comment.
-- The Vanity Gateway request body scenario (`@vanity-request-body`) sends
+- The Vanity Gateway request body scenarios (`@vanity-request-body`) send
   bodies longer than the gateway's 64 KiB routing prefix with the routing
-  fields first and last, and reads the forwarded request back from the echo
-  sample. It asserts forwarded bytes, not the request body read metric, so it
-  passes against the released gateway image as well as a branch build.
+  fields first and last. The first reads the forwarded request back from the
+  echo sample. It asserts forwarded bytes, not the request body read metric,
+  so it passes against the released gateway image as well as a branch build.
+  The second sets `maxStreamedRequestSizeBytes` above the 64 MiB buffered
+  limit, sends 80 MiB bodies from files under `tests/bdd/out/`, and checks
+  the echo sample's body digest, because the echo reply is capped at 1 MiB.
+  It needs a Vanity Gateway chart and image that have the streamed limit,
+  and an echo sample with the body controls (`LOAD_TESTER_MAX_REQUEST_BYTES`
+  and `X-Load-Tester-Body-Digest`).
 - Gateway API route readiness tables expose each route's kind, name,
   namespace, and intended Gateway parent plus the shared context and timeout.
   The step requires `Accepted=True` and `ResolvedRefs=True` for that parent but

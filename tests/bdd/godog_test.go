@@ -21,6 +21,7 @@ package bdd_tmp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -649,7 +651,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		},
 		gatewayTransportCommand:  {ExitCode: 0, Stdout: "true"},
 		llmWorkerShutdownCommand: {ExitCode: 0, Stdout: "grace=120 prestop=sleep 60 drain=55000\n"},
-		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}": {ExitCode: 0, Stdout: "67108864"},
+		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_REQUEST_SIZE_BYTES}":          {ExitCode: 0, Stdout: "67108864"},
+		"kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_STREAMED_REQUEST_SIZE_BYTES}": {ExitCode: 0, Stdout: "134217728"},
 		gatewayServiceMonitorCommand:                                 {ExitCode: 0, Stdout: "kind: ConfigMap\nmetadata:\n  name: llm-api-gateway\n"},
 		`/bin/bash -c 'date -u -d "+1 day" +%Y-%m-%dT%H:%M:%S.000Z'`: {ExitCode: 0, Stdout: "2030-01-01T00:00:00.000Z\n"},
 		"/usr/bin/nvcf-cli --config /repo-root-placeholder/tests/bdd/fixtures/nvcf-cli-local.yaml function invoke --request-body '{\"message\":\"bdd-echo\",\"repeats\":1}' --timeout 120 --poll-duration 5": {
@@ -726,7 +729,9 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	vanityShadow := newVanityShadowFake("", decisionRoutes)
 	vanityShadow.attach(runner)
 	decisionRoutes.attach(runner, suite.Config.RepoRoot)
-	requestBody := newVanityRequestBodyFake("", vanityShadow)
+	streamedLimit := newVanityStreamedLimitFake("", t.TempDir(), vanityShadow)
+	streamedLimit.attach(runner)
+	requestBody := newVanityRequestBodyFake("", streamedLimit)
 	requestBody.attach(runner)
 	clusterGroups := &clusterGroupsHTTPFake{next: &icmsKeyHTTPFake{next: requestBody}, runner: runner}
 	suite.HTTP = clusterGroups
@@ -855,12 +860,8 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "function delete --deployment-only") {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
-	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
-	for _, key := range []string{"early", "late"} {
-		if !requestBody.seen[key] {
-			t.Errorf("vanity request body scenario never sent the %s-field request", key)
-		}
-	}
+	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 13)
+	assertVanityRequestBodyScenariosRan(t, suite.Runner.(*fakeRunner).runs, requestBody, streamedLimit)
 	for _, key := range []string{"shadow-warmup", "promptCacheKey", "firstMessageHash", "continuation", "failing-shadow"} {
 		if !vanityShadow.seen[key] {
 			t.Errorf("vanity shadow scenario never exercised %s", key)
@@ -3295,7 +3296,7 @@ func singleClusterHelmfileTags() string {
 // under the sample registry org and team.
 const (
 	sampleLLMEchoImageEnv     = "SAMPLE_LLM_ECHO_IMAGE"
-	sampleLLMEchoDefaultImage = "nvcf-openai-compatible-sample:5.1.0"
+	sampleLLMEchoDefaultImage = "nvcf-openai-compatible-sample:5.4.0"
 )
 
 // TestSingleClusterHA is the live entry point for the high-availability
@@ -4712,7 +4713,7 @@ func TestVanityRequestBodyScenarioRejectsChangedBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, scenario, found := strings.Cut(string(data), "    @vanity-request-body\n")
-	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	scenario, _, ended := strings.Cut(scenario, "\n"+vanityStreamedLimitScenarioStart)
 	if !found || !ended {
 		t.Fatal("missing vanity request body scenario")
 	}
@@ -4753,6 +4754,264 @@ func TestVanityRequestBodyScenarioRejectsChangedBodies(t *testing.T) {
 				t.Fatalf("feature did not send both requests: %v", fake.seen)
 			}
 		})
+	}
+}
+
+// vanityStreamedLimitScenarioStart is the first comment line of the streamed
+// limit scenario, which follows the request body scenario.
+const vanityStreamedLimitScenarioStart = "    # A model request above the 64 MiB buffered limit set in the Background"
+
+const (
+	vanityStreamedBodyBytes  = 83886080
+	vanityBufferedLimitBytes = 67108864
+	vanityStreamedLimitBytes = 134217728
+)
+
+// vanityStreamedLimitFake stands in for the direct Vanity Gateway model route
+// in the streamed limit scenario, with the echo sample's body digest behind
+// it. It writes the scenario's two bodies itself, so the wiring tests do not
+// spend seconds on the real script; TestVanityStreamedLimitBodyScriptWritesExactBodies
+// runs that script. Each broken mode reproduces one way a gateway could get
+// the two limits wrong.
+type vanityStreamedLimitFake struct {
+	broken string
+	dir    string
+	seen   map[string]bool
+	inner  harness.HTTPClient
+}
+
+func newVanityStreamedLimitFake(broken, dir string, inner harness.HTTPClient) *vanityStreamedLimitFake {
+	return &vanityStreamedLimitFake{broken: broken, dir: dir, seen: map[string]bool{}, inner: inner}
+}
+
+func vanityStreamedBody(fieldsFirst bool) string {
+	prefix := `{"model":"bdd-streamed-limit","stream":false,"messages":[{"role":"user","content":"`
+	suffix := `"}]}`
+	if !fieldsFirst {
+		prefix = `{"messages":[{"role":"user","content":"`
+		suffix = `"}],"model":"bdd-streamed-limit","stream":false}`
+	}
+	return prefix + strings.Repeat("a", vanityStreamedBodyBytes-len(prefix)-len(suffix)) + suffix
+}
+
+func vanityTooLarge(limit int) harness.HTTPResponse {
+	return harness.HTTPResponse{
+		Status: 400,
+		Header: http.Header{"Nvcf-Error-Source": []string{"gateway_rejected"}},
+		Body: fmt.Sprintf(`{"error":{"message":"Please make sure your payload is below %d bytes in size. `+
+			`If larger assets are required please refer to our Assets API.","type":"invalid_request_error","param":null,"code":"invalid_image_format"}}`, limit),
+	}
+}
+
+func vanityBodyDigest(body string) harness.HTTPResponse {
+	sum := sha256.Sum256([]byte(body))
+	return harness.HTTPResponse{Status: 200, Body: fmt.Sprintf(`{"object":"load_tester.body_digest","bytes":%d,"sha256":"%x","content_length":%d,"complete":true}`, len(body), sum, len(body))}
+}
+
+func (f *vanityStreamedLimitFake) Do(ctx context.Context, method, rawURL string, headers map[string]string, body string) (harness.HTTPResponse, error) {
+	if rawURL != "http://vanity-openai.localhost:8080/v1/chat/completions" || !strings.Contains(body, `"model":"bdd-streamed-limit"`) {
+		return f.inner.Do(ctx, method, rawURL, headers, body)
+	}
+	if method != "POST" || headers["Authorization"] != "Bearer wiring-function-api-key" || headers["Content-Type"] != "application/json" {
+		return harness.HTTPResponse{Status: 401}, nil
+	}
+	digest := headers["X-Load-Tester-Body-Digest"] == "true" && f.broken != "drops-digest-header"
+	switch body {
+	case vanityStreamedBody(true):
+		f.seen["fields-first"] = true
+		switch f.broken {
+		case "buffered-limit-on-streamed":
+			return vanityTooLarge(vanityBufferedLimitBytes), nil
+		case "truncates-streamed-body":
+			body = body[:len(body)-1]
+		}
+	case vanityStreamedBody(false):
+		f.seen["fields-last"] = true
+		switch f.broken {
+		case "streams-late-fields":
+		case "wrong-limit-in-error":
+			return vanityTooLarge(vanityStreamedLimitBytes), nil
+		default:
+			return vanityTooLarge(vanityBufferedLimitBytes), nil
+		}
+	default:
+		return harness.HTTPResponse{}, fmt.Errorf("streamed limit scenario sent an unexpected body of %d bytes", len(body))
+	}
+	if !digest {
+		return harness.HTTPResponse{Status: 200, Body: `{"object":"chat.completion","choices":[{"message":{"content":"xxxx"}}]}`}, nil
+	}
+	return vanityBodyDigest(body), nil
+}
+
+// attach answers the scenario's commands: the two body files are written to
+// f.dir, and the digest command hashes the fields-first file.
+func (f *vanityStreamedLimitFake) attach(runner *fakeRunner) {
+	previous := runner.onRun
+	runner.onRun = func(command string) error {
+		switch {
+		case strings.Contains(command, "vanity-streamed-body") && strings.Contains(command, "bdd-streamed-limit"):
+			for order, fieldsFirst := range map[string]bool{"first": true, "last": false} {
+				if err := os.WriteFile(filepath.Join(f.dir, "fields-"+order+".json"), []byte(vanityStreamedBody(fieldsFirst)), 0o600); err != nil {
+					return err
+				}
+			}
+			runner.results[command] = harness.Result{Stdout: f.dir + "\n"}
+		case strings.Contains(command, "sha256sum") && strings.Contains(command, f.dir+"/fields-first.json"):
+			data, err := os.ReadFile(filepath.Join(f.dir, "fields-first.json"))
+			if err != nil {
+				return err
+			}
+			runner.results[command] = harness.Result{Stdout: fmt.Sprintf("%x\n", sha256.Sum256(data))}
+		case strings.Contains(command, " function invoke ") && strings.Contains(command, "bdd-streamed-limit-ready"):
+			runner.results[command] = harness.Result{Stdout: `{"object":"chat.completion","choices":[{"message":{"content":"{\"messages\":[{\"content\":\"bdd-streamed-limit-ready\"}]}"}}]}`}
+		case strings.Contains(command, "jsonpath={.data.MAX_STREAMED_REQUEST_SIZE_BYTES}"):
+			runner.results[command] = harness.Result{Stdout: "134217728"}
+		case strings.Contains(command, "httproute/vanity-gateway") && strings.Contains(command, "-o yaml"):
+			runner.results[command] = harness.Result{Stdout: "spec:\n  hostnames:\n    - vanity.localhost\n    - vanity-openai.localhost\n"}
+		}
+		if previous != nil {
+			return previous(command)
+		}
+		return nil
+	}
+}
+
+// assertVanityRequestBodyScenariosRan checks that the whole-feature run sent
+// every request of both request body scenarios, and the streamed limit
+// requests from a function with the larger sample limit.
+func assertVanityRequestBodyScenariosRan(t *testing.T, runs []string, requestBody *vanityRequestBodyFake, streamedLimit *vanityStreamedLimitFake) {
+	t.Helper()
+	for _, key := range []string{"early", "late"} {
+		if !requestBody.seen[key] {
+			t.Errorf("vanity request body scenario never sent the %s-field request", key)
+		}
+	}
+	for _, key := range []string{"fields-first", "fields-last"} {
+		if !streamedLimit.seen[key] {
+			t.Errorf("vanity streamed limit scenario never sent the %s request", key)
+		}
+	}
+	if !commandRanThatContainsAll(runs, "function create --name bdd-vanity-streamed-limit", "--container-env LOAD_TESTER_MAX_REQUEST_BYTES=134217728") {
+		t.Fatal("streamed limit function was not created with the larger sample body limit")
+	}
+}
+
+func vanityStreamedLimitScenario(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(mustResolveFeaturePath(t, "single-cluster-helmfile.feature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, scenario, found := strings.Cut(string(data), vanityStreamedLimitScenarioStart)
+	scenario, _, ended := strings.Cut(scenario, "\n    # Proves the serve path")
+	if !found || !ended {
+		t.Fatal("missing vanity streamed limit scenario")
+	}
+	return scenario
+}
+
+func TestVanityStreamedLimitScenarioRejectsBrokenGateways(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("REPO_ROOT", "/repo-root-placeholder")
+	t.Setenv("NVCF_CLI", "/usr/bin/nvcf-cli")
+	t.Setenv("SAMPLE_LLM_ECHO_IMAGE", "nvcr.io/test-org/test-team/openai-compatible-sample:test")
+	seedFunctionAPIKey(t, home)
+	scenario := vanityStreamedLimitScenario(t)
+	for _, broken := range []string{"", "buffered-limit-on-streamed", "truncates-streamed-body", "drops-digest-header", "streams-late-fields", "wrong-limit-in-error"} {
+		t.Run(broken, func(t *testing.T) {
+			runner := newFakeRunner(map[string]harness.Result{})
+			runner.onRun = func(command string) error {
+				if strings.Contains(command, " status --json") {
+					runner.results[command] = harness.Result{Stdout: `{"currentFunction":{"hasFunction":true,"functionId":"function-1","versionId":"version-1"}}`}
+				}
+				return nil
+			}
+			suite := newWiringSuite(t, runner)
+			envFile := filepath.Join(suite.Config.RepoRoot, "deploy", "stacks", "self-managed", "environments", "local-bdd.yaml")
+			if err := os.MkdirAll(filepath.Dir(envFile), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(envFile, []byte("addons: {}\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fake := newVanityStreamedLimitFake(broken, t.TempDir(), &llmRoutingHTTPFake{seen: map[string]bool{}})
+			fake.attach(runner)
+			suite.HTTP = fake
+			sc := steps.NewScenarioContext(suite)
+			var out strings.Builder
+			status := godog.TestSuite{
+				Name:                "vanity-streamed-limit-feature",
+				ScenarioInitializer: func(ctx *godog.ScenarioContext) { steps.RegisterAll(ctx, sc) },
+				Options:             &godog.Options{Format: "pretty", Output: &out, Strict: true, FeatureContents: []godog.Feature{{Name: "vanity", Contents: []byte("Feature: Vanity streamed limit\n" + vanityStreamedLimitScenarioStart + scenario)}}},
+			}.Run()
+			if broken != "" && status == 0 {
+				t.Fatalf("feature did not reject the %s gateway:\n%s", broken, out.String())
+			}
+			if broken == "" && status != 0 {
+				t.Fatalf("feature failed:\n%s", out.String())
+			}
+			if broken == "" && (!fake.seen["fields-first"] || !fake.seen["fields-last"]) {
+				t.Fatalf("feature did not send both requests: %v", fake.seen)
+			}
+			if broken == "" && !commandRanThatContains(runner.runs, "rm -rf "+fake.dir) {
+				t.Fatal("feature did not remove its body files")
+			}
+		})
+	}
+}
+
+// TestVanityStreamedLimitBodyScriptWritesExactBodies runs the scenario's body
+// script, which the wiring fakes replace, and checks both files: exactly
+// 80 MiB of valid JSON with the routing fields first and last. The files go
+// to one fixed path under the ignored suite output directory, so a failed
+// run leaves one pair that the next run overwrites.
+func TestVanityStreamedLimitBodyScriptWritesExactBodies(t *testing.T) {
+	var command string
+	for _, line := range strings.Split(vanityStreamedLimitScenario(t), "\n") {
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "/bin/bash -c ") && strings.Contains(line, `fields-$order.json`) {
+			command = line
+		}
+	}
+	argv, err := shlex.Split(command)
+	if err != nil || len(argv) != 3 {
+		t.Fatalf("body script command %q: argv=%q err=%v", command, argv, err)
+	}
+	repoRoot := t.TempDir()
+	t.Setenv("REPO_ROOT", repoRoot)
+	t.Setenv("TMPDIR", t.TempDir())
+	var dir string
+	for run := 0; run < 2; run++ {
+		output, err := exec.Command(argv[0], argv[1], argv[2]).Output()
+		if err != nil {
+			t.Fatalf("body script run %d failed: %v", run+1, err)
+		}
+		dir = strings.TrimSpace(string(output))
+	}
+	if want := filepath.Join(repoRoot, "tests", "bdd", "out", "vanity-streamed-body"); dir != want {
+		t.Fatalf("body files written to %q, want the fixed suite output path %q", dir, want)
+	}
+	for order, firstKey := range map[string]string{"first": "model", "last": "messages"} {
+		data, err := os.ReadFile(filepath.Join(dir, "fields-"+order+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) != vanityStreamedBodyBytes {
+			t.Fatalf("fields-%s.json has %d bytes, want %d", order, len(data), vanityStreamedBodyBytes)
+		}
+		if string(data) != vanityStreamedBody(order == "first") {
+			t.Fatalf("fields-%s.json differs from the expected body", order)
+		}
+		var body struct {
+			Model  string `json:"model"`
+			Stream *bool  `json:"stream"`
+		}
+		if err := json.Unmarshal(data, &body); err != nil || body.Model != "bdd-streamed-limit" || body.Stream == nil || *body.Stream {
+			t.Fatalf("fields-%s.json: model=%q stream=%v err=%v", order, body.Model, body.Stream, err)
+		}
+		if !strings.HasPrefix(string(data), `{"`+firstKey+`"`) {
+			t.Fatalf("fields-%s.json does not start with %q", order, firstKey)
+		}
 	}
 }
 

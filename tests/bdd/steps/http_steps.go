@@ -47,6 +47,7 @@ func registerHTTPSteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I poll "([A-Z]+)" "([^"]*)" for up to (\d+) seconds until the HTTP response body contains "([^"]*)"$`, sc.iPollHTTPUntilBodyContains)
 	ctx.Step(`^the HTTP request header "([^"]*)" is the NVCF CLI function API key with prefix "([^"]*)"$`, sc.theHTTPRequestHeaderIsFunctionAPIKey)
 	ctx.Step(`^I send an? "([A-Z]+)" request to "([^"]*)" with timeout (\d+) seconds and body:$`, sc.iSendHTTPRequestWithTimeout)
+	ctx.Step(`^I send an? "([A-Z]+)" request to "([^"]*)" with timeout (\d+) seconds and body from file "([^"]*)"$`, sc.iSendHTTPRequestWithTimeoutAndBodyFile)
 	ctx.Step(`^the HTTP response should take at least "([^"]*)"$`, sc.theHTTPResponseShouldTakeAtLeast)
 	ctx.Step(`^the HTTP response body should end with "([^"]*)"$`, sc.theHTTPBodyShouldEndWith)
 	ctx.Step(`^the HTTP status should be (\d+)$`, sc.theHTTPStatusShouldBe)
@@ -330,6 +331,29 @@ func (sc *ScenarioContext) iSendHTTPRequestWithTimeout(ctx context.Context, meth
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
 	defer cancel()
 	return sc.sendHTTP(ctx, method, url, doc.Content)
+}
+
+// iSendHTTPRequestWithTimeoutAndBodyFile sends the named file's content as
+// the body, byte for byte. Only the URL and the path are interpolated.
+func (sc *ScenarioContext) iSendHTTPRequestWithTimeoutAndBodyFile(ctx context.Context, method, url string, seconds int, path string) error {
+	if seconds <= 0 {
+		return fmt.Errorf("HTTP timeout must be positive")
+	}
+	body, err := os.ReadFile(dsl.Interpolate(path))
+	if err != nil {
+		return fmt.Errorf("read request body file: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(seconds)*time.Second)
+	defer cancel()
+	headers := sc.HTTPHeaders
+	sc.HTTPHeaders = nil
+	resp, err := sc.httpClient().Do(ctx, method, dsl.Interpolate(url), headers, string(body))
+	if err != nil {
+		sc.LastHTTP = nil
+		return err
+	}
+	sc.LastHTTP = &resp
+	return nil
 }
 
 func (sc *ScenarioContext) theHTTPResponseShouldTakeAtLeast(minimum string) error {

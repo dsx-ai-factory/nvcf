@@ -73,7 +73,7 @@ request message from `/echo`. The single-cluster LLM field-fidelity scenario
 deploys the in-repo `examples/function-samples/openai-compatible-sample`, which
 supports the `x_load_tester_echo` body control, and reads the forwarded request
 from its reply. It defaults to the released
-`nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/nvcf-openai-compatible-sample:5.1.0`;
+`nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/nvcf-openai-compatible-sample:5.4.0`;
 set `SAMPLE_LLM_ECHO_IMAGE` to override it.
 The Vanity Gateway shadow sampling scenario deploys two LLM functions from the
 same image, so it must also honor the `LOAD_TESTER_DEFAULT_*` container

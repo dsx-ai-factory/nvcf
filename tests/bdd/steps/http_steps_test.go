@@ -347,3 +347,39 @@ func TestHTTPObservationsRejectMissingResponseAndInvalidInputs(t *testing.T) {
 		t.Fatal("unbounded timeout accepted")
 	}
 }
+
+func TestSendHTTPWithBodyFromFileSendsTheFileUnchanged(t *testing.T) {
+	t.Setenv("BDD_HTTP_HOST", "vanity.localhost:8080")
+	t.Setenv("BDD_BODY_DIR", t.TempDir())
+	t.Setenv("BDD_NOT_INTERPOLATED", "replaced")
+	content := `{"model":"m","input":"${BDD_NOT_INTERPOLATED}"}`
+	if err := os.WriteFile(filepath.Join(os.Getenv("BDD_BODY_DIR"), "body.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sc, fake := newHTTPScenario(t, harness.HTTPResponse{Status: 200, Body: "{}"})
+	if err := sc.theHTTPRequestHeaderIs("Content-Type", "application/json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.iSendHTTPRequestWithTimeoutAndBodyFile(context.Background(), "POST", "http://${BDD_HTTP_HOST}/v1/chat/completions", 120, "${BDD_BODY_DIR}/body.json"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.calls != 1 || fake.method != "POST" || fake.url != "http://vanity.localhost:8080/v1/chat/completions" {
+		t.Fatalf("calls=%d method=%q url=%q", fake.calls, fake.method, fake.url)
+	}
+	if fake.body != content {
+		t.Fatalf("body = %q, want the file content unchanged %q", fake.body, content)
+	}
+	if fake.headers["Content-Type"] != "application/json" {
+		t.Fatalf("headers = %v", fake.headers)
+	}
+	if err := sc.theHTTPStatusShouldBe(200); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sc.iSendHTTPRequestWithTimeoutAndBodyFile(context.Background(), "POST", "http://x/", 120, "${BDD_BODY_DIR}/missing.json"); err == nil || fake.calls != 1 {
+		t.Fatalf("missing file: err=%v calls=%d, want an error and no request", err, fake.calls)
+	}
+	if err := sc.iSendHTTPRequestWithTimeoutAndBodyFile(context.Background(), "POST", "http://x/", 0, "${BDD_BODY_DIR}/body.json"); err == nil || fake.calls != 1 {
+		t.Fatalf("zero timeout: err=%v calls=%d, want an error and no request", err, fake.calls)
+	}
+}

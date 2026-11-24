@@ -957,6 +957,138 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       And the HTTP response JSON field "choices.0.message.content.model" should equal "bdd-request-body"
       And the HTTP response JSON field "choices.0.message.content.messages.0.content" should equal "bdd-late-${BDD_REQUEST_BODY_PADDING}"
 
+    # A model request above the 64 MiB buffered limit set in the Background
+    # and below the streamed limit set here reaches the model server unchanged
+    # through invocation and the worker when model and stream come first. The
+    # same body with them last is rejected with the buffered limit after the
+    # gateway reads the routing prefix. The echo sample answers with the byte
+    # count and SHA-256 of the body it received (X-Load-Tester-Body-Digest),
+    # because its echo reply is capped at 1 MiB, and its own body limit is
+    # raised for the test. Needs a Vanity Gateway chart and image with
+    # maxStreamedRequestSizeBytes, and an echo sample with the body controls
+    # (LOAD_TESTER_MAX_REQUEST_BYTES and the digest header). The key stays
+    # set for later scenarios until suite teardown restores the environment
+    # file. Depends on the earlier install and registration scenarios.
+    @vanity-request-body
+    Scenario: Vanity Gateway forwards a model request above the buffered limit when its routing fields come first
+      Given environment variable "SAMPLE_LLM_ECHO_IMAGE" is set
+      And I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully create function "bdd-vanity-streamed-limit" from image "${SAMPLE_LLM_ECHO_IMAGE}" with CLI options:
+        | option           | value                                   |
+        | --inference-url  | /v1/chat/completions                    |
+        | --inference-port | 8000                                    |
+        | --health-uri     | /health                                 |
+        | --health-port    | 8000                                    |
+        | --health-timeout | PT30S                                   |
+        | --container-env  | LOAD_TESTER_MAX_REQUEST_BYTES=134217728 |
+        | --container-env  | LOAD_TESTER_READ_TIMEOUT_MS=600000      |
+      And I export the function selected by NVCF CLI to environment variables "BDD_STREAMED_LIMIT_FUNCTION_ID" and "BDD_STREAMED_LIMIT_VERSION_ID"
+      And function "${BDD_STREAMED_LIMIT_FUNCTION_ID}" version "${BDD_STREAMED_LIMIT_VERSION_ID}" is deleted at scenario teardown
+      And function "${BDD_STREAMED_LIMIT_FUNCTION_ID}" version "${BDD_STREAMED_LIMIT_VERSION_ID}" is undeployed at scenario teardown
+      And I successfully deploy the function selected by NVCF CLI with options:
+        | option          | value           |
+        | --gpu           | H100            |
+        | --instance-type | NCP.GPU.H100_1x |
+        | --backend       | ncp-local       |
+        | --regions       | us-west-1       |
+        | --min-instances | 1               |
+        | --max-instances | 1               |
+        | --timeout       | 900             |
+      And I successfully generate a function API key with CLI options:
+        | option        | value                                                               |
+        | --description | bdd-vanity-streamed-limit                                           |
+        | --scopes      | invoke_function,list_functions,queue_details,list_functions_details |
+
+      When I successfully invoke the function selected by NVCF CLI over HTTP with timeout "120" seconds and poll duration "5" seconds:
+        """
+        {"model":"bdd-streamed-limit","x_load_tester_echo":true,"messages":[{"role":"user","content":"bdd-streamed-limit-ready"}]}
+        """
+      Then the command output should contain "bdd-streamed-limit-ready"
+
+      When I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "addons.vanityGateway.config.maxStreamedRequestSizeBytes" to:
+        """
+        134217728
+        """
+      And I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "addons.vanityGateway.mappingConfig.v2config.openai" to:
+        """
+        host: vanity-openai.localhost:8080
+        chatCompletions:
+          bdd_streamed_limit:
+            modelName: bdd-streamed-limit
+            functionID: ${BDD_STREAMED_LIMIT_FUNCTION_ID}
+            functionVersionID: ${BDD_STREAMED_LIMIT_VERSION_ID}
+            usePexec: false
+        """
+      And I set yaml file "deploy/stacks/self-managed/environments/local-bdd.yaml" key "ingress.gatewayApi.routes.vanityGateway.hostnames" to:
+        """
+        - vanity.localhost
+        - vanity-openai.localhost
+        """
+      When I successfully run command "k3d kubeconfig merge ncp-local --output ${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml --overwrite --kubeconfig-switch-context=false"
+      And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=ingress KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
+      And I successfully run command "make -C deploy/stacks/self-managed apply HELMFILE_ENV=local-bdd HELMFILE_SELECTOR=name=vanity-gateway KUBECONFIG_FILE=${REPO_ROOT}/tests/bdd/out/ncp-local-vanity-kubeconfig.yaml"
+      And I successfully run command "kubectl --context k3d-ncp-local rollout restart deployment/vanity-gateway --namespace nvcf"
+      Then deployment "vanity-gateway" in namespace "nvcf" using context "k3d-ncp-local" should complete rollout within "5m"
+      # The old pod keeps serving with the previous mapping during its 70 s
+      # preStop, so wait until only the new pod is left.
+      And I poll command for up to 360 seconds until output contains "vanity-gateway pods: 1.":
+        """
+        /bin/bash -c 'echo "vanity-gateway pods: $(kubectl --context k3d-ncp-local get pods -n nvcf -l app.kubernetes.io/instance=vanity-gateway --no-headers | wc -l | tr -d " ")."'
+        """
+      And Kubernetes resource "httproute/vanity-gateway" in namespace "envoy-gateway-system" using context "k3d-ncp-local" should contain:
+        """
+        spec:
+          hostnames:
+            - vanity.localhost
+            - vanity-openai.localhost
+        """
+      And these Gateway API routes should be accepted and resolved using context "k3d-ncp-local" within "2m":
+        | kind      | name           | namespace            | parent    |
+        | HTTPRoute | vanity-gateway | envoy-gateway-system | shared-gw |
+
+      # Confirm the operator's 128 MiB streamed limit reaches the gateway environment.
+      When I run command "kubectl --context k3d-ncp-local get configmap/vanity-gateway-env -n nvcf -o jsonpath={.data.MAX_STREAMED_REQUEST_SIZE_BYTES}"
+      Then the command exit code should be 0
+      And the command output should contain "134217728"
+
+      # Two bodies of exactly 80 MiB (83886080 bytes), too large for an
+      # environment variable, with model and stream first and last. They go
+      # to a fixed path in the suite output directory, so a failed run leaves
+      # one pair that the next run overwrites.
+      When I successfully run command:
+        """
+        /bin/bash -c 'set -euo pipefail; dir=${REPO_ROOT}/tests/bdd/out/vanity-streamed-body; mkdir -p "$dir"; for order in first last; do if [ "$order" = first ]; then prefix="{\"model\":\"bdd-streamed-limit\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\""; suffix="\"}]}"; else prefix="{\"messages\":[{\"role\":\"user\",\"content\":\""; suffix="\"}],\"model\":\"bdd-streamed-limit\",\"stream\":false}"; fi; { printf "%s" "$prefix"; head -c $((83886080 - ${#prefix} - ${#suffix})) /dev/zero | tr "\0" a; printf "%s" "$suffix"; } > "$dir/fields-$order.json"; done; echo "$dir"'
+        """
+      And I export command output to environment variable "BDD_STREAMED_BODY_DIR"
+      When I successfully run command:
+        """
+        /bin/bash -c 'set -euo pipefail; f=${BDD_STREAMED_BODY_DIR}/fields-first.json; if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi | cut -d " " -f 1'
+        """
+      And I export command output to environment variable "BDD_STREAMED_BODY_SHA256"
+
+      # model and stream first: forwarded as it arrives, within the streamed limit.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      And the HTTP request header "Content-Type" is "application/json"
+      And the HTTP request header "X-Load-Tester-Body-Digest" is "true"
+      When I send a "POST" request to "http://vanity-openai.localhost:8080/v1/chat/completions" with timeout 600 seconds and body from file "${BDD_STREAMED_BODY_DIR}/fields-first.json"
+      Then the HTTP status should be 200
+      And the HTTP response JSON field "object" should equal "load_tester.body_digest"
+      And the HTTP response JSON field "complete" should equal "true"
+      And the HTTP response JSON field "bytes" should be at least 83886080
+      And the HTTP response JSON field "bytes" should be less than 83886081
+      And the HTTP response JSON field "sha256" should equal "${BDD_STREAMED_BODY_SHA256}"
+
+      # model and stream last: read in full, so the 64 MiB buffered limit applies.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      And the HTTP request header "Content-Type" is "application/json"
+      When I send a "POST" request to "http://vanity-openai.localhost:8080/v1/chat/completions" with timeout 600 seconds and body from file "${BDD_STREAMED_BODY_DIR}/fields-last.json"
+      Then the HTTP status should be 400
+      And the HTTP response header "NVCF-Error-Source" should equal "gateway_rejected"
+      And the HTTP response body should contain "Please make sure your payload is below 67108864 bytes"
+
+      When I successfully run command "rm -rf ${BDD_STREAMED_BODY_DIR}"
+
     # Proves the serve path the @llm-gateway scenario only installs:
     # LLM-type functions route through llm-api-gateway and
     # llm-request-router. The CLI maps invocation.localhost to the
