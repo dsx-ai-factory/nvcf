@@ -73,12 +73,13 @@ int fake_open_contexts(void) { return open_ctxs; }
 void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
 
 /* Knobs for the white-box cases (test_ibv.py PROBE). */
-static int port_delay_ms, fail_marker, fail_init, err_opcode, async_calls, live_pds;
+static int port_delay_ms, fail_marker, fail_init, fail_destroy, err_opcode, async_calls, live_pds;
 static uint32_t next_lkey;
 static struct fqp *event_qp;
 void fake_port_delay_ms(int ms) { port_delay_ms = ms; }
 void fake_fail_marker(int nth) { fail_marker = nth; }   /* the nth fence write's post fails */
 void fake_fail_init(int n) { fail_init = n; }           /* the next n moves to INIT fail */
+void fake_fail_destroy(int n) { fail_destroy = n; }     /* the next n queue pair destroys fail */
 void fake_err_opcode(int on) { err_opcode = on; }       /* failed completions carry a receive's opcode */
 void fake_next_lkey(uint32_t k) { next_lkey = k; }
 void fake_raise_qp_event(struct ibv_qp *q) { event_qp = (struct fqp *)q; }
@@ -180,7 +181,15 @@ struct ibv_context *ibv_open_device(struct ibv_device *d)
     open_ctxs++;
     return c;
 }
-int ibv_close_device(struct ibv_context *c) { close(c->cmd_fd); close(c->async_fd); free(c); open_ctxs--; return 0; }
+/* As the kernel: what is left of the device's objects goes with it. The
+ * context is not freed: a queue pair left over may still point at it. */
+int ibv_close_device(struct ibv_context *c)
+{
+    for (int i = 0; i < n_qps; i++) if (qps[i]->q.context == c) qps[i]->live = 0;
+    for (int i = 0; i < n_mrs; i++) if (mrs[i]->m.context == c) mrs[i]->live = 0;
+    close(c->cmd_fd); close(c->async_fd); open_ctxs--;
+    return 0;
+}
 int ibv_get_async_event(struct ibv_context *c, struct ibv_async_event *e)
 {
     async_calls++;
@@ -266,6 +275,7 @@ int ibv_destroy_qp(struct ibv_qp *q)
     struct fqp *f = (struct fqp *)q;
     for (int i = 0; i < 3000 && __atomic_load_n(&f->unacked, __ATOMIC_SEQ_CST); i++) usleep(1000);
     if (__atomic_load_n(&f->unacked, __ATOMIC_SEQ_CST)) return EBUSY;
+    if (fail_destroy && fail_destroy--) return EIO;
     f->live = 0;
     return 0;
 }
@@ -437,13 +447,13 @@ static int probe_poll(struct pollfd *p, nfds_t n, int t);
 
 #define FK(ret, name, ...) static ret (*name)(__VA_ARGS__)
 FK(void, fake_move, void); FK(void, fake_port_delay_ms, int); FK(void, fake_fail_marker, int);
-FK(void, fake_fail_init, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
+FK(void, fake_fail_init, int); FK(void, fake_fail_destroy, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
 FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
 FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *);
 static void fakes(void)
 {
 #define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
-    G(fake_move); G(fake_port_delay_ms); G(fake_fail_marker); G(fake_fail_init); G(fake_err_opcode);
+    G(fake_move); G(fake_port_delay_ms); G(fake_fail_marker); G(fake_fail_init); G(fake_fail_destroy); G(fake_err_opcode);
     G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
     G(fake_qp_receives);
 #undef G
@@ -758,6 +768,26 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "destroyfail")) {
+        /* The release cannot destroy one queue pair (qa); its peer (qb) is
+         * destroyed. After the restore, qa must reach the new qb. */
+        up(1);
+        fake_fail_destroy(1);
+        int s = nvsnap_ibv_suspend(rep, sizeof(rep));
+        fake_move();
+        int r = nvsnap_ibv_restore(rep, sizeof(rep));
+        int k = r ? -1 : reconnect();
+        nvsnap_ibv_open();
+        int ok = 0;
+        if (!k) {
+            send_t(NULL);
+            struct ibv_wc wc[8];
+            int n = cq->context->ops.poll_cq(cq, 8, wc);
+            for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        }
+        printf("suspend=%d restore=%d connect=%d completed=%d\n", s, r, k, ok);
+        return 0;
+    }
     if (!strcmp(c, "sge5drain")) {
         /* The receive is already in a verbs call (past the gate) when the
          * fence checks, and is recorded only while the fence waits for
@@ -935,6 +965,12 @@ class Ibv(unittest.TestCase):
 
     def test_receive_with_too_many_entries_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5")["fence"], "0")
+
+    def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
+        out = self.probe("destroyfail")
+        self.assertNotEqual(out["suspend"], "0", out)
+        self.assertEqual((out["restore"], out["connect"]), ("0", "0"), out)
+        self.assertEqual(out["completed"], "1", "a queue pair left by the release still targets its peer's old number")
 
     def test_receive_recorded_while_the_fence_waits_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5drain")["fence"], "0",

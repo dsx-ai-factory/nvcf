@@ -1146,6 +1146,16 @@ EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
     for (int i = 0; i < n_ctxs; i++)
         if (R.close_device(ctxs[i]->real)) bad++;
         else ctxs[i]->real = NULL, __atomic_add_fetch(&ctxs[i]->gen, 1, __ATOMIC_SEQ_CST);
+    /* An object whose destroy failed went with its device when the device
+     * closed (the kernel destroys what is left of a closed device): its
+     * handle is stale. Forget it, so the restore creates it again with the
+     * rest. Kept, a queue pair would be skipped by the restore and by
+     * "connect", and go on targeting its peer's old number while the peer
+     * is created again. The provider's memory for it is leaked. */
+    for (int i = 0; bad && i < n_qps; i++) if (qps[i]->real && !qps[i]->pd->c->real) qps[i]->real = NULL;
+    for (int i = 0; bad && i < n_cqs; i++) if (cqs[i]->real && !cqs[i]->c->real) cqs[i]->real = NULL;
+    for (int i = 0; bad && i < n_mrs; i++) if (mrs[i]->real && !mrs[i]->pd->c->real) mrs[i]->real = NULL;
+    for (int i = 0; bad && i < n_pds; i++) if (pds[i]->real && !pds[i]->c->real) pds[i]->real = NULL;
     int nq = n_qps, nm = n_mrs, nc = n_ctxs;
     pthread_mutex_unlock(&omu);
     if (bad) { snprintf(reply, n, "err %d verbs object(s) could not be destroyed", bad); return -1; }
