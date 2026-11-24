@@ -481,7 +481,7 @@ sum(rate(nvca_workload_result_total[5m])) > 0.1
 An unchanged-capacity check does not send an upstream request and does not
 increment this counter. Heartbeat event-processing latency includes these no-op
 checks as well as publications; use upstream client metrics to measure requests.
-Published-heartbeat debug logs include `heartbeat_trigger=periodic` or
+Published-heartbeat info logs include `heartbeat_trigger=periodic` or
 `heartbeat_trigger=capacity` to distinguish the two sources.
 
 **Usage:**

@@ -823,16 +823,7 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 		t.Fatal("function deployment cleanup was never invoked")
 	}
 	assertFunctionDeploymentsUseInstanceType(t, suite.Runner.(*fakeRunner).runs, "NCP.GPU.H100_1x", 12)
-	for _, key := range []string{"early", "late"} {
-		if !requestBody.seen[key] {
-			t.Errorf("vanity request body scenario never sent the %s-field request", key)
-		}
-	}
-	for _, key := range []string{"shadow-warmup", "promptCacheKey", "firstMessageHash", "continuation", "failing-shadow"} {
-		if !vanityShadow.seen[key] {
-			t.Errorf("vanity shadow scenario never exercised %s", key)
-		}
-	}
+	assertVanityScenariosObserved(t, requestBody.seen, vanityShadow.seen)
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"function delete --deployment-only --function-id", "--version-id") {
 		t.Error("vanity shadow functions are not undeployed by ID at teardown")
@@ -843,6 +834,20 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	}
 	if !commandRanThatContains(suite.Runner.(*fakeRunner).runs, "http://llm.localhost:8080/v1/chat/completions") {
 		t.Fatal("unauthenticated LLM gateway check was never invoked")
+	}
+}
+
+func assertVanityScenariosObserved(t *testing.T, requestBodies, shadows map[string]bool) {
+	t.Helper()
+	for _, key := range []string{"early", "late"} {
+		if !requestBodies[key] {
+			t.Errorf("vanity request body scenario never sent the %s-field request", key)
+		}
+	}
+	for _, key := range []string{"shadow-warmup", "promptCacheKey", "firstMessageHash", "continuation", "failing-shadow"} {
+		if !shadows[key] {
+			t.Errorf("vanity shadow scenario never exercised %s", key)
+		}
 	}
 }
 

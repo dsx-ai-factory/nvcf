@@ -20,7 +20,6 @@ package health
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,7 +56,7 @@ func (f GetComponentStatusFunc) GetComponentStatus(ctx context.Context) (nvcatyp
 }
 
 type BackendStatusCache struct {
-	refreshMu     sync.Mutex
+	refreshGate   chan struct{}
 	backendStatus atomic.Value
 	getters       []ComponentStatusGetter
 
@@ -76,6 +75,7 @@ func NewBackendStatusCache(
 	getters ...ComponentStatusGetter,
 ) *BackendStatusCache {
 	cache := &BackendStatusCache{
+		refreshGate:    make(chan struct{}, 1),
 		getters:        getters,
 		minRefreshWait: minRefreshWait,
 		nowFunc:        time.Now,
@@ -162,8 +162,15 @@ func (c *BackendStatusCache) RefreshStatus(ctx context.Context) (nvcatypes.Agent
 
 // RefreshStatusForLevel refreshes the cached status for all status getters in the cache.
 func (c *BackendStatusCache) RefreshStatusForLevel(ctx context.Context, level nvcatypes.StatusLevel) (nvcatypes.AgentHealth, error) {
-	c.refreshMu.Lock()
-	defer c.refreshMu.Unlock()
+	select {
+	case c.refreshGate <- struct{}{}:
+		defer func() { <-c.refreshGate }()
+	case <-ctx.Done():
+		return nvcatypes.AgentHealth{}, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nvcatypes.AgentHealth{}, err
+	}
 	log := core.GetLogger(ctx)
 
 	if c.minRefreshWait != 0 {
@@ -171,7 +178,6 @@ func (c *BackendStatusCache) RefreshStatusForLevel(ctx context.Context, level nv
 			c.lastRefresh.Add(1*c.minRefreshWait).After(c.nowFunc()) {
 			return c.GetStatusForLevel(level), nil
 		}
-		c.lastRefresh = c.nowFunc()
 	}
 
 	results := make(chan statusResult)
@@ -223,6 +229,9 @@ func (c *BackendStatusCache) RefreshStatusForLevel(ctx context.Context, level nv
 
 	if err := utilerror.NewAggregate(errs); err != nil {
 		return nvcatypes.AgentHealth{}, err
+	}
+	if c.minRefreshWait != 0 {
+		c.lastRefresh = c.nowFunc()
 	}
 	return c.GetStatusForLevel(level), nil
 }

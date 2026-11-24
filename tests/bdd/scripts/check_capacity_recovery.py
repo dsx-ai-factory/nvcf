@@ -39,14 +39,24 @@ def allocation_released(old_name, pods, requests):
     return all(i.get("lastReportedStatus") == "terminated" for i in instances)
 
 
-def latest_heartbeat(logs):
+def latest_heartbeat(logs, *, with_timestamp=False):
     found = None
     for line in logs.splitlines():
         if "heartBeatRequest " not in line:
             continue
         raw = line.split("heartBeatRequest ", 1)[1].replace('\\"', '"')
         try:
-            found = json.JSONDecoder().raw_decode(raw)[0]
+            payload = json.JSONDecoder().raw_decode(raw)[0]
+            if with_timestamp:
+                if line.lstrip().startswith("{"):
+                    event = json.loads(line)
+                    received_at = event.get("@timestamp") or event.get("timestamp", "")
+                else:
+                    received_at = line.split()[0]
+                received = datetime.datetime.fromisoformat(received_at.replace("Z", "+00:00")).timestamp()
+                found = payload, received
+            else:
+                found = payload
         except (ValueError, json.JSONDecodeError):
             continue
     return found
@@ -61,6 +71,12 @@ def occupied_by_candidate(usage, heartbeat, gpu, capacity, version):
         and (heartbeat or {}).get("nvcaAgentVersion") == version
         and reported.get("allocated") == capacity
     )
+
+
+def capacity_publication_observed(logs):
+    return any("Published NVCA heartbeat" in line and
+               re.search(r'heartbeat_trigger[=:"\s]+capacity\b', line)
+               for line in logs.splitlines())
 
 
 def periodic_heartbeat_seconds(logs):
@@ -99,9 +115,13 @@ class RecoveryCheck:
         path.write_text(json.dumps(value, indent=2) + "\n")
         path.chmod(0o600)
 
-    @staticmethod
-    def command(argv):
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=600, check=False)
+    def command(self, argv):
+        timeout = 600
+        if getattr(self, "deadline", None) is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("observation deadline elapsed")
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
         if result.returncode:
             # CLI and API failures can contain sensitive data. Keep failures terse.
             raise RuntimeError(f"{Path(argv[0]).name} failed with exit code {result.returncode}")
@@ -125,25 +145,51 @@ class RecoveryCheck:
             self.args.api_url + "/v1/accounts/" + self.args.account + "/clusters",
             headers={"Host": self.args.icms_host, "Authorization": "Bearer " + self.token},
         )
-        with self.http.open(request, timeout=20) as response:
+        timeout = 20
+        if getattr(self, "deadline", None) is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("observation deadline elapsed")
+        with self.http.open(request, timeout=timeout) as response:
             clusters = json.load(response)
         if isinstance(clusters, dict):
             clusters = clusters["clusters"]
         cluster = next(c for c in clusters if c.get("clusterName") == self.args.backend)
         return cluster.get("gpuUsage", {}).get(self.args.gpu, {})
 
-    @staticmethod
-    def wait(label, condition, timeout):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                value = condition()
-            except (RuntimeError, OSError, urllib.error.URLError, subprocess.TimeoutExpired):
-                value = None
-            if value:
-                return value
-            time.sleep(1)
+    def wait(self, label, condition, timeout, *, deadline=None):
+        previous = getattr(self, "deadline", None)
+        limits = [time.monotonic() + timeout]
+        limits += [d for d in (previous, deadline) if d is not None]
+        self.deadline = min(limits)
+        try:
+            while time.monotonic() < self.deadline:
+                try:
+                    value = condition()
+                except (RuntimeError, OSError, urllib.error.URLError, subprocess.TimeoutExpired):
+                    value = None
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if value:
+                    return value
+                time.sleep(min(1, remaining))
+        finally:
+            self.deadline = previous
         raise RuntimeError(label + " timed out")
+
+    def create(self, name):
+        args = self.args
+        created = json.loads(self.cli("function", "create", "--name", name,
+            "--image", args.image, "--inference-url", "/echo", "--inference-port", "8000",
+            "--health-uri", "/health", "--health-port", "8000", "--health-timeout", "PT30S", "--json"))["function"]
+        identity = (created["id"], created["versionId"])
+        self.identities.append(identity)
+        self.save("functions.json", self.identities)
+        self.cli("function", "deploy", "create", "--function-id", identity[0],
+                 "--version-id", identity[1], "--backend", args.backend, "--gpu", args.gpu,
+                 "--instance-type", args.instance_type, "--regions", args.region,
+                 "--min-instances", "1", "--max-instances", "1", "--timeout", "600")
 
     def run(self):
         args = self.args
@@ -195,17 +241,7 @@ class RecoveryCheck:
             self.wait("all test capacity available before fixture creation", unused, 360)
             # Independent requests preserve the min=max=1 release behavior.
             for index in range(args.expected_capacity):
-                self.cli("function", "create", "--name", f"{prefix}-{index}",
-                         "--image", args.image, "--inference-url", "/echo", "--inference-port", "8000",
-                         "--health-uri", "/health", "--health-port", "8000", "--health-timeout", "PT30S")
-                selected = json.loads(self.cli("status", "--json"))["currentFunction"]
-                identity = (selected["functionId"], selected["versionId"])
-                self.identities.append(identity)
-                self.save("functions.json", self.identities)
-                self.cli("function", "deploy", "create", "--function-id", identity[0],
-                         "--version-id", identity[1], "--backend", args.backend, "--gpu", args.gpu,
-                         "--instance-type", args.instance_type, "--regions", args.region,
-                         "--min-instances", "1", "--max-instances", "1", "--timeout", "600")
+                self.create(f"{prefix}-{index}")
             self.save("functions.json", self.identities)
             function_ids = {identity[0] for identity in self.identities}
             workers = lambda: self.objects("pods", "nvcf-backend")
@@ -237,25 +273,38 @@ class RecoveryCheck:
             since = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
             def occupied():
-                heartbeat = latest_heartbeat(self.kubectl("logs", "deployment/spot-instance-service",
-                    "-n", "sis", "--since-time=" + since, "--tail=10000"))
+                observed = latest_heartbeat(self.kubectl("logs", "deployment/spot-instance-service",
+                    "-n", "sis", "--since-time=" + since, "--tail=10000"), with_timestamp=True)
+                heartbeat, received = observed if observed else (None, None)
                 usage = self.usage()
                 if occupied_by_candidate(usage, heartbeat, args.gpu, args.expected_capacity, args.agent_version):
                     return {"usage": usage, "heartbeat": heartbeat, "images": images,
+                            "heartbeatReceivedAt": received,
                             "notBefore": since,
                             "observedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
                 return None
 
-            self.save("occupied.json", self.wait("candidate heartbeat with no spare capacity", occupied, 360))
+            occupied_snapshot = self.wait("candidate heartbeat with no spare capacity", occupied, 360)
+            self.save("occupied.json", occupied_snapshot)
+            # A slow release must not move the deadline past the periodic fallback.
+            periodic_deadline = time.monotonic() + occupied_snapshot["heartbeatReceivedAt"] + interval - time.time()
             old = next(p for p in ready_workers(workers(), function_ids)
                        if p["metadata"]["labels"]["function-id"] == self.identities[0][0])
             old_name, old_uid = old["metadata"]["name"], old["metadata"]["uid"]
             self.kubectl("delete", "pod", old_name, "-n", "nvcf-backend", "--grace-period=5", "--wait=false")
             self.wait("workload gone and termination reported", lambda: allocation_released(
-                old_name, workers(), self.objects("icmsrequests")), 240)
+                old_name, workers(), self.objects("icmsrequests")), 240, deadline=periodic_deadline)
             released = time.monotonic()
-            self.wait("released capacity published", lambda: self.usage().get("available", 0) > 0,
-                      args.publication_timeout)
+
+            def published_by_capacity_check():
+                if self.usage().get("available", 0) <= 0:
+                    return False
+                logs = self.kubectl("logs", "deployment/nvca", "-c", "agent", "-n", "nvca-system",
+                                    "--since-time=" + occupied_snapshot["observedAt"], "--tail=10000")
+                return capacity_publication_observed(logs)
+
+            self.wait("released capacity published", published_by_capacity_check,
+                      args.publication_timeout, deadline=periodic_deadline)
             published = time.monotonic() - released
 
             def recovered():
@@ -265,8 +314,9 @@ class RecoveryCheck:
                                 and p["metadata"]["uid"] != old_uid for p in ready))
 
             self.wait("automatic replacement ready", recovered,
-                      max(1, args.recovery_timeout - (time.monotonic() - released)))
+                      max(1, args.recovery_timeout - (time.monotonic() - released)), deadline=periodic_deadline)
             result = {"passed": True, "agentVersion": args.agent_version, "discoveryMode": args.discovery_mode,
+                      "publicationTrigger": "capacity",
                       "capacity": args.expected_capacity, "publicationSeconds": published,
                       "replacementReadySeconds": time.monotonic() - released,
                       "workerGraceSeconds": 5, "periodicHeartbeatSeconds": 300}

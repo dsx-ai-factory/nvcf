@@ -1703,7 +1703,7 @@ func (a *Agent) putNVCAStatusUpdate(ctx context.Context, capacityOnly bool) erro
 		"rpc":    "Agent.PutNVCAStatusUpdate",
 		"action": response.Action,
 	})
-	log.Debug("Published NVCA heartbeat")
+	log.Info("Published NVCA heartbeat")
 
 	shouldTriggerSelfDestruct := false
 

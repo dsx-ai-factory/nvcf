@@ -6,10 +6,11 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from check_capacity_recovery import (
     allocation_released,
+    capacity_publication_observed,
     discovery_mode,
     latest_heartbeat,
     occupied_by_candidate,
@@ -21,6 +22,72 @@ from check_capacity_recovery import (
 
 
 class CapacityRecoveryTests(unittest.TestCase):
+    def test_only_successful_capacity_triggered_publication_counts(self):
+        self.assertTrue(capacity_publication_observed('level=info msg="Published NVCA heartbeat" heartbeat_trigger=capacity'))
+        self.assertTrue(capacity_publication_observed('{"msg":"Published NVCA heartbeat","heartbeat_trigger":"capacity"}'))
+        self.assertFalse(capacity_publication_observed('level=info msg="Published NVCA heartbeat" heartbeat_trigger=periodic'))
+        self.assertFalse(capacity_publication_observed('level=error msg="request failed" heartbeat_trigger=capacity'))
+
+    def test_created_identity_is_owned_before_deployment_or_cli_state_can_fail(self):
+        check = RecoveryCheck.__new__(RecoveryCheck)
+        check.args = SimpleNamespace(image="sample", backend="target", gpu="H100", instance_type="one", region="local")
+        check.identities = []
+        check.save = Mock()
+        check.cli = Mock(side_effect=[json.dumps({"function": {"id": "owned", "versionId": "version"}}),
+                                      RuntimeError("deployment failed")])
+        with self.assertRaisesRegex(RuntimeError, "deployment failed"):
+            check.create("unique-name")
+        self.assertEqual([("owned", "version")], check.identities)
+        self.assertEqual("--json", check.cli.call_args_list[0].args[-1])
+        self.assertFalse(any(call.args[0] == "status" for call in check.cli.call_args_list))
+
+    def test_wait_rejects_a_successful_observation_completed_after_its_deadline(self):
+        for duration, timeout, accepted in ((0.5, 1, True), (1.5, 1, False)):
+            with self.subTest(duration=duration):
+                clock = [0]
+                check = RecoveryCheck.__new__(RecoveryCheck)
+
+                def condition():
+                    clock[0] += duration
+                    return "observed"
+
+                with patch("check_capacity_recovery.time.monotonic", side_effect=lambda: clock[0]):
+                    if accepted:
+                        self.assertEqual("observed", check.wait("bounded", condition, timeout))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "bounded timed out"):
+                            check.wait("bounded", condition, timeout)
+
+    def test_wait_rejects_periodic_fallback_even_within_the_release_relative_limit(self):
+        clock = [0]
+        check = RecoveryCheck.__new__(RecoveryCheck)
+
+        def condition():
+            clock[0] = 51
+            return True
+
+        with patch("check_capacity_recovery.time.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(RuntimeError, "before periodic timed out"):
+                check.wait("before periodic", condition, 60, deadline=50)
+
+    def test_command_and_http_calls_use_the_remaining_observation_budget(self):
+        check = RecoveryCheck.__new__(RecoveryCheck)
+        check.deadline = 10
+        check.args = SimpleNamespace(api_url="http://local", account="test", icms_host="sis", backend="target", gpu="H100")
+        check.token = "unit-token"
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({"clusters": [{"clusterName": "target", "gpuUsage": {"H100": {}}}]}).encode()
+        check.http = Mock()
+        check.http.open.return_value = response
+        with patch("check_capacity_recovery.time.monotonic", return_value=9), \
+                patch("check_capacity_recovery.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="ok")) as run:
+            self.assertEqual("ok", check.command(["tool"]))
+            self.assertEqual(1, run.call_args.kwargs["timeout"])
+            check.usage()
+            self.assertEqual(1, check.http.open.call_args.kwargs["timeout"])
+
     def test_static_fixture_supplies_required_instance_values_and_test_capacity(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures" / "capacity-gpus.json"
         gpus = json.loads(fixture.read_text())
@@ -137,6 +204,22 @@ class CapacityRecoveryTests(unittest.TestCase):
                 + "heartBeatRequest invalid")
         self.assertEqual(last, latest_heartbeat(logs))
         self.assertIsNone(latest_heartbeat("no heartbeat"))
+
+    def test_heartbeat_timestamp_belongs_to_the_latest_complete_request(self):
+        logs = ('2026-01-01T00:00:00Z INFO heartBeatRequest {"nvcaAgentVersion":"old"}\n'
+                '2026-01-01T00:05:00Z INFO heartBeatRequest {"nvcaAgentVersion":"candidate"}\n'
+                '2026-01-01T00:06:00Z INFO heartBeatRequest incomplete')
+        heartbeat, received = latest_heartbeat(logs, with_timestamp=True)
+        self.assertEqual({"nvcaAgentVersion": "candidate"}, heartbeat)
+        self.assertEqual(1767225900, received)
+
+    def test_structured_heartbeat_log_preserves_request_and_timestamp(self):
+        heartbeat = {"nvcaAgentVersion": "candidate", "gpuUsage": {"H100": {"allocated": 4}}}
+        line = json.dumps({"@timestamp": "2026-01-01T00:05:00.123456789Z",
+                           "message": "HEART_BEAT_LOGGING: heartBeatRequest " + json.dumps(heartbeat)})
+        parsed, received = latest_heartbeat(line, with_timestamp=True)
+        self.assertEqual(heartbeat, parsed)
+        self.assertAlmostEqual(1767225900.123456, received, places=5)
 
     def test_heartbeat_interval_is_observed_in_startup(self):
         self.assertEqual(300, periodic_heartbeat_seconds("options: HeartbeatInterval:300000000000, rest"))

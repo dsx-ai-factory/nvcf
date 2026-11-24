@@ -189,6 +189,94 @@ func TestBackendStatusCacheConcurrentFirstRefresh(t *testing.T) {
 	require.EqualValues(t, 1, calls.Load())
 }
 
+func TestBackendStatusCacheRefreshWaitHonorsContext(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "deadline", true: "already canceled"}[canceled], func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			var calls atomic.Int32
+			cache := NewBackendStatusCache(time.Hour, GetComponentStatusFunc(func(context.Context) (nvcatypes.AgentHealth, error) {
+				calls.Add(1)
+				close(started)
+				<-release
+				return nvcatypes.AgentHealth{Status: nvcatypes.HealthStatusHealthy}, nil
+			}))
+			first := make(chan error, 1)
+			go func() {
+				_, err := cache.RefreshStatus(context.Background())
+				first <- err
+			}()
+			<-started
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			defer cancel()
+			want := context.DeadlineExceeded
+			if canceled {
+				cancel()
+				want = context.Canceled
+			}
+			waiting := make(chan error, 1)
+			go func() {
+				_, err := cache.RefreshStatus(ctx)
+				waiting <- err
+			}()
+			select {
+			case err := <-waiting:
+				require.ErrorIs(t, err, want)
+			case <-time.After(time.Second):
+				t.Fatal("waiting refresh did not stop when its context ended")
+			}
+			require.EqualValues(t, 1, calls.Load(), "a canceled waiter must not start a refresh")
+			unblock()
+			require.NoError(t, <-first)
+			_, err := cache.RefreshStatus(context.Background())
+			require.NoError(t, err, "cancellation must not prevent later cached reads")
+			require.EqualValues(t, 1, calls.Load())
+		})
+	}
+}
+
+func TestBackendStatusCacheFailedRefreshIsRetried(t *testing.T) {
+	for _, primed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "first refresh", true: "expired successful refresh"}[primed], func(t *testing.T) {
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			failure := errors.New("component refresh failed")
+			var calls int
+			fail := false
+			cache := NewBackendStatusCache(time.Hour, GetComponentStatusFunc(func(context.Context) (nvcatypes.AgentHealth, error) {
+				calls++
+				if fail {
+					return nvcatypes.AgentHealth{}, failure
+				}
+				return nvcatypes.AgentHealth{GPUUsage: map[nvcatypes.GPUName]nvcatypes.GPUResource{
+					"A100": {Capacity: 1},
+				}}, nil
+			}))
+			cache.nowFunc = func() time.Time { return now }
+			if primed {
+				_, err := cache.RefreshStatus(context.Background())
+				require.NoError(t, err)
+				now = now.Add(2 * time.Hour)
+			}
+			fail = true
+			before := calls
+			for range 2 {
+				_, err := cache.RefreshStatus(context.Background())
+				require.ErrorIs(t, err, failure, "a failed refresh must not become a healthy cached response")
+			}
+			require.Equal(t, before+2, calls)
+			fail = false
+			for range 2 {
+				status, err := cache.RefreshStatus(context.Background())
+				require.NoError(t, err)
+				require.Contains(t, status.GPUUsage, nvcatypes.GPUName("A100"))
+			}
+			require.Equal(t, before+3, calls, "successful refreshes must still honor the refresh wait")
+		})
+	}
+}
+
 type mockResponse struct {
 	health nvcatypes.AgentHealth
 	err    error
