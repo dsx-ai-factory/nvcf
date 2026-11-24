@@ -31,6 +31,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,7 +39,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/bytebufferpool"
@@ -82,6 +82,13 @@ func directMappings() *config.GatewayConfig {
 // same body limit middleware as the model API host.
 func newPrefixTestDirector(t testing.TB, limit int64, transport http.RoundTripper) (*ModelDirector, http.Handler) {
 	t.Helper()
+	return newPrefixTestDirectorWithStreamedLimit(t, limit, limit, transport)
+}
+
+// newPrefixTestDirectorWithStreamedLimit is newPrefixTestDirector with a
+// separate limit for streamed requests.
+func newPrefixTestDirectorWithStreamedLimit(t testing.TB, limit, streamedLimit int64, transport http.RoundTripper) (*ModelDirector, http.Handler) {
+	t.Helper()
 	vanity, err := NewVanityDirector("http://nvcf.test", transport)
 	require.NoError(t, err)
 	llm, err := NewLLMGatewayDirector("http://llm.test", transport)
@@ -89,9 +96,10 @@ func newPrefixTestDirector(t testing.TB, limit int64, transport http.RoundTrippe
 	director, err := NewModelDirector(directMappings(), regexp.MustCompile("^$"), vanity, llm, NewTrafficShadower(64, time.Minute))
 	require.NoError(t, err)
 	director.requestBodyLimit = limit
+	director.streamedRequestBodyLimit = streamedLimit
 
 	router := chi.NewRouter()
-	sized := chimiddleware.RequestSize(limit)
+	sized := limitModelRequestBody(limit)
 	router.Method(http.MethodPost, "/v1/chat/completions", sized(http.HandlerFunc(director.ServeChatCompletions)))
 	router.Method(http.MethodPost, "/v1/messages", sized(http.HandlerFunc(director.ServeMessages)))
 	router.Method(http.MethodPost, decisionsPath, sized(http.HandlerFunc(director.ServeDecisions)))
@@ -510,6 +518,13 @@ func TestBufferedRequestWaitsForClientEOF(t *testing.T) {
 // tests below exercise the HTTP server body reader and http.Transport.
 func realNetworkGateway(t *testing.T, limit int64, upstream http.Handler) string {
 	t.Helper()
+	return realNetworkGatewayWithStreamedLimit(t, limit, limit, upstream)
+}
+
+// realNetworkGatewayWithStreamedLimit is realNetworkGateway with a separate
+// limit for streamed requests.
+func realNetworkGatewayWithStreamedLimit(t *testing.T, limit, streamedLimit int64, upstream http.Handler) string {
+	t.Helper()
 	backend := httptest.NewServer(upstream)
 	t.Cleanup(backend.Close)
 	vanity, err := NewVanityDirector(backend.URL, &http.Transport{})
@@ -517,8 +532,9 @@ func realNetworkGateway(t *testing.T, limit int64, upstream http.Handler) string
 	director, err := NewModelDirector(directMappings(), regexp.MustCompile("^$"), vanity, nil, nil)
 	require.NoError(t, err)
 	director.requestBodyLimit = limit
+	director.streamedRequestBodyLimit = streamedLimit
 	router := chi.NewRouter()
-	sized := chimiddleware.RequestSize(limit)
+	sized := limitModelRequestBody(limit)
 	router.Method(http.MethodPost, "/v1/chat/completions", sized(http.HandlerFunc(director.ServeChatCompletions)))
 	router.Method(http.MethodPost, "/v1/messages", sized(http.HandlerFunc(director.ServeMessages)))
 	gateway := httptest.NewServer(router)
@@ -607,7 +623,24 @@ func TestRequestTooLargeAfterDispatchFollowsTheClientProtocol(t *testing.T) {
 // unknown length that passes the limit after dispatch fails the upstream body
 // and returns the same error as a limit reached before dispatch.
 func TestStreamedRequestLimitBoundaries(t *testing.T) {
-	const limit = 4 * requestPrefixLimit
+	const buffered = 4 * requestPrefixLimit
+	for _, limits := range []struct {
+		name     string
+		streamed int64
+	}{
+		{"streamed limit unset", buffered},
+		{"streamed limit above the buffered limit", 4 * buffered},
+	} {
+		t.Run(limits.name, func(t *testing.T) {
+			testStreamedRequestLimitBoundaries(t, buffered, limits.streamed)
+		})
+	}
+}
+
+// testStreamedRequestLimitBoundaries checks that the streamed limit, not the
+// buffered limit, bounds a streamed request and is the limit its error names.
+func testStreamedRequestLimitBoundaries(t *testing.T, buffered, streamed int64) {
+	limit := int(streamed)
 	head := `{"model":"` + prefixTestModel + `","stream":false,"input":"`
 	bodyOfSize := func(size int) string {
 		return head + filler(size-len(head)-2) + `"}`
@@ -631,7 +664,7 @@ func TestStreamedRequestLimitBoundaries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
 			upstreamErr := make(chan error, 1)
-			url := realNetworkGateway(t, limit, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			url := realNetworkGatewayWithStreamedLimit(t, buffered, streamed, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				body, err := io.ReadAll(r.Body)
 				if err == nil && len(body) != tc.size {
@@ -666,6 +699,9 @@ func TestStreamedRequestLimitBoundaries(t *testing.T) {
 				var openAIErr OpenAIError
 				require.NoError(t, stdjson.Unmarshal(payload, &openAIErr))
 				assert.Equal(t, "invalid_image_format", openAIErr.Error.Code)
+			}
+			if tc.status != http.StatusOK {
+				assert.Contains(t, string(payload), " "+strconv.FormatInt(streamed, 10)+" bytes", "the error names the streamed limit")
 			}
 			if tc.upstreamCalls > 0 {
 				select {

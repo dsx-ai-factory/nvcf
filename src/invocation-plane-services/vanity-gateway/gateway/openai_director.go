@@ -89,6 +89,10 @@ type ModelDirector struct {
 	// Content-Length exceeds it is rejected before any body byte is read.
 	// Shadow replays are exempt. Zero means unknown.
 	requestBodyLimit int64
+	// streamedRequestBodyLimit is the body limit once a request takes the
+	// streamed path. It is at least requestBodyLimit. Zero means it equals
+	// requestBodyLimit.
+	streamedRequestBodyLimit int64
 
 	// Private models are listed only for callers whose API key may access the
 	// function version they route to. privateModels is nil when private model
@@ -821,6 +825,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	}
 	body, bodyMode, err := d.readModelRequestBody(request, modelToNVCFUrl)
 	if err != nil {
+		recordBodyLimitBeforeDispatch(request, body, bodyMode, modelToNVCFUrl, err)
 		markGatewayRejected(writer, request)
 		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
 			status, kind, message := requestReadFailure(protocol, err)
@@ -871,6 +876,11 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 	}
 	middleware.SetPreUpstreamModel(request.Context(), nvcfUrl.publicModelName)
 	middleware.AddOpenAIRequestMetricAttributes(request.Context(), body.Model, nvcfUrl.functionId)
+	if bodyMode.mode == requestBodyModeStreamed {
+		// The body can still pass the limit after dispatch; the proxy error
+		// handler logs that with the route.
+		request = withStreamedRequestRoute(request, body.Model, nvcfUrl.functionId)
+	}
 
 	statusHandled := writeFunctionStatusError(writer, request, nvcfUrl.offlineMessage, nvcfUrl.eol, body.Model)
 	if statusHandled {

@@ -64,6 +64,10 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	if err != nil {
 		return nil, err
 	}
+	maxStreamedRequestSize, err := serverConfig.streamedRequestSizeLimit()
+	if err != nil {
+		return nil, err
+	}
 	// Compile the regex pattern
 	re, err := regexp.Compile(serverConfig.PrivateModelNameRegexPattern)
 	if err != nil {
@@ -112,6 +116,7 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 		return nil, err
 	}
 	modelDirector.requestBodyLimit = maxRequestSize
+	modelDirector.streamedRequestBodyLimit = maxStreamedRequestSize
 	if serverConfig.NvcfControlPlaneEndpoint != "" {
 		modelDirector.privateModels, err = sharedPrivateModelAccess(serverConfig.NvcfControlPlaneEndpoint, transport)
 		if err != nil {
@@ -191,16 +196,16 @@ func registerVanity(hostRouter *middleware.HostRouter, mappings *config.GatewayC
 func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, modelDirector *ModelDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler, maxRequestSize int64) {
 	r := chi.NewRouter()
 	r.Use(serverTelemetry)
-	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))
-	r.Method(http.MethodPost, "/v1/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeCompletions)))
-	r.Method(http.MethodPost, "/v1/embeddings", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeEmbeddings)))
-	r.Method(http.MethodPost, "/v1/messages", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeMessages)))
-	r.Method(http.MethodPost, decisionsPath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeDecisions)))
-	r.Method(http.MethodPost, systemOnePath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeSystemOne)))
-	r.Method(http.MethodPost, "/v1/responses", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeResponses)))
-	r.Method(http.MethodPost, "/v1/images/generations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageGenerations)))
-	r.Method(http.MethodPost, "/v1/images/edits", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageEdits)))
-	r.Method(http.MethodPost, "/v1/images/variations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageVariations)))
+	r.Method(http.MethodPost, "/v1/chat/completions", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))
+	r.Method(http.MethodPost, "/v1/completions", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeCompletions)))
+	r.Method(http.MethodPost, "/v1/embeddings", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeEmbeddings)))
+	r.Method(http.MethodPost, "/v1/messages", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeMessages)))
+	r.Method(http.MethodPost, decisionsPath, limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeDecisions)))
+	r.Method(http.MethodPost, systemOnePath, limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeSystemOne)))
+	r.Method(http.MethodPost, "/v1/responses", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeResponses)))
+	r.Method(http.MethodPost, "/v1/images/generations", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageGenerations)))
+	r.Method(http.MethodPost, "/v1/images/edits", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageEdits)))
+	r.Method(http.MethodPost, "/v1/images/variations", limitModelRequestBody(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageVariations)))
 	r.Get("/v1/models", modelDirector.ListModels)
 	r.Get("/v1/models/{model}", modelDirector.GetModel)
 	r.Get("/v1/models/{company}/{model}", modelDirector.GetModel)
