@@ -56,9 +56,11 @@ type rateLimiter interface {
 }
 
 type FunctionInvoker struct {
-	nc                  *nats.Conn
-	natsState           *ConnState
+	conns *NatsConnections
+	// js is on the shared connection, for lookups and purges. dispatchJS is on
+	// the dispatch connection, for work items.
 	js                  jetstream.JetStream
+	dispatchJS          jetstream.JetStream
 	nvcfClient          pb.ProxyClient
 	connectPaths        ConnectPaths
 	region              string
@@ -68,10 +70,17 @@ type FunctionInvoker struct {
 	// Resolved work-stream handles, keyed by stream name. Bounded; see
 	// workStreamCacheCapacity.
 	workStreams *ttlcache.Cache[string, jetstream.Stream]
+	// retryPause replaces the pause before a rejected send is retried. Tests
+	// only; nil means sleeping for reconnectPollInterval.
+	retryPause func(context.Context)
 }
 
-func NewFunctionInvoker(nc *nats.Conn, natsState *ConnState, nvcfClient pb.ProxyClient, connectPaths ConnectPaths, jetstreamPlacementTag, region string, geoLookup geoLookuper, rateLimit rateLimiter) (*FunctionInvoker, error) {
-	js, err := jetstream.New(nc)
+func NewFunctionInvoker(conns *NatsConnections, nvcfClient pb.ProxyClient, connectPaths ConnectPaths, jetstreamPlacementTag, region string, geoLookup geoLookuper, rateLimit rateLimiter) (*FunctionInvoker, error) {
+	js, err := jetstream.New(conns.Shared)
+	if err != nil {
+		return nil, err
+	}
+	dispatchJS, err := jetstream.New(conns.Dispatch)
 	if err != nil {
 		return nil, err
 	}
@@ -88,9 +97,9 @@ func NewFunctionInvoker(nc *nats.Conn, natsState *ConnState, nvcfClient pb.Proxy
 	go workStreams.Start()
 
 	return &FunctionInvoker{
-		nc:                  nc,
-		natsState:           natsState,
+		conns:               conns,
 		js:                  js,
+		dispatchJS:          dispatchJS,
 		nvcfClient:          nvcfClient,
 		connectPaths:        connectPaths,
 		region:              region,
@@ -108,6 +117,9 @@ func (f *FunctionInvoker) Close() error {
 		f.workStreams.Stop()
 	}
 	f.js.CleanupPublisher()
+	f.dispatchJS.CleanupPublisher()
+	// Closed last: the director purges pending work before closing the invoker.
+	f.conns.Close()
 	if closer, ok := f.rateLimit.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -283,15 +295,14 @@ func (f *FunctionInvoker) startNewSession(ctx context.Context, conn net.Conn, re
 		return cancel, false, dispatched, nil
 	}
 	subject := f.requestStreamSubject(functionVersion.FunctionVersionId, requestId)
-	publishCtx, cancelPublish := context.WithTimeout(ctx, publishTimeout)
-	defer cancelPublish()
-	if err = waitConnected(publishCtx, f.natsState); err == nil {
-		_, err = f.js.PublishMsg(publishCtx, &nats.Msg{
+	err = f.publishDispatch(ctx, metrics.NatsSendWorkItem, publishTimeout, func(publishCtx context.Context) error {
+		_, err := f.dispatchJS.PublishMsg(publishCtx, &nats.Msg{
 			Subject: subject,
 			Header:  otelHeaders(ctx),
 			Data:    marshalledInvokeFunctionRequest,
 		})
-	}
+		return err
+	})
 	if err != nil {
 		cancel()
 		return nil, false, nil, fmt.Errorf("failed to publish function invocation request to nats: %w", err)
@@ -373,15 +384,16 @@ func (f *FunctionInvoker) tryRegionForLLS(ctx context.Context, region string, re
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
-	if err := waitConnected(ctx, f.natsState); err != nil {
+	if err := f.waitDispatchConnected(ctx, metrics.NatsSendDispatch); err != nil {
 		return err
 	}
 	subject := llsRequestSubject(region, functionVersion.FunctionVersionId, requestId)
-	_, err := f.nc.RequestMsgWithContext(ctx, &nats.Msg{
+	_, err := f.conns.Dispatch.RequestMsgWithContext(ctx, &nats.Msg{
 		Subject: subject,
 		Header:  otelHeaders(ctx),
 		Data:    marshalledInvokeFunctionRequest,
 	})
+	recordPublishRejection(metrics.NatsSendDispatch, err)
 
 	return err
 }
@@ -391,16 +403,13 @@ func (f *FunctionInvoker) joinExistingSession(ctx context.Context, requestId uui
 	if err != nil {
 		return err
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, publishTimeout)
-	defer cancel()
-	if err := waitConnected(waitCtx, f.natsState); err != nil {
-		return fmt.Errorf("failed to publish function invocation request to nats: %w", err)
-	}
 	subject := reconnectSubject(requestId)
-	err = f.nc.PublishMsg(&nats.Msg{
-		Subject: subject,
-		Header:  otelHeaders(ctx),
-		Data:    marshalledInvokeFunctionRequest,
+	err = f.publishDispatch(ctx, metrics.NatsSendSessionJoin, publishTimeout, func(context.Context) error {
+		return f.conns.Dispatch.PublishMsg(&nats.Msg{
+			Subject: subject,
+			Header:  otelHeaders(ctx),
+			Data:    marshalledInvokeFunctionRequest,
+		})
 	})
 	if err != nil {
 		return fmt.Errorf("failed to publish function invocation request to nats: %w", err)
@@ -408,19 +417,94 @@ func (f *FunctionInvoker) joinExistingSession(ctx context.Context, requestId uui
 	return nil
 }
 
-// publishTimeout bounds a JetStream or session-join publish, including any wait
-// for a reconnect. It matches JetStream's default API timeout, which is how long
-// a publish already waited for its ack.
+// publishTimeout bounds a work-item or session-join send as a whole: waiting for
+// the dispatch connection, retrying rejected attempts, and JetStream's wait for
+// the ack. It matches JetStream's default API timeout, which is how long a
+// publish already waited for its ack.
 const publishTimeout = 5 * time.Second
+
+// publishDispatch sends a work item or session join on the dispatch connection
+// within timeout. If nats.go rejects an attempt with
+// ErrReconnectBufExceeded because the connection is reconnecting, it pauses,
+// waits for the connection and tries again, so a brief outage does not fail the
+// send. Every attempt shares the one deadline.
+//
+// Only ErrReconnectBufExceeded is retried. nats.go returns it before taking any
+// of the message's bytes, so retrying cannot also deliver the rejected attempt.
+// Other errors, such as a missing ack, can follow a send that reached NATS and
+// are returned as they are.
+func (f *FunctionInvoker) publishDispatch(ctx context.Context, send string, timeout time.Duration, publish func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		if err := f.waitDispatchConnected(ctx, send); err != nil {
+			return err
+		}
+		err := publish(ctx)
+		recordPublishRejection(send, err)
+		if !errors.Is(err, nats.ErrReconnectBufExceeded) {
+			return err
+		}
+		f.pauseBeforeRetry(ctx)
+	}
+}
+
+// pauseBeforeRetry runs after a rejected attempt. The callbacks may not have
+// marked the connection down yet, so without it the next waitDispatchConnected
+// could pass at once and the loop would publish again without stopping.
+func (f *FunctionInvoker) pauseBeforeRetry(ctx context.Context) {
+	if f.retryPause != nil {
+		f.retryPause(ctx)
+		return
+	}
+	SleepWithContext(ctx, reconnectPollInterval)
+}
 
 // reconnectPollInterval is how often waitConnected checks the connection.
 const reconnectPollInterval = 50 * time.Millisecond
 
+// waitDispatchConnected waits for the dispatch connection before a send and
+// counts a failed wait.
+func (f *FunctionInvoker) waitDispatchConnected(ctx context.Context, send string) error {
+	err := waitConnected(ctx, f.conns.DispatchState)
+	if reason := sendFailureReason(err); reason != "" {
+		metrics.NatsSendFailures.WithLabelValues(send, metrics.NatsSendStageWait, reason).Inc()
+	}
+	return err
+}
+
+// recordPublishRejection counts an attempt that nats.go rejected because the
+// dispatch connection was reconnecting or closed, including one a later retry
+// sends. Other errors, such as no
+// responders or a missing ack, are not about the connection and are not
+// counted.
+func recordPublishRejection(send string, err error) {
+	switch {
+	case errors.Is(err, nats.ErrReconnectBufExceeded):
+		metrics.NatsSendFailures.WithLabelValues(send, metrics.NatsSendStagePublish, metrics.NatsSendReasonReconnecting).Inc()
+	case errors.Is(err, nats.ErrConnectionClosed):
+		metrics.NatsSendFailures.WithLabelValues(send, metrics.NatsSendStagePublish, metrics.NatsSendReasonClosed).Inc()
+	}
+}
+
+func sendFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return metrics.NatsSendReasonCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return metrics.NatsSendReasonTimeout
+	case errors.Is(err, nats.ErrConnectionClosed):
+		return metrics.NatsSendReasonClosed
+	}
+	return ""
+}
+
 // waitConnected returns once the connection is up, or with an error once ctx
-// ends or the connection is closed. Dispatches, work items and session joins call
-// it before publishing, so they are not queued in the reconnect buffer and sent
-// after an outage to callers that have given up. It reads ConnState, so it never
-// waits on the connection's lock and always honours ctx.
+// ends or the connection is closed. The dispatch connection's sends call it so
+// they do not try while it is down. It reads ConnState, so it never waits on the
+// connection's lock and always honours ctx.
 func waitConnected(ctx context.Context, state *ConnState) error {
 	for {
 		if err := ctx.Err(); err != nil {
