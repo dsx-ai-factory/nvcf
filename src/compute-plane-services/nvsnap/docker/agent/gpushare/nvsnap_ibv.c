@@ -1072,10 +1072,17 @@ static int stop_calls(char *reply, size_t n)
     return 0;
 }
 
-/* Queue pairs whose state this library cannot save (omu held): one with a
- * failed completion (see seen_wc), or one it could not track. */
+/* Queue pairs whose state this library cannot save (omu held, after
+ * stop_calls): one with a failed completion (see seen_wc), or one it could
+ * not track; or an object it cannot re-create, recorded by a call that was
+ * already in progress when stop_calls checked (a receive with too many
+ * scatter entries, kept cut short). */
 static int untracked(char *reply, size_t n)
 {
+    if (__atomic_load_n(&unsupported, __ATOMIC_SEQ_CST)) {
+        snprintf(reply, n, "err NCCL uses a verbs object this library cannot re-create (see the log)");
+        return -1;
+    }
     for (int i = 0; i < n_qps; i++)
         if (__atomic_load_n(&qps[i]->failed, __ATOMIC_SEQ_CST) || qps[i]->slot < 0) {
             snprintf(reply, n, "err queue pair %u %s: its outstanding receives are not known", qps[i]->v.qp_num,

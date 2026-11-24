@@ -531,6 +531,8 @@ static void *query_port(void *a)
 static void *alloc_pd(void *a) { (void)a; return ibv_alloc_pd(ctx); }
 static int sus_rc;
 static void *suspend_t(void *a) { (void)a; sus_rc = nvsnap_ibv_suspend(rep, sizeof(rep)); return NULL; }
+static int fence_rc;
+static void *fence_t(void *a) { (void)a; fence_rc = nvsnap_ibv_fence(rep, sizeof(rep)); return NULL; }
 static struct ibv_async_event ev;
 static int got_event;
 static void *event_t(void *a)
@@ -756,6 +758,23 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "sge5drain")) {
+        /* The receive is already in a verbs call (past the gate) when the
+         * fence checks, and is recorded only while the fence waits for
+         * that call to return. */
+        up(1);
+        enter();
+        pthread_create(&t, NULL, fence_t, NULL);
+        while (!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST)) usleep(1000);
+        struct ibv_sge sg[5] = { { (uintptr_t)buf, 4, mr->lkey } };
+        for (int i = 1; i < 5; i++) sg[i] = sg[0];
+        struct ibv_recv_wr rw = { .wr_id = 9, .sg_list = sg, .num_sge = 5 };
+        recv_add((struct vqp *)qb, &rw);
+        leave();
+        pthread_join(t, NULL);
+        printf("fence=%d\n", fence_rc);
+        return 0;
+    }
     if (!strcmp(c, "noslot")) {
         up(0);
         pd = ibv_alloc_pd(ctx);
@@ -916,6 +935,10 @@ class Ibv(unittest.TestCase):
 
     def test_receive_with_too_many_entries_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5")["fence"], "0")
+
+    def test_receive_recorded_while_the_fence_waits_refuses_the_checkpoint(self):
+        self.assertNotEqual(self.probe("sge5drain")["fence"], "0",
+                            "a receive cut short while the fence waited for its call was checkpointed")
 
     def test_untracked_queue_pair_refuses_the_checkpoint(self):
         out = self.probe("noslot")
