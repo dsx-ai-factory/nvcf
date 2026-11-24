@@ -41,9 +41,18 @@ public interface ClusterAuthorizationService {
      *   <li>Apply NCA-id authorization filtering (specific authorization,
      *       public/wildcard authorization, plus the backend-specific
      *       authorization-filtering-enabled flag).</li>
+     *   <li>If {@link #appliesCapacityGatingBeforeAggregation()} returns {@code true}, apply
+     *       the requester's capacity policy to the authorized real clusters, GPUs, and
+     *       instance types before aggregation. Capacity gating narrows authorization;
+     *       it must not cause a fallback to otherwise excluded public clusters.</li>
      *   <li>Aggregate the filtered clusters into a single response,
      *       applying the supplied {@code instanceTypeUsageEnum} filter.</li>
      * </ol>
+     * Providers that apply capacity gating before aggregation may return compatibility cluster
+     * IDs rather than the real cluster IDs used by the policy. Core callers skip aggregate
+     * capacity gating only when the provider explicitly opts in through that capability.
+     * Opted-in providers must return {@code null} if capacity gating leaves no eligible
+     * clusters or GPUs.
      *
      * @param requestingNcaId         the NCA id making the request
      * @param instanceTypeUsageEnum   instance-type usage filter to apply
@@ -53,6 +62,19 @@ public interface ClusterAuthorizationService {
     ClusterGroups fetchAuthorizedClusterGroup(
             @NotNull String requestingNcaId,
             @NotNull InstanceTypeUsageEnum instanceTypeUsageEnum);
+
+    /**
+     * Whether {@link #fetchAuthorizedClusterGroup} enforces the requester's complete capacity
+     * policy against real clusters, GPUs, and instance types before aggregation.
+     *
+     * <p>Opt in only when all policy levels are enforced. The default keeps core's existing
+     * aggregate filtering for implementations compiled against older versions of this SPI.
+     *
+     * @return {@code true} to skip core's capacity filter on the aggregated response
+     */
+    default boolean appliesCapacityGatingBeforeAggregation() {
+        return false;
+    }
 
     /**
      * Apply backend-specific authorization filtering to the supplied mutable set of

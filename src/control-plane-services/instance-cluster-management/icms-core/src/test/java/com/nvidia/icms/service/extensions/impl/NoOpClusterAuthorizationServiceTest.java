@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
@@ -44,6 +45,12 @@ class NoOpClusterAuthorizationServiceTest {
                 "any-nca-id", InstanceTypeUsageEnum.DEFAULT);
 
         assertNull(result, "NoOp must report no Non BYOC cluster group is available");
+    }
+
+    @Test
+    void appliesCapacityGatingBeforeAggregation_defaultsToFalse() {
+        assertFalse(noop.appliesCapacityGatingBeforeAggregation(),
+                "implementations without an opt-in retain core's aggregate capacity filter");
     }
 
     @Test

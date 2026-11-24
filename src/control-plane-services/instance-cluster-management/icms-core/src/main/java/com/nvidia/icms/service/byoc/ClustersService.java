@@ -126,14 +126,21 @@ public class ClustersService {
 
         clusterGroupsSet.addAll(fetchClusterGroupsForNvca(ncaId, instanceTypeUsageEnum));
 
-        ClusterGroups nonByocClusterGroup = clusterAuthorizationService
-                .fetchAuthorizedClusterGroup(ncaId, instanceTypeUsageEnum);
-        if (nonByocClusterGroup != null) {
-            clusterGroupsSet.add(nonByocClusterGroup);
-        }
-
-        // Applied last so both NVCA and authorized non-BYOC groups are covered once.
         capacityGatingService.removeGatedClusterGroups(clusterGroupsSet, ncaId);
+
+        if (!capacityGatingProperties.isOrgDenied(ncaId)) {
+            ClusterGroups nonByocClusterGroup = clusterAuthorizationService
+                    .fetchAuthorizedClusterGroup(ncaId, instanceTypeUsageEnum);
+            if (nonByocClusterGroup != null) {
+                Set<ClusterGroups> nonByocGroups = new HashSet<>(Set.of(nonByocClusterGroup));
+                // Opted-in providers gate real clusters before aggregation and may return
+                // compatibility IDs. Preserve the existing final filter for older providers.
+                if (!clusterAuthorizationService.appliesCapacityGatingBeforeAggregation()) {
+                    capacityGatingService.removeGatedClusterGroups(nonByocGroups, ncaId);
+                }
+                clusterGroupsSet.addAll(nonByocGroups);
+            }
+        }
 
         return ClusterGroupResponse.builder()
                 .clusterGroup(clusterGroupsSet)
