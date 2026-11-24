@@ -2321,10 +2321,12 @@ static void do_ipcget(unsigned long long base, int s)
  * open again. "resume hold lease" takes one with the held resume, before it
  * answers: a tool that will send "open" itself (--sync-open) is then never
  * without one while the launches are held, so that its death does not
- * leave the gates closed for good. "lease" takes one alone (what such a
- * tool sends after "resume hold" to a library without "resume hold
- * lease"). A sender already gone when its lease would be taken counts as
- * exited. "release" ends the lease (released memory must not be used
+ * leave the gates closed for good. "lease" takes one alone. A sender
+ * already gone when its lease would be taken counts as exited. When no
+ * lease can be taken (its pid or pidfd cannot be had), no hold is left
+ * without one: the gates open (once the state lock is free), "hold" and
+ * "lease" answer an error, and "resume hold lease" answers that it let
+ * the launches through ("no lease"). "release" ends the lease (released memory must not be used
  * until "resume"), and so do "resume" and "open". Only the control thread
  * touches it. */
 #ifndef SYS_pidfd_open
@@ -2348,23 +2350,53 @@ static void lease_end(void)
 
 static int lease_recover(void);
 
-static void lease_take(int s)
+/* Take the lease on the sender of s. 0 when it holds one (or was already
+ * gone: its exit is handled as a lease's); else -1, with why, and the
+ * gates are opened as if the sender had exited: no hold is left without a
+ * lease. */
+static int lease_take(int s, char *why, size_t n)
 {
-    struct ucred c;
+    struct ucred c = { .pid = -1 };
     socklen_t l = sizeof(c);
-    if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c, &l) != 0 || (lease_fd >= 0 && c.pid == lease_pid)) return;
-    lease_end();
-    expiry_pid = 0;
-    int fd = (int)syscall(SYS_pidfd_open, c.pid, 0);
-    if (fd < 0 && errno == ESRCH) {  /* the sender is already gone: as if it exited holding */
-        expiry_pid = c.pid;
-        if (lease_recover() < 0)
-            logf_("hold: pid %d exited, but the state lock is busy: launches stay held until it is free (retrying)", c.pid);
-        return;
+    int fd = -1, gone = 0;
+    if (getsockopt(s, SOL_SOCKET, SO_PEERCRED, &c, &l) != 0) {
+        snprintf(why, n, "SO_PEERCRED: %s", strerror(errno));
+        c.pid = -1;
+    } else if (lease_fd >= 0 && c.pid == lease_pid) {
+        return 0;
+    } else {
+        lease_end();
+        expiry_pid = 0;
+        fd = (int)syscall(SYS_pidfd_open, c.pid, 0);
+        gone = fd < 0 && errno == ESRCH;  /* the sender is already gone: as if it exited holding */
+        if (fd < 0 && !gone) snprintf(why, n, "pidfd_open: %s", strerror(errno));
     }
-    if (fd < 0) { logf_("hold: no lease on pid %d (pidfd_open: %s)", c.pid, strerror(errno)); return; }
-    lease_fd = fd;
-    lease_pid = c.pid;
+    if (fd >= 0) {
+        lease_fd = fd;
+        lease_pid = c.pid;
+        return 0;
+    }
+    if (!gone) logf_("hold: no lease on pid %d (%s): launches are not left held", c.pid, why);
+    expiry_pid = c.pid;
+    if (lease_recover() < 0)
+        logf_("hold: no lease on pid %d, and the state lock is busy: launches stay held until it is free (retrying)",
+              c.pid);
+    return gone ? 0 : -1;
+}
+
+/* After a command that left the launches held for its sender: take the
+ * sender's lease, or (none) say so in rep; resumed: the command resumed,
+ * which stands, else it fails. */
+static void lease_or_open(int s, char *rep, size_t n, int resumed)
+{
+    char why[128] = "";
+    if (lease_take(s, why, sizeof(why)) == 0) return;
+    if (resumed) {
+        size_t k = strlen(rep);
+        snprintf(rep + k, n - k, "; no lease (%s): launches let through", why);
+    } else {
+        snprintf(rep, n, "err no lease (%s): launches let through", why);
+    }
 }
 
 /* Reopen the gates after the holder's exit, once the state lock is free.
@@ -2810,7 +2842,11 @@ static void serve(int s)
     int fd = -1;
     if (msg_recv(s, buf, sizeof(buf), &fd) < 0) return;
     if (!strcmp(buf, "quiesce")) { do_quiesce(rep, sizeof(rep)); msg_send(s, rep, -1); }
-    else if (!strcmp(buf, "hold")) { do_hold(rep, sizeof(rep)); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "hold")) {
+        do_hold(rep, sizeof(rep));
+        if (!strcmp(rep, "ok held")) lease_or_open(s, rep, sizeof(rep), 0);
+        msg_send(s, rep, -1);
+    }
     else if (!strcmp(buf, "poll")) { do_poll(rep, sizeof(rep), 0); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "step")) { do_poll(rep, sizeof(rep), 1); msg_send(s, rep, -1); }
     else if (!strcmp(buf, "release")) { do_release(rep, sizeof(rep), NULL); msg_send(s, rep, -1); }
@@ -2827,11 +2863,15 @@ static void serve(int s)
     else if (!strcmp(buf, "resume hold lease")) {
         /* The lease first: the sender's death after the reply still opens. */
         do_resume(rep, sizeof(rep), 1);
-        if (!strncmp(rep, "ok", 2)) lease_take(s);
+        if (!strncmp(rep, "ok", 2)) lease_or_open(s, rep, sizeof(rep), 1);
         msg_send(s, rep, -1);
     }
     else if (!strcmp(buf, "open")) { do_open(rep, sizeof(rep)); msg_send(s, rep, -1); }
-    else if (!strcmp(buf, "lease")) { snprintf(rep, sizeof(rep), "ok leased"); msg_send(s, rep, -1); }
+    else if (!strcmp(buf, "lease")) {
+        snprintf(rep, sizeof(rep), "ok leased");
+        lease_or_open(s, rep, sizeof(rep), 0);
+        msg_send(s, rep, -1);
+    }
     else if (!strcmp(buf, "ibv")) { snprintf(rep, sizeof(rep), "ok ibv %d", ibv_devices()); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "mx ", 3)) { do_py(rep, sizeof(rep), mx_py, sizeof(mx_py), "mx", buf + 3, ""); msg_send(s, rep, -1); }
     else if (!strncmp(buf, "nixl ", 5)) {
@@ -2851,10 +2891,10 @@ static void serve(int s)
      * may be partly released could corrupt it. "resume" ends it once it
      * reopened the gates, or ("resume hold") left them for "open"; "open"
      * only once it opened them ("ok not held" opened nothing). If one fails
-     * (a busy state lock), the holder's exit still reopens them. "resume
-     * hold lease" took its own lease above. */
-    if ((!strcmp(buf, "hold") && !strcmp(rep, "ok held")) || !strcmp(buf, "lease")) lease_take(s);
-    else if ((!strncmp(buf, "release", 7) && strcmp(rep, "err busy (state lock)") && strcmp(rep, "err not quiesced")) ||
+     * (a busy state lock), the holder's exit still reopens them. "hold",
+     * "lease" and "resume hold lease" took their lease above, before
+     * answering. */
+    if ((!strncmp(buf, "release", 7) && strcmp(rep, "err busy (state lock)") && strcmp(rep, "err not quiesced")) ||
              (!strncmp(buf, "resume", 6) && strcmp(buf, "resume hold lease") && !strncmp(rep, "ok", 2)) ||
              (!strcmp(buf, "open") && !strcmp(rep, "ok opened"))) {
         lease_end();

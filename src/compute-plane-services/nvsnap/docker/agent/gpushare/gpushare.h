@@ -47,10 +47,12 @@ SPDX-License-Identifier: Apache-2.0
  *   resume hold lease  "resume hold", and, before it answers, a lease on
  *            the sender (the process that will send "open"): the launch
  *            gate reopens if it exits first, even right after the reply;
- *            a successful "open" ends it.
+ *            a successful "open" ends it. When no lease can be taken, the
+ *            gate is not left closed: "ok resumed ...; no lease (why):
+ *            launches let through".
  *   lease    (after "resume hold", from the process that will send "open")
- *            the same lease alone, for a library without "resume hold
- *            lease".
+ *            the same lease alone; "err no lease (why): launches let
+ *            through" when none can be taken ("hold" too).
  *   mx pause  (before quiesce)  ModelExpress stops serving its weights to
  *            peers and drops its NIXL/RDMA state, which CRIU cannot dump.
  *   mx resume (after open)  it registers them again and republishes.

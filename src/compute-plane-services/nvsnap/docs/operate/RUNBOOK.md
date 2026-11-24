@@ -261,10 +261,11 @@ suspended or locked, as before.
     report resumed within 2 minutes of the first. Or no verdict came within
     3 minutes. Or the stop after the suspend failed, so the resume went
     through the holder and opened at once. Or the pod runs an older
-    `libnvsnap_gpushare` without `resume hold`, so it opened at its own
-    resume: then every in-place group capture of it fails as
+    `libnvsnap_gpushare` without `resume hold lease`, so it opened at its
+    own resume: then every in-place group capture of it fails as
     `resume_stalled`. Restart the pod onto the new library; retrying does
-    not help. The group's error names the members that did not report
+    not help. A library that could not take the tool's lease ("no lease"
+    in the tool's output, with the reason) also opened at its resume. The group's error names the members that did not report
     (`the GPU launch gates were opened before every node resumed: …`). The
     workload runs, but it may hang on memory that another node had not
     bound yet. Check for the Xid above on this node, and look at the named

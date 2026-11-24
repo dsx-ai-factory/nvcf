@@ -78,7 +78,8 @@ SPDX-License-Identifier: Apache-2.0
  * let through before every node resumed": closed gates would wedge the
  * workload for good, while an early launch only hangs it if a node has not
  * bound its memory yet. It says so too when a process's library has no
- * "resume hold" (it opened at its resume). Without --sync-open the resume
+ * "resume hold lease", or could not take the lease (it opened at its
+ * resume: no hold is left without a lease). Without --sync-open the resume
  * opens at once, as before.
  * --clock-at NS (resume after stop + CRIU restore): NS is the CLOCK_MONOTONIC
  * CRIU dumped. Thaw only once the pids' clock (in their time namespace) has
@@ -398,7 +399,7 @@ static const char *store_dir, *ckpt_dir, *cache_dir, *fabric_dir;
 static int hold_gate;  /* --hold-gate */
 static unsigned sync_open_ms;  /* --sync-open */
 static int sync_gate;  /* resume_unheld, with --sync-open: hold, then open_synced */
-static int held_fallback;  /* resume_held: processes whose library has no "resume hold" */
+static int held_fallback;  /* resume_held: processes resumed without the hold (see there) */
 static long long clock_at = -1;  /* --clock-at, ns */
 static int resume_held(const int *pids, int n);
 
@@ -904,24 +905,27 @@ static int remap_all(const int *pids, int n)
 }
 
 /* --hold-gate: "resume hold" each pid; a library that predates it resumes
- * and opens its gate at once, as before. --sync-open: "resume hold lease",
- * which takes this tool's lease on the held launches in the same request,
- * so that there is no moment where they are held and this tool's death
- * would not open them; a library without it gets "resume hold", then
- * "lease". */
+ * and opens its gate at once, as before ("open" comes later, from another
+ * process: no lease on this one). --sync-open: "resume hold lease", which
+ * takes this tool's lease on the held launches in the same request, so
+ * that they are never held without one: this tool's death opens them. A
+ * library without it, or one that could not take the lease ("no lease":
+ * it let the launches through), is resumed without the hold and counts as
+ * not synced (held_fallback). A separate "resume hold" then "lease" would
+ * leave the launches held with no lease between the two. */
 static int resume_held(const int *pids, int n)
 {
     int count = 0;
     for (int i = 0; i < n; i++) {
-        int r = sync_gate ? ctl(pids[i], "resume hold lease") : -3;
-        if (r == -3) {
+        char rep[GPUSHARE_REPLY_MAX] = "";
+        int r;
+        if (sync_gate) {
+            r = ctl_rep(pids[i], "resume hold lease", rep, sizeof(rep), 0);
+            if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
+            else if (r == 0 && strstr(rep, "no lease")) held_fallback++;
+        } else {
             r = ctl(pids[i], "resume hold");
             if (r == -3) r = ctl(pids[i], "resume"), held_fallback += r == 0;
-            else if (r == 0 && sync_gate && ctl(pids[i], "lease") < 0)
-                /* An older library has no "lease": if this tool dies before
-                 * open_synced, that pid's launches stay held. */
-                fprintf(stderr, "pid=%d: no lease on its held launches; they stay held if this tool dies before it opens them\n",
-                        pids[i]);
         }
         if (r < 0) return r;
         count += r == 0;
@@ -1454,7 +1458,8 @@ static int open_synced(const int *pids, int n)
     if (dfd >= 0) close(dfd);
     int r = open_all(pids, n);
     if (got > 0 && held_fallback)
-        snprintf(why, sizeof(why), "%d process(es) without \"resume hold\" opened at their resume", held_fallback);
+        snprintf(why, sizeof(why), "%d process(es) without \"resume hold lease\" (or its lease) opened at their resume",
+                 held_fallback);
     if (got > 0 && !held_fallback) printf("sync-open: every node resumed: launches let through\n");
     else printf("sync-open: %s; " SYNC_OPEN_UNSYNCED "\n", why);
     return r;

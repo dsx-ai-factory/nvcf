@@ -79,7 +79,25 @@ PROBE = r"""
 static void (*on_gate_lock)(void);
 static int probe_lock(pthread_mutex_t *m);
 #define pthread_mutex_lock(m) probe_lock(m)
+/* FAIL_PIDFD: pidfd_open fails (EMFILE), so no lease can be taken. */
+#include <errno.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static long probe_syscall(long nr, ...)
+{
+    va_list ap;
+    long a[6];
+    va_start(ap, nr);
+    for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
+    va_end(ap);
+    if (nr == SYS_pidfd_open && getenv("FAIL_PIDFD")) { errno = EMFILE; return -1; }
+    return syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+}
+#define syscall probe_syscall
 #include "gpushare.c"
+#undef syscall
 #undef pthread_mutex_lock
 #include <sys/wait.h>
 
@@ -235,6 +253,35 @@ int main(int argc, char **argv)
         printf("closed_after_exit=%d\n", closed(&lgate));
         return 0;
     }
+    if (argc > 1 && (!strcmp(argv[1], "nolease_resume") || !strcmp(argv[1], "nolease_lease") ||
+                     !strcmp(argv[1], "nolease_hold"))) {
+        /* No lease can be taken (FAIL_PIDFD). A sender asks for one with a
+         * held resume, after one ("lease"), or with "hold". Whatever it
+         * gets, the launches must not stay held with no lease. */
+        const char *cmd = !strcmp(argv[1], "nolease_resume") ? "resume hold lease"
+                        : !strcmp(argv[1], "nolease_lease") ? "lease" : "hold";
+        start_ctl();
+        if (strcmp(cmd, "hold")) hold_launches();
+        if (!strcmp(cmd, "lease")) held = 1;  /* as after "resume hold" */
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b, r[256] = "";
+            request(getppid(), cmd, -1, r, sizeof(r), NULL);
+            /* n: ok, but "no lease" (the launches went through); o: ok; e: err */
+            char k = r[0] != 'o' ? 'e' : strstr(r, "no lease") ? 'n' : 'o';
+            if (write(up[1], &k, 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        char k = 0;
+        if (read(up[0], &k, 1) != 1) return 4;
+        for (int i = 0; i < 300 && closed(&lgate); i++) usleep(10000);
+        printf("reply=%c closed_while_alive=%d\n", k, closed(&lgate));
+        if (write(down[1], "x", 1) != 1) return 5;
+        waitpid(c, NULL, 0);
+        return 0;
+    }
     if (argc > 1 && (!strcmp(argv[1], "holdlease") || !strcmp(argv[1], "holdleasegone"))) {
         /* --sync-open's resume: one request resumes with the launches held
          * and takes the sender's lease. holdlease: the sender lives on
@@ -383,9 +430,9 @@ class GateSync(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def probe(self, case, sync_ms=0):
+    def probe(self, case, sync_ms=0, **env):
         p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, SYNC_MS=str(sync_ms)))
+                           env=dict(os.environ, SYNC_MS=str(sync_ms), **env))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return dict(kv.split("=", 1) for line in p.stdout.split("\n") for kv in line.split() if "=" in kv)
 
@@ -440,6 +487,15 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["resume"], "1", out)
         self.assertEqual(out["closed_while_alive"], "1", "the held resume let the launches through")
         self.assertEqual(out["closed_after_exit"], "0", "the tool that sent the held resume exited: launches stayed held")
+
+    def test_no_lease_never_leaves_launches_held(self):
+        # A held resume that cannot take its lease resumes without the hold,
+        # and says so ("no lease"); "lease" and "hold" refuse. Each way the
+        # launches run while the sender lives.
+        for case, reply in (("nolease_resume", "n"), ("nolease_lease", "e"), ("nolease_hold", "e")):
+            out = self.probe(case, FAIL_PIDFD="1")
+            self.assertEqual((out["reply"], out["closed_while_alive"]), (reply, "0"),
+                             "%s: launches held with no lease (reply %s): %s" % (case, out["reply"], out))
 
     def test_held_resume_from_a_sender_already_gone_opens(self):
         out = self.probe("holdleasegone")

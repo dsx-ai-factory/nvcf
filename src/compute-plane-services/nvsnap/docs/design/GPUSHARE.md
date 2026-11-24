@@ -302,9 +302,14 @@ load before any remaps, so the markers normally come close together.
   with `resume hold lease`, which takes a lease like the one `hold` takes
   (`release` ended that one) before it answers, and a successful `open`
   ends it. A tool that dies at any point after the request, even before
-  it reads the answer, opens the gates. A library without that command
-  gets `resume hold`, then `lease`, which leaves a moment between the two
-  without a lease. Without the lease, a tool that died with its agent
+  it reads the answer, opens the gates. No hold is ever left without a
+  lease. When the library cannot take one (it cannot get the sender's pid
+  or a pidfd), it lets the launches through and answers "no lease". `hold`
+  and `lease` answer an error in that case. A library without `resume hold
+  lease` is resumed with plain `resume`. Either way, the process opened at
+  its resume, so the tool reports the resume as not synced. A separate
+  `resume hold` and then `lease` would leave a moment between the two
+  requests with the launches held and no lease. Without the lease, a tool that died with its agent
   would leave the workload held for good, with no agent left to delete
   it. The resume fails, the
   source counts as left suspended, and the instance's pods are deleted. So

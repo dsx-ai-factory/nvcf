@@ -72,6 +72,8 @@ log = open(sys.argv[1], "a")
 old_lib = len(sys.argv) > 2 and sys.argv[2] == "old"  # a library without "resume hold"
 # A library with "resume hold" and "lease", but not "resume hold lease".
 no_hold_lease = old_lib or (len(sys.argv) > 2 and sys.argv[2] == "nolease")
+# A library that cannot take the lease: it resumes without the hold.
+lease_fails = len(sys.argv) > 2 and sys.argv[2] == "leasefails"
 # A library whose NCCL release refused after the fence: it answers every
 # command that would let it run again with an error (gpushare.c, DOOMED_REPLY).
 doomed = len(sys.argv) > 2 and sys.argv[2] == "doomed"
@@ -102,6 +104,9 @@ def serve():
             rep = "ok quiesced"
         elif cmd == "resume hold" and not old_lib:
             held, rep = True, "ok resumed (0 multicast bind(s), 0 multicast mapping(s)); launches held until open"
+        elif cmd == "resume hold lease" and lease_fails:
+            held, rep = False, ("ok resumed (0 multicast bind(s), 0 multicast mapping(s)); no lease (pidfd_open: "
+                                "Too many open files): launches let through")
         elif cmd == "resume hold lease" and not no_hold_lease:
             held, rep = True, "ok resumed (0 multicast bind(s), 0 multicast mapping(s)); launches held until open"
         elif cmd == "resume":
@@ -356,18 +361,30 @@ class SyncOpen(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.fabric, "resumed")), "a marker without --sync-open")
         self.assertNotIn("sync-open", out)
 
-    def test_library_without_resume_hold_lease_gets_a_lease_after_resume_hold(self):
+    def test_library_without_resume_hold_lease_is_not_held(self):
+        # A held resume and a separate "lease" would leave the launches
+        # held with no lease between the two requests: such a library is
+        # resumed without the hold, and the resume says it was not synced.
         self.start_rank("nolease")
-        drv = Driver(self.fabric, "open", delay=1.5)
+        drv = Driver(self.fabric, "open")
         r, _, cmds = self.cycle(drv, 30000)
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         names = [c for _, c in cmds]
-        held, lease = self.at(cmds, "resume hold"), self.at(cmds, "lease")
-        self.assertEqual((len(held), len(lease)), (1, 1), "the held launches have no lease on this tool: %s" % names)
-        self.assertTrue(held[0] <= lease[0] <= drv.verdict_at, names)
-        self.assertEqual(len(self.at(cmds, "open")), 1, out)
-        self.assertIn("sync-open: every node resumed", out)
+        self.assertIn("resume", names, out)
+        self.assertNotIn("resume hold", names, "launches held with no lease: %s" % names)
+        self.assertNotIn("lease", names, names)
+        self.assertIn(UNSYNCED, out)
+        self.assertIn('without "resume hold lease"', out)
+
+    def test_lease_that_cannot_be_taken_is_not_synced(self):
+        self.start_rank("leasefails")
+        drv = Driver(self.fabric, "open")
+        r, _, cmds = self.cycle(drv, 30000)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn(UNSYNCED, out, "a resume whose launches went through without a lease was reported synced")
+        self.assertIn("no lease", out)
 
     def test_library_without_resume_hold_is_not_synced(self):
         self.start_rank("old")
@@ -377,7 +394,7 @@ class SyncOpen(unittest.TestCase):
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("resume", [c for _, c in cmds], out)
         self.assertIn(UNSYNCED, out, "a process that opened at its resume was reported synced")
-        self.assertIn('without "resume hold"', out, out)
+        self.assertIn('without "resume hold lease"', out, out)
 
     def test_release_refused_after_the_fence_fails_the_rollback(self):
         # The process cannot run again: the suspend's rollback fails, and
