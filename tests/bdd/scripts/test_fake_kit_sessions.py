@@ -39,10 +39,11 @@ class FakeKitTests(unittest.TestCase):
             if label == "released capacity published":
                 self.assertEqual(300, kwargs["deadline"])
                 self.assertEqual(60, timeout)
-                self.assertTrue(condition({"usage": {"available": 1}}))
+                self.assertTrue(condition({"usage": {"available": 0}}),
+                                "replacement may consume the published capacity before this poll")
                 self.assertIn("--since-time=cutoff", check.kube.call_args.args)
                 check.kube.return_value = 'msg="Published NVCA heartbeat" heartbeat_trigger=periodic'
-                self.assertFalse(condition({"usage": {"available": 1}}))
+                self.assertFalse(condition({"usage": {"available": 0}}))
                 clock[0] = 14
                 return True
             if label == "automatic healthy replacement after nonzero exit":

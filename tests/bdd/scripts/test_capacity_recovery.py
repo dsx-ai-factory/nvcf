@@ -22,6 +22,16 @@ from check_capacity_recovery import (
 
 
 class CapacityRecoveryTests(unittest.TestCase):
+    def test_publication_survives_capacity_already_consumed_by_replacement(self):
+        check = RecoveryCheck.__new__(RecoveryCheck)
+        check.usage = Mock(return_value={"available": 0})
+        check.kubectl = Mock(return_value='msg="Published NVCA heartbeat" heartbeat_trigger=capacity')
+        self.assertTrue(check.capacity_published_since("cutoff"))
+        self.assertIn("--since-time=cutoff", check.kubectl.call_args.args)
+        check.usage.assert_not_called()
+        check.kubectl.return_value = 'msg="Published NVCA heartbeat" heartbeat_trigger=periodic'
+        self.assertFalse(check.capacity_published_since("cutoff"))
+
     def test_only_successful_capacity_triggered_publication_counts(self):
         self.assertTrue(capacity_publication_observed('level=info msg="Published NVCA heartbeat" heartbeat_trigger=capacity'))
         self.assertTrue(capacity_publication_observed('{"msg":"Published NVCA heartbeat","heartbeat_trigger":"capacity"}'))

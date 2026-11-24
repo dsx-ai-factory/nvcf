@@ -191,7 +191,10 @@ measured from the occupied heartbeat's receive time, even if allocation release
 is slow. Blocking observations use the remaining deadline budget, and late
 responses cannot pass. The check also requires a successful heartbeat log with
 `heartbeat_trigger=capacity`, so an immediate or randomly offset startup
-heartbeat cannot satisfy publication. Run evidence is written under
+heartbeat cannot satisfy publication.
+The successful publication log remains valid if replacement placement consumes
+the free capacity before the next availability read; readiness is checked separately.
+Run evidence is written under
 `out/capacity-recovery-*`; the check deletes only its own function definitions
 and deployments on completion or
 failure. Static discovery explicitly disables the dynamic discovery gate and

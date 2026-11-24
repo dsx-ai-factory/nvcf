@@ -383,8 +383,6 @@ class SessionCheck:
         released = time.monotonic()
 
         def published_by_capacity_check(sample):
-            if sample["usage"].get("available", 0) <= 0:
-                return False
             logs = self.kube("logs", "deployment/nvca", "-c", "agent", "-n", "nvca-system",
                              "--since-time=" + publication_since, "--tail=10000")
             return capacity_publication_observed(logs)

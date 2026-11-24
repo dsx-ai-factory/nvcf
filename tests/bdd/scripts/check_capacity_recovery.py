@@ -178,6 +178,12 @@ class RecoveryCheck:
             self.deadline = previous
         raise RuntimeError(label + " timed out")
 
+    def capacity_published_since(self, since):
+        # A replacement can consume capacity before the next availability read.
+        logs = self.kubectl("logs", "deployment/nvca", "-c", "agent", "-n", "nvca-system",
+                            "--since-time=" + since, "--tail=10000")
+        return capacity_publication_observed(logs)
+
     def create(self, name):
         args = self.args
         created = json.loads(self.cli("function", "create", "--name", name,
@@ -296,14 +302,7 @@ class RecoveryCheck:
                 old_name, workers(), self.objects("icmsrequests")), 240, deadline=periodic_deadline)
             released = time.monotonic()
 
-            def published_by_capacity_check():
-                if self.usage().get("available", 0) <= 0:
-                    return False
-                logs = self.kubectl("logs", "deployment/nvca", "-c", "agent", "-n", "nvca-system",
-                                    "--since-time=" + occupied_snapshot["observedAt"], "--tail=10000")
-                return capacity_publication_observed(logs)
-
-            self.wait("released capacity published", published_by_capacity_check,
+            self.wait("released capacity published", lambda: self.capacity_published_since(occupied_snapshot["observedAt"]),
                       args.publication_timeout, deadline=periodic_deadline)
             published = time.monotonic() - released
 
