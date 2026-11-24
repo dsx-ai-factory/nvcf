@@ -92,7 +92,9 @@ static int probe_lock(pthread_mutex_t *m)
 /* What gate_enter does for a held launch let through by "step". */
 static void take_permit(void) { lgate.pass--; __atomic_add_fetch(&lgate.inflight, 1, __ATOMIC_SEQ_CST); }
 static int closed(struct gate *g) { return __atomic_load_n(&g->closed, __ATOMIC_SEQ_CST); }
-/* Wait until n threads wait at gate g. */
+/* Wait until n threads wait at gate g; none within 5 s fails the probe:
+ * a check of the closed gate that ran before its waiter got there would
+ * pass without testing it. */
 static void wait_waiting(struct gate *g, int n)
 {
     for (int i = 0; i < 5000; i++) {
@@ -102,6 +104,8 @@ static void wait_waiting(struct gate *g, int n)
         if (w >= n) return;
         usleep(1000);
     }
+    printf("no_waiter=1\n");
+    exit(9);
 }
 
 extern int stub_syncs, stub_batches;
