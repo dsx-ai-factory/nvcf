@@ -785,8 +785,26 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
 	c.observeGroupCapture(ctx, key, leader, len(ranks), len(members), err, time.Since(t0), log)
-	started := record.Data["startedAt"]
-	if uerr := c.updateGroupRecord(context.WithoutCancel(ctx), key, func(d map[string]string) bool {
+	c.commitCapture(context.WithoutCancel(ctx), key, record.Data["startedAt"], data, members, func() {
+		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, drv, uris, len(ranks), log)
+		nodes := make([]string, len(members))
+		for i, m := range members {
+			nodes[i] = m.Spec.NodeName
+		}
+		// Off the capture's path: the replacements' restore starts now.
+		go c.a.spreadSmallCheckpoints(context.WithoutCancel(ctx), results, nodes, log)
+	}, log)
+	return false
+}
+
+// commitCapture writes data, a capture's outcome, over group record key,
+// unless another capture took the record over since this one claimed it
+// (started). A capture to verify (data's state verifying) then has
+// published run once the record says so, and its pods, dumped and gone,
+// deleted: their replacements are admitted as the restore's placeholders
+// (or cold, without the record).
+func (c *criuAutoRestorer) commitCapture(ctx context.Context, key, started string, data map[string]string, members []*corev1.Pod, published func(), log *logrus.Entry) {
+	if uerr := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
 		if d["state"] != criuGroupStateCapturing || d["startedAt"] != started {
 			return false // another capture took the record over
 		}
@@ -800,21 +818,11 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}); uerr != nil {
 		log.WithError(uerr).Error("CRIU group capture: cannot update the group record")
 	} else if data["state"] == criuGroupStateVerifying {
-		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, drv, uris, len(ranks), log)
-		nodes := make([]string, len(members))
-		for i, m := range members {
-			nodes[i] = m.Spec.NodeName
-		}
-		// Off the capture's path: the replacements' restore starts now.
-		go c.a.spreadSmallCheckpoints(context.WithoutCancel(ctx), results, nodes, log)
+		published()
 	}
-	if err == nil && data["state"] == criuGroupStateVerifying {
-		// Its pods were dumped and are gone; their replacements are
-		// admitted as the restore's placeholders (or cold, without the
-		// record).
-		c.deleteInstance(context.WithoutCancel(ctx), key, members, log)
+	if data["state"] == criuGroupStateVerifying {
+		c.deleteInstance(ctx, key, members, log)
 	}
-	return false
 }
 
 // companionMaxFailures bounds the attempts to tell an instance's

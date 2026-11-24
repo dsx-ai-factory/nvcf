@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,6 +114,58 @@ func TestDeleteInstance_ReplacementAdmittedBeforeSiblingDelete(t *testing.T) {
 	}
 	if cm.Data[groupLeavingKey] != "engine-0,engine-1" || cm.Data[groupLeavingAtKey] == "" {
 		t.Errorf("record lists %q leaving at %q, want both captured pods", cm.Data[groupLeavingKey], cm.Data[groupLeavingAtKey])
+	}
+}
+
+// The capture's own commit (captureGroup's last step) records the capture
+// to verify and lists its pods as leaving on that record before the first
+// delete reaches the API server.
+func TestCommitCapture_ListsLeavingBeforeFirstDelete(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	ctx := context.Background()
+	if err := c.updateGroupRecord(ctx, "k1", func(d map[string]string) bool {
+		for k := range d {
+			delete(d, k)
+		}
+		d["state"], d["startedAt"] = criuGroupStateCapturing, "t0"
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data := map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn", "size": "2", "captures": "1",
+		"startedAt": "t0", "checkpoint.0": "c0", "checkpoint.1": "c1"}
+	var mu sync.Mutex
+	var firstDelete map[string]string
+	prev := deleteMember
+	deleteMember = func(a *Agent, ctx context.Context, ns, name string, uid types.UID) error {
+		mu.Lock()
+		if firstDelete == nil {
+			cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+			if err != nil {
+				t.Error(err)
+			} else {
+				firstDelete = cm.Data
+			}
+		}
+		mu.Unlock()
+		return prev(a, ctx, ns, name, uid)
+	}
+	t.Cleanup(func() { deleteMember = prev })
+	published := false
+
+	c.commitCapture(ctx, "k1", "t0", data, members, func() { published = true }, c.a.log.WithField("t", 1))
+
+	if !published {
+		t.Error("the capture to verify was not published")
+	}
+	if firstDelete[groupLeavingKey] != "engine-0,engine-1" || firstDelete["state"] != criuGroupStateVerifying {
+		t.Errorf("at the first delete the record was %v; want it verifying and listing both captured pods", firstDelete)
+	}
+	if g, ok := c.a.lookupCRIUGroup(ctx, "k1"); !ok || len(g.Leaving) != 2 {
+		t.Errorf("the webhook's view lists %v leaving (ok %v)", g.Leaving, ok)
+	}
+	if left := remainingPods(t, kc); len(left) != 0 {
+		t.Errorf("pods left %v, want the captured pods deleted", left)
 	}
 }
 
