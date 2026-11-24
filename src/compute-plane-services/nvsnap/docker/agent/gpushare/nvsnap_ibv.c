@@ -1087,7 +1087,9 @@ static int stop_calls(char *reply, size_t n)
     double t0 = now_s();
     while (__atomic_load_n(&inflight, __ATOMIC_SEQ_CST)) {
         if (now_s() - t0 > 2) {
-            reopen();
+            /* After a fence the calls stay held: the caller decides
+             * (release_refused), and a peer may be releasing. */
+            if (!fenced) reopen();
             snprintf(reply, n, "err a verbs call did not return in 2 s");
             return -1;
         }

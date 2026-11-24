@@ -445,8 +445,18 @@ PROBE = r"""
  * restore and resume before it returns that the old descriptor is ready. */
 static int probe_poll(struct pollfd *p, nfds_t n, int t);
 #define poll(p, n, t) probe_poll(p, n, t)
+/* Counts the broadcasts that let NCCL's held verbs calls go (reopen). */
+static int probe_broadcast(pthread_cond_t *c);
+#define pthread_cond_broadcast(c) probe_broadcast(c)
 #include "nvsnap_ibv.c"
 #undef poll
+#undef pthread_cond_broadcast
+static int gate_opens;
+static int probe_broadcast(pthread_cond_t *c)
+{
+    if (c == &gcv) __atomic_add_fetch(&gate_opens, 1, __ATOMIC_SEQ_CST);
+    return pthread_cond_broadcast(c);
+}
 
 #define FK(ret, name, ...) static ret (*name)(__VA_ARGS__)
 FK(void, fake_move, void); FK(void, fake_port_delay_ms, int); FK(void, fake_fail_marker, int);
@@ -775,6 +785,20 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "refusetimeout")) {
+        /* After a fence, a thread caught between counting itself in and
+         * seeing the gate closed (enter) keeps inflight up: the release's
+         * wait for calls in progress times out. NCCL's calls must not be
+         * let go even for a moment: a peer may be releasing. */
+        up(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        int before = __atomic_load_n(&gate_opens, __ATOMIC_SEQ_CST);
+        int s = nvsnap_ibv_suspend(rep, sizeof(rep));
+        printf("fence=%d suspend=%d opens=%d held=%d timeout=%d\n", f, s, __atomic_load_n(&gate_opens, __ATOMIC_SEQ_CST) - before,
+               __atomic_load_n(&suspended, __ATOMIC_SEQ_CST), strstr(rep, "did not return") != NULL);
+        return 0;
+    }
     if (!strcmp(c, "refusefenced") || !strcmp(c, "refuseunfenced")) {
         /* The release refuses (a queue pair with a failed completion),
          * after a fence that succeeded (its peers may be releasing now) or
@@ -1001,6 +1025,13 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("1", "1", "0"),
                          "a rank whose peers may be releasing let NCCL post again: %s" % out)
         self.assertEqual(out["doomed"], "1", out)
+
+    def test_release_timing_out_after_the_fence_never_lets_nccl_go(self):
+        out = self.probe("refusetimeout")
+        self.assertEqual((out["fence"], out["timeout"]), ("0", "1"), out)
+        self.assertNotEqual(out["suspend"], "0", out)
+        self.assertEqual((out["opens"], out["held"]), ("0", "1"),
+                         "the release's timeout let NCCL's held calls go after the fence: %s" % out)
 
     def test_release_refused_without_a_fence_lets_nccl_run(self):
         out = self.probe("refuseunfenced")
