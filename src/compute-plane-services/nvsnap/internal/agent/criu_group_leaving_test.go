@@ -208,13 +208,17 @@ func TestDeleteInstance_ListsLeavingOnlyOnVerifyingRecord(t *testing.T) {
 // A pod the record lists as leaving is not running; any other pod of the
 // instance is, and a listing older than leavingWindow (a delete that never
 // happened) or more than a minute ahead of the admitting agent's clock no
-// longer vouches for it. Nor does it for a listed pod that is Ready or
-// whose container started after the listing: it was restarted after its
-// dump and may run an engine. Fail closed.
+// longer vouches for it. Nor does it for a listed pod that became Ready,
+// or whose container started, after the listing: it was restarted after
+// its dump and may run an engine. A pod still Ready from before the
+// listing (its status not yet updated after the dump) is leaving. Fail
+// closed.
 func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 	now := time.Now()
-	ready := func(p *corev1.Pod) {
-		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	readySince := func(at time.Time) func(*corev1.Pod) {
+		return func(p *corev1.Pod) {
+			p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(at)}}
+		}
 	}
 	startedAt := func(at time.Time) func(*corev1.Pod) {
 		return func(p *corev1.Pod) {
@@ -239,7 +243,8 @@ func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 		{"no listing", []string{"engine-1"}, nil, now, nil, false, "already runs"},
 		{"listing stale: the delete never happened", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() - time.Second), nil, false, "already runs"},
 		{"listing from the future", []string{"engine-1"}, []string{"engine-1"}, now.Add(2 * time.Minute), nil, false, "already runs"},
-		{"listed but Ready", []string{"engine-1"}, []string{"engine-1"}, now, ready, false, "already runs"},
+		{"listed, still Ready from before the listing (status not yet updated)", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), readySince(now.Add(-time.Hour)), true, ""},
+		{"listed but became Ready after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), readySince(now.Add(-10 * time.Second)), false, "already runs"},
 		{"listed but its container started after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), startedAt(now.Add(-10 * time.Second)), false, "already runs"},
 		{"one sibling listed, another not", []string{"engine-1", "engine-2"}, []string{"engine-1"}, now, nil, false, "engine-2 of the instance already runs"},
 	} {
@@ -305,18 +310,22 @@ func TestCRIUCompanionAdmits_Leaving(t *testing.T) {
 		name    string
 		leaving []string
 		at      time.Time
-		ready   bool
+		readyAt time.Duration // Ready since now+readyAt; 0: not Ready
 		want    bool
 	}{
-		{"captured rank listed", []string{"engine-0"}, now, false, true},
-		{"rank not listed", []string{"engine-9"}, now, false, false},
-		{"listing stale", []string{"engine-0"}, now.Add(-leavingWindow() - time.Second), false, false},
-		{"listing 30s ahead (skew tolerated)", []string{"engine-0"}, now.Add(30 * time.Second), false, true},
-		{"captured rank listed but Ready", []string{"engine-0"}, now, true, false},
+		{"captured rank listed", []string{"engine-0"}, now, 0, true},
+		{"rank not listed", []string{"engine-9"}, now, 0, false},
+		{"listing stale", []string{"engine-0"}, now.Add(-leavingWindow() - time.Second), 0, false},
+		{"listing 30s ahead (skew tolerated)", []string{"engine-0"}, now.Add(30 * time.Second), 0, true},
+		{"captured rank still Ready from before the listing", []string{"engine-0"}, now.Add(-time.Minute), -time.Hour, true},
+		{"captured rank became Ready after the listing", []string{"engine-0"}, now.Add(-time.Minute), -10 * time.Second, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kc := fake.NewSimpleClientset()
-			rank := stsRank("engine-0", "0", "1", "sts-a", tc.ready)
+			rank := stsRank("engine-0", "0", "1", "sts-a", tc.readyAt != 0)
+			if tc.readyAt != 0 {
+				rank.Status.Conditions[0].LastTransitionTime = metav1.NewTime(now.Add(tc.readyAt))
+			}
 			if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &rank, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}

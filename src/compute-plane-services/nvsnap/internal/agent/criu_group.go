@@ -235,8 +235,10 @@ const leavingSkew = time.Minute
 // listed pod does not count as leaving after all, which also refuses:
 //   - the listing is stale (its delete may never have happened) or
 //     stamped more than leavingSkew ahead of now (the writer's clock);
-//   - the pod is Ready, or a container of it started after the listing:
-//     a dumped pod is neither, so it was restarted and may run an engine.
+//   - the pod became Ready, or a container of it started, after the
+//     listing: it was restarted after its dump and may run an engine. A
+//     pod still Ready from before the listing is not: its status may lag
+//     its dump (no capture hold gate keeps it unready).
 func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) (ok bool, ignored string) {
 	if p.UID == "" || g.LeavingAt.IsZero() || !slices.Contains(g.Leaving, string(p.UID)) {
 		return false, ""
@@ -247,8 +249,10 @@ func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) (ok bool, ignore
 	case age >= leavingWindow():
 		return false, "stale"
 	}
-	if rootfsonly.IsPodReady(p) {
-		return false, "the pod is Ready"
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue && c.LastTransitionTime.After(g.LeavingAt) {
+			return false, "the pod became Ready after the listing"
+		}
 	}
 	for _, cs := range p.Status.ContainerStatuses {
 		var started metav1.Time
