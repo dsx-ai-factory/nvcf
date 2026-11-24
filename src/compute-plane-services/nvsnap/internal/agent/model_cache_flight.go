@@ -714,7 +714,7 @@ func (c *nodeModelCache) promote(ctx context.Context, f *flight, log logrus.Fiel
 		c.release(bg, f.key, f.identity)
 		return
 	}
-	if err := emptyVolume(f.vol); err != nil {
+	if err := emptyFlightVolume(f.vol); err != nil {
 		log.WithError(err).Warn("model cache: single flight: emptying the volume failed; the pod downloads")
 		c.release(bg, f.key, f.identity)
 		return
@@ -724,6 +724,9 @@ func (c *nodeModelCache) promote(ctx context.Context, f *flight, log logrus.Fiel
 		c.release(bg, f.key, f.identity)
 	}
 }
+
+// emptyFlightVolume is emptyVolume for a takeover; tests stub it.
+var emptyFlightVolume = emptyVolume
 
 func emptyVolume(dir string) error {
 	ents, err := os.ReadDir(dir)

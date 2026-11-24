@@ -662,12 +662,10 @@ func leaseHolder(kube *fake.Clientset, key string) string {
 // would renew or serve it, and the other pods would wait out its expiry.
 func TestSingleFlightATakeoverThatCannotEmptyTheVolumeReleasesTheLease(t *testing.T) {
 	a, f, kube := promoteFixture(t)
-	locked := filepath.Join(f.vol, "locked")
-	write(t, locked, "x.bin", "x")
-	if err := os.Chmod(locked, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	// A stub, not a read-only directory: root (as in CI) removes those.
+	prev := emptyFlightVolume
+	emptyFlightVolume = func(string) error { return errors.New("remove w.bin: device or resource busy") }
+	t.Cleanup(func() { emptyFlightVolume = prev })
 	a.c.promote(context.Background(), f, a.c.log)
 	if h := leaseHolder(kube, f.key); h == f.identity {
 		t.Fatal("the Lease is still held by a pod that cannot download")
