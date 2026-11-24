@@ -161,6 +161,10 @@ type fabricSessionDir struct {
 	// resume until the driver's open verdict (--sync-open). The driver
 	// waits only for the members that do.
 	holdsOpen atomic.Bool
+	// warnedMarker: a malformed DIR/resumed was logged. The driver reads
+	// the state every fabricPollInterval, and the workload writes the
+	// marker: it is logged once per session, not at every read.
+	warnedMarker atomic.Bool
 }
 
 // own gives the directory to the user process pid runs as: the tool and
@@ -416,7 +420,10 @@ func readFabricState(s *fabricSessionDir) (fabricState, error) {
 		if tok := strings.TrimSpace(string(b)); fabricOpenTokenRe.MatchString(tok) {
 			st.Resumed = tok
 		} else {
-			logrus.WithField("marker", truncate(tok, 64)).Warn("gpushare fabric: malformed resumed marker; not counted as resumed")
+			if s.warnedMarker.CompareAndSwap(false, true) {
+				logrus.WithFields(logrus.Fields{"session": s.name, "marker": truncate(tok, 64)}).
+					Warn("gpushare fabric: malformed resumed marker; not counted as resumed")
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return st, err

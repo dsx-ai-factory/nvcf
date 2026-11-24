@@ -1196,13 +1196,46 @@ func TestFabricSession_OpenOverHTTP(t *testing.T) {
 		}
 	}
 	// A marker the workload garbled is not a report: the member has not
-	// resumed, and the rest of its state is still served.
+	// resumed, and the rest of its state is still served. It is logged
+	// once for the session, however often the driver reads the state.
+	hook := &markerWarnings{}
+	old := logrus.StandardLogger().ReplaceHooks(make(logrus.LevelHooks))
+	defer logrus.StandardLogger().ReplaceHooks(old)
+	logrus.AddHook(hook)
 	if err := os.WriteFile(filepath.Join(dir, "resumed"), []byte("x y z\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if st, ok, err := m.State(context.Background()); err != nil || !ok || st.Resumed != "" || !st.HoldsOpen {
-		t.Errorf("garbled marker: %+v ok=%v err=%v; want the state, not resumed", st, ok, err)
+	for range 3 {
+		if st, ok, err := m.State(context.Background()); err != nil || !ok || st.Resumed != "" || !st.HoldsOpen {
+			t.Errorf("garbled marker: %+v ok=%v err=%v; want the state, not resumed", st, ok, err)
+		}
 	}
+	if got := hook.sessions(); len(got) != 1 || !strings.HasSuffix(got[0], "s1") {
+		t.Errorf("malformed marker logged for sessions %q; want once, naming the session", got)
+	}
+}
+
+// markerWarnings records the session of each malformed-marker warning.
+type markerWarnings struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (h *markerWarnings) Levels() []logrus.Level { return []logrus.Level{logrus.WarnLevel} }
+
+func (h *markerWarnings) Fire(e *logrus.Entry) error {
+	if strings.Contains(e.Message, "malformed resumed marker") {
+		h.mu.Lock()
+		h.seen = append(h.seen, fmt.Sprint(e.Data["session"]))
+		h.mu.Unlock()
+	}
+	return nil
+}
+
+func (h *markerWarnings) sessions() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.seen)
 }
 
 // The open verdict is decided once: a member first seen holding after it
