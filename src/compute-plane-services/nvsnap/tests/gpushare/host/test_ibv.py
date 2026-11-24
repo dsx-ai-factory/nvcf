@@ -19,9 +19,11 @@ with immediate data from one queue pair to the other, then the test
     land, the receive posted before the suspend completes, and the
     completion names NCCL's queue pair number.
 
-A second program (ROLLBACK) drives the same library through gpushare's
-own commands, as the GPU tool rolls back a release that could not destroy
-one queue pair.
+A second program (ROLLBACK) runs under libnvsnap_gpushare with the same
+library, and nvsnap-gpu-suspend suspends it: the release cannot destroy
+one queue pair, and the tool's own rollback (undo, remap_all) must leave
+that queue pair reaching its re-created peer. TOOL_SRC names another
+nvsnap-gpu-suspend.c to build instead (negative controls).
 
 Run: python3 -I tests/gpushare/host/test_ibv.py
 (IBV_INC names the directory with infiniband/verbs.h; default /usr/include.
@@ -29,6 +31,7 @@ CUDA_INC names the one with cuda.h; default /usr/local/cuda/include.)
 """
 
 import os
+import selectors
 import shutil
 import subprocess
 import sys
@@ -910,20 +913,33 @@ int main(int argc, char **argv)
 """
 
 
-# The rollback of a release that could not destroy one of NCCL's queue
-# pairs, through gpushare's own commands in the order nvsnap-gpu-suspend
-# sends them (quiesce, release; then, rolling back, load, fabmap, remap
-# with the merged list, resume), with libnvsnap_ibv loaded as NCCL loads it
-# over the fake verbs. Then NCCL's queue pair whose destroy failed writes
-# to its peer, which the rollback re-created with a new number.
+# A worker for the GPU tool's rollback: libnvsnap_gpushare preloaded (its
+# control thread started by an import), libnvsnap_ibv loaded as NCCL loads
+# it over the fake verbs, two of NCCL's queue pairs connected, and the
+# first queue pair destroy set to fail. It prints "ready", lets
+# nvsnap-gpu-suspend suspend it (the release fails and the tool rolls
+# back: load, the verbs exchange, remap, resume), then, on a line on stdin,
+# writes from the queue pair whose destroy failed to its peer, which the
+# rollback re-created with a new number.
 ROLLBACK = r"""
-#include "gpushare.c"
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include <infiniband/verbs.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 #define S(f) __typeof__(&f) p_##f = dlvsym(h, #f, "IBVERBS_1.1")
 
 int main(void)
 {
+    /* A driver lookup starts the library's control thread
+     * (NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1): a process with NCCL's verbs and
+     * no GPU memory of its own still takes part in the suspend. */
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW);
+    int (*gpa)(const char *, void **, int, unsigned long long, void *) = cuda ? dlsym(cuda, "cuGetProcAddress_v2") : NULL;
+    void *fn = NULL;
+    if (!gpa || gpa("cuInit", &fn, 12000, 0, NULL)) { printf("no driver\n"); return 2; }
     void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) { printf("dlopen %s\n", dlerror()); return 2; }
     struct ibv_device **(*getl)(int *) = dlvsym(h, "ibv_get_device_list", "IBVERBS_1.1");
@@ -958,32 +974,21 @@ int main(void)
         struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
         p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
     }
-    char rep[GPUSHARE_REPLY_MAX], path[] = "/tmp/ibvrollbackXXXXXX";
-    close(mkstemp(path));
-    do_quiesce(rep, sizeof(rep));
-    int q = !strcmp(rep, "ok quiesced");
     fail_destroy(1);  /* a's */
-    do_release(rep, sizeof(rep), NULL);
-    int rel = !strncmp(rep, "ok", 2);
-    char *step = "load";
-    do_load(rep, sizeof(rep), NULL);
-    if (!strncmp(rep, "ok", 2)) step = "fabmap", do_fabmap(rep, sizeof(rep), path);
-    if (!strncmp(rep, "ok", 2)) step = "remap", do_remap(rep, sizeof(rep), path);
-    if (!strncmp(rep, "ok", 2)) step = "resume", do_resume(rep, sizeof(rep), 0);
-    int rolled = !strncmp(rep, "ok", 2);
-    if (!rolled) printf("rollback %s: %s\n", step, rep);
-    unlink(path);
+    printf("ready\n");
+    fflush(stdout);
+    char line[16];
+    if (!fgets(line, sizeof(line), stdin)) return 3;
     /* NCCL writes from a to b with the numbers and keys it had. */
     snprintf(src, sizeof(src), "rolled");
     struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
     struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
                              .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
-    int posted = rolled && !a->context->ops.post_send(a, &w, &wb), ok = 0;
+    int posted = !a->context->ops.post_send(a, &w, &wb), ok = 0;
     struct ibv_wc wc[8];
     int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
     for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
-    printf("quiesce_ok=%d release_ok=%d rollback_ok=%d written=%d data=%s\n", q, rel, rolled, ok,
-           strncmp(dst, "rolled", 6) ? "wrong" : "ok");
+    printf("written=%d data=%s\n", ok, strncmp(dst, "rolled", 6) ? "wrong" : "ok");
     return 0;
 }
 """
@@ -1017,9 +1022,17 @@ class Ibv(unittest.TestCase):
             f.write(ROLLBACK)
         subprocess.run(["gcc", "-shared", "-fPIC", "-I", CUDA_INC, "-o", os.path.join(t, "libcuda.so.1"),
                         os.path.join(t, "cuda.c")], check=True)
-        subprocess.run(["gcc", "-O2", "-Wall", "-Wno-unused-function", *inc, "-I", CUDA_INC, "-I", SRC, "-o",
-                        os.path.join(t, "rollback"), os.path.join(t, "rollback.c"), os.path.join(t, "libcuda.so.1"),
-                        "-Wl,-rpath," + t, "-ldl", "-lpthread"], check=True)
+        subprocess.run(["gcc", "-O2", "-Wall", "-Werror", *inc, "-o", os.path.join(t, "rollback"),
+                        os.path.join(t, "rollback.c"), "-ldl"],
+                       check=True)
+        # The library and the GPU tool, as the agent image builds them.
+        subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-fpatchable-function-entry=4", "-fPIC", "-shared",
+                        "-I", SRC, "-I", CUDA_INC, "-o", os.path.join(t, "libnvsnap_gpushare.so"),
+                        os.path.join(SRC, "gpushare.c"), "-ldl", "-lpthread"], check=True)
+        cls.tool = os.path.join(t, "nvsnap-gpu-suspend")
+        subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", SRC, "-I", CUDA_INC, "-o", cls.tool,
+                        os.environ.get("TOOL_SRC", os.path.join(SRC, "nvsnap-gpu-suspend.c")), "-ldl", "-lpthread"],
+                       check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", *inc, "-I", CUDA_INC,
                         "-I", SRC, "-rdynamic", "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"), "-ldl",
                         "-lpthread"],
@@ -1148,15 +1161,29 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("0", "0", "1"), out)
         self.assertEqual(out["doomed"], "0", out)
 
-    def test_rollback_of_a_failed_destroy_through_gpushare_reaches_the_new_peer(self):
-        p = subprocess.run([os.path.join(self.tmp, "rollback")], capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake))
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        out = dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
-        self.assertEqual((out["quiesce_ok"], out["release_ok"]), ("1", "0"), p.stdout)
-        self.assertEqual(out["rollback_ok"], "1", p.stdout)
-        self.assertEqual((out["written"], out["data"]), ("1", "ok"),
-                         "after the rollback, the queue pair whose destroy failed does not reach its peer: " + p.stdout)
+    def test_tool_rollback_of_a_failed_destroy_reaches_the_new_peer(self):
+        env = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, NVSNAP_GPUSHARE_CTL_ON_CUDA_USE="1",
+                   LD_PRELOAD=os.path.join(self.tmp, "libnvsnap_gpushare.so"))
+        w = subprocess.Popen([os.path.join(self.tmp, "rollback")], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+        self.addCleanup(w.wait)
+        self.addCleanup(w.kill)
+        sel = selectors.DefaultSelector()
+        sel.register(w.stdout, selectors.EVENT_READ)
+        line = w.stdout.readline().strip() if sel.select(30) else "<nothing in 30 s>"
+        sel.close()
+        self.assertEqual(line, "ready", line)
+        # The suspend's release fails (one queue pair cannot be destroyed),
+        # and the tool rolls the process back.
+        s = subprocess.run([self.tool, "--timeout-ms", "10000", "suspend", str(w.pid)], capture_output=True, text=True,
+                           timeout=120, env=dict(os.environ, LD_LIBRARY_PATH=self.tmp))
+        out = s.stdout + s.stderr
+        self.assertNotEqual(s.returncode, 0, out)
+        self.assertIn("could not be destroyed", out)
+        self.assertIn("suspend failed; rolled back, the workload runs as before", out)
+        res, _ = w.communicate("go\n", timeout=60)
+        self.assertIn("written=1 data=ok", res,
+                      "after the tool's rollback, the queue pair whose destroy failed does not reach its peer:\n" + out + res)
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")
