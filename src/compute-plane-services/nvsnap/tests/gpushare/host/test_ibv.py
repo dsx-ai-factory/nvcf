@@ -19,6 +19,10 @@ with immediate data from one queue pair to the other, then the test
     land, the receive posted before the suspend completes, and the
     completion names NCCL's queue pair number.
 
+A second program (ROLLBACK) drives the same library through gpushare's
+own commands, as the GPU tool rolls back a release that could not destroy
+one queue pair.
+
 Run: python3 -I tests/gpushare/host/test_ibv.py
 (IBV_INC names the directory with infiniband/verbs.h; default /usr/include.
 CUDA_INC names the one with cuda.h; default /usr/local/cuda/include.)
@@ -27,6 +31,7 @@ CUDA_INC names the one with cuda.h; default /usr/local/cuda/include.)
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -34,6 +39,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.normpath(os.path.join(HERE, "../../../docker/agent/gpushare"))
 IBV_INC = os.environ.get("IBV_INC", "/usr/include")
 CUDA_INC = os.environ.get("CUDA_INC", "/usr/local/cuda/include")
+sys.path.insert(0, HERE)
+from test_rdma_nccl import STUB as CUDA_STUB  # noqa: E402  (libcuda for gpushare's quiesce)
 
 FAKE = r"""
 #include <errno.h>
@@ -899,6 +906,85 @@ int main(int argc, char **argv)
 """
 
 
+# The rollback of a release that could not destroy one of NCCL's queue
+# pairs, through gpushare's own commands in the order nvsnap-gpu-suspend
+# sends them (quiesce, release; then, rolling back, load, fabmap, remap
+# with the merged list, resume), with libnvsnap_ibv loaded as NCCL loads it
+# over the fake verbs. Then NCCL's queue pair whose destroy failed writes
+# to its peer, which the rollback re-created with a new number.
+ROLLBACK = r"""
+#include "gpushare.c"
+#include <infiniband/verbs.h>
+
+#define S(f) __typeof__(&f) p_##f = dlvsym(h, #f, "IBVERBS_1.1")
+
+int main(void)
+{
+    void *h = dlopen("libnvsnap_ibv.so", RTLD_NOW | RTLD_LOCAL);
+    if (!h) { printf("dlopen %s\n", dlerror()); return 2; }
+    struct ibv_device **(*getl)(int *) = dlvsym(h, "ibv_get_device_list", "IBVERBS_1.1");
+    S(ibv_open_device); S(ibv_alloc_pd); S(ibv_create_cq); S(ibv_create_qp); S(ibv_modify_qp); S(ibv_query_gid);
+    struct ibv_mr *(*regmr)(struct ibv_pd *, void *, size_t, int) = dlvsym(h, "ibv_reg_mr", "IBVERBS_1.1");
+    int (*qport)(struct ibv_context *, uint8_t, struct ibv_port_attr *) = dlvsym(h, "ibv_query_port", "IBVERBS_1.1");
+    int nd;
+    struct ibv_device **l = getl(&nd);
+    void *fake = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_NOLOAD);  /* loaded by the library */
+    void (*fail_destroy)(int) = fake ? (void (*)(int))dlsym(fake, "fake_fail_destroy") : NULL;
+    if (!fail_destroy) { printf("no fake verbs\n"); return 2; }
+    struct ibv_context *c = p_ibv_open_device(l[0]);
+    struct ibv_pd *pd = p_ibv_alloc_pd(c);
+    static char src[64], dst[64];
+    struct ibv_mr *ms = regmr(pd, src, sizeof(src), 0), *md = regmr(pd, dst, sizeof(dst), 7);
+    struct ibv_cq *cq = p_ibv_create_cq(c, 64, NULL, NULL, 0);
+    struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                   .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 1 } };
+    struct ibv_qp *a = p_ibv_create_qp(pd, &ia), *b = p_ibv_create_qp(pd, &ia);
+    union ibv_gid gid;
+    struct ibv_port_attr pa;
+    p_ibv_query_gid(c, 1, 3, &gid);
+    qport(c, 1, &pa);
+    struct ibv_qp *pair[2][2] = { { a, b }, { b, a } };
+    for (int i = 0; i < 2; i++) {
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        p_ibv_modify_qp(pair[i][0], &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = pair[i][1]->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        p_ibv_modify_qp(pair[i][0], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
+    }
+    char rep[GPUSHARE_REPLY_MAX], path[] = "/tmp/ibvrollbackXXXXXX";
+    close(mkstemp(path));
+    do_quiesce(rep, sizeof(rep));
+    int q = !strcmp(rep, "ok quiesced");
+    fail_destroy(1);  /* a's */
+    do_release(rep, sizeof(rep), NULL);
+    int rel = !strncmp(rep, "ok", 2);
+    char *step = "load";
+    do_load(rep, sizeof(rep), NULL);
+    if (!strncmp(rep, "ok", 2)) step = "fabmap", do_fabmap(rep, sizeof(rep), path);
+    if (!strncmp(rep, "ok", 2)) step = "remap", do_remap(rep, sizeof(rep), path);
+    if (!strncmp(rep, "ok", 2)) step = "resume", do_resume(rep, sizeof(rep), 0);
+    int rolled = !strncmp(rep, "ok", 2);
+    if (!rolled) printf("rollback %s: %s\n", step, rep);
+    unlink(path);
+    /* NCCL writes from a to b with the numbers and keys it had. */
+    snprintf(src, sizeof(src), "rolled");
+    struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
+    struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                             .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
+    int posted = rolled && !a->context->ops.post_send(a, &w, &wb), ok = 0;
+    struct ibv_wc wc[8];
+    int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
+    for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
+    printf("quiesce_ok=%d release_ok=%d rollback_ok=%d written=%d data=%s\n", q, rel, rolled, ok,
+           strncmp(dst, "rolled", 6) ? "wrong" : "ok");
+    return 0;
+}
+"""
+
+
 class Ibv(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -921,6 +1007,15 @@ class Ibv(unittest.TestCase):
         subprocess.run(["gcc", "-O2", "-Wall", "-Werror", *inc, "-o", os.path.join(t, "app"), os.path.join(t, "app.c"), "-ldl"], check=True)
         with open(os.path.join(t, "probe.c"), "w") as f:
             f.write(PROBE)
+        with open(os.path.join(t, "cuda.c"), "w") as f:
+            f.write(CUDA_STUB)
+        with open(os.path.join(t, "rollback.c"), "w") as f:
+            f.write(ROLLBACK)
+        subprocess.run(["gcc", "-shared", "-fPIC", "-I", CUDA_INC, "-o", os.path.join(t, "libcuda.so.1"),
+                        os.path.join(t, "cuda.c")], check=True)
+        subprocess.run(["gcc", "-O2", "-Wall", "-Wno-unused-function", *inc, "-I", CUDA_INC, "-I", SRC, "-o",
+                        os.path.join(t, "rollback"), os.path.join(t, "rollback.c"), os.path.join(t, "libcuda.so.1"),
+                        "-Wl,-rpath," + t, "-ldl", "-lpthread"], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", *inc, "-I", CUDA_INC,
                         "-I", SRC, "-rdynamic", "-o", os.path.join(t, "probe"), os.path.join(t, "probe.c"), "-ldl",
                         "-lpthread"],
@@ -1048,6 +1143,16 @@ class Ibv(unittest.TestCase):
         self.assertNotEqual(out["suspend"], "0", out)
         self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("0", "0", "1"), out)
         self.assertEqual(out["doomed"], "0", out)
+
+    def test_rollback_of_a_failed_destroy_through_gpushare_reaches_the_new_peer(self):
+        p = subprocess.run([os.path.join(self.tmp, "rollback")], capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
+        self.assertEqual((out["quiesce_ok"], out["release_ok"]), ("1", "0"), p.stdout)
+        self.assertEqual(out["rollback_ok"], "1", p.stdout)
+        self.assertEqual((out["written"], out["data"]), ("1", "ok"),
+                         "after the rollback, the queue pair whose destroy failed does not reach its peer: " + p.stdout)
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")
