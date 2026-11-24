@@ -110,6 +110,13 @@ const (
 	groupGPUFaultsKey    = "gpuFaults"
 	groupLastGPUFaultKey = "lastGPUFault"
 
+	// groupLeavingKey lists, comma-separated, the UIDs of the captured
+	// pods being deleted so their replacements restore from the record;
+	// groupLeavingAtKey is when they were listed (RFC 3339), before the
+	// first delete (deleteInstance).
+	groupLeavingKey   = "leaving"
+	groupLeavingAtKey = "leavingAt"
+
 	lwsGroupKeyLabel = "leaderworkerset.sigs.k8s.io/group-key"
 
 	// criuCaptureAnnotation opts a multi-pod instance into the capture.
@@ -203,7 +210,30 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 		g.ColdEntrypoints[i] = data[fmt.Sprintf("coldEntrypoint.%d", i)]
 		g.ProcessConfigs[i] = data[fmt.Sprintf("processConfig.%d", i)]
 	}
+	if at, err := time.Parse(time.RFC3339, data[groupLeavingAtKey]); err == nil && data[groupLeavingKey] != "" {
+		g.Leaving, g.LeavingAt = strings.Split(data[groupLeavingKey], ","), at
+	}
 	return g, true
+}
+
+// leavingWindow bounds how long after the record lists a captured pod as
+// leaving (deleteInstance) admission takes it for leaving rather than
+// running: the deletes' retries (deleteRetry), and a minute for the
+// replacement's creation and the clocks of the agents. A delete that never
+// happened (the agent stopped between the record and the delete, or every
+// retry failed) leaves a pod listed; after the window it counts as running
+// again.
+func leavingWindow() time.Duration { return deleteRetry.total + time.Minute }
+
+// leaving reports whether g lists p as a captured pod being deleted for
+// its replacement to restore, listed within leavingWindow of now. A pod
+// not listed, or listed too long ago, may run: admission refuses beside it.
+func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) bool {
+	if p.UID == "" || g.LeavingAt.IsZero() || !slices.Contains(g.Leaving, string(p.UID)) {
+		return false
+	}
+	age := now.Sub(g.LeavingAt)
+	return age > -time.Minute && age < leavingWindow()
 }
 
 // lookupCRIUGroup is the webhook's view of the group records.
@@ -726,7 +756,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			// a stopped instance, its controllers replace every pod of it,
 			// cold.
 			log.Error("CRIU group capture: the instance was stopped for it; replacing its pods, which start fresh")
-			c.deleteInstance(context.WithoutCancel(ctx), members, log)
+			c.deleteInstance(context.WithoutCancel(ctx), key, members, log)
 		}
 	} else {
 		// The dump stopped the instance for good. Its replacements restore
@@ -782,7 +812,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		// Its pods were dumped and are gone; their replacements are
 		// admitted as the restore's placeholders (or cold, without the
 		// record).
-		c.deleteInstance(context.WithoutCancel(ctx), members, log)
+		c.deleteInstance(context.WithoutCancel(ctx), key, members, log)
 	}
 	return false
 }
@@ -822,12 +852,20 @@ var deleteMember = (*Agent).deletePodRetrying
 // deleteInstance deletes the pods of a captured instance so its
 // controllers replace them.
 //
-// Every member's delete is issued at once, each retried on its own: one
-// delete that waits on another would let a controller recreate a deleted
-// rank while another still runs, and that rank's replacement is then
-// admitted beside a running pod of the instance, which no group restore
-// admits (criuGroupAdmits), so the instance starts cold.
-func (c *criuAutoRestorer) deleteInstance(ctx context.Context, members []*corev1.Pod, log *logrus.Entry) {
+// A replacement is admitted as its rank's restore placeholder only when no
+// other pod of the instance runs (criuGroupAdmits, criuCompanionAdmits),
+// and a rank's controller can recreate it, and its replacement be
+// admitted, before the API server accepts a sibling's delete. So before
+// the first delete, the members are listed as leaving on the record their
+// replacements restore from (key, when it is being verified): admission
+// takes a listed pod for leaving whether or not its delete is visible yet.
+// Members not listed (the record could not be written) are deleted all the
+// same; a replacement admitted beside one starts cold.
+//
+// Every member's delete is then issued at once, each retried on its own,
+// so the listed pods are gone soon after they are listed.
+func (c *criuAutoRestorer) deleteInstance(ctx context.Context, key string, members []*corev1.Pod, log *logrus.Entry) {
+	c.listLeaving(ctx, key, members, log)
 	var wg sync.WaitGroup
 	for _, p := range members {
 		wg.Add(1)
@@ -839,6 +877,31 @@ func (c *criuAutoRestorer) deleteInstance(ctx context.Context, members []*corev1
 		}(p)
 	}
 	wg.Wait()
+}
+
+// listLeaving lists members as leaving on group record key
+// (groupLeavingKey), only when the record is being verified: the capture
+// the members' replacements restore from. Any other record restores no
+// replacement of theirs, and is left as it is.
+func (c *criuAutoRestorer) listLeaving(ctx context.Context, key string, members []*corev1.Pod, log *logrus.Entry) {
+	if key == "" {
+		return
+	}
+	uids := make([]string, 0, len(members))
+	for _, p := range members {
+		if p.UID != "" {
+			uids = append(uids, string(p.UID))
+		}
+	}
+	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		if d["state"] != criuGroupStateVerifying || len(uids) == 0 {
+			return false
+		}
+		d[groupLeavingKey], d[groupLeavingAtKey] = strings.Join(uids, ","), time.Now().UTC().Format(time.RFC3339)
+		return true
+	}); err != nil {
+		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods as leaving on the group record; a replacement admitted before a sibling's delete starts cold")
+	}
 }
 
 // instanceConfigURI is the configuration of an instance: its ranks' shared

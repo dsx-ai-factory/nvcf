@@ -70,7 +70,7 @@ func TestCRIUGroupRestore_Companion(t *testing.T) {
 		}
 	}
 
-	m.CRIUCompanionAdmits = func(context.Context, *corev1.Pod) (bool, string) { return false, "GPU pod runs" }
+	m.CRIUCompanionAdmits = func(context.Context, *corev1.Pod, CRIUGroup) (bool, string) { return false, "GPU pod runs" }
 	if p := m.criuGroupRestorePatches(context.Background(), etcdPod()); p != nil {
 		t.Errorf("a companion of a running instance must start, got %d patches", len(p))
 	}
@@ -133,7 +133,7 @@ func TestCRIUGroupRestore_IdenticalCompanions(t *testing.T) {
 		t.Error("a refused companion must not claim a slot")
 		return 1, nil
 	}
-	m.CRIUCompanionAdmits = func(context.Context, *corev1.Pod) (bool, string) { return false, "GPU pod runs" }
+	m.CRIUCompanionAdmits = func(context.Context, *corev1.Pod, CRIUGroup) (bool, string) { return false, "GPU pod runs" }
 	_ = m.criuGroupRestorePatches(context.Background(), etcdPod())
 }
 

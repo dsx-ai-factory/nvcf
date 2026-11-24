@@ -1,0 +1,241 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package agent
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
+)
+
+// capturedInstance is an instance of two ranks just captured: its record
+// verifying, its pods dumped and not yet deleted.
+func capturedInstance(t *testing.T) (*criuAutoRestorer, *fake.Clientset, []*corev1.Pod) {
+	t.Helper()
+	ctx := context.Background()
+	kc := fake.NewSimpleClientset(parallelSTS())
+	a := &Agent{kubeClient: kc, log: logrus.New()}
+	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("k1"), Namespace: "nvsnap-system"},
+		Data: map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn", "size": "2", "captures": "1",
+			"checkpoint.0": "c0", "checkpoint.1": "c1"}}
+	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Create(ctx, record, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var members []*corev1.Pod
+	for i, name := range []string{"engine-0", "engine-1"} {
+		p := stsRank(name, []string{"0", "1"}[i], "2", "sts-a", true)
+		created, err := kc.CoreV1().Pods("fn").Create(ctx, &p, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		members = append(members, created)
+	}
+	return a.criuRestorer(), kc, members
+}
+
+// parallelSTS is the StatefulSet stsRank's pods name as their controller,
+// creating its pods together.
+func parallelSTS() *appsv1.StatefulSet {
+	p := stsRank("x", "0", "1", "sts-a", false)
+	return &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: metav1.GetControllerOf(&p).Name, Namespace: "fn", UID: "sts-a"},
+		Spec: appsv1.StatefulSetSpec{PodManagementPolicy: appsv1.ParallelPodManagement}}
+}
+
+// replacement is the pod a controller creates for a deleted rank: the
+// same name, a new UID.
+func replacement(t *testing.T, kc *fake.Clientset, old *corev1.Pod) *corev1.Pod {
+	t.Helper()
+	ordinal := old.Annotations[modelvolume.CacheOrdinalAnnotation]
+	p := stsRank(old.Name, ordinal, "2", "sts-a", false)
+	p.Annotations = map[string]string{}
+	for k, v := range old.Annotations {
+		p.Annotations[k] = v
+	}
+	p.UID = types.UID(old.Name + "-new")
+	created, err := kc.CoreV1().Pods("fn").Create(context.Background(), &p, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+// The bad order: one rank's delete is accepted and its controller
+// recreates it, and the replacement is admitted, before the API server
+// accepts its sibling's delete (the sibling has no deletionTimestamp yet).
+// The replacement must still be admitted as its rank's restore
+// placeholder: admission must not depend on the order of the deletes.
+func TestDeleteInstance_ReplacementAdmittedBeforeSiblingDelete(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	admitted := make(chan struct{})
+	var got bool
+	var why string
+	prev := deleteMember
+	deleteMember = func(a *Agent, ctx context.Context, ns, name string, uid types.UID) error {
+		if name == "engine-1" {
+			// Delivered only after rank 0's replacement was admitted.
+			select {
+			case <-admitted:
+			case <-time.After(5 * time.Second):
+				t.Error("rank 0's replacement was never admitted")
+			}
+			return prev(a, ctx, ns, name, uid)
+		}
+		if err := prev(a, ctx, ns, name, uid); err != nil {
+			return err
+		}
+		defer close(admitted)
+		r := replacement(t, kc, members[0])
+		got, why = admitReplacement(t, c.a, r)
+		return nil
+	}
+	t.Cleanup(func() { deleteMember = prev })
+
+	c.deleteInstance(context.Background(), "k1", members, c.a.log.WithField("t", 1))
+
+	if !got {
+		t.Errorf("rank 0's replacement, admitted before rank 1's delete was accepted, starts cold: %s", why)
+	}
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(context.Background(), criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data[groupLeavingKey] != "engine-0,engine-1" || cm.Data[groupLeavingAtKey] == "" {
+		t.Errorf("record lists %q leaving at %q, want both captured pods", cm.Data[groupLeavingKey], cm.Data[groupLeavingAtKey])
+	}
+}
+
+// admitReplacement is the webhook's decision for a replacement rank: the
+// record it restores from, then the group admission against it.
+func admitReplacement(t *testing.T, a *Agent, pod *corev1.Pod) (bool, string) {
+	t.Helper()
+	g, ok := a.lookupCRIUGroup(context.Background(), "k1")
+	if !ok {
+		return false, "no usable group record"
+	}
+	return a.criuGroupAdmits(context.Background(), pod, g)
+}
+
+// Only a record being verified lists its members as leaving: a failed
+// capture's record (its replacements start cold) is left as it is.
+func TestDeleteInstance_ListsLeavingOnlyOnVerifyingRecord(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	ctx := context.Background()
+	if err := c.updateGroupRecord(ctx, "k1", func(d map[string]string) bool {
+		d["state"] = criuGroupStateFailed
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c.deleteInstance(ctx, "k1", members, c.a.log.WithField("t", 1))
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data[groupLeavingKey] != "" || cm.Data[groupLeavingAtKey] != "" {
+		t.Errorf("failed record lists %q leaving", cm.Data[groupLeavingKey])
+	}
+	if left := remainingPods(t, kc); len(left) != 0 {
+		t.Errorf("pods left %v, want the captured pods deleted all the same", left)
+	}
+}
+
+// A pod the record lists as leaving is not running; any other pod of the
+// instance is, and a listing older than leavingWindow (a delete that never
+// happened) or from the future no longer vouches for it. Fail closed.
+func TestCRIUGroupAdmits_Leaving(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		siblings []string // running pods besides the replacement of rank 0
+		leaving  []string
+		at       time.Time
+		want     bool
+		reason   string
+	}{
+		{"captured sibling listed, its delete not yet accepted", []string{"engine-1"}, []string{"engine-0", "engine-1"}, now, true, ""},
+		{"listed just inside the window", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() + time.Minute), true, ""},
+		{"sibling not captured: not listed", []string{"engine-1"}, []string{"engine-0"}, now, false, "engine-1 of the instance already runs"},
+		{"no listing", []string{"engine-1"}, nil, now, false, "already runs"},
+		{"listing stale: the delete never happened", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() - time.Second), false, "already runs"},
+		{"listing from the future", []string{"engine-1"}, []string{"engine-1"}, now.Add(2 * time.Minute), false, "already runs"},
+		{"one sibling listed, another not", []string{"engine-1", "engine-2"}, []string{"engine-1"}, now, false, "engine-2 of the instance already runs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kc := fake.NewSimpleClientset(parallelSTS())
+			for i, name := range tc.siblings {
+				p := stsRank(name, []string{"1", "2"}[i], "3", "sts-a", true)
+				if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &p, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := stsRank("engine-0", "0", "3", "sts-a", false)
+			r.UID = "engine-0-new"
+			a := &Agent{kubeClient: kc, log: logrus.New()}
+			g := webhook.CRIUGroup{Key: "k1", Leaving: tc.leaving}
+			if tc.leaving != nil {
+				g.LeavingAt = tc.at
+			}
+			got, why := a.criuGroupAdmits(context.Background(), &r, g)
+			if got != tc.want || !strings.Contains(why, tc.reason) {
+				t.Errorf("admits = %v (%q), want %v (%q)", got, why, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+// A companion's replacement is admitted beside a captured GPU rank the
+// record lists as leaving, not beside any other GPU pod.
+func TestCRIUCompanionAdmits_Leaving(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name    string
+		leaving []string
+		at      time.Time
+		want    bool
+	}{
+		{"captured rank listed", []string{"engine-0"}, now, true},
+		{"rank not listed", []string{"engine-9"}, now, false},
+		{"listing stale", []string{"engine-0"}, now.Add(-leavingWindow() - time.Second), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kc := fake.NewSimpleClientset()
+			rank := stsRank("engine-0", "0", "1", "sts-a", true)
+			if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &rank, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			a := &Agent{kubeClient: kc, log: logrus.New(), groveReplicas: replicasOf(map[string]int{}, nil)}
+			etcd := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "etcd-0", Namespace: "fn", UID: "etcd-new"}}
+			got, why := a.criuCompanionAdmits(context.Background(), etcd, webhook.CRIUGroup{Key: "k1", Leaving: tc.leaving, LeavingAt: tc.at})
+			if got != tc.want {
+				t.Errorf("admits = %v (%q), want %v", got, why, tc.want)
+			}
+		})
+	}
+}
+
+// The listing is read back from the record by the webhook's lookup.
+func TestParseCRIUGroup_Leaving(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	data := map[string]string{"state": "complete", "size": "1", "checkpoint.0": "a",
+		groupLeavingKey: "u0,u1", groupLeavingAtKey: at.Format(time.RFC3339)}
+	g, ok := parseCRIUGroup("k1", data)
+	if !ok || strings.Join(g.Leaving, ",") != "u0,u1" || !g.LeavingAt.Equal(at) {
+		t.Errorf("parsed leaving %v at %v (ok %v)", g.Leaving, g.LeavingAt, ok)
+	}
+	data[groupLeavingAtKey] = "not a time"
+	if g, _ := parseCRIUGroup("k1", data); len(g.Leaving) != 0 {
+		t.Errorf("leaving %v parsed without a valid time", g.Leaving)
+	}
+}
