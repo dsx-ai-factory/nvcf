@@ -453,6 +453,9 @@ PROBE = r"""
  * restore and resume before it returns that the old descriptor is ready. */
 static int probe_poll(struct pollfd *p, nfds_t n, int t);
 #define poll(p, n, t) probe_poll(p, n, t)
+/* Set once stop_calls is in its wait for verbs calls in progress. */
+static int in_drain_wait;
+#define NVSNAP_IBV_WAITING_HOOK() __atomic_store_n(&in_drain_wait, 1, __ATOMIC_SEQ_CST)
 /* Counts the broadcasts that let NCCL's held verbs calls go (reopen). */
 static int probe_broadcast(pthread_cond_t *c);
 #define pthread_cond_broadcast(c) probe_broadcast(c)
@@ -622,9 +625,10 @@ int main(int argc, char **argv)
     }
     if (!strcmp(c, "portdrain")) {
         /* A port query in the provider when the fence starts. The query
-         * stays there until the fence is seen waiting for it (the gate
-         * closed, the call still counted in); the fence must not have
-         * returned then, and must pass once the query returns. */
+         * stays there until the fence is in its wait for calls in progress
+         * (NVSNAP_IBV_WAITING_HOOK); the fence must not have returned
+         * then, and must pass once the query returns. A fence that never
+         * waits never signals, and the query is released only after 5 s. */
         up(0);
         fake_port_block(1);
         pthread_create(&t, NULL, query_port, NULL);
@@ -634,7 +638,7 @@ int main(int argc, char **argv)
         fence_rc = 99;
         pthread_create(&t2, NULL, fence_t, NULL);
         int waiting = 0;
-        for (int i = 0; i < 5000 && !(waiting = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST)); i++) usleep(100);
+        for (int i = 0; i < 5000 && !(waiting = __atomic_load_n(&in_drain_wait, __ATOMIC_SEQ_CST)); i++) usleep(1000);
         int returned_early = __atomic_load_n(&fence_rc, __ATOMIC_SEQ_CST) != 99;
         int inflight_seen = __atomic_load_n(&inflight, __ATOMIC_SEQ_CST);
         fake_port_block(0);

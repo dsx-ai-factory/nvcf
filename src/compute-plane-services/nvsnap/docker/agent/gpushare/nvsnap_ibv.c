@@ -1072,6 +1072,13 @@ static void release_refused(void)
               "the process cannot run again");
 }
 
+/* Test hook: runs in each round of stop_calls' wait for calls in progress
+ * (the host tests define it before including this file). Nothing in a
+ * build of the library. */
+#ifndef NVSNAP_IBV_WAITING_HOOK
+#define NVSNAP_IBV_WAITING_HOOK() do {} while (0)
+#endif
+
 /* Stop NCCL's verbs calls and wait for those in progress, without omu: a
  * call in progress may need it to finish (see suspended). */
 static int stop_calls(char *reply, size_t n)
@@ -1086,6 +1093,7 @@ static int stop_calls(char *reply, size_t n)
     pthread_mutex_unlock(&omu);
     double t0 = now_s();
     while (__atomic_load_n(&inflight, __ATOMIC_SEQ_CST)) {
+        NVSNAP_IBV_WAITING_HOOK();
         if (now_s() - t0 > 2) {
             /* After a fence the calls stay held: the caller decides
              * (release_refused), and a peer may be releasing. */
