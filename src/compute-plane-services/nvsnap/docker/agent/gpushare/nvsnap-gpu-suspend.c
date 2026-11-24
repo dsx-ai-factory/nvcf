@@ -1460,8 +1460,10 @@ static int open_synced(const int *pids, int n)
     if (got > 0 && held_fallback)
         snprintf(why, sizeof(why), "%d process(es) without \"resume hold lease\" (or its lease) opened at their resume",
                  held_fallback);
-    if (got > 0 && !held_fallback) printf("sync-open: every node resumed: launches let through\n");
-    else printf("sync-open: %s; " SYNC_OPEN_UNSYNCED "\n", why);
+    if (got > 0 && !held_fallback) {
+        /* A failed open is reported by the caller. */
+        if (r == 0) printf("sync-open: every node resumed: launches let through\n");
+    } else printf("sync-open: %s; " SYNC_OPEN_UNSYNCED "\n", why);
     return r;
 }
 

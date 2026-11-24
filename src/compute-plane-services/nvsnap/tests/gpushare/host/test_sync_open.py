@@ -74,6 +74,8 @@ old_lib = len(sys.argv) > 2 and sys.argv[2] == "old"  # a library without "resum
 no_hold_lease = old_lib or (len(sys.argv) > 2 and sys.argv[2] == "nolease")
 # A library that cannot take the lease: it resumes without the hold.
 lease_fails = len(sys.argv) > 2 and sys.argv[2] == "leasefails"
+# A library whose "open" finds the state lock busy.
+open_busy = len(sys.argv) > 2 and sys.argv[2] == "openbusy"
 # A library whose NCCL release refused after the fence: it answers every
 # command that would let it run again with an error (gpushare.c, DOOMED_REPLY).
 doomed = len(sys.argv) > 2 and sys.argv[2] == "doomed"
@@ -113,6 +115,8 @@ def serve():
             held, rep = False, "ok resumed (0 multicast bind(s), 0 multicast mapping(s))"
         elif cmd == "lease" and not old_lib:
             rep = "ok leased"
+        elif cmd == "open" and open_busy:
+            rep = "err busy (state lock)"
         elif cmd == "open":
             rep = "ok opened" if held else "ok not held"
             held = False
@@ -376,6 +380,16 @@ class SyncOpen(unittest.TestCase):
         self.assertNotIn("lease", names, names)
         self.assertIn(UNSYNCED, out)
         self.assertIn('without "resume hold lease"', out)
+
+    def test_open_that_fails_is_not_reported_let_through(self):
+        self.start_rank("openbusy")
+        drv = Driver(self.fabric, "open")
+        r, _, cmds = self.cycle(drv, 30000)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertNotIn("every node resumed: launches let through", out,
+                         "the resume said the launches were let through when an open failed")
+        self.assertIn("not every pid's GPU launches were let through", out)
 
     def test_lease_that_cannot_be_taken_is_not_synced(self):
         self.start_rank("leasefails")
