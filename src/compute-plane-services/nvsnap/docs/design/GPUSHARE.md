@@ -484,7 +484,11 @@ ranks may already be destroying their queue pairs, and a rollback
 re-creates only theirs: this process's queue pairs would go on targeting
 peers that are gone. So libnvsnap_ibv keeps NCCL's verbs calls held for
 good (`nvsnap_ibv_doomed`), also when its wait for calls in progress
-times out. gpushare answers every command that would let the process run
+times out. A `release` that finds gpushare's state lock busy after the
+fence is treated the same way, without that lock: gpushare marks the
+process and tells the library (`nvsnap_ibv_doom_if_fenced`). An older
+library without that call stays held anyway, because gpushare never
+opens NCCL's calls again for a marked process. gpushare answers every command that would let the process run
 again (`resume`, `resume hold`, `open`, `hold`, `step`, `quiesce`,
 `release`) with "it cannot run again (replace it)" and keeps its gates
 closed, also when a lease expires. The tool's rollback then fails

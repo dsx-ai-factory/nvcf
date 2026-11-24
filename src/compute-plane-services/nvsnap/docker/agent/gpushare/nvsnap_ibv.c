@@ -1580,6 +1580,18 @@ EXPORT void nvsnap_ibv_open(void)
  * not run again. */
 EXPORT int nvsnap_ibv_doomed(void) { return __atomic_load_n(&doomed, __ATOMIC_SEQ_CST); }
 
+/* gpushare's "release" could not run at all (its state lock was busy)
+ * after a fence: as a refused release, keep NCCL's calls held for good.
+ * 1 when fenced (now doomed), else 0 and nothing changes. Takes no lock. */
+EXPORT int nvsnap_ibv_doom_if_fenced(void)
+{
+    if (!__atomic_load_n(&fenced, __ATOMIC_SEQ_CST)) return 0;
+    __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
+    if (!__atomic_exchange_n(&doomed, 1, __ATOMIC_SEQ_CST))
+        logf_("release did not run after the fence: NCCL's verbs calls stay held for good; the process cannot run again");
+    return 1;
+}
+
 /* The files NCCL's open devices hold (each real context's command and
  * event file), at most max of them in fds; returns how many there are.
  * gpushare's "mx" and "nixl" pauses leave these to nvsnap_ibv_suspend,

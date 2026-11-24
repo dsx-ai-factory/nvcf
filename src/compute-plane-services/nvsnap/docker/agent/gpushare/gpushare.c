@@ -985,6 +985,11 @@ static void ibv_unfence(void);
  * its gates stay closed, and every command that would let it run answers
  * DOOMED_REPLY (the tool's rollback fails, and the workload is replaced). */
 static int ibv_doomed_here;
+/* The last "quiesce" fenced NCCL's verbs, and nothing has let them run
+ * since (ibv_unfence) or released them. A "release" that then cannot even
+ * take the state lock leaves this process as one that refused its release
+ * after the fence (do_release). Only the control thread touches both. */
+static int ibv_fenced_here;
 #define DOOMED_REPLY "err this process refused its RDMA release after its peers were fenced; " \
                      "it cannot run again (replace it)"
 
@@ -1274,7 +1279,7 @@ static struct {
     int (*fence)(char *, size_t), (*suspend)(char *, size_t), (*restore)(char *, size_t), (*map)(FILE *);
     int (*connect)(const char *, char *, size_t), (*count)(void), (*fds)(int *, int);
     void (*open)(void);
-    int (*doomed)(void);
+    int (*doomed)(void), (*doom_if_fenced)(void);
 } ibv;
 
 /* NCCL's RDMA devices open through libnvsnap_ibv (0: none, or not loaded). */
@@ -1286,7 +1291,9 @@ static int ibv_devices(void);
  * them held until its objects are back). */
 static void ibv_unfence(void)
 {
-    if (!ibv_doomed_here && ibv_devices() > 0) ibv.open();
+    if (ibv_doomed_here) return;
+    ibv_fenced_here = 0;
+    if (ibv_devices() > 0) ibv.open();
 }
 
 static int ibv_devices(void)
@@ -1308,6 +1315,7 @@ static int ibv_devices(void)
         /* Optional: without it, a refused release is not known to have
          * come after the fence (an older library reopens NCCL's calls). */
         *(void **)&ibv.doomed = real_dlsym(h, "nvsnap_ibv_doomed");
+        *(void **)&ibv.doom_if_fenced = real_dlsym(h, "nvsnap_ibv_doom_if_fenced");
         *(void **)&ibv.count = real_dlsym(h, "nvsnap_ibv_count");
         if (!ibv.count) return 0;
     }
@@ -1492,6 +1500,7 @@ static void do_quiesce(char *reply, size_t n)
     else {
         verify_log("quiesce");
         snprintf(reply, n, "ok quiesced");
+        ibv_fenced_here = ibv_devices() > 0;
     }
     pthread_mutex_unlock(&mu);
 }
@@ -1535,7 +1544,20 @@ static int void_export_copies(void)
  * host memory. */
 static void do_release(char *reply, size_t n, const char *args)
 {
-    if (lock_ctl()) { snprintf(reply, n, "err busy (state lock)"); return; }
+    if (lock_ctl()) {
+        snprintf(reply, n, "err busy (state lock)");
+        /* After the fence, the other ranks release now: this one, which
+         * could not, must never run again (see ibv_doomed_here). Without
+         * the state lock: the library is told on its own (an older one,
+         * without the call, keeps the calls held as gpushare never opens
+         * them again). */
+        if (ibv_fenced_here && !ibv_doomed_here) {
+            if (ibv.doom_if_fenced) ibv.doom_if_fenced();
+            ibv_doomed_here = 1;
+            logf_("release: the state lock is busy after the fence: this process cannot run again");
+        }
+        return;
+    }
     if (refuse_doomed(reply, n)) return;
     if (!gated) {
         snprintf(reply, n, "err not quiesced");

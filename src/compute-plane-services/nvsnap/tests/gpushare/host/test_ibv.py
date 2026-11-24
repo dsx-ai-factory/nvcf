@@ -808,6 +808,19 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "doomiffenced") || !strcmp(c, "doomunfenced")) {
+        /* gpushare's release could not run (its state lock busy): after a
+         * fence NCCL's calls stay held for good; without one nothing
+         * changes. */
+        up(1);
+        int f = !strcmp(c, "doomiffenced") ? nvsnap_ibv_fence(rep, sizeof(rep)) : 0;
+        int (*doom)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "nvsnap_ibv_doom_if_fenced");
+        int d = doom ? doom() : -1;
+        nvsnap_ibv_open();
+        printf("fence=%d doom=%d doomed=%d held_after_open=%d\n", f, d, nvsnap_ibv_doomed(),
+               __atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
+        return 0;
+    }
     if (!strcmp(c, "refusetimeout")) {
         /* After a fence, a thread caught between counting itself in and
          * seeing the gate closed (enter) keeps inflight up: the release's
@@ -1150,6 +1163,12 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("1", "1", "0"),
                          "a rank whose peers may be releasing let NCCL post again: %s" % out)
         self.assertEqual(out["doomed"], "1", out)
+
+    def test_release_that_could_not_run_after_the_fence_keeps_nccl_held(self):
+        out = self.probe("doomiffenced")
+        self.assertEqual(out, {"fence": "0", "doom": "1", "doomed": "1", "held_after_open": "1"}, out)
+        out = self.probe("doomunfenced")
+        self.assertEqual(out, {"fence": "0", "doom": "0", "doomed": "0", "held_after_open": "0"}, out)
 
     def test_release_timing_out_after_the_fence_never_lets_nccl_go(self):
         out = self.probe("refusetimeout")

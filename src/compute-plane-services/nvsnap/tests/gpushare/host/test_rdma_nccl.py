@@ -104,8 +104,12 @@ int shim_opens;  /* nvsnap_ibv_open calls */
 void nvsnap_ibv_open(void) { shim_opens++; }
 int nvsnap_ibv_count(void) { return 1; }
 #ifndef NODOOM
-/* REFUSE: the release refused after the fence; NCCL's calls stay held. */
-int nvsnap_ibv_doomed(void) { return getenv("REFUSE") != NULL; }
+/* REFUSE: the release refused after the fence; NCCL's calls stay held.
+ * nvsnap_ibv_doom_if_fenced: gpushare's release could not run after the
+ * fence (state lock busy): held for good too. */
+int shim_doom_calls;
+int nvsnap_ibv_doomed(void) { return getenv("REFUSE") != NULL || shim_doom_calls > 0; }
+int nvsnap_ibv_doom_if_fenced(void) { shim_doom_calls++; return 1; }
 #endif
 #ifndef OLD
 int nvsnap_ibv_fds(int *fds, int max)
@@ -135,6 +139,8 @@ PROBE = r"""
 #include <sys/timerfd.h>
 
 static int closed_gate(struct gate *g) { return __atomic_load_n(&g->closed, __ATOMIC_SEQ_CST); }
+/* "release" from another thread than the one holding the state lock. */
+static void *release_t(void *rep) { do_release(rep, GPUSHARE_REPLY_MAX, NULL); return NULL; }
 
 static void open_map(const char *dev, int keep)
 {
@@ -150,13 +156,29 @@ int main(int argc, char **argv)
     const char *c = argc > 2 ? argv[1] : "";
     if (strcmp(c, "noshim") && !dlopen(argv[2], RTLD_NOW | RTLD_LOCAL)) { puts(dlerror()); return 3; }
     if (!strcmp(c, "refused")) {
-        /* Quiesce, then a release whose NCCL verbs refuse (REFUSE), then
+        /* Quiesce (unless UNFENCED), then a release whose NCCL verbs
+         * refuse (REFUSE), or that finds the state lock busy (BUSY), then
          * every command that would let the process run again. */
         char rep[GPUSHARE_REPLY_MAX], r2[GPUSHARE_REPLY_MAX];
-        int *opens = dlsym(dlopen(argv[2], RTLD_NOW | RTLD_NOLOAD), "shim_opens");
-        do_quiesce(rep, sizeof(rep));
-        int q = !strcmp(rep, "ok quiesced");
-        do_release(rep, sizeof(rep), NULL);
+        void *sh = dlopen(argv[2], RTLD_NOW | RTLD_NOLOAD);
+        int *opens = dlsym(sh, "shim_opens"), *dooms = dlsym(sh, "shim_doom_calls");
+        int q = 0;
+        if (!getenv("UNFENCED")) {
+            do_quiesce(rep, sizeof(rep));
+            q = !strcmp(rep, "ok quiesced");
+        } else {
+            hold_launches();
+        }
+        pthread_t locker;
+        if (getenv("BUSY")) {
+            pthread_mutex_lock(&mu);  /* another thread's: the release cannot take it */
+            pthread_create(&locker, NULL, release_t, rep);
+            pthread_join(locker, NULL);
+            pthread_mutex_unlock(&mu);
+            printf("release_reply=%s\n", !strcmp(rep, "err busy (state lock)") ? "busy" : "other");
+        } else {
+            do_release(rep, sizeof(rep), NULL);
+        }
         int rel = !strncmp(rep, "ok", 2), o0 = *opens, refused = 0;
         const char *cmds[] = { "resume", "resume hold", "open", "hold", "step", "quiesce", "release" };
         for (int i = 0; i < 7; i++) {
@@ -174,8 +196,8 @@ int main(int argc, char **argv)
         }
         gate_open();
         ibv_unfence();
-        printf("quiesce_ok=%d release_ok=%d refused=%d launch_closed=%d memory_closed=%d verbs_opens=%d\n", q, rel,
-               refused, closed_gate(&lgate), closed_gate(&mgate), *opens - o0);
+        printf("quiesce_ok=%d release_ok=%d refused=%d launch_closed=%d memory_closed=%d verbs_opens=%d doom_calls=%d\n",
+               q, rel, refused, closed_gate(&lgate), closed_gate(&mgate), *opens - o0, dooms ? *dooms : -1);
         return 0;
     }
     if (!strcmp(c, "noshim")) {
@@ -361,6 +383,24 @@ class RdmaNCCL(unittest.TestCase):
         self.assertEqual((out["quiesce_ok"], out["release_ok"]), ("1", "0"), out)
         self.assertEqual(out["refused"], "7", "a command let a process run again after its NCCL release refused: %s" % out)
         self.assertEqual((out["launch_closed"], out["memory_closed"], out["verbs_opens"]), ("1", "1", "0"), out)
+
+    def test_release_on_a_busy_lock_after_the_fence_never_runs_again(self):
+        # The state lock is busy when "release" comes after the quiesce
+        # fenced NCCL's verbs: the peers may release, so this process must
+        # not run again, with or without the library's nvsnap_ibv_doom_if_fenced.
+        for shim, dooms in (("libnvsnap_ibv.so", "1"), ("nodoom/libnvsnap_ibv.so", "-1")):
+            out = self.probe("refused", shim=shim, BUSY="1")
+            self.assertEqual((out["quiesce_ok"], out["release_reply"], out["release_ok"]), ("1", "busy", "0"), out)
+            self.assertEqual(out["refused"], "7", "%s: a process ran again after its release found the lock busy: %s" % (shim, out))
+            self.assertEqual((out["launch_closed"], out["memory_closed"], out["verbs_opens"]), ("1", "1", "0"), out)
+            self.assertEqual(out["doom_calls"], dooms, "%s: the verbs library was not told: %s" % (shim, out))
+
+    def test_release_on_a_busy_lock_without_a_fence_runs_again(self):
+        # No quiesce, so nothing was fenced: the busy release changes
+        # nothing, and the process may run again.
+        out = self.probe("refused", BUSY="1", UNFENCED="1")
+        self.assertEqual((out["release_reply"], out["refused"], out["launch_closed"]), ("busy", "0", "0"), out)
+        self.assertEqual(out["doom_calls"], "0", out)
 
     def test_release_refused_by_an_older_verbs_library_rolls_back(self):
         # No nvsnap_ibv_doomed: the refusal is taken as before, and the

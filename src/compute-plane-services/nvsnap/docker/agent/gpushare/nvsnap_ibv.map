@@ -19,4 +19,5 @@ NVSNAP_IBV_1 {
   global:
     nvsnap_ibv_fence; nvsnap_ibv_suspend; nvsnap_ibv_restore; nvsnap_ibv_map; nvsnap_ibv_connect;
     nvsnap_ibv_open; nvsnap_ibv_count; nvsnap_ibv_fds; nvsnap_ibv_doomed;
+    nvsnap_ibv_doom_if_fenced;
 };
