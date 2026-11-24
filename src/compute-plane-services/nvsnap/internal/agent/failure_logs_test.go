@@ -83,6 +83,27 @@ func TestKeepFailedCapture_SaysWhereTheToolOutputIs(t *testing.T) {
 	if b, rerr := os.ReadFile(kept); rerr != nil || string(b) != out.String() {
 		t.Errorf("kept output differs (%d of %d bytes): %v", len(b), out.Len(), rerr)
 	}
+	// The tool's output could not be kept, the other logs were: the error
+	// does not claim it was.
+	root2 := t.TempDir()
+	dir2 := filepath.Join(root2, "abc__20261122-233817")
+	if err := os.MkdirAll(dir2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir2, "dump.log"), []byte("criu"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the tool's log would be copied: its copy fails.
+	if err := os.MkdirAll(filepath.Join(root2, failureLogsDir, "abc__20261122-233817", "nvsnap-gpu-suspend-suspend.log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err2 := keepFailedCapture(root2, dir2, fmt.Errorf("gpushare suspend: %w", te), logrus.NewEntry(logrus.New()))
+	if strings.Contains(err2.Error(), "whole output is kept") {
+		t.Errorf("error %q says the tool's output is kept, but its copy failed", err2)
+	}
+	if _, serr := os.Stat(filepath.Join(root2, failureLogsDir, "abc__20261122-233817", "dump.log")); serr != nil {
+		t.Errorf("the other logs were not kept: %v", serr)
+	}
 	// Without a tool error, nothing is added.
 	plain := errors.New("criu: exit status 1")
 	if got := keepFailedCapture(root, dir, plain, logrus.NewEntry(logrus.New())); got.Error() != plain.Error() {
