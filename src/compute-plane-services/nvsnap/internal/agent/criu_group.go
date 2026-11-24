@@ -30,6 +30,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -815,14 +816,29 @@ func (c *criuAutoRestorer) companionsUnknown(ctx context.Context, key string, le
 	return false
 }
 
+// deleteMember is Agent.deletePodRetrying for deleteInstance; tests stub it.
+var deleteMember = (*Agent).deletePodRetrying
+
 // deleteInstance deletes the pods of a captured instance so its
 // controllers replace them.
+//
+// Every member's delete is issued at once, each retried on its own: one
+// delete that waits on another would let a controller recreate a deleted
+// rank while another still runs, and that rank's replacement is then
+// admitted beside a running pod of the instance, which no group restore
+// admits (criuGroupAdmits), so the instance starts cold.
 func (c *criuAutoRestorer) deleteInstance(ctx context.Context, members []*corev1.Pod, log *logrus.Entry) {
+	var wg sync.WaitGroup
 	for _, p := range members {
-		if err := c.a.deletePodRetrying(ctx, p.Namespace, p.Name, p.UID); err != nil {
-			log.WithError(err).WithField("pod", p.Name).Error("CRIU group capture: cannot delete a pod of the captured instance")
-		}
+		wg.Add(1)
+		go func(p *corev1.Pod) {
+			defer wg.Done()
+			if err := deleteMember(c.a, ctx, p.Namespace, p.Name, p.UID); err != nil {
+				log.WithError(err).WithField("pod", p.Name).Error("CRIU group capture: cannot delete a pod of the captured instance")
+			}
+		}(p)
 	}
+	wg.Wait()
 }
 
 // instanceConfigURI is the configuration of an instance: its ranks' shared
