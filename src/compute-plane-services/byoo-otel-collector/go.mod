@@ -1,6 +1,6 @@
-module github.com/NVIDIA/nvcf/src/compute-plane-services/byoo-otel-collector
+module github.com/dsx-ai-factory/nvcf/src/compute-plane-services/byoo-otel-collector
 
-go 1.23.4
+go 1.26.10
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0
@@ -20,7 +20,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/compress v1.17.9 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect

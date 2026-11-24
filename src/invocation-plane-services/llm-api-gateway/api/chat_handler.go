@@ -18,6 +18,7 @@ limitations under the License.
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,12 +32,14 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/telemetry"
 )
+
+const msgUpstreamStreamIncomplete = "upstream stream ended before completion"
 
 type UnaryResponseSender func(
 	c *GatewayContext,
@@ -59,7 +62,10 @@ func (h *OpenAIChatHandlers) CreateChatCompletion(ec echo.Context) error {
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
+	}
+	if err := requireJSONBody(c.Request(), rawBody); err != nil {
+		return err
 	}
 	if err := rejectAmbiguousMembers(rawBody, models.ChatCompletionRequest{}); err != nil {
 		return err
@@ -67,7 +73,7 @@ func (h *OpenAIChatHandlers) CreateChatCompletion(ec echo.Context) error {
 
 	var request models.ChatCompletionRequest
 	if err := c.Bind(&request); err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return requestDecodeError(err)
 	}
 
 	return h.handleChatCompletionRequest(c, &request, rawBody, nil, nil)
@@ -84,6 +90,7 @@ func (h *OpenAIChatHandlers) handleChatCompletionRequest(
 	if err := applyChatSessionAffinity(c, request); err != nil {
 		return err
 	}
+	h.handlers.setChatLastClusterKeys(c.RequestContext(), rawBody)
 	normalized, err := h.handlers.normalizeChatRequest(c, request, rawBody)
 	if err != nil {
 		return err
@@ -150,7 +157,9 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 	finalizeCtx := context.WithoutCancel(c.UserContext())
 	finalization := &streamFinalizationState{}
 	defer func() {
-		if finalization.IsFinalized() {
+		// The drain below can still deliver a usage chunk, so claim the state:
+		// a release followed by a finalize charges the input tokens twice.
+		if !finalization.MarkFinalized() {
 			return
 		}
 		h.handlers.releaseReservedTokenConsumption(finalizeCtx, request)
@@ -176,6 +185,16 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 		stream,
 		finalization,
 	)
+	if wrappedStream != nil {
+		// A handler that stops reading early, for example after a failed client write,
+		// must not strand the stream goroutines: drain until the provider closes the stream.
+		defer func() {
+			go func() {
+				for range wrappedStream {
+				}
+			}()
+		}()
+	}
 	if overrideStreamResponseSender != nil {
 		return overrideStreamResponseSender(c, wrappedStream, request)
 	}
@@ -188,10 +207,10 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 
 	for event := range wrappedStream {
 		if event.Err != nil {
-			if !errors.Is(event.Err, context.Canceled) {
-				return echo.NewHTTPError(http.StatusBadGateway, event.Err.Error())
+			if errors.Is(event.Err, context.Canceled) {
+				return nil
 			}
-			return nil
+			return failChatCompletionStream(c, event.Err)
 		}
 
 		if event.Chunk == nil {
@@ -223,6 +242,37 @@ func (h *OpenAIChatHandlers) streamChatCompletionWithSender(
 	return err
 }
 
+// failChatCompletionStream ends a stream whose upstream failed after the 200: an error
+// event instead of [DONE] makes OpenAI SDKs raise, and the returned status marks the
+// request failed: the 4xx of an upstream event that rejects the request, else 502.
+// An upstream error event keeps its fields but takes the gateway's error shape.
+func failChatCompletionStream(c *GatewayContext, cause error) error {
+	status := http.StatusBadGateway
+	event := openAIError{Message: msgUpstreamStreamIncomplete, Type: openAIErrorType(status)}
+	var upstreamErr *provider.UpstreamStreamError
+	if errors.As(cause, &upstreamErr) {
+		if isUpstreamClientError(upstreamErr.Status) {
+			status = upstreamErr.Status
+		}
+		event = openAIError{
+			Message: cmp.Or(upstreamErr.Message, msgUpstreamStreamIncomplete),
+			Type:    cmp.Or(ptr.Deref(upstreamErr.Type), openAIErrorType(status)),
+			Param:   upstreamErr.Param,
+			Code:    upstreamErr.Code,
+		}
+	}
+	failure := echo.NewHTTPError(status, msgUpstreamStreamIncomplete)
+	payload, err := json.Marshal(openAIErrorResponse{Error: event})
+	if err != nil {
+		return failure.SetInternal(errors.Join(cause, err))
+	}
+	_, writeErr := fmt.Fprintf(c.Response(), "data: %s\n\n", payload)
+	if writeErr == nil {
+		c.Response().Flush()
+	}
+	return failure.SetInternal(errors.Join(cause, writeErr))
+}
+
 type streamFinalizationState struct {
 	mu        sync.Mutex
 	finalized bool
@@ -238,13 +288,6 @@ func (s *streamFinalizationState) MarkFinalized() bool {
 
 	s.finalized = true
 	return true
-}
-
-func (s *streamFinalizationState) IsFinalized() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.finalized
 }
 
 func (h *OpenAIChatHandlers) wrapStreamForFinalization(

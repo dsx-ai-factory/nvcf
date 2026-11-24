@@ -16,12 +16,10 @@ installation path.
 
 </Info>
 
-Clone the public repository and run the compute-plane commands from its root:
-
-```bash
-git clone https://github.com/nvidia/nvcf.git
-cd nvcf
-```
+Obtain the selected stack packages using [Consume an NVCF release](../../overview/umbrella-releases.md).
+Run the commands below from the extracted `BUNDLE_DIR`, with the compute-plane
+and control-plane directories kept as siblings. A source checkout is needed
+only when developing from source.
 
 ## Prerequisites
 
@@ -63,7 +61,7 @@ step, and the operator consumes it:
 2. You export the control-plane profile. The profile is the canonical handoff
    for the control-plane identity, reachable endpoints, host overrides, and
    transport trust.
-3. From the repository root, you run
+3. From the extracted bundle root, you run
    `make -C deploy/stacks/nvcf-compute-plane register-cluster` (see
    [Register the cluster](#register-the-cluster)). The target runs
    `nvcf-cli self-hosted compute-plane register` with the profile. The CLI
@@ -71,7 +69,7 @@ step, and the operator consumes it:
    the control plane (ICMS), and writes the `clusterID`, `clusterGroupID`,
    identity source, endpoints, host overrides, and transport trust to a
    registration values file.
-4. From the repository root, you run
+4. From the extracted bundle root, you run
    `make -C deploy/stacks/nvcf-compute-plane install`. Helmfile installs
    `helm-nvca-operator` with the compute-plane environment and registration
    values for that cluster, using the same selected kubeconfig context as
@@ -112,30 +110,19 @@ sequenceDiagram
 
 ## Configure the compute plane
 
-Create the environment file from the repository root. It provides the chart
+Create the environment file from the extracted bundle root. It provides the chart
 registry, image registry, image pull secret name, and deployment-specific
 overrides used by the NVCA operator. The generated registration values provide
 the control-plane service URLs and host overrides.
 
 ```bash
-cd path/to/nvcf
+cd "$BUNDLE_DIR"
 touch deploy/stacks/nvcf-compute-plane/environments/<environment-name>.yaml
 ```
 
-```yaml title="deploy/stacks/nvcf-compute-plane/environments/<environment-name>.yaml"
-global:
-  helm:
-    sources:
-      registry: <your-chart-registry>
-      repository: <your-chart-repository>
-
-  image:
-    registry: <your-image-registry>
-    repository: <your-image-repository>
-
-  imagePullSecrets:
-    - name: nvcr-pull-secret
-```
+Start with the [chart and image access settings](../../self-managed/helmfile-installation.md#configure-artifact-access).
+Use the same selected chart and image source as the control plane. Add the
+compute-specific settings below to that environment file.
 
 The profile exporter derives the service URLs and route-matching host overrides
 from the selected control-plane environment, and registration writes them as
@@ -225,7 +212,7 @@ running Helmfile.
 
 | Chart | `helm-nvca-operator` |
 | --- | --- |
-| Version | `1.28.0` |
+| Version | `1.37.1` |
 | Namespace | `nvca-operator` |
 | Depends on | All control-plane services and gateway must be running |
 
@@ -241,6 +228,23 @@ The compute-plane Helmfile passes these values to the chart:
 Use `global.nvcaOperator.nodeSelector`, `global.nvcaOperator.tolerations`, and
 `global.nvcaOperator.agent.*` in the compute-plane environment when you need to
 place the operator, agent, or workloads on specific nodes.
+
+Registering a compute plane does not enable the NVCA OTel collector, even when
+the control plane runs the Event Ledger. A control plane can have many
+registered compute planes, and some are registered through GitOps rather than
+the CLI, so set `global.nvcaOperator.selfManaged.otelCollector.enabled: true`
+explicitly in `environments/<environment-name>.yaml` for each compute plane
+that should send its events to the Event Ledger. Also set
+`global.nvcaOperator.selfManaged.eventLedgerServiceURL` there when the compute
+plane is in a different cluster than the control plane; leave it empty when
+they share a cluster, since the collector then defaults to the in-cluster
+Event Ledger Service.
+
+The collector image is optional and must be present in the registry configured
+by `global.image` before it is enabled. See
+[Enable and Operate Event Ledger](../../self-managed/event-ledger.md#enable-the-compute-plane-collector)
+for image configuration, colocated and split-cluster examples, verification,
+and troubleshooting.
 
 <Warning>
 The `KAIScheduler` feature flag is optional. Enable it only if the
@@ -476,7 +480,11 @@ control-plane worker endpoints used by NVCF. For multi-cluster EKS installs,
 first validate the GPU cluster by checking `nvca-operator` rollout and
 `NVCFBackend` agent health. Function deployment and invocation are valid
 acceptance checks only after the worker endpoints are reachable from the GPU
-cluster.
+cluster. When the control plane runs the
+[Worker Callback Proxy](../../self-managed/worker-callback-proxy.md), the GPU
+cluster must also resolve `*.<workerDomain>` to the proxy and trust its CA
+(`global.nvcaOperator.agent.workerCallbackCaPem`); see that page to validate
+them.
 
 1. Set up environment variables:
 
@@ -745,6 +753,31 @@ Cleanup Script appendix in the self-hosted troubleshooting guide.
   ```bash
   kubectl describe nvcfbackends -n nvca-operator
   ```
+
+- Functions stuck in DEPLOYING with `failed calling webhook` and
+  `x509: certificate signed by unknown authority` in events: The NVCA webhook
+  serving certificate is not signed by the CA in the webhook `caBundle`. Check
+  each webhook configuration against the stored serving certificate:
+
+  ```bash
+  kubectl get secret nvca-webhook-tls-server-certs -n nvca-system \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/nvca-tls.crt
+  for kind in validatingwebhookconfiguration mutatingwebhookconfiguration; do
+    kubectl get "$kind" nvca -o jsonpath='{.webhooks[0].clientConfig.caBundle}' \
+      | base64 -d > /tmp/nvca-ca.pem
+    echo "$kind: $(openssl verify -CAfile /tmp/nvca-ca.pem /tmp/nvca-tls.crt 2>&1 | tail -1)"
+  done
+  ```
+
+  If either line does not end in `OK`, force a rollout. The operator rewrites the
+  certificate Secrets and both webhook configurations from one certificate and CA:
+
+  ```bash
+  kubectl annotate -n nvca-operator --overwrite --all nvcfbackends \
+    nvca.nvcf.nvidia.io/forcedRolloutAt="$(date)"
+  ```
+
+  Run the check again to confirm both lines end in `OK`.
 
 - Agent fails to register with SIS (HTTP 401): The control plane could not
   validate the agent's PSAT against the recorded issuer and JWKS. Re-run

@@ -29,9 +29,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	batchv1 "k8s.io/api/batch/v1"
@@ -55,19 +55,19 @@ import (
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/icms"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	k8smock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
-	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	nvcafake "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	featureflagmock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
-	fakenodefeatures "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/fake"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
-	nvcatypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/icms"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	k8smock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
+	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	nvcafake "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	featureflagmock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
+	fakenodefeatures "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures/fake"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 func init() {
@@ -850,6 +850,42 @@ func Test_translateFunctionLaunchSpecification(t *testing.T) {
 	}
 	assert.Equal(t, []string{"--backend-connectivity=reverse"}, backendConnectivityArgs)
 	assert.Equal(t, []string{"--initial-input-tps=100"}, initialInputTPSArgs)
+
+	// The agent's workload.llmInferenceStopPause reaches the translated LLM pod.
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 90 * time.Second
+	reqLLMPause := reqLLM.DeepCopy()
+	reqLLMPause.Name = "sr-llm-pause"
+	gotArtifactsPause, err := kc.translateFunctionLaunchSpecification(ctx, reqLLMPause)
+	kc.bk8s.cfg.Workload.LLMInferenceStopPause = 0
+	require.NoError(t, err)
+	pausePod := &corev1.Pod{}
+	for _, artifact := range gotArtifactsPause {
+		if artifact.Type == function.LaunchArtifactTypePod {
+			podBytes, err := base64.StdEncoding.DecodeString(artifact.Specification)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(podBytes, pausePod))
+			break
+		}
+	}
+	require.NotNil(t, pausePod.Spec.TerminationGracePeriodSeconds)
+	assert.Equal(t, int64(150), *pausePod.Spec.TerminationGracePeriodSeconds)
+	for _, c := range pausePod.Spec.Containers {
+		switch c.Name {
+		case "inference":
+			require.NotNil(t, c.Lifecycle)
+			require.NotNil(t, c.Lifecycle.PreStop)
+			require.NotNil(t, c.Lifecycle.PreStop.Exec)
+			assert.Equal(t, []string{"sleep", "90"}, c.Lifecycle.PreStop.Exec.Command)
+		case function.LLMWorkerContainerName:
+			var drain []string
+			for _, env := range c.Env {
+				if env.Name == "PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS" {
+					drain = append(drain, env.Value)
+				}
+			}
+			assert.Equal(t, []string{"85000"}, drain)
+		}
+	}
 
 	// Helm chart basic function.
 	msgMetaHelmChart := cmHelmChart.CreationQueueMessageMetadata
@@ -2027,6 +2063,125 @@ func TestGetICMSRequestUpdatesForCreatePodRequest_CreateContainerError_EventLogI
 	assert.Contains(t, update.Payload.HealthInfo.ErrorLog, "Kubernetes events:")
 	assert.Contains(t, update.Payload.HealthInfo.ErrorLog, "[CreateContainerError]")
 	assert.Contains(t, update.Payload.HealthInfo.ErrorLog, eventMessage)
+}
+
+// A streaming app that quits when its session ends is restarted in place by the kubelet. Its restart count grows
+// with every session, but a clean exit after the Pod was ready must not purge the instance.
+func TestGetICMSRequestUpdatesForCreatePodRequest_ContainerRestarts(t *testing.T) {
+	now := time.Now()
+	lastExit := now.Add(-20 * time.Second)
+
+	tests := []struct {
+		name          string
+		lastExitCode  int32
+		lastReason    string
+		wantPurge     bool
+		wantInstState types.ICMSInstanceState
+	}{
+		{
+			name:          "clean exit after serving keeps the instance",
+			lastExitCode:  0,
+			lastReason:    "Completed",
+			wantInstState: types.ICMSInstanceStarted,
+		},
+		{
+			name:          "failed exit purges the instance",
+			lastExitCode:  1,
+			lastReason:    "Error",
+			wantPurge:     true,
+			wantInstState: types.ICMSInstanceTerminated,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := newTestContext()
+			clients := mockKubeClients()
+			ns := RequestsNamespace
+
+			bc := &BackendK8sCache{
+				podInstanceNamespace: ns,
+				systemNamespace:      SystemNamespace,
+				featureFlagFetcher:   &featureflagmock.Fetcher{},
+				clients:              clients,
+				k8sTimeConfig:        (&k8sutil.TimeConfig{}).Complete(),
+			}
+			kb := K8sComputeBackend{
+				clients: clients,
+				bk8s:    bc,
+			}
+
+			podName := "0-sr-restarting"
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: ns},
+				Status: v1.PodStatus{
+					Phase:     v1.PodRunning,
+					StartTime: &metav1.Time{Time: now.Add(-72 * time.Hour)},
+					Conditions: []v1.PodCondition{
+						{Type: v1.PodScheduled, Status: v1.ConditionTrue},
+						{Type: v1.PodInitialized, Status: v1.ConditionTrue},
+						{Type: v1.ContainersReady, Status: v1.ConditionFalse, LastTransitionTime: metav1.NewTime(lastExit)},
+						{Type: v1.PodReady, Status: v1.ConditionFalse, LastTransitionTime: metav1.NewTime(lastExit.Add(-5 * time.Second))},
+					},
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							Name:         "inference",
+							Ready:        true,
+							RestartCount: k8sutil.RestartCountToFailInstance,
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(lastExit)},
+							},
+							LastTerminationState: v1.ContainerState{
+								Terminated: &v1.ContainerStateTerminated{
+									ExitCode:   tt.lastExitCode,
+									Reason:     tt.lastReason,
+									StartedAt:  metav1.NewTime(now.Add(-17 * time.Hour)),
+									FinishedAt: metav1.NewTime(lastExit),
+								},
+							},
+						},
+						{
+							Name:  common.UtilsContainerName,
+							State: v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-72 * time.Hour))}},
+						},
+					},
+				},
+			}
+			_, err := clients.K8s.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			req := &nvcav2beta1.ICMSRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: "sr-restarting", Namespace: ns},
+				Spec: nvcav2beta1.ICMSRequestSpec{
+					RequestID: "req-restarting",
+					Action:    common.FunctionCreationAction,
+				},
+				Status: nvcav2beta1.ICMSRequestStatus{
+					Instances: map[string]nvcav2beta1.InstanceStatus{
+						podName: {
+							ID:                 podName,
+							Type:               nvcav2beta1.InstanceTypePod,
+							Status:             string(types.ICMSInstanceRunning),
+							LastReportedStatus: string(types.ICMSInstanceRunning),
+						},
+					},
+				},
+			}
+
+			update, err := kb.GetICMSRequestUpdatesForCreatePodRequest(ctx, req.Status.Instances[podName], req)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantInstState, update.Payload.InstanceState)
+
+			_, err = clients.K8s.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+			if tt.wantPurge {
+				assert.True(t, errors.IsNotFound(err), "pod should be deleted, got err %v", err)
+				assert.Equal(t, types.ICMSInstanceFailedContainerRestartLoop, update.Payload.TerminationCause)
+			} else {
+				require.NoError(t, err, "pod should be kept")
+				assert.Empty(t, update.Payload.TerminationCause)
+			}
+		})
+	}
 }
 
 func TestImageCredentialUpdater(t *testing.T) {

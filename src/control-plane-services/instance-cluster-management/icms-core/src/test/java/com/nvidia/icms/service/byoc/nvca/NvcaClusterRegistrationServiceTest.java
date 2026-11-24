@@ -35,6 +35,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import com.amazonaws.services.sqs.model.QueueAttributeName;
 import com.nvidia.icms.configuration.byoc.ByocConfigurationProperties;
 import com.nvidia.icms.configuration.nvca.NvcaConfigurationProperties;
+import com.nvidia.icms.errors.IcmsActiveInstancesConflictException;
 import com.nvidia.icms.errors.IcmsBadRequestException;
 import com.nvidia.icms.errors.IcmsConflictException;
 import com.nvidia.icms.errors.IcmsNotFoundException;
@@ -598,9 +599,9 @@ class NvcaClusterRegistrationServiceTest {
         doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doNothing().when(queueManager).deleteQueue(queueUrlToBeDeleted);
-        doReturn(Set.of()).when(instanceServiceHelper)
-                .getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                           Set.of("Standard_ND96amsr_A100_v4_1x"));
+        doReturn(Map.of()).when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                          Set.of("Standard_ND96amsr_A100_v4_1x"));
         doReturn(false).when(instanceServiceHelper).isTaskClusterCreationQueuesAllowed(Mockito.any());
         doNothing().when(auditService)
                 .sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(), Mockito.any());
@@ -644,8 +645,8 @@ class NvcaClusterRegistrationServiceTest {
         verify(nvcaConfigurationProperties).getCreationQueueNameFormat();
         verify(clusterQueueAccessCredsService).createNvcaFunctionCreationQueue(creationQueueUrl, DUMMY_CLUSTER_ID, false);
         verify(queueManager).deleteQueue(queueUrlToBeDeleted);
-        verify(instanceServiceHelper).getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                                        Set.of("Standard_ND96amsr_A100_v4_1x"));
+        verify(instanceServiceHelper).getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                                       Set.of("Standard_ND96amsr_A100_v4_1x"));
         verify(auditService).sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(),
                                                             Mockito.any());
         verify(telemetryEventClient).triggerEvent(
@@ -668,9 +669,10 @@ class NvcaClusterRegistrationServiceTest {
 
         doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
-        doReturn(Set.of("instance_id_1", "instance_id2")).when(instanceServiceHelper)
-                .getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                           Set.of("Standard_ND96amsr_A100_v4_1x"));
+        doReturn(Map.of("Standard_ND96amsr_A100_v4_1x", Set.of("instance_id_1", "instance_id2")))
+                .when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                          Set.of("Standard_ND96amsr_A100_v4_1x"));
 
         var request = NvcaRegistrationRequest.builder()
                 .status(ClusterStatusEnum.READY)
@@ -679,7 +681,7 @@ class NvcaClusterRegistrationServiceTest {
                                                       "A200")))
                 .build();
         // Act
-        var exception = assertThrows(IcmsConflictException.class, () -> {
+        var exception = assertThrows(IcmsActiveInstancesConflictException.class, () -> {
             nvcaClusterRegistrationService.nvcaClusterRegistration(request, DUMMY_CLUSTER_ID,
                                                                    new HashMap<>());
         });
@@ -688,6 +690,8 @@ class NvcaClusterRegistrationServiceTest {
         assertNotNull(exception);
         assertTrue(exception.getBody().getDetail().contains(
                 "cluster registration failed, active instances exists for removed [Standard_ND96amsr_A100_v4_1x] instanceTypes"));
+        assertEquals(List.of("Standard_ND96amsr_A100_v4_1x"), exception.getInstanceTypes());
+        assertEquals(List.of("instance_id2", "instance_id_1"), exception.getActiveInstanceIds());
 
         verify(clusterRepository).getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
         verify(clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
@@ -695,8 +699,102 @@ class NvcaClusterRegistrationServiceTest {
         verifyNoInteractions(queueManager);
         verifyNoInteractions(clusterQueueAccessCredsService);
         verifyNoInteractions(nvcaClusterRepository);
-        verify(instanceServiceHelper).getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                                        Set.of("Standard_ND96amsr_A100_v4_1x"));
+        verify(instanceServiceHelper).getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                                       Set.of("Standard_ND96amsr_A100_v4_1x"));
+    }
+
+    @Test
+    void validateNvcaClusterRegistration_GpusRemovedAndNoActiveInstances_appliesNothing() {
+        // Prepare
+        var existingClusterEntity = getDummyClusterEntity(DUMMY_CLUSTER_ID, Set.of(getDummyA100GpuV5()), true,
+                                                          false, false);
+        existingClusterEntity.setCapabilities(Set.of(DYNAMIC_GPU_DISCOVERY.toString()));
+
+        doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
+                .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
+        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+                clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
+        doReturn(Map.of()).when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                          Set.of("Standard_ND96amsr_A100_v4_1x"));
+
+        var request = NvcaRegistrationRequest.builder()
+                .status(ClusterStatusEnum.READY)
+                .gpus(Set.of(getDummyGpuRequestSchema("Standard_ND96amsr_A200_v4_1x",
+                                                      "Standard_ND96amsr_A200_v4",
+                                                      "A200")))
+                .k8sVersion("1.29.0")
+                .build();
+
+        // Act
+        nvcaClusterRegistrationService.validateNvcaClusterRegistration(request, DUMMY_CLUSTER_ID);
+
+        // Assert: the registration ran its checks but created, deleted, and wrote nothing.
+        verify(clusterRepository).getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
+        verify(clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
+        verify(instanceServiceHelper).getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                                       Set.of("Standard_ND96amsr_A100_v4_1x"));
+        verifyNoInteractions(queueManager);
+        verifyNoInteractions(clusterQueueAccessCredsService);
+        verifyNoInteractions(nvcaClusterRepository);
+        verifyNoInteractions(auditService);
+        verifyNoInteractions(telemetryEventClient);
+        verifyNoInteractions(clusterOidcIdentityService);
+    }
+
+    @Test
+    void validateNvcaClusterRegistration_GpusRemovedAndActiveInstancesPresent_throwsConflict() {
+        // Prepare
+        var existingClusterEntity = getDummyClusterEntity(DUMMY_CLUSTER_ID, Set.of(getDummyA100GpuV5()), true,
+                                                          false, false);
+        existingClusterEntity.setCapabilities(Set.of(DYNAMIC_GPU_DISCOVERY.toString()));
+
+        doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
+                .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
+        doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
+                clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
+        doReturn(Map.of("Standard_ND96amsr_A100_v4_1x", Set.of("instance_id_1")))
+                .when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                          Set.of("Standard_ND96amsr_A100_v4_1x"));
+
+        var request = NvcaRegistrationRequest.builder()
+                .status(ClusterStatusEnum.READY)
+                .gpus(Set.of(getDummyGpuRequestSchema("Standard_ND96amsr_A200_v4_1x",
+                                                      "Standard_ND96amsr_A200_v4",
+                                                      "A200")))
+                .build();
+
+        // Act
+        var exception = assertThrows(IcmsActiveInstancesConflictException.class, () ->
+                nvcaClusterRegistrationService.validateNvcaClusterRegistration(request, DUMMY_CLUSTER_ID));
+
+        // Assert
+        assertEquals(List.of("Standard_ND96amsr_A100_v4_1x"), exception.getInstanceTypes());
+        assertEquals(List.of("instance_id_1"), exception.getActiveInstanceIds());
+        verifyNoInteractions(queueManager);
+        verifyNoInteractions(clusterQueueAccessCredsService);
+        verifyNoInteractions(nvcaClusterRepository);
+    }
+
+    @Test
+    void validateRemovedInstanceTypes_namesOnlyInstanceTypesWithActiveInstances() {
+        // Prepare
+        Set<String> removedInstanceTypes = Set.of("type_a", "type_b", "type_c");
+        doReturn(Map.of("type_b", Set.of("instance_2", "instance_1"))).when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID, removedInstanceTypes);
+
+        // Act
+        var exception = assertThrows(IcmsActiveInstancesConflictException.class, () ->
+                nvcaClusterRegistrationService.validateRemovedInstanceTypes(removedInstanceTypes,
+                                                                            DUMMY_CLUSTER_ID));
+
+        // Assert
+        assertEquals(List.of("type_b"), exception.getInstanceTypes());
+        assertEquals(List.of("instance_1", "instance_2"), exception.getActiveInstanceIds());
+        // The message still names every removed instance type.
+        assertTrue(exception.getBody().getDetail().contains("type_a"));
+        assertTrue(exception.getBody().getDetail().contains("type_c"));
     }
 
     @Test
@@ -815,9 +913,9 @@ class NvcaClusterRegistrationServiceTest {
         doReturn(List.of(TestUtil.toClusterByGroupIdAndIdEntity(existingClusterEntity))).when(
                 clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         doReturn(false).when(instanceServiceHelper).isTaskClusterCreationQueuesAllowed(Mockito.any());
-        doReturn(Set.of()).when(instanceServiceHelper)
-                .getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                           Set.of("Standard_ND96amsr_A100_v4_1x"));
+        doReturn(Map.of()).when(instanceServiceHelper)
+                .getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                          Set.of("Standard_ND96amsr_A100_v4_1x"));
         doNothing().when(auditService)
                 .sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(), Mockito.any());
         doNothing().when(telemetryEventClient)
@@ -858,8 +956,8 @@ class NvcaClusterRegistrationServiceTest {
         verify(clusterQueueAccessCredsService).createNvcaFunctionCreationQueue(creationQueueUrl, DUMMY_CLUSTER_ID, false);
         verify(clusterRepository).getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID);
         verify(queueManager, times(0)).deleteQueue(Mockito.any());
-        verify(instanceServiceHelper).getActiveInstancesFromZoneForInstanceType(DUMMY_CLUSTER_ID,
-                                                                        Set.of("Standard_ND96amsr_A100_v4_1x"));
+        verify(instanceServiceHelper).getActiveInstancesFromZoneByInstanceType(DUMMY_CLUSTER_ID,
+                                                                       Set.of("Standard_ND96amsr_A100_v4_1x"));
         verify(auditService).sendAuditEventForClusterEntity(Mockito.any(), Mockito.any(),
                                                             Mockito.any());
         verify(telemetryEventClient).triggerEvent(
@@ -1591,16 +1689,6 @@ class NvcaClusterRegistrationServiceTest {
                                                           false, false);
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
-        doReturn(dummyInstant).when(instanceServiceHelper).getCurrentTimestamp();
-
-        // Queue mocks
-        doReturn(CREATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getCreationQueueNameFormat();
-        doReturn(TERMINATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getTerminationQueueNameFormat();
-        var creationQueueUrl = String.format(CREATION_QUEUE_FORMAT, DUMMY_CLUSTER_GROUP_ID, A100GpuName);
-        doReturn(creationQueueUrl).when(clusterQueueAccessCredsService)
-                .createNvcaFunctionCreationQueue(creationQueueUrl, DUMMY_CLUSTER_ID, false);
-        doReturn(TERMINATION_QUEUE_URL).when(clusterQueueAccessCredsService)
-                .createNvcaTerminationQueue(TERMINATION_QUEUE_URL, DUMMY_CLUSTER_ID, false);
 
         var request = NvcaRegistrationRequest.builder()
                 .status(ClusterStatusEnum.READY)
@@ -1608,11 +1696,13 @@ class NvcaClusterRegistrationServiceTest {
                 .jwks("x".repeat(65_537))
                 .build();
 
-        // Act & Assert
+        // Act & Assert: the JWKS is checked before any queue is created
         IcmsBadRequestException ex = assertThrows(IcmsBadRequestException.class, () ->
                 nvcaClusterRegistrationService.nvcaClusterRegistration(
                         request, DUMMY_CLUSTER_ID, new HashMap<>()));
         assertTrue(ex.getMessage().contains("exceeds maximum"));
+        verifyNoInteractions(clusterQueueAccessCredsService);
+        verifyNoInteractions(nvcaClusterRepository);
     }
 
     @Test
@@ -1623,16 +1713,6 @@ class NvcaClusterRegistrationServiceTest {
                                                           false, false);
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
-        doReturn(dummyInstant).when(instanceServiceHelper).getCurrentTimestamp();
-
-        // Queue mocks
-        doReturn(CREATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getCreationQueueNameFormat();
-        doReturn(TERMINATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getTerminationQueueNameFormat();
-        var creationQueueUrl = String.format(CREATION_QUEUE_FORMAT, DUMMY_CLUSTER_GROUP_ID, A100GpuName);
-        doReturn(creationQueueUrl).when(clusterQueueAccessCredsService)
-                .createNvcaFunctionCreationQueue(creationQueueUrl, DUMMY_CLUSTER_ID, false);
-        doReturn(TERMINATION_QUEUE_URL).when(clusterQueueAccessCredsService)
-                .createNvcaTerminationQueue(TERMINATION_QUEUE_URL, DUMMY_CLUSTER_ID, false);
 
         var request = NvcaRegistrationRequest.builder()
                 .status(ClusterStatusEnum.READY)
@@ -1640,11 +1720,13 @@ class NvcaClusterRegistrationServiceTest {
                 .jwks("not-valid-json")
                 .build();
 
-        // Act & Assert: should fail with format error, not size error
+        // Act & Assert: should fail with format error, not size error, before any queue is created
         IcmsBadRequestException ex = assertThrows(IcmsBadRequestException.class, () ->
                 nvcaClusterRegistrationService.nvcaClusterRegistration(
                         request, DUMMY_CLUSTER_ID, new HashMap<>()));
         assertTrue(ex.getMessage().contains("Invalid JWKS format"));
+        verifyNoInteractions(clusterQueueAccessCredsService);
+        verifyNoInteractions(nvcaClusterRepository);
     }
 
     // --- JWKS Fingerprint Uniqueness Tests ---
@@ -1712,7 +1794,6 @@ class NvcaClusterRegistrationServiceTest {
                                                           false, false);
         doReturn(Optional.of(existingClusterEntity)).when(clusterRepository)
                 .getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false);
-        doReturn(dummyInstant).when(instanceServiceHelper).getCurrentTimestamp();
 
         String fingerprint = AuthUtils.computeJwksFingerprint(VALID_JWKS);
         String otherClusterId = "other-cluster-id";
@@ -1722,27 +1803,20 @@ class NvcaClusterRegistrationServiceTest {
                 .when(clusterOidcIdentityService)
                 .validateFingerprintAvailable(fingerprint, DUMMY_CLUSTER_ID);
 
-        // Queue mocks
-        doReturn(CREATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getCreationQueueNameFormat();
-        doReturn(TERMINATION_QUEUE_FORMAT).when(nvcaConfigurationProperties).getTerminationQueueNameFormat();
-        var creationQueueUrl = String.format(CREATION_QUEUE_FORMAT, DUMMY_CLUSTER_GROUP_ID, A100GpuName);
-        doReturn(creationQueueUrl).when(clusterQueueAccessCredsService)
-                .createNvcaFunctionCreationQueue(creationQueueUrl, DUMMY_CLUSTER_ID, false);
-        doReturn(TERMINATION_QUEUE_URL).when(clusterQueueAccessCredsService)
-                .createNvcaTerminationQueue(TERMINATION_QUEUE_URL, DUMMY_CLUSTER_ID, false);
-
         var request = NvcaRegistrationRequest.builder()
                 .status(ClusterStatusEnum.READY)
                 .k8sVersion("1.29.0")
                 .jwks(VALID_JWKS)
                 .build();
 
-        // Act & Assert: should throw conflict before the fan-out write
+        // Act & Assert: should throw conflict before any queue is created or row is written
         IcmsConflictException ex = assertThrows(IcmsConflictException.class, () ->
                 nvcaClusterRegistrationService.nvcaClusterRegistration(
                         request, DUMMY_CLUSTER_ID, new HashMap<>()));
         assertTrue(ex.getMessage().contains("JWKS signing keys are already registered by cluster"));
         assertTrue(ex.getMessage().contains(otherClusterId));
+        verifyNoInteractions(clusterQueueAccessCredsService);
+        verifyNoInteractions(nvcaClusterRepository);
     }
 
     @Test

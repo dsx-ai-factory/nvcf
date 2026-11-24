@@ -11,10 +11,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/backend"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/request-trace-uploader/config"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/backend"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 )
 
 func writeSecrets(t *testing.T, body string) string {
@@ -81,10 +83,16 @@ func TestNewRequiresCredentials(t *testing.T) {
 	}
 }
 
+// The runner logs this error at startup, and logs never carry paths.
 func TestNewRejectsUnreadableSecretsFile(t *testing.T) {
-	cfg := baseConfig(filepath.Join(t.TempDir(), "missing.json"), "https://127.0.0.1:0")
-	if _, err := New(cfg); err == nil {
+	dir := t.TempDir()
+	cfg := baseConfig(filepath.Join(dir, "missing.json"), "https://127.0.0.1:0")
+	_, err := New(cfg)
+	if err == nil {
 		t.Fatal("New() error = nil, want a read error")
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("New() error = %q, want no path", err)
 	}
 }
 
@@ -176,7 +184,7 @@ func TestSubmitUploadsAndReportsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status() error = %v", err)
 	}
-	if status != backend.StatusSuccess {
+	if status != backend.StatusSucceeded {
 		t.Errorf("Status() = %v, want success", status)
 	}
 }
@@ -326,7 +334,7 @@ func TestSubmitRejectsAnHTTPSToHTTPRedirect(t *testing.T) {
 	}
 }
 
-func TestCapabilitiesDeclareExportAndSyncOutcome(t *testing.T) {
+func TestCapabilitiesDeclareAResubmitSafeExport(t *testing.T) {
 	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b"}`), "https://127.0.0.1:0")
 	client, err := New(cfg)
 	if err != nil {
@@ -335,9 +343,6 @@ func TestCapabilitiesDeclareExportAndSyncOutcome(t *testing.T) {
 	caps := client.Capabilities()
 	if !caps.Exports {
 		t.Error("Capabilities().Exports = false, want true")
-	}
-	if !caps.TerminalOutcomeSync {
-		t.Error("Capabilities().TerminalOutcomeSync = false, want true")
 	}
 	if !caps.ResubmitSafe {
 		t.Error("Capabilities().ResubmitSafe = false, want true")
@@ -410,7 +415,7 @@ func TestSubmitDryRunLogsAndDoesNotUpload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status() error = %v", err)
 	}
-	if status != backend.StatusSuccess {
+	if status != backend.StatusSucceeded {
 		t.Errorf("Status() = %v, want success", status)
 	}
 }
@@ -440,5 +445,108 @@ func TestCapabilitiesDryRunDoesNotExport(t *testing.T) {
 	}
 	if client.Capabilities().Exports {
 		t.Error("Capabilities().Exports = true, want false for a dry run")
+	}
+}
+
+func TestSubmitUploadsAFilesOnlyRequest(t *testing.T) {
+	withHostname(t, "pod-a")
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), server.URL)
+	cfg.ObjectStore.KeyPrefix = "segments"
+	client, err := newClient(cfg, server.Client().Transport)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+
+	path := writeSegment(t, "compressed-fixture")
+	id, err := client.Submit(context.Background(), backend.SubmitRequest{Files: []backend.File{{Path: path, Bytes: int64(len("compressed-fixture"))}}})
+	if err != nil {
+		t.Fatalf("Submit() error = %v, want the one file in Files uploaded", err)
+	}
+	if id != "segments/pod-a/request-trace.000000.jsonl.gz" {
+		t.Errorf("Submit() id = %q, want the key named after the file", id)
+	}
+	if !strings.HasSuffix(gotPath, "/segments/pod-a/request-trace.000000.jsonl.gz") || string(gotBody) != "compressed-fixture" {
+		t.Errorf("uploaded %q to %q, want the file bytes under its key", gotBody, gotPath)
+	}
+}
+
+// A store that takes the object and never answers does not hold Submit until
+// shutdown: the wait for its answer is bounded. The upload itself is not, so
+// a large object on a slow link is never cut.
+func TestSubmitStopsWaitingForAStoreThatNeverAnswers(t *testing.T) {
+	withHostname(t, "pod-a")
+	release := make(chan struct{})
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), server.URL)
+	cfg.ObjectStore.ResponseTimeout = 200 * time.Millisecond
+	client, err := newClient(cfg, server.Client().Transport)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = client.Submit(ctx, backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")})
+	if err == nil || ctx.Err() != nil || !strings.Contains(err.Error(), "awaiting response headers") {
+		t.Fatalf("Submit() error = %v, context error = %v; want the bounded wait for the answer to end it", err, ctx.Err())
+	}
+}
+
+// A client from New works on its own, without the core's UseTransport: a
+// failed store call is an error, never a panic.
+func TestAClientFromNewWorksWithoutUseTransport(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b","session_token":"c"}`), "https://127.0.0.1:1")
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Submit panicked: %v", r)
+		}
+	}()
+	if _, err := client.Submit(context.Background(), backend.SubmitRequest{Path: writeSegment(t, "compressed-fixture")}); err == nil {
+		t.Fatal("Submit() to a closed port succeeded")
+	}
+}
+
+// A Config built by hand, with no response timeout, still bounds the wait for
+// the store's answer: zero uses the default and never means no bound.
+func TestAConfigBuiltByHandStillBoundsTheWaitForAnAnswer(t *testing.T) {
+	withHostname(t, "pod-a")
+	cfg := baseConfig(writeSecrets(t, `{"access_key_id":"a","secret_access_key":"b"}`), "https://127.0.0.1:0")
+	built, err := newClient(cfg, nil)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+	httpClient, ok := built.(*Client).s3.Options().HTTPClient.(*http.Client)
+	if !ok {
+		t.Fatalf("HTTP client is %T, want *http.Client", built.(*Client).s3.Options().HTTPClient)
+	}
+	swap, ok := httpClient.Transport.(*swappableTransport)
+	if !ok {
+		t.Fatalf("transport is %T, want *swappableTransport", httpClient.Transport)
+	}
+	transport, ok := swap.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base transport is %T, want *http.Transport", swap.base)
+	}
+	if got := transport.ResponseHeaderTimeout; got != config.DefaultObjectStoreResponseTimeout {
+		t.Fatalf("response header timeout = %v, want the default %v", got, config.DefaultObjectStoreResponseTimeout)
 	}
 }

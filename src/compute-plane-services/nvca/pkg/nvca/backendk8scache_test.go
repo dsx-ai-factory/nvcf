@@ -33,10 +33,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -70,27 +70,27 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	nvcaauth "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/auth"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/icms"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
-	nvcametrics "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/metrics"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/envutil"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	k8smock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
-	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	fakebartclient "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
-	nvcainformers "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/informers/externalversions"
-	nvcav2beta1listers "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/client/listers/nvca/v2beta1"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	featureflagmock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/queue"
-	queuemock "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/queue/mock"
-	queuesqs "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/queue/sqs"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
-	nvcatypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcaauth "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/auth"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/icms"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/kubeclients"
+	nvcametrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/envutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	k8smock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil/mock"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
+	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	fakebartclient "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
+	nvcainformers "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/informers/externalversions"
+	nvcav2beta1listers "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/listers/nvca/v2beta1"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	featureflagmock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag/mock"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/queue"
+	queuemock "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/queue/mock"
+	queuesqs "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/queue/sqs"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -726,6 +726,92 @@ func TestBackendK8sCacheStartRemovesLegacyIntraNamespaceEgressPolicy(t *testing.
 		ctx, k8sutil.AllowEgressIntraNamespaceNetworkPolicyName, metav1.GetOptions{},
 	)
 	assert.True(t, apierrors.IsNotFound(err))
+}
+
+// objectMetaWithManagedFields returns object metadata with managedFields
+// entries from two field managers.
+func objectMetaWithManagedFields(namespace, name string, objLabels map[string]string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Namespace: namespace,
+		Name:      name,
+		Labels:    objLabels,
+		ManagedFields: []metav1.ManagedFieldsEntry{
+			{Manager: "creator", Operation: metav1.ManagedFieldsOperationUpdate},
+			{Manager: "status-writer", Operation: metav1.ManagedFieldsOperationUpdate, Subresource: "status"},
+		},
+	}
+}
+
+func TestBackendK8sCacheStartStripsManagedFields(t *testing.T) {
+	ctx, cancel := context.WithCancel(newTestContext())
+	t.Cleanup(cancel)
+
+	pod := &v1.Pod{ObjectMeta: objectMetaWithManagedFields(RequestsNamespace, "pod-1", nil)}
+	node := &v1.Node{ObjectMeta: objectMetaWithManagedFields("", "node-1", map[string]string{
+		"nvidia.com/gpu.present": "true",
+	})}
+	instanceNamespace := &v1.Namespace{ObjectMeta: objectMetaWithManagedFields("", "instance-ns", map[string]string{
+		nvcatypes.WorkloadInstanceTypeLabel: nvcatypes.WorkloadInstanceTypeValueMiniService,
+	})}
+	icmsRequest := &nvcav2beta1.ICMSRequest{
+		ObjectMeta: objectMetaWithManagedFields(RequestsNamespace, "request-1", nil),
+	}
+	storageRequest := &nvcav2beta1.StorageRequest{
+		ObjectMeta: objectMetaWithManagedFields(RequestsNamespace, "storage-1", nil),
+	}
+
+	clients := mockKubeClients(pod, node, instanceNamespace)
+	clients.BART = fakebartclient.NewSimpleClientset(icmsRequest, storageRequest)
+	bc, _, err := NewBackendk8sCacheBuilder().
+		WithNamespaceLabels(labels.Set{"foo": "bar"}).
+		WithClients(clients).
+		Start(ctx)
+	require.NoError(t, err)
+
+	listers := []struct {
+		name string
+		get  func() (metav1.Object, error)
+	}{
+		{"pod", func() (metav1.Object, error) { return bc.podLister.Pods(pod.Namespace).Get(pod.Name) }},
+		{"node", func() (metav1.Object, error) { return bc.nodeLister.Get(node.Name) }},
+		{"instance namespace", func() (metav1.Object, error) {
+			return bc.instanceNamespaceLister.Get(instanceNamespace.Name)
+		}},
+		{"ICMS request", func() (metav1.Object, error) {
+			return bc.icmsRequestLister.ICMSRequests(icmsRequest.Namespace).Get(icmsRequest.Name)
+		}},
+		{"storage request", func() (metav1.Object, error) {
+			return bc.storageRequestLister.StorageRequests(storageRequest.Namespace).Get(storageRequest.Name)
+		}},
+	}
+	for _, l := range listers {
+		cached, err := l.get()
+		require.NoError(t, err, l.name)
+		assert.Nil(t, cached.GetManagedFields(), "cached %s", l.name)
+	}
+}
+
+func TestStartSecretMirroringInformerStripsManagedFields(t *testing.T) {
+	ctx, cancel := context.WithCancel(newTestContext())
+	t.Cleanup(cancel)
+
+	secret := &v1.Secret{ObjectMeta: objectMetaWithManagedFields("mirror-source", "secret-1", map[string]string{
+		"mirror": "true",
+	})}
+	c := &BackendK8sCache{
+		clients:                     &kubeclients.KubeClients{K8s: fakek8sclient.NewSimpleClientset(secret)},
+		secretMirrorSourceNamespace: secret.Namespace,
+		secretMirrorLabelSelector:   "mirror=true",
+		resyncPeriod:                ResyncInterval,
+	}
+	require.NoError(t, c.startSecretMirroringInformer(ctx))
+	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer syncCancel()
+	require.True(t, cache.WaitForCacheSync(syncCtx.Done(), c.syncedFuncs...))
+
+	cached, err := c.secretLister.Secrets(secret.Namespace).Get(secret.Name)
+	require.NoError(t, err)
+	assert.Nil(t, cached.ManagedFields)
 }
 
 func TestCleanupFailedButNoInstances(t *testing.T) {
@@ -1673,8 +1759,11 @@ func TestCreateICMSRequestLaunchSpec(t *testing.T) {
 	// Container function.
 	containerFuncMsgBYOO := decodeCM(t, creationgMsgFunctionContainerLaunchSpecBYOO)
 
-	_, err = bc.CreateICMSCreationMessageRequest(ctx, containerFuncMsgBYOO, "mrecpt", "msg", "")
-	require.EqualError(t, err, "telemetries is set but required features are disabled: BYOObservability, UseFunctionTranslator")
+	rejectedSR, err := bc.CreateICMSCreationMessageRequest(ctx, containerFuncMsgBYOO, "mrecpt", "msg", "")
+	require.NoError(t, err)
+	assert.Contains(t, GetCreationRejectionReason(rejectedSR), "BYOObservability, UseFunctionTranslator")
+	err = clients.BART.NvcaV2beta1().ICMSRequests(bc.requestsNamespace).Delete(ctx, rejectedSR.Name, metav1.DeleteOptions{})
+	require.NoError(t, err)
 
 	fff.EnabledFFs = append(fff.EnabledFFs,
 		featureflag.BYOObservability,
@@ -1691,8 +1780,11 @@ func TestCreateICMSRequestLaunchSpec(t *testing.T) {
 	fff.EnabledFFs = nil
 	helmFuncMsgBYOO := decodeCM(t, creationgMsgFunctionHelmLaunchSpecBYOO)
 
-	_, err = bc.CreateICMSCreationMessageRequest(ctx, helmFuncMsgBYOO, "mrecpt", "msg", "")
-	require.EqualError(t, err, "telemetries is set but required features are disabled: BYOObservability, UseFunctionTranslator")
+	rejectedSR, err = bc.CreateICMSCreationMessageRequest(ctx, helmFuncMsgBYOO, "mrecpt", "msg", "")
+	require.NoError(t, err)
+	assert.Contains(t, GetCreationRejectionReason(rejectedSR), "BYOObservability, UseFunctionTranslator")
+	err = clients.BART.NvcaV2beta1().ICMSRequests(bc.requestsNamespace).Delete(ctx, rejectedSR.Name, metav1.DeleteOptions{})
+	require.NoError(t, err)
 
 	fff.EnabledFFs = append(fff.EnabledFFs,
 		featureflag.BYOObservability,
@@ -5120,6 +5212,9 @@ func (noopICMSRequestHelper) GetICMSRequestUpdatesForCreateRequest(context.Conte
 func (noopICMSRequestHelper) ComputeCleanupCacheReferences(context.Context, []string) error {
 	return nil
 }
+func (noopICMSRequestHelper) RetryFailedModelCacheCleanup(context.Context, *nvcav2beta1.ICMSRequest) error {
+	return nil
+}
 func (noopICMSRequestHelper) AllInstancesTerminatedAndReported(context.Context, *nvcav2beta1.ICMSRequest) bool {
 	return false
 }
@@ -5708,6 +5803,44 @@ func TestEnsureModelCacheNamespaceLabel_Envtest(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestCreateICMSRequestsReusedMessageID(t *testing.T) {
+	for _, termination := range []bool{false, true} {
+		t.Run(fmt.Sprintf("termination=%t", termination), func(t *testing.T) {
+			ctx := newTestContext()
+			clients := mockKubeClients()
+			bc := &BackendK8sCache{clients: clients, requestsNamespace: RequestsNamespace, featureFlagFetcher: featureflag.DefaultFetcher}
+			old := &nvcav2beta1.ICMSRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: "original", Namespace: RequestsNamespace, Labels: map[string]string{SQSMessageIDKey: "reused-message-id"}},
+				Spec:       nvcav2beta1.ICMSRequestSpec{RequestID: "old-request"},
+			}
+			_, err := clients.BART.NvcaV2beta1().ICMSRequests(RequestsNamespace).Create(ctx, old, metav1.CreateOptions{})
+			require.NoError(t, err)
+			for attempt := 0; attempt < 2; attempt++ {
+				if termination {
+					err = bc.CreateICMSTerminationMessageRequest(ctx, types.ICMSTerminationMessage{RequestID: "new-request", NCAId: "test-org"}, "new-receipt", "reused-message-id")
+					require.NoError(t, err)
+				} else {
+					var payload map[string]any
+					require.NoError(t, json.Unmarshal([]byte(goodCM), &payload))
+					payload["requestId"] = "new-request"
+					body, err := json.Marshal(payload)
+					require.NoError(t, err)
+					created, err := bc.CreateICMSCreationMessageRequest(ctx, decodeCM(t, string(body)), "new-receipt", "reused-message-id", "creation")
+					require.NoError(t, err)
+					if attempt == 0 {
+						require.NotNil(t, created)
+					} else {
+						require.Nil(t, created, "redelivery must remain idempotent")
+					}
+				}
+			}
+			requests, err := clients.BART.NvcaV2beta1().ICMSRequests(RequestsNamespace).List(ctx, metav1.ListOptions{})
+			require.NoError(t, err)
+			require.Len(t, requests.Items, 2)
 		})
 	}
 }

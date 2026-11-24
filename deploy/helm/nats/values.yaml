@@ -13,6 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# CI indexes the image settings below. A chart must not choose an image
+# source: registry and repository belong in the stack base.yaml or a values
+# file. This chart still prefills them, so it renders without them today, and
+# is pending-fix in tools/docs-version-sync/chart-image-exclusions.yaml. Once
+# fixed, it must fail to render when either source is missing.
+thirdPartyImages:
+  natsServer: nats.container.image
+  natsReloader: nats.reloader.image
+  natsBox: nats.natsBox.container.image
+
 # NATS Configuration (reference: https://github.com/nats-io/k8s/tree/main/helm/charts/nats)
 nats:
   enabled: true
@@ -30,10 +40,18 @@ nats:
       registry: ""
       pullPolicy: IfNotPresent
   container:
+    merge:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
     image:
-      registry: ""
-      repository: ""
-      tag: 2.11.17-alpine3.22
+      registry: docker.io
+      repository: library/nats
+      tag: 2.14.9-alpine3.22
       pullPolicy: IfNotPresent
     env:
       NKEY_USER_KEY:
@@ -59,7 +77,7 @@ nats:
     # Use js-server-only health probes. With explicit accounts (AUTH/APP),
     # the default $G account has no streams, causing the standard JetStream
     # health check to fail with 503.
-    # js-server-only must be set to an explicit "true". nats-server 2.11.17
+    # js-server-only must be set to an explicit "true". nats-server 2.14.9
     # parses the valueless "?js-server-only" query arg as false, which leaves
     # the full account/stream/consumer JetStream health check active. During a
     # rolling upgrade a rejoining node can stay 503 on stream-current errors,
@@ -77,18 +95,26 @@ nats:
         value: "/healthz?js-server-only=true"
   reloader:
     enabled: true
+    merge:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
     image:
       registry: docker.io
       repository: natsio/nats-server-config-reloader
-      tag: 0.24.0
+      tag: 0.25.0
       pullPolicy: IfNotPresent
   natsBox:
     enabled: true
     container:
       image:
-        registry: ""
-        repository: ""
-        tag: 0.19.5-nonroot
+        registry: docker.io
+        repository: natsio/nats-box
+        tag: 0.20.1-nonroot
         pullPolicy: IfNotPresent
     # Add contexts configuration to mount the nkeys secret
     contexts:
@@ -96,12 +122,29 @@ nats:
         nkey:
           secretName: nats-nkeys
           key: user.key
+  podTemplate:
+    merge:
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
   # Auth callout NKey bootstrap.
   # The default secret name is shared with openbao-migrations; override it only
   # when every downstream consumer is configured to read the same Secret.
   authCallout:
     createNkeySecret: true
     secretName: nats-auth-callout-nkeys
+    # Worker token authentication. When enabled, the APP account also accepts
+    # worker logins (plugin webhook): the auth callout sends each one to the NVCF
+    # API, which checks the worker token and returns that function version's
+    # permissions in APP. Workers then need no NKey. The NVCF API tells workers
+    # their account (NVCF_NATS_ACCOUNT=APP under the ncp profile).
+    workerTokenAuth:
+      enabled: false
+      webhookUrl: http://api.nvcf.svc.cluster.local:8080/v2/nvcf/webhook/nats-auth
   # RBAC - primarily to allow the bao migrations job to read the nkeys secret
   rbac:
     openbao:

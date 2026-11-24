@@ -8,6 +8,14 @@ go_library(
         "call.go",
         "clientconn.go",
         "codec.go",
+    ] + select({
+        "@rules_go//go/platform:plan9": [
+            "clientconn_disconnect_reason_plan9.go",
+        ],
+        "//conditions:default": [
+            "clientconn_disconnect_reason_noplan9.go",
+        ],
+    }) + [
         "dialoptions.go",
         "doc.go",
         "interceptor.go",
@@ -23,7 +31,7 @@ go_library(
         "trace_withtrace.go",
         "version.go",
     ],
-    importmap = "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/vendor/google.golang.org/grpc",
+    importmap = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/vendor/google.golang.org/grpc",
     importpath = "google.golang.org/grpc",
     visibility = ["//visibility:public"],
     deps = [

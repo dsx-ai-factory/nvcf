@@ -50,15 +50,16 @@ import (
 
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/metrics/nvcf"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proto/nvcf"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proxy/buffconn"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proxy/handlerisolationconn"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proxy/quicconn"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proxy/rp"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils/middleware"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils/pool"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/ca"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metrics/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proto/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proxy/buffconn"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proxy/handlerisolationconn"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proxy/quicconn"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proxy/rp"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils/middleware"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils/pool"
 )
 
 const (
@@ -204,7 +205,18 @@ func (p *HttpProxy) Proxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequ
 	// start looking for reconnects asap, but we don't want to block on ack of first publish as
 	// that could penalise users not using reconnects. may need to revisit if the registration
 	// doesn't make it in time.
-	go p.keepaliveReconnectRegistration(ctx, work, trackingRegion)
+	registrationDone := make(chan struct{})
+	go func() {
+		defer close(registrationDone)
+		p.keepaliveReconnectRegistration(ctx, work, trackingRegion)
+	}()
+	// Remove the registration before returning: the proxy treats a missing
+	// registration as the end of the session, and our caller may close NATS
+	// right after we return.
+	defer func() {
+		cancel()
+		<-registrationDone
+	}()
 
 	clientConn, err := getClientConnFromProxy(ctx, work, p.h3)
 	if err != nil {
@@ -264,9 +276,16 @@ func (p *HttpProxy) Proxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequ
 			}
 			var work pb.WorkerInvokeFunctionRequest
 			err = proto.Unmarshal(msg.Data, &work)
+			if err == nil && work.StatefulConfig == nil {
+				err = errors.New("no stateful config")
+			}
 			if err != nil {
 				zap.L().Warn("malformed stateful session reconnect message", zap.String("req id", work.RequestId), zap.Error(err))
 				continue
+			}
+			// Let a proxy that asks for an answer know a worker is still here.
+			if msg.Reply != "" {
+				_ = msg.Respond(nil)
 			}
 			wg.Add(1)
 			go func() {
@@ -314,19 +333,29 @@ func (p *HttpProxy) keepaliveReconnectRegistration(ctx context.Context, work *pb
 			if err != nil {
 				return err
 			}
-			_, err = p.js.Publish(ctx, subject, body)
+			// Not cancelled with ctx: a publish that was already sent must be
+			// acked before the purge below, or the server can store it after.
+			pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_, err = p.js.Publish(pubCtx, subject, body)
 			return err
 		}, backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(0)), ctx))
 		utils.SleepWithContext(ctx, 20*time.Minute)
 	}
-	go func() {
+	p.removeReconnectRegistration(streamName, subject, work.RequestId)
+}
+
+func (p *HttpProxy) removeReconnectRegistration(streamName, subject, requestId string) {
+	err := backoff.Retry(func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		err := PurgeFromStream(ctx, p.nc, streamName, jetstream.WithPurgeSubject(subject))
-		if err != nil {
-			zap.L().Warn("failed to purge stateful session reconnect registration", zap.Error(err))
-		}
-	}()
+		return PurgeFromStream(ctx, p.nc, streamName, jetstream.WithPurgeSubject(subject))
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(time.Second), 2))
+	if err != nil {
+		zap.L().Warn("failed to remove stateful session reconnect registration", zap.String("req id", requestId), zap.Error(err))
+		return
+	}
+	zap.L().Info("removed stateful session reconnect registration", zap.String("req id", requestId))
 }
 
 // PurgeFromStream manually purges from a stream without having to first look up the stream
@@ -342,8 +371,20 @@ func PurgeFromStream(ctx context.Context, nc *nats.Conn, name string, opts ...je
 		return err
 	}
 	purgeSubject := jetstream.DefaultAPIPrefix + "STREAM.PURGE." + name
-	_, err = nc.RequestWithContext(ctx, purgeSubject, req)
-	return err
+	msg, err := nc.RequestWithContext(ctx, purgeSubject, req)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Error *jetstream.APIError `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return fmt.Errorf("decoding stream purge response: %w", err)
+	}
+	if resp.Error != nil {
+		return resp.Error
+	}
+	return nil
 }
 
 func getClientConnFromProxy(ctx context.Context, work *pb.WorkerInvokeFunctionRequest, h3 *h3ConnectionCache) (net.Conn, error) {
@@ -532,14 +573,11 @@ func tcpConnect(ctx context.Context, requestId string, connectionConfig *pb.Work
 	if err != nil {
 		return nil, traceError(span, err)
 	}
-	proxyAddr := proxy.Host
-	if proxy.Port() == "" {
-		proxyAddr = net.JoinHostPort(proxyAddr, "80")
-	}
+	proxyAddr := proxyDialAddr(proxy)
 
-	c, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", proxyAddr)
+	c, err := dialProxy(ctx, proxy, proxyAddr)
 	if err != nil {
-		return nil, fmt.Errorf("dialing proxy %q failed: %v", proxyAddr, err)
+		return nil, traceError(span, fmt.Errorf("dialing proxy %q failed: %w", proxyAddr, err))
 	}
 
 	err = request.Write(c)
@@ -567,4 +605,45 @@ func tcpConnect(ctx context.Context, requestId string, connectionConfig *pb.Work
 
 	// purposely not closing the body, we're going to ignore the response body and use the stream directly
 	return buffconn.NewBufConn(c, br), nil
+}
+
+func defaultProxyPort(scheme string) string {
+	if scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+// proxyDialAddr resolves the host:port to dial. Hostname() rather than Host, because a
+// portless IPv6 URL carries its own brackets and JoinHostPort would add a second pair.
+func proxyDialAddr(proxy *url.URL) string {
+	if proxy.Port() != "" {
+		return proxy.Host
+	}
+	return net.JoinHostPort(proxy.Hostname(), defaultProxyPort(proxy.Scheme))
+}
+
+// dialProxy opens the transport the CONNECT request is written on. The scheme selects it:
+// https negotiates TLS with the proxy, anything else stays plaintext so existing
+// deployments are unaffected. grpc-proxy's HTTP/1 listener does not serve TLS itself, so
+// https is only usable where TLS terminates in front of it.
+func dialProxy(ctx context.Context, proxy *url.URL, proxyAddr string) (net.Conn, error) {
+	netDialer := &net.Dialer{Timeout: 3 * time.Second}
+	if proxy.Scheme != "https" {
+		return netDialer.DialContext(ctx, "tcp", proxyAddr)
+	}
+
+	// Same trust pool as the HTTP/3 path, so one NVCF_PROXY_CA_FILE covers both transports.
+	proxyCAs, err := ca.ProxyCAs()
+	if err != nil {
+		return nil, err
+	}
+	return (&tls.Dialer{
+		NetDialer: netDialer,
+		Config: &tls.Config{
+			ServerName: proxy.Hostname(),
+			RootCAs:    proxyCAs,
+			MinVersion: tls.VersionTLS12,
+		},
+	}).DialContext(ctx, "tcp", proxyAddr)
 }

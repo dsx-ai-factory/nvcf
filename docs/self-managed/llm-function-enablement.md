@@ -23,13 +23,160 @@ Standard HTTP, gRPC, and LLS functions do not require this addon, even when a
 container exposes paths such as `/v1/chat/completions`, `/v1/responses`, or
 `/v1/embeddings`.
 
+The addon also serves the beta decision model routes, `POST /v1/decisions` and
+`POST /v1/systemone`. The gateway forwards their bodies unchanged except for
+the model value, does not forward the caller's credentials, and does not stream
+responses. Declare each route the container serves in
+`models[].llmConfig.uris` when you create the function, for example
+`--llm-model "name=<model>,uris=/v1/decisions|/v1/systemone"`. The `uris` of a
+function cannot change after creation, and a model gets a `404` on a decision
+route that it does not declare. The gateway does not limit request body size
+by default, so limit it in front of the gateway when you enable these routes.
+See the [LLM Gateway guide](../overview/llm-gateway.md#decision-models-beta),
+including how to map these models in the Vanity Gateway.
+
 When enabled, the stack creates:
 
 - `llm-api-gateway` in the `nvcf` namespace.
 - `llm-request-router` in the `nvcf` namespace.
-- The `llm.invocation.<domain>` HTTPRoute when Gateway API ingress is enabled.
+- The `llm.<domain>` and `llm.invocation.<domain>` HTTPRoutes when Gateway API
+  ingress is enabled. To skip either route, for example when callers reach the
+  gateway in-cluster, set `ingress.gatewayApi.routes.llmApiGateway.enabled` or
+  `ingress.gatewayApi.routes.llmInvocation.enabled` to `false`.
 - LLM worker pods with a `pylon` sidecar that forwards requests to the function
   container on the configured `inferencePort`.
+
+When a worker pod of a container-based LLM function is removed, for example on
+scale-down, the function container gets a `preStop` pause before its stop
+signal, so it keeps serving requests while the `pylon` sidecar stops. The
+pause is 60 seconds by default. The pod's termination grace period is the
+pause plus 60 seconds, or 120 seconds if that is longer, and the `pylon`
+sidecar gets `PYLON_SHUTDOWN_DRAIN_TIMEOUT_MS` set to the pause minus 5
+seconds; a `pylon` version that reads this variable uses it as its drain
+deadline. A removed pod therefore releases its GPU up to one pause later. To
+change the pause, set `worker.llmInferenceStopPause` in the `nvca-operator`
+chart values, for example `90s`, between `10s` and `1h`; it applies to worker
+pods created after NVCA picks up the new value. The pause runs `sleep` in the
+function container; an image without `sleep` stops at once, as before. When
+the function uses Bring Your Own Observability (BYOO), the BYOO collector and
+log-forwarder sidecars wait for the same pause, so telemetry from requests
+served during the pause is still sent. They use the Kubernetes `sleep`
+lifecycle action, which is stable since Kubernetes 1.34. The function
+container's own shutdown output after the pause may not be sent.
+
+A new worker registers with `llm-request-router` at a fixed 100 input tokens
+per second. To start it at a measured rate instead, set
+`PYLON_DO_CALIBRATION: "true"` in `agent.functionEnvOverrides` of the
+`nvca-operator` chart values. `pylon` then measures each model's input rate
+before it registers. Older `pylon` versions ignore this variable and start at
+100. A model whose calibration fails starts at 100 and logs a warning.
+Calibration adds about 5 to 15 seconds per model name to worker startup. Unless
+`PYLON_READINESS_GATE` is on, the worker pod can be Ready during that time. If
+the function has no other registered worker, a request then gets `404` with
+`no_eligible_candidates`.
+
+To change the time limit for each calibration load step, 5 seconds by default,
+set `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` there. `PYLON_DO_CALIBRATION` must
+be `true` or `false`, and `PYLON_BRINGUP_CALIBRATION_TIMEOUT_MS` must be a
+positive number of milliseconds. The overrides apply to every LLM function on
+the cluster, so an invalid value stops `pylon` on every new LLM worker there.
+Both variables apply to worker pods created after NVCA picks up the new values.
+
+By default an LLM worker pod is Ready as soon as `pylon` starts, so a version
+can become `ACTIVE` before its model workers load. To hold readiness until the
+function's health check passes, set `PYLON_READINESS_GATE: "true"` in
+`agent.functionEnvOverrides`. Any value other than `true` or `false` stops
+`pylon`. `pylon` then waits for the declared check, with its path, port,
+expected status, and timeout, before it calibrates and registers. NVCA adds a
+readiness probe on `pylon`'s `/ready`. It returns `200` after
+`llm-request-router` accepts the registration. NVCA runs `pylon` with a reverse
+tunnel, so `/ready` also waits until the tunnel connects.
+
+Before you enable the switch:
+
+- Make sure every LLM worker runs a `pylon` that serves `/ready`. The control
+  plane sets the image with `nvcf.sidecars.llm-router-client-image`. If it is
+  empty, NVCA uses a built-in image without `/ready`. An older `pylon` exits at
+  startup with an `unexpected argument` error.
+- Verify the health check of each LLM function: path, port, expected status,
+  and timeout. For a Helm function, the `pylon` pod must reach the health port.
+  If the check never passes, NVCA removes the worker when
+  `INFERENCE_READY_TIMEOUT` ends.
+- If you override `INFERENCE_HEALTH_TIMEOUT`, use an ISO-8601 value such as
+  `PT10S`. `pylon` stops at startup on a Go duration such as `1m30s`.
+
+Declare a check that waits for the model workers, for example a sidecar that
+returns `200` only when enough workers are ready. Without a declared check, the
+NVCF default `/v2/health/ready` applies. If the backend answers it with `401`,
+`403`, `404`, or `405`, `pylon` uses its usual health paths, and readiness does
+not wait for the workers. A gRPC health check gets no readiness probe.
+
+## Enable on an Existing Installation
+
+The addon can be enabled on a running control plane after the initial install
+or after a stack upgrade. Complete and validate the stack upgrade first, then
+enable the addon as a separate change. This keeps the upgrade diff small and
+separates the worker network dependencies from the upgrade itself.
+
+Enabling the addon adds releases and does not restart the running core
+services:
+
+- New releases: `nvcf-pki` in `cert-manager`, `llm-request-router` and
+  `llm-api-gateway` in `nvcf`. cert-manager is already part of the base stack
+  unless `certManager.enabled: false`.
+- Changed resources: the OpenBao migration Job, which creates the
+  `services/all/pki/root` mount and the LLM policies, the NVCF API remote
+  configuration, and the `ingress` release, which adds the `llm.<domain>` and
+  `llm.invocation.<domain>` HTTPRoutes and the LLM worker routes when enabled.
+- No existing Deployment or StatefulSet changes. Running non-LLM functions
+  keep serving.
+
+Before applying:
+
+1. Mirror the addon artifacts when the registry is private. The addon needs
+   the `helm-nvcf-pki`, `helm-nvcf-llm-request-router`, and
+   `helm-nvcf-llm-api-gateway` charts and the `stargate`,
+   `llm-api-gateway`, `pylon`, and `nvcf-worker-llm-credentials-oss` images.
+   Take versions from the [manifest](../overview/manifest.md). The `pylon` and
+   `nvcf-worker-llm-credentials-oss` images are pulled by worker pods in every
+   compute cluster, not by the control plane. A missing `pylon` image appears
+   only when the first LLM worker starts, as `ImagePullBackOff` on the
+   `llm-worker` container.
+2. For remote compute clusters, create the Gateway listeners and provision
+   DNS, load balancer, and firewall paths for ports 50071 and 50072 before
+   applying, so the LLM worker routes attach on the first apply. See
+   [Remote compute clusters and regions](#remote-compute-clusters-and-regions).
+3. Review the rendered change before applying:
+
+   ```bash
+   cd "$BUNDLE_DIR/deploy/stacks/self-managed"
+   HELMFILE_ENV=<environment-name> helmfile --environment default diff --suppress-secrets
+   ```
+
+   Expect new `nvcf-pki`, `llm-request-router`, and `llm-api-gateway`
+   releases and changes to the migration Job, the API remote configuration,
+   and `ingress`. Stop if the diff changes an existing Deployment or
+   StatefulSet you did not intend to change.
+
+Export the control-plane profile only after the apply completes. The migration
+Job creates the OpenBao PKI mount during the apply. Before that, `control-plane
+profile export` fails with an HTTP 403 from the OpenBao PKI endpoint.
+
+The order is:
+
+1. Add the addon values to the environment file. See
+   [Production TLS Configuration](#production-tls-configuration) and, for
+   separate GPU clusters,
+   [Remote compute clusters and regions](#remote-compute-clusters-and-regions).
+2. Apply the control-plane stack and wait for the issuer and certificates.
+   See [Apply and Verify](#apply-and-verify).
+3. Export a refreshed profile, add `requestRouterAddress` for remote
+   clusters, register each compute cluster again, and install the refreshed
+   registration values. Cluster identity is preserved; compare `clusterID` and
+   `clusterGroupID` in the registration values with the existing `NVCFBackend`
+   status before installing.
+4. Deploy an LLM function and run the
+   [end-to-end check](#end-to-end-check).
 
 ## Production TLS Configuration
 
@@ -189,7 +336,7 @@ For a split control-plane and compute-plane deployment, override this value
 with a host and port that worker pods can reach.
 
 The stack maps the configured or default address to
-`api.remoteConfig.configData.nvcf.llm-request-router.worker-address`. The NVCF
+`api.remoteConfig.configData.nvcf.llm.request-router.worker-address`. The NVCF
 API then includes the address in LLM worker configuration. Do not configure
 the worker address under `api.env`. When the LLM addon is disabled, the stack
 does not pass a staged endpoint to the API chart.
@@ -311,7 +458,7 @@ the trust bundle in every compute cluster. A successful Helm render and
 accepted Gateway routes do not prove remote TCP or UDP reachability. Test both
 paths and an LLM invocation from each region before production use.
 
-The request router uses `power-of-two` when no load-balancer configuration is
+The request router uses `power-of-n` when no load-balancer configuration is
 set, and accepts any supported `routingMethod` from a function. When a
 load-balancer configuration is set, a function can only select an algorithm
 that the configuration enables.
@@ -608,7 +755,7 @@ the API creates a new LLM function version.
 Apply the updated control-plane environment:
 
 ```bash
-cd path/to/nvcf-self-managed-stack
+cd "$BUNDLE_DIR/deploy/stacks/self-managed"
 make apply HELMFILE_ENV=<environment-name>
 ```
 
@@ -737,6 +884,33 @@ gRPC `Certificate`, stream timeout policy, and
 `ReferenceGrant` as described in
 [Gateway Routing and DNS](./gateway-routing.md#verify-llm-worker-routes).
 
+### End-to-end check
+
+Deploy one LLM function and invoke it through the LLM invocation route. For
+the function payload, see [LLM Gateway](../overview/llm-gateway.md). Wait for
+the deployment to become `ACTIVE`, then confirm the sidecar registered:
+
+```bash
+kubectl -n nvcf-backend logs <function-pod> -c llm-worker --tail=20
+```
+
+Invoke through the gateway. `GATEWAY_ADDR` is the control-plane gateway
+address and `DOMAIN` is the route suffix:
+
+```bash
+curl -sSf "http://${GATEWAY_ADDR}/v1/chat/completions" \
+  -H "Host: llm.invocation.${DOMAIN}" \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<function-id>/<model-name>","messages":[{"role":"user","content":"Say hello."}],"max_tokens":32}'
+```
+
+Expect an HTTP 200 with an OpenAI-style completion. For up to about one minute
+after the deployment becomes `ACTIVE`, the gateway can return a `404` with
+`no eligible candidates` while the sidecar registers with the request
+routers. For separate GPU clusters, this check is the only proof that the
+gRPC and UDP worker paths are reachable. Run it from every compute cluster.
+
 ## Certificate Renewal
 
 cert-manager renews the request-router certificate and updates the Secret named
@@ -780,9 +954,9 @@ Use this order for an upgrade from plaintext transport:
 
 4. Schedule a maintenance window and undeploy the existing LLM functions.
    The router does not support a mixed plaintext and TLS transition.
-5. Apply the remaining control-plane stack. The managed router hook prepares
-   the OpenBao signing path before cert-manager reconciles the request-router
-   `Certificate`.
+5. Apply the remaining control-plane stack. The OpenBao migration from the
+   dependency stage has already prepared the signing path that cert-manager
+   uses for the request-router `Certificate`.
 6. Wait for the issuer and the `Certificate` named by
    `addons.llm.pki.secretName` to become ready. The default name is
    `stargate-quic-tls`.
@@ -847,6 +1021,36 @@ not delete it before its certificates and consumers have moved to the
 replacement trust path. Do not use `stargateQUICInsecure` as a production
 rollback path.
 
+### Disable the addon
+
+To remove the LLM addon from a running control plane:
+
+1. Undeploy every LLM function. Standard HTTP, gRPC, and LLS functions are
+   not affected.
+2. Set `addons.llm.enabled: false` in the environment file, or restore the
+   environment file from before enablement, and apply the control-plane
+   stack. This removes the `llm.<domain>` and `llm.invocation.<domain>`
+   routes and clears the LLM settings in the NVCF API remote configuration,
+   so new LLM functions can no longer be invoked or launched with the
+   sidecar. No running Deployment or StatefulSet changes.
+3. Remove the addon releases. With the addon disabled, the Helmfile no longer
+   contains these releases, so the apply leaves them installed and running
+   instead of uninstalling them:
+
+   ```bash
+   helm uninstall llm-api-gateway --namespace nvcf
+   helm uninstall llm-request-router --namespace nvcf
+   helm uninstall nvcf-pki --namespace cert-manager
+   ```
+
+   Skip `nvcf-pki` to keep issuing certificates from the managed issuer. The
+   OpenBao PKI mount and the managed `ClusterIssuer` are retained in both
+   cases, so a later `control-plane profile export` still succeeds and
+   re-enabling the addon reuses the existing hierarchy.
+4. Registering the compute clusters again is optional. The registered trust
+   bundle and `agent.llm.requestRouterAddress` are unused without LLM
+   functions and do not affect other function types.
+
 ## Gateway Authentication and Worker Transport
 
 The gateway authentication hop and the worker transport are independent:
@@ -891,13 +1095,74 @@ authentication hop.
 
 </Warning>
 
+## Error Responses
+
+The LLM API Gateway returns errors in the format OpenAI and Anthropic SDKs
+read. Errors from the gateway and the LLM request router use the OpenAI
+format on `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, and the
+other OpenAI-compatible endpoints, including `/v1/decisions`:
+
+```json
+{"error":{"message":"no eligible candidates","type":"invalid_request_error","param":null,"code":null}}
+```
+
+On `/v1/messages`, they use the Anthropic format:
+
+```json
+{"type":"error","error":{"type":"not_found_error","message":"no eligible candidates"},"request_id":"<request-id>"}
+```
+
+The `type` follows the HTTP status. For example, `401` is
+`authentication_error`, `429` is `rate_limit_error`, and `529` is
+`overloaded_error`. On OpenAI-compatible endpoints, `529` always has
+`code: "overloaded_error"`.
+
+On `/v1/systemone`, they use the System One format, with `error.code`,
+`error.message`, and `error.request_id`. On `/v1/decisions` and
+`/v1/systemone`, `error.code` follows the decision route code table. See the
+[LLM Gateway guide](../overview/llm-gateway.md#decision-models-beta) for the
+codes.
+
+On `/v1/decisions` and `/v1/systemone`, model server errors are returned
+unchanged, whatever their shape, size, or encoding, with one exception. For
+older request router builds that do not mark their own errors with
+`X-Stargate-Error-Code`, the gateway treats a `413`, `499`, `502`, `503`, or
+`504` with an empty body as a router error and rewrites it in the route's
+format. A model server response with one of these statuses and an empty body is
+therefore rewritten too.
+
+On the other endpoints, model server errors already in the endpoint's format are returned unchanged,
+including the server's `type` and `code`. Other model server bodies are
+converted to the endpoint's format, keeping up to 32 KiB of the server's
+message when the gateway can read it. The gateway reads uncompressed and gzip error bodies up
+to 1 MiB. For larger bodies or other encodings, the message is the HTTP
+status text.
+
+To return the request router's rejection reason, such as
+`no_eligible_candidates`, in `error.code`, set
+`llmApiGateway.config.exposeRouterErrorCodes: true` in the LLM API Gateway
+chart. The Anthropic format has no `code` field, so `/v1/messages` returns
+only the message. In either case, the request router logs the reason as
+`rejection_reason` and the gateway logs it as `router_error_code`.
+
 ## Troubleshooting
 
-`404 no_eligible_candidates` from `llm.invocation.<domain>` means the request
-reached the LLM Gateway, but the requested function or model was unknown or was
-not registered on the selected request router. Similar `503` candidate errors
-mean the router knows the target but has no active eligible backend. Check:
+A `404` with `no eligible candidates` from `llm.invocation.<domain>` means the
+request reached the LLM Gateway, but the requested function or model was
+unknown or was not registered on the selected request router. The message is
+in `error.message`, as described in [Error Responses](#error-responses).
+A `503` with `no ready backends` means the router knows the model but no
+backend is ready, for example while the only instance is replaced or the model
+is still loading. The response carries `Retry-After`, and clients should retry.
+By default the router keeps a model known for 15 minutes after its last
+backend leaves, so a removed function returns this `503` before it returns
+`404`. The request router flag `--deregistered-model-grace-ms` sets this
+period, and `0` disables it. Each request router replica keeps this in
+memory, so a replica that never saw the model, or restarted since, returns
+`404` right away. Check:
 
+- The deployment became `ACTIVE` more than about one minute ago. The sidecar
+  registers with the request routers after the pod is `Running`.
 - The LLM function is deployed and its pod is `Running`.
 - The request `model` value uses `<function-id>/<model-name>`.
 - The function's `models[].name` matches the model suffix in the request.
@@ -910,6 +1175,24 @@ mean the router knows the target but has no active eligible backend. Check:
 - Local clusters without worker transport TLS set
   `workload.stargateQUICInsecure: true`. The bundled gateway-to-API
   authentication hop already defaults to plaintext.
+
+An LLM worker pod with `ImagePullBackOff` or `ErrImagePull` on the
+`llm-worker` container means the `pylon` image is not available in the
+configured registry. Confirm the effective sidecar image reference and mirror
+it:
+
+```bash
+kubectl -n nvcf get configmap nvcf-api-remote-config -o yaml \
+  | grep llm-router-client-image
+kubectl -n nvcf-backend get pod <function-pod> \
+  -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.image}{"\n"}{end}'
+```
+
+A `400` from the function container on `/v1/chat/completions` for a request
+that works when sent directly to the inference server can come from optional
+OpenAI fields that the gateway forwards with a `null` value, such as
+`include_reasoning`. Some inference servers reject `null` for these fields.
+Send an explicit value, for example `"include_reasoning": false`.
 
 For transport TLS failures, check:
 

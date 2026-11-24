@@ -35,8 +35,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/clients"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/clients"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nkeys"
@@ -48,22 +48,25 @@ import (
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
 
-	nvauth "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
+	nvauth "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/auth"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/consumer"
-	nvcfMetrics "github.com/NVIDIA/nvcf/src/libraries/go/worker/metrics/nvcf"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/proto/nvcf"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/token"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/tracing"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/types"
-	"github.com/NVIDIA/nvcf/src/libraries/go/worker/utils"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/auth"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/consumer"
+	nvcfMetrics "github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/metrics/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proto/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/token"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
 )
 
 const cachedNvcfTokenFilename = "nvcf-worker-token.json"
 
 // By default, grpc-go doesn't have a timeout.
 const DefaultNvcfClientTimeout = 20 * time.Second
+
+// DefaultNatsAccount is the NATS account a worker asks for when the control plane names none.
+const DefaultNatsAccount = "Worker"
 
 type ConnectionRegions struct {
 	Primary     string
@@ -91,7 +94,27 @@ type Client struct {
 	CurrentNatsConsumer    atomic.Pointer[consumer.GlobalNatsConsumer]
 }
 
-func CreateClient(nvcfFqdn string, nvcfFqdnNats *string, nvcfWorkerToken string, nkeySeed *string, ncaId string, instanceId string, functionId string, functionVersionId string, sharedConfigDir string, nvcfClientTimeout time.Duration) (*Client, error) {
+// ClientOption customizes CreateClient.
+type ClientOption func(*clientOptions)
+
+type clientOptions struct {
+	natsAccount string
+}
+
+// WithNatsAccount names the NATS account the worker asks for when it logs in with its worker
+// token. An empty account keeps DefaultNatsAccount.
+func WithNatsAccount(account string) ClientOption {
+	return func(o *clientOptions) {
+		o.natsAccount = account
+	}
+}
+
+func CreateClient(nvcfFqdn string, nvcfFqdnNats *string, nvcfWorkerToken string, nkeySeed *string, ncaId string, instanceId string, functionId string, functionVersionId string, sharedConfigDir string, nvcfClientTimeout time.Duration, opts ...ClientOption) (*Client, error) {
+	var options clientOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	workerClient, err := createWorkerClient(nvcfFqdn, nvcfClientTimeout)
 	if err != nil {
 		return nil, err
@@ -143,7 +166,7 @@ func CreateClient(nvcfFqdn string, nvcfFqdnNats *string, nvcfWorkerToken string,
 	}
 
 	if nvcfFqdnNats != nil {
-		nc, err := newNatsConnection(*nvcfFqdnNats, nkeySeed, tokenProvider, instanceId, functionVersionId)
+		nc, err := newNatsConnection(*nvcfFqdnNats, nkeySeed, options.natsAccount, tokenProvider, instanceId, functionVersionId)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to nats: %w", err)
 		}
@@ -375,7 +398,7 @@ func createWorkerClient(nvcfFqdn string, timeout time.Duration) (pb.WorkerClient
 	return workerClient, nil
 }
 
-func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string) (*nats.Conn, error) {
+func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string) (*nats.Conn, error) {
 	const maxNatsReconnectDelay = 15 * time.Second
 	const maxNatsReconnects = 12
 	// backoff is not thread-safe, so we need to lock it
@@ -383,10 +406,11 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, nvcfTokenProvider 
 	expBackoff := backoff.NewExponentialBackOff(
 		backoff.WithMaxInterval(maxNatsReconnectDelay),
 	)
-	authOption, err := natsAuthOption(nkeySeed, nvcfTokenProvider)
+	authOption, err := natsAuthOption(nkeySeed, natsAccount, nvcfTokenProvider)
 	if err != nil {
 		return nil, err
 	}
+	logger := zap.L().With(zap.String("function version id", functionVersionId), zap.String("instance id", instanceId))
 	return nats.Connect(nvcfFqdnNats, nats.PingInterval(10*time.Second),
 		nats.RetryOnFailedConnect(true),
 		nats.Timeout(5*time.Second),
@@ -399,9 +423,13 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, nvcfTokenProvider 
 			if delay == backoff.Stop {
 				delay = maxNatsReconnectDelay
 			}
+			logger.Warn("waiting to reconnect to nats", zap.Int("reconnect_round", attempt), zap.Duration("delay", delay))
 			return delay
 		}),
 		authOption,
+		nats.ReconnectErrHandler(func(conn *nats.Conn, err error) {
+			logger.Warn("nats reconnect attempt failed", zap.Error(err))
+		}),
 		nats.LameDuckModeHandler(func(conn *nats.Conn) {
 			nvcfMetrics.NatsLameDuckCounter.Inc()
 			expBackoffMutex.Lock()
@@ -454,15 +482,21 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, nvcfTokenProvider 
 			if err := conn.LastError(); err != nil {
 				nvcfMetrics.NatsErrorCounter.Inc()
 				nvcfMetrics.NatsErrorByTypeCounter.WithLabelValues("terminal_close").Inc()
+				logger.Error("nats connection permanently closed", zap.Error(err))
+				return
 			}
-			zap.L().Info("nats connection closed.", zap.Error(conn.LastError()))
+			logger.Info("nats connection closed.")
 		}),
 	)
 }
 
-// natsAuthOption will use the nkey if provided, else will use the worker token
-func natsAuthOption(nkeySeed *string, nvcfTokenProvider *auth.SettableTokenSource) (nats.Option, error) {
+// natsAuthOption will use the nkey if provided, else will use the worker token to ask for
+// natsAccount, or DefaultNatsAccount when it is empty
+func natsAuthOption(nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource) (nats.Option, error) {
 	if nkeySeed == nil {
+		if natsAccount == "" {
+			natsAccount = DefaultNatsAccount
+		}
 		return nats.TokenHandler(func() string {
 			token, err := nvcfTokenProvider.Token()
 			if err != nil {
@@ -477,7 +511,7 @@ func natsAuthOption(nkeySeed *string, nvcfTokenProvider *auth.SettableTokenSourc
 				PluginName string `json:"pluginName"`
 				Payload    string `json:"payload"`
 			}{
-				Account:    "Worker",
+				Account:    natsAccount,
 				PluginName: "webhook",
 				Payload:    token.AccessToken,
 			})

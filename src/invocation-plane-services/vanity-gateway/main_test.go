@@ -28,7 +28,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -267,6 +269,7 @@ func startNvcfServer() *http.Server {
 }
 
 func TestGatewayService(t *testing.T) {
+	startedAt := time.Now()
 	// set up gateway to watch a temporary test config file
 	tempDir := t.TempDir()
 	setUpTempConfigFile(t, tempDir)
@@ -302,6 +305,8 @@ func TestGatewayService(t *testing.T) {
 	client := http.Client{
 		Timeout: 3 * time.Second,
 	}
+
+	testConfigReloadMetricsExposed(t, client, startedAt)
 
 	testVanityNonExistFunction(t, client)
 
@@ -425,6 +430,26 @@ func stagedConfigPath(t *testing.T, tempDir string) string {
 		t.Fatal(err)
 	}
 	return filepath.Join(stagingDir, tempTestConfigName)
+}
+
+func testConfigReloadMetricsExposed(t *testing.T, client http.Client, startedAt time.Time) {
+	t.Run("Testing config reload metrics are exposed", func(t *testing.T) {
+		res, err := client.Get("http://localhost:10083/metrics")
+		require.NoError(t, err)
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+
+		for _, stage := range []string{"load", "router_build"} {
+			require.Regexp(t, `(?m)^nvcf_vanity_gateway_config_reload_failures_total\{[^}]*stage="`+stage+`"[^}]*\} \d+(\.\d+)?$`, string(body))
+		}
+		match := regexp.MustCompile(`(?m)^nvcf_vanity_gateway_last_successful_config_reload_timestamp_seconds(?:\{[^}]*\})? (\S+)$`).FindStringSubmatch(string(body))
+		require.NotNil(t, match, "the gauge must be set once the initial router is built")
+		lastReload, err := strconv.ParseFloat(match[1], 64)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, lastReload, float64(startedAt.Unix()))
+		require.LessOrEqual(t, lastReload, float64(time.Now().Unix()))
+	})
 }
 
 func testVanityNonExistFunction(t *testing.T, client http.Client) {
@@ -2345,4 +2370,66 @@ func TestConfigDecodesMappingLoadTimeout(t *testing.T) {
 		require.ErrorContains(t, err, "MAPPING_LOAD_TIMEOUT")
 		require.ErrorContains(t, err, "missing unit in duration")
 	})
+}
+
+func TestConfigDecodesRequestSizeLimit(t *testing.T) {
+	for _, value := range []string{"omitted", "26214400", "67108864", "1"} {
+		t.Run(value, func(t *testing.T) {
+			if value != "omitted" {
+				t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			}
+			cmd := &cobra.Command{Use: "gateway"}
+			registerConfigFlags(cmd)
+			v, err := config.InitConfig(cmd, "", "", "")
+			require.NoError(t, err)
+			cmd.Flags().VisitAll(func(f *pflag.Flag) { v.MustBindEnv(f.Name) })
+			var cfg gateway.Config
+			require.NoError(t, v.Unmarshal(&cfg))
+			if value == "omitted" {
+				require.Nil(t, cfg.MaxRequestSizeBytes)
+			} else {
+				expected, err := strconv.ParseInt(value, 10, 64)
+				require.NoError(t, err)
+				require.NotNil(t, cfg.MaxRequestSizeBytes)
+				require.Equal(t, expected, *cfg.MaxRequestSizeBytes)
+			}
+		})
+	}
+}
+
+func TestStartupReadsRequestSizeLimitAsDecimal(t *testing.T) {
+	for value, expected := range map[string]int64{"010": 10, "08": 8, "067108864": 67108864} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			cmd := &cobra.Command{Use: "gateway"}
+			registerConfigFlags(cmd)
+			cfg, err := loadConfig(cmd, "")
+			require.NoError(t, err)
+			require.NotNil(t, cfg.MaxRequestSizeBytes)
+			require.Equal(t, expected, *cfg.MaxRequestSizeBytes)
+		})
+	}
+}
+
+func TestStartupRejectsInvalidRequestSizeLimit(t *testing.T) {
+	for _, value := range []string{"", "0", "-1", "1.5", "64MiB", "nope", "9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_REQUEST_SIZE_BYTES", value)
+			cmd := NewRootCommand(nil)
+			cmd.SetArgs(nil)
+			require.ErrorContains(t, cmd.Execute(), "MAX_REQUEST_SIZE_BYTES")
+		})
+	}
+}
+
+func TestStartupRejectsInvalidRequestSizeConfigFile(t *testing.T) {
+	for _, value := range []string{"0", "-1", "1.5", "true", `""`, "9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte("MAX_REQUEST_SIZE_BYTES: "+value+"\n"), 0600))
+			cmd := NewRootCommand(nil)
+			cmd.SetArgs([]string{"--config", path})
+			require.ErrorContains(t, cmd.Execute(), "MAX_REQUEST_SIZE_BYTES")
+		})
+	}
 }

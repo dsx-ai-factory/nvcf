@@ -29,7 +29,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/auth"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 	"go.uber.org/zap"
@@ -38,7 +38,7 @@ import (
 	"nvcf-grpc-proxy/proxy/metrics"
 )
 
-func NewNatsConnection(natsFqdn, nKeySeed, serviceName, ssaFqdn, secretsPath string) (*nats.Conn, error) {
+func NewNatsConnection(natsFqdn, nKeySeed, serviceName, oauth2Fqdn, secretsPath string) (*nats.Conn, error) {
 	var natsAuthOption nats.Option
 	if nKeySeed != "" {
 		var err error
@@ -49,14 +49,30 @@ func NewNatsConnection(natsFqdn, nKeySeed, serviceName, ssaFqdn, secretsPath str
 		}
 	} else {
 		var err error
-		natsAuthOption, err = newAuthCalloutAuthOption(ssaFqdn, secretsPath)
+		natsAuthOption, err = newAuthCalloutAuthOption(oauth2Fqdn, secretsPath)
 		if err != nil {
 			recordNatsStartupFailure("nats auth callout setup failed", err)
 			return nil, err
 		}
 	}
 
-	nc, err := nats.Connect(natsFqdn, nats.PingInterval(10*time.Second), natsAuthOption,
+	nc, err := nats.Connect(natsFqdn, connectOptions(serviceName, natsAuthOption)...)
+	if err != nil {
+		recordNatsStartupFailure("nats initial connection failed", err)
+		return nil, err
+	}
+	metrics.SetNatsStatsConnection(nc)
+	return nc, nil
+}
+
+func connectOptions(serviceName string, authOption nats.Option) []nats.Option {
+	return []nats.Option{nats.PingInterval(10 * time.Second), authOption,
+		// Nothing replaces a closed connection, and readiness stays down while it is
+		// closed, so keep reconnecting through long outages. Without
+		// IgnoreAuthErrorAbort, nats.go closes the connection after the same
+		// authentication error twice, even with unlimited reconnects.
+		nats.MaxReconnects(-1),
+		nats.IgnoreAuthErrorAbort(),
 		nats.LameDuckModeHandler(func(conn *nats.Conn) {
 			metrics.NatsLameDuckCounter.Inc()
 			go func() {
@@ -78,13 +94,7 @@ func NewNatsConnection(natsFqdn, nKeySeed, serviceName, ssaFqdn, secretsPath str
 			recordNatsDisconnect(err)
 		}), nats.ConnectHandler(func(conn *nats.Conn) {
 			zap.L().Info("connected to nats", zap.String("server", conn.ConnectedServerName()), zap.String("cluster", conn.ConnectedClusterName()))
-		}))
-	if err != nil {
-		recordNatsStartupFailure("nats initial connection failed", err)
-		return nil, err
-	}
-	metrics.SetNatsStatsConnection(nc)
-	return nc, nil
+		})}
 }
 
 func recordNatsDisconnect(err error) {
@@ -182,8 +192,8 @@ func newNkeyAuthOption(nKeySeed string) (nats.Option, error) {
 	}), nil
 }
 
-func newAuthCalloutAuthOption(ssaFqdn, secretsPath string) (nats.Option, error) {
-	oauthTokenProvider, err := newOAuthTokenProvider(ssaFqdn, secretsPath)
+func newAuthCalloutAuthOption(oauth2Fqdn, secretsPath string) (nats.Option, error) {
+	oauthTokenProvider, err := newOAuthTokenProvider(oauth2Fqdn, secretsPath)
 	if err != nil {
 		return nil, err
 	}
@@ -195,10 +205,10 @@ type oauthTokenProvider struct {
 	tokenSource credentials.PerRPCCredentials
 }
 
-func newOAuthTokenProvider(ssaFqdn, secretsPath string) (*oauthTokenProvider, error) {
+func newOAuthTokenProvider(oauth2Fqdn, secretsPath string) (*oauthTokenProvider, error) {
 	authnConfig := &auth.AuthnConfig{
 		OIDCConfig: &auth.ProviderConfig{
-			Host:            ssaFqdn,
+			Host:            oauth2Fqdn,
 			CredentialsFile: secretsPath,
 			Scopes:          []string{"admin:nats:Worker"},
 		},

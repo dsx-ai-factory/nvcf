@@ -5,8 +5,8 @@
 - Repo: `nvct-api-colocated-deploy`
 - Workspace(s): `self-hosted-nvcf`
 - Tier: `chart`
-- Team: `@NVIDIA/nvcf-dev`
-- Default owner: `@NVIDIA/nvcf-dev`.
+- Team: `@dsx-ai-factory/nvcf-dev`
+- Default owner: `@dsx-ai-factory/nvcf-dev`.
 - Manifest description: Helm chart for NVCT API / nvct-service (helm-nvcf-nvct-api)
 
 ## Use `nvcf-agentic-dev` As The Routing Layer
@@ -36,6 +36,7 @@ Check these files first when they exist in your local workspace:
 ## Completion Expectations
 
 - Validate with the repo-native command set if one exists (`make`, Maven, Helm, npm, etc.).
+- After changing any entry in `nvctApi.remoteConfig.configData.nvct.sidecars` or `nvctApi.remoteConfig.workerImageTags`, run `make test`. It checks the composed worker references and the `release-artifact-*-image` annotations that surface these images to stack release tooling. Worker releases move `workerImageTags` through the `deploys` entries in `tools/ci/github-release-subprojects.json`.
 - If you change cross-repo behavior, mention the adjacent repo(s) that may also need follow-up.
 - In your final summary, state that routing was confirmed through `nvcf-agentic-dev` and name the workspace context used.
 

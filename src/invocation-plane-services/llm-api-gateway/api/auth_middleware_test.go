@@ -19,6 +19,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,8 +29,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/nvcf"
 )
 
 func TestNVCFAuthHTTPErrorMapsCodes(t *testing.T) {
@@ -46,6 +47,7 @@ func TestNVCFAuthHTTPErrorMapsCodes(t *testing.T) {
 		{"not found -> 404", status.Error(codes.NotFound, "not found"), http.StatusNotFound},
 		{"deadline -> 504", status.Error(codes.DeadlineExceeded, "slow"), http.StatusGatewayTimeout},
 		{"unavailable -> 503", status.Error(codes.Unavailable, "down"), http.StatusServiceUnavailable},
+		{"failed precondition -> 503", status.Error(codes.FailedPrecondition, "degraded"), http.StatusServiceUnavailable},
 		{"internal -> 502", status.Error(codes.Internal, "boom"), http.StatusBadGateway},
 	}
 
@@ -159,6 +161,10 @@ var priorityMiddlewarePaths = []struct {
 		body: `{"model":"fn-chat/company-name/model-name","input":"hello"}`,
 	},
 	{
+		path: "/v1/messages",
+		body: `{"model":"fn-chat/company-name/model-name","messages":[{"role":"user","content":"hello"}],"max_tokens":16}`,
+	},
+	{
 		path: "/v1/embeddings",
 		body: `{"model":"fn-chat/company-name/model-name","input":"hello"}`,
 	},
@@ -213,6 +219,48 @@ func TestNVCFAuthMiddlewarePropagatesResolvedPriority(t *testing.T) {
 				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNoContent, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestNVCFAuthMiddlewarePropagatesAccountTokenRateLimits(t *testing.T) {
+	t.Parallel()
+
+	authClient := &stubInvocationAuthClient{
+		authResponse: &nvcf.InvocationAuthResponse{
+			RoutingKey:                  "fn-chat",
+			ClientAuthID:                "subject-123",
+			AuthContext:                 map[string]string{"ncaId": "nca-456"},
+			RateLimitKey:                "nca-456",
+			AccountInputTokenRateLimit:  "5000-M",
+			AccountOutputTokenRateLimit: "1000-M",
+		},
+	}
+	tc := priorityMiddlewarePaths[0]
+
+	e := echo.New()
+	e.Use(NewContextMiddleware(config.Default()))
+	e.Use(NewNVCFAuthMiddleware(authClient))
+	e.POST(tc.path, func(ec echo.Context) error {
+		reqCtx := ec.(*GatewayContext).RequestContext()
+		if reqCtx == nil {
+			t.Fatal("request context was not set")
+		}
+		if reqCtx.AccountInputTokenRateLimit != "5000-M" || reqCtx.AccountOutputTokenRateLimit != "1000-M" {
+			t.Fatalf("account limits = %q/%q, want 5000-M/1000-M",
+				reqCtx.AccountInputTokenRateLimit, reqCtx.AccountOutputTokenRateLimit)
+		}
+		return ec.NoContent(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(echo.HeaderAuthorization, "Bearer sk-live")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNoContent, rec.Body.String())
 	}
 }
 
@@ -292,6 +340,147 @@ func TestNVCFAuthMiddlewareRejectsMissingBearerToken(t *testing.T) {
 	}
 	if authClient.authorizeCalls != 0 {
 		t.Fatalf("authorize calls = %d, want 0", authClient.authorizeCalls)
+	}
+}
+
+func TestNVCFAuthMiddlewareCredentialHeaderSelection(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		path          string
+		body          string
+		authorization string
+		emptyAuth     bool
+		apiKey        string
+		wantStatus    int
+		wantToken     string
+	}{
+		{
+			name:       "chat completions rejects x-api-key without bearer",
+			path:       "/v1/chat/completions",
+			body:       `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`,
+			apiKey:     "sk-api-key",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "responses rejects x-api-key without bearer",
+			path:       "/v1/responses",
+			body:       `{"model":"fn-alpha/company-name/model-name","input":"hello"}`,
+			apiKey:     "sk-api-key",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "embeddings rejects x-api-key without bearer",
+			path:       "/v1/embeddings",
+			body:       `{"model":"fn-alpha/company-name/model-name","input":"hello"}`,
+			apiKey:     "sk-api-key",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:          "chat completions with bearer carries no request-id",
+			path:          "/v1/chat/completions",
+			body:          `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`,
+			authorization: "Bearer sk-bearer",
+			wantStatus:    http.StatusNoContent,
+			wantToken:     "sk-bearer",
+		},
+		{
+			name:          "messages prefers bearer over x-api-key",
+			path:          messagesEndpointPath,
+			body:          `{"model":"fn-alpha/company-name/model-name","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}`,
+			authorization: "Bearer sk-bearer",
+			apiKey:        "sk-api-key",
+			wantStatus:    http.StatusNoContent,
+			wantToken:     "sk-bearer",
+		},
+		{
+			name:          "messages rejects non-bearer authorization even with x-api-key",
+			path:          messagesEndpointPath,
+			body:          `{"model":"fn-alpha/company-name/model-name","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}`,
+			authorization: "Basic dXNlcjpwYXNz",
+			apiKey:        "sk-api-key",
+			wantStatus:    http.StatusUnauthorized,
+		},
+		{
+			name:       "messages treats an empty authorization header as present",
+			path:       messagesEndpointPath,
+			body:       `{"model":"fn-alpha/company-name/model-name","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}`,
+			emptyAuth:  true,
+			apiKey:     "sk-api-key",
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			authClient := &stubInvocationAuthClient{authResponse: &nvcf.InvocationAuthResponse{RateLimitKey: "org-test"}}
+			e := echo.New()
+			e.Use(NewContextMiddleware(config.Default()))
+			e.Use(NewNVCFAuthMiddleware(authClient))
+			e.POST(tc.path, func(c echo.Context) error {
+				return c.NoContent(http.StatusNoContent)
+			})
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			if tc.authorization != "" {
+				req.Header.Set(echo.HeaderAuthorization, tc.authorization)
+			}
+			if tc.emptyAuth {
+				req.Header[echo.HeaderAuthorization] = []string{""}
+			}
+			if tc.apiKey != "" {
+				req.Header.Set("X-Api-Key", tc.apiKey)
+			}
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if authClient.authorizeToken != tc.wantToken {
+				t.Fatalf("authorized token = %q, want %q", authClient.authorizeToken, tc.wantToken)
+			}
+			if got := rec.Header().Get(headerMessagesRequestID); tc.path != messagesEndpointPath && got != "" {
+				t.Fatalf("request-id = %q on %s, want none outside Messages", got, tc.path)
+			}
+		})
+	}
+}
+
+func TestMessagesAcceptsXAPIKeyWithoutForwardingIt(t *testing.T) {
+	captured := make(chan http.Header, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured <- r.Header.Clone()
+		w.Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer backend.Close()
+
+	e, auth := messagesTestAPI(t, backend.URL, config.Default(), nil, []string{messagesEndpointPath})
+	req := httptest.NewRequest(http.MethodPost, messagesEndpointPath, strings.NewReader(messagesTestBody))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("x-api-key", "sk-anthropic-sdk")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if auth.authorizeToken != "sk-anthropic-sdk" {
+		t.Fatalf("authorized token = %q, want the x-api-key value", auth.authorizeToken)
+	}
+	got := <-captured
+	for _, name := range []string{"X-Api-Key", echo.HeaderAuthorization} {
+		if v := got.Get(name); v != "" {
+			t.Fatalf("backend received %s = %q, want it removed", name, v)
+		}
 	}
 }
 
@@ -410,6 +599,7 @@ func TestNVCFAuthMiddlewareUsesProjectScopedRateLimitKeyWhenPresent(t *testing.T
 
 type stubInvocationAuthClient struct {
 	authResponse        *nvcf.InvocationAuthResponse
+	authErr             error
 	authorizeCalls      int
 	authorizeToken      string
 	authorizeRoutingKey string
@@ -423,7 +613,98 @@ func (s *stubInvocationAuthClient) AuthorizeInvocation(
 	s.authorizeCalls++
 	s.authorizeToken = clientAuthorizationToken
 	s.authorizeRoutingKey = routingKey
-	return s.authResponse, nil
+	return s.authResponse, s.authErr
+}
+
+func TestNVCFAuthMiddlewareFunctionNotReadyIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		path     string
+		body     string
+		wantType string
+	}{
+		{"openai", "/v1/chat/completions", `{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`, "server_error"},
+		{"anthropic", messagesEndpointPath, messagesTestBody, "api_error"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			authClient := &stubInvocationAuthClient{
+				authErr: status.Error(codes.FailedPrecondition, "Function id 'fn-alpha': DEGRADED function cannot be invoked"),
+			}
+			e := echo.New()
+			e.HTTPErrorHandler = newHTTPErrorHandler(false)
+			e.Use(NewContextMiddleware(config.Default()))
+			e.Use(NewNVCFAuthMiddleware(authClient))
+			e.POST(tc.path, func(c echo.Context) error {
+				t.Fatal("handler must not run when auth fails")
+				return nil
+			})
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			req.Header.Set(echo.HeaderAuthorization, "Bearer sk-live")
+			rec := httptest.NewRecorder()
+
+			e.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+			}
+			if got := rec.Header().Get("Retry-After"); got != "30" {
+				t.Fatalf("Retry-After = %q, want 30", got)
+			}
+			var body struct {
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode body: %v: %s", err, rec.Body.String())
+			}
+			if body.Error.Type != tc.wantType {
+				t.Fatalf("error type = %q, want %q", body.Error.Type, tc.wantType)
+			}
+			if body.Error.Message != "model temporarily unavailable" {
+				t.Fatalf("error message = %q, want model temporarily unavailable", body.Error.Message)
+			}
+		})
+	}
+}
+
+func TestNVCFAuthMiddlewareOmitsRetryAfterForOtherErrors(t *testing.T) {
+	t.Parallel()
+
+	authClient := &stubInvocationAuthClient{authErr: status.Error(codes.Unavailable, "down")}
+	e := echo.New()
+	e.Use(NewContextMiddleware(config.Default()))
+	e.Use(NewNVCFAuthMiddleware(authClient))
+	e.POST("/v1/chat/completions", func(c echo.Context) error {
+		return c.NoContent(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"fn-alpha/company-name/model-name","messages":[{"role":"user","content":"hello"}]}`),
+	)
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set(echo.HeaderAuthorization, "Bearer sk-live")
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want unset", got)
+	}
 }
 
 func TestNVCFAuthHTTPErrorDoesNotLeakTransportDetail(t *testing.T) {

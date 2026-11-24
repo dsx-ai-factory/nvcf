@@ -2,11 +2,18 @@
 
 [KAI Scheduler](https://github.com/kai-scheduler/KAI-Scheduler) is an open
 source Kubernetes scheduler for AI workloads. NVCF integrates with KAI to
-bin-pack GPU workloads onto eligible nodes to help improve cluster utilization.
+place GPU workload Pods. With the configuration in this guide, KAI bin-packs
+those Pods onto eligible nodes. This keeps whole nodes free for larger
+workloads and improves cluster utilization. Helm functions can also request
+gang scheduling and topology-aware placement in their charts. See
+[Gang Scheduling](./gang-scheduling.md) and
+[Topology-Aware Scheduling](./topology-aware-scheduling.md).
 
 KAI coexists with the default Kubernetes scheduler. When the `KAIScheduler`
 feature gate is enabled, the NVIDIA Cluster Agent (NVCA) assigns NVCF workload
-Pods to KAI. Other Pods can continue using the default scheduler.
+Pods to KAI. Other Pods can continue using the default scheduler. When the
+feature gate is disabled, all Pods use the default scheduler, even if KAI is
+installed.
 
 ## Operational responsibilities
 
@@ -44,6 +51,13 @@ its default queues, and enables NVCA's `KAIScheduler` feature gate unless
 explicitly disabled with `-KAIScheduler`. Apply the environment through your
 compute plane installation workflow. Skip the manual installation below.
 
+The add-on manages the Helm release `kai-scheduler` in the `kai-scheduler`
+namespace. If a release with that name exists, enabling the add-on upgrades
+it to the version pinned by the compute plane stack and applies the stack's
+values. A KAI installation under another release name or namespace is not
+adopted. Remove it before enabling the add-on, or keep the add-on disabled
+and follow the next section.
+
 ### Use an existing or separately managed installation
 
 If KAI is managed outside the compute plane stack, leave the installation
@@ -68,6 +82,9 @@ Create `values.yaml` with the required scheduler and queue settings:
 <Accordion title="values.yaml">
 
 ```yaml title="values.yaml"
+global:
+  gpuSharingMode: Disabled
+
 scheduler:
   placementStrategy: binpack
   plugins:
@@ -79,6 +96,8 @@ scheduler:
     preempt:
       enabled: false
     consolidation:
+      enabled: false
+    reclaim:
       enabled: false
 
 defaultQueue:
@@ -114,6 +133,69 @@ defaultQueue:
 ```
 
 </Accordion>
+
+From KAI v0.18, the chart turns GPU sharing on unless `global.gpuSharingMode`
+is set. NVCF workloads request whole GPUs, so set it to `Disabled`.
+
+The preempt, consolidation, and reclaim actions are disabled so that KAI never
+evicts running NVCF workloads to place other workloads. Reclaim needs the most
+care. Because NVCF queues have unlimited quotas, quota-based reclaim never takes
+from them. With KAI's default `allow-consolidating-reclaim`, however, reclaim
+can still move running NVCF Pods to other nodes to make room for another
+queue's pending gang. Workloads that create their own queues, such as Dynamo,
+make this possible.
+
+KAI's `stalegangeviction` action stays enabled. It evicts the remaining Pods of
+a gang that stays below its minimum size for longer than the staleness grace
+period (60 seconds by default). Grove's `kai-scheduler`
+backend, which Grove enables by default from v0.1.0-alpha.13, owns this
+decision for Grove workloads, including Dynamo's. Where that backend is active,
+add `default-staleness-grace-period: "-1s"` under `scheduler.args`, as the
+Dynamo 1.5 upgrade notes require. Keep the default when KAI runs without Grove
+or when Grove's `kai-scheduler` backend is disabled. When the compute plane
+stack installs KAI, it sets this whenever the Grove operator add-on is enabled.
+
+The setting changes the scheduler-wide default, so it applies to every PodGroup
+that does not set its own grace period, including PodGroups owned by other
+teams on a shared cluster. Such a gang keeps its running Pods for as long as it
+stays below its minimum size. A workload that needs stale-gang eviction can set
+its own grace period with the `kai.scheduler/staleness-grace-period` annotation
+on its Pods or its parent resource. KAI's podgrouper copies the annotation into
+the PodGroup it creates. For a PodGroup that the workload creates itself with
+`kai.scheduler/skip-podgrouper`, set `spec.stalenessGracePeriod` on the
+PodGroup instead.
+
+If other teams on a shared cluster rely on reclaim to enforce their queue
+quotas, use the following `scheduler` block instead of the one in the values
+above. It keeps reclaim enabled but turns off `allow-consolidating-reclaim`, so
+reclaim no longer moves running NVCF Pods, and quota-based reclaim between the
+other queues still works. This relies on the `proportion` plugin's
+`queuePriorityInQuotaReclaim` argument staying at its default of `false`. When
+it is enabled, a queue with a higher priority can reclaim in-quota resources
+from a lower-priority queue, which includes evicting preemptible NVCF Pods.
+Where Grove's `kai-scheduler` backend is active, keep both arguments by
+uncommenting the staleness setting:
+
+```yaml
+scheduler:
+  placementStrategy: binpack
+  plugins:
+    nodeplacement:
+      arguments:
+        gpu: binpack
+        cpu: spread
+  actions:
+    preempt:
+      enabled: false
+    consolidation:
+      enabled: false
+    reclaim:
+      enabled: true
+  args:
+    allow-consolidating-reclaim: "false"
+    # Required where Grove's kai-scheduler backend is active:
+    # default-staleness-grace-period: "-1s"
+```
 
 For a new installation, replace `<kai-version>` with the `version` of the
 `kai-scheduler` release in
@@ -164,8 +246,45 @@ kubectl get pods -n <workload-namespace> \
 ```
 
 New NVCF workload Pods should use `kai-scheduler` and `default-queue`.
-If a Pod remains `Pending`, check its events, KAI component health, queue
-configuration, and available resources on eligible nodes.
+If a Pod remains `Pending`, see [Troubleshoot the integration](#troubleshoot-the-integration).
+
+## Troubleshoot the integration
+
+When the `KAIScheduler` feature gate is enabled, NVCA checks the KAI queue
+configuration and reports the result as the `kai-scheduler-queues` health
+component. A failed check marks the agent unhealthy.
+
+Check the agent status:
+
+```bash
+kubectl get nvcfbackends.nvcf.nvidia.io -A
+```
+
+If `HEALTH` is not `healthy`, read the component detail from the NVCA
+health endpoint:
+
+```bash
+kubectl get --raw /api/v1/namespaces/nvca-system/services/nvca:8000/proxy/healthz \
+  | jq '.Components["kai-scheduler-queues"]'
+```
+
+| Error contains | Cause | Fix |
+| --- | --- | --- |
+| `KAI Scheduler is not installed` | The feature gate is on but the KAI CRDs are missing. | Install KAI, or remove `KAIScheduler` from the feature gates. |
+| `either one or both were not found` | `default-parent-queue` or `default-queue` does not exist. | Apply the queue values from this guide. |
+| `Queue hierarchy misconfigured` | `default-queue` is not a child of `default-parent-queue`. | Correct `parentName` and `childName` in the KAI values. |
+| `resource violation for queue` | A queue quota, limit, or `overQuotaWeight` differs from `-1`, `-1`, `1`. | Restore the unlimited values for CPU, GPU, and memory. |
+
+If the component is healthy but workload Pods stay `Pending`, the queue
+configuration is correct. Confirm that the Pod uses `kai-scheduler` and that
+the KAI components are running, then check the `Unschedulable` event on the
+Pod and the KAI scheduler logs:
+
+```bash
+kubectl get pods -n kai-scheduler
+kubectl -n <workload-namespace> describe pod <pod-name>
+kubectl -n kai-scheduler logs deploy/kai-scheduler-default --tail=100
+```
 
 ## Maintain KAI Scheduler
 
@@ -184,9 +303,13 @@ The platform operator is responsible for restoring KAI availability.
 ## Schedule multi-Pod workloads
 
 KAI can hold a multi-Pod workload until all required members fit. Grove and
-Dynamo build on this behavior for multi-role inference services. See
-[Gang Scheduling](./gang-scheduling.md) for add-on configuration, workload
-examples, supported resource types, and troubleshooting.
+Dynamo build on this behavior for multi-role inference services.
+
+A Helm function requests this in its chart. NVCA passes the chart's KAI,
+Grove, and Dynamo resources through when the matching add-ons are enabled.
+It does not create `PodGroup` resources or set `minMember` on a workload's
+behalf. See [Gang Scheduling](./gang-scheduling.md) for add-on setup,
+workload examples, and troubleshooting.
 
 On NVLink-optimized clusters, KAI can also place the complete gang in one GPU
 clique. See

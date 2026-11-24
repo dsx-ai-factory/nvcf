@@ -35,7 +35,7 @@ on:
 
 permissions:
   contents: read
-  # Required to pull the private ghcr.io/nvidia/nvcf/bazel-ci job container.
+  # Required to pull the private ghcr.io/dsx-ai-factory/nvcf/bazel-ci job container.
   packages: read
 
 concurrency:
@@ -146,7 +146,10 @@ jobs:
       CACHE_TOKEN: ${{ secrets.BAZEL_REMOTE_CACHE_TOKEN }}
       CACHE_ENDPOINT: ${{ vars.BAZEL_REMOTE_CACHE_ENDPOINT }}
     container:
-      image: ${{ vars.BAZEL_CI_IMAGE || 'ghcr.io/nvidia/nvcf/bazel-ci:0.14.0' }}
+      image: ${{ vars.BAZEL_CI_IMAGE || 'ghcr.io/dsx-ai-factory/nvcf/bazel-ci:0.14.0' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     defaults:
       run:
         # In container jobs Actions falls back to plain `sh` (dash), which
@@ -292,6 +295,11 @@ jobs:
             echo "scope=//$SVC_PATH/..." >> "$GITHUB_OUTPUT"
             echo "layout: root module, scoped to //$SVC_PATH/..."
           fi
+
+      - name: Configure CI Java runtime options
+        env:
+          JAVA_CI_WORKDIR: ${{ steps.layout.outputs.workdir }}
+        run: bash tools/ci/configure-java-runtime --workspace "$GITHUB_WORKSPACE" --workspace "$JAVA_CI_WORKDIR"
 
       - name: Build and push multi-arch image(s)
         working-directory: ${{ steps.layout.outputs.workdir }}

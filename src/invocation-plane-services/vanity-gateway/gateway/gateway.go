@@ -45,11 +45,23 @@ type Config struct {
 	MappingPath                  string        `mapstructure:"MAPPING_PATH"`
 	MappingLoadTimeout           time.Duration `mapstructure:"MAPPING_LOAD_TIMEOUT"`
 	NvcfApiEndpoint              string        `mapstructure:"NVCF_API_ENDPOINT"`
+	NvcfControlPlaneEndpoint     string        `mapstructure:"NVCF_CONTROL_PLANE_ENDPOINT"`
 	LLMGatewayEndpoint           string        `mapstructure:"LLM_GATEWAY_ENDPOINT"`
 	PrivateModelNameRegexPattern string        `mapstructure:"PRIVATE_MODEL_NAME_REGEX_PATTERN"`
 	PodIP                        string        `mapstructure:"POD_IP"`
 	AWSRegion                    string        `mapstructure:"AWS_REGION"`
 	ShadowMaxConcurrent          int           `mapstructure:"SHADOW_MAX_CONCURRENT"`
+	MaxRequestSizeBytes          *int64        `mapstructure:"MAX_REQUEST_SIZE_BYTES"`
+}
+
+func (c Config) requestSizeLimit() (int64, error) {
+	if c.MaxRequestSizeBytes == nil {
+		return defaultMaxRequestSize, nil
+	}
+	if *c.MaxRequestSizeBytes <= 0 {
+		return 0, fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+	}
+	return *c.MaxRequestSizeBytes, nil
 }
 
 type NVCFGateway struct {
@@ -68,15 +80,20 @@ func swapRouterWhenNotified(ctx context.Context, mappings reloadableconfig.Reloa
 			newMux, err := buildChiMux(mappings.Get(), config)
 			if err != nil {
 				zap.L().Error("Failed to build ChiMux, skipping router swap", zap.Error(err))
+				recordConfigReloadFailure(ctx, reloadStageRouterBuild)
 				continue
 			}
 			router.SetNewMux(newMux)
+			recordConfigReloadSuccess(ctx)
 			zap.L().Info("Finished swapping the new ChiMux")
 		}
 	}()
 }
 
 func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error) {
+	if _, err := config.requestSizeLimit(); err != nil {
+		return nil, err
+	}
 	if config.SecretsPath == "" {
 		config.SecretsPath = "vault/secrets.json"
 	}
@@ -113,8 +130,22 @@ func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error)
 	if err := setupShadowMetrics(); err != nil {
 		return nil, fmt.Errorf("failed to setup shadow metrics: %w", err)
 	}
+	if err := setupRequestBodyMetrics(); err != nil {
+		return nil, fmt.Errorf("failed to setup request body metrics: %w", err)
+	}
+	if err := setupPrivateModelMetrics(); err != nil {
+		return nil, fmt.Errorf("failed to setup private model metrics: %w", err)
+	}
+	if config.NvcfControlPlaneEndpoint == "" {
+		zap.L().Info("Private model listing is disabled because NVCF_CONTROL_PLANE_ENDPOINT is not set")
+	}
 
-	mappings, err := gatewayConfig.SetupConfigWithConfigPathAndTimeout(config.MappingPath, config.MappingLoadTimeout)
+	if err := setupReloadMetrics(); err != nil {
+		return nil, fmt.Errorf("failed to setup config reload metrics: %w", err)
+	}
+
+	mappings, err := gatewayConfig.SetupConfigWithConfigPathAndTimeout(config.MappingPath, config.MappingLoadTimeout,
+		reloadableconfig.WithReloadErrorFunc[gatewayConfig.GatewayConfig](recordConfigLoadFailure))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load mapping configuration: %w", err)
 	}
@@ -125,6 +156,7 @@ func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error)
 		cancel()
 		return nil, err
 	}
+	recordConfigReloadSuccess(ctx)
 	http2Server := createHttp2Server("0.0.0.0:10081", router)
 	http2ServerPair := servers.ServerFuncPair{
 		Execute: func() error {

@@ -1,0 +1,26 @@
+{{- $pr := .Values.agent.metrics.prometheusRule }}
+{{- $on := toString $pr.enabled }}
+{{- if and .Values.agent.enabled (or (eq $on "true") (and (eq $on "auto") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule"))) }}
+{{- /* Guard first: a disabled feature must emit nothing at all (see grafana-dashboard.yaml). */ -}}
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The NvSnap alerts (files/prometheus-rules.yaml, unit-tested by
+# files/prometheus-rules.test.yaml) for the cluster's Prometheus, which
+# selects rules by the labels below. Runbook: docs/operate/RUNBOOK.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nvsnap
+  {{- /* The ServiceMonitor's namespace rule: a namespace the cluster lacks is replaced by the release's (agent-servicemonitor.yaml). */}}
+  {{- $prNS := $pr.namespace | default .Release.Namespace }}
+  {{- if and (ne $prNS .Release.Namespace) (lookup "v1" "Namespace" "" "kube-system") (not (lookup "v1" "Namespace" "" $prNS)) }}{{ $prNS = .Release.Namespace }}{{ end }}
+  namespace: {{ $prNS }}
+  labels:
+    {{- include "nvsnap.agent.labels" . | nindent 4 }}
+    {{- range $k, $v := $pr.labels }}
+    {{ $k }}: {{ $v | toString | quote }}
+    {{- end }}
+spec:
+  {{- .Files.Get "files/prometheus-rules.yaml" | nindent 2 }}
+{{- end }}

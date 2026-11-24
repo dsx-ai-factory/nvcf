@@ -20,6 +20,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -29,9 +30,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/must"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/internal/ptr"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
 )
 
 const (
@@ -56,14 +57,14 @@ func (h *OpenAIProxyHandlers) Translations(ec echo.Context) error {
 
 func (h *OpenAIProxyHandlers) handleAudioToTextProxy(ec echo.Context, translation bool) error {
 	c := must.As[*GatewayContext](ec)
-	reqCtx, err := h.requireFunctionRequestContext(c)
+	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
 	if err != nil {
 		return err
 	}
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
@@ -169,14 +170,14 @@ func (h *OpenAIProxyHandlers) handleAudioToTextProxy(ec echo.Context, translatio
 
 func (h *OpenAIProxyHandlers) SpeechToSpeech(ec echo.Context) error {
 	c := must.As[*GatewayContext](ec)
-	reqCtx, err := h.requireFunctionRequestContext(c)
+	reqCtx, err := h.handlers.requireFunctionRequestContext(c)
 	if err != nil {
 		return err
 	}
 
 	rawBody, err := captureRequestBody(c.Request())
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		return err
 	}
 
 	form, err := c.MultipartForm()
@@ -298,17 +299,17 @@ func parseSpeechToSpeechRequest(form *multipart.Form) (*speechToSpeechRequest, e
 
 	if value := form.Value["stt"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.STT); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal stt params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`stt` field", "stt."))
 		}
 	}
 	if value := form.Value["llm"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.LLM); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal llm params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`llm` field", "llm."))
 		}
 	}
 	if value := form.Value["tts"]; len(value) == 1 && value[0] != "" {
 		if err := json.Unmarshal([]byte(value[0]), &params.TTS); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal tts params: %w", err)
+			return nil, errors.New(jsonDecodeMessage(err, "`tts` field", "tts."))
 		}
 	}
 

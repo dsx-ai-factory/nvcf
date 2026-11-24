@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -165,6 +166,7 @@ metrics! {
         float_gauge output_tps("model_output_tps", "Current output TPS by model", ["model"]);
         float_gauge embedding_item_tps("model_embedding_item_tps", "Current embeddings item throughput by model", ["model"]);
         float_gauge last_mean_input_tps("model_last_mean_input_tps", "Last valid mean input TPS by model", ["model"]);
+        float_gauge max_input_tps("model_max_input_tps", "Generation max input TPS by model", ["model"]);
         float_gauge max_output_tps("model_max_output_tps", "Observed max output TPS by model", ["model"]);
         float_gauge max_embedding_item_tps("model_max_embedding_item_tps", "Observed max embeddings item throughput by model", ["model"]);
         float_gauge queue_size("model_queue_size", "Current queued request count by model", ["model"]);
@@ -351,6 +353,12 @@ impl PylonMetrics {
         ] {
             gauge.with_label_values(&[model_id]).set(value);
         }
+        match stats.max_input_tps {
+            Some(value) => self.max_input_tps.with_label_values(&[model_id]).set(value),
+            None => {
+                let _ = self.max_input_tps.remove_label_values(&[model_id]);
+            }
+        }
         for (gauge, values) in [
             (&self.stats_capability, &stats.stats_capabilities),
             (&self.stats_source, &stats.stats_sources),
@@ -392,6 +400,7 @@ impl PylonMetrics {
             &self.output_tps,
             &self.embedding_item_tps,
             &self.last_mean_input_tps,
+            &self.max_input_tps,
             &self.max_output_tps,
             &self.max_embedding_item_tps,
             &self.queue_size,
@@ -630,11 +639,16 @@ pub(crate) enum CanaryPhase {
 impl CanaryPhase {
     const ALL: [Self; 2] = [Self::Active, Self::Recovery];
 
-    /// Results each phase can record; recovery canaries never skip and must pass.
+    /// Results each phase can record; recovery canaries never skip.
     fn results(self) -> &'static [CanaryResult] {
         match self {
             Self::Active => &CanaryResult::ALL,
-            Self::Recovery => &[CanaryResult::Passed, CanaryResult::Failed],
+            Self::Recovery => &[
+                CanaryResult::Passed,
+                CanaryResult::TimedOutUpstreamBusy,
+                CanaryResult::RejectedUpstreamBusy,
+                CanaryResult::Failed,
+            ],
         }
     }
 
@@ -653,16 +667,22 @@ pub(crate) enum CanaryResult {
     /// Recent request progress on the model made the canary unnecessary.
     SkippedRecentProgress,
     /// The canary timed out while the upstream made progress on other requests.
+    /// In the recovery phase it restored the model.
     TimedOutUpstreamBusy,
-    /// The canary failed and counted against the model.
+    /// The upstream rejected the canary as overloaded while it made progress
+    /// on other requests. In the recovery phase it restored the model.
+    RejectedUpstreamBusy,
+    /// The canary failed and counted against the model, including a busy
+    /// recovery canary for a model demoted for a real failure.
     Failed,
 }
 
 impl CanaryResult {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Passed,
         Self::SkippedRecentProgress,
         Self::TimedOutUpstreamBusy,
+        Self::RejectedUpstreamBusy,
         Self::Failed,
     ];
 
@@ -671,6 +691,7 @@ impl CanaryResult {
             Self::Passed => "passed",
             Self::SkippedRecentProgress => "skipped_recent_progress",
             Self::TimedOutUpstreamBusy => "timed_out_upstream_busy",
+            Self::RejectedUpstreamBusy => "rejected_upstream_busy",
             Self::Failed => "failed",
         }
     }
@@ -717,13 +738,29 @@ async fn get_metrics(
 
 owned_task_handle!(MetricsServerHandle);
 
+/// Backs `GET /ready`: 503 until a router acknowledges registration, or in
+/// reverse mode until a router has the connected tunnel, then 200 for the rest
+/// of the process. Canaries handle later upstream failures, so readiness never
+/// turns back.
+#[derive(Clone, Debug, Default)]
+pub struct StartupReadiness(Arc<AtomicBool>);
+
+impl StartupReadiness {
+    pub fn mark_ready(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 pub async fn start_metrics_server(
     addr: SocketAddr,
     registry: Arc<Registry>,
+    readiness: StartupReadiness,
 ) -> anyhow::Result<MetricsServerHandle> {
-    let router = Router::new()
-        .route("/metrics", get(get_metrics))
-        .with_state(registry);
+    let router = metrics_router(registry, readiness);
 
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, "pylon metrics server listening");
@@ -739,6 +776,25 @@ pub async fn start_metrics_server(
     Ok(MetricsServerHandle { task })
 }
 
+fn metrics_router(registry: Arc<Registry>, readiness: StartupReadiness) -> Router {
+    Router::new()
+        .route("/metrics", get(get_metrics))
+        .with_state(registry)
+        .route(
+            "/ready",
+            get(move || {
+                let is_ready = readiness.is_ready();
+                async move {
+                    if is_ready {
+                        (StatusCode::OK, "ready")
+                    } else {
+                        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                    }
+                }
+            }),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -746,12 +802,39 @@ mod tests {
 
     use stargate_proto::pb::InferenceServerStatus;
 
-    use super::{CalibrationOutcome, CanaryPhase, CanaryResult};
+    use super::{CalibrationOutcome, CanaryPhase, CanaryResult, StartupReadiness, metrics_router};
+    use crate::test_support::TestHttpServer;
 
     use crate::{
         CurrentModelStats, PylonMetrics, PylonRuntimeState, RequestObservation,
         RequestObservationEndpoint, RequestObservationState,
     };
+
+    #[tokio::test]
+    async fn ready_endpoint_turns_ready_once_and_stays_ready() {
+        let readiness = StartupReadiness::default();
+        let server = TestHttpServer::spawn(metrics_router(
+            PylonMetrics::new()
+                .expect("metrics should build")
+                .registry(),
+            readiness.clone(),
+        ))
+        .await;
+        let ready_url = format!("{}/ready", server.as_str());
+        let status = || async {
+            reqwest::get(&ready_url)
+                .await
+                .expect("ready request should succeed")
+                .status()
+        };
+
+        assert_eq!(status().await, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        readiness.mark_ready();
+        assert_eq!(status().await, reqwest::StatusCode::OK);
+        assert_eq!(status().await, reqwest::StatusCode::OK);
+
+        server.shutdown().await;
+    }
 
     #[test]
     fn tls_reload_metrics_are_preinitialized() {
@@ -914,6 +997,7 @@ mod tests {
         let metrics = PylonMetrics::new().expect("metrics should initialize");
         let stats = CurrentModelStats {
             last_mean_input_tps: 12.0,
+            max_input_tps: Some(13.0),
             stats_capabilities: vec!["input_tps".to_string()],
             stats_sources: vec!["engine_stats_stream".to_string()],
             ..CurrentModelStats::default()
@@ -1081,6 +1165,7 @@ mod tests {
                 output_tps: 20.0,
                 embedding_item_tps: 25.0,
                 last_mean_input_tps: 30.0,
+                max_input_tps: Some(35.0),
                 max_output_tps: 40.0,
                 max_embedding_item_tps: 45.0,
                 queue_size: 2,
@@ -1100,6 +1185,7 @@ mod tests {
                 r#"pylon_model_output_tps{model="model-a"} 20"#,
                 r#"pylon_model_embedding_item_tps{model="model-a"} 25"#,
                 r#"pylon_model_last_mean_input_tps{model="model-a"} 30"#,
+                r#"pylon_model_max_input_tps{model="model-a"} 35"#,
                 r#"pylon_model_max_embedding_item_tps{model="model-a"} 45"#,
                 r#"pylon_model_queue_size{model="model-a"} 2"#,
                 r#"pylon_model_queued_input_tokens{model="model-a"} 17"#,
@@ -1108,6 +1194,10 @@ mod tests {
                 r#"pylon_model_stats_source{model="model-a",source="engine_stats_stream"} 1"#,
             ],
         );
+
+        metrics.observe_model_stats("model-a", &CurrentModelStats::default());
+        let body = metrics.gather_text().expect("metrics should encode");
+        assert!(!body.contains(r#"pylon_model_max_input_tps{model="model-a"}"#));
     }
 
     #[test]
@@ -1179,14 +1269,16 @@ mod tests {
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="passed"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="skipped_recent_progress"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="timed_out_upstream_busy"} 1"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="active",result="rejected_upstream_busy"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="active",result="failed"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="passed"} 0"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="timed_out_upstream_busy"} 0"#,
+                r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="rejected_upstream_busy"} 0"#,
                 r#"pylon_model_canary_results_total{model="model-a",phase="recovery",result="failed"} 0"#,
             ],
         );
         assert!(
-            !body.contains(r#"phase="recovery",result="skipped_recent_progress""#)
-                && !body.contains(r#"phase="recovery",result="timed_out_upstream_busy""#),
+            !body.contains(r#"phase="recovery",result="skipped_recent_progress""#),
             "unreachable recovery results should not be pre-initialized"
         );
 

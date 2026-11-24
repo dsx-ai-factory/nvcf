@@ -20,9 +20,9 @@ package config
 import (
 	"errors"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/common"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/tracing"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/common"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/tracing"
 )
 
 var (
@@ -58,6 +58,8 @@ type Config struct {
 	HTTP               HTTPClientConfig       `mapstructure:"http"`
 	Pagination         PaginationConfig       `mapstructure:"pagination"`
 	Stats              StatsConfig            `mapstructure:"stats"`
+	Cache              CacheConfig            `mapstructure:"cache"`
+	V3                 V3Config               `mapstructure:"v3"`
 	ID                 string                 `mapstructure:"id"`
 	Secret             string                 `mapstructure:"secret"`
 	DeprecateEndpoints bool                   `mapstructure:"deprecate-endpoints"`
@@ -273,6 +275,52 @@ type StatsConfig struct {
 	// FilteredStatsEnabledEventNames lists which event names should update the filtered stats view.
 	// The mapstructure key is retained for compatibility. If empty, the view is disabled (no writes).
 	FilteredStatsEnabledEventNames []string `mapstructure:"ngc-stats-enabled-event-names"`
+}
+
+// V3Config configures the v3 write path.
+type V3Config struct {
+	// AccountColumnsEnabled stores nca_id and function_id in their own columns.
+	// Enable it only after the event_ledger 04 migration has been applied. While
+	// disabled, those values stay in details.attributes and are not validated.
+	AccountColumnsEnabled bool `mapstructure:"account-columns-enabled"`
+}
+
+// CacheConfig configures the local stats write cache. The inactivity TTL is
+// derived from the flush interval and is not configurable.
+type CacheConfig struct {
+	// Enabled is reserved for the local write cache and has no effect until the
+	// cache is applied to writes. The service writes every stats event straight
+	// to the database.
+	Enabled bool `mapstructure:"enabled"`
+	// MaxSize is the maximum number of cached entries before LRU eviction.
+	MaxSize int `mapstructure:"max-size"`
+	// FlushIntervalSeconds is how long a pending entry waits before it is flushed.
+	FlushIntervalSeconds int `mapstructure:"flush-interval-seconds"`
+}
+
+// GetDefaultCacheConfig returns default cache configuration values
+func GetDefaultCacheConfig() CacheConfig {
+	return CacheConfig{
+		Enabled: false,
+		// About 800 B per entry for a typical event: 100,000 entries is roughly 76 MiB,
+		// and larger event details add their size to every entry.
+		MaxSize:              100_000, // Entries kept before LRU eviction
+		FlushIntervalSeconds: 60,      // Seconds a pending entry waits before it is flushed
+	}
+}
+
+// WithDefaults returns a CacheConfig with default values for unset fields
+func (c CacheConfig) WithDefaults() CacheConfig {
+	defaults := GetDefaultCacheConfig()
+
+	if c.MaxSize <= 0 {
+		c.MaxSize = defaults.MaxSize
+	}
+	if c.FlushIntervalSeconds <= 0 {
+		c.FlushIntervalSeconds = defaults.FlushIntervalSeconds
+	}
+
+	return c
 }
 
 // WithDefaults returns a PaginationConfig with default values for unset fields

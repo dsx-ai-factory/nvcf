@@ -19,10 +19,10 @@ use crate::runtime_state::OutputCalibrationFacts;
 use crate::{CurrentModelStats, RequestObservation, RequestObservationEvent};
 
 use super::aggregator::{
-    EmbeddingThroughputSample, InputThroughputSample, KvCacheStatsSnapshot, ModelMetricsState,
-    ModelStatsSnapshotInputs, RequestIntervalKey, StatsAggregator, aggregate_model_state,
-    apply_input_throughput_sample, current_unix_millis, output_decode_duration, push_sample,
-    tps_for_units,
+    EmbeddingThroughputSample, InputIntervalSample, InputThroughputSample, KvCacheStatsSnapshot,
+    ModelMetricsState, ModelStatsSnapshotInputs, RequestIntervalKey, StatsAggregator,
+    aggregate_model_state, apply_input_throughput_sample, current_unix_millis,
+    output_decode_duration, push_sample, tps_for_units,
 };
 use super::collector::StatsCollectorConfig;
 
@@ -139,21 +139,45 @@ impl StatsAggregator {
         };
 
         let mut input_tps_changed = false;
-        if matches!(
+        let generation_endpoint = matches!(
             observation.endpoint,
             RequestObservationEndpoint::ChatCompletions | RequestObservationEndpoint::Responses
-        ) && let Some(interval) = event.input_interval()
-            && let Some(input_tps) = model_state.request_input_intervals.observe(
-                &observation.request_id,
-                interval,
-                observation.input_tokens,
-                event.input_tokens_explicit(),
+        );
+        let calibration = generated_request_kind(&observation.request_id)
+            == Some(GeneratedRequestKind::Calibration);
+        let chat = observation.endpoint == RequestObservationEndpoint::ChatCompletions;
+        let uncached_input_tokens = match event.cached_input_tokens() {
+            // Cached tokens above the prompt total are inconsistent; the
+            // request then counts total tokens and is not max-eligible.
+            Some(cached) => observation.input_tokens.checked_sub(cached),
+            None => {
+                (chat && model_state.chat_cache_details_observed && event.input_tokens_explicit())
+                    .then_some(observation.input_tokens)
+            }
+        };
+        model_state.chat_cache_details_observed |=
+            chat && event.cached_input_tokens().is_some() && uncached_input_tokens.is_some();
+        if generation_endpoint
+            && let Some(interval) = event.input_interval()
+            && let Some(window_rate) = model_state.request_input_intervals.observe(
+                InputIntervalSample {
+                    request_id: &observation.request_id,
+                    interval,
+                    prompt_tokens: observation.input_tokens,
+                    input_tokens: uncached_input_tokens.unwrap_or(observation.input_tokens),
+                    input_tokens_explicit: event.input_tokens_explicit(),
+                    max_input_tps_eligible: uncached_input_tokens.is_some() || calibration,
+                    // Engine-reported usage resolves the slot even if the
+                    // terminal event is later dropped.
+                    pending: event.input_usage_expected()
+                        && !observation.is_terminal()
+                        && !event.input_tokens_explicit(),
+                },
                 config,
             )
-            && model_state.last_mean_input_tps != input_tps
         {
-            model_state.last_mean_input_tps = input_tps;
-            input_tps_changed = true;
+            input_tps_changed = model_state
+                .publish_mean_input_tps(window_rate.input_tps, window_rate.max_input_tps_eligible);
         }
         let mut completed_sample_recorded = false;
         if observation.state == RequestObservationState::Complete {
@@ -227,11 +251,13 @@ impl StatsAggregator {
                         completed_sample_recorded = true;
                     }
                 }
+                RequestObservationEndpoint::Decisions => {}
             }
         }
 
-        let embedding_input_changed = observation.endpoint
-            == RequestObservationEndpoint::Embeddings
+        // Non-streaming requests report input throughput only until a
+        // streaming request has measured it.
+        let embedding_input_changed = !observation.endpoint.is_streaming()
             && observation.state == RequestObservationState::Complete
             && !model_state.request_input_intervals.has_observed_rate()
             && apply_input_throughput_sample(
@@ -320,9 +346,7 @@ pub(super) fn observed_output_tps(
     output_tokens: u64,
 ) -> Option<f64> {
     let observation = &event.observation;
-    if observation.endpoint == RequestObservationEndpoint::Embeddings
-        || output_tokens < config.min_output_tokens
-    {
+    if !observation.endpoint.is_streaming() || output_tokens < config.min_output_tokens {
         return None;
     }
     tps_for_units(

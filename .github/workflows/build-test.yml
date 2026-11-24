@@ -5,9 +5,9 @@ name: build-test
 
 on:
   push:
-    branches: [main, 'release-**']
+    branches: [main, 'release-**', 'release/**']
   pull_request:
-    branches: [main, 'release-**']
+    branches: [main, 'release-**', 'release/**', 'docs/**']
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -23,6 +23,7 @@ jobs:
   docs:
     name: docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,12 +41,37 @@ jobs:
       - name: Run docs validation
         run: ./tools/ci/check-docs
 
+      - name: Validate Development links
+        run: ./tools/ci/preview-docs --check
+
+      - name: Test changed-doc link selection
+        run: bash tools/scripts/test/test-check-doc-links
+
+      - name: Check links in changed Markdown
+        env:
+          DOCS_LINK_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'HEAD^' }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tools/ci/check-doc-links "$DOCS_LINK_BASE" "$RUNNER_TEMP/docs-link-report.md"
+
+      - name: Retain link report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-link-report
+          path: ${{ runner.temp }}/docs-link-report.md
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Check latest stack release
         continue-on-error: true
         env:
           DOC_VERSION_SYNC_GITHUB_TOKEN: ${{ github.token }}
         run: ./tools/ci/check-doc-version-current-release
 
+  # "go-lib codegen" is a required status check on main. It also runs the
+  # vendored go-lib drift guard so that drift blocks merges. Keep the check
+  # name and keep this job unfiltered by paths: a skipped required check
+  # counts as passing.
   go-lib-codegen:
     name: go-lib codegen
     runs-on: ubuntu-latest
@@ -56,7 +82,16 @@ jobs:
         with:
           go-version-file: tools/go-toolchain/go.mod
 
+      # Runs before codegen, which may leave the library tree modified when
+      # it fails.
+      - name: Test the vendored go-lib drift guard
+        run: bash tools/ci/test-check-go-vendored-lib
+
+      - name: Check vendored copies of the shared Go library match its source
+        run: bash tools/ci/check-go-vendored-lib
+
       - name: Run go-lib codegen freshness check
+        if: ${{ !cancelled() }}
         run: ./tools/ci/check-go-codegen src/libraries/go/lib --install k8s.io/code-generator/cmd/deepcopy-gen@v0.34.2 --command 'make codegen-update'
 
   helm-charts:
@@ -65,19 +100,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Collector tests render the stack's pinned, independently released chart.
+          fetch-depth: 0
           persist-credentials: false
 
       # Pinned and checksum-verified rather than floating latest, so a chart
       # that renders today keeps rendering the same way tomorrow. helmfile
       # v1.2.0+ processes helmfile.d/ in parallel and breaks the ordering the
       # self-managed stack relies on, so stay on v1.1.x. deploy/stacks
-      # requires helm v3.x.
-      - name: Install helm and helmfile (pinned, checksum-verified)
+      # requires helm v3.x. check-helm-charts reads its chart values map with
+      # yq v4 (mikefarah).
+      - name: Install helm, helmfile and yq (pinned, checksum-verified)
         env:
           HELM_VERSION: "3.21.4"
           HELM_SHA256: "61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14"
           HELMFILE_VERSION: "1.1.9"
           HELMFILE_SHA256: "ee71196bb12460905b8cbe0ef67b28db51ef681b777cc212d8c0956475b51905"
+          YQ_VERSION: "4.47.1"
+          YQ_SHA256: "0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
         run: |
           set -euo pipefail
           cd "${RUNNER_TEMP}"
@@ -91,8 +131,13 @@ jobs:
           echo "${HELMFILE_SHA256}  helmfile.tar.gz" | sha256sum -c -
           tar xzf helmfile.tar.gz helmfile
 
+          curl -sSL --retry 3 -o yq \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  yq" | sha256sum -c -
+          chmod +x yq
+
           mkdir -p "${RUNNER_TEMP}/bin"
-          mv linux-amd64/helm helmfile "${RUNNER_TEMP}/bin/"
+          mv linux-amd64/helm helmfile yq "${RUNNER_TEMP}/bin/"
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
 
       - name: Check tool versions
@@ -100,6 +145,7 @@ jobs:
           set -euo pipefail
           helm version --short
           helmfile --version
+          yq --version
 
       - name: Test the chart mapping guard
         run: bash tools/ci/test-check-helm-charts
@@ -110,23 +156,88 @@ jobs:
       - name: Test NVCA chart schema and defaults
         run: |
           make -C deploy/helm/nvca-operator test-default-ownership
+          make -C deploy/helm/nvca-operator test-collector-image-tag
           make -C deploy/helm/nvca-operator test-resource-quantity-schema
-          make -C deploy/stacks/nvcf-compute-plane test-nvca-default-ownership
+          make -C deploy/helm/nvca-operator test-sibling-image-repositories
+          make -C deploy/helm/nvca-operator test-worker-timeouts-schema
+          make -C deploy/helm/nvca-operator test-cluster-validator
+          make -C deploy/helm/nvca-operator test-byoo-fluent-bit-image
+          make -C deploy/helm/nvca-operator test-self-managed-nvca-image-reference
+          make -C deploy/helm/nvca-operator test-render-values
+          make -C deploy/stacks/nvcf-compute-plane test-nvca-default-ownership test-collector-images test-nvca-callback-ca
+
+      - name: Test invocation-service chart rendering
+        run: |
+          for test in deploy/helm/http-invocation/tests/*_test.sh; do
+            bash "${test}"
+          done
 
       - name: Run self-managed Helmfile render tests
         run: make -C deploy/stacks/self-managed test
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go-toolchain/go.mod
+
+      - name: Verify bundled receipt release inventory
+        env:
+          NVCF_RECEIPT_INVENTORY_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^TestReceiptInventoryIncludesBundledChartAndDefaultHookImage$' -count=1
+
+      - name: Check image coverage for every tracked Helm chart
+        env:
+          NVCF_IMAGE_CATALOG_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
+
+      - name: Check image sources for every Helmfile stack
+        env:
+          NVCF_IMAGE_CATALOG_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
+
+      - name: Test NATS and OpenBao chart image guards
+        env:
+          NVCF_IMAGE_CATALOG_E2E: "1"
+        run: go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
+
       - name: Run observability Helmfile profile tests
         run: make -C deploy/stacks/observability test
+
+      - name: Test LLM request router chart rendering
+        run: make -C deploy/helm/llm-request-router test
+
+      - name: Test grpc-proxy HTTP/3 chart rendering
+        run: bash deploy/helm/grpc-proxy/tests/http3-render.sh
+
+      - name: Run Stargate dev stack render tests
+        run: python3 -m unittest discover -s deploy/stacks/stargate-dev/tests
 
       - name: Test OpenBao auto-unseal retry behavior
         run: bash deploy/helm/openbao/tests/auto-unseal-sidecar.sh
 
-      - name: Test OpenBao plugin catalog refresh hook
-        run: bash deploy/helm/openbao/tests/plugin-catalog-refresh-hook.sh
+      - name: Test OpenBao declarative JWT lifecycle
+        run: |
+          bash deploy/helm/openbao/tests/jwt-plugin-lifecycle.sh
+          sh infra/openbao/tests/verify-runtime-ca-test.sh
+          python3 -B -m unittest discover -s infra/openbao/tests
+          bash migrations/openbao/tests/jwt-plugin-version-test.sh
+
+      - name: Test OpenBao initialization tool requirements
+        run: bash deploy/helm/openbao/tests/init-tool-requirements.sh
 
       - name: Test ReVal authorization configuration
         run: bash deploy/helm/helm-reval/tests/auth-config.sh
+
+      - name: Test NVCT API sidecar release artifacts
+        run: bash deploy/helm/cloud-tasks/tests/sidecar_release_artifacts_test.sh
+
+      - name: Test vanity-gateway chart probes
+        run: bash deploy/helm/vanity-gateway/tests/chart-render/verify-probes.sh
+
+      - name: Test worker callback proxy chart rendering
+        run: bash deploy/helm/worker-callback-proxy/tests/chart-render/verify-render.sh
+
+      - name: Validate worker callback proxy Envoy configuration
+        run: bash deploy/helm/worker-callback-proxy/tests/chart-render/validate-envoy.sh
 
       - name: Check for uncommitted helm dependency artifacts
         run: |
@@ -163,6 +274,7 @@ jobs:
         run: |
           make -C tools/ncp-local-cluster test-cluster-lifecycle-make
           make -C tools/ncp-local-cluster test-multicluster-make
+          make -C tools/ncp-local-cluster test-destroy-all-ncp-local
           make -C tools/ncp-local-cluster test-gateway-timeout-compatibility
 
       # The repo tooling modules carry tests that no workflow ran, so a pull
@@ -216,11 +328,18 @@ jobs:
       - name: Check migrations against the proposed version bump
         env:
           BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           STACK: ${{ matrix.stack }}
         run: |
-          bump="$(tools/ci/release-bump-type for-branch "origin/${BASE_REF}")"
+          bump="$(tools/ci/release-bump-type for-branch "${BASE_SHA}")"
           echo "proposed bump: ${bump}"
-          tools/ci/check-stack-upgrade-policy --stack "${STACK}" --bump "${bump}"
+          args=()
+          # Maintenance PRs change an existing train, which may have synthetic
+          # history. Compare their target branch, not a newer sibling release.
+          if [[ "${BASE_REF}" == release-* ]]; then
+            args+=(--base-ref "${BASE_SHA}")
+          fi
+          tools/ci/check-stack-upgrade-policy --stack "${STACK}" --bump "${bump}" "${args[@]}"
 
   github-release-helper:
     name: GitHub release helper
@@ -236,6 +355,12 @@ jobs:
       - name: Test stack pin branch refresh
         run: bash tools/ci/test-prepare-stack-pin-branch
 
+      - name: Test compute-plane golden refresh on bump branches
+        run: bash tools/ci/test-refresh-compute-plane-goldens
+
+      - name: Test bump workflow push credentials
+        run: bash tools/ci/test-bump-workflow-push
+
       - name: Check Go toolchain declarations agree
         run: tools/ci/check-go-version
 
@@ -248,3 +373,27 @@ jobs:
         run: |
           bash tools/ci/test-check-gazelle
           bash tools/ci/check-gazelle
+
+  stargate-dev-benchmark:
+    name: Stargate development benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: deploy/stacks/stargate-dev/benchmark
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test the benchmark controller
+        run: cargo test --locked --all-targets
+
+      - name: Check Rust diagnostics
+        run: cargo clippy --locked --all-targets -- -D warnings

@@ -27,7 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
 )
 
 func dummyFetcher(yaml string, err error) func(context.Context) (*corev1.ConfigMap, error) {
@@ -259,6 +259,57 @@ miniService:
 		require.NotNil(t, cluster)
 
 		assert.Nil(t, cluster.NVCFBackend.Spec.ClusterConfig.MiniService)
+	})
+}
+
+func TestConfigMapClient_GetCluster_FNDServiceConfig(t *testing.T) {
+	t.Run("maps fndService serviceURL without enabling agent publishing", func(t *testing.T) {
+		yamlWithFNDService := `
+clusterId: test-cluster-id
+clusterName: test-cluster
+fndService:
+  serviceURL: "https://events.example.test"
+`
+		c := newConfigMapClient(nvidiaiov1.EnvTypeProd, dummyFetcher(yamlWithFNDService, nil), DefaultVaultOAuthClientMountPathTemplate)
+		cluster, err := c.GetCluster(context.Background(), "")
+		require.NoError(t, err)
+		require.NotNil(t, cluster)
+
+		fndService := cluster.NVCFBackend.Spec.ClusterConfig.FNDService
+		require.NotNil(t, fndService)
+		assert.Equal(t, "https://events.example.test", fndService.ServiceURL)
+		// The URL only selects where the OTel collector exports. The agent's own
+		// FnDS publishing stays behind its feature flag.
+		assert.Nil(t, fndService.Enabled)
+		assert.False(t, fndService.IsEnabled(nil))
+	})
+
+	t.Run("leaves FNDService nil when not present in DTO", func(t *testing.T) {
+		yamlWithoutFNDService := `
+clusterId: test-cluster-id
+clusterName: test-cluster
+`
+		c := newConfigMapClient(nvidiaiov1.EnvTypeProd, dummyFetcher(yamlWithoutFNDService, nil), DefaultVaultOAuthClientMountPathTemplate)
+		cluster, err := c.GetCluster(context.Background(), "")
+		require.NoError(t, err)
+		require.NotNil(t, cluster)
+
+		assert.Nil(t, cluster.NVCFBackend.Spec.ClusterConfig.FNDService)
+	})
+
+	t.Run("leaves FNDService nil when serviceURL is empty", func(t *testing.T) {
+		yamlWithEmptyURL := `
+clusterId: test-cluster-id
+clusterName: test-cluster
+fndService:
+  serviceURL: ""
+`
+		c := newConfigMapClient(nvidiaiov1.EnvTypeProd, dummyFetcher(yamlWithEmptyURL, nil), DefaultVaultOAuthClientMountPathTemplate)
+		cluster, err := c.GetCluster(context.Background(), "")
+		require.NoError(t, err)
+		require.NotNil(t, cluster)
+
+		assert.Nil(t, cluster.NVCFBackend.Spec.ClusterConfig.FNDService)
 	})
 }
 

@@ -35,10 +35,11 @@ independent.
 
 ## Navigation and links
 
-For current pages, start with `fern/navigation.yml`. Stable editions build
-from their own `docs/releases/X.Y.Z` branch; inspect that branch's navigation
-and source when answering a version-specific question. Historical product
-routes use the matching file under `fern/products/`.
+For current pages, start with `fern/navigation.yml`. Legacy editions build from
+immutable `docs/releases/X.Y.Z` branches. Umbrella versions build the approved
+`docs/versions/X.Y.Z` commit in `fern/editions.yml`. Inspect that approved source
+when answering a version-specific question. Historical product routes use the
+matching file under `fern/products/`.
 
 Confirm each `path:` exists. Treat `href:` as an external destination.
 Use explicit page slugs, and keep section `skip-slug` behavior intact.
@@ -58,8 +59,13 @@ rg -n "<term>" docs/overview docs/self-managed docs/compute-plane docs/observabi
 ## Editing
 
 Edit the owning current source tree for customer changes and `docs/dev/` for
-contributor guides. Changes on `main` update Development. Released docs branches
-are immutable; corrections require a new patch edition.
+contributor guides. Changes on `main` update Development. Legacy
+`docs/releases/` branches are immutable; corrections require a new patch
+edition. Opt-in umbrella entries use maintained `docs/versions/X.Y.Z`
+sources. Their approved docs commit can advance under the same product
+version, while the bound product manifest and artifact pins stay immutable.
+Use `umbrella docs-revise` to prepare a reviewed canonical registry update.
+Do not change the production default before the mixed-version preview gate.
 
 ### Artifact manifest
 
@@ -93,8 +99,11 @@ NVIDIA Cloud Functions glyphs inside green icon boxes must stay white in both mo
 
 Before finishing SVG changes, render light and dark previews for every changed SVG and compare them together for consistent background tone, panel contrast, connector contrast, text readability, and accent brightness.
 
-Use `--update-catalog` only when synchronizing artifact versions and registry
-paths from the latest stable releases of all three stacks. Presentation-only changes to
+Use `--update-catalog` to synchronize artifact versions and registry paths.
+It selects the latest stable releases of all three stacks by default. For an
+assembled umbrella candidate, pass `--release-manifest` and `--inventories`
+together to preserve its exact selection; see the maintainer workflow above.
+This does not qualify or publish the candidate. Presentation-only changes to
 `manifest.entries` use the regeneration command above.
 
 To synchronize the development catalog and generated blocks from the latest
@@ -120,11 +129,13 @@ exact public locations in `publications` and mark unavailable versions in
 `version` so charts, images, and resources with the same name remain distinct.
 Version overrides also require `name` and `type`.
 
-Release a docs edition only after the complete three-stack combination is
-qualified. Use `edition prepare` with exact stack versions and a reviewed
-source commit, then protect and register `docs/releases/X.Y.Z`. Do not cut
-per-stack documentation folders or docs release tags. See
-[the edition release and rollback workflow](dev/docs-editions.md).
+Publish an umbrella or docs edition only after the complete selected
+three-stack combination is qualified. Independent stack source releases and
+inventories can precede that qualification. For
+umbrella versions, follow [the product and maintained docs workflow](dev/umbrella-releases.md).
+For legacy immutable editions, use `edition prepare`, then protect and register
+`docs/releases/X.Y.Z`; see [the edition workflow](dev/docs-editions.md).
+Do not cut per-stack documentation folders or docs release tags.
 
 Generated blocks are marked with comments such as:
 
@@ -155,20 +166,22 @@ DOCS_PREVIEW_ID=nvcf-candidate DOCS_PREVIEW_SKIP_COMMENT=1 \
   DOCS_PREVIEW_CONFIG=fern/candidate.yml tools/ci/preview-docs
 ```
 
-The file must exist directly under `fern/`. The helper stages `docs/` and
-`fern/` in a temporary clone with the original Git remote for branch refs.
+The optional override must exist directly under `fern/` and is used as supplied.
+The helper always stages `docs/` and `fern/` in a temporary clone with the
+original Git remote for branch refs.
 CI and local helpers use the pin in `fern/fern.config.json`; CI uses the
 Node version in `fern/.node-version`.
 
-The edition preview also requires Go. It validates and normalizes current
-cross-tab links in a temporary workspace. Keep explicit page slugs in
-`fern/navigation.yml`. Never run `edition links` against frozen documentation
-trees. `fern/edition-preview.yml` makes Development the default for PR previews.
+Without an override, the helper uses Go to derive a Development-first preview
+from `fern/docs.yml` and normalize current cross-tab links. A prepared release
+branch uses its local default instead. Keep explicit page slugs in
+`fern/navigation.yml`. Run `edition preview` and `edition links` only in a
+disposable clone, never against frozen documentation trees.
 
 Check the staged candidate without publishing a preview:
 
 ```bash
-DOCS_PREVIEW_CONFIG=fern/edition-preview.yml tools/ci/preview-docs --check
+tools/ci/preview-docs --check
 ```
 
 Native release notes live in `fern/changelog/YYYY-MM-DD.mdx`. Keep full release
@@ -196,6 +209,23 @@ Run full docs validation before finishing docs changes:
 
 ```bash
 ./tools/ci/check-docs
+```
+
+The required `docs` PR check validates canonical and Development links with
+Fern, then checks public HTTP links in every added or modified `.md` and `.mdx`
+file under `docs/` and `fern/`. The same check runs in the merge queue. Failed
+links fail the required check. Previews and publication also use Fern's strict
+broken-link validation.
+
+External checks use checksum-pinned Lychee 0.24.2. Results appear in the `docs`
+job log and its `docs-link-report` artifact. There is no recurring audit. Code
+examples are excluded; exact NGC login-page exceptions are documented in
+`tools/ci/docs-links.toml`. Do not suppress whole domains or all 401/403 errors.
+
+Run the external check against a base ref:
+
+```bash
+./tools/ci/check-doc-links origin/main /tmp/docs-link-report.md
 ```
 
 For pure routing or AGENTS.md-only changes, `git diff --check` plus targeted `rg` checks are usually sufficient.

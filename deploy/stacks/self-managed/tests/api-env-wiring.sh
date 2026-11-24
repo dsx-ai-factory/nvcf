@@ -79,7 +79,7 @@ assert_render_failure() {
 }
 
 remote_pylon_expression='.api.remoteConfig.configData.nvcf.sidecars."llm-router-client-image"'
-remote_worker_address_expression='.api.remoteConfig.configData.nvcf."llm-request-router"."worker-address"'
+remote_worker_address_expression='.api.remoteConfig.configData.nvcf.llm."request-router"."worker-address"'
 manifest_pylon_expression='select(.kind == "ConfigMap" and .data."nvcf-api.yaml" != null) | .data."nvcf-api.yaml" | from_yaml | .nvcf.sidecars."llm-router-client-image"'
 
 # The public chart-native path overrides the computed default. Arbitrary remote
@@ -101,8 +101,9 @@ api:
         sidecars:
           llm-router-client-image: mirror.example.test/team/pylon:9.9.9
           retained-setting: keep-inside-sidecars
-        llm-request-router:
-          worker-address: wrong-owner.example.test:1
+        llm:
+          request-router:
+            worker-address: wrong-owner.example.test:1
   env:
     CUSTOM_API_ENV: configured
     LITERAL_TEMPLATE_VALUE: '{{ requiredEnv "DO_NOT_EVALUATE_API_ENV" }}'
@@ -139,7 +140,7 @@ assert_yaml_value "$explicit_manifest" \
   'select(.kind == "ConfigMap" and .data."nvcf-api.yaml" != null) | .data."nvcf-api.yaml" | from_yaml | .nvcf.sidecars.retained-setting' \
   keep-inside-sidecars "rendered nested sidecar remote config"
 
-# With no explicit value, the enabled LLM addon derives Pylon 0.18.0 from the
+# With no explicit value, the enabled LLM addon derives Pylon 0.25.0 from the
 # effective worker-sidecar registry rather than the control-plane image path.
 write_environment <<'EOF'
 global:
@@ -157,7 +158,7 @@ EOF
 default_values="$work_dir/default-values.yaml"
 render_api_values "$default_values" >/dev/null
 assert_yaml_value "$default_values" "$remote_pylon_expression" \
-  registry.example.test/team/sidecars/pylon:0.18.0 "computed Pylon default"
+  registry.example.test/team/sidecars/pylon:0.25.0 "computed Pylon default"
 
 # Local BDD fixtures rely on the same computed default after their registry
 # paths are configured. They must not carry unresolved fixture placeholders
@@ -174,8 +175,8 @@ for fixture_name in self-managed-local-bdd.yaml self-managed-local-bdd-multi.yam
   fixture_pylon_image="$(yq -r "$remote_pylon_expression" "$fixture_values")"
   [[ "$fixture_pylon_image" != *REPLACE_WITH_* ]] ||
     fail "$fixture_name Pylon property retained an unresolved fixture placeholder"
-  [[ "$fixture_pylon_image" == nvcr.io/sample-org/sample-team/pylon:0.18.0 ]] ||
-    fail "$fixture_name Pylon property: expected computed 0.18.0 image, got $fixture_pylon_image"
+  [[ "$fixture_pylon_image" == nvcr.io/sample-org/sample-team/pylon:0.25.0 ]] ||
+    fail "$fixture_name Pylon property: expected computed 0.25.0 image, got $fixture_pylon_image"
 done
 
 # The deprecated env key remains accepted for one compatibility window, but

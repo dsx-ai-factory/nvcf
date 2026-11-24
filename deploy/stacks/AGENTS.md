@@ -16,8 +16,9 @@ resource.
 - Each stack releases from its own `release-deploy/stacks/<stack>/vX.Y`
   branch and advances its trains independently. All three started at `1.0.0`.
 - Each stack has its own documentation tree (`docs/self-managed/`,
-  `docs/compute-plane/`, `docs/observability/`) published as a Fern product
-  with its own version list. Shared pages live in `docs/overview/`.
+  `docs/compute-plane/`, `docs/observability/`) published as a Fern tab. One
+  docs release selector records the qualified combination. Shared pages live
+  in `docs/overview/`. Follow `docs/dev/docs-editions.md` for docs releases.
 - Do not reference another stack's Helmfile state from an inventory config.
 - Keep a dependency in the stack that installs or creates it.
 - Follow the nearest nested `AGENTS.md` when it adds stack-specific guidance.
@@ -30,6 +31,9 @@ For every dependency change:
 2. Give an optional release an explicit condition and inventory render profile.
 3. Update the owning stack's `release-inventory.yaml`.
 4. Add registry and repository overrides for images that customers must mirror.
+   Declare every image registry and repository in the stack's
+   `environments/base.yaml`, with no literal default in a `.gotmpl` file.
+   `TestStackImageSources` in `tools/docs-version-sync` enforces this.
 5. Record images that do not appear in rendered Kubernetes `image` fields.
 6. Update the artifact classification in `docs/version-catalog/main.yaml`.
 7. If the change alters which trains of another stack this stack works with,
@@ -64,6 +68,7 @@ make -C deploy/stacks/self-managed test
 make -C deploy/stacks/nvcf-compute-plane test-local
 make -C deploy/stacks/observability test
 go test -C tools/docs-version-sync ./...
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
 go run -C tools/docs-version-sync . --target main
 ./tools/ci/check-doc-version-sync
 ./tools/ci/check-docs

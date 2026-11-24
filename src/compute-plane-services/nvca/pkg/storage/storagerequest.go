@@ -22,16 +22,16 @@ import (
 	"os"
 	"strings"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	nvcav2beta1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
-	nvcatypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 const (
@@ -219,6 +219,9 @@ func NewRequeueableStorageError(message string) error {
 	return fmt.Errorf("%s - %s", message, requeableStorageErrorToken)
 }
 
+// GetStorageRequestErrorLog returns a user-facing explanation for a failed
+// StorageRequest, preferring the recorded cause of a rejected shared-storage
+// object over the generic phase message. It returns "" for healthy requests.
 func GetStorageRequestErrorLog(st *nvcav2beta1.StorageRequest) string {
 	// Check for shared storage failure condition
 	if st.Status.Phase == nvcav2beta1.StorageFailed || st.Status.Phase == nvcav2beta1.StorageRuntimeError {
@@ -228,6 +231,14 @@ func GetStorageRequestErrorLog(st *nvcav2beta1.StorageRequest) string {
 				return fmt.Sprintf("%s driver must be installed when %s feature flag is enabled. "+
 					"Please contact your cluster administrator to install the driver.",
 					SMBCSIDriverName, featureflag.HelmSharedStorage.Key)
+			}
+			if condition.Type == ConditionTypeSharedStorageResourcesCreated &&
+				condition.Status == metav1.ConditionFalse && condition.Message != "" {
+				return condition.Message
+			}
+			if condition.Type == ConditionTypeSMBServerReady &&
+				condition.Status == metav1.ConditionFalse && condition.Message != "" {
+				return condition.Message
 			}
 		}
 		return fmt.Sprintf("storage request %s is in %s phase", st.Name, st.Status.Phase)

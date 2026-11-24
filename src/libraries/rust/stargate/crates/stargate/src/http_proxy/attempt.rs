@@ -17,11 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use stargate_protocol::tunnel_contract::{
-    HEADER_INFERENCE_SERVER_ID as HEADER_CHOSEN_INFERENCE_SERVER_ID, HEADER_STARGATE_RETRY_REASON,
-    HEADER_STARGATE_RETRYABLE,
+    HEADER_INFERENCE_SERVER_ID as HEADER_CHOSEN_INFERENCE_SERVER_ID, HEADER_STARGATE_ERROR_CODE,
+    HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE, RETRY_REASON_LOCAL_CONNECT_FAILURE,
+    RETRY_REASON_MODEL_GENERATION_UNAVAILABLE, RETRY_REASON_UPSTREAM_OVERLOADED,
 };
 use tracing::{Instrument, Span, field, info, warn};
 
@@ -31,7 +32,8 @@ use super::ProxyAppState;
 use super::retry::{
     FinalRetryDisposition, RetryDecision, UpstreamRetry, decide_proxy_error_retry,
     decide_upstream_response_retry, header_str, is_internal_capacity_rejection,
-    retry_budget_has_remaining, should_release_queue_mismatch_reservation,
+    is_model_server_error_reason, retry_budget_has_remaining,
+    should_release_queue_mismatch_reservation,
 };
 use super::routing::overloaded_response;
 use super::run::{ProxyRequestRun, SelectedClusterRun};
@@ -43,11 +45,22 @@ use super::upstream::{
 const HEADER_CHOSEN_INFERENCE_SERVER_URL: &str = "x-inference-server-url";
 const HEADER_CHOSEN_CLUSTER_ID: &str = "x-stargate-cluster-id";
 
+fn clamp_routing_reservation_ttl(
+    rtt: std::time::Duration,
+    min: std::time::Duration,
+    max: std::time::Duration,
+) -> std::time::Duration {
+    // Startup rejects min > max; `Duration::clamp` would panic on every
+    // dispatch if a programmatic config bypassed that check, so max wins.
+    rtt.max(min).min(max)
+}
+
 #[derive(Default)]
 pub(super) struct ProxyAttemptCounters {
     pub(super) attempt: u32,
     connect_retries: u32,
     request_retries: u32,
+    has_non_overload_retry: bool,
 }
 
 pub(super) enum ProxyAttemptOutcome {
@@ -112,11 +125,24 @@ impl ProxyRequestRun<'_> {
             }
         }
 
-        let reservation: Option<RoutingReservation> = selected.cluster.reserve_backend(
-            &chosen.registration,
-            self.request.request_inputs.input_tokens,
-            self.request.request_inputs.priority,
-        );
+        let reservation: Option<RoutingReservation> =
+            selected.cluster.reserve_backend_with_rtt_ttl(
+                &chosen.registration,
+                self.request.request_inputs.input_tokens,
+                self.request.request_inputs.priority,
+                |rtt| {
+                    clamp_routing_reservation_ttl(
+                        rtt,
+                        self.app.routing_reservation_ttl_min,
+                        self.app.routing_reservation_ttl_max,
+                    )
+                },
+                self.app.metrics.clone(),
+                &crate::routing_state::RoutingTargetKey::new(
+                    self.routing_key().map(str::to_owned),
+                    self.model_id(),
+                ),
+            );
         record_proxy_attempt_start(self, selected, chosen);
 
         let upstream_span = proxy_upstream_attempt_span(self, selected, chosen);
@@ -142,6 +168,13 @@ impl ProxyRequestRun<'_> {
             &self.request.path_and_query,
             attempt_headers,
             || {
+                // The tunnel calls this after opening the stream and sending
+                // the request head, so the soft expiry starts only once the
+                // request has left Stargate. Attempts that end earlier arm
+                // when the reservation is dropped.
+                if let Some(reservation) = &reservation {
+                    reservation.arm();
+                }
                 let body = self.request.replay_body.body_for_attempt()?;
                 // After handing the body to the tunnel, a transport failure
                 // cannot establish whether the backend applied this POST.
@@ -217,6 +250,13 @@ impl ProxyRequestRun<'_> {
             }
             RetryDecision::Retry(retry) => retry,
         };
+        if let UpstreamRetry::AlternateCluster(reason) = &retry
+            && is_model_server_error_reason(reason)
+            && !self.has_untried_cluster(&chosen.cluster_id).await
+        {
+            let disposition = FinalRetryDisposition::Exhausted(reason.clone());
+            return finish_attempt(self, chosen, disposition, Ok(upstream));
+        }
         let (outcome, retry_reason, message) = match retry {
             UpstreamRetry::AlternateBackend(reason) => (
                 ProxyAttemptOutcome::RetryAlternateBackend(chosen.inference_server_id.clone()),
@@ -230,6 +270,9 @@ impl ProxyRequestRun<'_> {
             ),
         };
         self.attempt_counters.request_retries += 1;
+        if retry_reason != RETRY_REASON_UPSTREAM_OVERLOADED {
+            self.attempt_counters.has_non_overload_retry = true;
+        }
         self.record_retry(&retry_reason);
         warn!(
             inference_server_id = %chosen.inference_server_id,
@@ -367,6 +410,14 @@ fn finish_attempt(
     if let Some(retry_reason) = disposition.retry_reason() {
         Span::current().record("proxy.retry_reason", retry_reason);
     }
+    // When every instance this request tried was overloaded, the client gets
+    // the router's overload answer, as for an overloaded single backend.
+    let every_attempt_overloaded = matches!(disposition, FinalRetryDisposition::Exhausted(_))
+        && !run.attempt_counters.has_non_overload_retry
+        && upstream.as_ref().is_ok_and(|response| {
+            header_str(&response.headers, HEADER_STARGATE_RETRY_REASON)
+                == Some(RETRY_REASON_UPSTREAM_OVERLOADED)
+        });
     let upstream = match disposition {
         FinalRetryDisposition::PassThrough | FinalRetryDisposition::ReplayIncomplete(_) => upstream,
         FinalRetryDisposition::AmbiguousDelivery => {
@@ -381,9 +432,10 @@ fn finish_attempt(
         }
         FinalRetryDisposition::PayloadTooLarge(_) => Err(StatusCode::PAYLOAD_TOO_LARGE),
     };
-    let capacity_rejected = upstream
-        .as_ref()
-        .is_ok_and(|response| is_internal_capacity_rejection(response.status, &response.headers));
+    let capacity_rejected = every_attempt_overloaded
+        || upstream.as_ref().is_ok_and(|response| {
+            is_internal_capacity_rejection(response.status, &response.headers)
+        });
     let status = if capacity_rejected {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -487,6 +539,9 @@ fn build_proxy_response(
     *response.status_mut() = upstream.status;
     let response_headers = response.headers_mut();
     copy_forwardable_headers(&upstream.headers, response_headers);
+    if let Some(code) = pylon_error_code(upstream.status, &upstream.headers) {
+        response_headers.insert(HeaderName::from_static(HEADER_STARGATE_ERROR_CODE), code);
+    }
     for (name, value) in [
         (
             HEADER_CHOSEN_INFERENCE_SERVER_ID,
@@ -504,6 +559,27 @@ fn build_proxy_response(
         );
     }
     Ok(response)
+}
+
+/// The error code of a response Pylon generated itself. Pylon marks those
+/// responses and strips the header from backend responses. Older Pylon builds
+/// leave it out, so their own failures are recognized by retry reason.
+fn pylon_error_code(status: StatusCode, headers: &HeaderMap) -> Option<HeaderValue> {
+    if status.is_success() {
+        return None;
+    }
+    if let Some(code) = headers.get(HEADER_STARGATE_ERROR_CODE) {
+        return Some(code.clone());
+    }
+    match header_str(headers, HEADER_STARGATE_RETRY_REASON)? {
+        RETRY_REASON_LOCAL_CONNECT_FAILURE => {
+            Some(HeaderValue::from_static(RETRY_REASON_LOCAL_CONNECT_FAILURE))
+        }
+        RETRY_REASON_MODEL_GENERATION_UNAVAILABLE => Some(HeaderValue::from_static(
+            RETRY_REASON_MODEL_GENERATION_UNAVAILABLE,
+        )),
+        _ => None,
+    }
 }
 
 fn record_upstream_result_to_span(
@@ -532,25 +608,258 @@ fn upstream_status(result: &Result<UpstreamStreamingResponse, StatusCode>) -> St
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, Method};
+    use prometheus::Encoder;
     use stargate_proto::pb::{InferenceServerStatus, ModelStats};
-    use stargate_protocol::tunnel_contract::HEADER_STARGATE_RETRY_AFTER_MS;
+    use stargate_protocol::tunnel_contract::{
+        HEADER_INPUT_TOKENS, HEADER_MODEL, HEADER_REQUEST_ID, HEADER_STARGATE_RETRY_AFTER_MS,
+    };
     use std::time::Duration;
 
     use super::super::HEADER_STARGATE_ERROR_CODE;
-    use super::super::request::ProxyRequestInputs;
+    use super::super::request::{ProxyRequestInputs, parse_proxy_request_inputs};
     use super::super::retry::ReplayableRequestBody;
     use super::super::run::PreparedProxyRequest;
     use super::super::test_support::test_proxy_app_state;
+    use crate::load_balancer::LoadBalancerCandidateChoice;
     use crate::routing_state::{
-        RegistrationIdentity, RoutingTargetKey, test_registration_generation,
+        RegistrationIdentity, RoutingTargetKey, StargateState, test_registration_generation,
     };
+
+    fn chat_request_inputs(target: RoutingTargetKey) -> ProxyRequestInputs {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_REQUEST_ID, "req-1".parse().unwrap());
+        headers.insert(HEADER_MODEL, target.model_id.parse().unwrap());
+        headers.insert(HEADER_INPUT_TOKENS, "10".parse().unwrap());
+        let mut inputs = parse_proxy_request_inputs(&headers).unwrap();
+        inputs.target = target;
+        inputs
+    }
+
+    #[test]
+    fn reservation_ttl_is_clamped_to_the_configured_bounds() {
+        let min = Duration::from_millis(1);
+        let max = Duration::from_millis(1000);
+
+        assert_eq!(clamp_routing_reservation_ttl(Duration::ZERO, min, max), min);
+        assert_eq!(
+            clamp_routing_reservation_ttl(Duration::from_millis(60), min, max),
+            Duration::from_millis(60)
+        );
+        assert_eq!(
+            clamp_routing_reservation_ttl(Duration::from_secs(5), min, max),
+            max
+        );
+    }
+
+    #[test]
+    fn reservation_ttl_clamp_does_not_panic_on_inverted_bounds() {
+        let min = Duration::from_millis(20);
+        let max = Duration::from_millis(10);
+
+        for rtt in [Duration::ZERO, Duration::from_millis(15), Duration::MAX] {
+            assert_eq!(clamp_routing_reservation_ttl(rtt, min, max), max);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_reservation_ttl_uses_the_selected_backends_rtt() {
+        let mut app = test_proxy_app_state();
+        app.state = Arc::new(StargateState::new_with_metrics(app.metrics.clone()));
+        let target = RoutingTargetKey::new(Some("tenant-a".to_string()), "model-a");
+
+        for (backend_id, port, rtt_ms) in [("fast", 5001, 10), ("slow", 5002, 100)] {
+            let identity = RegistrationIdentity {
+                inference_server_id: backend_id.to_string(),
+                cluster_id: "cluster-a".to_string(),
+                inference_server_url: format!("quic://127.0.0.1:{port}"),
+                routing_key: target.routing_key.clone(),
+                reverse_tunnel: true,
+            };
+            let registration = app.state.begin_registration(&identity).unwrap();
+            let update = stargate_proto::pb::InferenceServerRegistration {
+                inference_server_id: identity.inference_server_id.clone(),
+                cluster_id: identity.cluster_id.clone(),
+                inference_server_url: identity.inference_server_url.clone(),
+                models: std::collections::HashMap::from([(
+                    target.model_id.clone(),
+                    stargate_proto::pb::InferenceServerModelRegistration {
+                        stats: Some(ModelStats {
+                            last_mean_input_tps: 100.0,
+                            queue_time_estimate_ms_by_priority: std::collections::HashMap::from([
+                                (0, 10),
+                            ]),
+                            ..ModelStats::default()
+                        }),
+                        status: InferenceServerStatus::Active.into(),
+                    },
+                )]),
+                reverse_tunnel: true,
+            };
+            app.state
+                .apply_registration_update(
+                    &registration,
+                    &update,
+                    true,
+                    Some(Duration::from_millis(rtt_ms)),
+                )
+                .await;
+        }
+
+        let candidates = app.state.candidates_for_target(&target).await;
+        let chosen = Arc::new(
+            candidates
+                .into_iter()
+                .min_by_key(|candidate| candidate.rtt)
+                .expect("both backends should be routable"),
+        );
+        assert_eq!(chosen.inference_server_id, "fast");
+        assert_eq!(chosen.rtt, Duration::from_millis(10));
+
+        let target_snapshot = app
+            .state
+            .routing_target_snapshot(&target)
+            .await
+            .expect("registered backends should produce a target snapshot");
+        let resolution = app
+            .lb_router
+            .resolve_algorithm_override(&target.model_id, None)
+            .unwrap();
+        let selected = super::super::run::SelectedClusterRun::new(
+            target_snapshot,
+            resolution.selection(LoadBalancerCandidateChoice::with_rank_depth_1(0)),
+            0,
+        );
+        let request = PreparedProxyRequest {
+            lb_resolution: resolution,
+            request_inputs: chat_request_inputs(target),
+            endpoint_name: "chat_completions",
+            method: Method::POST,
+            path_and_query: "/v1/chat/completions".to_string(),
+            forwarded_headers: HeaderMap::new(),
+            retry_deadline: None,
+            request_start: Instant::now(),
+            replay_body: ReplayableRequestBody::new(&HeaderMap::new(), Body::empty(), 1024)
+                .unwrap(),
+        };
+        let mut run = ProxyRequestRun::new(&app, request);
+        let _ = run.run_proxy_attempt(&selected, &chosen).await;
+
+        let mut encoded = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&app.metrics.registry().gather(), &mut encoded)
+            .unwrap();
+        let metrics = String::from_utf8(encoded).unwrap();
+        assert!(metrics.contains(
+            "stargate_routing_reservation_ttl_seconds_sum{model=\"model-a\",routing_key=\"tenant-a\"} 0.01"
+        ));
+        assert!(metrics.contains(
+            "stargate_routing_reservations_active{model=\"model-a\",routing_key=\"tenant-a\"} 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_backend_retry_reserves_with_the_current_backend_rtt() {
+        let mut app = test_proxy_app_state();
+        app.state = Arc::new(StargateState::new_with_metrics(app.metrics.clone()));
+        let target = RoutingTargetKey::new(Some("tenant-a".to_string()), "model-a");
+        let identity = RegistrationIdentity {
+            inference_server_id: "backend-a".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            inference_server_url: "quic://127.0.0.1:5001".to_string(),
+            routing_key: target.routing_key.clone(),
+            reverse_tunnel: true,
+        };
+        let registration = app.state.begin_registration(&identity).unwrap();
+        let update = stargate_proto::pb::InferenceServerRegistration {
+            inference_server_id: identity.inference_server_id.clone(),
+            cluster_id: identity.cluster_id.clone(),
+            inference_server_url: identity.inference_server_url.clone(),
+            models: std::collections::HashMap::from([(
+                target.model_id.clone(),
+                stargate_proto::pb::InferenceServerModelRegistration {
+                    stats: Some(ModelStats::default()),
+                    status: InferenceServerStatus::Active.into(),
+                },
+            )]),
+            reverse_tunnel: true,
+        };
+        app.state
+            .apply_registration_update(
+                &registration,
+                &update,
+                true,
+                Some(Duration::from_millis(60)),
+            )
+            .await;
+        let resolution = app
+            .lb_router
+            .resolve_algorithm_override(&target.model_id, None)
+            .unwrap();
+        let selected = super::super::run::SelectedClusterRun::new(
+            app.state
+                .routing_target_snapshot(&target)
+                .await
+                .expect("registered backend should produce a target snapshot"),
+            resolution.selection(LoadBalancerCandidateChoice::with_rank_depth_1(0)),
+            0,
+        );
+        // A same-backend retry reuses the snapshot chosen for the first attempt.
+        let retained = selected
+            .cluster
+            .select_backend(&std::collections::HashSet::new())
+            .expect("registered backend should be selectable");
+        assert_eq!(retained.rtt, Duration::from_millis(60));
+
+        app.state
+            .apply_registration_update(
+                &registration,
+                &update,
+                true,
+                Some(Duration::from_millis(200)),
+            )
+            .await;
+        let request = PreparedProxyRequest {
+            lb_resolution: resolution,
+            request_inputs: chat_request_inputs(target),
+            endpoint_name: "chat_completions",
+            method: Method::POST,
+            path_and_query: "/v1/chat/completions".to_string(),
+            forwarded_headers: HeaderMap::new(),
+            retry_deadline: None,
+            request_start: Instant::now(),
+            replay_body: ReplayableRequestBody::new(&HeaderMap::new(), Body::empty(), 1024)
+                .unwrap(),
+        };
+        let mut run = ProxyRequestRun::new(&app, request);
+        let _ = run.run_proxy_attempt(&selected, &retained).await;
+
+        let ttl = app
+            .metrics
+            .routing_reservation_ttl_seconds(Some("tenant-a"), "model-a");
+        assert_eq!(ttl.get_sample_count(), 1);
+        assert_eq!(
+            Duration::from_secs_f64(ttl.get_sample_sum()),
+            Duration::from_millis(200),
+            "a new dispatch must use the backend's current RTT, not the retained snapshot"
+        );
+        app.state.end_registration(registration).await;
+    }
 
     fn finish_response(
         disposition: FinalRetryDisposition,
         status: StatusCode,
         headers: HeaderMap,
     ) -> ProxyAttemptOutcome {
-        let app = test_proxy_app_state();
+        finish_response_on(&test_proxy_app_state(), false, disposition, status, headers)
+    }
+
+    fn finish_response_on(
+        app: &ProxyAppState,
+        has_non_overload_retry: bool,
+        disposition: FinalRetryDisposition,
+        status: StatusCode,
+        headers: HeaderMap,
+    ) -> ProxyAttemptOutcome {
         let target = RoutingTargetKey::new(None, "model-a");
         let request = PreparedProxyRequest {
             lb_resolution: app
@@ -558,6 +867,7 @@ mod tests {
                 .resolve_algorithm_override(&target.model_id, None)
                 .unwrap(),
             request_inputs: ProxyRequestInputs {
+                request_id: "req-1".to_string(),
                 target,
                 input_tokens: 1,
                 priority: 0,
@@ -565,6 +875,8 @@ mod tests {
                 request_slo_ms: None,
                 cache_affinity_key: None,
                 routing_algorithm_override: None,
+                routing_expression: None,
+                last_cluster: Default::default(),
             },
             endpoint_name: "chat_completions",
             method: Method::POST,
@@ -575,7 +887,8 @@ mod tests {
             replay_body: ReplayableRequestBody::new(&HeaderMap::new(), Body::empty(), 1024)
                 .unwrap(),
         };
-        let run = ProxyRequestRun::new(&app, request);
+        let mut run = ProxyRequestRun::new(app, request);
+        run.attempt_counters.has_non_overload_retry = has_non_overload_retry;
         let chosen = RoutedInferenceServerSnapshot {
             registration: test_registration_generation(RegistrationIdentity {
                 inference_server_id: "backend-a".to_string(),
@@ -590,6 +903,7 @@ mod tests {
             stats: ModelStats::default(),
             rtt: Duration::from_millis(1),
             snapshot_updated_at: Instant::now(),
+            update_received_at: Instant::now(),
             status: InferenceServerStatus::Active,
             reverse_tunnel: false,
         };
@@ -704,5 +1018,133 @@ mod tests {
             ),
             ProxyAttemptOutcome::ProxyError(StatusCode::PAYLOAD_TOO_LARGE)
         ));
+    }
+
+    #[tokio::test]
+    async fn pylon_generated_errors_keep_a_router_error_code() {
+        let header = |name: &'static str, value: &'static str| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        };
+        let marked = HeaderMap::from_iter([
+            header(HEADER_STARGATE_ERROR_CODE, "local_connect_failure"),
+            header(HEADER_STARGATE_RETRYABLE, "true"),
+            header(HEADER_STARGATE_RETRY_REASON, "local_connect_failure"),
+        ]);
+        // Pylon builds without the marker still name their own failures in
+        // the retry reason.
+        let older_connect_failure = HeaderMap::from_iter([
+            header(HEADER_STARGATE_RETRYABLE, "false"),
+            header(HEADER_STARGATE_RETRY_REASON, "local_connect_failure"),
+        ]);
+        let older_generation = HeaderMap::from_iter([
+            header(HEADER_STARGATE_RETRYABLE, "true"),
+            header(HEADER_STARGATE_RETRY_REASON, "model_generation_unavailable"),
+        ]);
+        for (headers, code) in [
+            (marked, "local_connect_failure"),
+            (older_connect_failure, "local_connect_failure"),
+            (older_generation, "model_generation_unavailable"),
+        ] {
+            for disposition in [
+                FinalRetryDisposition::PassThrough,
+                FinalRetryDisposition::Exhausted("local_connect_failure".to_string()),
+            ] {
+                let ProxyAttemptOutcome::ReturnFinal(response) = finish_response(
+                    disposition.clone(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    headers.clone(),
+                ) else {
+                    panic!("expected the Pylon response")
+                };
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response.headers()[HEADER_STARGATE_ERROR_CODE],
+                    code,
+                    "{disposition:?}"
+                );
+                assert!(
+                    !response
+                        .headers()
+                        .contains_key(HEADER_STARGATE_RETRY_REASON)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_errors_stay_unmarked_after_retries() {
+        let backend_rejection = HeaderMap::from_iter([
+            (
+                HeaderName::from_static(HEADER_STARGATE_RETRYABLE),
+                HeaderValue::from_static("true"),
+            ),
+            (
+                HeaderName::from_static(HEADER_STARGATE_RETRY_REASON),
+                HeaderValue::from_static("upstream_admission_rejected"),
+            ),
+        ]);
+        let ProxyAttemptOutcome::ReturnFinal(response) = finish_response(
+            FinalRetryDisposition::Exhausted("upstream_admission_rejected".to_string()),
+            StatusCode::TOO_MANY_REQUESTS,
+            backend_rejection,
+        ) else {
+            panic!("expected the backend response")
+        };
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(HEADER_STARGATE_ERROR_CODE));
+    }
+
+    #[tokio::test]
+    async fn exhausted_model_server_errors_answer_by_what_the_request_tried() {
+        // (label, status and retry reason of the last response, whether an
+        // earlier attempt failed another way, client status, client error code)
+        #[rustfmt::skip] // one case per line
+        let cases = [
+            ("every_attempt_overloaded", 529, "upstream_overloaded", false, 503, Some("overloaded_error")),
+            ("overloaded_after_another_error", 529, "upstream_overloaded", true, 529, None),
+            ("unavailable", 503, "upstream_unavailable", false, 503, None),
+            ("model_unregistered", 404, "upstream_model_unregistered", false, 404, None),
+        ];
+        for (label, status, reason, has_non_overload_retry, client_status, error_code) in cases {
+            let app = test_proxy_app_state();
+            let headers = HeaderMap::from_iter([
+                (
+                    HeaderName::from_static(HEADER_STARGATE_RETRYABLE),
+                    HeaderValue::from_static("true"),
+                ),
+                (
+                    HeaderName::from_static(HEADER_STARGATE_RETRY_REASON),
+                    HeaderValue::from_static(reason),
+                ),
+            ]);
+            let ProxyAttemptOutcome::ReturnFinal(response) = finish_response_on(
+                &app,
+                has_non_overload_retry,
+                FinalRetryDisposition::Exhausted(reason.to_string()),
+                StatusCode::from_u16(status).unwrap(),
+                headers,
+            ) else {
+                panic!("{label}: expected a final response")
+            };
+            assert_eq!(response.status().as_u16(), client_status, "{label}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(HEADER_STARGATE_ERROR_CODE)
+                    .map(|code| code.to_str().unwrap()),
+                error_code,
+                "{label}"
+            );
+            assert_eq!(
+                app.metrics
+                    .proxy_retry_exhausted_total(None, "model-a", reason)
+                    .get(),
+                1,
+                "{label}"
+            );
+        }
     }
 }

@@ -27,9 +27,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	translateutil "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	translateutil "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
 )
 
 // translateContainerUtilsDeploy converts a container function request into an
@@ -233,10 +233,11 @@ func translateContainerUtilsDeploy(t CreationQueueMessage, tcfg TranslateConfig)
 			Image:           initContainerImage,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             common.SortEnvs(initEnvs),
-			SecurityContext: common.NewInfraContainerSecurityContext(),
+			SecurityContext: common.NewWorkerInitContainerSecurityContext(),
 			VolumeMounts:    initContainerVolumeMounts,
 		}
 		inferencePod.Spec.InitContainers = append(inferencePod.Spec.InitContainers, initContainer)
+		common.EnsureWorkerInitFSGroup(&inferencePod.Spec)
 
 		objs = append(objs, inferencePod)
 	}
@@ -517,10 +518,11 @@ func getUtilsDeploymentAndSecrets(t CreationQueueMessage, tcfg TranslateConfig) 
 		Image:           initContainerImage,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Env:             common.SortEnvs(initEnvs),
-		SecurityContext: common.NewInfraContainerSecurityContext(),
+		SecurityContext: common.NewWorkerInitContainerSecurityContext(),
 		VolumeMounts:    initContainerVolumeMounts,
 	}
 	utilsPod.Spec.InitContainers = append(utilsPod.Spec.InitContainers, initContainer)
+	common.EnsureWorkerInitFSGroup(&utilsPod.Spec)
 
 	// The ESS init container needs to be added after the init container,
 	// since the init container creates config.hcl.
@@ -539,6 +541,7 @@ func getUtilsDeploymentAndSecrets(t CreationQueueMessage, tcfg TranslateConfig) 
 			essDataVolumeMount,
 		}
 		utilsPod.Spec.InitContainers = append(utilsPod.Spec.InitContainers, essInitContainer)
+		common.EnsureESSFSGroup(&utilsPod.Spec)
 	}
 
 	utilsContainer := corev1.Container{
@@ -570,6 +573,7 @@ func getUtilsDeploymentAndSecrets(t CreationQueueMessage, tcfg TranslateConfig) 
 					Annotations: commonAnnotations,
 				},
 				Spec: corev1.PodSpec{
+					SecurityContext:               utilsPod.Spec.SecurityContext,
 					AutomountServiceAccountToken:  translateutil.NewBoolPtr(false),
 					TerminationGracePeriodSeconds: new(int64),
 					Affinity:                      &corev1.Affinity{},

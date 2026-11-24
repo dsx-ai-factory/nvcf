@@ -29,8 +29,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/config"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/provider"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/config"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/provider"
 )
 
 const (
@@ -326,7 +326,7 @@ func TestNewWrapsEchoWithFinalWriteDeadline(t *testing.T) {
 	}
 	// e.Start would reset the handler to e and drop the final write
 	// deadline; main serves through Start, which keeps it.
-	if e.Server.Handler == http.Handler(e) {
+	if e.Server.Handler == http.Handler(e.Echo) {
 		t.Fatal("server handler is the bare Echo instance")
 	}
 }

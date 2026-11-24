@@ -132,6 +132,10 @@ Control-plane defaults scrape `state-metrics`, `invocation-service`,
 `grpc-proxy`, `llm-api-gateway`, and `function-autoscaler` in `nvcf`.
 Compute defaults select NVCA in `nvca-system`, DCGM pods by their NVCA
 metrics label, and NVCA-managed workload pods by `icms-request-id`.
+The worker and DCGM PodMonitors set the `job` label to `nvcf-worker` and
+`nvidia-dcgm-exporter` through `jobName`. BYOO platform metrics federation
+selects series by these names, so keep them aligned with the collector
+templates.
 
 The default observability namespace is `monitoring`. A different namespace
 also requires NetworkPolicy reachability to the collector.
@@ -153,6 +157,17 @@ fixture and review its diff:
 make generate-test-golden
 git diff -- tests/golden/profile-matrix.txt
 ```
+
+A stack release publishes each chart under `charts/` at its `Chart.yaml`
+version. When a chart changes after a stack release, bump its `version` and
+`appVersion`. `tests/chart-versions.sh` compares each chart with every
+published stack release and release candidate, on any train. It fails when a
+chart has no `appVersion`, or when the content differs from a release but keeps
+that release's `version` or `appVersion`. Untracked files in a chart count as
+changes unless Git ignores them; releases build from a clean checkout, so
+ignored files never ship. It skips the check when no release tag is available
+locally. `tests/chart-versions-selftest.sh` runs it against a scratch
+repository.
 
 Confirm that every changed row matches the intended profile contract before
 committing the fixture.

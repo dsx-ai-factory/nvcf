@@ -37,7 +37,9 @@ All Pod specs in your helm chart will be updated with pull secrets at runtime, s
 
    - NVCF uses `helmChartServiceName` for readiness checks and function
      metrics. It must match the service that exposes the `mini-service` entry
-     point. Templated service names are not supported.
+     point. Templated service names are not supported. The name must be a DNS
+     label: at most 63 letters, digits, or hyphens, starting and ending with a
+     letter or digit. The API rejects other values.
 
    - Important: The Helm chart name should not contain underscores or other special symbols, as that may cause issues during deployment.
 
@@ -58,7 +60,7 @@ curl -s -X POST "http://${GATEWAY_ADDR}/v2/nvcf/functions" \
     "inferenceUrl": "v2/models/model_name/versions/model_version/infer",
     "inferencePort": 8001,
     "helmChart": "oci://'${REGISTRY}'/'${REPOSITORY}'/charts/inference-test-1.0.tgz",
-    "helmChartServiceName": "service_name",
+    "helmChartServiceName": "entrypoint",
     "apiBodyFormat": "CUSTOM"
 }'
 ```
@@ -95,12 +97,29 @@ NVCA will create a
 to connect GPU workload Pods through IMEX.
 
 <Note>
-Each GPU-enabled Pod must request a full node of GPUs.
+Each GPU-enabled Pod that uses the `ComputeDomain` must request a full node of GPUs.
 </Note>
 
 A function that does not need cross-node NVLink memory sharing can opt out of
 `ComputeDomain` allocation with the `DisableNVLinkComputeDomain` workload
 feature flag. See [Workload configuration](#workload-configuration).
+
+To opt out only some of a function's Pods, set this annotation on their Pod
+template:
+
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        dra.nvcf.nvidia.io/disable-compute-domain: "true"
+```
+
+NVCA skips all the NVLink mutations described below for an annotated Pod. The
+Pod gets no IMEX channel, so it cannot use cross-node NVLink, but it does not
+need a full node and is not drawn to the function's GPU clique. The function's
+other Pods keep the `ComputeDomain`. For example, prefill workers that use part
+of a node can share nodes while decode workers span nodes over NVLink.
 
 #### Legacy NVCA NVLink partition annotation
 
@@ -140,7 +159,8 @@ rack or clique:
   require the groups to use different GPU cliques.
 - Pods without the annotation share a default logical group.
 
-On an NVLink-optimized cluster, NVCA mutates each admitted Pod as follows:
+On an NVLink-optimized cluster, NVCA mutates each admitted Pod that has not
+opted out of the `ComputeDomain` as follows:
 
 - It adds the generated `dra.nvcf.nvidia.io/nvlink-domain-partition` label.
   Do not set this label in the chart.
@@ -193,6 +213,12 @@ Any standard that cannot be enforced by modification will result in error(s) dur
   - Roles
   - Rolebindings
   - PersistentVolumeClaims
+
+- Self-managed compute planes also accept KAI Scheduler, Grove, and Dynamo
+  resources, such as `PodGroup` and `DynamoGraphDeployment`, when the matching
+  add-ons are enabled. Without them, NVCF rejects the chart with an error such
+  as `unsupported types: ["nvidia.com/v1alpha1.DynamoGraphDeployment"]`. See
+  [Gang Scheduling](../compute-plane/cluster-management/gang-scheduling.md#enable-gang-scheduling).
 
 - A rendered Helm chart may contain a maximum of 300 of the aforementioned objects.
 
@@ -307,7 +333,7 @@ defaults. Only Worker Degradation Period is operator-configurable, through the
 | --- | --- | --- | --- |
 | Pod scheduling | 10 minutes | A Pod cannot be scheduled onto a node, for example no node satisfies its resources or affinity. | The Pod is marked terminal (`PodStuckScheduling`) and the instance fails and is re-created. For tasks, the task's max queued duration is used instead of this default. |
 | Image pull error | 1 minute | A scheduled Pod reports `ErrImagePull` or `ImagePullBackOff` on any container or init container. | The Pod is marked terminal (`ImagePullIssues`) and the instance fails. Check registry credentials and image references. |
-| Container restart loop | 10 minutes | A container or init container restarts at least 3 times. | The Pod is marked terminal (stuck initializing, containers in restart loop) and the instance fails. |
+| Container restart loop | 10 minutes | A container or init container restarts at least 3 times. A container whose latest run exited with code 0 after the Pod became ready is not in a restart loop, for example a streaming app that exits after each session. | The Pod is marked terminal (stuck initializing, containers in restart loop) and the instance fails. |
 | Init container stuck | 2 hours | A Pod's init containers have not completed (the Pod is not yet `Initialized`). | The Pod is marked terminal (init container stuck) and the instance fails. |
 | Worker startup | 2 hours | A running Pod has not become ready during its initial startup, before it has ever reported ready. | The Pod is considered degraded and the instance fails. |
 | Worker Degradation Period | 30 minutes | A Pod that had been ready becomes not ready (containers report not ready) after being initialized. | The Pod is considered degraded, the instance is marked degraded, and NVCA kills and re-creates it. Operator-configurable. |

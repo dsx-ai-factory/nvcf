@@ -32,6 +32,9 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "umbrella" {
+		return runUmbrella(args[1:])
+	}
 	if len(args) > 0 && args[0] == "edition" {
 		return runEdition(args[1:])
 	}
@@ -41,12 +44,12 @@ func run(args []string) error {
 	target := flags.String("target", "main", "documentation target to render")
 	catalogPath := flags.String("catalog", "", "version catalog path")
 	check := flags.Bool("check", false, "fail if generated docs differ from checked-in marker blocks")
-	updateCatalog := flags.Bool("update-catalog", false, "fetch the resolved GitHub stack inventory and update the catalog")
+	updateCatalog := flags.Bool("update-catalog", false, "update the catalog from resolved stack inventories")
+	releaseManifest := flags.String("release-manifest", "", "update from this immutable umbrella manifest instead of GitHub release discovery")
+	inventories := flags.String("inventories", "", "directory containing the manifest-selected inventory assets")
 	stackVersion := flags.String("stack-version", "", "self-managed stack version to fetch or inventory")
 	computeStackVersion := flags.String("compute-stack-version", "", "compute-plane stack version to fetch")
 	observabilityStackVersion := flags.String("observability-stack-version", "", "observability stack version to fetch")
-	freezeStack := flags.String("freeze-stack", "", "release_set stack whose documentation version is being frozen (control-plane, compute-plane, or observability)")
-	freezeVersion := flags.String("freeze-version", "", "documentation version to freeze for --freeze-stack ("+documentationVersionFormat+")")
 	inventoryOutput := flags.String("generate-stack-inventory", "", "write a resolved stack inventory to this path")
 	inventoryConfig := flags.String("inventory-config", "", "release inventory config path; defaults to the stack checkout")
 	allowUnavailableSourceCharts := flags.Bool("allow-unavailable-source-charts", false, "use published charts when configured source paths are unavailable in a historical tag")
@@ -64,6 +67,14 @@ func run(args []string) error {
 	if err := ValidateTarget(*target); err != nil {
 		return err
 	}
+	if *releaseManifest != "" || *inventories != "" {
+		if !*updateCatalog || *releaseManifest == "" || *inventories == "" {
+			return fmt.Errorf("--release-manifest and --inventories require --update-catalog and each other")
+		}
+		if *stackVersion != "" || *computeStackVersion != "" || *observabilityStackVersion != "" || *inventoryOutput != "" || *compareFrom != "" || *compareTo != "" {
+			return fmt.Errorf("--release-manifest cannot be combined with stack version selection, inventory generation, or comparison")
+		}
+	}
 
 	repoRoot, err := findRepoRoot()
 	if err != nil {
@@ -73,7 +84,7 @@ func run(args []string) error {
 		if *compareFrom == "" || *compareTo == "" {
 			return fmt.Errorf("--compare-release-set-from and --compare-release-set-to must be used together")
 		}
-		if *updateCatalog || *check || *inventoryOutput != "" || *freezeStack != "" || *freezeVersion != "" ||
+		if *updateCatalog || *check || *inventoryOutput != "" ||
 			*stackVersion != "" || *computeStackVersion != "" || *observabilityStackVersion != "" ||
 			*inventoryConfig != "" || *allowUnavailableSourceCharts || *stackSourceTag != "" || *stackSourceCommit != "" {
 			return fmt.Errorf("release-set comparison cannot be combined with catalog update, check, or inventory generation flags")
@@ -124,20 +135,6 @@ func run(args []string) error {
 	if !filepath.IsAbs(*catalogPath) {
 		*catalogPath = filepath.Join(repoRoot, *catalogPath)
 	}
-	if *freezeStack != "" || *freezeVersion != "" {
-		if *freezeStack == "" || *freezeVersion == "" {
-			return fmt.Errorf("--freeze-stack and --freeze-version must be used together")
-		}
-		if *updateCatalog || *check || *stackVersion != "" || *computeStackVersion != "" || *observabilityStackVersion != "" {
-			return fmt.Errorf("--freeze-stack cannot be combined with catalog update, check, or stack version flags")
-		}
-		snapshotPath, err := freezeStackDocumentation(repoRoot, *catalogPath, *freezeStack, *freezeVersion)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(os.Stderr, "wrote %s for %s version %s\n", relOrAbs(repoRoot, snapshotPath), *freezeStack, *freezeVersion)
-		return nil
-	}
 
 	var catalog *Catalog
 	if *updateCatalog {
@@ -145,11 +142,16 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		updated, err := updateCatalogFromGitHubInventories(repoRoot, map[string]string{
-			selfManagedStackKey:   *stackVersion,
-			computePlaneStackKey:  *computeStackVersion,
-			observabilityStackKey: *observabilityStackVersion,
-		}, base)
+		var updated *Catalog
+		if *releaseManifest != "" {
+			updated, err = updateCatalogFromManifest(repoRoot, resolveRepoPath(repoRoot, *releaseManifest), resolveRepoPath(repoRoot, *inventories), base)
+		} else {
+			updated, err = updateCatalogFromGitHubInventories(repoRoot, map[string]string{
+				selfManagedStackKey:   *stackVersion,
+				computePlaneStackKey:  *computeStackVersion,
+				observabilityStackKey: *observabilityStackVersion,
+			}, base)
+		}
 		if err != nil {
 			return err
 		}

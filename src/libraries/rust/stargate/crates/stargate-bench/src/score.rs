@@ -99,6 +99,8 @@ pub struct QueueAdmissionSummary {
     pub stargate_retry_exhausted_count: f64,
     #[serde(default)]
     pub stargate_retry_exhausted_by_reason: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub pylon_unmeasured_rate_count: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -473,6 +475,7 @@ pub fn queue_admission_summary_from_prometheus(metrics: &str) -> QueueAdmissionS
                     Some("unknown_local_estimate") => {
                         summary.pylon_unknown_local_estimate_count += value;
                     }
+                    Some("unmeasured_rate") => summary.pylon_unmeasured_rate_count += value,
                     _ => {}
                 }
             }
@@ -516,6 +519,7 @@ pub fn queue_admission_summary_delta_from_prometheus(
         pylon_disabled_count,
         pylon_missing_estimate_count,
         pylon_unknown_local_estimate_count,
+        pylon_unmeasured_rate_count,
         stargate_queue_mismatch_retry_count,
         stargate_retry_exhausted_count,
     );
@@ -594,8 +598,8 @@ pub fn topology_for(backends: &BackendConfig) -> RoutingTopology {
     for index in 0..backends.count {
         let capacity = backends
             .profile_for_index(index)
-            .registration
-            .last_mean_input_tps;
+            .service_time_ms
+            .prefill_tokens_per_s;
         if capacity > 0.0 && capacity.is_finite() {
             let backend_id = format!("backend-{index}");
             let cluster_id = backends.effective_cluster_id_for_index(index);
@@ -691,9 +695,7 @@ fn percentile(values: &[u64], q: f64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        BackendProfile, BackendProfileGroup, RegistrationConfig, ServiceTimeConfig,
-    };
+    use crate::config::{BackendProfile, BackendProfileGroup, ServiceTimeConfig};
 
     fn result(backend: &str, ttft: u64, ttlt: u64) -> RequestResult {
         RequestResult {
@@ -738,7 +740,7 @@ mod tests {
         default_tps: f64,
         groups: &[(usize, f64)],
     ) -> BackendConfig {
-        let profile = |last_mean_input_tps| BackendProfile {
+        let profile = |prefill_tokens_per_s| BackendProfile {
             name: "test".to_string(),
             weight: 1.0,
             max_concurrent_requests: None,
@@ -748,10 +750,7 @@ mod tests {
                 ttft_jitter_ms: 0,
                 decode_tokens_per_s: 1,
                 decode_jitter_ms: 0,
-                prefill_tokens_per_s: None,
-            },
-            registration: RegistrationConfig {
-                last_mean_input_tps,
+                prefill_tokens_per_s,
             },
         };
         BackendConfig {
@@ -1026,6 +1025,7 @@ mod tests {
         let metrics = r#"
 pylon_queue_admission_decisions_total{inference_server_id="backend-0",model_id="dummy-model",result="rejected"} 2
 pylon_queue_admission_decisions_total{inference_server_id="backend-1",model_id="dummy-model",result="disabled"} 4
+pylon_queue_admission_decisions_total{inference_server_id="backend-1",model_id="dummy-model",result="unmeasured_rate"} 5
 stargate_proxy_retries_total{model="dummy-model",reason="queue_estimate_mismatch",routing_key=""} 2
 stargate_proxy_retry_exhausted_total{model="dummy-model",reason="retry_budget_exhausted",routing_key=""} 1
 "#;
@@ -1034,6 +1034,7 @@ stargate_proxy_retry_exhausted_total{model="dummy-model",reason="retry_budget_ex
 
         assert_eq!(summary.pylon_rejected_count, 2.0);
         assert_eq!(summary.pylon_disabled_count, 4.0);
+        assert_eq!(summary.pylon_unmeasured_rate_count, 5.0);
         assert_eq!(summary.stargate_queue_mismatch_retry_count, 2.0);
         assert_eq!(summary.stargate_retry_exhausted_count, 1.0);
         assert_eq!(

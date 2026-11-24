@@ -23,11 +23,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/auth"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
 	"github.com/bombsimon/logrusr/v4"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/auth"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	"github.com/go-logr/logr"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -36,12 +36,12 @@ import (
 	"k8s.io/klog/v2"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
-	nvcaauth "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/auth"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/cmdutil"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/storage"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/types"
+	nvcaauth "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/auth"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/cmdutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/storage"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 )
 
 func NewCommand() *cobra.Command {
@@ -249,9 +249,10 @@ func newCobraCommand(
 					NamespaceStuckTimeout:                     cfg.Workload.NamespaceStuckTimeout,
 					FailingObjectsBackoffTimeout:              cfg.Workload.FailingObjectsBackoffTimeout,
 					FailingObjectsBackoffRequeueInterval:      cfg.Workload.FailingObjectsBackoffRequeueInterval,
+					WorkerContainerRestartCountToFailInstance: cfg.Workload.WorkerContainerRestartCountToFailInstance,
 				},
-				FunctionEnvOverrides: cfg.Workload.FunctionEnvOverrides,
-				TaskEnvOverrides:     cfg.Workload.TaskEnvOverrides,
+				FunctionEnvOverrides: cfg.Workload.EffectiveFunctionEnvOverrides(),
+				TaskEnvOverrides:     cfg.Workload.EffectiveTaskEnvOverrides(),
 			}
 
 			// The operator injects OTEL_EXPORTER via the otel-nvca-config secret, but Viper

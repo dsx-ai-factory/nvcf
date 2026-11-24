@@ -3,7 +3,8 @@
 A controllable HTTP target for testing NVCF LLM functions with OpenAI client
 libraries and load generators. It returns synthetic text and deterministic
 embedding vectors. It is not a model server and does not implement the full
-OpenAI API.
+OpenAI API. It also serves a synthetic Anthropic Messages route for Anthropic
+clients.
 
 ## Supported routes
 
@@ -13,6 +14,9 @@ OpenAI API.
 | `POST /v1/completions` | Legacy text completions with JSON or SSE output |
 | `POST /v1/responses` | Responses API JSON or SSE output |
 | `POST /v1/embeddings` | Embeddings for one string or an array of strings |
+| `POST /v1/messages` | Anthropic Messages JSON or SSE output |
+| `POST /v1/decisions` | Canned Decisions answers, one per question, in order |
+| `POST /v1/systemone` | Canned System One answers, keyed by question name |
 | `GET /v1/models` | Lists the sample model |
 | `GET /v1/models/{id}` | Returns metadata for a model ID |
 | `GET /health` | Health check returning 200 |
@@ -32,24 +36,27 @@ decoded normally.
 
 If any request header starts with `X-Load-Tester-`, all body controls are
 ignored. Header controls and defaults apply instead. The default output chunk
-is `xxxx`. Text controls apply to Chat Completions, Responses, and legacy
-Completions. Queue delay, TTFT, status injection, and concurrency limits apply
+is `xxxx` unless the container sets `LOAD_TESTER_DEFAULT_CHUNK`. Text controls apply to Chat Completions, Responses, Messages, and
+legacy Completions. Queue delay, TTFT, status injection, and concurrency limits apply
 to all POST routes.
 
 | Control | Header | JSON body field | Default | Behavior |
 |---------|--------|-----------------|---------|----------|
 | Queue delay | `X-Load-Tester-Queue-Delay-Ms` | `x_load_tester_queue_delay_ms` | `0` | Delay before processing the request. |
-| TTFT | `X-Load-Tester-TTFT-Ms` | `x_load_tester_ttft_ms` | `0` | Delay before the first response byte. |
+| TTFT | `X-Load-Tester-TTFT-Ms` | `x_load_tester_ttft_ms` | `LOAD_TESTER_DEFAULT_TTFT_MS`, else `0` | Delay before the first response byte. |
 | TTFT jitter | `X-Load-Tester-TTFT-Jitter-Ms` | `x_load_tester_ttft_jitter_ms` | `0` | Random extra delay from 0 through this value. |
-| ITL | `X-Load-Tester-ITL-Ms` | `x_load_tester_itl_ms` | `0` | Delay between streamed output chunks. |
+| ITL | `X-Load-Tester-ITL-Ms` | `x_load_tester_itl_ms` | `LOAD_TESTER_DEFAULT_ITL_MS`, else `0` | Delay between streamed output chunks. |
 | ITL jitter | `X-Load-Tester-ITL-Jitter-Ms` | `x_load_tester_itl_jitter_ms` | `0` | Random extra delay between chunks. |
-| Chunk text | `X-Load-Tester-Chunk` | `x_load_tester_chunk` | `xxxx` | Text returned in each output chunk. |
+| Chunk text | `X-Load-Tester-Chunk` | `x_load_tester_chunk` | `LOAD_TESTER_DEFAULT_CHUNK`, else `xxxx` | Text returned in each output chunk. |
 | Chunk bytes | `X-Load-Tester-Chunk-Bytes` | `x_load_tester_chunk_bytes` | `0` | Generate a random chunk of this byte length. |
 | Output chunks | `X-Load-Tester-Output-Chunks` | `x_load_tester_output_chunks` | `1` | Number of text chunks to return, capped by the startup limit. |
 | Status injection | `X-Load-Tester-Status-Code` | `x_load_tester_status_code` | unset | Return an OpenAI-shaped HTTP error. |
 | Stream error | `X-Load-Tester-Stream-Error-After-Chunks` | `x_load_tester_stream_error_after_chunks` | unset | End a stream with an OpenAI-shaped error after this many chunks. |
 | Stream truncate | `X-Load-Tester-Stream-Truncate-After-Chunks` | `x_load_tester_stream_truncate_after_chunks` | unset | Close a stream without its completion event after this many chunks. |
 | Concurrency limit | `X-Load-Tester-Max-Concurrency` | `x_load_tester_max_concurrency` | `0` | Return 429 when the global in-flight request count exceeds this value. |
+| Echo | `X-Load-Tester-Echo` | `x_load_tester_echo` | `false` | Return the raw request body as the output text. |
+| SSE line ending | `X-Load-Tester-SSE-Line-Ending` | `x_load_tester_sse_line_ending` | `lf` | `/v1/messages` streams only: write the stream with `lf`, `crlf` or `cr` line endings. |
+| SSE split bytes | `X-Load-Tester-SSE-Split-Bytes` | `x_load_tester_sse_split_bytes` | `0` | `/v1/messages` streams only: write the stream in pieces of this many bytes and flush after each, so a multi-byte UTF-8 character can be split across two writes. |
 
 Timing values are non-negative integer milliseconds and are capped at five
 minutes. Output is capped at 1 MiB and the startup chunk limit. The
@@ -60,12 +67,426 @@ are mutually exclusive.
 For a deterministic concurrency test, send the same concurrency limit header
 on every request in the load test.
 
+## Container defaults
+
+Three environment variables set defaults for one container. A request that
+sets the matching control, by header or body field, still overrides them.
+
+| Environment variable | Control | Accepted values |
+|----------------------|---------|-----------------|
+| `LOAD_TESTER_DEFAULT_TTFT_MS` | TTFT | Integer milliseconds from 0 through 300000 |
+| `LOAD_TESTER_DEFAULT_ITL_MS` | ITL | Integer milliseconds from 0 through 300000 |
+| `LOAD_TESTER_DEFAULT_CHUNK` | Chunk text | Text of at most 1 MiB |
+
+The server reads them once at startup and exits with an error on an invalid
+value. An empty value counts as unset. The `Chunk-Bytes` and echo controls
+replace the default chunk text.
+
+Use them when a request cannot choose the container that serves it. For
+example, give two versions of one NVCF LLM function different defaults through
+each version's container environment. The request router picks the version,
+so only a container default can make one version slower. A distinct default
+chunk for each version, such as `fast` and `slow`, shows in every response
+which version answered.
+
+## Server limits
+
+Two environment variables raise the request limits for slow or large uploads.
+No request can change them.
+
+| Environment variable | Default | Accepted values | Behavior |
+|----------------------|---------|-----------------|----------|
+| `LOAD_TESTER_MAX_REQUEST_BYTES` | 10 MiB, and 16 MiB on the decision routes | Integer bytes from 1 through 1073741824 | Largest request body on every POST route. |
+| `LOAD_TESTER_READ_TIMEOUT_MS` | `30000` | Integer milliseconds from 1 through 3600000 | Time allowed to read one request, headers and body. |
+
+A body over the limit gets the route's usual error: 400 on the OpenAI routes,
+413 on Messages and the decision routes. A read that passes the timeout fails
+like a closed connection. The routes hold the whole body in memory, except
+with the body digest, so size the container for the largest body. The second
+startup log line shows the limits.
+
+## Request body controls
+
+These header-only controls act on the raw request body before a route parses
+it. They apply to every POST route, including Messages and the decision
+routes, and never change the body. Like every `X-Load-Tester-` header, they
+turn off body controls.
+
+| Control | Header | Behavior |
+|---------|--------|----------|
+| Body digest | `X-Load-Tester-Body-Digest: true` | Read the whole body without parsing it and answer with a receipt instead of the route response. |
+| Read delay | `X-Load-Tester-Read-Delay-Ms` | Wait this long before each body read of at most 16 KiB. |
+| Read pause | `X-Load-Tester-Read-Pause-After-Bytes` and `X-Load-Tester-Read-Pause-Ms` | After this many body bytes, stop reading once for this long. Set both. |
+| Early status | `X-Load-Tester-Early-Status-Code` | Answer with this error status, from 400 through 599, before reading any body byte. |
+
+The digest receipt for the example below:
+
+```json
+{
+  "object": "load_tester.body_digest",
+  "bytes": 70052,
+  "sha256": "78428f6e0cdef39f0e754223e208faaafe1f369aa25c0b4237540eff4c54a8e5",
+  "content_length": 70052,
+  "accept": "*/*",
+  "first_byte_at": "2026-11-12T03:16:40.167Z",
+  "last_byte_at": "2026-11-12T03:16:42.167Z",
+  "eof_at": "2026-11-12T03:16:42.167Z",
+  "complete": true
+}
+```
+
+`sha256` covers the bytes exactly as received, so duplicate keys, key order
+and whitespace count. `content_length` is -1 for a chunked upload. Times are
+UTC with milliseconds. A body over the limit returns 413 and any other read
+failure returns 400, both with `complete: false` and `read_error`.
+
+Early status cannot be combined with the digest. Its body uses the route's
+error shape. On the OpenAI routes the error code is `injected_early_response`.
+The server sends it at once, even while the client is still uploading. Some
+clients, such as `curl` reading the body from standard input, show it only
+after their upload ends.
+
+Read delay and read pause slow the server's reads, so the client or a proxy
+in front sees backpressure. Delay and pause values are integer milliseconds up
+to five minutes. Without the digest, the route still answers normally after
+the slow read.
+
+The read timeout keeps running during a delay or pause, but it is only checked
+when the server next reads from the connection. If the timeout passes during a
+pause, the read after the pause fails, unless the server already holds the
+rest of the body in its buffer. Set `LOAD_TESTER_READ_TIMEOUT_MS` above the
+whole upload, pauses included.
+
+The body digest, an early status answer and a rejected control header all
+answer without running the route's handler, so `LOG_REQUESTS` logs only the
+JSON line below for them, not the route's own request log line.
+
+```bash
+python3 -c 'import sys; sys.stdout.write("{\"model\":\"test-model\",\"messages\":[]," + " " * 70000 + "\"model\":\"other\"}")' > body.json
+shasum -a 256 body.json
+curl -sS http://localhost:8000/v1/chat/completions \
+  --header 'Expect:' \
+  --header 'X-Load-Tester-Body-Digest: true' \
+  --header 'X-Load-Tester-Read-Pause-After-Bytes: 65536' \
+  --header 'X-Load-Tester-Read-Pause-Ms: 2000' \
+  --data-binary @body.json
+```
+
+With `LOG_REQUESTS=true`, every POST request to these routes also logs one
+JSON line to standard error when the handler returns. Messages, Decisions and
+System One requests keep their request log line as well. For a client that closed after
+1 MiB of a declared 8 MiB body:
+
+```json
+{"time":"2026-11-11T19:20:25.958753-08:00","level":"INFO","msg":"request body","method":"POST","path":"/v1/chat/completions","request_id":"abort-8m","content_length":8388608,"bytes":1048576,"complete":false,"first_byte_at":"2026-11-12T03:20:25.450Z","last_byte_at":"2026-11-12T03:20:25.454Z","read_error":"unexpected EOF"}
+```
+
+`request_id` and `function_id` come from the `NVCF-REQID` and
+`NVCF-FUNCTION-ID` request headers when present. `complete` is true only when
+the server read the body to its end without an error. The line also has
+`sha256` with the digest, `eof_at` for a complete body, and `early_status`
+for an early answer.
+
+## Echo control
+
+Set `x_load_tester_echo` to `true`, or send `X-Load-Tester-Echo: true`, to
+return the request body exactly as the sample received it. Use it to check that
+a gateway forwards request fields without adding, dropping, or rewriting them.
+
+Echo applies to Chat Completions and Responses, streaming and non-streaming.
+The output text is the raw body, so parse it as JSON and compare fields. A body
+control is part of the echoed body. Echo cannot be combined with `Chunk`,
+`Chunk-Bytes`, or `Output-Chunks`, and the 1 MiB output cap applies. Other
+routes reject the control with 400.
+
+```bash
+curl -sS http://localhost:8000/v1/chat/completions \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "test-model",
+    "messages": [{"role": "user", "content": "hello"}],
+    "chat_template_kwargs": {"enable_thinking": false},
+    "x_load_tester_echo": true
+  }' | jq -r '.choices[0].message.content | fromjson'
+```
+
+## Anthropic Messages
+
+`POST /v1/messages` returns synthetic text in the
+[Anthropic Messages](https://platform.claude.com/docs/en/api/messages) format.
+A request needs `model`, a non-negative integer `max_tokens`, and a non-empty
+`messages` array. Other fields, such as `system`, `tools`, `thinking`, and
+`stop_sequences`, are accepted and ignored. The `anthropic-version` and
+`x-api-key` headers are not checked.
+
+- Without `stream`, the response is a `message` object with one `text` content
+  block, `stop_reason`, `stop_sequence: null`, and `usage`.
+- With `stream: true`, the
+  [event stream](https://platform.claude.com/docs/en/build-with-claude/streaming)
+  sends `message_start`, `content_block_start`, `ping`, one
+  `content_block_delta` (`text_delta`) per output chunk, `content_block_stop`,
+  `message_delta`, and `message_stop`.
+- Each output chunk counts as one output token. `usage.input_tokens` and the
+  cache token fields are always 0.
+- If `max_tokens` is lower than the output chunk count, output stops after
+  `max_tokens` chunks and `stop_reason` is `max_tokens`. Otherwise it is
+  `end_turn`. With `max_tokens: 0` the message has no content blocks. Stream
+  error and truncate controls past the capped output have no effect.
+- Every response has a `request-id` header. Errors use the Messages error shape,
+  `{"type":"error","error":{"type":"...","message":"..."},"request_id":"..."}`.
+- The error type follows the HTTP status: 400 `invalid_request_error`, 401
+  `authentication_error`, 402 `billing_error`, 403 `permission_error`, 404
+  `not_found_error`, 409 `conflict_error`, 413 `request_too_large`, 429
+  `rate_limit_error`, 500 `api_error`, 504 `timeout_error`, and 529
+  `overloaded_error`. Other 4xx codes use `invalid_request_error` and other 5xx
+  codes use `api_error`.
+- The SSE line ending and split bytes controls change only how a stream is
+  written, not its events. Structural newlines are replaced; newlines inside
+  text deltas are JSON-escaped and stay untouched. With `x_load_tester_chunk`
+  set to a multi-byte string and `x_load_tester_sse_split_bytes` set to `1`,
+  every byte is its own write, so characters are split between writes. Both are
+  off by default.
+- The stream error control sends an `error` event with type `api_error`. Stream
+  error and truncate controls end the stream without `message_stop`.
+
+Tool use, thinking blocks, images, documents, citations, stop sequences,
+prompt caching, token counting, and Message Batches are not implemented.
+`GET /v1/models` keeps the OpenAI shape.
+
+## Backend diagnostics
+
+The Messages route can report which replica served a request and which headers
+the replica received. Use it to check replica affinity across requests, to see
+which caller headers a gateway or proxy forwarded, and to tell which function
+version answered. It is off by default and has no effect on other routes.
+
+Set the top-level body field `x_load_tester_echo_diagnostics` to `true` to turn
+it on. It is a body field only, with no header form. Unlike the benchmark
+controls, it still applies when the request carries an `X-Load-Tester-*` header.
+
+When it is on, the response carries:
+
+- Response headers `x-backend-replica` and, when the version id is known,
+  `x-backend-function-version`. They are set before the body, so they are
+  readable on streamed responses too.
+- An `x_backend` object in the message body. For a stream, the object is in the
+  `message` of the `message_start` event.
+
+| `x_backend` field | Source |
+|-------------------|--------|
+| `replica` | `NVCF_INSTANCE_ID` (the pod name on NVCF), else the hostname, else `unknown` |
+| `function_id` | `NVCF_FUNCTION_ID`, omitted when unset |
+| `function_version_id` | `NVCF_FUNCTION_VERSION_ID`, omitted when unset |
+| `method` | HTTP method the replica saw |
+| `path` | Request path the replica saw |
+| `query` | Raw query string, omitted when empty |
+| `host` | `Host` the replica saw, omitted when empty |
+| `remote_addr` | Peer address of the connection, omitted when empty |
+| `content_length` | Request `Content-Length`, `-1` when unknown |
+| `received_headers` | Every request header. Names are lower-cased and each value is a list |
+
+Diagnostics are added only to successful responses. Error responses, such as
+status injection, a concurrency 429, or a validation 400, carry no `x_backend`
+and no diagnostic headers.
+
+The values of `Authorization`, `Proxy-Authorization`, `X-Api-Key` and
+`Cookie` are replaced with `<redacted>`. The names stay, so you can still see
+whether a gateway forwarded them. Other header values are echoed as received.
+
+### Non-streaming request
+
+```bash
+curl -sS http://localhost:18000/v1/messages \
+  --include \
+  --header 'Content-Type: application/json' \
+  --header 'X-Test-Header: hello' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+The response headers include `x-backend-replica: <pod name>`. The body looks
+like this, trimmed:
+
+```json
+{
+  "id": "msg_2",
+  "type": "message",
+  "content": [{"type": "text", "text": "xxxx"}],
+  "stop_reason": "end_turn",
+  "x_backend": {
+    "replica": "0-sr-1a2b3c",
+    "function_id": "<function id>",
+    "function_version_id": "<version id>",
+    "method": "POST",
+    "path": "/v1/messages",
+    "host": "localhost:18000",
+    "remote_addr": "172.17.0.1:53012",
+    "content_length": 143,
+    "received_headers": {
+      "content-type": ["application/json"],
+      "x-test-header": ["hello"]
+    }
+  }
+}
+```
+
+### Streaming request
+
+Add `"stream": true`. The headers are on the HTTP response and `x_backend` is in
+the first event.
+
+```bash
+curl -sSN http://localhost:18000/v1/messages \
+  --include \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "stream": true,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+### Read only the replica or the headers
+
+```bash
+BODY='{"model":"test-model","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"x_load_tester_echo_diagnostics":true}'
+
+# Which replica answered
+curl -sS -o /dev/null -D - http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' --data "$BODY" | grep -i '^x-backend-'
+
+# Which headers a gateway forwarded
+curl -sS http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' --data "$BODY" \
+  | jq '.x_backend.received_headers'
+```
+
+### Check replica spread
+
+Send the same request repeatedly and count replicas. One replica means all
+requests landed on it. Several means the router spread them.
+
+```bash
+for _ in $(seq 1 50); do
+  curl -sS -o /dev/null -D - http://localhost:18000/v1/messages \
+    --header 'Content-Type: application/json' --data "$BODY" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="x-backend-replica"{print $2}'
+done | sort | uniq -c
+```
+
+For affinity, repeat the loop with the header or session value your gateway
+uses for sticky routing and confirm the count stays at one replica.
+
+### Combine with benchmark controls
+
+Diagnostics combine with every Messages control. A request can set latency,
+chunk count, and diagnostics together:
+
+```bash
+curl -sS http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' \
+  --header 'X-Load-Tester-TTFT-Ms: 200' \
+  --header 'X-Load-Tester-Output-Chunks: 3' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+### Anthropic Python client
+
+The Anthropic client passes unknown body fields through `extra_body`. Read the
+response headers with `with_raw_response`. `x_backend` is not a modeled field,
+so it is in `model_extra`.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="not-needed",
+    base_url="http://localhost:18000",
+)
+
+raw = client.messages.with_raw_response.create(
+    model="test-model",
+    max_tokens=16,
+    messages=[{"role": "user", "content": "hello"}],
+    extra_body={"x_load_tester_echo_diagnostics": True},
+)
+print(raw.headers["x-backend-replica"])
+message = raw.parse()
+print(message.model_extra["x_backend"]["received_headers"])
+```
+
+### Request log
+
+Set `LOG_REQUESTS=true` in the container environment to log one line at handler
+entry for each Messages, Decisions, or System One request, including requests
+that later return errors. The server reads the variable once at startup.
+Logs go to stderr and are available through `kubectl logs`.
+
+Messages logs are unchanged and do not require the diagnostics control:
+
+```text
+messages request id=req_7 replica=0-sr-1a2b3c method=POST path=/v1/messages headers=content-length,content-type,x-test-header
+```
+
+The Messages log has the generated request id, replica, method, path, and sorted
+header names. Its id matches the `request-id` response header.
+
+Decisions and System One log the received `X-Request-Id`, method, path, replica,
+and function and version ids from the environment (empty when unavailable):
+
+```text
+decision request id="caller-request-id" replica="sample-pod" method="POST" path="/v1/decisions" function_id="function-id" function_version_id="version-id"
+```
+
+Fields are quoted and escaped to keep each request on one line. These access
+logs exclude credentials, cookies, request bodies, image data, query parameters,
+and other header values. Responses and echo behavior are unchanged.
+
+To check gateway rejection, send distinct `X-Request-Id` values for an owner
+request and a request from an account without access to a private function.
+Confirm the owner receives 200 and its id appears in the backend logs. Confirm
+the other account receives 404 and its id is absent across all backend replicas
+in the same time window. A missing id alone is insufficient evidence; keep the
+owner log as a positive control and allow for log collection delay.
+
+```bash
+kubectl logs -l '<backend-selector>' --all-containers=true --prefix=true \
+  --since=10m --tail=-1 | grep -F 'id="caller-request-id"'
+```
+
+| Environment variable | Accepted values | Default |
+|----------------------|-----------------|---------|
+| `LOG_REQUESTS` | `true` enables the log. Any other value disables it | unset (off) |
+| `NVCF_INSTANCE_ID` | Replica name reported in diagnostics. NVCF sets it | hostname |
+| `NVCF_FUNCTION_ID` | Function id reported in diagnostics. NVCF sets it | omitted |
+| `NVCF_FUNCTION_VERSION_ID` | Version id reported in diagnostics. NVCF sets it | omitted |
+
 ## Build and run
 
 ```bash
 cd examples/function-samples/openai-compatible-sample
 docker build --platform linux/amd64 -t openai-compatible-sample .
 docker run --rm -p 18000:8000 openai-compatible-sample
+```
+
+Release images are built with Bazel for linux/amd64 and linux/arm64. A
+`feat`, `fix`, or `perf` commit under this directory cuts an
+`examples/function-samples/openai-compatible-sample/vX.Y.Z` release, and the
+release pipeline publishes that version. Build the same image locally with:
+
+```bash
+bazel build //examples/function-samples/openai-compatible-sample/http-server:image_index
 ```
 
 ## Smoke test
@@ -111,6 +532,21 @@ curl --request POST \
   --url http://localhost:18000/v1/embeddings \
   --header 'Content-Type: application/json' \
   --data '{"model": "test-model", "input": ["one", "two"], "encoding_format": "float"}'
+
+curl --request POST \
+  --url http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' \
+  --header 'anthropic-version: 2023-06-01' \
+  --header 'X-Load-Tester-TTFT-Ms: 200' \
+  --header 'X-Load-Tester-ITL-Ms: 50' \
+  --header 'X-Load-Tester-Chunk: token' \
+  --header 'X-Load-Tester-Output-Chunks: 3' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 1024,
+    "stream": true,
+    "messages": [{"role": "user", "content": "hello"}]
+  }'
 ```
 
 ## OpenAI Python client
@@ -160,6 +596,52 @@ go run .
 python3 openai_client_check.py
 ```
 
+## Anthropic Python client
+
+Use the sample root URL, without `/v1`, as the Anthropic client `base_url`:
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="not-needed",
+    base_url="http://localhost:18000",
+    _strict_response_validation=True,
+)
+
+message = client.messages.create(
+    model="test-model",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "hello"}],
+    extra_headers={
+        "X-Load-Tester-Chunk": "token",
+        "X-Load-Tester-Output-Chunks": "3",
+    },
+)
+assert message.content[0].text == "tokentokentoken"
+assert message.stop_reason == "end_turn"
+
+with client.messages.stream(
+    model="test-model",
+    max_tokens=2,
+    messages=[{"role": "user", "content": "hello"}],
+    extra_headers={"X-Load-Tester-Output-Chunks": "3"},
+) as stream:
+    text = "".join(stream.text_stream)
+assert text == "xxxxxxxx"
+assert stream.get_final_message().stop_reason == "max_tokens"
+```
+
+Run the included Messages compatibility check after starting the Go server:
+
+```bash
+cd examples/function-samples/openai-compatible-sample/http-server
+go run .
+
+# In another terminal, with the anthropic package installed:
+python3 anthropic_client_check.py
+```
+
 ## 60-second SSE capacity run
 
 Use the matching pinned xk6 binary from `examples/load-tests`. The command
@@ -188,6 +670,34 @@ ulimit -n 65536
   -e LOAD_TESTER_OUTPUT_CHUNKS=12000
 ```
 
+## Decision routes
+
+`POST /v1/decisions` and `POST /v1/systemone` return fixed answers for test
+use. Decisions returns `answers` as a list in question order. System One
+returns `answers` keyed by question name. Both include `model` and `usage`.
+Benchmark controls do not apply. Only `X-Load-Tester-Echo` and the
+`x_load_tester_echo` body field are read, and they add the request body as
+`request_body`.
+
+Every successful response has an `echo` object with the request headers
+`typesafe-danger-zone-images`, `x-model`, `x-input-tokens`, `x-request-id`
+and `x-vendor-test` when present, plus `body_length` and
+`credentials_received`. `credentials_received` is `true` when the request
+carried `Authorization`, `X-Api-Key`, `Proxy-Authorization` or `Cookie`. The
+values are never echoed. When `TypeSafe-Danger-Zone-Images` is sent, a
+successful response also sets `x-mock-echo-typesafe-danger-zone-images`.
+When `X-Input-Tokens` is a non-negative integer, `usage.input_tokens` mirrors
+it. Otherwise the sample estimates one token per four body bytes.
+
+These two routes accept bodies up to 16 MiB. The other routes keep 10 MiB.
+Bodies must be one JSON object, otherwise the response is 400 with a JSON
+error. A `null` body is a 400, and so is a `model` that is not a string,
+including `null`. More than 1000 questions is a 400.
+When `X-Input-Tokens` is too large to add the output token to, the sample
+uses its own estimate. Add `?mock_error=429` for a 429 with `Retry-After: 7`, or
+`?mock_error=400` for a 400. The 400 body is FastAPI style
+(`{"detail":[...]}`) on System One and OpenAI style on Decisions.
+
 ## NVCF LLM functions
 
 Expose port 8000 and configure the function inference URL as `/`. Declare the
@@ -198,7 +708,10 @@ routes required by the workload, such as:
 /v1/completions
 /v1/responses
 /v1/embeddings
+/v1/messages
+/v1/decisions
+/v1/systemone
 ```
 
-See the [LLM Gateway guide](../../../docs/user/llm-gateway.md) for function
+See the [LLM Gateway guide](../../../docs/overview/llm-gateway.md) for function
 model configuration and invocation flow.

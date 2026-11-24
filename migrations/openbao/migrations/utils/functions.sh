@@ -22,6 +22,8 @@ if [[ -n "${_FUNCTIONS_SH_SOURCED:-}" ]]; then
 fi
 readonly _FUNCTIONS_SH_SOURCED=1
 
+source "$(dirname "${BASH_SOURCE[0]}")/jwt_plugin_version.sh"
+
 # Define standard Kubernetes paths as constants for clarity and maintainability.
 readonly K8S_SA_TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount/token"
 
@@ -212,7 +214,15 @@ function enable_secrets_mount() {
     fi
 
     log_step "Enabling $mount_type secrets engine at mount path '$mount_path'"
-    if ! output=$(bao secrets enable -path=$mount_path $mount_type 2>&1); then
+    local enable_args=(secrets enable "-path=$mount_path")
+    if [[ "$mount_type" == "vault-plugin-secrets-jwt" ]]; then
+        local plugin_version
+        plugin_version=$(jwt_plugin_version) || return 1
+        if [[ -n $plugin_version ]]; then
+            enable_args+=("-plugin-version=$plugin_version")
+        fi
+    fi
+    if ! output=$(bao "${enable_args[@]}" "$mount_type" 2>&1); then
         log_error "Error enabling $mount_type secrets engine: $output"
         return 1
     fi
@@ -331,15 +341,30 @@ EOF
 # create the role with them.
 #
 # Usage:
-#   merged=$(merge_jwt_role_policies <role_name> <policies_csv>)
+#   merged=$(merge_jwt_role_policies <role_name> <policies_csv> [require_existing])
 #
 function merge_jwt_role_policies() {
     local role_name=$1
     local new_policies_csv=$2
+    local require_existing=${3:-false}
 
-    local existing
-    existing=$(bao read -format=json "auth/jwt/role/${role_name}" 2>/dev/null \
-        | jq -r '.data.token_policies // [] | join(",")' 2>/dev/null) || existing=""
+    local role_json existing
+    if ! role_json=$(bao read -format=json "auth/jwt/role/${role_name}" 2>&1); then
+        if [[ "${role_json}" == *"No value found"* ]]; then
+            if [[ "${require_existing}" == true ]]; then
+                log_error "JWT auth role '${role_name}' must exist before policies are added" >&2
+                return 1
+            fi
+            echo "${new_policies_csv}"
+            return 0
+        fi
+        log_error "Cannot read JWT auth role '${role_name}': ${role_json}" >&2
+        return 1
+    fi
+    if ! existing=$(jq -er '.data.token_policies | if type == "array" then join(",") else error("missing token_policies") end' <<<"${role_json}"); then
+        log_error "Cannot parse policies for JWT auth role '${role_name}'" >&2
+        return 1
+    fi
 
     if [ -z "${existing}" ]; then
         echo "${new_policies_csv}"
@@ -568,8 +593,6 @@ function generate_jwt_secret_role() {
   local scopes=$4
   local issuer_override=${5:-""}
 
-  local quoted_scopes=$(sed 's/\([^,]*\)/"\1"/g' <<< "$scopes")
-
   local issuer="http://${target_service_name}.${target_service_account_namespace}.svc.cluster.local"
   if [[ -n "${issuer_override}" ]]; then
     issuer="${issuer_override}"
@@ -583,7 +606,7 @@ function generate_jwt_secret_role() {
     --arg issuer     "${issuer}" \
     --arg client     "${client_service_name}" \
     --arg target     "${target_service_name}" \
-    --argjson scopes "[${quoted_scopes}]" \
-    '{issuer: $issuer, claims: {azp: $client, aud: [$client, ("s:" + $target)], scopes: $scopes, sub: $client}}')
+    --arg scopes "${scopes}" \
+    '{issuer: $issuer, claims: {azp: $client, aud: [$client, ("s:" + $target)], scopes: (if $scopes == "" then [] else ($scopes | split(",") | map(select(length > 0))) end), sub: $client}}')
   echo "$role_json"
 }

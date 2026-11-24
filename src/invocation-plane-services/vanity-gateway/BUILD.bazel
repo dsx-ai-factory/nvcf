@@ -40,6 +40,7 @@ go_oci_image(
     ],
     env = {"ULIMIT_FLAG": "1"},
     tags = ["nvcf-ai-api-gateway-service"],
+    user = "1000:1000",
     visibility = ["//visibility:public"],
 )
 
@@ -69,9 +70,9 @@ go_library(
     # VCS build info (absent under Bazel).
     x_defs = {
         "ai-api-gateway-service/gateway.version": "{STABLE_VERSION}",
-        "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version.Service": "nvcf-ai-api-gateway-service",
-        "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version.Version": "{STABLE_VERSION}",
-        "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version.GitHash": "{STABLE_GIT_COMMIT_FULL}",
+        "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version.Service": "nvcf-ai-api-gateway-service",
+        "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version.Version": "{STABLE_VERSION}",
+        "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version.GitHash": "{STABLE_GIT_COMMIT_FULL}",
     },
     deps = [
         "//src/invocation-plane-services/vanity-gateway/gateway",
@@ -117,4 +118,20 @@ go_test(
         "@org_uber_go_zap//:zap",
         "@org_uber_go_zap//zapcore",
     ],
+)
+
+go_test(
+    name = "image_numeric_user_test",
+    srcs = ["//rules/oci/private:numeric_user_test.go"],
+    args = [
+        "-image_index=$(location :image_index)",
+        "-expected_user=1000:1000",
+    ],
+    data = [":image_index"],
+)
+
+filegroup(
+    name = "model_info_testdata",
+    srcs = glob(["testdata/model_info/*"]),
+    visibility = ["//src/invocation-plane-services/vanity-gateway:__subpackages__"],
 )

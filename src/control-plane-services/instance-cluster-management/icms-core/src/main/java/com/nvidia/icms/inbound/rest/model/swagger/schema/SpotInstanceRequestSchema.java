@@ -119,6 +119,10 @@ public class SpotInstanceRequestSchema {
     @Schema(name = "FunctionDetails.FunctionType", description = "Indicates whether the function is a default, streaming, or LLM function")
     FunctionType functionType;
 
+    @Schema(name = "FunctionDetails.TerminationGracePeriodDuration",
+            description = "Optional ISO 8601 duration. Time the function instance is given to finish its in-flight work before it is deleted. Forwarded to the backend in the function details.")
+    Duration terminationGracePeriodDurationForFunction;
+
     @Schema(name = "LaunchSpecification.Clusters", description = "Targeted clusters name. " +
             "All deployed instances will be within the clusters list")
     Set<String> clusters;
@@ -208,6 +212,8 @@ public class SpotInstanceRequestSchema {
         appendIfNotNull(response, "FunctionVersionId", getFunctionVersionId());
         appendIfNotBlank(response, "OwnerNcaId", getOwnerNcaId());
         appendIfNotNull(response, "FunctionType", getFunctionType());
+        appendIfNotNull(response, "TerminationGracePeriodDurationForFunction",
+                        getTerminationGracePeriodDurationForFunction());
 
         // Task details
         appendIfNotNull(response, "TaskId", getTaskId());

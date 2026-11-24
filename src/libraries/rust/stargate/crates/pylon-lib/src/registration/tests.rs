@@ -41,7 +41,7 @@ use tower::util::MapRequestLayer;
 use crate::quic_http_tunnel::{TunnelError, TunnelForwardingConfig};
 use crate::request_quality_monitor::RequestQualityMonitorConfig;
 use crate::runtime_state::{CurrentModelStats, PylonRuntimeState, gated_model_status};
-use crate::stats::PylonMetrics;
+use crate::stats::{PylonMetrics, StartupReadiness};
 use crate::test_support::{RecordedTracingEvent, RecordingTracingSubscriber};
 
 use super::discovery::*;
@@ -372,7 +372,7 @@ fn watch_snapshot(routers: &[&str], watch_urls: &[&str]) -> WatchEndpointSnapsho
     }
 }
 
-fn test_registration_config() -> InferenceServerRegistrationConfig {
+pub(super) fn test_registration_config() -> InferenceServerRegistrationConfig {
     InferenceServerRegistrationConfig {
         seeds: vec!["router-a".to_string()],
         inference_server_id: "inst-a".to_string(),
@@ -393,6 +393,7 @@ fn test_registration_config() -> InferenceServerRegistrationConfig {
         quic_insecure: true,
         tunnel_protocol: TunnelTransportProtocol::RawQuic,
         auth_token_provider: None,
+        shutdown_drain_timeout: crate::DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
     }
 }
 
@@ -956,6 +957,41 @@ async fn stats_changes_publish_before_the_heartbeat_and_coalesce() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn readiness_turns_ready_only_after_a_router_acknowledges_registration() {
+    let cases = [
+        ("router acknowledges", None, true),
+        (
+            "router ends the stream without an ack",
+            Some(Err(Status::unavailable("registration rejected"))),
+            false,
+        ),
+    ];
+    for (label, terminal, expected_ready) in cases {
+        let ca = TestCertificateAuthority::new("registration-readiness-ca");
+        let mut server = TestTlsControlPlane::spawn_with_terminal(&ca, "localhost", terminal).await;
+        let mut config = test_registration_config();
+        config.seeds = vec![server.dial_url.clone()];
+        config.grpc_tls_ca_cert_pem = Some(ca.pem());
+        let readiness = StartupReadiness::default();
+        let mut client = InferenceServerRegistrationClient::with_readiness(readiness.clone());
+
+        client.start(config).expect("registration should start");
+        server.first_registration().await;
+        let became_ready = tokio::time::timeout(Duration::from_millis(500), async {
+            while !readiness.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        assert_eq!(became_ready, expected_ready, "{label}");
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+}
+
 #[test]
 fn change_after_initial_snapshot_stays_pending() {
     type RuntimeChange = fn(&PylonRuntimeState);
@@ -1477,6 +1513,7 @@ fn runtime_snapshot_forwards_bootstrap_and_collected_stats_exactly() {
         "model-a",
         CurrentModelStats {
             last_mean_input_tps: 3.5,
+            max_input_tps: Some(4.5),
             output_tps: 2.5,
             queue_size: 4,
             queued_input_size: 5,
@@ -1502,6 +1539,7 @@ fn runtime_snapshot_forwards_bootstrap_and_collected_stats_exactly() {
     assert_eq!(model.status, InferenceServerStatus::Active as i32);
     let stats = model.stats.as_ref().expect("stats should be present");
     assert_eq!(stats.last_mean_input_tps, 3.5);
+    assert_eq!(stats.max_input_tps, Some(4.5));
     assert_eq!(stats.output_tps, 2.5);
     assert_eq!(
         stats.queue_time_estimate_ms_by_priority,

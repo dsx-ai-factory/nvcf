@@ -20,11 +20,14 @@ meaningful target, value, context, and timeout visible while hiding only
 command or output-format mechanics. Keep `When I run command` plus an
 assertion as the escape hatch for uncommon or command-specific behavior.
 
-Function lifecycle steps are a narrow command-adapter exception. They store
-only the selected `nvcf-cli` config, pass visible arguments to one CLI command,
-and preserve the real command result. They do not store function identity,
-apply defaults, parse or normalize product values, or enforce product
-preconditions. Their `successfully` wording asserts exit code 0 to keep happy
+Function and task lifecycle steps, plus API key generation for their backing
+services and Event Ledger, are a narrow command-adapter exception. They
+store only the selected `nvcf-cli` config, pass visible arguments to one CLI
+command, and preserve the real command result. They do not store function or
+task identity, apply defaults, parse or normalize product values, or enforce
+product preconditions. The task status assertion is a bounded test-runner
+poll of `task get --json` that compares `.task.status` with an exact string and
+classifies no status as terminal. Their `successfully` wording asserts exit code 0 to keep happy
 paths compact. Use raw command steps for negative and exit-code-specific cases
 so `nvcf-cli` and the NVCF API remain the product-validation boundary.
 
@@ -55,13 +58,42 @@ logic into `dsl/`.
 - `${VAR}` interpolation is the only env-var form the DSL recognizes;
   a bare `$word` is left literal. Implementations must not use
   `os.ExpandEnv`. Expansion lives in `dsl.Interpolate`.
-- Function lifecycle CLI option tables preserve row order, repeated options,
+- Function and task lifecycle CLI option tables preserve row order, repeated options,
   empty values, and product-invalid values. Only the `option | value` table
   structure is validated before the command runs.
 - The Helm function lifecycle uses `SAMPLE_HELM_FUNCTION_CHART`. The chart
   must be publicly reachable by ReVal, expose an `entrypoint` Service on port
   8000, answer `/health`, and echo the request message from `/echo`. Keep the
   chart reference outside the feature so release versions are not hard-coded.
+- The LLM field-fidelity scenario uses `SAMPLE_LLM_ECHO_IMAGE` (default: the
+  released in-repo sample), an
+  OpenAI-compatible sample that replies with the request it received when
+  `x_load_tester_echo` is true. Do not point it at the `:local` sample, which
+  returns a fixed reply other scenarios assert.
+- The decision route scenarios (`@llm-decision-routes`) use
+  `SAMPLE_LLM_DECISIONS_IMAGE`, an in-repo sample image that serves
+  `/v1/decisions` and `/v1/systemone` with a header echo and the `mock_error`
+  query controls. The scenarios are opt-in: `TestSingleClusterHelmfile`
+  excludes `@llm-decision-routes` unless the variable is set, and
+  `TestDecisionRouteScenariosSkipWithoutDecisionsImage` covers that. Do not
+  default it in `godog_test.go`. The scenarios sit after the field-fidelity
+  scenario under a `# Beta decision routes` comment, which `TestLLMRoutingFeaturesRejectIncompleteAndMisroutedResponses`
+  uses to stop its slice; their wiring test is
+  `TestDecisionRouteScenariosRejectBrokenGateways`.
+- The BYOO feature reads its task sample from `SAMPLE_BYOO_TASK_IMAGE` and its
+  function sample from `SAMPLE_BYOO_FUNCTION_IMAGE`. Tag every BYOO
+  scenario that installs, upgrades, or removes a release with `@stack-change`
+  so `TestBYOOExistingInstall` never changes an existing install.
+- The Vanity Gateway shadow sampling scenario reads shadow decisions from the
+  gateway's metrics, because a client cannot see whether a request was
+  shadowed. Its session keys and first messages are chosen for fixed hash
+  buckets on either side of 50 percent; if the sampling hash or canonical
+  first-message form changes, pick new values and update the comment.
+- The Vanity Gateway request body scenario (`@vanity-request-body`) sends
+  bodies longer than the gateway's 64 KiB routing prefix with the routing
+  fields first and last, and reads the forwarded request back from the echo
+  sample. It asserts forwarded bytes, not the request body read metric, so it
+  passes against the released gateway image as well as a branch build.
 - Gateway API route readiness tables expose each route's kind, name,
   namespace, and intended Gateway parent plus the shared context and timeout.
   The step requires `Accepted=True` and `ResolvedRefs=True` for that parent but

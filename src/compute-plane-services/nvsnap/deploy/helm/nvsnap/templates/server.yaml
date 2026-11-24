@@ -64,9 +64,11 @@ rules:
   # Lease ('nvsnap-promote-<short>') to serialize concurrent promote
   # attempts on the same hash. Deleted on hash delete so a future
   # re-capture isn't blocked by a stale lease holder.
+  # get/list/watch: the election reconciler lists nvsnap-capture-<short>
+  # Leases to check leader liveness and deletes them on release.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["delete"]
+    verbs: ["get", "list", "watch", "delete"]
   # services.get: the observability proxy (internal/server/observability_proxy.go)
   # probes whether the grafana / jaeger / prometheus Services exist
   # before rendering the matching UI nav tile. Without this rule the
@@ -86,6 +88,11 @@ rules:
   - apiGroups: ["nvsnap.io"]
     resources: ["gpurestores", "gpurestores/status"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # NvsnapFunction: one per function version the capture records name,
+  # kept from the records (internal/server/function_status.go).
+  - apiGroups: ["nvsnap.io"]
+    resources: ["nvsnapfunctions"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -198,7 +205,9 @@ metadata:
   labels:
     {{- include "nvsnap.server.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.server.service.type }}
+  # The server's API deletes checkpoints and labels pods: it gets no
+  # address outside the cluster. server.service.type is not read.
+  type: ClusterIP
   selector:
     {{- include "nvsnap.server.selectorLabels" . | nindent 4 }}
   ports:

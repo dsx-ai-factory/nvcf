@@ -21,8 +21,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
-	nvcaconfig "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
 	evanphxpatch "github.com/evanphx/json-patch/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -377,9 +377,10 @@ func TestInjectIntoPodSpecUsesRenderedInitImageAndPullPolicy(t *testing.T) {
 	}, installContainer.Args)
 	require.NotNil(t, installContainer.SecurityContext)
 	require.NotNil(t, installContainer.SecurityContext.RunAsUser)
-	assert.Equal(t, int64(0), *installContainer.SecurityContext.RunAsUser)
+	assert.Equal(t, int64(1000), *installContainer.SecurityContext.RunAsUser)
 	require.NotNil(t, installContainer.SecurityContext.RunAsNonRoot)
-	assert.False(t, *installContainer.SecurityContext.RunAsNonRoot)
+	assert.True(t, *installContainer.SecurityContext.RunAsNonRoot)
+	assert.Equal(t, int64(1000), *podSpec.SecurityContext.FSGroup)
 }
 
 func TestInjectIntoPodSpecRejectsMissingOrEmptyRegularInitImage(t *testing.T) {

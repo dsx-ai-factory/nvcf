@@ -62,6 +62,15 @@ var (
 		Help:      "Total restore operations by status and workload type.",
 	}, []string{"status", "workload_type", "namespace"})
 
+	// RestoreCapturedAddressTotal counts what restores did with the captured
+	// pod address (docs/design/RESTORE-POD-ADDRESS.md): applied, unchanged,
+	// or skipped and why.
+	RestoreCapturedAddressTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "restore_captured_address_total",
+		Help:      "Restores by what they did with the captured pod address.",
+	}, []string{"result"})
+
 	RestoreDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Name:      "restore_duration_seconds",
@@ -72,7 +81,7 @@ var (
 	ActiveOperations = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "active_operations",
-		Help:      "Currently active operations.",
+		Help:      "Checkpoint and restore operations running now: the agent's API calls, the instance captures it leads, its rank fallback captures, and its automatic restores of a pod.",
 	}, []string{"operation"})
 
 	CRIUDumpDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -154,12 +163,14 @@ func RegisterAgent() {
 			CheckpointDuration,
 			CheckpointSize,
 			RestoreTotal,
+			RestoreCapturedAddressTotal,
 			RestoreDuration,
 			ActiveOperations,
 			CRIUDumpDuration,
 			GPUProcessesDiscovered,
 			AgentAuthTotal,
 		)
+		prometheus.MustRegister(lifecycleCollectors...)
 		// The agent serves an HTTP API too, so it needs the same RED metrics
 		// the server has. See InstrumentRoute.
 		registerAPIMetrics()
@@ -182,9 +193,18 @@ func RegisterServer() {
 	})
 }
 
-// Handler returns the Prometheus HTTP handler for /metrics.
+// Active counts an operation running in ActiveOperations until the
+// returned function is called.
+func Active(operation string) (done func()) {
+	g := ActiveOperations.WithLabelValues(operation)
+	g.Inc()
+	return g.Dec
+}
+
+// Handler returns the Prometheus HTTP handler for /metrics. Its scrapes
+// release the lifecycle metrics' held first observations (Scraped).
 func Handler() http.Handler {
-	return promhttp.Handler()
+	return Scraped(promhttp.Handler())
 }
 
 // InstrumentRoute returns a mux middleware that records per-route request metrics.

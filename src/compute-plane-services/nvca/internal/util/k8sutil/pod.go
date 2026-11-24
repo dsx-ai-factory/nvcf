@@ -23,12 +23,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nodefeatures"
 )
 
 const (
@@ -60,6 +60,30 @@ func IsUtilsPod(pod *corev1.Pod) bool {
 			}
 			return false
 		}
+	}
+	return false
+}
+
+// isWorkerContainer reports whether the named container is the NVCA worker: the "utils" container of the static
+// "utils" Pod for Helm functions, or the worker container that carries the instance ID for container functions.
+// Sidecars such as ESS in the Helm "utils" Pod are not the worker.
+func isWorkerContainer(pod *corev1.Pod, containerName string) bool {
+	if pod.Name == common.UtilsPodName && IsMiniServiceNamespaceName(pod.Namespace) {
+		return containerName == common.UtilsContainerName
+	}
+	if containerName != common.UtilsContainerName && containerName != function.LLMWorkerContainerName {
+		return false
+	}
+	for _, c := range pod.Spec.Containers {
+		if c.Name != containerName {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == InstanceIDEnvKey {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }
@@ -193,28 +217,56 @@ func IsPodDegraded(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodDegraded, boo
 	}
 
 	if containersNotReady && podNotReady && podInitialized {
-		degradedContainers := []ContainerDegraded{}
 		isNonRestartableContainerTerminated := pod.Spec.RestartPolicy == corev1.RestartPolicyNever &&
-			slices.IndexFunc(status.ContainerStatuses, func(cs corev1.ContainerStatus) bool {
-				if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
-					degradedContainers = append(degradedContainers, ContainerDegraded{
-						Name:    cs.Name,
-						Reason:  cs.State.Terminated.Reason,
-						Message: cs.State.Terminated.Message,
-					})
-					return true
-				}
-				return false
-			}) != -1
+			slices.ContainsFunc(status.ContainerStatuses, func(cs corev1.ContainerStatus) bool {
+				return cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0
+			})
 		isWDPPassed := !podNotReadyCond.LastTransitionTime.IsZero() && time.Since(podNotReadyCond.LastTransitionTime.Time) > wdp
 		if isNonRestartableContainerTerminated || isWDPPassed {
 			return PodDegraded{
-				Containers: degradedContainers,
+				Containers: notReadyContainers(status.ContainerStatuses),
 				Reason:     containersNotReadyReason,
 			}, true
 		}
 	}
 	return PodDegraded{}, false
+}
+
+// notReadyContainers returns a ContainerDegraded entry for every container that is not
+// Ready, regardless of why: terminated with a non-zero exit code, stuck in a Waiting
+// state (e.g. ImagePullBackOff/CrashLoopBackOff), or otherwise Running but failing
+// readiness checks. This must not be restricted by the pod's RestartPolicy: a
+// RestartPolicy=Always worker stuck in ImagePullBackOff never terminates, so gating
+// container attribution on a Terminated state would leave this list permanently empty
+// for every function (only RestartPolicy=Never tasks can terminate a container).
+func notReadyContainers(statuses []corev1.ContainerStatus) []ContainerDegraded {
+	degraded := []ContainerDegraded{}
+	for _, cs := range statuses {
+		if cs.Ready {
+			continue
+		}
+		switch {
+		case cs.State.Terminated != nil:
+			if cs.State.Terminated.ExitCode == 0 {
+				continue
+			}
+			degraded = append(degraded, ContainerDegraded{
+				Name:    cs.Name,
+				Reason:  cs.State.Terminated.Reason,
+				Message: cs.State.Terminated.Message,
+			})
+		case cs.State.Waiting != nil:
+			degraded = append(degraded, ContainerDegraded{
+				Name:    cs.Name,
+				Reason:  cs.State.Waiting.Reason,
+				Message: cs.State.Waiting.Message,
+			})
+		default:
+			// Running but not Ready, e.g. a failing readiness probe.
+			degraded = append(degraded, ContainerDegraded{Name: cs.Name})
+		}
+	}
+	return degraded
 }
 
 func IsPodInInitialStartup(status corev1.PodStatus) bool {
@@ -245,6 +297,42 @@ type ContainerStuckInitializing struct {
 	Message string
 }
 
+// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times, or
+// WorkerContainerRestartCountToFailInstance times for the NVCA worker container, in a Pod launched more than
+// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so a
+// container whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose
+// (for example a streaming app that quits when its session ends) and the kubelet restarted it in place.
+func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
+	threshold := RestartCountToFailInstance
+	if isWorkerContainer(pod, cs.Name) {
+		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
+	}
+	if cs.RestartCount < threshold ||
+		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+		return false
+	}
+	return !exitedCleanlyAfterPodReady(pod.Status, cs)
+}
+
+// exitedCleanlyAfterPodReady reports whether the container's latest run exited with code 0 and the Pod was
+// Ready at some point after that run started.
+func exitedCleanlyAfterPodReady(status corev1.PodStatus, cs corev1.ContainerStatus) bool {
+	// State holds the latest run until the kubelet restarts the container, then LastTerminationState does.
+	last := cs.State.Terminated
+	if last == nil {
+		last = cs.LastTerminationState.Terminated
+	}
+	if last == nil || last.ExitCode != 0 || last.StartedAt.IsZero() {
+		return false
+	}
+	ready := getPodReadyCondition(status)
+	if ready == nil {
+		return false
+	}
+	// PodReady only toggles between True and False, so a False condition was True until its last transition.
+	return ready.Status == corev1.ConditionTrue || ready.LastTransitionTime.After(last.StartedAt.Time)
+}
+
 func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuckInitializing, bool) {
 	podStatus := pod.Status
 	initConditionTrue := false
@@ -257,8 +345,7 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 	stuckContainers := []ContainerStuckInitializing{}
 	if initConditionTrue {
 		for _, containerStatus := range podStatus.ContainerStatuses {
-			if containerStatus.RestartCount >= RestartCountToFailInstance &&
-				IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+			if IsContainerInRestartLoop(pod, containerStatus, k8sTimeConfig) {
 				reason := "ContainerInRestartLoop"
 				message := ""
 				switch {
@@ -284,8 +371,7 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 		}
 	} else {
 		for _, containerStatus := range podStatus.InitContainerStatuses {
-			if containerStatus.RestartCount >= RestartCountToFailInstance &&
-				IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
+			if IsContainerInRestartLoop(pod, containerStatus, k8sTimeConfig) {
 				reason := "InitContainerInRestartLoop"
 				message := ""
 				switch {
@@ -324,23 +410,50 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 }
 
 func IsTimeSincePodLaunchedLaterThan(pod *corev1.Pod, dtc time.Duration) bool {
+	launched, ok := PodLaunchTime(pod)
+	return ok && IsOverTimeout(launched, dtc, time.Now())
+}
+
+// PodLaunchTime returns the time that launch timeouts, such as the scheduling
+// timeout, are measured from. It returns false when the pod has no such time.
+//
+// A started pod is measured from its start time. A pod that has not started and
+// is not scheduled is measured from its creation time, not from the
+// PodScheduled=False condition's LastTransitionTime. Some schedulers, such as the
+// KAI scheduler, rewrite that condition with a new LastTransitionTime on every
+// scheduling attempt, so a timeout measured from it never expires. A bound pod
+// is never unscheduled again: an evicted or preempted pod is replaced by a new
+// pod with its own creation time, so the creation time is how long this pod has
+// waited to be scheduled. The transition time is used only when the pod has no
+// creation time.
+func PodLaunchTime(pod *corev1.Pod) (metav1.Time, bool) {
 	ps := pod.Status
-	now := time.Now()
 	if ps.StartTime != nil && !ps.StartTime.IsZero() {
-		return IsOverTimeout(*ps.StartTime, dtc, now)
+		return *ps.StartTime, true
 	}
 
 	// If a Pod is not scheduled due for whatever reason, kubelet will not set the StartTime.
-	// Rely on scheduled=false condition's transition time to check if pod has launched within timeout.
 	for _, cond := range ps.Conditions {
-		if cond.Type == corev1.PodScheduled {
-			return cond.Status == corev1.ConditionFalse &&
-				!cond.LastTransitionTime.IsZero() &&
-				IsOverTimeout(cond.LastTransitionTime, dtc, now)
+		if cond.Type != corev1.PodScheduled {
+			continue
 		}
+		// A scheduled pod that the kubelet has not started yet has no launch time.
+		if cond.Status != corev1.ConditionFalse {
+			return metav1.Time{}, false
+		}
+		if !pod.CreationTimestamp.IsZero() {
+			return pod.CreationTimestamp, true
+		}
+		if !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime, true
+		}
+		return metav1.Time{}, false
 	}
 	// If there is no scheduled condition, rely on creation timestamp.
-	return !pod.CreationTimestamp.IsZero() && IsOverTimeout(pod.CreationTimestamp, dtc, now)
+	if pod.CreationTimestamp.IsZero() {
+		return metav1.Time{}, false
+	}
+	return pod.CreationTimestamp, true
 }
 
 func IsOverTimeout(t metav1.Time, timeoutDuration time.Duration, now time.Time) bool {

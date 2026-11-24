@@ -27,11 +27,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	translateutil "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	translateutil "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
 )
 
 // TODO: k8s version considerations.
@@ -401,10 +401,11 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			Image:           initContainerImage,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             common.SortEnvs(initEnvs),
-			SecurityContext: common.NewInfraContainerSecurityContext(),
+			SecurityContext: common.NewWorkerInitContainerSecurityContext(),
 			VolumeMounts:    initContainerVolumeMounts,
 		}
 		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+		common.EnsureWorkerInitFSGroup(&pod.Spec)
 
 		// The ESS init container needs to be added after the init container,
 		// since the init container creates config.hcl.
@@ -426,6 +427,7 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 				essDataVolumeMount,
 			}
 			pod.Spec.InitContainers = append(pod.Spec.InitContainers, essInitContainer)
+			common.EnsureESSFSGroup(&pod.Spec)
 		}
 
 		utilsContainer := corev1.Container{

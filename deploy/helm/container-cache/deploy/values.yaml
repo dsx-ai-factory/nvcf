@@ -32,14 +32,18 @@ targetHost: nvcr.io,stg.nvcr.io
 # Container image information used by container-cache.
 images:
   # Name of the container image containing container-cache Nginx proxy.
-  server: nvcr.io/nv-ngc-devops/nvcf-container-cache:v1.1.36
-  # Name of the container image containing Nginx Prometheus exporter.
-  exporter: nvcr.io/nv-ngc-devops/nginx-prometheus-exporter:1.0
+  server: nvcr.io/nvidia/nvcf/nvcf-container-cache:v1.1.42
+  # Nginx Prometheus exporter. Override for a registry mirror; use
+  # images.secrets for authenticated registry pulls.
+  exporter: docker.io/nginx/nginx-prometheus-exporter:1.5.3
   # Certificate bundle used for cache certificates.
-  certificates: nvcr.io/nv-ngc-devops/nvcf-proxy-tls-certs:v1.2.11
-  # Optional pull secrets for private registries.
-  secrets:
-    - nvidia-ngcuser-pull-secret
+  certificates: nvcr.io/nvidia/nvcf/nvcf-proxy-tls-certs:v1.2.15
+  # Image for the init container that fixes ownership of the cache volumes.
+  # Needs only bash, chown, chmod and find. Empty means the certificates image,
+  # which is pulled from the same registry org with the same pull secret.
+  init: ""
+  # Pull secrets for private images or authenticated Docker Hub pulls.
+  secrets: []
 
 # Configuration options related to cache behavior.
 cache:
@@ -245,6 +249,14 @@ vault:
   vaultAddress: https://vault.example.com
   # Used only when vault.enabled=true by the containerd daemonset.
   certLocation: ""
+  # Lifetime requested for the signing intermediate that Vault issues to each
+  # pod. Always sent explicitly: a request with no ttl takes the PKI mount's
+  # default, which Vault rejects whenever that default outlives the signing
+  # CA, and a pod that restarts into that rejection never leaves Init.
+  # The vault-agent sidecar re-issues the certificate at about 80 percent of
+  # this lifetime and reloads nginx without a pod restart, so keep it short
+  # (Vault PKI duration format: 336h is 14 days).
+  intermediateCertTTL: 336h
 
 # CRI-O configuration.
 # When CRI-O is detected on nodes, the DaemonSet configures registry mirrors.

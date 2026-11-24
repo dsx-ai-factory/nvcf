@@ -36,12 +36,12 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	golibversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
+	golibversion "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 )
 
 const (
-	maxRequestSize = 25 * 1024 * 1024 // 25 MB
-	healthPath     = "/health"
+	defaultMaxRequestSize = 25 * 1024 * 1024 // 25 MiB
+	healthPath            = "/health"
 	// max nvcf api timeout is one hour
 	requestTimeout = 1*time.Hour + 10*time.Second
 )
@@ -60,6 +60,10 @@ func buildRouter(mappings *config.GatewayConfig, serverConfig Config) (*router.S
 // Callers must ensure mappings have been validated (SetupConfigWithConfigPath
 // handles this via WithPostLoadFunc on both initial load and reload).
 func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux, error) {
+	maxRequestSize, err := serverConfig.requestSizeLimit()
+	if err != nil {
+		return nil, err
+	}
 	// Compile the regex pattern
 	re, err := regexp.Compile(serverConfig.PrivateModelNameRegexPattern)
 	if err != nil {
@@ -103,13 +107,29 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	}
 	shadower := NewTrafficShadower(shadowMaxConcurrent, requestTimeout)
 
-	openAIDirector, err := NewOpenAIDirectorV2(mappings, re, vanityDirector, llmGatewayDirector, shadower)
+	modelDirector, err := NewModelDirector(mappings, re, vanityDirector, llmGatewayDirector, shadower)
 	if err != nil {
 		return nil, err
 	}
+	modelDirector.requestBodyLimit = maxRequestSize
+	if serverConfig.NvcfControlPlaneEndpoint != "" {
+		modelDirector.privateModels, err = sharedPrivateModelAccess(serverConfig.NvcfControlPlaneEndpoint, transport)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	serverTelemetry := middleware.ServerTelemetryMiddleware()
+
+	// Request IDs apply only on the model API host. Pass-through vanity hosts
+	// keep the caller's and the function's headers unchanged. The middleware
+	// runs on the root router so errors from the root middleware carry an ID.
+	requestIDRouter := &middleware.HostRouter{}
+	requestIDRouter.Register(mappings.OpenAI.Host, middleware.RequestID)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RejectSpoofedShadowRequests(shadowHeader))
+	r.Use(requestIDRouter.Handler)
+	r.Use(middleware.RejectSpoofedShadowRequests(shadowHeader, serverTelemetry))
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(requestTimeout))
@@ -121,9 +141,8 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 	}))
 
 	hostRouter := &middleware.HostRouter{}
-	serverTelemetry := middleware.ServerTelemetryMiddleware()
 
-	registerOpenAI(hostRouter, mappings, openAIDirector, healthManager, serverTelemetry)
+	registerModelAPIs(hostRouter, mappings, modelDirector, healthManager, serverTelemetry, maxRequestSize)
 	registerVanity(hostRouter, mappings, vanityDirector, healthManager, serverTelemetry)
 
 	r.Use(hostRouter.Handler)
@@ -169,19 +188,23 @@ func registerVanity(hostRouter *middleware.HostRouter, mappings *config.GatewayC
 }
 
 // openai specific domain
-func registerOpenAI(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, openAIDirector *OpenAIDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler) {
+func registerModelAPIs(hostRouter *middleware.HostRouter, mappings *config.GatewayConfig, modelDirector *ModelDirector, healthManager *health.Health, serverTelemetry func(http.Handler) http.Handler, maxRequestSize int64) {
 	r := chi.NewRouter()
 	r.Use(serverTelemetry)
-	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeChatCompletions)))
-	r.Method(http.MethodPost, "/v1/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeCompletions)))
-	r.Method(http.MethodPost, "/v1/embeddings", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeEmbeddings)))
-	r.Method(http.MethodPost, "/v1/responses", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeResponses)))
-	r.Method(http.MethodPost, "/v1/images/generations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageGenerations)))
-	r.Method(http.MethodPost, "/v1/images/edits", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageEdits)))
-	r.Method(http.MethodPost, "/v1/images/variations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(openAIDirector.ServeImageVariations)))
-	r.Get("/v1/models", openAIDirector.ListModels)
-	r.Get("/v1/models/{model}", openAIDirector.GetModel)
-	r.Get("/v1/models/{company}/{model}", openAIDirector.GetModel)
+	r.Method(http.MethodPost, "/v1/chat/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeChatCompletions)))
+	r.Method(http.MethodPost, "/v1/completions", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeCompletions)))
+	r.Method(http.MethodPost, "/v1/embeddings", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeEmbeddings)))
+	r.Method(http.MethodPost, "/v1/messages", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeMessages)))
+	r.Method(http.MethodPost, decisionsPath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeDecisions)))
+	r.Method(http.MethodPost, systemOnePath, chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeSystemOne)))
+	r.Method(http.MethodPost, "/v1/responses", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeResponses)))
+	r.Method(http.MethodPost, "/v1/images/generations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageGenerations)))
+	r.Method(http.MethodPost, "/v1/images/edits", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageEdits)))
+	r.Method(http.MethodPost, "/v1/images/variations", chimiddleware.RequestSize(maxRequestSize)(http.HandlerFunc(modelDirector.ServeImageVariations)))
+	r.Get("/v1/models", modelDirector.ListModels)
+	r.Get("/v1/models/{model}", modelDirector.GetModel)
+	r.Get("/v1/models/{company}/{model}", modelDirector.GetModel)
+	r.Get("/v1/models/{prefix}/{company}/{model}", modelDirector.GetModel)
 
 	r.Get(healthPath, healthManager.HandlerFunc)
 	r.Get("/info", golibversion.Handler().ServeHTTP)

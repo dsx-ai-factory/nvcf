@@ -27,10 +27,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
-	translateutil "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/cache"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	translateutil "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/util"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/otelconfig/backendconfig"
 )
 
 // translateContainer converts a container function request into Kubernetes resources.
@@ -382,6 +382,13 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			SecurityContext: common.NewWorkloadContainerSecurityContext(),
 			VolumeMounts:    inferenceContainerVolumeMounts,
 		}
+		if isLLM {
+			shutdown := newLLMShutdown(tcfg.LLMInferenceStopPause.Duration)
+			inferenceContainer.Lifecycle = shutdown.inferenceLifecycle()
+			if grace := shutdown.minGraceSeconds(); grace > *pod.Spec.TerminationGracePeriodSeconds {
+				*pod.Spec.TerminationGracePeriodSeconds = grace
+			}
+		}
 
 		pod.Spec.Containers = append(pod.Spec.Containers, inferenceContainer)
 
@@ -392,10 +399,11 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			Image:           initContainerImage,
 			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             common.SortEnvs(initEnvs),
-			SecurityContext: common.NewInfraContainerSecurityContext(),
+			SecurityContext: common.NewWorkerInitContainerSecurityContext(),
 			VolumeMounts:    initContainerVolumeMounts,
 		}
 		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+		common.EnsureWorkerInitFSGroup(&pod.Spec)
 
 		// The ESS init container needs to be added after the init container,
 		// since the init container creates config.hcl.
@@ -417,6 +425,7 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 				essDataVolumeMount,
 			}
 			pod.Spec.InitContainers = append(pod.Spec.InitContainers, essInitContainer)
+			common.EnsureESSFSGroup(&pod.Spec)
 		}
 
 		if !isLLM {
@@ -462,6 +471,9 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			fluentbitCM := common.SetupFluentBit(pod, telLaunchSpec, allEnvSet, common.WorkloadTypeContainer, tcfg.Namespace, tcfg.FluentbitEnabled, tcfg.FluentbitResources)
 			if fluentbitCM != nil {
 				objs = append(objs, fluentbitCM)
+			}
+			if isLLM {
+				newLLMShutdown(tcfg.LLMInferenceStopPause.Duration).holdTelemetrySidecars(pod)
 			}
 		}
 

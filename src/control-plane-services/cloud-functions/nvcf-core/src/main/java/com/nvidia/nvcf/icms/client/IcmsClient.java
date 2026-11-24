@@ -38,6 +38,7 @@ import com.nvidia.boot.exceptions.NotFoundException;
 import com.nvidia.boot.exceptions.UpstreamException;
 import com.nvidia.boot.registries.service.registry.client.ngc.NgcRegistryUtils;
 import com.nvidia.boot.registries.service.registry.dto.ArtifactTypeEnum;
+import com.nvidia.nvcf.configuration.LlmProperties;
 import com.nvidia.nvcf.configuration.nats.NatsConfiguration.NatsProperties;
 import com.nvidia.nvcf.configuration.staticclientauth.FixedBearerExchangeFilterFunction;
 import com.nvidia.nvcf.configuration.staticclientauth.StaticClientAuthConfiguration.StaticClientIcmsProperties;
@@ -51,6 +52,7 @@ import com.nvidia.nvcf.persistence.function.entity.FunctionType;
 import com.nvidia.nvcf.persistence.function.entity.GpuSpecificationEntity;
 import com.nvidia.nvcf.persistence.function.entity.Protocol;
 import com.nvidia.nvcf.rest.function.deployment.dto.InstanceUsageTypeEnum;
+import com.nvidia.nvcf.rest.function.management.dto.LlmInvocationConfigDto;
 import com.nvidia.nvcf.rest.registry.dto.ProvisionedByEnum;
 import com.nvidia.nvcf.service.function.FunctionMapperService;
 import com.nvidia.nvcf.service.registry.RegistryArtifactValidationService;
@@ -66,6 +68,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
@@ -99,6 +102,11 @@ import tools.jackson.databind.json.JsonMapper;
 public class IcmsClient {
     public static final int BATCH_SIZE = 32;
     public static final String CLIENT_REGISTRATION_ID = "icms";
+    private static final String OTLP_ENDPOINT_PROPERTY =
+            "management.opentelemetry.tracing.export.otlp.endpoint";
+    private static final String MESG_INVALID_OTLP_ENDPOINT =
+            "Invalid %s '%s': expected an http:// or https:// URL with a host and an optional numeric"
+                    + " port, or an empty value to disable tracing";
 
     private static final String MESG_INVALID_GPU =
             "Cluster Group '%s': Invalid GPU '%s' specified";
@@ -164,7 +172,7 @@ public class IcmsClient {
     private final String otelCollectorContainer;
     private final String llmCredentialManagerImage;
     private final String llmRouterClientImage;
-    private final String llmRequestRouterAddress;
+    private final LlmProperties llmProperties;
     private final JsonMapper jsonMapper;
     private final GrpcTokenService grpcTokenService;
     private final FunctionMapperService functionMapperService;
@@ -203,13 +211,12 @@ public class IcmsClient {
             @Value("${nvcf.sidecars.utils-container-image.go}") String goUtilsContainer,
             @Value("${nvcf.sidecars.niclls-container}") String nicllsContainer,
             @Value("${nvcf.sidecars.ess-agent-container}") String essAgentContainer,
-            @Value("${nvcf.sidecars.otel-collector-container}") String otelCollectorContainer,
+            @Value("${nvcf.sidecars.otel-collector-container:}") String otelCollectorContainer,
             @Value("${nvcf.sidecars.llm-credential-manager-image}") String llmCredentialManagerImage,
             @Value("${nvcf.sidecars.llm-router-client-image}") String llmRouterClientImage,
-            @Value("${nvcf.llm-request-router.worker-address}") String llmRequestRouterAddress,
             @Value("${nvcf.fqdn}") String selfFqdn,
             @Value("${nvcf.global-fqdn-grpc}") String globalFqdnGrpc,
-            @Value("${management.opentelemetry.tracing.export.otlp.endpoint}") URI tracingUrl,
+            @Value("${" + OTLP_ENDPOINT_PROPERTY + ":}") String tracingEndpoint,
             // ESS_FQDN advertised to the LLM worker is the worker-facing ESS address,
             // which differs from EssClient's in-cluster base-url when the compute plane
             // is external. Defaults to nvcf.ess.base-url (colocated); split deployments
@@ -224,6 +231,7 @@ public class IcmsClient {
             JsonMapper jsonMapper,
             GrpcTokenService grpcTokenService,
             FunctionMapperService functionMapperService,
+            LlmProperties llmProperties,
             NatsProperties natsProperties,
             TelemetryService telemetryService,
             RegistryArtifactValidationService registryArtifactValidationService,
@@ -241,7 +249,7 @@ public class IcmsClient {
         this.otelCollectorContainer = otelCollectorContainer;
         this.llmCredentialManagerImage = llmCredentialManagerImage;
         this.llmRouterClientImage = llmRouterClientImage;
-        this.llmRequestRouterAddress = llmRequestRouterAddress;
+        this.llmProperties = llmProperties;
         this.selfFqdn = selfFqdn;
         this.globalFqdnGrpc = globalFqdnGrpc;
         this.jsonMapper = jsonMapper;
@@ -266,7 +274,7 @@ public class IcmsClient {
                 .builderFor(WebClientAdapter.create(webClient))
                 .build()
                 .createClient(IcmsStubService.class);
-        this.tracingUrl = tracingUrl;
+        this.tracingUrl = parseTracingUrl(tracingEndpoint);
         this.clusterGroupCache = Caffeine.newBuilder()
                 .maximumSize(64)
                 .expireAfterWrite(Duration.ofMinutes(15))
@@ -387,6 +395,7 @@ public class IcmsClient {
         // for container-based it should be null
         var configuration = isNotBlank(function.getHelmChart()) ? gpuSpec.getConfiguration() : null;
         var models = getFunctionModels(function);
+        var terminationGracePeriod = terminationGracePeriod(function);
         var response = service.createInstance(backend, gpu, instanceType, ncaId,
                                               rawAvailabilityZones, count,
                                               getInferenceContainer(function), helmChart, env,
@@ -407,6 +416,7 @@ public class IcmsClient {
                                               regions,
                                               attributes,
                                               function.getFunctionType(),
+                                              terminationGracePeriod,
                                               telemetries,
                                               helmValidationPolicy);
         if (response == null || response.getRequestId() == null) {
@@ -437,11 +447,12 @@ public class IcmsClient {
                 validateAndGetHelmRegistryImagePullSecrets(function);
         var sidecarRegistryCredentialEncoded = registryCredentialFunctionService
                 .getBase64EncodedSidecarRegistryImagePullSecret(function);
-        var envStream = Stream.of(
+        Stream<Pair<String, Object>> envStream = Stream.of(
                 Pair.of("NVCF_WORKER_TOKEN", nvcfWorkerToken),
                 Pair.of("NVCF_FQDN", selfFqdn),
                 Pair.of("NVCF_FQDN_GRPC", globalFqdnGrpc),
                 Pair.of("NVCF_FQDN_NATS", natsProperties.getWorkerUrl()),
+                Pair.of("NVCF_NATS_ACCOUNT", natsProperties.getAuthCalloutWorkerAccount()),
                 Pair.of("INFERENCE_CONTAINER", getInferenceContainer(function)),
                 Pair.of("INFERENCE_CONTAINER_ARGS", args),
                 Pair.of("INFERENCE_CONTAINER_ENV", cenv),
@@ -454,7 +465,6 @@ public class IcmsClient {
                 Pair.of("INFERENCE_URL", function.getInferenceUrl()),
                 Pair.of("INFERENCE_PORT", inferencePort),
                 Pair.of("INFERENCE_PROTOCOL", getInferenceProtocol(function)),
-                Pair.of("OTEL_EXPORTER_OTLP_ENDPOINT", tracingUrl.toString()),
                 Pair.of("TRACING_ACCESS_TOKEN", tracingAccessToken),
                 Pair.of("INIT_CONTAINER", initContainer),
                 Pair.of("OTEL_CONTAINER", otelContainer),
@@ -468,7 +478,6 @@ public class IcmsClient {
                 Pair.of("HELM_CHART_INFERENCE_SERVICE_NAME", helmChartServiceName),
                 Pair.of("SECRETS_ASSERTION_TOKEN", secretsAssertionToken),
                 Pair.of("ESS_AGENT_CONTAINER", essAgentContainer),
-                Pair.of("BYOO_OTEL_COLLECTOR_CONTAINER", otelCollectorContainer),
                 Pair.of("FUNCTION_SECRETS_PRESENT", functionSecretsPresent),
                 Pair.of("CONTAINER_REGISTRIES_CREDENTIALS", containerRegistryCredentialsEncoded),
                 Pair.of("HELM_REGISTRIES_CREDENTIALS", helmRegistryCredentialsEncoded),
@@ -478,7 +487,13 @@ public class IcmsClient {
             envStream = Stream.concat(envStream, Stream.of(
                     Pair.of("LLM_CREDENTIAL_MANAGER_IMAGE", llmCredentialManagerImage),
                     Pair.of("LLM_ROUTER_CLIENT_IMAGE", llmRouterClientImage),
-                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS", llmRequestRouterAddress)));
+                    Pair.of("LLM_REQUEST_ROUTER_ADDRESS",
+                            llmProperties.getRequestRouter().getWorkerAddress())));
+            var terminationGracePeriod = terminationGracePeriod(function);
+            if (terminationGracePeriod != null) {
+                envStream = Stream.concat(envStream, Stream.of(
+                        Pair.of("TERMINATION_GRACE_PERIOD", terminationGracePeriod)));
+            }
         }
         if (function.getFunctionType() == FunctionType.STREAMING) {
             envStream = Stream.concat(envStream,
@@ -488,6 +503,8 @@ public class IcmsClient {
             envStream = Stream.concat(envStream,
                                       Stream.of(Pair.of("NKEY_SEED", workerNKeySeed.get())));
         }
+        envStream = Stream.concat(envStream, otlpEndpointEnv(tracingUrl));
+        envStream = Stream.concat(envStream, byooOtelCollectorContainerEnv(otelCollectorContainer));
 
         // ### Keep the option to send legacy properties in case we need to troubleshoot.
         //     By default, sendLegacyCredProps is false. When sending legacy properties, we are
@@ -497,16 +514,50 @@ public class IcmsClient {
         if (sendLegacyCredProps) {
             var containerRegistryCred = getSystemContainerRegistrySecret(function.getNcaId());
             var sidecarRegistryCredential = NgcRegistryUtils.getApiKey(sidecarImagePullSecret);
-            var legacyCredPropsStream =
+            Stream<Pair<String, Object>> legacyCredPropsStream =
                     Stream.of(Pair.of("INFERENCE_CONTAINER_CREDENTIAL", containerRegistryCred),
                               Pair.of("SIDECAR_CREDENTIAL", sidecarRegistryCredential));
             envStream = Stream.concat(envStream, legacyCredPropsStream);
         }
 
         var env = envStream
-                .map(pair -> pair.getFirst() + "=" + pair.getSecond())
+                .map(pair -> pair.getFirst() + "=" + encodeEnvironmentValue(pair.getSecond()))
                 .collect(Collectors.joining("\n"));
         return Base64.getEncoder().encodeToString(env.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String terminationGracePeriod(FunctionEntity function) {
+        if (function.getFunctionType() != FunctionType.LLM) {
+            return null;
+        }
+        LlmInvocationConfigDto config = functionMapperService.toLlmInvocationConfigDto(
+                function.getLlmConfig());
+        var duration = config == null ? null : config.terminationGracePeriodDuration();
+        // if duration is not set in database we should send a default value which is equals to min
+        return (duration == null ? llmProperties.getWorker().getTerminationGracePeriod().getMin()
+                : duration).toString();
+    }
+
+    // The worker reads one KEY=value entry per line and unquotes Go double-quoted values, so a
+    // value with a control character is quoted to stay one entry. Other values are not quoted, so
+    // workers see the same bytes as before.
+    // Example: "a\nb" becomes "a\\u000ab", which the worker unquotes back to "a\nb".
+    static String encodeEnvironmentValue(Object value) {
+        var text = String.valueOf(value);
+        if (text.chars().noneMatch(Character::isISOControl)) {
+            return text;
+        }
+        var quoted = new StringBuilder("\"");
+        text.chars().forEach(c -> {
+            if (c == '"' || c == '\\') {
+                quoted.append('\\').append((char) c);
+            } else if (Character.isISOControl(c)) {
+                quoted.append("\\u%04x".formatted(c));
+            } else {
+                quoted.append((char) c);
+            }
+        });
+        return quoted.append('"').toString();
     }
 
     private String getFunctionModels(FunctionEntity function) {
@@ -717,7 +768,10 @@ public class IcmsClient {
         try {
             return service.getInstancesByDeploymentId(
                     ncaId, deploymentId, includeTerminated, true, includeExpiredAckedInstances);
-        } catch (NotFoundException ex) {
+        } catch (UpstreamException ex) {
+            if (!(ex.getCause() instanceof NotFoundException)) {
+                throw ex;
+            }
             log.info(MSG_NO_INSTANCES_FOUND, ncaId, deploymentId);
             return IcmsStubService.Instances.builder().Instances(List.of()).build();
         }
@@ -834,5 +888,64 @@ public class IcmsClient {
             return Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
         }
         return null;
+    }
+
+    // Workers and the BYOO collector run with tracing disabled when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is missing, so send it only when an endpoint is configured.
+    // A configured endpoint must be an http or https URL with a host and an optional numeric port,
+    // as the OpenTelemetry SDK and workers expect. Anything else is a configuration error, and
+    // throwing here stops startup because the refresh scope creates this bean eagerly.
+    static URI parseTracingUrl(String endpoint) {
+        if (isBlank(endpoint)) {
+            return null;
+        }
+        var trimmed = endpoint.trim();
+        URI uri;
+        try {
+            uri = new URI(trimmed);
+        } catch (URISyntaxException e) {
+            throw invalidTracingEndpoint(trimmed, e);
+        }
+        var scheme = uri.getScheme();
+        var httpScheme = "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+        var authority = uri.getRawAuthority();
+        if (!httpScheme || isBlank(authority) || !hasValidPort(authority)) {
+            throw invalidTracingEndpoint(trimmed, null);
+        }
+        return uri;
+    }
+
+    // java.net.URI falls back to a registry-based authority, with no host or port, when the port
+    // is not a number, so check the port text directly. Everything after the first colon outside
+    // an IPv6 literal must be the port, which rejects extra colons. Registry-style host names,
+    // such as names with underscores, and an empty port stay valid.
+    private static boolean hasValidPort(String authority) {
+        var hostPort = authority.substring(authority.lastIndexOf('@') + 1);
+        var hostEnd = hostPort.startsWith("[") ? Math.max(hostPort.indexOf(']'), 0) : 0;
+        var colon = hostPort.indexOf(':', hostEnd);
+        if (colon < 0) {
+            return true;
+        }
+        var port = hostPort.substring(colon + 1);
+        return port.isEmpty() || port.matches("\\d{1,5}") && Integer.parseInt(port) <= 65535;
+    }
+
+    private static IllegalArgumentException invalidTracingEndpoint(String endpoint, Throwable cause) {
+        return new IllegalArgumentException(
+                String.format(MESG_INVALID_OTLP_ENDPOINT, OTLP_ENDPOINT_PROPERTY, endpoint), cause);
+    }
+
+    static Stream<Pair<String, Object>> otlpEndpointEnv(URI tracingUrl) {
+        return tracingUrl == null
+                ? Stream.empty()
+                : Stream.of(Pair.of("OTEL_EXPORTER_OTLP_ENDPOINT", tracingUrl.toString()));
+    }
+
+    // An empty collector image means the compute plane supplies it. The NVCA operator chart
+    // sets BYOO_OTEL_COLLECTOR_CONTAINER through its function and task env overrides.
+    static Stream<Pair<String, Object>> byooOtelCollectorContainerEnv(String image) {
+        return isBlank(image)
+                ? Stream.empty()
+                : Stream.of(Pair.of("BYOO_OTEL_COLLECTOR_CONTAINER", image));
     }
 }

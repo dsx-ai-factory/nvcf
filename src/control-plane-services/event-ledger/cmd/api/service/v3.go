@@ -18,7 +18,9 @@ limitations under the License.
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +31,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/observability/logging"
 	"github.com/gorilla/mux"
 	"github.com/mitchellh/mapstructure"
 	"go.uber.org/zap"
@@ -40,9 +42,9 @@ import (
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
 
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/common/core/types"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/data_access"
-	"github.com/NVIDIA/nvcf/src/control-plane-services/event-ledger/internal/middleware"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/common/core/types"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/data_access"
+	"github.com/dsx-ai-factory/nvcf/src/control-plane-services/event-ledger/internal/middleware"
 )
 
 var (
@@ -51,6 +53,10 @@ var (
 	// instanceIDFieldPattern additionally permits dot-separated instance ID segments.
 	instanceIDFieldPattern = regexp.MustCompile(`^[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*$`)
 	namespaceFieldPattern  = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
+	// ncaIDFieldPattern validates the account identifier. Unlike context fields it
+	// permits underscores, and its length is capped separately by maxNcaIDLength.
+	ncaIDFieldPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	uuidFieldPattern  = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 	ErrMissingEventName = errors.New("missing required field: event_name")
 	ErrMissingNamespace = errors.New("missing required field: namespace")
@@ -59,6 +65,8 @@ var (
 
 	MaxContextLength = 1024
 )
+
+const maxNcaIDLength = 128
 
 const (
 	defaultStatsView        = ""
@@ -167,7 +175,14 @@ type ContextV3 struct {
 // Used to deserialize CloudEvent extensions before converting to internal format
 // Note: CloudEvents spec forbids underscores in extension names, so we use camelCase
 type cloudEventWireFormat struct {
-	Namespace          string         `mapstructure:"namespace"`
+	Namespace string `mapstructure:"namespace"`
+	// FunctionVersionID lets a producer name the namespace by what it is.
+	FunctionVersionID string `mapstructure:"functionVersionId"`
+	// NcaID and FunctionID scope the event to an account and function. They are
+	// stored as columns rather than in the context or details. Optional while
+	// producers roll out.
+	NcaID              string         `mapstructure:"ncaId"`
+	FunctionID         string         `mapstructure:"functionId"`
 	InstanceID         string         `mapstructure:"instanceId"`
 	DeploymentID       string         `mapstructure:"deploymentId"`
 	GPUSpecificationID string         `mapstructure:"gpuSpecificationId"`
@@ -182,6 +197,9 @@ type otlpAttributesWireFormat struct {
 	EventName          string         `mapstructure:"event_name"`
 	Namespace          string         `mapstructure:"namespace"`
 	Source             string         `mapstructure:"source"`
+	NcaID              string         `mapstructure:"nca_id"`
+	FunctionID         string         `mapstructure:"function_id"`
+	FunctionVersionID  string         `mapstructure:"function_version_id"`
 	InstanceID         string         `mapstructure:"instance_id"`
 	DeploymentID       string         `mapstructure:"deployment_id"`
 	GPUSpecificationID string         `mapstructure:"gpu_specification_id"`
@@ -198,6 +216,8 @@ type EventV3 struct {
 	Namespace   string
 	Source      string // Event source identifier (e.g., "kubernetes", "nvcf")
 	Context     string // Canonical context string (e.g., "instanceid=pod-1")
+	NcaID       string // Account the event belongs to; empty until all producers send it
+	FunctionID  string // Function the event belongs to; empty until all producers send it
 	Timestamp   time.Time
 	DetailsJSON json.RawMessage // Event details as JSON blob
 }
@@ -225,7 +245,70 @@ func (e *EventV3) Validate() error {
 	if len(e.Source) > MaxContextLength {
 		return fmt.Errorf("source exceeds max length of %d", MaxContextLength)
 	}
+	if e.NcaID != "" {
+		if len(e.NcaID) > maxNcaIDLength {
+			return fmt.Errorf("invalid ncaId: exceeds max length of %d", maxNcaIDLength)
+		}
+		if !ncaIDFieldPattern.MatchString(e.NcaID) {
+			return fmt.Errorf("invalid ncaId: must contain only alphanumeric characters, dashes, and underscores")
+		}
+	}
+	if e.FunctionID != "" && !uuidFieldPattern.MatchString(e.FunctionID) {
+		return fmt.Errorf("invalid functionId: must be a UUID")
+	}
 	return nil
+}
+
+// extractOptions adjusts how events are extracted.
+type extractOptions struct {
+	// accountColumns stores nca_id and function_id as their own fields and
+	// validates them. When false they stay in the event attributes, unvalidated,
+	// as they did before the columns existed. It is true unless an option says
+	// otherwise.
+	accountColumns bool
+}
+
+type extractOption func(*extractOptions)
+
+func withAccountColumns(enabled bool) extractOption {
+	return func(o *extractOptions) { o.accountColumns = enabled }
+}
+
+func newExtractOptions(options []extractOption) extractOptions {
+	opts := extractOptions{accountColumns: true}
+	for _, option := range options {
+		option(&opts)
+	}
+	return opts
+}
+
+// restoreAttribute puts a decoded wire value back into the unmapped attributes
+// under its wire name.
+func restoreAttribute(attrs *map[string]any, name, value string) {
+	if value == "" {
+		return
+	}
+	if *attrs == nil {
+		*attrs = make(map[string]any)
+	}
+	(*attrs)[name] = value
+}
+
+// resolveNamespace returns the namespace for an event. A producer may name it by
+// what it is (functionVersionId); when both are set they must agree. With
+// requireUUID, the function version ID must also be a UUID, which the namespace
+// pattern alone does not enforce.
+func resolveNamespace(namespace, functionVersionID string, requireUUID bool) (string, error) {
+	if functionVersionID == "" {
+		return namespace, nil
+	}
+	if requireUUID && !uuidFieldPattern.MatchString(functionVersionID) {
+		return "", errors.New("invalid functionVersionId: must be a UUID")
+	}
+	if namespace != "" && namespace != functionVersionID {
+		return "", errors.New("namespace and functionVersionId must match when both are set")
+	}
+	return functionVersionID, nil
 }
 
 // PostK8sEventV3 handles K8s events in OTLP format (both JSON and protobuf)
@@ -298,7 +381,7 @@ func (s *Server) processOTLPEvents(traceCtx context.Context, req *collectorlogsv
 	for _, rl := range req.ResourceLogs {
 		for _, sl := range rl.ScopeLogs {
 			for _, lr := range sl.LogRecords {
-				event, err := extractK8sEvent(traceCtx, lr)
+				event, err := extractK8sEvent(traceCtx, lr, withAccountColumns(s.accountColumnsEnabled))
 				if err != nil {
 					if errors.Is(err, errClusterAuthorization) {
 						logger.WarnContext(traceCtx, "Aborting batch", zap.Error(err))
@@ -327,12 +410,14 @@ func (s *Server) processOTLPEvents(traceCtx context.Context, req *collectorlogsv
 	records := make([]data_access.EventV3UpsertRecord, len(events))
 	for i, e := range events {
 		records[i] = data_access.EventV3UpsertRecord{
-			Namespace: e.Namespace,
-			Context:   e.Context,
-			EventName: e.EventName,
-			Source:    e.Source,
-			Details:   e.DetailsJSON,
-			Timestamp: e.Timestamp,
+			Namespace:  e.Namespace,
+			Context:    e.Context,
+			EventName:  e.EventName,
+			Source:     e.Source,
+			Details:    e.DetailsJSON,
+			Timestamp:  e.Timestamp,
+			NcaID:      e.NcaID,
+			FunctionID: e.FunctionID,
 		}
 	}
 
@@ -480,7 +565,9 @@ func bindNVCAClusterID(ctx context.Context, payloadClusterID string) (string, er
 //   - Context fields (optional): instance_id, deployment_id, gpu_specification_id, cluster_id
 //   - resource_id (optional): generic unique identifier for events that have no
 //     other distinguishing context field (e.g. an ICMSRequest keyed by its request id).
-func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord) (*EventV3, error) {
+func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord, options ...extractOption) (*EventV3, error) {
+	opts := newExtractOptions(options)
+
 	// Step 1: Convert OTLP protobuf attributes to map
 	attrs := make(map[string]any)
 	for _, attr := range lr.Attributes {
@@ -491,6 +578,20 @@ func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord) (*EventV3, error
 	var wireFormat otlpAttributesWireFormat
 	if err := mapstructure.Decode(attrs, &wireFormat); err != nil {
 		return nil, fmt.Errorf("failed to decode OTLP attributes: %w", err)
+	}
+
+	namespace := wireFormat.Namespace
+	ncaID, functionID := wireFormat.NcaID, wireFormat.FunctionID
+	if opts.accountColumns {
+		var err error
+		if namespace, err = resolveNamespace(wireFormat.Namespace, wireFormat.FunctionVersionID, true); err != nil {
+			return nil, err
+		}
+	} else {
+		ncaID, functionID = "", ""
+		restoreAttribute(&wireFormat.UnmappedAttributes, "nca_id", wireFormat.NcaID)
+		restoreAttribute(&wireFormat.UnmappedAttributes, "function_id", wireFormat.FunctionID)
+		restoreAttribute(&wireFormat.UnmappedAttributes, "function_version_id", wireFormat.FunctionVersionID)
 	}
 
 	// Step 3: Convert wire format to internal context representation
@@ -538,9 +639,11 @@ func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord) (*EventV3, error
 	// Step 4: Build internal EventV3 struct
 	event := &EventV3{
 		EventName:   wireFormat.EventName,
-		Namespace:   wireFormat.Namespace,
+		Namespace:   namespace,
 		Source:      wireFormat.Source,
 		Context:     canonicalContext,
+		NcaID:       ncaID,
+		FunctionID:  functionID,
 		Timestamp:   timestamp,
 		DetailsJSON: detailsJSON,
 	}
@@ -551,12 +654,33 @@ func extractK8sEvent(ctx context.Context, lr *logsv1.LogRecord) (*EventV3, error
 	return event, nil
 }
 
+// CloudEvent bodies are stored as bytes, which JSON encodes as base64. Decode
+// JSON objects and arrays on reads so existing records need no migration.
+// Leave other strings and binary payloads unchanged.
+func decodeEventBody(body any) any {
+	s, ok := body.(string)
+	if !ok {
+		return body
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return body
+	}
+	decoded = bytes.TrimSpace(decoded)
+	if len(decoded) == 0 || (decoded[0] != '{' && decoded[0] != '[') || !json.Valid(decoded) {
+		return body
+	}
+	return json.RawMessage(decoded)
+}
+
 // extractCloudEvent converts a CloudEvent into our internal EventV3 format
 // CloudEvents extensions are mapped via mapstructure to:
-//   - namespace (required)
+//   - namespace (required), or functionVersionId, which is stored as the namespace
 //   - Context fields (optional, camelCase): instanceId, deploymentId, gpuSpecificationId, clusterId
 //     Note: CloudEvents spec forbids underscores in extension names, so we use camelCase
-func extractCloudEvent(ctx context.Context, ce *cloudevents.Event) (*EventV3, error) {
+func extractCloudEvent(ctx context.Context, ce *cloudevents.Event, options ...extractOption) (*EventV3, error) {
+	opts := newExtractOptions(options)
+
 	// Validate required CloudEvents fields per spec (using CloudEvents field names in errors)
 	if strings.TrimSpace(ce.ID()) == "" {
 		return nil, errors.New("missing required field: id")
@@ -572,6 +696,17 @@ func extractCloudEvent(ctx context.Context, ce *cloudevents.Event) (*EventV3, er
 	var wireFormat cloudEventWireFormat
 	if err := mapstructure.Decode(ce.Extensions(), &wireFormat); err != nil {
 		return nil, fmt.Errorf("failed to decode CloudEvent extensions: %w", err)
+	}
+
+	ncaID, functionID := wireFormat.NcaID, wireFormat.FunctionID
+	if !opts.accountColumns {
+		ncaID, functionID = "", ""
+		restoreAttribute(&wireFormat.UnmappedExtensions, "ncaid", wireFormat.NcaID)
+		restoreAttribute(&wireFormat.UnmappedExtensions, "functionid", wireFormat.FunctionID)
+	}
+	namespace, err := resolveNamespace(wireFormat.Namespace, wireFormat.FunctionVersionID, opts.accountColumns)
+	if err != nil {
+		return nil, err
 	}
 
 	// Convert wire format to internal context representation
@@ -603,9 +738,11 @@ func extractCloudEvent(ctx context.Context, ce *cloudevents.Event) (*EventV3, er
 
 	event := &EventV3{
 		EventName:   ce.Type(),
-		Namespace:   wireFormat.Namespace,
+		Namespace:   namespace,
 		Source:      ce.Source(),
 		Context:     canonicalContext,
+		NcaID:       ncaID,
+		FunctionID:  functionID,
 		Timestamp:   ce.Time(),
 		DetailsJSON: detailsJSON,
 	}
@@ -633,7 +770,7 @@ func (s *Server) processCloudEvents(traceCtx context.Context, cloudEvents []*clo
 			continue
 		}
 
-		event, err := extractCloudEvent(traceCtx, cloudEvent)
+		event, err := extractCloudEvent(traceCtx, cloudEvent, withAccountColumns(s.accountColumnsEnabled))
 		if err != nil {
 			if errors.Is(err, errClusterAuthorization) {
 				logger.WarnContext(traceCtx, "Aborting batch", zap.Error(err))
@@ -661,12 +798,14 @@ func (s *Server) processCloudEvents(traceCtx context.Context, cloudEvents []*clo
 	records := make([]data_access.EventV3UpsertRecord, len(storageEvents))
 	for i, event := range storageEvents {
 		records[i] = data_access.EventV3UpsertRecord{
-			Namespace: event.Namespace,
-			Context:   event.Context,
-			EventName: event.EventName,
-			Source:    event.Source,
-			Details:   event.DetailsJSON,
-			Timestamp: event.Timestamp,
+			Namespace:  event.Namespace,
+			Context:    event.Context,
+			EventName:  event.EventName,
+			Source:     event.Source,
+			Details:    event.DetailsJSON,
+			Timestamp:  event.Timestamp,
+			NcaID:      event.NcaID,
+			FunctionID: event.FunctionID,
 		}
 	}
 
@@ -711,7 +850,7 @@ func (s *Server) processCloudEvents(traceCtx context.Context, cloudEvents []*clo
 // without putting event and primary-stats persistence back on the per-event LWT path.
 func (s *Server) completeCloudEvent(traceCtx context.Context, event *EventV3, result *EventProcessingResult) {
 	if s.isFilteredStatsEnabled(event.EventName) {
-		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp); err != nil {
+		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
 			logging.GetLogger(traceCtx).ErrorContext(traceCtx, "Failed to store event in filtered stats view", zap.Error(err))
 			result.FailureCount++
 			result.LastError = err
@@ -753,7 +892,7 @@ func (s *Server) storeK8sEvent(traceCtx context.Context, event *EventV3) error {
 
 	// Store the latest event per context in the opt-in filtered stats view.
 	if s.isFilteredStatsEnabled(event.EventName) {
-		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp); err != nil {
+		if err := s.conns.DbHandlerV2.UpsertFilteredStatsV3(traceCtx, event.Namespace, event.Context, event.EventName, event.Timestamp, event.NcaID, event.FunctionID); err != nil {
 			return fmt.Errorf("failed to store in filtered stats view: %w", err)
 		}
 	}
@@ -1140,6 +1279,8 @@ func (s *Server) GetEventsV3(w http.ResponseWriter, r *http.Request) {
 				details = EventDetails{}
 			}
 		}
+
+		details.Body = decodeEventBody(details.Body)
 
 		// Apply the optional generic attribute filter.
 		if !attributeMatches(details, attributeKey, attributeValue) {

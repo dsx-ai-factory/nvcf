@@ -19,6 +19,7 @@ package operator
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -29,8 +30,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
-	nvcaoptypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	nvcaoptypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 )
 
 // chartPath is the operator chart this test renders. It is the single
@@ -145,6 +146,10 @@ func renderOperatorClusterRoleRules(t *testing.T) []rbacv1.PolicyRule {
 	}
 	abs, err := filepath.Abs(chartPath)
 	require.NoError(t, err)
+	if _, err := os.Stat(abs); err != nil {
+		// Bazel runs the test from its runfiles, which hold no chart.
+		t.Skipf("chart not available at %s: %v", abs, err)
+	}
 
 	// ngcConfig.serviceKey is `required` by the chart's pull-secret helper.
 	// Any non-empty value renders; nothing here depends on its contents.

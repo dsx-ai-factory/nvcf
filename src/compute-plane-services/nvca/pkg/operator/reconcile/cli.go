@@ -23,20 +23,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
-	nvidiaiov1 "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
-	nvcaoperatorerrors "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/internal/errors"
+	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
+	nvcaoperatorerrors "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/internal/errors"
 
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/core"
-	"github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
-	cmnsecret "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/secret"
-	nvversion "github.com/NVIDIA/nvcf/src/libraries/go/lib/pkg/version"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
+	cmnsecret "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/secret"
+	nvversion "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	cli "github.com/urfave/cli/v2"
 
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/mirror"
-	"github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/reconcile/clustermgmt"
-	nvcaoptypes "github.com/NVIDIA/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/clustervalidator"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/mirror"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/reconcile/clustermgmt"
+	nvcaoptypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 
 	"github.com/bombsimon/logrusr/v4"
 	corev1 "k8s.io/api/core/v1"
@@ -110,6 +112,16 @@ func NewOperatorCommand() *cli.Command {
 				Name:    "pod-namespace",
 				EnvVars: []string{"POD_NAMESPACE"},
 				Usage:   "Namespace of this pod (from Downward API)",
+			},
+			&cli.BoolFlag{
+				Name:    "cluster-validator-enabled",
+				EnvVars: []string{clustervalidator.EnabledEnv},
+				Usage:   "The chart runs the cluster-validator, so the agent publishes its metrics baseline",
+			},
+			&cli.StringFlag{
+				Name:    "cluster-validator-cronjob",
+				EnvVars: []string{clustervalidator.InitialRunCronJobEnv},
+				Usage:   "Cluster-validator CronJob in this pod's namespace to run whenever its validator spec changes",
 			},
 			&cli.StringFlag{
 				Name:    "deployment-name",
@@ -266,6 +278,12 @@ func NewOperatorCommand() *cli.Command {
 				Name:    "nvca-worker-degradation-period",
 				Usage:   "Duration for determining if a worker is degraded (e.g., 90m, 1h30m)",
 				EnvVars: []string{"NVCA_WORKER_DEGRADATION_PERIOD"},
+				Value:   0,
+			},
+			&cli.IntFlag{
+				Name:    "nvca-worker-container-restart-count-to-fail-instance",
+				Usage:   "NVCA worker (utils) container restart count at which NVCA marks a function instance failed; other containers always use 3 (0 uses the NVCA default of 3)",
+				EnvVars: []string{"NVCA_WORKER_CONTAINER_RESTART_COUNT_TO_FAIL_INSTANCE"},
 				Value:   0,
 			},
 			&cli.StringFlag{
@@ -460,56 +478,70 @@ func doAction(c *cli.Context) error {
 		return fmt.Errorf("identity-source is not supported for cluster source %s", clusterSource)
 	}
 
+	restartCountToFailInstance := c.Int("nvca-worker-container-restart-count-to-fail-instance")
+	if restartCountToFailInstance > math.MaxInt32 {
+		return fmt.Errorf("nvca-worker-container-restart-count-to-fail-instance must be at most %d, got %d",
+			math.MaxInt32, restartCountToFailInstance)
+	}
+	if restartCountToFailInstance < 0 {
+		log.Warnf("ignoring negative nvca-worker-container-restart-count-to-fail-instance %d, using the NVCA default",
+			restartCountToFailInstance)
+		restartCountToFailInstance = 0
+	}
+
 	opts := &AgentOptions{
-		NCAID:                             c.String("nca-id"),
-		KubeConfigPath:                    c.String("kubeconfig"),
-		K8sVersionOverride:                c.String("k8s-version-override"),
-		SvcAddress:                        c.String("listen"),
-		AdminAddr:                         c.String("listen-admin"),
-		ShutdownAddr:                      c.String("listen-shutdown"),
-		PodName:                           c.String("pod-name"),
-		PodNamespace:                      c.String("pod-namespace"),
-		DeploymentName:                    c.String("deployment-name"),
-		SystemNamespace:                   c.String("system-namespace"),
-		PriorityClassName:                 c.String("priority-class-name"),
-		ClusterName:                       c.String("cluster-name"),
-		ClusterSource:                     clusterSource,
-		NodeSelectorKey:                   c.String("node-selector-key"),
-		NodeSelectorValue:                 c.String("node-selector-value"),
-		NVCAClusterManagementAPIURL:       c.String("ngc-api-url"),
-		NVCFClusterID:                     c.String("cluster-id"),
-		NVCAClusterAPIRefreshInterval:     c.Duration("nvca-cluster-api-refresh-interval"),
-		NVCAImageRepo:                     c.String("nvca-image-repo"),
-		NVCARunAsUserID:                   c.Int64("nvca-run-as-userid"),
-		NVCARunAsGroupID:                  c.Int64("nvca-run-as-groupid"),
-		GXCacheNamespace:                  c.String("nvca-gxcache-namespace"),
-		HelmRepositoryPrefix:              c.String("nvca-helm-repository-prefix"),
-		EnableGXCache:                     c.Bool("enable-gxcache"),
-		DDCSIPAllowList:                   c.StringSlice("ddcs-ip-allowlist"),
-		K8sClusterNetworkCIDRs:            c.StringSlice("k8s-cluster-network-cidrs"),
-		AgentResources:                    agentRR,
-		WebhookResources:                  webhookRR,
-		NVCACacheMountOptionsEnabled:      c.Bool("nvca-cache-mount-options-enabled"),
-		NVCACacheMountOptions:             c.String("nvca-cache-mount-options"),
-		NVCAWorkerDegradationPeriod:       c.Duration("nvca-worker-degradation-period"),
-		NVCAWorkloadTolerations:           workloadTolerations,
-		NVCAAgentTolerations:              agentTolerations,
-		NVCASecretMirrorSourceNamespace:   c.String("nvca-secret-mirror-source-namespace"),
-		NVCASecretMirrorLabelSelector:     c.String("nvca-secret-mirror-label-selector"),
-		GenerateImagePullSecret:           c.Bool("generate-image-pull-secret"),
-		AdditionalImagePullSecrets:        additionalSecrets,
-		TokenFetcher:                      tokenFetcher,
-		OTelCollectorImageRepo:            c.String("otel-collector-image-repo"),
-		OTelCollectorImageTag:             c.String("otel-collector-image-tag"),
-		OTelCollectorEnabled:              c.Bool("otel-collector-enabled"),
-		OTelCollectorResources:            otelCollectorRR,
-		NVCAOTELConfig:                    nvcaOTELConfig,
-		CreateAgentConfig:                 c.Bool("create-agent-config"),
-		FunctionEnvOverridesB64:           c.String("function-env-overrides-b64"),
-		TaskEnvOverridesB64:               c.String("task-env-overrides-b64"),
-		AgentOverrideEnvVars:              agentOverrideEnvVars,
-		VaultOAuthClientMountPathTemplate: vaultOAuthClientMountPathTemplate,
-		IdentitySource:                    identitySource,
+		NCAID:                         c.String("nca-id"),
+		KubeConfigPath:                c.String("kubeconfig"),
+		K8sVersionOverride:            c.String("k8s-version-override"),
+		SvcAddress:                    c.String("listen"),
+		AdminAddr:                     c.String("listen-admin"),
+		ShutdownAddr:                  c.String("listen-shutdown"),
+		PodName:                       c.String("pod-name"),
+		PodNamespace:                  c.String("pod-namespace"),
+		ClusterValidatorEnabled:       c.Bool("cluster-validator-enabled"),
+		ClusterValidatorCronJob:       c.String("cluster-validator-cronjob"),
+		DeploymentName:                c.String("deployment-name"),
+		SystemNamespace:               c.String("system-namespace"),
+		PriorityClassName:             c.String("priority-class-name"),
+		ClusterName:                   c.String("cluster-name"),
+		ClusterSource:                 clusterSource,
+		NodeSelectorKey:               c.String("node-selector-key"),
+		NodeSelectorValue:             c.String("node-selector-value"),
+		NVCAClusterManagementAPIURL:   c.String("ngc-api-url"),
+		NVCFClusterID:                 c.String("cluster-id"),
+		NVCAClusterAPIRefreshInterval: c.Duration("nvca-cluster-api-refresh-interval"),
+		NVCAImageRepo:                 c.String("nvca-image-repo"),
+		NVCARunAsUserID:               c.Int64("nvca-run-as-userid"),
+		NVCARunAsGroupID:              c.Int64("nvca-run-as-groupid"),
+		GXCacheNamespace:              c.String("nvca-gxcache-namespace"),
+		HelmRepositoryPrefix:          c.String("nvca-helm-repository-prefix"),
+		EnableGXCache:                 c.Bool("enable-gxcache"),
+		DDCSIPAllowList:               c.StringSlice("ddcs-ip-allowlist"),
+		K8sClusterNetworkCIDRs:        c.StringSlice("k8s-cluster-network-cidrs"),
+		AgentResources:                agentRR,
+		WebhookResources:              webhookRR,
+		NVCACacheMountOptionsEnabled:  c.Bool("nvca-cache-mount-options-enabled"),
+		NVCACacheMountOptions:         c.String("nvca-cache-mount-options"),
+		NVCAWorkerDegradationPeriod:   c.Duration("nvca-worker-degradation-period"),
+		NVCAWorkerContainerRestartCountToFailInstance: int32(restartCountToFailInstance),
+		NVCAWorkloadTolerations:                       workloadTolerations,
+		NVCAAgentTolerations:                          agentTolerations,
+		NVCASecretMirrorSourceNamespace:               c.String("nvca-secret-mirror-source-namespace"),
+		NVCASecretMirrorLabelSelector:                 c.String("nvca-secret-mirror-label-selector"),
+		GenerateImagePullSecret:                       c.Bool("generate-image-pull-secret"),
+		AdditionalImagePullSecrets:                    additionalSecrets,
+		TokenFetcher:                                  tokenFetcher,
+		OTelCollectorImageRepo:                        c.String("otel-collector-image-repo"),
+		OTelCollectorImageTag:                         c.String("otel-collector-image-tag"),
+		OTelCollectorEnabled:                          c.Bool("otel-collector-enabled"),
+		OTelCollectorResources:                        otelCollectorRR,
+		NVCAOTELConfig:                                nvcaOTELConfig,
+		CreateAgentConfig:                             c.Bool("create-agent-config"),
+		FunctionEnvOverridesB64:                       c.String("function-env-overrides-b64"),
+		TaskEnvOverridesB64:                           c.String("task-env-overrides-b64"),
+		AgentOverrideEnvVars:                          agentOverrideEnvVars,
+		VaultOAuthClientMountPathTemplate:             vaultOAuthClientMountPathTemplate,
+		IdentitySource:                                identitySource,
 	}
 
 	a, err := NewAgent(ctx, opts)

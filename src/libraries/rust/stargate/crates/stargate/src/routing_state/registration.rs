@@ -17,13 +17,21 @@ use super::keys::{RegistrationIdentity, RoutingTargetKey};
 use super::*;
 use parking_lot::RwLock;
 use std::collections::{HashMap, hash_map::Entry};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::tunnel::RegistrationConnections;
 
-#[derive(Debug, Default)]
+pub const DEFAULT_DEREGISTERED_MODEL_GRACE: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug)]
 pub(super) struct RegistrationRegistry {
     membership: RwLock<RegistrationMembership>,
+}
+
+impl Default for RegistrationRegistry {
+    fn default() -> Self {
+        Self::new(DEFAULT_DEREGISTERED_MODEL_GRACE)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +39,9 @@ struct RegistrationMembership {
     registrations_by_id: HashMap<String, RegistrationRecord>,
     active_clusters: HashMap<RegistrationClusterKey, ActiveRegistrationCluster>,
     advertised_targets: HashMap<RoutingTargetKey, usize>,
+    /// Expiry per target whose last advertiser left; keeps it known while a replacement registers.
+    recently_advertised: HashMap<RoutingTargetKey, Instant>,
+    deregistered_model_grace: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,6 +62,18 @@ struct ActiveRegistrationCluster {
 #[derive(Debug, Default)]
 pub(super) struct RegistrationClusterGeneration {
     retired: AtomicBool,
+    pub(super) capacity: CapacityDomain,
+}
+
+/// Engine load of one capacity domain, `(routing_key, cluster_id)`, shared
+/// by every model name it serves. Pylon counts each request under exactly one
+/// name, so the sum over names is the engine's running count.
+#[derive(Debug, Default)]
+pub(super) struct CapacityDomain {
+    // The running counts that each routed target state last reported, plus
+    // reservations routed under any name and not yet settled. One atomic, so
+    // a reader never combines two counts taken at different times.
+    running_queries: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -130,6 +153,34 @@ impl RegistrationClusterGeneration {
     }
 }
 
+impl CapacityDomain {
+    /// Running requests on the engine: reported by its backends, plus
+    /// requests routed to it that no backend has reported yet.
+    pub(super) fn running_queries(&self) -> u64 {
+        self.running_queries.load(Ordering::Acquire)
+    }
+
+    /// Replaces one routed target state's share of the reported running
+    /// count. `share` holds that state's last published value.
+    pub(super) fn replace_reported_running(&self, share: &mut u64, running: u64) {
+        // Bounding each share keeps the sum from wrapping, so every share can
+        // be subtracted exactly. Adding first means a reader can only see a
+        // brief overcount, which errs toward rejecting.
+        let running = running.min(u64::from(u32::MAX));
+        self.running_queries.fetch_add(running, Ordering::AcqRel);
+        self.running_queries.fetch_sub(*share, Ordering::AcqRel);
+        *share = running;
+    }
+
+    pub(super) fn reservation_started(&self) {
+        self.running_queries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn reservation_ended(&self) {
+        self.running_queries.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl RegisteredModelState {
     fn begin_update(
         &mut self,
@@ -168,6 +219,15 @@ impl RegisteredModelState {
 }
 
 impl RegistrationRegistry {
+    pub(super) fn new(deregistered_model_grace: Duration) -> Self {
+        Self {
+            membership: RwLock::new(RegistrationMembership {
+                deregistered_model_grace,
+                ..RegistrationMembership::default()
+            }),
+        }
+    }
+
     pub(super) fn begin_registration(
         &self,
         identity: &RegistrationIdentity,
@@ -178,14 +238,16 @@ impl RegistrationRegistry {
     pub(super) fn end_registration(
         &self,
         running: RunningRegistration,
+        now: Instant,
     ) -> Option<EndedRegistration> {
-        self.membership.write().end(running)
+        self.membership.write().end(running, now)
     }
 
     pub(super) fn begin_advertised_model_update(
         &self,
         running: &RunningRegistration,
         advertised_models: BTreeSet<String>,
+        now: Instant,
     ) -> BTreeSet<String> {
         let mut membership = self.membership.write();
         let registration = &running.0;
@@ -193,7 +255,7 @@ impl RegistrationRegistry {
             let record = membership.running_record_mut(registration);
             record.models.begin_update(advertised_models)
         };
-        membership.remove_advertised_targets(&registration.identity.routing_key, &removed);
+        membership.remove_advertised_targets(&registration.identity.routing_key, &removed, now);
         membership.add_advertised_targets(&registration.identity.routing_key, &added);
         removed
     }
@@ -218,11 +280,22 @@ impl RegistrationRegistry {
         record.models.cleanup_model_ids()
     }
 
-    pub(super) fn has_registered_model_for_target(&self, target: &RoutingTargetKey) -> bool {
-        self.membership
-            .read()
-            .advertised_targets
-            .contains_key(target)
+    pub(super) fn has_registered_model_for_target(
+        &self,
+        target: &RoutingTargetKey,
+        now: Instant,
+    ) -> bool {
+        let membership = self.membership.read();
+        membership.advertised_targets.contains_key(target)
+            || membership
+                .recently_advertised
+                .get(target)
+                .is_some_and(|expires_at| now < *expires_at)
+    }
+
+    #[cfg(test)]
+    pub(super) fn recently_advertised_target_count(&self) -> usize {
+        self.membership.read().recently_advertised.len()
     }
 
     pub(super) fn reverse_tunnel_registration(
@@ -295,7 +368,7 @@ impl RegistrationMembership {
         Ok(RunningRegistration(state))
     }
 
-    fn end(&mut self, running: RunningRegistration) -> Option<EndedRegistration> {
+    fn end(&mut self, running: RunningRegistration, now: Instant) -> Option<EndedRegistration> {
         let registration = running.0;
         let inference_server_id = &registration.identity.inference_server_id;
         self.registrations_by_id
@@ -315,6 +388,7 @@ impl RegistrationMembership {
                     advertised: models, ..
                 } => models,
             },
+            now,
         );
         let cleanup_model_ids = removed.models.cleanup_model_ids();
 
@@ -368,6 +442,7 @@ impl RegistrationMembership {
     ) {
         for model_id in model_ids {
             let target = RoutingTargetKey::new(routing_key.clone(), model_id);
+            self.recently_advertised.remove(&target);
             let advertiser_count = self.advertised_targets.entry(target).or_default();
             *advertiser_count = advertiser_count
                 .checked_add(1)
@@ -379,7 +454,9 @@ impl RegistrationMembership {
         &mut self,
         routing_key: &Option<String>,
         model_ids: &BTreeSet<String>,
+        now: Instant,
     ) {
+        let mut retired = Vec::new();
         for model_id in model_ids {
             let target = RoutingTargetKey::new(routing_key.clone(), model_id);
             let advertiser_count = self.advertised_targets.get_mut(&target).unwrap_or_else(|| {
@@ -390,8 +467,26 @@ impl RegistrationMembership {
                 .expect("registered target advertiser count underflow");
             if *advertiser_count == 0 {
                 self.advertised_targets.remove(&target);
+                retired.push(target);
             }
         }
+        self.remember_retired_targets(retired, now);
+    }
+
+    fn remember_retired_targets(&mut self, targets: Vec<RoutingTargetKey>, now: Instant) {
+        if targets.is_empty() {
+            return;
+        }
+        let Some(expires_at) = now
+            .checked_add(self.deregistered_model_grace)
+            .filter(|expires_at| now < *expires_at)
+        else {
+            return;
+        };
+        self.recently_advertised
+            .retain(|_, retained_until| now < *retained_until);
+        self.recently_advertised
+            .extend(targets.into_iter().map(|target| (target, expires_at)));
     }
 }
 

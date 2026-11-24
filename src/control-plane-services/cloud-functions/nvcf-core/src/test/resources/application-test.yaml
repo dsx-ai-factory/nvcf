@@ -184,8 +184,9 @@ nvcf:
     timeout: 1s # only whole seconds
   fqdn: http://localhost:${server.port}
   global-fqdn-grpc: http://localhost:${spring.grpc.server.port}
-  llm-request-router:
-    worker-address: llm-request-router.example.com:50071
+  llm:
+    request-router:
+      worker-address: llm-request-router.example.com:50071
   sidecars:
     tracing-key: ${kv.worker-tracing}
     hostname: stg.nvcr.io
@@ -221,6 +222,8 @@ nvcf:
       enabled: true
   api-keys:
     base-url: http://localhost:9093
+  # Off by default; tests enable it to cover the JWT and API-key lookup paths.
+  account-token-rate-limit-enabled: true
   account:
     max-functions-allowed: 50
     max-tasks-allowed: 50

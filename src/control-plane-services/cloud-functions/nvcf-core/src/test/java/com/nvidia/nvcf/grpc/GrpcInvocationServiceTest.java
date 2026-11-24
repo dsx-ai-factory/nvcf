@@ -48,6 +48,7 @@ import static com.nvidia.nvcf.util.TestConstants.TEST_VERSION_ID_5;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.nvidia.nvcf.persistence.function.entity.FunctionStatus;
 import com.nvidia.nvcf.persistence.function.entity.FunctionType;
 import com.nvidia.nvcf.persistence.function.entity.RateLimitUdt;
 import com.nvidia.nvcf.proto.ClientInvokeRequest;
@@ -1173,6 +1174,18 @@ class GrpcInvocationServiceTest extends BaseFunctionInvocationTest {
     }
 
     @Test
+    void degradedFunctionReturnsInvalidArgument() {
+        setFunctionStatus(TEST_FUNCTION_ID, TEST_VERSION_ID_1, FunctionStatus.DEGRADED);
+        var clientAuth = MOCK_OAUTH2_TOKEN_SERVER.getJwt(TEST_CLIENT_SUBJECT,
+                                                         List.of(SCOPE_INVOKE_FUNCTION), 100);
+
+        assertThatThrownBy(() -> functionAuth(clientAuth, TEST_FUNCTION_ID.toString(), null))
+                .isInstanceOf(StatusRuntimeException.class)
+                .extracting(thrown -> ((StatusRuntimeException) thrown).getStatus().getCode())
+                .isEqualTo(Status.INVALID_ARGUMENT.getCode());
+    }
+
+    @Test
     void llmFunctionWithoutAccessStillReturnsNotFound() {
         // TEST_FUNCTION_ID_2 belongs to another account. Access checks must run first so the
         // function type of an inaccessible function is not revealed.
@@ -1215,6 +1228,40 @@ class GrpcInvocationServiceTest extends BaseFunctionInvocationTest {
                 .isInstanceOf(StatusRuntimeException.class)
                 .extracting(thrown -> ((StatusRuntimeException) thrown).getStatus().getCode())
                 .isEqualTo(Status.NOT_FOUND.getCode());
+    }
+
+    // A party shared on one version must not reach another version of the same function by
+    // naming it; the request is rejected rather than served by the shared version.
+    @Test
+    void authorizedPartyCannotInvokeUnsharedVersion() {
+        var functionId = UUID.randomUUID();
+        var sharedVersionId = UUID.randomUUID();
+        var unsharedVersionId = UUID.randomUUID();
+        createFunctionVersion(functionId, sharedVersionId);
+        createFunctionVersion(functionId, unsharedVersionId);
+        setFunctionActive(functionId, sharedVersionId);
+        setFunctionActive(functionId, unsharedVersionId);
+        shareFunctionVersion(functionId, sharedVersionId, TEST_AUTHORIZED_NCA_ID_3);
+        setResponse(TEST_AUTHORIZED_NCA_ID_3, TEST_OWNER_ID,
+                    List.of(new Resource("authorized-functions", "*")),
+                    List.of(SCOPE_INVOKE_FUNCTION));
+        var apiKey = "nvapi-stg-version-shared-key";
+
+        assertThat(functionAuth(apiKey, functionId.toString(), sharedVersionId.toString())
+                           .getFunctionVersionsList())
+                .extracting(FunctionVersion::getFunctionVersionId)
+                .containsExactly(sharedVersionId.toString());
+        assertThat(functionAuth(apiKey, functionId.toString(), null)
+                           .getFunctionVersionsList())
+                .extracting(FunctionVersion::getFunctionVersionId)
+                .containsExactly(sharedVersionId.toString());
+        for (var versionId : List.of(unsharedVersionId, UUID.randomUUID())) {
+            assertThatThrownBy(() -> functionAuth(apiKey, functionId.toString(),
+                                                  versionId.toString()))
+                    .isInstanceOf(StatusRuntimeException.class)
+                    .extracting(thrown -> ((StatusRuntimeException) thrown).getStatus().getCode())
+                    .isEqualTo(Status.NOT_FOUND.getCode());
+        }
     }
 
     @Test

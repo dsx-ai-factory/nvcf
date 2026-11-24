@@ -27,19 +27,19 @@ import (
 
 	echo "github.com/labstack/echo/v4"
 
-	openairesponses "github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/api/adapters/openairesponses"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/models"
-	"github.com/NVIDIA/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
+	openairesponses "github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/api/adapters/openairesponses"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/models"
+	"github.com/dsx-ai-factory/nvcf/src/invocation-plane-services/llm-gateway/requestctx"
 )
 
 const (
 	HeaderMultiTurnSessionID = "x-multi-turn-session-id"
 
 	sessionIDMaxLen              = 256
-	sessionAffinitySourceHeader  = "header"
-	sessionAffinitySourcePayload = "payload"
-	sessionAffinitySourcePrompt  = "prompt_cache_key"
-	sessionAffinitySourceConv    = "conversation_id"
+	sessionAffinitySourceHeader  = requestctx.SessionSourceHeader
+	sessionAffinitySourcePayload = requestctx.SessionSourcePayload
+	sessionAffinitySourcePrompt  = requestctx.SessionSourcePromptCacheKey
+	sessionAffinitySourceConv    = requestctx.SessionSourceConversationID
 	sessionAffinitySourceSession = "session"
 )
 
@@ -70,6 +70,10 @@ func applyResponsesSessionAffinity(
 	}
 	if headerSessionID != "" {
 		return setSessionAffinity(reqCtx, sessionAffinitySourceHeader, headerSessionID)
+	}
+	// Without input every request would hash to the same key and pin to one replica.
+	if len(request.Input.Items) == 0 {
+		return nil
 	}
 
 	payload, err := json.Marshal(request.Input)
