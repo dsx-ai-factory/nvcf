@@ -1,3 +1,5 @@
+# Compatibility fixtures from nvsnap v0.3.2
+
 Fixtures recorded from the released agent, tag
 `src/compute-plane-services/nvsnap/v0.3.2` (commit 027b8fc890dd, 2026-11-23),
 by a test run in that tree. Do not regenerate them from a newer agent.
