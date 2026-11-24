@@ -225,15 +225,60 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 // again.
 func leavingWindow() time.Duration { return deleteRetry.total + time.Minute }
 
+// leavingSkew is how far ahead of this agent's clock a listing may be
+// stamped, by the clock of the agent that wrote it, and still count.
+const leavingSkew = time.Minute
+
 // leaving reports whether g lists p as a captured pod being deleted for
 // its replacement to restore, listed within leavingWindow of now. A pod
-// not listed, or listed too long ago, may run: admission refuses beside it.
-func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) bool {
+// not listed may run: admission refuses beside it. ignored says why a
+// listed pod does not count as leaving after all, which also refuses:
+//   - the listing is stale (its delete may never have happened) or
+//     stamped more than leavingSkew ahead of now (the writer's clock);
+//   - the pod is Ready, or a container of it started after the listing:
+//     a dumped pod is neither, so it was restarted and may run an engine.
+func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) (ok bool, ignored string) {
 	if p.UID == "" || g.LeavingAt.IsZero() || !slices.Contains(g.Leaving, string(p.UID)) {
-		return false
+		return false, ""
 	}
-	age := now.Sub(g.LeavingAt)
-	return age > -time.Minute && age < leavingWindow()
+	switch age := now.Sub(g.LeavingAt); {
+	case age <= -leavingSkew:
+		return false, "stamped ahead of this agent's clock"
+	case age >= leavingWindow():
+		return false, "stale"
+	}
+	if rootfsonly.IsPodReady(p) {
+		return false, "the pod is Ready"
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		var started metav1.Time
+		switch {
+		case cs.State.Running != nil:
+			started = cs.State.Running.StartedAt
+		case cs.State.Terminated != nil:
+			started = cs.State.Terminated.StartedAt
+		}
+		if started.After(g.LeavingAt) {
+			return false, "a container restarted after the listing"
+		}
+	}
+	return true, ""
+}
+
+// leavingPod is leaving, logging a listing it ignores once per record,
+// listing, pod and reason: a clock skew between agents, or a restarted
+// pod, shows without flooding the log.
+func (a *Agent) leavingPod(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) bool {
+	ok, ignored := leaving(g, p, now)
+	if ignored != "" {
+		k := g.Key + "/" + g.LeavingAt.UTC().Format(time.RFC3339) + "/" + string(p.UID) + "/" + ignored
+		if _, seen := a.leavingIgnored.LoadOrStore(k, struct{}{}); !seen {
+			a.log.WithFields(logrus.Fields{"criuGroup": g.Key, "pod": p.Namespace + "/" + p.Name, "leavingAt": g.LeavingAt.UTC().Format(time.RFC3339),
+				"now": now.UTC().Format(time.RFC3339), "why": ignored}).
+				Warn("CRIU group restore: leaving listing ignored; the pod counts as running, so its instance's replacement starts cold")
+		}
+	}
+	return ok
 }
 
 // lookupCRIUGroup is the webhook's view of the group records.

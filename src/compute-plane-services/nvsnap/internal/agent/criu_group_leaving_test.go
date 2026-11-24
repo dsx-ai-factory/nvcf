@@ -36,7 +36,8 @@ func capturedInstance(t *testing.T) (*criuAutoRestorer, *fake.Clientset, []*core
 	}
 	var members []*corev1.Pod
 	for i, name := range []string{"engine-0", "engine-1"} {
-		p := stsRank(name, []string{"0", "1"}[i], "2", "sts-a", true)
+		// Dumped: its engine stopped, so the pod is not Ready.
+		p := stsRank(name, []string{"0", "1"}[i], "2", "sts-a", false)
 		created, err := kc.CoreV1().Pods("fn").Create(ctx, &p, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -206,29 +207,49 @@ func TestDeleteInstance_ListsLeavingOnlyOnVerifyingRecord(t *testing.T) {
 
 // A pod the record lists as leaving is not running; any other pod of the
 // instance is, and a listing older than leavingWindow (a delete that never
-// happened) or from the future no longer vouches for it. Fail closed.
+// happened) or more than a minute ahead of the admitting agent's clock no
+// longer vouches for it. Nor does it for a listed pod that is Ready or
+// whose container started after the listing: it was restarted after its
+// dump and may run an engine. Fail closed.
 func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 	now := time.Now()
+	ready := func(p *corev1.Pod) {
+		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	}
+	startedAt := func(at time.Time) func(*corev1.Pod) {
+		return func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "engine",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(at)}}}}
+		}
+	}
 	for _, tc := range []struct {
 		name     string
-		siblings []string // running pods besides the replacement of rank 0
+		siblings []string // pods besides the replacement of rank 0
 		leaving  []string
 		at       time.Time
+		sibling  func(*corev1.Pod)
 		want     bool
 		reason   string
 	}{
-		{"captured sibling listed, its delete not yet accepted", []string{"engine-1"}, []string{"engine-0", "engine-1"}, now, true, ""},
-		{"listed just inside the window", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() + time.Minute), true, ""},
-		{"sibling not captured: not listed", []string{"engine-1"}, []string{"engine-0"}, now, false, "engine-1 of the instance already runs"},
-		{"no listing", []string{"engine-1"}, nil, now, false, "already runs"},
-		{"listing stale: the delete never happened", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() - time.Second), false, "already runs"},
-		{"listing from the future", []string{"engine-1"}, []string{"engine-1"}, now.Add(2 * time.Minute), false, "already runs"},
-		{"one sibling listed, another not", []string{"engine-1", "engine-2"}, []string{"engine-1"}, now, false, "engine-2 of the instance already runs"},
+		{"captured sibling listed, its delete not yet accepted", []string{"engine-1"}, []string{"engine-0", "engine-1"}, now, nil, true, ""},
+		{"listed one second inside the window", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() + time.Second), nil, true, ""},
+		{"listed 30s ahead of this clock (skew tolerated)", []string{"engine-1"}, []string{"engine-1"}, now.Add(30 * time.Second), nil, true, ""},
+		{"listed, its container started before the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), startedAt(now.Add(-time.Hour)), true, ""},
+		{"sibling not captured: not listed", []string{"engine-1"}, []string{"engine-0"}, now, nil, false, "engine-1 of the instance already runs"},
+		{"no listing", []string{"engine-1"}, nil, now, nil, false, "already runs"},
+		{"listing stale: the delete never happened", []string{"engine-1"}, []string{"engine-1"}, now.Add(-leavingWindow() - time.Second), nil, false, "already runs"},
+		{"listing from the future", []string{"engine-1"}, []string{"engine-1"}, now.Add(2 * time.Minute), nil, false, "already runs"},
+		{"listed but Ready", []string{"engine-1"}, []string{"engine-1"}, now, ready, false, "already runs"},
+		{"listed but its container started after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), startedAt(now.Add(-10 * time.Second)), false, "already runs"},
+		{"one sibling listed, another not", []string{"engine-1", "engine-2"}, []string{"engine-1"}, now, nil, false, "engine-2 of the instance already runs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kc := fake.NewSimpleClientset(parallelSTS())
 			for i, name := range tc.siblings {
-				p := stsRank(name, []string{"1", "2"}[i], "3", "sts-a", true)
+				p := stsRank(name, []string{"1", "2"}[i], "3", "sts-a", false)
+				if tc.sibling != nil {
+					tc.sibling(&p)
+				}
 				if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &p, metav1.CreateOptions{}); err != nil {
 					t.Fatal(err)
 				}
@@ -248,6 +269,34 @@ func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 	}
 }
 
+// A listing ignored for the clock (stale or ahead of this agent) is logged
+// once per record, listing and reason, not on every admission: the skew
+// between agents shows, without flooding the log.
+func TestCRIUGroupAdmits_IgnoredListingLoggedOnce(t *testing.T) {
+	kc := fake.NewSimpleClientset(parallelSTS())
+	p := stsRank("engine-1", "1", "2", "sts-a", false)
+	if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &p, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	lg := logrus.New()
+	lg.SetOutput(&logs)
+	a := &Agent{kubeClient: kc, log: lg}
+	g := webhook.CRIUGroup{Key: "k1", Leaving: []string{"engine-1"}, LeavingAt: time.Now().Add(5 * time.Minute)}
+	for range 3 {
+		r := stsRank("engine-0", "0", "2", "sts-a", false)
+		if ok, _ := a.criuGroupAdmits(context.Background(), &r, g); ok {
+			t.Fatal("admitted beside a pod listed from the future")
+		}
+	}
+	if n := strings.Count(logs.String(), "listing ignored"); n != 1 {
+		t.Errorf("ignored listing logged %d times, want once:\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "ahead") {
+		t.Errorf("log does not say the listing is ahead of this clock:\n%s", logs.String())
+	}
+}
+
 // A companion's replacement is admitted beside a captured GPU rank the
 // record lists as leaving, not beside any other GPU pod.
 func TestCRIUCompanionAdmits_Leaving(t *testing.T) {
@@ -256,15 +305,18 @@ func TestCRIUCompanionAdmits_Leaving(t *testing.T) {
 		name    string
 		leaving []string
 		at      time.Time
+		ready   bool
 		want    bool
 	}{
-		{"captured rank listed", []string{"engine-0"}, now, true},
-		{"rank not listed", []string{"engine-9"}, now, false},
-		{"listing stale", []string{"engine-0"}, now.Add(-leavingWindow() - time.Second), false},
+		{"captured rank listed", []string{"engine-0"}, now, false, true},
+		{"rank not listed", []string{"engine-9"}, now, false, false},
+		{"listing stale", []string{"engine-0"}, now.Add(-leavingWindow() - time.Second), false, false},
+		{"listing 30s ahead (skew tolerated)", []string{"engine-0"}, now.Add(30 * time.Second), false, true},
+		{"captured rank listed but Ready", []string{"engine-0"}, now, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			kc := fake.NewSimpleClientset()
-			rank := stsRank("engine-0", "0", "1", "sts-a", true)
+			rank := stsRank("engine-0", "0", "1", "sts-a", tc.ready)
 			if _, err := kc.CoreV1().Pods("fn").Create(context.Background(), &rank, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}

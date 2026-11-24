@@ -450,7 +450,7 @@ func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod, g webh
 		p := &pods.Items[i]
 		// A GPU pod g lists as leaving is a captured rank being deleted
 		// for its replacement to restore (deleteInstance).
-		if p.DeletionTimestamp != nil || !hasGPU(p) || leaving(g, p, now) {
+		if p.DeletionTimestamp != nil || !hasGPU(p) || a.leavingPod(g, p, now) {
 			continue
 		}
 		if p.Annotations[webhook.CRIUGroupAnnotation] != "" && p.Annotations[webhook.CRIURestoredAnnotation] == "" {

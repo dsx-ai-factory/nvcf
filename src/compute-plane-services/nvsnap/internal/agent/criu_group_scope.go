@@ -174,7 +174,7 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod, g webhook.
 	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) || leaving(g, p, now) {
+		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) || a.leavingPod(g, p, now) {
 			continue
 		}
 		if p.Annotations[webhook.CRIUGroupAnnotation] != "" && p.Annotations[webhook.CRIURestoredAnnotation] == "" {
