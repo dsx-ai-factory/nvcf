@@ -211,6 +211,31 @@ func TestNatsConsumerSetupBackOff(t *testing.T) {
 
 }
 
+func TestBoundedNatsConsumerSetupBackOff(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	b := newBoundedNatsConsumerSetupBackOffWithClock(clock)
+
+	maxWait := natsConsumerFastRetryMaxWait + natsConsumerFastRetryMaxWait/4
+	for i := 0; ; i++ {
+		require.Less(t, i, 1000, "the bounded backoff did not stop")
+		wait := b.NextBackOff()
+		if wait == backoff.Stop {
+			break
+		}
+		require.Positive(t, wait)
+		require.LessOrEqual(t, wait, maxWait)
+		clock.now = clock.now.Add(wait)
+	}
+	waited := clock.now.Sub(time.Unix(0, 0))
+	assert.LessOrEqual(t, waited, natsConsumerSetupTimeout)
+	assert.Greater(t, waited, natsConsumerSetupTimeout-maxWait, "gives up only near natsConsumerSetupTimeout")
+}
+
+func TestNewNatsConsumerSetupBackOff(t *testing.T) {
+	assert.IsType(t, &backoff.ExponentialBackOff{}, newNatsConsumerSetupBackOff(false), "gives up by default")
+	assert.IsType(t, &phasedBackOff{}, newNatsConsumerSetupBackOff(true), "waits for NATS when opted in")
+}
+
 func TestPhasedBackOffReset(t *testing.T) {
 	now := time.Unix(0, 0)
 	b := &phasedBackOff{

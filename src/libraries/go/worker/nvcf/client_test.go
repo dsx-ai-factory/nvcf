@@ -36,11 +36,33 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/auth"
 )
 
+func TestNatsConnectionReconnectLimit(t *testing.T) {
+	tp := auth.NewSettableTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+	url := startEmbeddedNats(t)
+	for _, tt := range []struct {
+		name                 string
+		reconnectForever     bool
+		wantMaxReconnect     int
+		wantIgnoreAuthErrors bool
+	}{
+		{name: "limited by default", wantMaxReconnect: maxNatsReconnects},
+		{name: "reconnect forever", reconnectForever: true, wantMaxReconnect: -1, wantIgnoreAuthErrors: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conn, err := newNatsConnection(url, nil, "", tp, "inst-1", "fnv-1", tt.reconnectForever)
+			require.NoError(t, err)
+			t.Cleanup(conn.Close)
+			assert.Equal(t, tt.wantMaxReconnect, conn.Opts.MaxReconnect)
+			assert.Equal(t, tt.wantIgnoreAuthErrors, conn.Opts.IgnoreAuthErrorAbort)
+		})
+	}
+}
+
 func TestNatsConnectionLogging(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
 	t.Cleanup(zap.ReplaceGlobals(zap.New(core)))
 	tp := auth.NewSettableTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
-	conn, err := newNatsConnection(startEmbeddedNats(t), nil, "", tp, "inst-1", "fnv-1")
+	conn, err := newNatsConnection(startEmbeddedNats(t), nil, "", tp, "inst-1", "fnv-1", false)
 	require.NoError(t, err)
 	t.Cleanup(conn.Close)
 	opts := conn.Opts

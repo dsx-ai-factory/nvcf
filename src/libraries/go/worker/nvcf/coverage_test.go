@@ -843,7 +843,7 @@ func TestNewNatsConnection_Success(t *testing.T) {
 	url := startEmbeddedNats(t)
 	tp := auth.NewSettableTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok"}))
 
-	nc, err := newNatsConnection(url, nil, "", tp, "inst-1", "fnv-1")
+	nc, err := newNatsConnection(url, nil, "", tp, "inst-1", "fnv-1", false)
 	require.NoError(t, err)
 	require.NotNil(t, nc)
 
@@ -921,7 +921,7 @@ func ptr(s string) *string { return &s }
 func TestNewNatsConnection_InvalidNkey(t *testing.T) {
 	tp := auth.NewSettableTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok"}))
 	bad := "not-a-valid-seed"
-	_, err := newNatsConnection("nats://127.0.0.1:4222", &bad, "", tp, "inst", "fnv")
+	_, err := newNatsConnection("nats://127.0.0.1:4222", &bad, "", tp, "inst", "fnv", false)
 	require.Error(t, err)
 }
 

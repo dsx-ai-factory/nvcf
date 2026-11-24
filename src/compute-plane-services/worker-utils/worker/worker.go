@@ -122,6 +122,9 @@ type Config struct {
 	V3BackwardsCompatibilityDisabled bool   `mapstructure:"V3_BACKWARDS_COMPATIBILITY_DISABLED"`
 	InferenceServiceName             string `mapstructure:"INFERENCE_SERVICE_NAME"`
 	InferenceNamespace               string `mapstructure:"INFERENCE_NAMESPACE"`
+	// NATSWaitForRecovery keeps the worker waiting for NATS through an outage instead of exiting after about 2
+	// minutes: the NATS connection reconnects without a limit and consumer setup retries until it succeeds.
+	NATSWaitForRecovery bool `mapstructure:"NVCF_NATS_WAIT_FOR_RECOVERY"`
 }
 
 type NVCFWorker struct {
@@ -442,7 +445,8 @@ func (w *NVCFWorker) Run(withHttpServer bool) error {
 		w.config.FunctionVersionId,
 		w.config.SharedConfigDir,
 		nvcf.DefaultNvcfClientTimeout,
-		nvcf.WithNatsAccount(w.config.NVCFNatsAccount))
+		nvcf.WithNatsAccount(w.config.NVCFNatsAccount),
+		nvcf.WithNatsReconnectForever(w.config.NATSWaitForRecovery))
 	if err != nil {
 		return types.NewInternalError(err)
 	}
@@ -568,7 +572,7 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		setupCtx, cancelSetup := context.WithCancel(ctx)
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
 		var connectedRegion *nvcf.ConnectionRegions
-		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(), func() (*consumer.GlobalNatsConsumer, error) {
+		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(w.config.NATSWaitForRecovery), func() (*consumer.GlobalNatsConsumer, error) {
 			connectedRegion = w.nvcfClient.ConnectedRegions.Load()
 			c, err := consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
@@ -671,11 +675,29 @@ const (
 	natsConsumerSlowRetryMaxWait = 30 * time.Second
 )
 
-// newNatsConsumerSetupBackOff returns the retry schedule for consumer setup. It never stops on its own: the worker
-// keeps waiting for NATS instead of exiting, because a restart does not bring an unreachable NATS back and each
-// restart counts toward replacing the whole instance. The 25% jitter keeps fast waits at or under 5s.
-func newNatsConsumerSetupBackOff() backoff.BackOff {
+// natsConsumerSetupTimeout bounds how long the worker waits for NATS to come back before giving up on consumer
+// setup and exiting, unless NATSWaitForRecovery is set. It covers a rolling restart of the NATS cluster, where a
+// member can be unreachable for tens of seconds, and roughly matches how long the NATS client keeps reconnecting.
+const natsConsumerSetupTimeout = 2 * time.Minute
+
+// newNatsConsumerSetupBackOff returns the retry schedule for consumer setup. With waitForRecovery it never stops on
+// its own: the worker keeps waiting for NATS instead of exiting, because a restart does not bring an unreachable
+// NATS back and each restart counts toward replacing the whole instance. Otherwise it stops after
+// natsConsumerSetupTimeout. The 25% jitter keeps fast waits at or under 5s.
+func newNatsConsumerSetupBackOff(waitForRecovery bool) backoff.BackOff {
+	if !waitForRecovery {
+		return newBoundedNatsConsumerSetupBackOffWithClock(backoff.SystemClock)
+	}
 	return newNatsConsumerSetupBackOffWithClock(backoff.SystemClock)
+}
+
+func newBoundedNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *backoff.ExponentialBackOff {
+	return backoff.NewExponentialBackOff(
+		backoff.WithMaxInterval(natsConsumerFastRetryMaxWait),
+		backoff.WithRandomizationFactor(0.25),
+		backoff.WithMaxElapsedTime(natsConsumerSetupTimeout),
+		backoff.WithClockProvider(clock),
+	)
 }
 
 func newNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *phasedBackOff {
