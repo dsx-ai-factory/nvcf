@@ -23,37 +23,50 @@ import { getStatusDisplay } from "./StatusBadge";
 
 type ClusterStatus = NonNullable<GetClusterResponse["status"]>;
 
-const bannerCopy: Partial<
-	Record<ClusterStatus, { heading: string; body: string }>
-> = {
-	[GetClusterResponseStatus.UNHEALTHY]: {
-		heading: "No contact",
-		body: "The control plane is not receiving anything from this cluster. Everything shown below is last-known and stale.",
-	},
-	[GetClusterResponseStatus.ABANDONED]: {
-		heading: "Cannot accept workloads",
-		body: "This cluster is not able to take work.",
-	},
-	[GetClusterResponseStatus.CORDON]: {
-		heading: "In maintenance",
-		body: "New functions and tasks are paused. Running workloads continue.",
-	},
-	[GetClusterResponseStatus.CORDON_AND_DRAIN]: {
-		heading: "In maintenance",
-		body: "Cluster is drained. Capacity is intentionally offline.",
-	},
-	[GetClusterResponseStatus.NOT_READY]: {
-		heading: "Awaiting handshake",
-		body: "Registration attempt in progress, awaiting validation from the control plane. This usually completes in a few minutes.",
-	},
-};
+const bannerCopy = new Map<ClusterStatus, { heading: string; body: string }>([
+	[
+		GetClusterResponseStatus.UNHEALTHY,
+		{
+			heading: "No contact",
+			body: "The control plane is not receiving anything from this cluster. Everything shown below is last-known and stale.",
+		},
+	],
+	[
+		GetClusterResponseStatus.ABANDONED,
+		{
+			heading: "Cannot accept workloads",
+			body: "This cluster is not able to take work.",
+		},
+	],
+	[
+		GetClusterResponseStatus.CORDON,
+		{
+			heading: "In maintenance",
+			body: "New functions and tasks are paused. Running workloads continue.",
+		},
+	],
+	[
+		GetClusterResponseStatus.CORDON_AND_DRAIN,
+		{
+			heading: "In maintenance",
+			body: "Cluster is being drained. New work is paused and capacity is intentionally unavailable.",
+		},
+	],
+	[
+		GetClusterResponseStatus.NOT_READY,
+		{
+			heading: "Awaiting handshake",
+			body: "Registration attempt in progress, awaiting validation from the control plane. This usually completes in a few minutes.",
+		},
+	],
+]);
 
 export function ClusterHealthBanner({
 	status,
 }: {
 	status?: GetClusterResponse["status"];
 }) {
-	const copy = status && bannerCopy[status];
+	const copy = status && bannerCopy.get(status);
 	if (!status || !copy) return null;
 	const { color } = getStatusDisplay(status);
 
