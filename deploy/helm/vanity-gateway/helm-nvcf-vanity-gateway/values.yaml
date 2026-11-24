@@ -48,12 +48,18 @@ vanityGateway:
   config:
     mappingPath: /etc/vanity-gateway/config/config.yaml
     nvcfApiEndpoint: http://invocation.nvcf.svc.cluster.local:8080
+    # NVCF API base URL for listing the private models a caller's API key may
+    # access. Empty disables it. In the self-managed stack the NVCF API is
+    # http://api.nvcf.svc.cluster.local:8080.
+    nvcfControlPlaneEndpoint: ""
     llmGatewayEndpoint: http://llm-api-gateway.nvcf.svc.cluster.local:8080
     otelExporterOtlpEndpoint: ""
     secretsPath: ""
     privateModelNameRegexPattern: ""
     awsRegion: ""
     shadowMaxConcurrent: 256
+    # Maximum model API request body size in bytes (25 MiB). Must be positive.
+    maxRequestSizeBytes: 26214400
 
   mappingConfig:
     v2config:

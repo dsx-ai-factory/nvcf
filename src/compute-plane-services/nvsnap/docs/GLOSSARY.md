@@ -30,6 +30,7 @@ are listed in the generated [reference](REFERENCE.md).
 | CRIU capture | Checkpoints the processes themselves with CRIU and the CUDA checkpoint API; a restore resumes them. |
 | restore | Starting a pod from a checkpoint instead of cold. |
 | cold start | A start with no checkpoint: download, load, compile. |
+| abandoned | A function status, not a record state: a CRIU capture still `verifying` (no restore of it has served yet) whose namespace is removed or terminating, so nothing can verify it. The agent marks its record `abandonedAt` and leaves it `verifying` (`internal/agent/verify_abandoned.go` `resolveAbandonedVerifies`; `namespaceGone` in `internal/agent/criu_group.go` treats a namespace with a deletion timestamp as gone). |
 | placeholder | The pod a CRIU restore runs into: same spec as the captured pod, its main container waiting until the agent restores the captured processes into it. |
 | rootfs diff | The captured container's writable layer, saved as `rootfs-diff.tar` and replayed into the placeholder before CRIU restores the processes. |
 | replay mounts | The contents of `/dev/shm`, `/opt/nvsnap` and the pod's disk-backed emptyDir mounts, saved with the checkpoint and written back before restore; a memory-backed emptyDir is a tmpfs CRIU saves itself (`internal/agent/replay_mounts.go`). |
@@ -47,11 +48,14 @@ are listed in the generated [reference](REFERENCE.md).
 | companion | A member without GPUs that the ranks talk to (an etcd, a NATS, a frontend), captured and restored with them. |
 | group capture | Capturing every member of an instance together, opted in per instance. |
 | group freeze | The point where every member of a group capture stops at once, so no member sees another stop before it. |
+| group teardown hold | A restored rank's pod kept, once its own workload has exited, until every rank of the same restore has exited, so no node's IMEX daemon leaves while a peer still holds fabric memory imported from it ([design/GROUP-TEARDOWN.md](design/GROUP-TEARDOWN.md)). |
+| IMEX daemon | NVIDIA's per-node service that lets a process import GPU memory another node's process exported (fabric memory); on Kubernetes the DRA driver's ComputeDomain runs it for the workload, on the nodes its pods run on. |
 
 ## Where bytes live: the tiers
 
 A restore looks for a checkpoint in L1, L2 and L3, in that order, and takes
-the first copy it finds (`internal/agent/cascade_fetch.go` `EnsureLocal`). L4
+the first copy it finds (`internal/agent/cascade_fetch.go` `EnsureLocal`).
+When the rails tier is on, it runs between L1 and L2. L4
 is not in that order: replication fills it and pulls from it in the
 background.
 
@@ -62,6 +66,7 @@ background.
 | volume pair | The `rwx-<hash>` volume a capture is written to and the `rox-<hash>` read-only volume restores mount, made from it by promotion. |
 | promotion | Turning a written `rwx-` volume into its read-only `rox-` twin (by snapshot or by a shared read-only attach, depending on storage). |
 | L3 | Peer fetch: another agent that holds the checkpoint sends it over HTTP; every node that restores becomes a peer. |
+| rails tier | Opt-in fetch between L1 and L2: bedrock-peer copies the checkpoint from nodes that hold it over the nodes' RDMA NICs. Each node has one rails pod that claims its NICs through DRA, serves its checkpoints and runs its own fetches; it stays while a fetch has claimed it. |
 | L4 | An object-store bucket shared between clusters (cross-cluster replication of cachedir captures, `internal/agent/replication.go`). |
 
 ## Models and caches

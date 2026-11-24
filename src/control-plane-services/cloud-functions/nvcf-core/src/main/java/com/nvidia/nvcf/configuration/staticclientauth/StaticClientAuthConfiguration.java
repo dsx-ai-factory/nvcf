@@ -80,9 +80,9 @@ public class StaticClientAuthConfiguration {
     @Data
     @RefreshScope
     @Configuration
-    @ConditionalOnProperty("nvcf.service-account.static.token")
-    @ConfigurationProperties("nvcf.service-account.static")
-    public static class StaticClientServiceAccountProperties {
+    @ConditionalOnProperty("nvcf.event-ledger.static.token")
+    @ConfigurationProperties("nvcf.event-ledger.static")
+    public static class StaticClientEventLedgerProperties {
 
         private String token;
     }

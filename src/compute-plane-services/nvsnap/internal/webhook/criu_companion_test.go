@@ -48,8 +48,21 @@ func TestCRIUGroupRestore_Companion(t *testing.T) {
 		a[CRIUGroupCompanionAnnotation] != "true" || a[CRIUGroupAnnotation] != *asked {
 		t.Fatalf("companion annotations: %v", a)
 	}
+	if got.Labels[CRIUGroupLabel] != *asked {
+		t.Fatalf("companion labels: %v", got.Labels)
+	}
 	if c := got.Spec.Containers[0]; !reflect.DeepEqual(c.Command, []string{IdleBin}) {
 		t.Errorf("companion not idled: %v", c.Command)
+	}
+	// A pod with no labels at all gets the map made first.
+	bare := etcdPod()
+	bare.Labels = nil
+	bp, err := m.Mutate(context.Background(), bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l := applyPatches(t, bare, bp).Labels; l[CRIUGroupLabel] != *asked {
+		t.Fatalf("a pod without labels: labels %v", l)
 	}
 	for _, v := range got.Spec.Volumes {
 		if v.Name == gpushareStoreVolume {

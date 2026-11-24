@@ -4,6 +4,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,11 +13,16 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,14 +44,17 @@ func TestCRIUGroupRecaptures(t *testing.T) {
 		{"complete", map[string]string{"state": "complete", "captures": "1"}, false},
 		{"capturing", map[string]string{"state": "capturing", "captures": "1", "startedAt": ago(5 * time.Minute)}, false},
 		{"capture stopped without finishing", map[string]string{"state": "capturing", "captures": "1", "startedAt": ago(3 * time.Hour)}, true},
-		{"capture failed", map[string]string{"state": "failed", "captures": "1"}, true},
-		{"restore failed", map[string]string{"state": "restore-failed", "captures": "2"}, true},
+		{"capture failed under this agent version", map[string]string{"state": "failed", "captures": "1", "agentBundle": "v2"}, false},
+		{"capture failed under another agent version", map[string]string{"state": "failed", "captures": "1", "agentBundle": "v1"}, true},
+		{"capture failed, recorded before the version", map[string]string{"state": "failed", "captures": "1"}, true},
+		{"capture failed under another version, out of attempts", map[string]string{"state": "failed", "captures": "3", "agentBundle": "v1"}, false},
+		{"restore failed", map[string]string{"state": "restore-failed", "captures": "2", "agentBundle": "v2"}, true},
 		{"out of attempts", map[string]string{"state": "restore-failed", "captures": "3"}, false},
 		{"record before the counter", map[string]string{"state": "failed"}, true},
 		{"being verified", map[string]string{"state": "verifying", "captures": "1", "sourceNamespace": "fn"}, false},
 		{"its verification never ran", map[string]string{"state": "verifying", "captures": "1", "stalls": "3"}, true},
 	} {
-		if got := criuGroupRecaptures(tc.data, now); got != tc.want {
+		if got := criuGroupRecaptures(tc.data, now, "v2"); got != tc.want {
 			t.Errorf("%s: recaptures = %v, want %v", tc.name, got, tc.want)
 		}
 	}
@@ -127,9 +136,28 @@ func TestFailGroup_StallKeepsCheckpointsAndDeletesEveryRank(t *testing.T) {
 	}
 }
 
+// setRecord sets fields of group record k1.
+func setRecord(t *testing.T, kc *fake.Clientset, fields map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range fields {
+		cm.Data[k] = v
+	}
+	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A verified capture at its last allowed failure: the failed restore
+// blocks it and lets the configuration be captured again.
 func TestFailGroup_RestoreFailureBlocksAndAllowsRecapture(t *testing.T) {
 	c, kc, leader := groupFixture(t)
 	ctx := context.Background()
+	setRecord(t, kc, map[string]string{groupRestoreFailuresKey: strconv.Itoa(criuGroupMaxRestoreFailures - 1)})
 	c.failGroup(ctx, leader, "k1", true, errors.New("criu restore: exit status 1"), logrus.NewEntry(logrus.New()))
 	if !c.Blocked(ctx, "c0") || !c.Blocked(ctx, "c1") {
 		t.Error("a failed restore must block every checkpoint of the group")
@@ -138,17 +166,111 @@ func TestFailGroup_RestoreFailureBlocksAndAllowsRecapture(t *testing.T) {
 		t.Errorf("pods left = %v, want only the other instance", got)
 	}
 	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
-	if cm.Data["state"] != criuGroupStateRestoreFailed || !criuGroupRecaptures(cm.Data, time.Now()) {
+	if cm.Data["state"] != criuGroupStateRestoreFailed || !criuGroupRecaptures(cm.Data, time.Now(), "") || cm.Data[groupRestoreFailuresKey] != "" {
 		t.Errorf("record = %v, want a restore-failed record that may be captured again", cm.Data)
 	}
 	// The next Ready instance takes the record over, once.
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
-	first, err := c.claimGroupRecord(ctx, "k1", &p, 2)
+	first, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
 	if err != nil || first == nil || first.Data["captures"] != "2" || first.Data["state"] != "capturing" {
 		t.Fatalf("takeover = %v, %v", first, err)
 	}
-	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
 		t.Errorf("a second claim while capturing = %v, %v; want none", again, err)
+	}
+}
+
+// A failed capture is not tried again by agents of the release it failed
+// under (each attempt freezes the live instance); an agent of another
+// release tries it once more.
+func TestClaimGroupRecord_FailedCaptureWaitsForAnotherRelease(t *testing.T) {
+	c, kc, _ := groupFixture(t)
+	ctx := context.Background()
+	c.a.config.Webhook.HostBundleRoot = t.TempDir()
+	release := func(id string) {
+		t.Helper()
+		stageVersion(t, c.a, id, time.Hour)
+		if err := os.WriteFile(filepath.Join(c.a.bundleRoot(), "current-bundle"), []byte(id), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release("a1")
+	p := stsRank("kimi-0", "0", "2", "sts-c", true)
+	first, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
+	if err != nil || first == nil || first.Data[groupAgentBundleKey] != "a1" {
+		t.Fatalf("first claim = %v, %v; want one naming release a1", first, err)
+	}
+	first.Data["state"], first.Data["reason"] = criuGroupStateFailed, "inet: Unsupported proto 262"
+	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Update(ctx, first, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2); err != nil || again != nil {
+		t.Fatalf("the release a capture failed under claimed it again = %v, %v", again, err)
+	}
+	release("b1")
+	next, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
+	if err != nil || next == nil || next.Data["captures"] != "2" || next.Data[groupAgentBundleKey] != "b1" ||
+		next.Data["previousReason"] != "inet: Unsupported proto 262" {
+		t.Fatalf("another release's claim = %v, %v; want the second capture under b1", next, err)
+	}
+}
+
+// A verified capture whose restore fails, with failures to spare: its
+// checkpoints are not blocked and it stays usable, the failure is counted,
+// and the instance's pods are replaced so they restore from it again.
+func TestFailGroup_VerifiedCaptureSurvivesAFailedRestore(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	c.failGroup(ctx, leader, "k1", true, errors.New("gpushare open: no reply"), logrus.NewEntry(logrus.New()))
+	if c.Blocked(ctx, "c0") || c.Blocked(ctx, "c1") {
+		t.Error("one failed restore blocked a verified capture")
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["state"] != criuGroupStateComplete || cm.Data[groupRestoreFailuresKey] != "1" ||
+		!strings.Contains(cm.Data[groupLastRestoreFailureKey], "no reply") || criuGroupRecaptures(cm.Data, time.Now(), "") {
+		t.Errorf("record = %v, want it complete with one failure counted", cm.Data)
+	}
+	if got := remainingPods(t, kc); len(got) != 1 || got[0] != "other-0" {
+		t.Errorf("pods left = %v, want only the other instance", got)
+	}
+}
+
+// A capture still being verified has never served: its first failed
+// restore ends it.
+func TestFailGroup_CaptureBeingVerifiedFailsAtOnce(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn"})
+	c.failGroup(ctx, leader, "k1", true, errors.New("criu restore: exit status 1"), logrus.NewEntry(logrus.New()))
+	if !c.Blocked(ctx, "c0") || !c.Blocked(ctx, "c1") {
+		t.Error("a failed restore of a capture being verified must block it")
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["state"] != criuGroupStateRestoreFailed {
+		t.Errorf("record = %v, want restore-failed", cm.Data)
+	}
+}
+
+func TestRecordFailure_CountsFailuresOfAVerifiedCapture(t *testing.T) {
+	d := map[string]string{"state": "complete", "checkpoint.0": "c0"}
+	cause := errors.New("boom")
+	for i := 1; i < criuGroupMaxRestoreFailures; i++ {
+		if !recordFailure(d, "c0", true, cause) || d["state"] != "complete" || d[groupRestoreFailuresKey] != strconv.Itoa(i) {
+			t.Fatalf("failure %d: record %v", i, d)
+		}
+	}
+	if !recordFailure(d, "c0", true, cause) || d["state"] != criuGroupStateRestoreFailed || d[groupRestoreFailuresKey] != "" {
+		t.Errorf("failure %d: record %v, want restore-failed", criuGroupMaxRestoreFailures, d)
+	}
+	// A restore that did not run counts a stall, not a failure.
+	d = map[string]string{"state": "complete", "checkpoint.0": "c0"}
+	if !recordFailure(d, "c0", false, cause) || d[groupRestoreFailuresKey] != "" || d["stalls"] != "1" {
+		t.Errorf("stall: record %v", d)
+	}
+	// Another capture's record is not touched.
+	d = map[string]string{"state": "complete", "checkpoint.0": "n0"}
+	if recordFailure(d, "c0", true, cause) || d[groupRestoreFailuresKey] != "" {
+		t.Errorf("another capture: record %v", d)
 	}
 }
 
@@ -202,26 +324,31 @@ func TestFailGroup_RecordOfAnotherCapture(t *testing.T) {
 
 func TestRecordRestored_ClearsStallsOfItsCapture(t *testing.T) {
 	d := map[string]string{"state": "complete", "checkpoint.0": "c0", "stalls": "2"}
-	if recordRestored(d, "other") || d["stalls"] != "2" {
+	if recordRestored(d, "other", "u0/main") || d["stalls"] != "2" {
 		t.Error("a restore of another capture cleared the stalls")
 	}
-	if !recordRestored(d, "c0") || d["stalls"] != "" {
+	if !recordRestored(d, "c0", "u0/main") || d["stalls"] != "" {
 		t.Error("a restore did not clear its capture's stalls")
 	}
 }
 
-// The first restore of a capture being verified makes it complete, for
-// every instance; a restore of another capture changes nothing.
-func TestRecordRestored_VerifiesItsCapture(t *testing.T) {
+// A restore of a capture being verified records its pods and leaves the
+// capture being verified: restored processes do not verify it, served
+// pods do (restored_verify.go). A restore of another capture changes
+// nothing.
+func TestRecordRestored_LeavesItsCaptureBeingVerified(t *testing.T) {
 	d := map[string]string{"state": "verifying", "sourceNamespace": "fn", "checkpoint.0": "c0", "checkpoint.1": "c1"}
-	if recordRestored(d, "other") || d["state"] != "verifying" {
-		t.Fatal("a restore of another capture verified this one")
+	if recordRestored(d, "other", "u0/main,u1/main") || d[groupRestoredPodsKey] != "" {
+		t.Fatal("a restore of another capture changed this one")
 	}
-	if !recordRestored(d, "c0") || d["state"] != "complete" || d["sourceNamespace"] != "" || d["verifiedAt"] == "" {
-		t.Fatalf("record = %v, want complete and verified", d)
+	if !recordRestored(d, "c0", "u0/main,u1/main") || d[groupRestoredPodsKey] != "u0/main,u1/main" {
+		t.Fatalf("record = %v, want the restore's pods", d)
 	}
-	if recordRestored(d, "c0") {
-		t.Error("a later restore changed a verified record with nothing to clear")
+	if d["state"] != "verifying" || d["sourceNamespace"] != "fn" || d["verifiedAt"] != "" {
+		t.Fatalf("record = %v, want it still being verified", d)
+	}
+	if recordRestored(d, "c0", "u0/main,u1/main") {
+		t.Error("the same restore recorded again changed the record")
 	}
 }
 
@@ -319,6 +446,7 @@ func TestRecoverInterruptedCaptures(t *testing.T) {
 func TestFailGroup_BlocksBeforeDeleting(t *testing.T) {
 	c, kc, leader := groupFixture(t)
 	ctx := context.Background()
+	setRecord(t, kc, map[string]string{groupRestoreFailuresKey: strconv.Itoa(criuGroupMaxRestoreFailures - 1)})
 	var deletedUnblocked []string
 	kc.PrependReactor("delete", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		name := action.(k8stesting.DeleteAction).GetName()
@@ -368,7 +496,7 @@ func TestReplaceColliding(t *testing.T) {
 	if d := record(); d["state"] != "complete" || d["stalls"] != "1" {
 		t.Errorf("record = %v, want the capture kept and one stall", d)
 	}
-	if !recordRestored(record(), "c0") {
+	if !recordRestored(record(), "c0", "u0/main") {
 		t.Error("a restore did not clear the replacements")
 	}
 }
@@ -477,5 +605,224 @@ func TestFailGroup_RecordsOnlyOnItsOwnRecord(t *testing.T) {
 	}
 	if c.Blocked(ctx, "x9") {
 		t.Error("another tenant's checkpoint blocked")
+	}
+}
+
+// A group's failure, as its record keeps it, names every member with the
+// start and end of its own error, however long each member's error is: the member
+// that failed on its own is not hidden behind the others' aborts.
+func TestMembersFailedKeepsEveryMember(t *testing.T) {
+	abort := "checkpoint failed: CRIU dump failed (criu-v2): action.sh exited, status=1 " + strings.Repeat("Unseizing 4174664 into 1 | ", 400)
+	failed := []string{
+		memberFailure("fn/worker-0", abort),
+		memberFailure("fn/etcd-0", abort),
+		memberFailure("fn/nats-0", "checkpoint failed: first errors: inet: Unsupported proto 262 for socket 8808bc3 "+strings.Repeat("x", 5000)),
+	}
+	reason := truncate(membersFailed("group checkpoint", "s1", 3, failed).Error(), groupReasonMax)
+	if !strings.HasPrefix(reason, "group checkpoint s1: 3 of 3 members failed: fn/worker-0: ") {
+		t.Errorf("reason starts %q", reason[:80])
+	}
+	for _, want := range []string{"fn/worker-0: checkpoint failed", "fn/etcd-0: checkpoint failed", "fn/nats-0: checkpoint failed: first errors: inet: Unsupported proto 262"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("the recorded reason lost %q", want)
+		}
+	}
+	if len(reason) > groupReasonMax || len(reason) > 3*(groupMemberErrorMax+16)+64 {
+		t.Errorf("reason of %d bytes, want each member bounded", len(reason))
+	}
+}
+
+// A member's error keeps its end: a tool's own error comes after its
+// command line and its progress, which alone fill the bound.
+func TestMemberFailureKeepsTheEnd(t *testing.T) {
+	err := "500 Internal Server Error: restore failed: gpushare resume: nvsnap-gpu-suspend --hold-gate --fabric-map /w/.fabric-s1 resume " +
+		strings.Repeat("123 ", 60) + ": exit status 1 (output: " + strings.Repeat("pid=883 fabmap /w/out.883: ok 267 fabric handle(s) | ", 12) +
+		"fabric map: 267 handle(s) in /w/out; waiting for /w/in | no /w/in after 600 s)"
+	got := memberFailure("fn/worker-0", err)
+	if !strings.HasPrefix(got, "fn/worker-0: 500 Internal Server Error: restore failed: gpushare resume") {
+		t.Errorf("lost the start: %q", got[:80])
+	}
+	if !strings.HasSuffix(got, "no /w/in after 600 s)") {
+		t.Errorf("lost the cause at the end: %q", got[len(got)-80:])
+	}
+	if n := len(got) - len("fn/worker-0: "); n != groupMemberErrorMax {
+		t.Errorf("member error of %d bytes, want %d", n, groupMemberErrorMax)
+	}
+	if short := memberFailure("p", "boom"); short != "p: boom" {
+		t.Errorf("a short error changed: %q", short)
+	}
+}
+
+// A multibyte rune at either cut is kept whole or left out, never split:
+// the recorded error stays valid UTF-8 within the bound.
+func TestTruncateMiddleRuneBoundaries(t *testing.T) {
+	const n = groupMemberErrorMax
+	head := n / 3
+	tail := n - head - len(" … ")
+	for _, tc := range []struct{ name, s string }{
+		// é (2 bytes) starts one byte before the head cut.
+		{"head cut", strings.Repeat("a", head-1) + "é" + strings.Repeat("b", 2*n)},
+		// 世 (3 bytes) and 🙂 (4 bytes) straddling the head cut.
+		{"head cut, 3-byte rune", strings.Repeat("a", head-2) + "世" + strings.Repeat("b", 2*n)},
+		{"head cut, 4-byte rune", strings.Repeat("a", head-1) + "🙂" + strings.Repeat("b", 2*n)},
+		// The tail cut falls on é's second byte.
+		{"tail cut", strings.Repeat("a", 2*n) + "é" + strings.Repeat("b", tail-1)},
+		{"tail cut, 4-byte rune", strings.Repeat("a", 2*n) + "🙂" + strings.Repeat("b", tail-2)},
+	} {
+		got := truncateMiddle(tc.s, n)
+		if !utf8.ValidString(got) {
+			t.Errorf("%s: invalid UTF-8 around the cuts: %q ... %q", tc.name, got[head-4:head+8], got[len(got)-tail-8:len(got)-tail+4])
+		}
+		if len(got) > n {
+			t.Errorf("%s: %d bytes, want at most %d", tc.name, len(got), n)
+		}
+		if !strings.HasPrefix(got, "aaaa") || !strings.HasSuffix(got, "bbbb") || !strings.Contains(got, " … ") {
+			t.Errorf("%s: lost the start, the end or the gap", tc.name)
+		}
+	}
+}
+
+// A capture being verified restores only into its own namespace. Once that
+// namespace is gone (the function undeployed, or scaled to zero, before a
+// restore of it served), the configuration is captured again by the next
+// Ready instance instead of starting cold for good. While the namespace
+// exists, or the attempts are spent, the record stands.
+func TestGroupRecaptures_VerifyingWithoutItsNamespace(t *testing.T) {
+	ctx := context.Background()
+	terminating := metav1.Now()
+	kc := fake.NewSimpleClientset(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "fn"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "leaving", DeletionTimestamp: &terminating, Finalizers: []string{"kubernetes"}}},
+	)
+	c := (&Agent{kubeClient: kc, log: logrus.New()}).criuRestorer()
+	verifying := func(ns, captures string) map[string]string {
+		return map[string]string{"state": criuGroupStateVerifying, "captures": captures, "sourceNamespace": ns}
+	}
+	for _, tc := range []struct {
+		name string
+		data map[string]string
+		want bool
+	}{
+		{"its namespace exists", verifying("fn", "1"), false},
+		{"its namespace is gone", verifying("gone", "1"), true},
+		{"its namespace is being deleted", verifying("leaving", "1"), true},
+		{"its namespace is gone, attempts spent", verifying("gone", strconv.Itoa(criuGroupMaxCaptures)), false},
+		{"complete, whatever the namespace", map[string]string{"state": criuGroupStateComplete, "captures": "1", "sourceNamespace": "gone"}, false},
+		{"capturing, whatever the namespace", map[string]string{"state": criuGroupStateCapturing, "captures": "1", "startedAt": time.Now().UTC().Format(time.RFC3339), "sourceNamespace": "gone"}, false},
+	} {
+		if got := c.groupRecaptures(ctx, tc.data); got != tc.want {
+			t.Errorf("%s: recaptures = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A namespace that cannot be read is not taken for gone.
+func TestGroupRecaptures_UnreadableNamespaceKeepsTheRecord(t *testing.T) {
+	kc := fake.NewSimpleClientset()
+	kc.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(corev1.Resource("namespaces"), "fn", errors.New("no"))
+	})
+	c := (&Agent{kubeClient: kc, log: logrus.New()}).criuRestorer()
+	data := map[string]string{"state": criuGroupStateVerifying, "captures": "1", "sourceNamespace": "fn"}
+	if c.groupRecaptures(context.Background(), data) {
+		t.Error("a namespace the agent cannot read must not release the record")
+	}
+}
+
+// The next Ready instance of the configuration, in another namespace,
+// takes over a record whose verification lost its namespace.
+func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
+	c, kc, _ := groupFixture(t)
+	ctx := context.Background()
+	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "undeployed"})
+	p := stsRank("kimi-0", "0", "2", "sts-c", true)
+	p.Namespace = "fn"
+	claimed, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim = %v, %v; want the record taken over", claimed, err)
+	}
+	if claimed.Data["state"] != criuGroupStateCapturing || claimed.Data["captures"] != "2" {
+		t.Errorf("record = %v, want a second capture under way", claimed.Data)
+	}
+	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn"})
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
+		t.Errorf("claim = %v, %v; a record still verified in its namespace is not taken over", again, err)
+	}
+}
+
+// A placeholder scheduled to a node no agent will run on (a pod without
+// GPUs on a CPU node) is never restored: the restore does not run, the
+// checkpoints stay usable, and the instance starts cold at once rather than
+// after the placeholder wait. A node an agent is on its way to is waited for.
+func TestRestoreGroup_PlaceholderWithoutAgent(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		gpuNode  bool
+		wantCold bool
+	}{
+		{"on a CPU node", false, true},
+		{"on a GPU node whose agent is not running yet", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, kc, leader := groupFixture(t)
+			var logs bytes.Buffer
+			c.a.log.SetOutput(&logs)
+			ctx := context.Background()
+			for _, name := range []string{"node-kimi-0", "node-kimi-1"} {
+				n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+				if name == "node-kimi-0" || tc.gpuNode {
+					n.Status.Allocatable = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("4")}
+				}
+				if _, err := kc.CoreV1().Nodes().Create(ctx, n, metav1.CreateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			agent := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nvsnap-agent-0", Namespace: c.a.criuFailedNamespace(), Labels: map[string]string{"app": "nvsnap-agent"}},
+				Spec: corev1.PodSpec{NodeName: "node-kimi-0"}}
+			if _, err := kc.CoreV1().Pods(agent.Namespace).Create(ctx, agent, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"kimi-0", "kimi-1"} {
+				p, err := kc.CoreV1().Pods("fn").Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				p.Annotations[webhook.CRIURestoreContainerAnnotation] = "engine"
+				p.Annotations[webhook.CRIUGroupOrdinalAnnotation] = name[len(name)-1:]
+				p.Annotations[webhook.CRIUGroupSizeAnnotation] = "2"
+				p.Spec.NodeName = "node-" + name
+				if name == "kimi-0" {
+					p.Status.Phase = corev1.PodRunning
+					p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "engine", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+				} else {
+					// Its mounts keep it in ContainerCreating there.
+					p.Status.Phase = corev1.PodPending
+				}
+				if _, err := kc.CoreV1().Pods("fn").Update(ctx, p, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				if name == "kimi-0" {
+					leader = p
+				}
+			}
+			rctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			t0 := time.Now()
+			c.restoreGroup(rctx, leader, "k1", 2)
+			cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+			if c.Blocked(ctx, "c0") || c.Blocked(ctx, "c1") {
+				t.Error("a restore that never ran blocked its checkpoints")
+			}
+			if tc.wantCold {
+				if time.Since(t0) > time.Second || cm.Data["stalls"] != "1" {
+					t.Errorf("after %s record = %v; want the restore ended at once as not run (one stall)\n%s", time.Since(t0), cm.Data, logs.String())
+				}
+				if got := remainingPods(t, kc); len(got) != 1 || got[0] != "other-0" {
+					t.Errorf("pods left = %v, want only the other instance", got)
+				}
+			} else if cm.Data["stalls"] != "" {
+				t.Errorf("record = %v; a node an agent is on its way to must be waited for\n%s", cm.Data, logs.String())
+			}
+		})
 	}
 }

@@ -47,6 +47,9 @@ spring:
           reval:
             client-id: unused
             client-secret: unused
+          event-ledger:
+            client-id: unused
+            client-secret: unused
         provider:
           api-keys:
             token-uri: unused
@@ -57,6 +60,8 @@ spring:
           ess:
             token-uri: unused
           reval:
+            token-uri: unused
+          event-ledger:
             token-uri: unused
 
 management:
@@ -87,9 +92,10 @@ nvcf:
   global-fqdn-grpc: http://api.nvcf.svc.cluster.local:9090
   # Host:port the LLM router client dials to reach the request router.
   # Advertised to the LLM worker env as LLM_REQUEST_ROUTER_ADDRESS.
-  # Self-managed deployments override via the chart (NVCF_LLM_REQUEST_ROUTER_WORKER_ADDRESS).
-  llm-request-router:
-    worker-address: llm-request-router.nvcf.svc.cluster.local:50071
+  # Self-managed deployments override via the chart remote config.
+  llm:
+    request-router:
+      worker-address: llm-request-router.nvcf.svc.cluster.local:50071
   # Sidecar container images are configured in configData in nvcf-api-colocated-deploy/nvcf-api/values.yaml:
   # https://gitlab-master.nvidia.com/ncp/nvcf/application-services/nvcf-api-colocated-deploy/-/blob/main/nvcf-api/values.yaml
   sidecars:
@@ -134,14 +140,11 @@ nvcf:
     # base-url: http://api.icms.svc.cluster.local:8080 -- Use when self-hosted stack is ready
     static:
       token: ${kv.tokens.icms}
+  event-ledger:
+    enabled: false
   api-keys:
     base-url: http://api-keys.api-keys.svc.cluster.local:8080
     # base-url: http://api-keys.nvcf.svc.cluster.local:8080 -- Use when self-hosted stack is ready
-    static:
-      token: ${kv.tokens.api-keys}
-  # This evaluation is served by the same api-keys evaluations gateway; without this, the
-  # OAuth2 fallback picks up api-keys' client-id/token-uri above, which are "unused" here.
-  service-account:
     static:
       token: ${kv.tokens.api-keys}
   registries:

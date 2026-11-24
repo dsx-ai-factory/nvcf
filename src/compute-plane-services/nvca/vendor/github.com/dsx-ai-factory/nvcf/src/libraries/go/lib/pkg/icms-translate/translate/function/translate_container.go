@@ -382,6 +382,13 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			SecurityContext: common.NewWorkloadContainerSecurityContext(),
 			VolumeMounts:    inferenceContainerVolumeMounts,
 		}
+		if isLLM {
+			shutdown := newLLMShutdown(tcfg.LLMInferenceStopPause.Duration)
+			inferenceContainer.Lifecycle = shutdown.inferenceLifecycle()
+			if grace := shutdown.minGraceSeconds(); grace > *pod.Spec.TerminationGracePeriodSeconds {
+				*pod.Spec.TerminationGracePeriodSeconds = grace
+			}
+		}
 
 		pod.Spec.Containers = append(pod.Spec.Containers, inferenceContainer)
 
@@ -464,6 +471,9 @@ func translateContainer(t CreationQueueMessage, tcfg TranslateConfig) (objs []me
 			fluentbitCM := common.SetupFluentBit(pod, telLaunchSpec, allEnvSet, common.WorkloadTypeContainer, tcfg.Namespace, tcfg.FluentbitEnabled, tcfg.FluentbitResources)
 			if fluentbitCM != nil {
 				objs = append(objs, fluentbitCM)
+			}
+			if isLLM {
+				newLLMShutdown(tcfg.LLMInferenceStopPause.Duration).holdTelemetrySidecars(pod)
 			}
 		}
 

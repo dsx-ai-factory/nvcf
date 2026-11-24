@@ -64,6 +64,30 @@ func IsUtilsPod(pod *corev1.Pod) bool {
 	return false
 }
 
+// isWorkerContainer reports whether the named container is the NVCA worker: the "utils" container of the static
+// "utils" Pod for Helm functions, or the worker container that carries the instance ID for container functions.
+// Sidecars such as ESS in the Helm "utils" Pod are not the worker.
+func isWorkerContainer(pod *corev1.Pod, containerName string) bool {
+	if pod.Name == common.UtilsPodName && IsMiniServiceNamespaceName(pod.Namespace) {
+		return containerName == common.UtilsContainerName
+	}
+	if containerName != common.UtilsContainerName && containerName != function.LLMWorkerContainerName {
+		return false
+	}
+	for _, c := range pod.Spec.Containers {
+		if c.Name != containerName {
+			continue
+		}
+		for _, env := range c.Env {
+			if env.Name == InstanceIDEnvKey {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.
 func isPodReadyConditionTrue(status corev1.PodStatus) bool {
 	condition := getPodReadyCondition(status)
@@ -273,13 +297,17 @@ type ContainerStuckInitializing struct {
 	Message string
 }
 
-// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times
-// in a Pod launched more than PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during
-// the Pod's lifetime, so a container whose latest run exited with code 0 after the Pod became Ready is not
-// counted: the app ended on purpose (for example a streaming app that quits when its session ends) and the
-// kubelet restarted it in place.
+// IsContainerInRestartLoop reports whether a container has restarted at least RestartCountToFailInstance times, or
+// WorkerContainerRestartCountToFailInstance times for the NVCA worker container, in a Pod launched more than
+// PodLaunchThresholdSecondsOnFailedRestarts ago. RestartCount is never reset during the Pod's lifetime, so a
+// container whose latest run exited with code 0 after the Pod became Ready is not counted: the app ended on purpose
+// (for example a streaming app that quits when its session ends) and the kubelet restarted it in place.
 func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
-	if cs.RestartCount < RestartCountToFailInstance ||
+	threshold := RestartCountToFailInstance
+	if isWorkerContainer(pod, cs.Name) {
+		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
+	}
+	if cs.RestartCount < threshold ||
 		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
 		return false
 	}
@@ -382,23 +410,50 @@ func IsPodStuckInitializing(pod *corev1.Pod, k8sTimeConfig *TimeConfig) (PodStuc
 }
 
 func IsTimeSincePodLaunchedLaterThan(pod *corev1.Pod, dtc time.Duration) bool {
+	launched, ok := PodLaunchTime(pod)
+	return ok && IsOverTimeout(launched, dtc, time.Now())
+}
+
+// PodLaunchTime returns the time that launch timeouts, such as the scheduling
+// timeout, are measured from. It returns false when the pod has no such time.
+//
+// A started pod is measured from its start time. A pod that has not started and
+// is not scheduled is measured from its creation time, not from the
+// PodScheduled=False condition's LastTransitionTime. Some schedulers, such as the
+// KAI scheduler, rewrite that condition with a new LastTransitionTime on every
+// scheduling attempt, so a timeout measured from it never expires. A bound pod
+// is never unscheduled again: an evicted or preempted pod is replaced by a new
+// pod with its own creation time, so the creation time is how long this pod has
+// waited to be scheduled. The transition time is used only when the pod has no
+// creation time.
+func PodLaunchTime(pod *corev1.Pod) (metav1.Time, bool) {
 	ps := pod.Status
-	now := time.Now()
 	if ps.StartTime != nil && !ps.StartTime.IsZero() {
-		return IsOverTimeout(*ps.StartTime, dtc, now)
+		return *ps.StartTime, true
 	}
 
 	// If a Pod is not scheduled due for whatever reason, kubelet will not set the StartTime.
-	// Rely on scheduled=false condition's transition time to check if pod has launched within timeout.
 	for _, cond := range ps.Conditions {
-		if cond.Type == corev1.PodScheduled {
-			return cond.Status == corev1.ConditionFalse &&
-				!cond.LastTransitionTime.IsZero() &&
-				IsOverTimeout(cond.LastTransitionTime, dtc, now)
+		if cond.Type != corev1.PodScheduled {
+			continue
 		}
+		// A scheduled pod that the kubelet has not started yet has no launch time.
+		if cond.Status != corev1.ConditionFalse {
+			return metav1.Time{}, false
+		}
+		if !pod.CreationTimestamp.IsZero() {
+			return pod.CreationTimestamp, true
+		}
+		if !cond.LastTransitionTime.IsZero() {
+			return cond.LastTransitionTime, true
+		}
+		return metav1.Time{}, false
 	}
 	// If there is no scheduled condition, rely on creation timestamp.
-	return !pod.CreationTimestamp.IsZero() && IsOverTimeout(pod.CreationTimestamp, dtc, now)
+	if pod.CreationTimestamp.IsZero() {
+		return metav1.Time{}, false
+	}
+	return pod.CreationTimestamp, true
 }
 
 func IsOverTimeout(t metav1.Time, timeoutDuration time.Duration, now time.Time) bool {

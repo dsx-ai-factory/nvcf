@@ -221,19 +221,34 @@ func (c *criuAutoRestorer) groupKeyRefusal(ctx context.Context, pod *corev1.Pod,
 	if err != nil {
 		return "", fmt.Errorf("%w: the namespace's tenant scope: %w", errRestoreUnverified, err)
 	}
-	own := criuGroupKey(uri, scope)
-	if own == key {
-		return "", nil
-	}
-	alias, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(own), metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "the group record is not its configuration's in its tenant scope", nil
+	cms := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace())
+	// The key names a driver major as well (driver_gate.go): the record's
+	// own, which the cluster's may have moved on from since the pod was
+	// admitted, else the cluster's now. The tenant scope is checked either
+	// way: it is in every key.
+	drivers := []int{c.a.keyDriver(ctx)}
+	if rec, err := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); err == nil {
+		if d := recordDriver(rec.Data); d != drivers[0] {
+			drivers = append(drivers, d)
 		}
-		return "", fmt.Errorf("%w: its configuration's group record: %w", errRestoreUnverified, err)
+	} else if !apierrors.IsNotFound(err) {
+		return "", fmt.Errorf("%w: the group record: %w", errRestoreUnverified, err)
 	}
-	if alias.Data["state"] == criuGroupStateAlias && alias.Data["alias"] == key {
-		return "", nil
+	for _, drv := range drivers {
+		own := criuGroupKeyDriver(uri, scope, drv)
+		if own == key {
+			return "", nil
+		}
+		alias, err := cms.Get(ctx, criuGroupConfigMapName(own), metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("%w: its configuration's group record: %w", errRestoreUnverified, err)
+		}
+		if alias.Data["state"] == criuGroupStateAlias && alias.Data["alias"] == key {
+			return "", nil
+		}
 	}
 	return "the group record is not its configuration's in its tenant scope", nil
 }
@@ -343,6 +358,15 @@ func (c *criuAutoRestorer) restoreRefusal(ctx context.Context, pod *corev1.Pod) 
 // forgetPod drops what the restorer keeps about a pod that is gone.
 func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.dropRestoreRecord(pod.UID)
+	c.forgetFallback(pod.UID)
+	c.readyObserved.Delete(pod.UID)
+	c.captureDecided.Delete(pod.UID)
+	c.companionFailures.Delete(pod.UID)
+	c.bundleWaitSince.Delete(pod.UID)
+	c.agentWaitSince.Delete(pod.UID)
+	c.attempted.Delete("capture/" + string(pod.UID))
+	c.attempted.Delete("teardown-hold/" + string(pod.UID))
+	c.attempted.Delete("teardown/" + string(pod.UID))
 	prefix := string(pod.UID) + "\x00"
 	c.verdicts.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {

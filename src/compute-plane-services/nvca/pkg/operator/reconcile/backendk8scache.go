@@ -308,12 +308,14 @@ func (b *BackendK8sCacheBuilder) WithNVCFWorkerConfig(
 	cacheMountOptionsEnabled bool,
 	cacheMountOptions string,
 	workerDegradationPeriod time.Duration,
+	workerContainerRestartCountToFailInstance int32,
 ) *BackendK8sCacheBuilder {
 	next := *b
 	next.nvcfWorkerConfig = nvidiaiov1.NVCFWorkerConfig{
-		CacheMountOptionsEnabled: cacheMountOptionsEnabled,
-		CacheMountOptions:        cacheMountOptions,
-		WorkerDegradationPeriod:  workerDegradationPeriod,
+		CacheMountOptionsEnabled:                  cacheMountOptionsEnabled,
+		CacheMountOptions:                         cacheMountOptions,
+		WorkerDegradationPeriod:                   workerDegradationPeriod,
+		WorkerContainerRestartCountToFailInstance: workerContainerRestartCountToFailInstance,
 	}
 	return &next
 }
@@ -404,6 +406,15 @@ func (b *BackendK8sCacheBuilder) WithClusterSource(clusterSource nvcaoptypes.Clu
 	return &next
 }
 
+// chartNamespace returns the namespace the operator chart (and its ConfigMaps)
+// is installed into, defaulting to NVCAOperatorNamespace when none was configured.
+func (c *BackendK8sCache) chartNamespace() string {
+	if c.operatorNamespace == "" {
+		return NVCAOperatorNamespace
+	}
+	return c.operatorNamespace
+}
+
 // newCache builds the cache from the builder's settings without starting any
 // informers.
 func (b *BackendK8sCacheBuilder) newCache() *BackendK8sCache {
@@ -415,6 +426,7 @@ func (b *BackendK8sCacheBuilder) newCache() *BackendK8sCache {
 		eventBroadcaster:     eventBroadcaster,
 		eventRecorder:        eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "nvca-operator"}),
 		systemNamespace:      b.systemNamespace,
+		operatorNamespace:    b.operatorNamespace,
 		ngcServiceKeyFetcher: b.ngcServiceKeyFetcher,
 		k8sVersionOverride:   b.k8sVersionOverride,
 		tracer:               b.tracer,
@@ -453,9 +465,7 @@ func (b *BackendK8sCacheBuilder) newCache() *BackendK8sCache {
 		clusterValidatorEnabled:            b.clusterValidatorEnabled,
 	}
 
-	if c.operatorNamespace == "" {
-		c.operatorNamespace = NVCAOperatorNamespace
-	}
+	c.operatorNamespace = c.chartNamespace()
 	return c
 }
 

@@ -62,6 +62,68 @@ bao_admin bao secrets list -detailed
 bao_admin bao plugin info secret vault-plugin-secrets-jwt
 ```
 
+### JWT canary
+
+The preflight needs a successful signed JWT and its public verification key.
+This check signs a token on one JWT mount and verifies it against the mount's
+public keys. It needs `bao_admin` from the previous block and the Python
+`cryptography` package. Keep its output as the baseline before the bridge and
+repeat it after each state transition.
+
+List the JWT mounts and pick one with a role:
+
+```bash
+bao_admin bao secrets list -detailed -format=json | jq -r 'to_entries[] | select(.value.type == "vault-plugin-secrets-jwt") | .key'
+bao_admin bao list services/<name>/jwt/roles
+```
+
+Define the check and run it for a mount and role:
+
+```bash
+jwt_canary() {
+  local mount=$1 role=$2 token jwks
+  token=$(bao_admin sh -c "echo '{\"claims\":{}}' | bao write -format=json $mount/sign/$role -" |
+    jq -er .data.token) || return 1
+  jwks=$(bao_admin bao read -format=json "$mount/jwks" | jq -c .data) || return 1
+  TOKEN="$token" JWKS="$jwks" python3 - <<'PY'
+import base64, json, os
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
+
+def decode(part):
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+header_b64, payload_b64, signature_b64 = os.environ["TOKEN"].split(".")
+header = json.loads(decode(header_b64))
+keys = {key["kid"]: key for key in json.loads(os.environ["JWKS"])["keys"]}
+key = keys[header["kid"]]
+message = (header_b64 + "." + payload_b64).encode()
+signature = decode(signature_b64)
+if key["kty"] == "RSA":
+    public = rsa.RSAPublicNumbers(int.from_bytes(decode(key["e"]), "big"),
+                                  int.from_bytes(decode(key["n"]), "big")).public_key()
+    public.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+elif key["kty"] == "EC":
+    curve, digest, size = {"P-256": (ec.SECP256R1(), hashes.SHA256(), 32),
+                           "P-384": (ec.SECP384R1(), hashes.SHA384(), 48),
+                           "P-521": (ec.SECP521R1(), hashes.SHA512(), 66)}[key["crv"]]
+    public = ec.EllipticCurvePublicNumbers(int.from_bytes(decode(key["x"]), "big"),
+                                           int.from_bytes(decode(key["y"]), "big"),
+                                           curve).public_key()
+    r, s = int.from_bytes(signature[:size], "big"), int.from_bytes(signature[size:], "big")
+    public.verify(utils.encode_dss_signature(r, s), message, ec.ECDSA(digest))
+else:
+    raise SystemExit("unsupported key type " + key["kty"])
+print("JWT canary OK alg=%s kid=%s" % (header["alg"], header["kid"]))
+PY
+}
+jwt_canary services/<name>/jwt <role>
+```
+
+The command passes the claims as JSON on standard input, because `bao write`
+cannot take a map on its command line. A failed signature, a missing key or a
+token that does not verify makes the function return an error.
+
 Confirm the unversioned catalog SHA equals the bridge's original binary SHA
 for every server architecture. Compare before replacing any pod; otherwise
 an incompatible bridge can make existing mounts unusable on restart.
@@ -126,7 +188,29 @@ The driver also runs outside Kubernetes or Helm using an authenticated `bao`:
 set `JWT_VERSIONS_FILE` to the image's version manifest and `JWT_PLUGIN_DIR` to
 its extracted plugin directory. It does not register plugins or restart servers.
 
+## Defer Existing Mount Migration
+
+Use this option only when the selected release's upgrade guide supports it.
+The [NVCF 1.0.4 procedure](../../overview/release-notes/1.0.2-to-1.0.4-upgrade.md)
+installs the bridge on every server and verifies existing mount identities,
+versions, hashes and consumers without tuning or reloading plugins.
+
+After those checks, [enable migrations](#enable-migrations) in `versioned`
+mode. Existing mounts retain their selection; new mounts use the target
+plugin. Keep both binaries and the original catalog entries. Existing mounts
+do not receive the target plugin's fixes until a separate maintenance window
+completes the migration below. Do not leave the final stack in `bridge` mode;
+that suppresses migrations.
+
+The all-member active checks below apply when changing existing mount
+selections. They remain a qualification requirement for that separate
+procedure; installing both binaries alone does not complete it.
+
 ## Pin, Rotate, Then Upgrade
+
+When returning from the deferred path, repeat preflight and start here.
+Retain `versioned` mode and the bridge images; do not repeat the bridge-mode
+apply or remove either binary.
 
 After each tune below, rotate all members to load the configured plugin
 version. A local reload and a status check on the active member do not prove
@@ -148,6 +232,11 @@ cluster health after each transfer. Stop if a transfer or check fails, or if
 leadership cannot be transferred to an unchecked member. Do not proceed based
 on a status response forwarded from a standby.
 
+OpenBao 2.6.3 step-down has no target selector and can alternate between the
+same two members. If this prevents the all-member check, stop at this gate;
+see [the supported-transfer follow-up](https://github.com/dsx-ai-factory/nvcf/issues/3241).
+Do not change Raft membership or skip a member to continue.
+
 ```bash
 bao_admin jwt-plugin-lifecycle pin-old
 ```
@@ -168,7 +257,11 @@ Rotate and check every member again, using
 configured metadata; rotation switches the running backend. If a check fails,
 stop and inspect `status`. Preserve existing keys, roles, and policies.
 
-After every member runs the bridge and verification passes, change
+## Enable Migrations
+
+Use this step after the selected guide's deferred-migration checks, or after
+the full plugin migration above. Once every member runs the bridge and its
+applicable checks pass, change
 `openbao.jwtPluginLifecycle.mode` to `versioned` in the persistent release
 values and stack environment. Apply with hooks enabled:
 
@@ -196,6 +289,9 @@ catalog against the candidate binary. Migrations can then create their first
 mount. Manual `verify`, tuning, and cleanup still reject empty inventories.
 
 ## Rollback During the Window
+
+Use this section only to reverse a plugin-selection change. A server upgrade
+that retained existing mount selections does not need plugin rollback.
 
 Keep both versioned binaries and their declarative config throughout the
 rollback window. Pause migrations and new mount creation during rollback.
@@ -252,9 +348,10 @@ policy; rollback to the retired plugin ends after cleanup.
 ```mermaid
 flowchart LR
   A[Unversioned mounts] --> B[Bridge with original and versioned commands]
-  B --> C[Pin old and rotate members]
+  B --> H[Enable migrations and retain existing selections]
+  H --> C[Separate window: pin old and rotate members]
   C --> D[Tune target and rotate members]
-  D --> E[Validate and retain rollback window]
+  D --> E[Validate all mounts and retain rollback window]
   E --> F[Later target-only image]
   F --> G[Verify then remove old catalog entries]
   D --> C

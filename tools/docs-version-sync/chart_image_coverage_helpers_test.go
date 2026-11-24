@@ -1,0 +1,248 @@
+// SPDX-FileCopyrightText: Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Chart finding categories, counted separately in the summary. The shared
+// categories (pending-fix now passing, stale or invalid entry, render error)
+// live with the image gate report.
+const (
+	findingUncovered = "uncovered"
+	// findingScenario: an indexed chart's CI values scenarios do not supply
+	// every image source. Without a complete scenario the override and guard
+	// checks cannot run, so even a pending-fix chart fails on it.
+	findingScenario = "incomplete scenario"
+	findingCoverage = "coverage"
+)
+
+var findingCategories = []string{findingUncovered, findingPendingFixed, findingInvalidEntry, findingRenderError, findingStackConfig, findingScenario, findingCoverage}
+
+// chartImageGate names the chart coverage matrix in its report and its
+// pending-fix messages.
+var chartImageGate = imageGateMatrix{File: chartImageExclusionsFile, Noun: "chart", Check: "image coverage"}
+
+// newChartCoverageReport returns an empty chart coverage report.
+func newChartCoverageReport() *imageGateReport {
+	return &imageGateReport{Name: "chart image coverage", Categories: findingCategories, Skipped: make(map[string][]string)}
+}
+
+// discoverTrackedCharts returns the directory of every tracked Chart.yaml,
+// relative to the repository root.
+func discoverTrackedCharts(repoRoot string) ([]string, error) {
+	raw, err := imageCatalogCommand("git", "-C", repoRoot, "ls-files", "--", "Chart.yaml", "**/Chart.yaml")
+	if err != nil {
+		return nil, err
+	}
+	var charts []string
+	for _, file := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if filepath.Base(file) == "Chart.yaml" {
+			charts = append(charts, filepath.Dir(file))
+		}
+	}
+	sort.Strings(charts)
+	if len(charts) == 0 {
+		return nil, fmt.Errorf("no tracked Chart.yaml under %s", repoRoot)
+	}
+	return charts, nil
+}
+
+const chartValuesMapFile = "tools/ci/helm-chart-values.yaml"
+const chartValuesDir = "tools/ci/helm-validate-values"
+
+// loadChartScenarios reads the CI values scenarios per chart from the chart
+// values map, which check-helm-charts also reads and wires to its files.
+// Chart keys are compared with git ls-files output, so a non-canonical path
+// such as "./deploy/x" or "deploy/x/" is rejected rather than silently never
+// matching a chart (check-helm-charts would still render it).
+func loadChartScenarios(repoRoot string, tracked map[string]bool) (map[string][]string, error) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot, chartValuesMapFile))
+	if err != nil {
+		return nil, err
+	}
+	var document struct {
+		Scenarios []struct {
+			Chart  string `yaml:"chart"`
+			Values string `yaml:"values"`
+		} `yaml:"scenarios"`
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&document); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", chartValuesMapFile, err)
+	}
+	scenarios := make(map[string][]string)
+	for index, entry := range document.Scenarios {
+		switch {
+		case entry.Chart == "" || entry.Chart != filepath.Clean(entry.Chart) || filepath.IsAbs(entry.Chart) || strings.HasPrefix(entry.Chart, ".."):
+			return nil, fmt.Errorf("%s entry %d: chart %q must be a canonical repo-root-relative directory", chartValuesMapFile, index+1, entry.Chart)
+		case entry.Values != filepath.Base(entry.Values) || !strings.HasSuffix(entry.Values, ".yaml"):
+			return nil, fmt.Errorf("%s entry %d: values %q must be a .yaml file name in %s", chartValuesMapFile, index+1, entry.Values, chartValuesDir)
+		case !tracked[entry.Chart]:
+			return nil, fmt.Errorf("%s entry %d: chart %q has no tracked Chart.yaml", chartValuesMapFile, index+1, entry.Chart)
+		}
+		scenarios[entry.Chart] = append(scenarios[entry.Chart], filepath.Join(repoRoot, chartValuesDir, entry.Values))
+	}
+	return scenarios, nil
+}
+
+// prepareImageChart copies a chart into a temporary directory and builds its
+// dependencies there, so the source tree is never changed.
+//
+// External access: charts with remote dependencies (the NATS HTTPS repository,
+// the OpenBao OCI registry) are fetched here, as the Helm CI job already does
+// for check-helm-charts. Callers isolate HELM_REPOSITORY_CONFIG,
+// HELM_REPOSITORY_CACHE and HELM_REGISTRY_CONFIG. A network failure surfaces as
+// a render error and fails the run.
+func prepareImageChart(source, workspace string) (string, error) {
+	chart := filepath.Join(workspace, "chart")
+	if err := copyResolvedInventoryStack(source, chart); err != nil {
+		return "", fmt.Errorf("copy chart: %w", err)
+	}
+	needsBuild, httpsRepositories, err := chartDependencyFetches(chart)
+	if err != nil || !needsBuild {
+		return chart, err
+	}
+	if err := registerImageCatalogRepositories(httpsRepositories); err != nil {
+		return "", err
+	}
+	if _, err := imageCatalogCommand("helm", "dependency", "build", "--skip-refresh", chart); err != nil {
+		return "", err
+	}
+	return chart, nil
+}
+
+// registerImageCatalogRepositories registers one chart's HTTPS dependency
+// repositories as image-catalog-<index> in the run's shared Helm config.
+// --force-update lets a later chart reuse a name at a different URL: without
+// it Helm fails with "repository name already exists", a false render error.
+// Overwriting is safe because charts are prepared one at a time and each
+// builds its dependencies right after registering them.
+func registerImageCatalogRepositories(repositories []string) error {
+	for index, repository := range repositories {
+		if _, err := imageCatalogCommand("helm", "repo", "add", "--force-update", fmt.Sprintf("image-catalog-%d", index), repository); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// chartDependencyFetches reports whether a chart needs helm dependency build,
+// and which HTTPS repositories to register for it. A file:// dependency that
+// is already vendored as charts/<dir> renders without a build.
+func chartDependencyFetches(chart string) (bool, []string, error) {
+	dependencies, err := readChartDependencies(chart)
+	if err != nil {
+		return false, nil, err
+	}
+	needsBuild := false
+	var https []string
+	for _, dependency := range dependencies {
+		local, isFile := strings.CutPrefix(dependency.Repository, "file://")
+		if isFile {
+			if _, err := os.Stat(filepath.Join(chart, local, "Chart.yaml")); err == nil && strings.HasPrefix(filepath.Clean(local), "charts/") {
+				continue
+			}
+		}
+		needsBuild = true
+		if strings.HasPrefix(dependency.Repository, "https://") {
+			https = append(https, dependency.Repository)
+		}
+	}
+	return needsBuild, https, nil
+}
+
+// undeclaredImages returns rendered images, direct or through a registered
+// indirect pattern, that the catalog does not declare.
+func undeclaredImages(catalog []catalogImage, manifest []byte) ([]string, error) {
+	declared := make(map[string]bool)
+	for _, image := range catalog {
+		declared[image.Reference] = true
+	}
+	actual, err := extractResolvedImages(manifest)
+	if err != nil {
+		return nil, err
+	}
+	var missing []string
+	for _, image := range actual {
+		if !declared[image.Reference] {
+			missing = append(missing, image.Reference)
+		}
+	}
+	return missing, nil
+}
+
+// imageOverrideTarget is where an override check moves every indexed image.
+type imageOverrideTarget struct {
+	Registry string
+	// Repository prefixes the lower-cased image identity.
+	Repository string
+	Digest     string
+}
+
+var (
+	mirrorOverride   = imageOverrideTarget{Registry: "mirror.example:5000", Repository: "renamed", Digest: "sha256:" + strings.Repeat("a", 64)}
+	explicitOverride = imageOverrideTarget{Registry: "explicit.example", Repository: "customer", Digest: "sha256:" + strings.Repeat("b", 64)}
+)
+
+// writeImageOverrides writes an ordinary values file that moves every image to
+// the target, with a separate registry and repository, and returns the
+// reference each image identity must then render.
+func writeImageOverrides(catalog []catalogImage, target imageOverrideTarget, path string) (map[string]string, error) {
+	values := make(map[string]any)
+	want := make(map[string]string)
+	// Repositories are lower case, so identities such as API and api would
+	// share a name; a numeric suffix keeps every expected reference distinct.
+	used := make(map[string]bool)
+	for _, image := range catalog {
+		parsed, err := parseResolvedImageReference(image.Reference)
+		if err != nil {
+			return nil, err
+		}
+		version := parsed.Version
+		if version == "" {
+			// A digest-only default still gets a tag, so the tag and
+			// digest fields are both exercised.
+			version = "override"
+		}
+		base := target.Repository + "/" + strings.ToLower(image.ID)
+		repository := base
+		for n := 1; used[repository]; n++ {
+			repository = base + "-" + strconv.Itoa(n)
+		}
+		used[repository] = true
+		setImageValue(values, image.Path, image.Exception.override(target.Registry, repository, version, target.Digest))
+		want[image.ID] = target.Registry + "/" + repository + ":" + version + "@" + target.Digest
+	}
+	encoded, err := yaml.Marshal(values)
+	if err != nil {
+		return nil, err
+	}
+	return want, os.WriteFile(path, encoded, 0o600)
+}
+
+// setImageValue places a value at a dotted path, keeping sibling fields.
+// Helm merges the written file with the chart values when it is rendered.
+func setImageValue(values map[string]any, path string, value any) {
+	keys := strings.Split(path, ".")
+	for _, key := range keys[:len(keys)-1] {
+		next, ok := values[key].(map[string]any)
+		if !ok {
+			next = make(map[string]any)
+			values[key] = next
+		}
+		values = next
+	}
+	values[keys[len(keys)-1]] = value
+}

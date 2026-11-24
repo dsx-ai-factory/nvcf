@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use stargate_proto::pb::{InferenceServerModelRegistration, InferenceServerStatus, ModelStats};
 use tokio::sync::watch;
 
+use crate::drain::{DrainCounters, DrainRequestGuard};
 use crate::queue_admission::{
     LiveRequestState, PylonQueueMismatchRetryConfig, QueueAdmissionDecision, QueueModelSnapshot,
     QueueTrackedRequestGuard,
@@ -35,6 +36,9 @@ pub struct CurrentModelStats {
     pub last_mean_input_tps: f64,
     // Greatest max-eligible last_mean_input_tps of this model generation, if any.
     pub max_input_tps: Option<f64>,
+    // True while last_mean_input_tps is still the configured initial rate and
+    // no request has measured it. Pylon-local; not sent to Stargate.
+    pub input_tps_from_seed: bool,
     // Token/sec output rate for streaming generation endpoints. Embeddings item
     // cardinality is observed separately and is not exported through this field.
     pub output_tps: f64,
@@ -93,6 +97,7 @@ pub struct PylonRuntimeState {
     output_token_calibration_enabled: bool,
     metrics: Option<Arc<PylonMetrics>>,
     observation_tx: Option<flume::Sender<RequestObservationEvent>>,
+    drain: Arc<DrainCounters>,
 }
 
 /// Version counter for advertised registration content.
@@ -224,6 +229,7 @@ impl PylonRuntimeState {
             output_token_calibration_enabled: false,
             metrics: None,
             observation_tx: None,
+            drain: Arc::default(),
         }
     }
 
@@ -247,6 +253,15 @@ impl PylonRuntimeState {
         state.metrics = metrics;
         state.observation_tx = Some(observation_tx);
         (state, observation_rx)
+    }
+
+    /// Counts a forwarded request for the drain summary until the guard drops.
+    pub(crate) fn begin_drain_request(&self) -> DrainRequestGuard<'_> {
+        self.drain.begin_request()
+    }
+
+    pub(crate) fn drain_counters(&self) -> Arc<DrainCounters> {
+        Arc::clone(&self.drain)
     }
 
     pub fn set_status(&self, status: InferenceServerStatus) {
@@ -360,16 +375,27 @@ impl PylonRuntimeState {
         generation: &ModelGeneration,
         stats: CurrentModelStats,
     ) -> bool {
-        let observed_stats = {
+        let (observed_stats, measured_after_seed) = {
             let mut advertised = self.advertised.lock();
             let Some(model) = advertised.current_mut(generation) else {
                 return false;
             };
-            self.live_requests
-                .update_generation_throughput(generation, stats.last_mean_input_tps);
+            self.live_requests.update_generation_throughput(
+                generation,
+                stats.last_mean_input_tps,
+                stats.input_tps_from_seed,
+            );
+            let measured_after_seed = model.stats.input_tps_from_seed && !stats.input_tps_from_seed;
             model.stats = stats;
-            model.stats.clone()
+            (model.stats.clone(), measured_after_seed)
         };
+        if measured_after_seed {
+            tracing::info!(
+                model_id = generation.model_id(),
+                input_tps = observed_stats.last_mean_input_tps,
+                "model input TPS measured; seeded rate replaced"
+            );
+        }
         self.registration_changes.notify();
         if let Some(metrics) = &self.metrics {
             metrics.observe_model_stats(generation.model_id(), &observed_stats);
@@ -560,7 +586,7 @@ impl PylonRuntimeState {
             .current_generation(model_id)
             .expect("test model generation should already exist");
         self.live_requests
-            .update_generation_throughput(&generation, last_mean_input_tps);
+            .update_generation_throughput(&generation, last_mean_input_tps, false);
     }
 
     pub(crate) fn metrics(&self) -> Option<&PylonMetrics> {
@@ -785,8 +811,8 @@ mod tests {
     use stargate_proto::pb::InferenceServerStatus;
 
     use super::{
-        ModelGeneration, OutputCalibrationFacts, PylonRuntimeState, RequestGenerationAdmission,
-        RequestObservationEvent,
+        CurrentModelStats, ModelGeneration, OutputCalibrationFacts, PylonRuntimeState,
+        RequestGenerationAdmission, RequestObservationEvent,
     };
     use crate::PylonMetrics;
     use crate::request_observer::{
@@ -1052,6 +1078,41 @@ mod tests {
         });
 
         assert_drop_warning(&subscriber, "req-dropped-disconnected", "disconnected");
+    }
+
+    #[test]
+    fn first_measured_input_tps_after_the_seed_logs_once() {
+        let runtime_state = PylonRuntimeState::new(
+            InferenceServerStatus::Active,
+            &["model-a".to_string(), "model-b".to_string()],
+        );
+        let stats = |last_mean_input_tps, input_tps_from_seed| CurrentModelStats {
+            last_mean_input_tps,
+            input_tps_from_seed,
+            ..CurrentModelStats::default()
+        };
+        let subscriber = RecordingTracingSubscriber::default();
+        tracing::subscriber::with_default(subscriber.clone(), || {
+            runtime_state.set_model_stats("model-a", stats(100.0, true));
+            runtime_state.set_model_stats("model-a", stats(100.0, true));
+            runtime_state.set_model_stats("model-a", stats(517.0, false));
+            runtime_state.set_model_stats("model-a", stats(1_350.0, false));
+            // A model that starts without a seed has no seed to replace.
+            runtime_state.set_model_stats("model-b", stats(900.0, false));
+        });
+
+        let events = subscriber.events();
+        let measured = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("model input TPS measured; seeded rate replaced")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(measured.len(), 1, "{events:?}");
+        assert_eq!(measured[0].level, tracing::Level::INFO);
+        assert_tracing_event_field(measured[0], "model_id", "model-a");
+        assert_tracing_event_field(measured[0], "input_tps", "517.0");
     }
 
     #[test]

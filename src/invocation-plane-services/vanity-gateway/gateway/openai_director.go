@@ -40,7 +40,6 @@ import (
 	"github.com/felixge/httpsnoop"
 	"github.com/go-chi/chi/v5"
 	"github.com/goccy/go-json"
-	"github.com/valyala/bytebufferpool"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
@@ -85,6 +84,18 @@ type ModelDirector struct {
 	shadower           *TrafficShadower
 	shadowRandomBucket func() int
 	shadowBodyRewriter func(body []byte, modelName string) ([]byte, error)
+
+	// requestBodyLimit is the route body limit. A request whose declared
+	// Content-Length exceeds it is rejected before any body byte is read.
+	// Shadow replays are exempt. Zero means unknown.
+	requestBodyLimit int64
+
+	// Private models are listed only for callers whose API key may access the
+	// function version they route to. privateModels is nil when private model
+	// listing is disabled.
+	privateIndex  privateModelIndex
+	privateModels *privateModelAccess
+	sections      []endpointModelMapping // every model section with its path, in listing order
 
 	// Cache for filtered models
 	filteredModelsCache        []ModelInfo
@@ -142,8 +153,9 @@ type shadowConfig struct {
 }
 
 type ModelMapping struct {
-	modelNameToNVCFUrl   map[string]FunctionInfo
-	modelNameToModelInfo map[string]ModelInfo // only contains public models
+	modelNameToNVCFUrl          map[string]FunctionInfo
+	modelNameToModelInfo        map[string]ModelInfo // only contains public models
+	privateModelNameToModelInfo map[string]ModelInfo
 }
 
 type ModelInfo struct {
@@ -284,6 +296,7 @@ func buildModelMapping(
 	privateModelMatcher *regexp.Regexp) (ModelMapping, error) {
 
 	modelNameToModelInfo := make(map[string]ModelInfo, len(modelNameToFunctionIdVersionId))
+	privateModelNameToModelInfo := make(map[string]ModelInfo)
 	modelNameToNVCFUrl := make(map[string]FunctionInfo, len(modelNameToFunctionIdVersionId))
 	// build the mapping for models to nvcf pexec url
 	for modelName, entry := range modelNameToFunctionIdVersionId {
@@ -313,17 +326,75 @@ func buildModelMapping(
 		}
 
 		// build the modelInfo list and modelName to modelInfo map
-		if !privateModelMatcher.MatchString(modelName) {
-			modelInfo := ModelInfo{
-				Id:      modelName,
-				Object:  "model",
-				Created: 735790403, // filler (year NVIDIA was founded)
-				OwnedBy: strings.Split(modelName, "/")[0],
-			}
+		modelInfo := ModelInfo{
+			Id:      modelName,
+			Object:  "model",
+			Created: 735790403, // filler (year NVIDIA was founded)
+			OwnedBy: strings.Split(modelName, "/")[0],
+		}
+		if publicModelName != "" {
 			modelNameToModelInfo[modelName] = modelInfo
+		} else {
+			privateModelNameToModelInfo[modelName] = modelInfo
 		}
 	}
-	return ModelMapping{modelNameToNVCFUrl, modelNameToModelInfo}, nil
+	return ModelMapping{
+		modelNameToNVCFUrl:          modelNameToNVCFUrl,
+		modelNameToModelInfo:        modelNameToModelInfo,
+		privateModelNameToModelInfo: privateModelNameToModelInfo,
+	}, nil
+}
+
+type endpointModelMapping struct {
+	path    string
+	mapping ModelMapping
+}
+
+// listModelInfos merges one model list across all endpoint sections, dedups by
+// model ID, attaches configured metadata, and sorts alphabetically. Aliases
+// that support a native protocol (Messages, decisions or System One) are
+// annotated so shared discovery does not imply that such a model accepts
+// OpenAI chat requests. Each endpoint map gets the merged entry back so
+// single-model lookups match the list.
+func listModelInfos(endpoints []endpointModelMapping, native []ModelMapping, metadata map[string]map[string]stdjson.RawMessage, models func(ModelMapping) map[string]ModelInfo) []ModelInfo {
+	seen := make(map[string]ModelInfo)
+	for _, endpoint := range endpoints {
+		for id, info := range models(endpoint.mapping) {
+			seen[id] = info
+		}
+	}
+	nativeIDs := make(map[string]struct{})
+	for _, mapping := range native {
+		for id := range models(mapping) {
+			nativeIDs[id] = struct{}{}
+		}
+	}
+	for id := range nativeIDs {
+		info := seen[id]
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				info.SupportedEndpoints = append(info.SupportedEndpoints, endpoint.path)
+			}
+		}
+		seen[id] = info
+	}
+	for id, info := range seen {
+		info.modelInfoFields = metadata[id]
+		seen[id] = info
+		for _, endpoint := range endpoints {
+			if _, ok := models(endpoint.mapping)[id]; ok {
+				models(endpoint.mapping)[id] = info
+			}
+		}
+	}
+	return sortModels(maps.Values(seen))
+}
+
+func sortModels(models []ModelInfo) []ModelInfo {
+	slices.SortFunc(models, func(a, b ModelInfo) int {
+		return cmp.Compare(a.Id, b.Id)
+	})
+	return models
 }
 
 func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp.Regexp, vanityDirector *VanityDirector, llmGatewayDirector *LLMGatewayDirector, shadower *TrafficShadower) (*ModelDirector, error) {
@@ -377,85 +448,24 @@ func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp
 		return nil, err
 	}
 
-	// Merge model lists across all endpoint sections, dedup by model ID, sort alphabetically
-	seen := make(map[string]ModelInfo)
-	for _, models := range []map[string]ModelInfo{
-		chatCompletions.modelNameToModelInfo,
-		completions.modelNameToModelInfo,
-		embeddings.modelNameToModelInfo,
-		responses.modelNameToModelInfo,
-		messages.modelNameToModelInfo,
-		decisions.modelNameToModelInfo,
-		systemOne.modelNameToModelInfo,
-		imageGenerations.modelNameToModelInfo,
-		imageEdits.modelNameToModelInfo,
-		imageVariations.modelNameToModelInfo,
-	} {
-		for id, info := range models {
-			seen[id] = info
-		}
+	endpoints := []endpointModelMapping{
+		{"/v1/chat/completions", chatCompletions},
+		{"/v1/completions", completions},
+		{"/v1/embeddings", embeddings},
+		{"/v1/responses", responses},
+		{"/v1/messages", messages},
+		{decisionsPath, decisions},
+		{systemOnePath, systemOne},
+		{"/v1/images/generations", imageGenerations},
+		{"/v1/images/edits", imageEdits},
+		{"/v1/images/variations", imageVariations},
 	}
-	// Annotate aliases that support a native protocol (Messages, decisions or
-	// System One) so shared discovery does not imply that such a model accepts
-	// OpenAI chat requests.
-	nativeIDs := make(map[string]struct{})
-	for _, models := range []map[string]ModelInfo{
-		messages.modelNameToModelInfo, decisions.modelNameToModelInfo, systemOne.modelNameToModelInfo,
-	} {
-		for id := range models {
-			nativeIDs[id] = struct{}{}
-		}
-	}
-	for id := range nativeIDs {
-		info := seen[id]
-		for _, endpoint := range []struct {
-			path   string
-			models map[string]ModelInfo
-		}{
-			{"/v1/chat/completions", chatCompletions.modelNameToModelInfo},
-			{"/v1/completions", completions.modelNameToModelInfo},
-			{"/v1/embeddings", embeddings.modelNameToModelInfo},
-			{"/v1/responses", responses.modelNameToModelInfo},
-			{"/v1/messages", messages.modelNameToModelInfo},
-			{decisionsPath, decisions.modelNameToModelInfo},
-			{systemOnePath, systemOne.modelNameToModelInfo},
-			{"/v1/images/generations", imageGenerations.modelNameToModelInfo},
-			{"/v1/images/edits", imageEdits.modelNameToModelInfo},
-			{"/v1/images/variations", imageVariations.modelNameToModelInfo},
-		} {
-			if _, ok := endpoint.models[id]; ok {
-				info.SupportedEndpoints = append(info.SupportedEndpoints, endpoint.path)
-			}
-		}
-		seen[id] = info
-		for _, models := range []map[string]ModelInfo{chatCompletions.modelNameToModelInfo, completions.modelNameToModelInfo, embeddings.modelNameToModelInfo, responses.modelNameToModelInfo, messages.modelNameToModelInfo, decisions.modelNameToModelInfo, systemOne.modelNameToModelInfo, imageGenerations.modelNameToModelInfo, imageEdits.modelNameToModelInfo, imageVariations.modelNameToModelInfo} {
-			if _, ok := models[id]; ok {
-				models[id] = info
-			}
-		}
-	}
+	native := []ModelMapping{messages, decisions, systemOne}
 	metadata := mapping.ModelInfoFieldsByName()
-	for id, info := range seen {
-		info.modelInfoFields = metadata[id]
-		seen[id] = info
-		for _, models := range []map[string]ModelInfo{
-			chatCompletions.modelNameToModelInfo, completions.modelNameToModelInfo,
-			embeddings.modelNameToModelInfo, responses.modelNameToModelInfo,
-			imageGenerations.modelNameToModelInfo, imageEdits.modelNameToModelInfo,
-			imageVariations.modelNameToModelInfo, messages.modelNameToModelInfo,
-			decisions.modelNameToModelInfo, systemOne.modelNameToModelInfo,
-		} {
-			if _, ok := models[id]; ok {
-				models[id] = info
-			}
-		}
-	}
-	allModels := maps.Values(seen)
-	slices.SortFunc(allModels, func(a, b ModelInfo) int {
-		return cmp.Compare(a.Id, b.Id)
-	})
+	allModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.modelNameToModelInfo })
+	allPrivateModels := listModelInfos(endpoints, native, metadata, func(m ModelMapping) map[string]ModelInfo { return m.privateModelNameToModelInfo })
 
-	return &ModelDirector{
+	d := &ModelDirector{
 		chatCompletions:    chatCompletions,
 		completions:        completions,
 		embeddings:         embeddings,
@@ -470,7 +480,10 @@ func NewModelDirector(mapping *config.GatewayConfig, privateModelMatcher *regexp
 		vanityDirector:     vanityDirector,
 		llmGatewayDirector: llmGatewayDirector,
 		shadower:           shadower,
-	}, nil
+	}
+	d.sections = endpoints
+	d.privateIndex = indexPrivateModels(allPrivateModels, d.allMappings()...)
+	return d, nil
 }
 
 // filterExpiredModels returns a new slice with expired models removed
@@ -517,8 +530,15 @@ func (d *ModelDirector) getFilteredModels() []ModelInfo {
 	}
 
 	// Compute filtered models
-	d.filteredModelsCache = filterExpiredModels(
-		d.allPublicModels,
+	d.filteredModelsCache = filterExpiredModels(d.allPublicModels, d.allMappings()...)
+	d.filteredModelsLastComputed = time.Now()
+
+	return d.filteredModelsCache
+}
+
+// allMappings returns the model routes of every endpoint section.
+func (d *ModelDirector) allMappings() []map[string]FunctionInfo {
+	return []map[string]FunctionInfo{
 		d.chatCompletions.modelNameToNVCFUrl,
 		d.completions.modelNameToNVCFUrl,
 		d.embeddings.modelNameToNVCFUrl,
@@ -529,10 +549,7 @@ func (d *ModelDirector) getFilteredModels() []ModelInfo {
 		d.imageGenerations.modelNameToNVCFUrl,
 		d.imageEdits.modelNameToNVCFUrl,
 		d.imageVariations.modelNameToNVCFUrl,
-	)
-	d.filteredModelsLastComputed = time.Now()
-
-	return d.filteredModelsCache
+	}
 }
 
 func convertIntoModelNameToFunctionIdAndVersionIdMappingV2(mapping map[string]config.ModelFunctionDetails, sectionName string) map[string]ModelNameToFunctionIdVersionId {
@@ -648,15 +665,25 @@ func (d *ModelDirector) ServeImageVariations(writer http.ResponseWriter, request
 }
 
 // ListModels answers in the caller's API: Anthropic clients get the Messages
-// models in the Anthropic shape, everyone else the shared OpenAI list.
+// models in the Anthropic shape, everyone else the shared OpenAI list. A
+// request with a bearer API key also gets the private models that key may
+// access.
 func (d *ModelDirector) ListModels(writer http.ResponseWriter, request *http.Request) {
+	// A keyed request can also list private models, so shared caches must keep
+	// responses for different keys apart.
+	writer.Header().Add("Vary", "Authorization")
 	if middleware.IsAnthropicRequest(request) {
-		d.listAnthropicModels(writer, request)
+		d.listAnthropicModels(writer, request, d.authorizedPrivateModels(writer, request, d.messagesSections()))
 		return
 	}
+	privateModels := d.authorizedPrivateModels(writer, request, d.sections)
 
 	// Get filtered models with lazy caching
 	activeModels := d.getFilteredModels()
+	if len(privateModels) > 0 {
+		privateModels = filterExpiredModels(privateModels, d.allMappings()...)
+		activeModels = sortModels(append(slices.Clone(activeModels), privateModels...))
+	}
 
 	m := ModelListResponse{
 		Object: "list",
@@ -672,12 +699,16 @@ func (d *ModelDirector) ListModels(writer http.ResponseWriter, request *http.Req
 }
 
 func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Request) {
-	// support "/" in model name to follow pre established format
+	// support "/" in model name to follow pre established format. Private
+	// names often carry a prefix, as in private/company/model.
+	prefix := chi.URLParam(request, "prefix")
 	company := chi.URLParam(request, "company")
 	model := chi.URLParam(request, "model")
 
 	var modelName string
-	if company != "" && model != "" {
+	if prefix != "" && company != "" && model != "" {
+		modelName = prefix + "/" + company + "/" + model
+	} else if company != "" && model != "" {
 		modelName = company + "/" + model
 	} else if model != "" {
 		modelName = model
@@ -703,6 +734,9 @@ func (d *ModelDirector) GetModel(writer http.ResponseWriter, request *http.Reque
 		d.imageEdits.modelNameToModelInfo,
 		d.imageVariations.modelNameToModelInfo,
 	)
+	if !ok {
+		modelInfo, ok = d.authorizedPrivateModel(writer, request, modelName, d.sections)
+	}
 	if !ok {
 		modelMissingError := "Model does not exist by the name of " + modelName
 		markGatewayRejected(writer, request)
@@ -746,6 +780,7 @@ func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, requ
 	if handled {
 		return
 	}
+	defer limitStreamedBodyIdle(writer, resolved.request)()
 
 	finishShadowPrimary := d.dispatchShadowIfNeeded(resolved, modelToNVCFUrl, endpoint)
 	var proxyErr error
@@ -776,19 +811,15 @@ func (d *ModelDirector) proxyModelMappedRequest(writer http.ResponseWriter, requ
 }
 
 func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, request *http.Request, modelToNVCFUrl map[string]FunctionInfo) (resolvedOpenAIRequest, bool) {
-	extract := extractOpenAIRequestBody
-	if isDecisionRoute(request) {
-		if !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
-			if request.Body != nil {
-				_ = request.Body.Close()
-			}
-			markGatewayRejected(writer, request)
-			writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
-			return resolvedOpenAIRequest{}, true
+	if isDecisionRoute(request) && !isDecisionContentType(request.Header.Get(contentTypeHeader)) {
+		if request.Body != nil {
+			_ = request.Body.Close()
 		}
-		extract = extractDecisionRequestBody
+		markGatewayRejected(writer, request)
+		writeNativeError(writer, request, http.StatusUnsupportedMediaType, "", "Content-Type must be application/json")
+		return resolvedOpenAIRequest{}, true
 	}
-	body, err := extract(request)
+	body, bodyMode, err := d.readModelRequestBody(request, modelToNVCFUrl)
 	if err != nil {
 		markGatewayRejected(writer, request)
 		if protocol := requestProtocol(request); protocol != nativeProtocolNone {
@@ -798,19 +829,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		}
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			// Handle the case where the body is too large
-			writer.WriteHeader(http.StatusBadRequest)
-			errorMessage := OpenAIError{
-				Error: CustomOpenAIError{
-					Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-						"If larger assets are required please refer to our Assets API.", maxRequestSize),
-					Type: "invalid_request_error",
-					Code: "invalid_image_format",
-				},
-			}
-			if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
-				http.Error(writer, err.Error(), http.StatusInternalServerError)
-			}
+			writeOpenAIRequestTooLarge(writer, maxBytesErr)
 			return resolvedOpenAIRequest{}, true
 		}
 		if errors.Is(err, errInvalidJSONBody) {
@@ -839,6 +858,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		traceAttrModelName.String(body.Model),
 		traceAttrModelStream.Bool(body.Stream),
 	)
+	recordRequestBodyMode(request, bodyMode)
 
 	nvcfUrl, ok := modelToNVCFUrl[body.Model]
 	if !ok {
@@ -903,9 +923,10 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 
 	targetModelNames := shadowModelNames(shadows)
 
-	// Clone body only for shadowed requests — avoids allocation on the hot path.
-	rawBody, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close() // releases bytebufferpool buffer
+	// Shadow bodies read from the primary's pooled buffer instead of copying it.
+	// Each holds its own reference, so the buffer returns to the pool only after
+	// the primary proxy and every shadow replay close their bodies.
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		recordShadowDispatchSummary(
 			resolved.request.Context(),
@@ -917,9 +938,7 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 		)
 		return func(error) {}
 	}
-	// Reset primary request body (pool buffer released above).
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rawBody))
-	resolved.request.ContentLength = int64(len(rawBody))
+	modelSpans, modelSpansErr := topLevelModelSpans(body.peek())
 
 	// Replay through the same code path — proxyModelMappedRequest will resolve the
 	// shadow model name from the same mapping and proxy it. The NVCF-Shadow header
@@ -934,7 +953,7 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 	var droppedTargetModels []string
 	finishers := make([]func(error), 0, len(shadows))
 	for _, shadow := range shadows {
-		shadowBody, err := d.rewriteShadowBody(resolved.request, rawBody, shadow.modelName)
+		shadowBody, shadowBodyLength, err := d.newShadowBody(body, modelSpans, modelSpansErr, shadow.modelName)
 		if err != nil {
 			zap.L().Warn("shadow body rewrite failed, dropping target", append(
 				middleware.TraceFields(resolved.request.Context()),
@@ -952,13 +971,14 @@ func (d *ModelDirector) dispatchShadowIfNeeded(resolved resolvedOpenAIRequest, m
 		// Build shadow request with the rewritten body and recursion guard.
 		shadowCtx, finishShadow := shadowContext(resolved.request, shadow.cancelOnClientDisconnect)
 		finishers = append(finishers, finishShadow)
-		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowCtx)
+		shadowReq := newShadowRequest(resolved.request, shadowBody, shadowBodyLength, shadowCtx)
 		handler := newShadowReplayHandler(shadow.modelName, replayHandler)
 
 		// Shadow admission errors are logged by TrafficShadower and summarized below.
 		// They must not affect the primary request.
 		err = d.shadower.Shadow(shadowReq, handler)
 		if err != nil {
+			_ = shadowBody.Close()
 			droppedCount++
 			if reason := shadowDroppedReason(err); reason != "" {
 				droppedReasons = append(droppedReasons, reason)
@@ -986,17 +1006,29 @@ func (d *ModelDirector) randomShadowBucket() int {
 	return rand.IntN(100)
 }
 
-// rewriteShadowBody points a shadow copy at its target model. Decision routes
-// replace only the model value so the shadow keeps every other byte, as the
-// primary does.
-func (d *ModelDirector) rewriteShadowBody(request *http.Request, body []byte, modelName string) ([]byte, error) {
+// newShadowBody points a shadow copy at its target model. It replaces only
+// the model values found in modelSpans, so the shadow keeps every other byte,
+// as the primary does, and reads them from the primary's pooled buffer.
+func (d *ModelDirector) newShadowBody(body *pooledRequestBody, modelSpans []byteSpan, modelSpansErr error, modelName string) (io.ReadCloser, int64, error) {
 	if d.shadowBodyRewriter != nil {
-		return d.shadowBodyRewriter(body, modelName)
+		rewritten, err := d.shadowBodyRewriter(body.peek(), modelName)
+		if err != nil {
+			return nil, 0, err
+		}
+		return io.NopCloser(bytes.NewReader(rewritten)), int64(len(rewritten)), nil
 	}
-	if isDecisionRoute(request) {
-		return replaceTopLevelModel(body, modelName)
+	if modelSpansErr != nil {
+		return nil, 0, modelSpansErr
 	}
-	return rewriteShadowRequestModel(body, modelName)
+	modelValue, err := encodeModelValue(modelName)
+	if err != nil {
+		return nil, 0, err
+	}
+	shadowBody, err := body.withModel(modelSpans, modelValue)
+	if err != nil {
+		return nil, 0, err
+	}
+	return shadowBody, shadowBody.Len(), nil
 }
 
 func finishShadows(finishers []func(error)) func(error) {
@@ -1015,25 +1047,28 @@ func (d *ModelDirector) proxyToLLMGateway(writer http.ResponseWriter, resolved r
 		return nil
 	}
 
-	body, err := io.ReadAll(resolved.request.Body)
-	_ = resolved.request.Body.Close()
+	body, err := bufferedRequestBody(resolved.request)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, fmt.Errorf("failed to read request body: %w", err))
 		return nil
 	}
-
-	rewrite := rewriteShadowRequestModel
-	if isDecisionRoute(resolved.request) {
-		rewrite = replaceTopLevelModel
+	// The forwarded body reads the pooled buffer around the new model values and
+	// holds its own buffer reference, so the primary body can close now.
+	rewritten, err := body.withTopLevelModel(resolved.functionInfo.functionId + "/" + resolved.modelName)
+	_ = body.Close()
+	if errors.Is(err, errInvalidJSONBody) {
+		// The model extractor accepts some bodies strict JSON rejects, such as
+		// raw control characters in strings. The caller sent them, so answer 400.
+		writeInvalidJSONBody(writer, resolved.request, err)
+		return nil
 	}
-	rewritten, err := rewrite(body, resolved.functionInfo.functionId+"/"+resolved.modelName)
 	if err != nil {
 		writeBadGatewayProblem(writer, resolved.request, err)
 		return nil
 	}
 
-	resolved.request.Body = io.NopCloser(bytes.NewReader(rewritten))
-	resolved.request.ContentLength = int64(len(rewritten))
+	resolved.request.Body = rewritten
+	resolved.request.ContentLength = rewritten.Len()
 
 	return d.llmGatewayDirector.ServeProxy(
 		LLMGatewayRequest{
@@ -1084,71 +1119,22 @@ func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolve
 	return observer.shadowFinalizationError(resolved.request, proxyErr)
 }
 
-func rewriteShadowRequestModel(body []byte, modelName string) ([]byte, error) {
-	if modelName == "" {
-		return body, nil
+// writeOpenAIRequestTooLarge writes the OpenAI-shaped response for a body
+// over the route limit. The forwarding path uses it too, when the limit is
+// reached after the request was dispatched but before any response.
+func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError) {
+	writer.WriteHeader(http.StatusBadRequest)
+	errorMessage := OpenAIError{
+		Error: CustomOpenAIError{
+			Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
+				"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
+			Type: "invalid_request_error",
+			Code: "invalid_image_format",
+		},
 	}
-
-	payload := map[string]json.RawMessage{}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("failed to decode shadow request body: %w", err)
+	if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
 	}
-
-	modelValue, err := json.Marshal(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow model name: %w", err)
-	}
-	payload["model"] = modelValue
-
-	rewritten, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode shadow request body: %w", err)
-	}
-	return rewritten, nil
-}
-
-// replaceTopLevelModel replaces the value of every top-level model member in
-// place and keeps every other byte of body. Go decoders match keys without
-// regard to case and differ on which duplicate wins, so every key that equals
-// model in any case is replaced and the LLM Gateway cannot read a value the
-// gateway did not resolve.
-func replaceTopLevelModel(body []byte, modelName string) ([]byte, error) {
-	modelValue, err := stdjson.Marshal(modelName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode model name: %w", err)
-	}
-	decoder := stdjson.NewDecoder(bytes.NewReader(body))
-	if token, err := decoder.Token(); err != nil || token != stdjson.Delim('{') {
-		return nil, fmt.Errorf("request body is not a JSON object")
-	}
-	type span struct{ start, end int64 }
-	var spans []span
-	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return nil, fmt.Errorf("failed to read request body key: %w", err)
-		}
-		key, _ := token.(string)
-		var value stdjson.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return nil, fmt.Errorf("failed to read request body value: %w", err)
-		}
-		if strings.EqualFold(key, "model") {
-			end := decoder.InputOffset()
-			spans = append(spans, span{end - int64(len(value)), end})
-		}
-	}
-	if len(spans) == 0 {
-		return nil, fmt.Errorf("request body has no model member")
-	}
-	rewritten := make([]byte, 0, len(body)+len(spans)*len(modelValue))
-	var last int64
-	for _, s := range spans {
-		rewritten = append(rewritten, body[last:s.start]...)
-		rewritten = append(rewritten, modelValue...)
-		last = s.end
-	}
-	return append(rewritten, body[last:]...), nil
 }
 
 // errModelFieldMissing signals that the client sent a valid request body that did
@@ -1267,6 +1253,12 @@ func extractDecisionRequestBody(request *http.Request) (openAIRequestBody, error
 	if err != nil {
 		return openAIRequestBody{}, err
 	}
+	return decodeDecisionRequestBody(bodyBytes)
+}
+
+// decodeDecisionRequestBody applies the decision route checks to a complete
+// buffered body and releases the buffer on error.
+func decodeDecisionRequestBody(bodyBytes *pooledRequestBody) (openAIRequestBody, error) {
 	if !stdjson.Valid(bodyBytes.peek()) {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, errInvalidJSONBody
@@ -1296,14 +1288,19 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	if err != nil {
 		return openAIRequestBody{}, err
 	}
+	return decodeOpenAIJSONBody(bodyBytes)
+}
 
+// decodeOpenAIJSONBody reads model and stream from a complete buffered body
+// and releases the buffer on error.
+func decodeOpenAIJSONBody(bodyBytes *pooledRequestBody) (openAIRequestBody, error) {
 	// A top-level null decodes without error, but the body must be a JSON object.
 	if bytes.Equal(bytes.TrimSpace(bodyBytes.peek()), []byte("null")) {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, fmt.Errorf("%w: body is null", errInvalidJSONBody)
 	}
 	body := openAIRequestBody{}
-	err = json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
+	err := json.UnmarshalWithOption(bodyBytes.peek(), &body, json.DecodeFieldPriorityFirstWin())
 	if err != nil {
 		_ = bodyBytes.Close()
 		return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidJSONBody, err)
@@ -1316,47 +1313,6 @@ func extractOpenAIJSONBody(request *http.Request) (openAIRequestBody, error) {
 	body.Model = strings.Clone(body.Model)
 	body.raw = bodyBytes.peek()
 	return body, nil
-}
-
-type bufferedOpenAIRequestBody struct {
-	*bytes.Reader
-	buffer  *bytebufferpool.ByteBuffer
-	release func()
-}
-
-func readOpenAIRequestBody(request *http.Request, bodyDescription string) (*bufferedOpenAIRequestBody, error) {
-	if request.Body == nil {
-		return nil, fmt.Errorf("expecting %s", bodyDescription)
-	}
-
-	bodyBytes := bytebufferpool.Get()
-	releaseBuffer := sync.OnceFunc(func() {
-		bodyBytes.Reset()
-		bytebufferpool.Put(bodyBytes)
-	})
-	_, err := io.Copy(bodyBytes, request.Body)
-	_ = request.Body.Close()
-	if err != nil {
-		releaseBuffer()
-		return nil, fmt.Errorf("failed to read body: %w", err)
-	}
-
-	bufferedBody := &bufferedOpenAIRequestBody{
-		Reader:  bytes.NewReader(bodyBytes.Bytes()),
-		buffer:  bodyBytes,
-		release: releaseBuffer,
-	}
-	request.Body = bufferedBody
-	return bufferedBody, nil
-}
-
-func (b *bufferedOpenAIRequestBody) peek() []byte {
-	return b.buffer.Bytes()
-}
-
-func (b *bufferedOpenAIRequestBody) Close() error {
-	b.release()
-	return nil
 }
 
 func getFirstValue[K comparable, V any](k K, maps ...map[K]V) (V, bool) {
@@ -1393,6 +1349,18 @@ func isDecisionRoute(request *http.Request) bool {
 
 // requestReadFailure maps a failure to read or parse the request body to the
 // status, error code and message of the route's native error.
+// writeInvalidJSONBody answers a request whose body is not valid JSON with 400
+// invalid_json in the route's error shape.
+func writeInvalidJSONBody(writer http.ResponseWriter, request *http.Request, err error) {
+	markGatewayRejected(writer, request)
+	if protocol := requestProtocol(request); protocol != nativeProtocolNone {
+		status, kind, message := requestReadFailure(protocol, err)
+		writeNativeError(writer, request, status, kind, message)
+		return
+	}
+	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
+}
+
 func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
 	status, kind := http.StatusInternalServerError, ""
 	message := "failed to read request"
@@ -1410,7 +1378,7 @@ func requestReadFailure(protocol nativeProtocol, err error) (int, string, string
 	}
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		status, kind, message = http.StatusRequestEntityTooLarge, "", "request body is too large"
+		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
 	}
 	if errors.Is(err, errModelFieldMissing) {
 		kind, message = errKindInvalidRequest, "model field is required"

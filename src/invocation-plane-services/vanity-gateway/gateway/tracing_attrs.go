@@ -32,6 +32,8 @@ const (
 	traceAttrIsShadow                  attribute.Key = "is_shadow"
 	traceAttrModelName                 attribute.Key = "model.name"
 	traceAttrModelStream               attribute.Key = "model.stream"
+	traceAttrRequestBodyMode           attribute.Key = "request.body.mode"
+	traceAttrRequestBodyReason         attribute.Key = "request.body.reason"
 	traceAttrSessionTimeoutSeconds     attribute.Key = "session_timeout.seconds"
 	traceAttrShadowDispatched          attribute.Key = "shadow.dispatched"
 	traceAttrShadowDispatchedCount     attribute.Key = "shadow.dispatched_count"

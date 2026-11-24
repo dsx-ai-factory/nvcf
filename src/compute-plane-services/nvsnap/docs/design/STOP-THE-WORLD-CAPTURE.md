@@ -11,6 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 - [Problem](#problem)
 - [Design](#design)
 - [Cost](#cost)
+- [Scaling groups of several replicas](#scaling-groups-of-several-replicas)
 - [Not covered](#not-covered)
 <!-- /toc -->
 
@@ -33,25 +34,51 @@ An instance resumed after a failed capture was left half dead.
 
 ## Design
 
-1. **The instance stops at one moment.** When the GPU ranks' quiesce vote
-   goes, the capture holds every member pod (`pod_hold.go`): each container is
-   frozen through its cgroup v2 freezer, sidecars included, and so are the
-   companions (etcd, NATS, frontends). A GPU rank's engine container stays
-   running only while gpushare saves its GPU memory; the dump then stops it. A
-   companion's container is thawed just before its dump, which stops it again.
-   Nothing of the instance counts the time the capture takes.
+1. **The instance stops at one moment.** The capture holds every member pod
+   (`pod_hold.go`, `instanceHold`): each container is frozen through its
+   cgroup v2 freezer. It does so in two steps, so that nothing a GPU rank's
+   engine talks to stops before the engine does:
+   - When the GPU ranks' quiesce vote goes, each rank's pod is held but for
+     its engine container, which keeps running while gpushare saves its GPU
+     memory (a minute or more for a large model): its sidecars stop before
+     they can count the suspending engine as failed.
+   - Once every member waits at the group freeze point, the ranks are
+     suspended, and the companions (etcd, NATS, frontends) are held. Until
+     then they run: an etcd held from the vote stopped answering a Dynamo
+     engine still running its save, the engine lost its lease and began to
+     shut down, the dump saved it shutting down, and its restore finished the
+     shutdown a few seconds after the network unlock.
+
+   The dump then stops each rank's engine container. A companion's container
+   is thawed just before its dump, which stops it again. Nothing of the
+   instance counts the time the capture takes.
+
+   The members are released to dump only once every hold has landed. A hold
+   still on its way after a bounded wait aborts the capture: landing in the
+   middle of the dumps, it would leave some pods held and others running.
+   The abort first cancels the holds still on their way, then tells the members
+   to stop (`group_freeze.go` `driveInstanceFreeze`), so the driver's failure
+   handling does not wait for a stalled one until the capture's deadline;
+   the members' hold releases end any that landed, and an agent refuses a
+   hold that comes after its release. A hold that fails outright leaves its
+   pod running, as in a capture without holds.
 2. **The captured instance is not resumed.** Its members are dumped without
    `--leave-running`, and its pods are deleted. Their controllers replace them,
    and the webhook admits the replacements as the restore's placeholders: the
    instance comes back by restoring from its own capture. The restore's time
    namespace hides the gap, as for any restore.
-3. **A capture is published only once it has restored.** The group record is
-   `verifying` (with `sourceNamespace`) until its first restore succeeds: only
-   the replacement pods of the captured instance restore from it. The first
-   successful restore makes it `complete`, for every instance of the
-   configuration. A failed verification blocks the checkpoints and the
+3. **A capture is published only once it has served.** The group record is
+   `verifying` (with `sourceNamespace`) until a restore of it serves: only the
+   replacement pods of the captured instance restore from it. Restored
+   processes are not enough, since an engine can restore and never finish its
+   first step. The capture becomes `complete`, for every instance of the
+   configuration, once every pod of a restore has been Ready for 6 minutes,
+   longer than a hung engine takes to drop its readiness or to give up on its
+   step and exit. A restore that has not served within 20 minutes, or whose
+   engine exits, fails the verification: the checkpoints are blocked and the
    configuration starts cold (and may be captured again); a bad checkpoint
-   never reaches scale-out.
+   never reaches scale-out. A restore whose pods are deleted before it serves
+   leaves the capture `verifying`, for the namespace's next restore.
 4. **A capture that fails after the instance stopped replaces it cold.** No
    instance is ever resumed from a stopped state.
 5. **Defense in depth.** The kubelet still probes during the freeze, so the
@@ -70,6 +97,36 @@ Large engine buffers in deleted shared-memory files (a vLLM CPU KV-cache tier,
 The first instance of a configuration is out of service for the capture and
 one restore, once per configuration. It should be captured before traffic is
 routed to it (or drained first); its in-flight requests fail otherwise.
+
+## Scaling groups of several replicas
+
+An instance is one replica of a Grove scaling group (one worker group of a
+Dynamo deployment), with the companions it talks to. When the namespace runs
+several such instances (several replicas of one scaling group, or several
+scaling groups such as prefill and decode workers), they all use the same
+companions (one etcd, one NATS, one frontend). A capture of one instance
+would stop companions the others still use, and each instance's restore
+would restore the same companions again. So the agent does not capture or
+restore those instances as groups:
+
+- Admission sums the replicas of the namespace's scaling groups, and counts
+  at least what the pods' replica indexes show. With more than one, GPU
+  ranks and the namespace's companions are admitted cold, to start from the
+  caches. If the count cannot be read while Grove pods are there, they are
+  admitted cold too.
+- Capture is skipped, and checked again just before the instance is held.
+  When the count cannot be read, capture is tried again later.
+- A group restore of such an instance ends before it waits for its
+  placeholders, as not run.
+- A group restore claims each companion placeholder before it restores it
+  (the `nvsnap.io/criu-companion-claimed-by` annotation, written with the
+  pod's `resourceVersion`). A restore that loses a claim to another live
+  leader ends as not run, and ending a restore leaves companions another
+  live leader claimed alone. A claim left by a leader that is gone is taken
+  over.
+
+Capturing every instance of a namespace, with its companions, as one group
+is future work.
 
 ## Not covered
 

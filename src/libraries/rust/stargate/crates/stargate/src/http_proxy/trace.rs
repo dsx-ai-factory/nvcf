@@ -17,7 +17,9 @@ use axum::http::HeaderMap;
 use tracing::{Span, field};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::load_balancer::ClusterComparator;
+use crate::load_balancer::{
+    ClusterComparator, LoadBalancerAlgorithm, LoadBalancerAlgorithmConfig, PulsarRendezvousWeight,
+};
 use crate::routing_state::{RoutedClusterSnapshot, RoutedInferenceServerSnapshot};
 use crate::telemetry::parent_context_from_headers;
 
@@ -46,6 +48,7 @@ pub(super) fn proxy_openai_request_span(headers: &HeaderMap) -> Span {
         selected_inst.output_tps = field::Empty,
         selected_inst.last_mean_input_tps = field::Empty,
         selected_inst.max_input_tps = field::Empty,
+        selected_inst.pulsar_weight_source = field::Empty,
         selected_inst.max_output_tps = field::Empty,
         selected_inst.queue_size = field::Empty,
         selected_inst.queued_input_size = field::Empty,
@@ -116,7 +119,11 @@ pub(super) struct RoutingTraceFields<'a> {
     pub(super) chosen: &'a RoutedInferenceServerSnapshot,
 }
 
-pub(super) fn record_routing_to_span(span: &Span, routing: RoutingTraceFields<'_>) {
+pub(super) fn record_routing_to_span(
+    span: &Span,
+    routing: RoutingTraceFields<'_>,
+    config: &LoadBalancerAlgorithmConfig,
+) {
     let stats = &routing.cluster.stats;
     record_fields!(span;
         "routing.algorithm" = routing.routing_algorithm,
@@ -129,6 +136,7 @@ pub(super) fn record_routing_to_span(span: &Span, routing: RoutingTraceFields<'_
         "selected_inst.output_tps" = stats.output_tps,
         "selected_inst.last_mean_input_tps" = stats.last_mean_input_tps,
         "selected_inst.max_input_tps" = stats.max_input_tps,
+        "selected_inst.pulsar_weight_source" = pulsar_weight_source(config, stats),
         "selected_inst.max_output_tps" = stats.max_output_tps,
         "selected_inst.queue_size" = stats.queue_size,
         "selected_inst.queued_input_size" = stats.queued_input_size,
@@ -147,9 +155,31 @@ pub(super) fn record_routing_to_span(span: &Span, routing: RoutingTraceFields<'_
     }
 }
 
+fn pulsar_weight_source(
+    config: &LoadBalancerAlgorithmConfig,
+    stats: &stargate_proto::pb::ModelStats,
+) -> Option<&'static str> {
+    if !matches!(
+        config.algorithm(),
+        LoadBalancerAlgorithm::Pulsar | LoadBalancerAlgorithm::PulsarWaitAndWiden
+    ) {
+        return None;
+    }
+    Some(match config.rendezvous_weight {
+        PulsarRendezvousWeight::LastMeanInputTps => "last-mean-input-tps",
+        PulsarRendezvousWeight::MaxInputTps if stats.max_input_tps.is_none() => {
+            "last-mean-input-tps-fallback"
+        }
+        PulsarRendezvousWeight::MaxInputTps => "max-input-tps",
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::proxy_openai_request_span;
+    use super::{proxy_openai_request_span, pulsar_weight_source};
+    use crate::load_balancer::{
+        LoadBalancerAlgorithm, LoadBalancerAlgorithmConfig, PulsarRendezvousWeight,
+    };
     use crate::telemetry::parent_context_from_headers;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use opentelemetry::global;
@@ -190,6 +220,41 @@ mod tests {
         assert!(fields.field("routing.sample_count_effective").is_some());
         assert!(fields.field("routing.comparator").is_some());
         assert!(fields.field("routing.session_state").is_some());
+        assert!(fields.field("selected_inst.pulsar_weight_source").is_some());
+    }
+
+    #[test]
+    fn pulsar_weight_source_distinguishes_fallback_from_explicit_mean() {
+        use stargate_proto::pb::ModelStats;
+
+        for algorithm in [
+            LoadBalancerAlgorithm::Pulsar,
+            LoadBalancerAlgorithm::PulsarWaitAndWiden,
+        ] {
+            let mut config = LoadBalancerAlgorithmConfig::from(algorithm);
+            let mut stats = ModelStats {
+                max_input_tps: Some(2000.0),
+                ..Default::default()
+            };
+            assert_eq!(pulsar_weight_source(&config, &stats), Some("max-input-tps"));
+            stats.max_input_tps = None;
+            assert_eq!(
+                pulsar_weight_source(&config, &stats),
+                Some("last-mean-input-tps-fallback")
+            );
+            config.rendezvous_weight = PulsarRendezvousWeight::LastMeanInputTps;
+            assert_eq!(
+                pulsar_weight_source(&config, &stats),
+                Some("last-mean-input-tps")
+            );
+        }
+        assert_eq!(
+            pulsar_weight_source(
+                &LoadBalancerAlgorithmConfig::from(LoadBalancerAlgorithm::PowerOfN),
+                &ModelStats::default(),
+            ),
+            None
+        );
     }
 
     #[derive(Clone, Default)]

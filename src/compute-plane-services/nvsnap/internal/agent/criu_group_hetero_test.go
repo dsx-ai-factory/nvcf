@@ -76,7 +76,7 @@ func TestGroupAliases(t *testing.T) {
 	mk(criuGroupConfigMapName(wkrKey), map[string]string{"state": "complete", "size": "1", "captures": "1", "checkpoint.0": "solo"})
 
 	uris := []string{ranks[0].Annotations[cacheURIAnnotation], ranks[1].Annotations[cacheURIAnnotation]}
-	c.writeGroupAliases(ctx, key, "fv", uris, len(uris), logrus.NewEntry(logrus.New()))
+	c.writeGroupAliases(ctx, key, "fv", 0, uris, len(uris), logrus.NewEntry(logrus.New()))
 
 	g, ok := a.lookupCRIUGroup(ctx, criuGroupKey("cache://a", "fv"))
 	if !ok || g.Key != key || len(g.Checkpoints) != 2 || g.Checkpoints[1] != "c1" {

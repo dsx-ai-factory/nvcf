@@ -18,7 +18,6 @@ limitations under the License.
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -76,6 +75,11 @@ func (s *TrafficShadower) Shadow(req *http.Request, handler http.Handler) error 
 
 	go func() {
 		defer s.sem.Release(1)
+		// Like net/http servers, close the body once the handler returns so a
+		// pooled body is released even when the handler never read it.
+		if req.Body != nil {
+			defer req.Body.Close()
+		}
 
 		ctx, timeoutCancel := context.WithTimeout(ctx, s.timeout)
 		defer timeoutCancel()
@@ -93,14 +97,14 @@ func setShadowSpanAttribute(span trace.Span, req *http.Request) {
 	span.SetAttributes(traceAttrIsShadow.Bool(isShadowRequest(req)))
 }
 
-func newShadowRequest(req *http.Request, body []byte, ctx context.Context) *http.Request {
+func newShadowRequest(req *http.Request, body io.ReadCloser, contentLength int64, ctx context.Context) *http.Request {
 	shadowReq := req.Clone(middleware.ShadowTelemetryContext(ctx))
 	shadowReq.Header.Set(shadowHeader, shadowHeaderValue)
 	// A shadow is a separate upstream request, so it gets its own ID. The
 	// shadow span keeps it linked to the primary trace.
 	shadowReq.Header.Set(middleware.RequestIDHeader, middleware.NewRequestID())
-	shadowReq.Body = io.NopCloser(bytes.NewReader(body))
-	shadowReq.ContentLength = int64(len(body))
+	shadowReq.Body = body
+	shadowReq.ContentLength = contentLength
 	return shadowReq
 }
 

@@ -103,7 +103,20 @@ For the mapping to Stargate algorithms, the request-router allowlist, and the
 tuning parameters, see
 [LLM Request Router Load Balancing](../self-managed/llm-request-router-load-balancing.md).
 
-`llmConfig.tokenRateLimit` applies a per-model token limit. Use one or more comma-separated limits in `<value>-<unit>` format, where `<value>` is a positive integer and `<unit>` is one of `S` (seconds), `M` (minutes), `H` (hours), `D` (days), or `W` (weeks). A single limit is one token budget over one time window, such as `1000-S`. A combined limit is multiple token budgets over distinct time windows, such as `1000-S,5000-M,100000-H,500000-D,1000000-W`; do not repeat a unit in the same value.
+[Session stickiness](#session-stickiness) needs a routing method that uses the
+cache-affinity key, such as:
+
+```text
+wait-and-widen;cache_affinity_backend_selection_count=1;max_queued=4;cache_affinity_wait_ms=200
+```
+
+Set the deployment's `maxRequestConcurrency` to the engine's real request
+capacity, such as engine workers times vLLM `--max-num-seqs`. If it is unset or
+`1`, the router cannot tell when a cluster is full. If it is too high, the
+router finds a full cluster only after requests queue inside the engine. See
+[Algorithms that use the cache-affinity key](https://github.com/NVIDIA/nvcf/blob/main/src/libraries/rust/stargate/docs/load-balancer-configuration.md#algorithms-that-use-the-cache-affinity-key).
+
+`llmConfig.tokenRateLimit` applies a per-model token limit. Use one or more comma-separated limits in `<value>-<unit>` format, where `<value>` is a positive integer and `<unit>` is one of `S` (seconds), `M` (minutes), `H` (hours), `D` (days), `W` (weeks), or `MO` (30 days). A single limit is one token budget over one time window, such as `1000-S`. The budget refills continuously over the window rather than resetting at a fixed time, so `3000000-MO` returns about 100000 tokens per day. A combined limit is multiple token budgets over distinct time windows, such as `1000-S,5000-M,100000-H,500000-D,1000000-W`; do not repeat a unit in the same value. A request is admitted against its estimated input tokens plus its requested output tokens (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). A request whose estimate is larger than a whole budget can never be admitted, so it gets `413` without `Retry-After` rather than `429`.
 
 The same configuration can be provided with CLI flags:
 
@@ -186,9 +199,24 @@ The upstream stream fails when it ends before `data: [DONE]`, the connection
 fails, the gateway request timeout expires, or the upstream sends an error
 event such as `data: {"error":{...}}`. A non-streaming client receives HTTP 502.
 A streaming client already has HTTP 200, so the stream ends with this event
-instead of `data: [DONE]`, with the upstream message when there is one:
+instead of `data: [DONE]`:
 `data: {"error":{"message":"upstream stream ended before completion","type":"server_error","param":null,"code":null}}`.
-The gateway records these failures as 502.
+When the upstream sent an error event, the gateway event takes its `message`,
+`type`, `param`, and `code`, and sends `code` as a string. The gateway records
+these failures as 502, except for the 4xx case below.
+
+An upstream that rejects the request after it opens the stream can put the
+HTTP status in the error event, for example
+`data: {"error":{"message":"...","type":"invalid_request_error","code":400}}`.
+If `code` is a number or a decimal string from 400 to 498, the gateway uses
+that status:
+
+- A non-streaming client receives that status with the upstream error object.
+- For a streaming client, the gateway records the request with that status.
+
+Dynamo releases before 1.6.0 send code 500 for every such error. To get the
+4xx status before the stream starts, set `DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS`
+on the Dynamo frontend (Dynamo 1.5.0 and later).
 
 ### Routing checks versus token-generation tests
 
@@ -221,6 +249,14 @@ The gateway requires the routed model to declare `/v1/responses` in `llmConfig.u
 For upstream compatibility, the gateway sends native Responses requests to the router as streaming requests. If the client requested streaming, the gateway relays SSE. If the client requested a non-streaming response, the gateway consumes the upstream SSE stream and returns the terminal Responses JSON object.
 
 The gateway treats the upstream stream as failed when it closes without a `response.completed`, `response.failed`, or `response.incomplete` event, when the upstream connection fails, or when the upstream sends an `error` event before a terminal event. A non-streaming client receives HTTP 502. A streaming client has already received HTTP 200, so the gateway ends the stream with a `response.failed` event whose `error.code` is `server_error`. The gateway does not relay an upstream `error` event; its message becomes the `response.failed` message. The gateway records these cases as 502 in its logs and metrics.
+
+A non-streaming client also receives an HTTP error when the terminal event is `response.failed` with one of these `error.code` values. The error carries the upstream message.
+
+- `invalid_prompt`: HTTP 400.
+- `rate_limit_exceeded`: HTTP 429.
+- `server_error`: HTTP 502.
+
+The gateway returns a failed response with any other code, or with no error, unchanged with HTTP 200. The OpenAI SDK raises no exception for that response, so check its `status` field.
 
 ### Embeddings
 
@@ -430,7 +466,10 @@ direct entry, one without `functionType: LLM`, of a function that serves both
 routes, set `usePexec: false`. A direct `usePexec: true` entry reaches only the
 function's default invocation path. On the decision routes the Vanity Gateway
 returns `415` when a request sets a `Content-Type` other than
-`application/json`, and accepts request bodies up to 25 MB.
+`application/json`, and accepts request bodies up to its configured limit,
+25 MiB by default. In the self-managed stack, set it with
+`addons.vanityGateway.config.maxRequestSizeBytes`. The LLM Gateway itself
+rejects request bodies over 50 MiB by default.
 
 ### Anthropic Messages
 
@@ -635,6 +674,8 @@ The client-facing `model` value must include a routing key and model name:
 
 The gateway uses `<function-id>` to authorize the request and select the NVCF function deployment. It rewrites the upstream model to `<model-name>` before forwarding the request.
 
+The model server never receives caller credentials. On every route, the gateway removes `Authorization`, `X-Api-Key`, `Proxy-Authorization`, and `Cookie` before forwarding, because they authorize NVCF, not the model server.
+
 The configured `llmConfig.uris` must match the paths served by the container. For example, a model that declares `/v1/responses` must have a container backend that can answer `POST /v1/responses`.
 
 ## Session Stickiness
@@ -688,6 +729,8 @@ sequenceDiagram
 
 Sticky routing only affects backend selection when the LLM request router is
 configured with a cache-affinity-aware routing method for the target model.
+Plain `wait-and-widen`, or its legacy name `groq_multiregion`, ignores the key.
+See [Function Configuration](#function-configuration).
 
 ### Last-Cluster Hints
 

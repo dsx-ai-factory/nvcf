@@ -241,7 +241,8 @@ func TestStargateProviderCompleteForwardsChatPayloadAndRoutingHeaders(t *testing
 		require.Equal(t, stargateChatCompletionsPath, r.URL.Path)
 		require.Equal(t, contentTypeJSON, r.Header.Get(headerContentType))
 		require.Equal(t, contentTypeSSE, r.Header.Get(headerAccept))
-		require.Equal(t, "Bearer secret-token", r.Header.Get(headerAuthorization))
+		// The caller's NVCF key authorizes the gateway, never the model server.
+		require.Empty(t, r.Header.Values(headerAuthorization))
 		require.Equal(t, "req-123", r.Header.Get(headerRequestID))
 		require.Equal(t, "us-west1", r.Header.Get(headerTargetRegion))
 		require.Equal(t, "us-west1", r.Header.Get(headerLegacyTargetRegion))
@@ -1497,41 +1498,34 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestStargateMessagesCredentialsStopBeforeWorker(t *testing.T) {
-	p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
-	require.NoError(t, err)
-	p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		require.Empty(t, r.Header.Get("Authorization"))
-		require.Empty(t, r.Header.Get("X-API-Key"))
-		require.Empty(t, r.Header.Get("Proxy-Authorization"))
-		require.Equal(t, "fn-messages", r.Header.Get(headerRoutingKey))
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
-	})}
-	resp, err := p.Proxy(context.Background(), &requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-messages"}, &ProxyRequest{Method: "POST", Path: "/v1/messages", Header: http.Header{"Authorization": {"Bearer injected"}, "X-Api-Key": {"secret"}, "Proxy-Authorization": {"secret"}}, Body: io.NopCloser(strings.NewReader(`{}`))})
-	require.NoError(t, err)
-	defer resp.Body.Close()
-}
-
-func TestStargateDecisionRouteCredentialsStopBeforeWorker(t *testing.T) {
-	for _, path := range []string{"/v1/decisions", "/v1/systemone"} {
+func TestStargateProxyCredentialsStopBeforeWorkerOnEveryRoute(t *testing.T) {
+	// The last path stands for any route added later: the rule has no route list.
+	for _, path := range []string{
+		"/v1/responses", "/v1/embeddings", "/v1/messages", "/v1/decisions", "/v1/systemone", "/v1/future-route",
+	} {
 		t.Run(path, func(t *testing.T) {
 			p, err := NewStargateProvider(config.StargateConfig{URL: "http://stargate.example"})
 			require.NoError(t, err)
+			var got http.Header
 			p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				for _, name := range []string{"Authorization", "X-Api-Key", "Proxy-Authorization", "Cookie"} {
-					require.Empty(t, r.Header.Values(name), name)
-				}
-				require.Equal(t, "fn-decisions", r.Header.Get(headerRoutingKey))
+				got = r.Header.Clone()
 				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
 			})}
 			resp, err := p.Proxy(context.Background(),
-				&requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-decisions"},
+				&requestctx.RequestContext{BearerToken: "caller-secret", RoutingKey: "fn-route"},
 				&ProxyRequest{Method: "POST", Path: path, Header: http.Header{
-					"Authorization": {"Bearer injected"}, "X-Api-Key": {"secret"},
+					"Authorization": {"Bearer caller-secret"}, "X-Api-Key": {"secret"},
 					"Proxy-Authorization": {"secret"}, "Cookie": {"session=secret"},
+					"X-Vendor": {"kept"},
 				}, Body: io.NopCloser(strings.NewReader(`{}`))})
 			require.NoError(t, err)
 			defer resp.Body.Close()
+
+			for _, name := range []string{"Authorization", "X-Api-Key", "Proxy-Authorization", "Cookie"} {
+				require.Empty(t, got.Values(name), name)
+			}
+			require.Equal(t, "kept", got.Get("X-Vendor"))
+			require.Equal(t, "fn-route", got.Get(headerRoutingKey))
 		})
 	}
 }

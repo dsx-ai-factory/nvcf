@@ -248,8 +248,21 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	}
 	root := filepath.Join(procBase, strconv.Itoa(hostPID), "root")
 
+	// A dump that fails before CRIU has dumped the container, with the
+	// container's process ended, failed because the workload exited
+	// (workload_exited.go). Once CRIU has dumped it, the dump itself
+	// stopped the process, and a later failure is nvsnap's.
+	// A process already gone here is the workload's exit too.
+	initStart, initGone := initialStart(procBase, hostPID)
+	dumped := false
+	defer func() { retErr = dumpFailure(retErr, dumped, procBase, hostPID, initStart, initGone) }()
+
 	// 1. The tools run from the node bundle mounted read-only in the
-	// container (bundle_tools.go), never from a copy in its filesystem.
+	// container (bundle_tools.go), never from a copy in its filesystem. A
+	// companion lacking them has them mounted into it (companion_tools.go).
+	if err := a.ensureCompanionToolsIn(procBase, hostPID); err != nil {
+		log.WithError(err).Warn("node bundle: cannot mount the tools into a pod without GPUs")
+	}
 	tools, err := bundleToolsOf(procBase, hostPID, a.bundleVersionsDir())
 	if err != nil {
 		return nil, fmt.Errorf("criu-v2: %w", err)
@@ -303,7 +316,15 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	var gpuMap string
 	var guard suspendGuard
 	if fabricSession != "" && !gsOn {
-		return nil, fmt.Errorf("gpushare: fabric session %s, but no process of this pod runs on the GPU under %s", fabricSession, gpushareLibName)
+		return nil, errNoGPUProcess(fabricSession)
+	}
+	if !gsOn {
+		// A workload under the library is captured through it or not at
+		// all: its configuration then falls back to the cachedir, never to
+		// the CUDA plugin (gpushare_outside.go).
+		if oerr := gpushareOutsideSession(procBase, targetHostPID); oerr != nil {
+			return nil, oerr
+		}
 	}
 	// A multi-node session's directory lives in the pod's store and must be
 	// gone before the store is collected into the checkpoint.
@@ -333,6 +354,24 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		if oerr := ownGPUShareStore(procBase, targetHostPID, root, fabric); oerr != nil {
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
+		// ModelExpress drops its RDMA state, which the dump cannot save,
+		// right before the suspend (gpushare_mx.go). Deferred before the
+		// suspend's guard, its resume runs after the source's: mx refuses
+		// while launches are held.
+		modelExpress := usesModelExpress(procBase, sessionPIDs(procBase, targetHostPID))
+		paused, mxErr := pauseModelExpress(ctx, modelExpress, tools.gpuToolText(), hostPID, gsPIDs, log)
+		if mxErr != nil {
+			return nil, fmt.Errorf("gpushare: %w", mxErr)
+		}
+		if paused {
+			defer func() {
+				// Not on a source whose GPU resume failed: it is stopped,
+				// and is replaced (errSourceLeftSuspended).
+				if sourceRunsOn(dumped, leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+					resumeModelExpress(ctx, hostPID, "", gsPIDs, log)
+				}
+			}()
+		}
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
@@ -351,7 +390,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare suspend: %w", serr)
 		}
 		gpuMap = gm
-		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib}
+		gsInfo = &GPUShareInfo{PIDs: gsPIDs, StorePath: GPUShareStoreInContainer, LibPath: gsLib, ModelExpress: paused}
 	}
 
 	final := finalOf(leaveRunning)
@@ -407,7 +446,9 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	}
 	// The container's pid namespace, from its init, dumped from outside
 	// with the agent's own CRIU (pidns_capture.go).
-	err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+	// dumped is CRIU's completion, not the error: a marker that cannot be
+	// written after CRIU dumped the container is nvsnap's failure.
+	dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}

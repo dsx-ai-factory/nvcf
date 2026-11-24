@@ -2,6 +2,9 @@
 
 This page provides guidance on configuring observability for self-hosted NVCF control-plane, including metrics, logging, and tracing.
 
+Obtain the selected Observability package through [Consume an NVCF release](../overview/umbrella-releases.md).
+Keep its directory beside the selected control-plane and compute-plane stacks.
+
 ## Find the answer to your question
 
 Common operator questions and where to look on this page or in linked references.
@@ -17,6 +20,14 @@ Common operator questions and where to look on this page or in linked references
 | How do I configure the shared metrics stack? | See [Self-managed metrics stack](#self-managed-metrics-stack). |
 
 ## Overview
+
+<Warning>
+Observability is supported on a single cluster, and on the control-plane cluster
+of a split deployment, including the control-plane cluster of a multi-cluster
+AWS deployment. Collecting compute-plane metrics from the GPU clusters in a
+multi-cluster AWS deployment is experimental and has not been qualified. See
+[Example dashboards](./example-dashboards.md) for the supported topologies.
+</Warning>
 
 Self-hosted NVCF control-plane observability enables users to monitor the health and performance of their NVCF deployment. The observability solution is designed to be:
 

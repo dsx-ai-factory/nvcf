@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -464,12 +465,171 @@ func TestIsTimeSincePodLaunchedLaterThan(t *testing.T) {
 			duration: 0,
 			want:     true,
 		},
+		{
+			// The KAI scheduler rewrites the PodScheduled=False transition time on
+			// every scheduling attempt, so it is always recent. The timeout must be
+			// measured from when the pod was created.
+			name: "pod unschedulable since creation with a just-rewritten transition time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-11 * time.Minute)}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						Reason:             corev1.PodReasonUnschedulable,
+						LastTransitionTime: metav1.Time{Time: now.Add(-time.Second)},
+					}},
+				},
+			},
+			duration: 10 * time.Minute,
+			want:     true,
+		},
+		{
+			name: "fresh unschedulable pod",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-time.Minute)}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						Reason:             corev1.PodReasonUnschedulable,
+						LastTransitionTime: metav1.Time{Time: now.Add(-time.Second)},
+					}},
+				},
+			},
+			duration: 10 * time.Minute,
+			want:     false,
+		},
+		{
+			name: "started pod is measured from its start time, not its creation time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)}},
+				Status: corev1.PodStatus{
+					StartTime: &metav1.Time{Time: now.Add(-30 * time.Minute)},
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionTrue,
+						LastTransitionTime: metav1.Time{Time: now.Add(-30 * time.Minute)},
+					}},
+				},
+			},
+			duration: time.Hour,
+			want:     false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := IsTimeSincePodLaunchedLaterThan(tt.pod, tt.duration)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestPodLaunchTime(t *testing.T) {
+	started := metav1.NewTime(time.Date(2026, 11, 6, 23, 0, 0, 0, time.UTC))
+	unscheduledSince := metav1.NewTime(started.Add(time.Minute))
+	created := metav1.NewTime(started.Add(-time.Minute))
+
+	tests := []struct {
+		name   string
+		pod    *corev1.Pod
+		want   metav1.Time
+		wantOK bool
+	}{
+		{
+			name: "start time wins over the scheduled condition",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					StartTime: &started,
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			want:   started,
+			wantOK: true,
+		},
+		{
+			name: "unscheduled pod uses its creation time, not the condition transition time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			want:   created,
+			wantOK: true,
+		},
+		{
+			name: "unscheduled pod without a creation time falls back to the condition transition time",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionFalse,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			want:   unscheduledSince,
+			wantOK: true,
+		},
+		{
+			name: "unscheduled pod without any time has no launch time",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:   corev1.PodScheduled,
+						Status: corev1.ConditionFalse,
+					}},
+				},
+			},
+			wantOK: false,
+		},
+		{
+			name: "scheduled pod without a start time has no launch time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{{
+						Type:               corev1.PodScheduled,
+						Status:             corev1.ConditionTrue,
+						LastTransitionTime: unscheduledSince,
+					}},
+				},
+			},
+			wantOK: false,
+		},
+		{
+			name: "pod without a scheduled condition uses its creation time",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created},
+			},
+			want:   created,
+			wantOK: true,
+		},
+		{
+			name:   "empty pod has no launch time",
+			pod:    &corev1.Pod{},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := PodLaunchTime(tt.pod)
+			require.Equal(t, tt.wantOK, ok)
+			assert.True(t, tt.want.Equal(&got), "got %s, want %s", got, tt.want)
 		})
 	}
 }
@@ -1231,6 +1391,93 @@ func TestIsContainerInRestartLoop(t *testing.T) {
 			assert.Equal(t, tt.want, IsContainerInRestartLoop(pod, tt.status, timeConfig))
 		})
 	}
+}
+
+func TestIsContainerInRestartLoopWorkerThreshold(t *testing.T) {
+	now := time.Now()
+	startTime := &metav1.Time{Time: now.Add(-72 * time.Hour)}
+	instanceIDEnv := []corev1.EnvVar{{Name: InstanceIDEnvKey, Value: "instance-1"}}
+	containerFunctionPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "fn-pod", Namespace: "nvcf-backend"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "inference"},
+			{Name: common.UtilsContainerName, Env: instanceIDEnv},
+		}},
+		Status: corev1.PodStatus{StartTime: startTime},
+	}
+	llmWorkerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "llm-pod", Namespace: "nvcf-backend"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "inference"},
+			{Name: function.LLMWorkerContainerName, Env: instanceIDEnv},
+		}},
+		Status: corev1.PodStatus{StartTime: startTime},
+	}
+	userUtilsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "user-pod", Namespace: "nvcf-backend"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: common.UtilsContainerName}}},
+		Status:     corev1.PodStatus{StartTime: startTime},
+	}
+	helmUtilsPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: common.UtilsPodName, Namespace: "sr-helm-fn"},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: common.InitContainerName}},
+			Containers:     []corev1.Container{{Name: common.UtilsContainerName}, {Name: common.ESSContainerName}},
+		},
+		Status: corev1.PodStatus{StartTime: startTime},
+	}
+	crashed := func(name string, restarts int32) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name:         name,
+			RestartCount: restarts,
+			State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now)}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   2,
+				Reason:     "Error",
+				StartedAt:  metav1.NewTime(now.Add(-time.Minute)),
+				FinishedAt: metav1.NewTime(now.Add(-10 * time.Second)),
+			}},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		pod       *corev1.Pod
+		container string
+		threshold int32
+		restarts  int32
+		want      bool
+	}{
+		{name: "worker uses the default of three", pod: containerFunctionPod, container: common.UtilsContainerName, restarts: 3, want: true},
+		{name: "worker tolerates two restarts by default", pod: containerFunctionPod, container: common.UtilsContainerName, restarts: 2, want: false},
+		{name: "negative worker threshold uses the default", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: -1, restarts: 3, want: true},
+		{name: "raised threshold lets the worker survive four restarts", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: 5, restarts: 4, want: false},
+		{name: "raised threshold fails the worker at its limit", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: 5, restarts: 5, want: true},
+		{name: "lowered threshold fails the worker at one restart", pod: containerFunctionPod, container: common.UtilsContainerName, threshold: 1, restarts: 1, want: true},
+		{name: "raised threshold applies to the LLM worker", pod: llmWorkerPod, container: function.LLMWorkerContainerName, threshold: 5, restarts: 4, want: false},
+		{name: "raised threshold applies to the Helm utils Pod worker", pod: helmUtilsPod, container: common.UtilsContainerName, threshold: 5, restarts: 4, want: false},
+		{name: "ESS sidecar in the Helm utils Pod keeps three", pod: helmUtilsPod, container: common.ESSContainerName, threshold: 5, restarts: 3, want: true},
+		{name: "init container in the Helm utils Pod keeps three", pod: helmUtilsPod, container: common.InitContainerName, threshold: 5, restarts: 3, want: true},
+		{name: "inference container keeps three with a raised worker threshold", pod: containerFunctionPod, container: "inference", threshold: 5, restarts: 3, want: true},
+		{name: "inference container keeps three with a lowered worker threshold", pod: containerFunctionPod, container: "inference", threshold: 1, restarts: 2, want: false},
+		{name: "utils container without the instance ID is not the worker", pod: userUtilsPod, container: common.UtilsContainerName, threshold: 5, restarts: 3, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeConfig := (&TimeConfig{WorkerContainerRestartCountToFailInstance: tt.threshold}).Complete()
+			assert.Equal(t, tt.want, IsContainerInRestartLoop(tt.pod, crashed(tt.container, tt.restarts), timeConfig))
+		})
+	}
+
+	t.Run("uncompleted config uses the default for the worker", func(t *testing.T) {
+		timeConfig := &TimeConfig{PodLaunchThresholdSecondsOnFailedRestarts: time.Minute}
+		assert.False(t, IsContainerInRestartLoop(containerFunctionPod, crashed(common.UtilsContainerName, 0), timeConfig))
+		assert.False(t, IsContainerInRestartLoop(containerFunctionPod,
+			crashed(common.UtilsContainerName, RestartCountToFailInstance-1), timeConfig))
+		assert.True(t, IsContainerInRestartLoop(containerFunctionPod,
+			crashed(common.UtilsContainerName, RestartCountToFailInstance), timeConfig))
+	})
 }
 
 func TestHasContainerNamed(t *testing.T) {

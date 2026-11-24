@@ -120,7 +120,28 @@ type StreamDirector struct {
 	functionInvoker FunctionInvoker
 	cors            *cors.Cors
 	eventLedger     *eventledger.Publisher
+	// Request IDs of disconnected sessions being watched for their end. See
+	// watchSessionEnd.
+	sessionWatches sync.Map
+	sessionEndPoll time.Duration
+	// How long a registration may be absent, before it was ever seen, without
+	// the session being treated as ended.
+	sessionRegistrationGrace time.Duration
+	sessionEndWatchLimit     time.Duration
+	watchCtx                 context.Context
+	stopWatches              context.CancelFunc
 }
+
+// How often a disconnected session is checked for whether it can still be
+// rejoined, and how long it is watched at most.
+const (
+	defaultSessionEndPoll       = 10 * time.Second
+	defaultSessionEndWatchLimit = 9 * time.Hour
+	// The worker may attach before it has published the session registration.
+	// An absent registration is only an ended session once it has been seen,
+	// or once this long has passed without it appearing.
+	defaultSessionRegistrationGrace = 2 * time.Minute
+)
 
 var errShuttingDown = errors.New("proxy is shutting down")
 
@@ -185,6 +206,8 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 	// shared by every RPC on a connection with the same function routing, so
 	// no single request's cancellation means nobody is waiting.
 	var purgeDepartedClientWork func(uuid.UUID, string)
+	// Assigned with purgeDepartedClientWork, for the same reason.
+	var director *StreamDirector
 
 	cache := ttlcache.New(
 		ttlcache.WithTTL[workerConnectionKey, *worker.WorkerConnection](consts.Timeout),
@@ -220,6 +243,9 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 					c.Delete(k)
 				}
 				newWorkerConnection := worker.NewWorkerConnection(k.requestId, k.functionId, k.functionVersionId, onActive, onInactive)
+				if auth := workerAuthCache.Get(k.workerAuthToken); auth != nil {
+					newWorkerConnection.CallerNcaId = auth.Value().callerNcaId
+				}
 				// the new connection gets inserted here, not by the return value of the loader func.
 				// this has the happy side effect that we are still holding the ttl update lock.
 				conn, connAlreadyExisted := c.GetOrSet(k, newWorkerConnection)
@@ -311,6 +337,15 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 			))
 		span.End()
 
+		if event, ok := attachmentEndEvent(wc, reasonStr, closedAt, heldFor, closeInfo.Code); ok && director != nil {
+			director.eventLedger.Publish(ctx, event)
+			// Either side can leave first. The registration says if the
+			// session is over.
+			if reasonStr == metrics.CloseReasonClientClosed || reasonStr == metrics.CloseReasonWorkerClosed {
+				director.watchSessionEnd(wc)
+			}
+		}
+
 		// Purge here rather than when a request is cancelled. This fires once
 		// for the shared entry, however many requests shared it.
 		//
@@ -334,7 +369,7 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 	})
 	go cache.Start()
 
-	director := &StreamDirector{
+	director = &StreamDirector{
 		workers:         cache,
 		shuttingDown:    shuttingDown,
 		departurePurges: make(chan struct{}, departurePurgeConcurrency),
@@ -345,6 +380,10 @@ func NewStreamDirector(functionInvoker FunctionInvoker) *StreamDirector {
 		functionInvoker: functionInvoker,
 		cors:            cors.New(middleware.DefaultCorsOptions),
 	}
+	director.sessionEndPoll = defaultSessionEndPoll
+	director.sessionRegistrationGrace = defaultSessionRegistrationGrace
+	director.sessionEndWatchLimit = defaultSessionEndWatchLimit
+	director.watchCtx, director.stopWatches = context.WithCancel(context.Background())
 	// Closed over by the eviction handler above, which runs before this
 	// returns only if an entry is evicted during construction, which cannot
 	// happen: the cache is empty until the director serves a request.
@@ -564,6 +603,7 @@ func (s *StreamDirector) purgePendingWork() {
 }
 
 func (s *StreamDirector) Close() error {
+	s.stopWatches()
 	// Mark first: DeleteAll evicts every entry, and without this those
 	// evictions would be misreported as client or worker initiated.
 	s.shuttingDown.Store(true)
@@ -618,6 +658,10 @@ func (s *StreamDirector) RegisterWorker(ctx context.Context, workerAuthToken str
 	// tunnel serves nobody and is not an attachment worth reporting.
 	if s.departedTokens.Has(workerAuthToken) {
 		zap.L().Info("worker connected after its client left", zap.Stringer("request id", info.requestId))
+		return nil
+	}
+	// Evicted while registering: eviction already decided no close follows.
+	if !w.Value().MarkEstablished() {
 		return nil
 	}
 	s.eventLedger.Publish(ctx, newAttachmentEstablished(w.Value(), info, connectedAt))
@@ -709,6 +753,19 @@ func (s *StreamDirector) serveStatefulRequest(w http.ResponseWriter, r *http.Req
 	}
 	reqLogger.Info("client directed to worker connection", zap.Stringer("request id", workerConn.RequestId))
 
+	// The transport fails a response only once its read of the request body
+	// returns, and a client that is only receiving sends nothing more. Closing
+	// the body when the tunnel goes away lets that client see its worker is
+	// gone. Only an HTTP/2 body can be closed while a read is blocked on it.
+	if r.ProtoMajor == 2 && r.Body != nil && r.Body != http.NoBody {
+		stop := context.AfterFunc(workerConn.TunnelContext(), func() { _ = r.Body.Close() })
+		defer stop()
+	}
+
+	if s.eventLedger != nil && workerConn.ClaimFirstRpc() {
+		s.serveReportedRpc(upstreamHandler, workerConn, w, r)
+		return nil
+	}
 	upstreamHandler.ServeHTTP(w, r)
 	return nil
 }
@@ -792,6 +849,8 @@ func (s *StreamDirector) getAndInitWorkerConnection(ctx context.Context, conn *w
 
 		// Capture API-provided function info in closure
 		var apiFunctionId, apiFunctionVersionId string
+		// Set by the callback, which the invoker runs right before dispatching.
+		var minted invocation.WorkerAuth
 
 		invokeResponse, cancelInvokingWorker, err := s.functionInvoker.InvokeStatefulFunction(ctx, conn, auth, functionId, functionVersionId, requestId, func(workerAuth invocation.WorkerAuth) {
 			// Populate workerAuth cache BEFORE worker is notified (atomicity guarantee)
@@ -813,12 +872,17 @@ func (s *StreamDirector) getAndInitWorkerConnection(ctx context.Context, conn *w
 			// Capture the API response values
 			apiFunctionId = workerAuth.FunctionId
 			apiFunctionVersionId = workerAuth.FunctionVersionId
+			minted = workerAuth
 		})
 		if err != nil {
+			// An error after the callback is the dispatch failing. Earlier errors
+			// come from unverified or rejected callers and are not published.
+			if minted.Token != "" {
+				s.eventLedger.Publish(ctx, newDispatchFailed(minted, time.Now()))
+			}
 			zap.L().Warn("failed to open stateful work request", zap.Error(err), zap.String("function id", functionId), zap.Stringer("request id", requestId))
 			return nil, fmt.Errorf("failed to open stateful work request: %w", err)
 		}
-
 		// Remembered until the worker CONNECTs back, so a shutdown can find the
 		// requests whose tokens are about to be lost with this pod and drop
 		// them from the work queue rather than leave them to be pulled and
@@ -844,6 +908,19 @@ func (s *StreamDirector) getAndInitWorkerConnection(ctx context.Context, conn *w
 			functionId:        apiFunctionId,
 			functionVersionId: apiFunctionVersionId,
 		}).Value()
+		if invokeResponse.StreamingDispatch == nil {
+			s.eventLedger.Publish(ctx, newWorkDispatched(minted, isRejoin, time.Now()))
+		} else {
+			// A streaming request is dispatched once a worker answers it. The
+			// sender always reports, so this goroutine always ends. A worker that
+			// attaches before its answer is seen stops the sender, and SetConnection
+			// marks the connection before that, so an attached worker also counts.
+			go func() {
+				if <-invokeResponse.StreamingDispatch || workerConnection.EverConnected() {
+					s.eventLedger.Publish(ctx, newWorkDispatched(minted, isRejoin, time.Now()))
+				}
+			}()
+		}
 		if cancelInvokingWorker != nil {
 			go func() {
 				// once a connection shows up or the context goes away we should stop looking for a worker
@@ -886,4 +963,112 @@ func GrpcCodeToHttpStatusCode(code grpcCodes.Code) int {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusInternalServerError
+}
+
+type sessionResumer interface {
+	SessionResumable(ctx context.Context, requestId uuid.UUID) (bool, error)
+}
+
+// sessionWatch lets a later departure of the same session extend a running
+// watch instead of starting a second one.
+type sessionWatch struct {
+	renew chan struct{}
+}
+
+// watchSessionEnd reports Session.Ended once the session wc belonged to can no
+// longer be rejoined. A client that left may still come back, so the proxy
+// asks the session registration, which the worker removes when it stops
+// waiting for the client. Only one watcher runs per request ID. A client that
+// rejoins and leaves again renews that watcher's deadline.
+func (s *StreamDirector) watchSessionEnd(wc *worker.WorkerConnection) {
+	resumer, ok := s.functionInvoker.(sessionResumer)
+	if !ok || s.eventLedger == nil {
+		return
+	}
+	watch := &sessionWatch{renew: make(chan struct{}, 1)}
+	if running, watching := s.sessionWatches.LoadOrStore(wc.RequestId, watch); watching {
+		select {
+		case running.(*sessionWatch).renew <- struct{}{}:
+		default: // a renewal is already pending
+		}
+		return
+	}
+	go func() {
+		defer s.sessionWatches.Delete(wc.RequestId)
+		ctx, cancel := context.WithCancel(s.watchCtx)
+		defer cancel()
+		deadline := time.NewTimer(s.sessionEndWatchLimit)
+		defer deadline.Stop()
+		ticker := time.NewTicker(s.sessionEndPoll)
+		defer ticker.Stop()
+		started := time.Now()
+		registrationSeen := false
+		lookupFailing := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline.C:
+				return
+			case <-watch.renew:
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				deadline.Reset(s.sessionEndWatchLimit)
+				continue
+			case <-ticker.C:
+			}
+			resumable, err := s.lookupSessionResumable(ctx, resumer, wc)
+			if err != nil {
+				if !lookupFailing {
+					zap.L().Warn("session registration lookup failed, will keep polling",
+						zap.Error(err),
+						zap.Stringer("request_id", wc.RequestId),
+						zap.String("function_id", wc.FunctionId),
+						zap.String("function_version_id", wc.FunctionVersionId),
+						zap.String("caller_nca_id", wc.CallerNcaId))
+				}
+				lookupFailing = true
+				continue
+			}
+			lookupFailing = false
+			if resumable {
+				registrationSeen = true
+				continue
+			}
+			if !registrationSeen && time.Since(started) < s.sessionRegistrationGrace {
+				continue
+			}
+			s.eventLedger.Publish(ctx, newSessionEnded(wc, time.Now()))
+			return
+		}
+	}()
+}
+
+func (s *StreamDirector) lookupSessionResumable(ctx context.Context, resumer sessionResumer, wc *worker.WorkerConnection) (bool, error) {
+	ctx, span := otel.GetTracerProvider().Tracer("proxy-tracer").Start(ctx, "grpc-proxy.session_registration_lookup",
+		trace.WithAttributes(
+			attribute.Stringer("request_id", wc.RequestId),
+			attribute.String("nvcf.function.id", wc.FunctionId),
+			attribute.String("nvcf.org.id", wc.CallerNcaId),
+		))
+	defer span.End()
+
+	began := time.Now()
+	resumable, err := resumer.SessionResumable(ctx, wc.RequestId)
+	metrics.SessionEndLookupDurationSeconds.Observe(time.Since(began).Seconds())
+	switch {
+	case err != nil:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupError).Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	case resumable:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupResumable).Inc()
+	default:
+		metrics.SessionEndLookupTotal.WithLabelValues(metrics.SessionLookupEnded).Inc()
+	}
+	return resumable, err
 }

@@ -42,6 +42,12 @@ func (rlr *RateLimitResult) Allowed() bool {
 	return rlr.Requested <= rlr.CurrentValue
 }
 
+// ExceedsLimit reports a request larger than the whole bucket, which no wait
+// can admit.
+func (rlr *RateLimitResult) ExceedsLimit() bool {
+	return rlr.RateLimit.Limit > 0 && rlr.Requested > rlr.RateLimit.Limit
+}
+
 func (rlr *RateLimitResult) Revert() {
 	rlr.reverted = true
 }
@@ -50,7 +56,11 @@ func (rlr *RateLimitResult) RemainingValue() int64 {
 	if rlr.reverted {
 		return rlr.CurrentValue
 	}
-	return max(rlr.CurrentValue-rlr.Requested, 0)
+	// Requested can be negative (a refund); CurrentValue-Requested is then an
+	// addition that can overflow the same way leakyBucket's own newValue can.
+	// CurrentValue is negative while a debt-allowing bucket is paying off debt;
+	// remaining never reports below zero.
+	return max(saturatingConsume(rlr.CurrentValue, rlr.Requested, 0, rlr.RateLimit.Limit), 0)
 }
 
 func (rlr *RateLimitResult) LimitValue() int64 {

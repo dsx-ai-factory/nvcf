@@ -357,6 +357,12 @@
       "deploys": []
     },
     {
+      "id": "worker-callback-proxy-helm",
+      "path": "deploy/helm/worker-callback-proxy",
+      "service_name": "helm-nvcf-worker-callback-proxy",
+      "deploys": []
+    },
+    {
       "id": "llm-request-router",
       "path": "deploy/helm/llm-request-router",
       "service_name": "helm-nvcf-llm-request-router",
@@ -419,6 +425,17 @@
       "path": "src/compute-plane-services/worker-task",
       "service_name": "nvcf-worker-task",
       "legacy_tag_prefix": "nvcf-worker-task-v"
+    },
+    {
+      "id": "nvsnap",
+      "path": "src/compute-plane-services/nvsnap",
+      "service_name": "nvsnap"
+    },
+    {
+      "id": "nvstor",
+      "path": "src/compute-plane-services/nvstor",
+      "service_name": "nvstor",
+      "initial_version": "0.2.0"
     },
     {
       "id": "cloud-tasks",

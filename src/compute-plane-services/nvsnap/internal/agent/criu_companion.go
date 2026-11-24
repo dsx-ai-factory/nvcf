@@ -38,6 +38,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -116,27 +117,75 @@ func (a *Agent) discoverCompanions(ctx context.Context, ranks []*corev1.Pod, log
 	}
 	slices := sl.Items
 	found := matchCompanions(peers, pods.Items, svcs.Items, slices, ranks)
+	// A pod without GPUs may run on a node no nvsnap agent runs on (a CPU
+	// node a helm chart's CPU-only pod is sent to): nothing there can be
+	// asked or dumped, so it is never asked.
+	agents, err := a.agentNodeNames(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list the node agents: %w", err)
+	}
+	for _, p := range found {
+		if !agents[p.Spec.NodeName] {
+			return nil, nil, a.withoutAgent(ctx, p)
+		}
+	}
 	if len(found) > 0 {
 		reach := companionAddresses(found, svcs.Items, slices)
 		peersOf := map[string][]string{}
+		var unasked []*corev1.Pod
 		for _, p := range companionCandidates(pods.Items, ranks) {
 			if found[p.Name] != nil || p.Status.PodIP == "" || p.Spec.NodeName == "" {
+				continue
+			}
+			if !agents[p.Spec.NodeName] {
+				if err := a.withoutAgent(ctx, p); !errors.As(err, new(*companionWithoutAgentError)) {
+					return nil, nil, err // an agent is on its way there: asked once it runs
+				}
+				unasked = append(unasked, p)
+				continue
+			}
+			running := runningContainers(p)
+			if len(running) == 0 {
 				continue
 			}
 			base, err := a.peerAgentURL(ctx, p.Spec.NodeName)
 			if err != nil {
 				return nil, nil, fmt.Errorf("pod %s: %w", p.Name, err)
 			}
-			for _, c := range p.Spec.Containers {
-				ips, err := fetchPeers(ctx, base, p.Namespace, p.Name, c.Name, false)
+			for _, c := range running {
+				ips, err := fetchPeers(ctx, base, p.Namespace, p.Name, c, false)
 				if err != nil {
-					return nil, nil, fmt.Errorf("pod %s: container %s: connections: %w", p.Name, c.Name, err)
+					return nil, nil, fmt.Errorf("pod %s: container %s: connections: %w", p.Name, c, err)
 				}
 				peersOf[p.Name] = append(peersOf[p.Name], ips...)
 			}
 		}
 		for name, p := range clientsOf(reach, peersOf, pods.Items) {
 			found[name] = p
+		}
+		// Whether a pod on a node without an agent connects to the
+		// instance's companions is read from the companions' side: only a
+		// client of theirs keeps the instance from being captured.
+		if len(unasked) > 0 {
+			seen, err := a.companionPeersBothWays(ctx, found)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, p := range unasked {
+				// Its own address, or its node's: where a client's
+				// connection is source-NATed (kube-proxy masqueradeAll, a
+				// CNI's SNAT) or the client uses the node's network, the
+				// companion sees the node's address.
+				addrs, err := a.nodeAddresses(ctx, p.Spec.NodeName)
+				if err != nil {
+					return nil, nil, fmt.Errorf("node %s of pod %s: %w", p.Spec.NodeName, p.Name, err)
+				}
+				for _, ip := range append(podIPs(p), addrs...) {
+					if seen[ip] {
+						return nil, nil, &companionWithoutAgentError{pod: p.Name, node: p.Spec.NodeName}
+					}
+				}
+			}
 		}
 	}
 	instance := companionAddresses(found, svcs.Items, slices)
@@ -232,6 +281,27 @@ func companionCandidates(pods []corev1.Pod, ranks []*corev1.Pod) []*corev1.Pod {
 			continue
 		}
 		out = append(out, p)
+	}
+	return out
+}
+
+// runningContainers returns the containers of p that run. Only they can
+// hold connections: a pod of the namespace whose container is down (a
+// telemetry agent in a crash loop, say) is no client of the instance while
+// it is, and asking its node for that container's connections fails, which
+// must not keep the instance from being captured (2026-11-08).
+func runningContainers(p *corev1.Pod) []string {
+	run := map[string]bool{}
+	for i := range p.Status.ContainerStatuses {
+		if cs := &p.Status.ContainerStatuses[i]; cs.State.Running != nil {
+			run[cs.Name] = true
+		}
+	}
+	var out []string
+	for i := range p.Spec.Containers {
+		if name := p.Spec.Containers[i].Name; run[name] {
+			out = append(out, name)
+		}
 	}
 	return out
 }
@@ -372,6 +442,9 @@ func (a *Agent) criuCompanionAdmits(ctx context.Context, pod *corev1.Pod) (bool,
 	if err != nil {
 		return false, fmt.Sprintf("cannot list the namespace's pods: %v", err)
 	}
+	if why := a.namespaceSharesCompanions(ctx, pod.Namespace, pods.Items); why != "" {
+		return false, why
+	}
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		if p.DeletionTimestamp != nil || !hasGPU(p) {
@@ -397,7 +470,18 @@ func (c *criuAutoRestorer) considerCompanionPlaceholder(ctx context.Context, pod
 	if !isCompanion(pod) || pod.Annotations[webhook.CRIURestoredAnnotation] != "" || pod.DeletionTimestamp != nil {
 		return
 	}
-	if time.Since(pod.CreationTimestamp.Time) < companionPlaceholderWait {
+	why := ""
+	if time.Since(pod.CreationTimestamp.Time) >= companionPlaceholderWait {
+		why = fmt.Sprintf("companion placeholder not restored after %s", companionPlaceholderWait)
+	} else if pods, err := c.a.kubeClient.CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{}); err == nil {
+		// A GPU pod of the same rollout admitted cold (no group restore
+		// took it, its model volume not ready): the instance does not
+		// restore, and the wait would only hold the companion back.
+		if rank := rankAdmittedCold(pod, pods.Items); rank != "" {
+			why = fmt.Sprintf("its instance's GPU pod %s was admitted cold, so the instance does not restore", rank)
+		}
+	}
+	if why == "" {
 		return
 	}
 	if _, busy := c.attempted.LoadOrStore("companion/"+string(pod.UID), struct{}{}); busy {
@@ -405,8 +489,34 @@ func (c *criuAutoRestorer) considerCompanionPlaceholder(ctx context.Context, pod
 	}
 	key := pod.Annotations[webhook.CRIUGroupAnnotation]
 	log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": key})
-	c.failGroup(ctx, pod, key, false, fmt.Errorf("companion placeholder not restored after %s", companionPlaceholderWait), log)
+	c.failGroup(ctx, pod, key, false, errors.New(why), log)
 }
+
+// rankAdmittedCold returns a GPU pod of companion's namespace that its
+// rollout admitted cold, or "": one created with or after the companion
+// placeholder (a rank already running blocks a companion's admission;
+// criuCompanionAdmits), not being deleted, and not taken by a group
+// restore. A rank the restore took carries the group annotation, restored
+// or not.
+func rankAdmittedCold(companion *corev1.Pod, pods []corev1.Pod) string {
+	since := companion.CreationTimestamp.Add(-companionRolloutSkew)
+	for i := range pods {
+		p := &pods[i]
+		if p.DeletionTimestamp != nil || !hasGPU(p) || p.Annotations[webhook.CRIUGroupAnnotation] != "" {
+			continue
+		}
+		if p.CreationTimestamp.Time.Before(since) {
+			continue
+		}
+		return p.Name
+	}
+	return ""
+}
+
+// companionRolloutSkew is how much earlier than a companion placeholder a
+// GPU pod of the same rollout may have been created: a controller creates
+// an instance's pods within moments of one another.
+const companionRolloutSkew = 2 * time.Minute
 
 // peersHandler lists the peers of a pod's established TCP connections that
 // it opened, or of all of them with direction=both, for the agent that
@@ -438,6 +548,10 @@ func (a *Agent) peersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func fetchPeers(ctx context.Context, base, ns, pod, container string, both bool) ([]string, error) {
+	// A node agent that does not answer must not stall the capture that
+	// asks, and the instance it holds.
+	ctx, cancel := context.WithTimeout(ctx, peersTimeout)
+	defer cancel()
 	u := fmt.Sprintf("%s/v1/pods/%s/%s/peers?container=%s", base, url.PathEscape(ns), url.PathEscape(pod), url.QueryEscape(container))
 	if both {
 		u += "&direction=both"
@@ -612,4 +726,84 @@ func (a *Agent) instanceServiceAliases(ctx context.Context, members []*corev1.Po
 		return ""
 	}
 	return serviceAliases(svcs.Items, slices.Items, members)
+}
+
+// companionWithoutAgentError is a pod of the instance (a companion, or a
+// client of one) on a node no nvsnap agent runs on: it can be neither asked
+// for its connections nor dumped, so the instance is not captured.
+type companionWithoutAgentError struct{ pod, node string }
+
+func (e *companionWithoutAgentError) Error() string {
+	return "companion " + e.pod + " runs on node " + e.node + ", where no nvsnap agent runs"
+}
+
+// agentNodeNames are the nodes an nvsnap agent pod is bound to.
+func (a *Agent) agentNodeNames(ctx context.Context) (map[string]bool, error) {
+	pods, err := a.kubeClient.CoreV1().Pods(a.criuFailedNamespace()).List(ctx, metav1.ListOptions{LabelSelector: agentLabelSelector})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for i := range pods.Items {
+		if n := pods.Items[i].Spec.NodeName; n != "" {
+			out[n] = true
+		}
+	}
+	return out, nil
+}
+
+// companionPeersBothWays are the addresses the companions found hold
+// connections with, in either direction, as their nodes' agents report.
+func (a *Agent) companionPeersBothWays(ctx context.Context, found map[string]*corev1.Pod) (map[string]bool, error) {
+	seen := map[string]bool{}
+	for _, f := range found {
+		base, err := a.peerAgentURL(ctx, f.Spec.NodeName)
+		if err != nil {
+			return nil, fmt.Errorf("pod %s: %w", f.Name, err)
+		}
+		for i := range f.Spec.Containers {
+			name := f.Spec.Containers[i].Name
+			ips, err := fetchPeers(ctx, base, f.Namespace, f.Name, name, true)
+			if err != nil {
+				return nil, fmt.Errorf("pod %s: container %s: connections: %w", f.Name, name, err)
+			}
+			for _, ip := range ips {
+				seen[ip] = true
+			}
+		}
+	}
+	return seen, nil
+}
+
+// nodeAddresses is the addresses of node name, as its status lists them.
+func (a *Agent) nodeAddresses(ctx context.Context, name string) ([]string, error) {
+	n, err := a.kubeClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(n.Status.Addresses))
+	for _, ad := range n.Status.Addresses {
+		if ad.Type == corev1.NodeInternalIP || ad.Type == corev1.NodeExternalIP {
+			out = append(out, ad.Address)
+		}
+	}
+	return out, nil
+}
+
+// peersTimeout bounds one ask of a node agent for a pod's connections.
+var peersTimeout = 30 * time.Second
+
+// withoutAgent is why pod, on a node with no nvsnap agent pod, holds up the
+// capture: a node the agent's placement covers gets one (a rollout, a new
+// node), and the capture is tried again (errAgentNotYet); on any other node
+// none ever runs (companionWithoutAgentError).
+func (a *Agent) withoutAgent(ctx context.Context, pod *corev1.Pod) error {
+	eligible, err := a.nodeInAgentPlacement(ctx, pod.Spec.NodeName)
+	if err != nil {
+		return fmt.Errorf("node %s of pod %s: %w", pod.Spec.NodeName, pod.Name, err)
+	}
+	if eligible {
+		return fmt.Errorf("pod %s on node %s: %w", pod.Name, pod.Spec.NodeName, errAgentNotYet)
+	}
+	return &companionWithoutAgentError{pod: pod.Name, node: pod.Spec.NodeName}
 }

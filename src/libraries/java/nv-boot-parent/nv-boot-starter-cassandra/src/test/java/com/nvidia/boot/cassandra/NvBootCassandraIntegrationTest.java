@@ -24,6 +24,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
+import com.nvidia.boot.cassandra.configuration.CassandraSessionPools;
 import com.nvidia.boot.cassandra.configuration.CassandraSslBundleConfiguration;
 import io.micrometer.core.instrument.LongTaskTimer;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -211,6 +212,33 @@ class NvBootCassandraIntegrationTest {
         assertThat(applicationContext.getBeanNamesForType(DriverConfigLoaderBuilderCustomizer.class))
                 .as("CassandraMetricsConfiguration should register configLoaderBuilderCustomizer when metrics lists are set")
                 .contains("configLoaderBuilderCustomizer");
+    }
+
+    // Guards the driver internals CassandraSessionPools reads: through the application's wrapped
+    // session, the pool counts exclude the control connection that Node#getOpenConnections counts.
+    @Test
+    void sessionPoolsExcludeTheControlConnection() throws InterruptedException {
+        // Node counts update through asynchronous driver events, so wait for them to settle.
+        var deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        var pools = CassandraSessionPools.of(cqlSession);
+        while (!settled(pools) && System.nanoTime() < deadline) {
+            Thread.sleep(200);
+            pools = CassandraSessionPools.of(cqlSession);
+        }
+
+        assertThat(pools.complete()).as(pools.toString()).isTrue();
+        assertThat(pools.allPoolsEmpty()).as(pools.toString()).isFalse();
+        assertThat(pools.nodes()).as(pools.toString()).singleElement().satisfies(node -> {
+            assertThat(node.pooled()).isTrue();
+            assertThat(node.control()).isTrue();
+            assertThat(node.poolSize()).isPositive();
+            assertThat(node.openConnections()).isEqualTo(node.poolSize() + 1);
+        });
+    }
+
+    private static boolean settled(CassandraSessionPools pools) {
+        return pools.complete() && pools.nodes().stream().allMatch(node -> node.poolSize() > 0
+                && node.openConnections() == node.poolSize() + (node.control() ? 1 : 0));
     }
 
     @Test

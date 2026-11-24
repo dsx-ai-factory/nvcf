@@ -4,12 +4,14 @@
 package agent
 
 // Pod holds. A group capture stops the whole instance at one moment
-// (criu_group.go): once its GPU ranks are quiesced, every container of
-// every member pod is frozen, so nothing of the instance keeps time while
-// the ranks save their GPU memory and the members are dumped. An etcd
-// that kept running would expire the ranks' leases; a sidecar that kept
-// running would count the frozen engine as failed and kill it (a Dynamo
-// gang-health watchdog gives up after about 15 s).
+// (criu_group.go), in two steps (instanceHold, group_freeze.go): once its
+// GPU ranks are quiesced, their pods are frozen but for the containers
+// that save their GPU memory, so a sidecar does not count a suspending
+// engine as failed and kill it (a Dynamo gang-health watchdog gives up
+// after about 15 s); once the ranks are suspended, at the freeze point,
+// the companions' pods are frozen too, so an etcd does not keep counting
+// and expire the stopped ranks' leases. A companion frozen any earlier is
+// gone for the engines that still run their save.
 //
 // A hold freezes a pod's containers through their cgroup v2 freezers,
 // except the one a GPU rank's agent is saving (it runs until its dump). A
@@ -382,4 +384,22 @@ func (a *Agent) holdMember(ctx context.Context, session, ns, pod, container stri
 	}
 	log := a.log.WithFields(logrus.Fields{"pod": ns + "/" + pod, "session": session})
 	return a.holdPod(holdKey(session, ns, pod), int(info.PID), keep, log)
+}
+
+// thawAfterDump thaws the cgroup a pid-namespace dump froze, and removes
+// its hold record. A dump that ends the container's processes (a capture
+// that stops the instance) leaves no cgroup to thaw: that is the end of
+// the hold, not a failure. A thaw that fails otherwise is retried.
+func thawAfterDump(cg, record string, log *logrus.Entry) {
+	err := setFrozen(cg, false)
+	switch {
+	case err == nil:
+	case os.IsNotExist(err):
+		log.WithField("cgroup", cg).Debug("criu-v2: the dumped container has ended; nothing to thaw")
+	default:
+		log.WithError(err).WithField("cgroup", cg).Warn("criu-v2: cannot thaw the dumped container; retrying")
+		go retryThaw(record, []string{cg}, log)
+		return
+	}
+	_ = os.Remove(record)
 }

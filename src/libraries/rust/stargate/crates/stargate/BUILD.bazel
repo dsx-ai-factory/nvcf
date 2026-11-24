@@ -146,6 +146,18 @@ rust_test(
     ] + all_crate_deps(normal_dev = True),
 )
 
+rust_test(
+    name = "stargate_compatibility_test",
+    srcs = ["tests/compatibility.rs"] + glob(["tests/common/**/*.rs"]),
+    aliases = aliases(),
+    crate_root = "tests/compatibility.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":stargate_lib"] + _WORKSPACE_DEPS + [
+        "//src/libraries/rust/stargate/crates/pylon-lib:pylon-lib-test-support",
+    ] + all_crate_deps(normal = True, normal_dev = True),
+)
+
 # Multi-arch OCI image. distroless/cc base, single stargate binary at
 # /usr/local/bin/stargate (matches the Dockerfile's stargate-runtime stage).
 rust_oci_image(
