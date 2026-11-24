@@ -835,7 +835,10 @@ int main(int argc, char **argv)
         nvsnap_ibv_open();
         int after_open = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         pthread_create(&t, NULL, send_t, NULL);
-        usleep(200000);
+        /* Open: the send goes out, so wait for it (no time decides it).
+         * Held: it must stay blocked; give it 200 ms to show otherwise. */
+        if (!after_open) pthread_join(t, NULL);
+        else usleep(200000);
         int (*doomed_q)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "nvsnap_ibv_doomed");
         printf("fence=%d suspend=%d held_after_refusal=%d held_after_open=%d sent=%d doomed=%d\n", f, s,
                after_refusal, after_open, __atomic_load_n(&sent, __ATOMIC_SEQ_CST), doomed_q ? doomed_q() : -1);
