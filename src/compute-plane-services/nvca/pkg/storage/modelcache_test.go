@@ -2776,3 +2776,87 @@ func TestLegacyReaderMountOptions(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcileInitModelCacheNVMesh_PublishesPrimaryPVOnlyAfterWriterDetach
+// proves the primary PV label, which every namespace keys its read-only
+// reader on, is not set while the completed writer's volume is still attached
+// read-write. A reader staged before the writer unstages mounts the on-disk
+// state without the writer's unflushed metadata and sees a cache missing its
+// last files. The reconcile requeues without blocking and publishes once the
+// VolumeAttachment is gone.
+func TestReconcileInitModelCacheNVMesh_PublishesPrimaryPVOnlyAfterWriterDetach(t *testing.T) {
+	ctx := context.Background()
+	handle := "detachgatehandle"
+	pvName := "pv-" + handle
+	done := metav1.Now()
+
+	initJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "writer-job-" + handle,
+			Namespace: ModelCacheInitNamespace,
+			Labels:    map[string]string{modelCacheHandleLabelKey: handle},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1, CompletionTime: &done},
+	}
+	rwPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rw-pvc-" + handle,
+			Namespace: ModelCacheInitNamespace,
+			Labels:    map[string]string{modelCacheHandleLabelKey: handle},
+		},
+		Spec:   corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: pvName},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes:                   []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimDelete,
+		},
+	}
+	va := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-writer"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "nvmesh-csi.excelero.com",
+			NodeName: "writer-node",
+			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(mgrScheme).WithObjects(initJob, rwPVC, pv, va).Build()
+	r := &Reconciler{
+		Client:        c,
+		metrics:       newTestMetrics(),
+		fff:           &featureflagmock.Fetcher{},
+		nowFunc:       time.Now,
+		k8sTimeConfig: (&k8sutil.TimeConfig{}).Complete(),
+	}
+	st := nvcav1new.StorageRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: nvcav1new.ModelCacheRequest.Name(), Namespace: "ns1"},
+		Spec: nvcav1new.StorageRequestSpec{
+			Type:       nvcav1new.ModelCacheRequest,
+			ModelCache: &nvcav1new.ModelCacheSpec{CacheHandle: handle},
+		},
+		Status: nvcav1new.StorageRequestStatus{Phase: nvcav1new.StorageInitRunning},
+	}
+	stCopy := st.DeepCopy()
+
+	// Writer still attached read-write: requeue, no primary label, phase unchanged.
+	res, err := r.reconcileInitModelCacheNVMesh(ctx, st, stCopy, rwPVC.DeepCopy(), initJob.DeepCopy(), nil, HelmCacheBackendNVMesh)
+	require.NoError(t, err)
+	assert.Equal(t, volumeDetachRequeueInterval, res.RequeueAfter, "must requeue (not block) while attached")
+	assert.Equal(t, nvcav1new.StorageInitRunning, stCopy.Status.Phase)
+	got := &corev1.PersistentVolume{}
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: pvName}, got))
+	assert.NotContains(t, got.Labels, primaryPVLabelKey, "primary PV must not be published while the writer is attached")
+
+	// Detached: publish the primary PV and advance.
+	require.NoError(t, c.Delete(ctx, va))
+	res, err = r.reconcileInitModelCacheNVMesh(ctx, st, stCopy, rwPVC.DeepCopy(), initJob.DeepCopy(), nil, HelmCacheBackendNVMesh)
+	require.NoError(t, err)
+	assert.True(t, res.Requeue) //nolint:staticcheck
+	assert.Equal(t, nvcav1new.StorageCreating, stCopy.Status.Phase)
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: pvName}, got))
+	assert.Equal(t, primaryPVLabelValue, got.Labels[primaryPVLabelKey])
+	assert.Equal(t, handle, got.Labels[modelCacheHandleLabelKey])
+	assert.Equal(t, corev1.PersistentVolumeReclaimRetain, got.Spec.PersistentVolumeReclaimPolicy)
+}

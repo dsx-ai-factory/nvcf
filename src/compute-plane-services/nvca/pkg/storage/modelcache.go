@@ -1404,7 +1404,25 @@ func (r *Reconciler) reconcileInitModelCacheNVMesh(ctx context.Context,
 				// NVMesh: retain the bound dynamic PV as the cross-namespace
 				// "primary" PV (it carries the data volume handle that secondary
 				// PVs copy) and tear down the writer job/RW PVC.
-				log.Info("Cache init RW PVC bound, finalizing primary PV")
+				//
+				// The primary label is what every namespace's reconcile keys on to
+				// publish its read-only reader, so it must not be set while the
+				// writer still holds the volume read-write. The completed writer
+				// Pod unmounts and detaches asynchronously after the Job reports
+				// success; a reader staged before that sees the on-disk state
+				// without the writer's unflushed metadata (mounted ro,norecovery)
+				// and so a cache missing its last files. Wait for the detach here,
+				// never blocking the reconcile worker, and publish afterwards.
+				detached, err := r.isVolumeDetached(ctx, rwPVC.Spec.VolumeName)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+				if !detached {
+					log.V(1).Info("Cache init RW PVC bound, waiting for the writer volume to detach before publishing the primary PV",
+						"pv", rwPVC.Spec.VolumeName)
+					return reconcile.Result{RequeueAfter: volumeDetachRequeueInterval}, nil
+				}
+				log.Info("Cache init RW PVC bound and writer volume detached, finalizing primary PV")
 				if err := r.finalizePrimaryPVOnSuccessfulInit(ctx, stCopy, rwPVC); err != nil {
 					log.Error(err, "Failed to finalize primary PV")
 					return reconcile.Result{}, err
