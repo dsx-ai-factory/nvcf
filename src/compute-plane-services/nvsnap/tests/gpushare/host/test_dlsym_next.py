@@ -14,7 +14,8 @@ it. The test checks that the interposer's dlsym(RTLD_NEXT, ...) returns the
 next definition, not its own, for
 
   * a libc function (setenv);
-  * a CUDA function this library wraps (cuMemFree_v2): the stub's, unwrapped.
+  * a CUDA function this library wraps (cuMemFree_v2): the stub's, unwrapped
+    (its address is in libcuda.so.1, under that name; none found fails).
 
 Run: python3 -I tests/gpushare/host/test_dlsym_next.py
 (CUDA_INC names the directory with cuda.h; default /usr/local/cuda/include.)
@@ -42,6 +43,7 @@ NEXT = r"""
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int setenv(const char *n, const char *v, int o)
 {
@@ -56,14 +58,17 @@ int cuMemFree_v2(unsigned long long p)
     return 0;
 }
 
+/* "next" only for the driver's own definition: cuMemFree_v2 in
+ * libcuda.so.1, told by dladdr (dlsym on the driver's handle would return
+ * the library's wrapper when it is preloaded). */
 void report_cuda(void)
 {
     void *next = dlsym(RTLD_NEXT, "cuMemFree_v2");
-    void *cuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
-    void *stub = cuda ? dlsym(cuda, "cuMemFree_v2") : NULL;
     Dl_info di;
-    printf("cuMemFree_v2: %s\n", next == (void *)cuMemFree_v2 ? "self" : next == stub ? "next"
-           : dladdr(next, &di) && di.dli_fname ? di.dli_fname : "none");
+    const char *f = next && dladdr(next, &di) && di.dli_fname ? di.dli_fname : NULL, *b = f ? strrchr(f, '/') : NULL;
+    b = b ? b + 1 : f;
+    int driver = b && !strcmp(b, "libcuda.so.1") && di.dli_sname && !strcmp(di.dli_sname, "cuMemFree_v2");
+    printf("cuMemFree_v2: %s\n", !next ? "none" : next == (void *)cuMemFree_v2 ? "self" : driver ? "next" : b ? b : "unknown");
 }
 """
 
@@ -97,8 +102,10 @@ class DlsymNext(unittest.TestCase):
         cc("-shared", "-fPIC", "-o", os.path.join(cls.tmp, "libcuda.so.1"), os.path.join(cls.tmp, "stub.c"))
         cc("-fpatchable-function-entry=4", "-shared", "-fPIC", "-o", os.path.join(cls.tmp, "libnvsnap_gpushare.so"),
            os.path.join(SRC, "gpushare.c"), "-ldl", "-lpthread")
+        # Kept as a dependency (no --as-needed drop: next.c calls no driver
+        # function), so the driver is loaded after it for RTLD_NEXT to find.
         cc("-shared", "-fPIC", "-o", os.path.join(cls.tmp, "libnext.so"), os.path.join(cls.tmp, "next.c"),
-           "-L", cls.tmp, "-l:libcuda.so.1", "-ldl")
+           "-L", cls.tmp, "-Wl,--no-as-needed", "-l:libcuda.so.1", "-Wl,--as-needed", "-ldl")
         cc("-o", os.path.join(cls.tmp, "main"), os.path.join(cls.tmp, "main.c"), "-ldl")
 
     @classmethod
