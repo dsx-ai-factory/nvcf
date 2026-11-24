@@ -161,12 +161,15 @@ CREATE TABLE IF NOT EXISTS nvcf.functions_deployment_v2
     health_info             FROZEN<SET<deployment_health_udt>>,
     created_at              TIMESTAMP,
     last_updated_at         TIMESTAMP,
+    shard_id                INT,
     PRIMARY KEY ((function_version_id))
 );
 CREATE CUSTOM INDEX IF NOT EXISTS deployment_v2_by_deployment_id_sai_idx
     ON nvcf.functions_deployment_v2 (deployment_id) USING 'StorageAttachedIndex';
 CREATE CUSTOM INDEX IF NOT EXISTS deployment_v2_by_nca_id_sai_idx
     ON nvcf.functions_deployment_v2 (nca_id) USING 'StorageAttachedIndex';
+CREATE CUSTOM INDEX IF NOT EXISTS deployment_v2_by_shard_id_sai_idx
+    ON nvcf.functions_deployment_v2 (shard_id) USING 'StorageAttachedIndex';
 
 CREATE TABLE IF NOT EXISTS nvcf.gpu_specifications
 (

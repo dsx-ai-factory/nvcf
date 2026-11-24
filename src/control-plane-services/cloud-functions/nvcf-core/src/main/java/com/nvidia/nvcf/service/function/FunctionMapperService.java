@@ -406,6 +406,7 @@ public class FunctionMapperService {
                 .deploymentId(deploymentId)
                 .functionId(functionId)
                 .ncaId(ncaId)
+                .shardId(FunctionDeploymentEntity.shardId(functionVersionId))
                 .createdAt(Instant.now())
                 .lastUpdatedAt(Instant.now())
                 .build();

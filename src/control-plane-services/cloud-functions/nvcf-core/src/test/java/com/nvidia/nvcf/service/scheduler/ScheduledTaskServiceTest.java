@@ -40,6 +40,9 @@ class ScheduledTaskServiceTest {
     private CleanNatsStreamsTask cleanNatsStreamsTask;
 
     @Mock
+    private DeploymentShardBackfillTask deploymentShardBackfillTask;
+
+    @Mock
     private FunctionDeploymentsTaskProperties functionDeploymentsTaskProperties;
 
     @Mock
@@ -53,6 +56,7 @@ class ScheduledTaskServiceTest {
         scheduledTaskService = new ScheduledTaskService(
                 functionDeploymentsTask,
                 cleanNatsStreamsTask,
+                deploymentShardBackfillTask,
                 functionDeploymentsTaskProperties);
         scheduledTaskService.onApplicationEvent(applicationReadyEvent);
     }
@@ -77,5 +81,12 @@ class ScheduledTaskServiceTest {
         scheduledTaskService.cleanNatsStreams();
 
         verify(cleanNatsStreamsTask).run(Duration.ofMinutes(15));
+    }
+
+    @Test
+    void shouldRunDeploymentShardBackfillTask() throws InterruptedException {
+        scheduledTaskService.backfillDeploymentShards();
+
+        verify(deploymentShardBackfillTask).run();
     }
 }

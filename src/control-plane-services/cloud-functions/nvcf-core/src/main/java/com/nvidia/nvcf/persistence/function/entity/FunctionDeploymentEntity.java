@@ -46,6 +46,14 @@ public class FunctionDeploymentEntity {
     public static final String COLUMN_HEALTH_INFO = "health_info";
     public static final String COLUMN_CREATED_AT = "created_at";
     public static final String COLUMN_LAST_UPDATED_AT = "last_updated_at";
+    public static final String COLUMN_SHARD_ID = "shard_id";
+    public static final int SHARD_COUNT = 128;
+
+    public static int shardId(UUID functionVersionId) {
+        // functionVersionId.hashCode() can be negative. Math.floorMod(hash, 128) guarantees
+        // a valid shard ID from 0 to 127; hash % 128 does not.
+        return Math.floorMod(functionVersionId.hashCode(), SHARD_COUNT);
+    }
 
     @NonNull
     @PrimaryKey
@@ -74,4 +82,8 @@ public class FunctionDeploymentEntity {
     @Column(COLUMN_LAST_UPDATED_AT)
     @Builder.Default
     private Instant lastUpdatedAt = Instant.now();
+
+    @Nullable
+    @Column(COLUMN_SHARD_ID)
+    private Integer shardId;
 }

@@ -374,6 +374,7 @@ class FunctionsRepositoryTest {
         );
         var deploymentEntity = FunctionDeploymentEntity.builder()
                 .key(FunctionDeploymentKey.builder().functionVersionId(TEST_VERSION_ID_1).build())
+                .shardId(FunctionDeploymentEntity.shardId(TEST_VERSION_ID_1))
                 .deploymentId(TEST_DEPLOYMENT_ID)
                 .functionId(TEST_FUNCTION_ID)
                 .ncaId(TEST_NCA_ID)
@@ -390,6 +391,8 @@ class FunctionsRepositoryTest {
         assertThat(deployment).isNotNull();
         assertThat(deployment.getKey().getFunctionVersionId()).isEqualTo(TEST_VERSION_ID_1);
         assertThat(deployment.getFunctionId()).isEqualTo(TEST_FUNCTION_ID);
+        assertThat(deployment.getShardId()).isEqualTo(
+                FunctionDeploymentEntity.shardId(TEST_VERSION_ID_1));
 
         var gpuSpecs = deploymentContext.gpuSpecs();
         assertThat(gpuSpecs).hasSize(2);
@@ -411,6 +414,8 @@ class FunctionsRepositoryTest {
         deploymentContext =
                 functionDeploymentLookupService.getDeploymentContextByVersionId(TEST_VERSION_ID_1)
                 .orElseThrow();
+        assertThat(deploymentContext.deployment().getShardId()).isEqualTo(
+                FunctionDeploymentEntity.shardId(TEST_VERSION_ID_1));
         gpuSpecs = deploymentContext.gpuSpecs();
         assertThat(gpuSpecs).isNotNull().isNotEmpty().hasSize(2);
         gpuSpecs.forEach(spec -> {

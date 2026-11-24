@@ -26,6 +26,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.javacrumbs.shedlock.core.LockAssert;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
@@ -45,6 +46,7 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
 
     private static final String CLEAN_NATS_STREAMS = "cleanNatsStreamsTask";
     private static final String FUNCTION_DEPLOYMENTS = "functionDeploymentsTask";
+    private static final String DEPLOYMENT_SHARD_BACKFILL = "deploymentShardBackfillTask";
 
     private static final String MESG_BEGIN_TASK = "Begin task: '{}'";
     private static final String MESG_END_TASK = "End task: '{}'";
@@ -52,7 +54,11 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
 
     private final FunctionDeploymentsTask functionDeploymentsTask;
     private final CleanNatsStreamsTask cleanNatsStreamsTask;
+    private final DeploymentShardBackfillTask deploymentShardBackfillTask;
     private final FunctionDeploymentsTaskProperties functionDeploymentsTaskProperties;
+
+    @Value("${nvcf.scheduler.deployment-shard-backfill.enabled:true}")
+    private boolean deploymentShardBackfillEnabled = true;
 
     @Override
     public void onApplicationEvent(@Nonnull ApplicationReadyEvent event) {
@@ -106,5 +112,19 @@ public class ScheduledTaskService implements ApplicationListener<ApplicationRead
         log.debug(MESG_BEGIN_TASK, CLEAN_NATS_STREAMS);
         cleanNatsStreamsTask.run(Duration.ofMinutes(15));
         log.debug(MESG_END_TASK, CLEAN_NATS_STREAMS);
+    }
+
+    // Keep scanning until disabled after rollout: older replicas can still write missing shards.
+    @SchedulerLock(name = DEPLOYMENT_SHARD_BACKFILL, lockAtMostFor = "PT55M")
+    @Scheduled(fixedDelayString = "${nvcf.scheduler.deployment-shard-backfill.fixed-delay:PT1H}")
+    void backfillDeploymentShards() throws InterruptedException {
+        initialised.await();
+        LockAssert.assertLocked();
+        if (!deploymentShardBackfillEnabled) {
+            return;
+        }
+        log.debug(MESG_BEGIN_TASK, DEPLOYMENT_SHARD_BACKFILL);
+        deploymentShardBackfillTask.run();
+        log.debug(MESG_END_TASK, DEPLOYMENT_SHARD_BACKFILL);
     }
 }
