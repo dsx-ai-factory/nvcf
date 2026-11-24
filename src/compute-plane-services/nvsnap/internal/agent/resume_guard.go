@@ -89,10 +89,34 @@ type memberBaseline struct {
 
 func baselineOf(p *corev1.Pod) memberBaseline {
 	b := memberBaseline{ns: p.Namespace, name: p.Name, uid: p.UID, restarts: map[string]int32{}}
-	for i := range p.Status.ContainerStatuses {
-		b.restarts[p.Status.ContainerStatuses[i].Name] = p.Status.ContainerStatuses[i].RestartCount
+	for _, c := range watchedStatuses(p) {
+		b.restarts[c.Name] = c.RestartCount
 	}
 	return b
+}
+
+// watchedStatuses are the statuses of the containers that run as long as
+// the pod: its containers and its restartable init containers (sidecars,
+// restartPolicy Always), which the kubelet restarts on their own. A
+// one-shot init container has completed before the pod ran, and is left
+// out.
+func watchedStatuses(p *corev1.Pod) []corev1.ContainerStatus {
+	st := slices.Clone(p.Status.ContainerStatuses)
+	for i := range p.Status.InitContainerStatuses {
+		if s := &p.Status.InitContainerStatuses[i]; restartableInit(p, s.Name) {
+			st = append(st, *s)
+		}
+	}
+	return st
+}
+
+func restartableInit(p *corev1.Pod, name string) bool {
+	for i := range p.Spec.InitContainers {
+		if c := &p.Spec.InitContainers[i]; c.Name == name {
+			return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+		}
+	}
+	return false
 }
 
 // memberState reads one member's pod: fatal, when it ended or was
@@ -109,8 +133,9 @@ func memberState(ctx context.Context, cs kubernetes.Interface, b memberBaseline)
 	case p.DeletionTimestamp != nil:
 		return "the pod is being deleted", false, ""
 	}
-	for i := range p.Status.ContainerStatuses {
-		c := &p.Status.ContainerStatuses[i]
+	st := watchedStatuses(p)
+	for i := range st {
+		c := &st[i]
 		if n, ok := b.restarts[c.Name]; ok && c.RestartCount > n {
 			return fmt.Sprintf("container %s restarted%s", c.Name, lastTermination(c.LastTerminationState.Terminated)), false, ""
 		}

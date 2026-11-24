@@ -212,6 +212,34 @@ func TestWatchMembersAfterResume_RestartAfterReady(t *testing.T) {
 	}
 }
 
+// withInit adds a one-shot init container that completed and a sidecar
+// (restartable init container) restarted sidecarRestarts times.
+func withInit(p *corev1.Pod, sidecarRestarts int32) *corev1.Pod {
+	always := corev1.ContainerRestartPolicyAlways
+	p.Spec.InitContainers = []corev1.Container{{Name: "setup"}, {Name: "proxy", RestartPolicy: &always}}
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{Name: "setup", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Completed"}}},
+		{Name: "proxy", RestartCount: sidecarRestarts, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+	}
+	return p
+}
+
+// A sidecar (restartable init container) that restarts during the watch
+// fails it as a container would; a one-shot init container that completed
+// before the capture does not.
+func TestWatchMembersAfterResume_Sidecars(t *testing.T) {
+	a := withInit(memberPod("a", true, 0), 0)
+	cs := fake.NewClientset(withInit(memberPod("a", true, 0), 0))
+	if err := watchMembersAfterResume(context.Background(), cs, []memberBaseline{baselineOf(a)}, fastWatch); err != nil {
+		t.Fatalf("a completed init container failed the watch: %v", err)
+	}
+	cs = fake.NewClientset(withInit(memberPod("a", true, 0), 1))
+	err := watchMembersAfterResume(context.Background(), cs, []memberBaseline{baselineOf(a)}, fastWatch)
+	if !errors.Is(err, errResumeStalled) || !strings.Contains(err.Error(), "container proxy restarted") {
+		t.Fatalf("a sidecar restarted after the resume: %v, want a stall naming it", err)
+	}
+}
+
 // groupLeaveRunningFixture runs a leave-running group checkpoint of two
 // pods against a fake peer agent whose members succeed at once; onCapture
 // runs as each member's checkpoint arrives.
