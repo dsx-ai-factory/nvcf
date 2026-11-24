@@ -34,6 +34,7 @@ import (
 	"github.com/samber/lo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	grpcCodes "google.golang.org/grpc/codes"
@@ -298,7 +299,7 @@ func (f *FunctionInvoker) startNewSession(ctx context.Context, conn net.Conn, re
 	err = f.publishDispatch(ctx, metrics.NatsSendWorkItem, publishTimeout, func(publishCtx context.Context) error {
 		_, err := f.dispatchJS.PublishMsg(publishCtx, &nats.Msg{
 			Subject: subject,
-			Header:  otelHeaders(ctx),
+			Header:  otelHeaders(publishCtx),
 			Data:    marshalledInvokeFunctionRequest,
 		})
 		return err
@@ -381,21 +382,15 @@ func (f *FunctionInvoker) tryRegionForLLS(ctx context.Context, region string, re
 	// to account for multiple retries within one client request. a nats request may have been
 	// received by a worker but then dropped which would cause a non-shortened-timeout request to
 	// continue waiting for a reply until the client eventually leaves rather than retrying.
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	if err := f.waitDispatchConnected(ctx, metrics.NatsSendDispatch); err != nil {
-		return err
-	}
 	subject := llsRequestSubject(region, functionVersion.FunctionVersionId, requestId)
-	_, err := f.conns.Dispatch.RequestMsgWithContext(ctx, &nats.Msg{
-		Subject: subject,
-		Header:  otelHeaders(ctx),
-		Data:    marshalledInvokeFunctionRequest,
+	return f.publishDispatch(ctx, metrics.NatsSendDispatch, 3*time.Second, func(requestCtx context.Context) error {
+		_, err := f.conns.Dispatch.RequestMsgWithContext(requestCtx, &nats.Msg{
+			Subject: subject,
+			Header:  otelHeaders(requestCtx),
+			Data:    marshalledInvokeFunctionRequest,
+		})
+		return err
 	})
-	recordPublishRejection(metrics.NatsSendDispatch, err)
-
-	return err
 }
 
 func (f *FunctionInvoker) joinExistingSession(ctx context.Context, requestId uuid.UUID, proxyAuthResponse *pb.ProxyAuthResponse, workerAuthToken string) error {
@@ -404,10 +399,10 @@ func (f *FunctionInvoker) joinExistingSession(ctx context.Context, requestId uui
 		return err
 	}
 	subject := reconnectSubject(requestId)
-	err = f.publishDispatch(ctx, metrics.NatsSendSessionJoin, publishTimeout, func(context.Context) error {
+	err = f.publishDispatch(ctx, metrics.NatsSendSessionJoin, publishTimeout, func(publishCtx context.Context) error {
 		return f.conns.Dispatch.PublishMsg(&nats.Msg{
 			Subject: subject,
-			Header:  otelHeaders(ctx),
+			Header:  otelHeaders(publishCtx),
 			Data:    marshalledInvokeFunctionRequest,
 		})
 	})
@@ -423,8 +418,8 @@ func (f *FunctionInvoker) joinExistingSession(ctx context.Context, requestId uui
 // publish already waited for its ack.
 const publishTimeout = 5 * time.Second
 
-// publishDispatch sends a work item or session join on the dispatch connection
-// within timeout. If nats.go rejects an attempt with
+// publishDispatch sends an LLS dispatch, work item or session join on the
+// dispatch connection within timeout, in one span. If nats.go rejects an attempt with
 // ErrReconnectBufExceeded because the connection is reconnecting, it pauses,
 // waits for the connection and tries again, so a brief outage does not fail the
 // send. Every attempt shares the one deadline.
@@ -433,13 +428,27 @@ const publishTimeout = 5 * time.Second
 // of the message's bytes, so retrying cannot also deliver the rejected attempt.
 // Other errors, such as a missing ack, can follow a send that reached NATS and
 // are returned as they are.
-func (f *FunctionInvoker) publishDispatch(ctx context.Context, send string, timeout time.Duration, publish func(context.Context) error) error {
+func (f *FunctionInvoker) publishDispatch(ctx context.Context, send string, timeout time.Duration, publish func(context.Context) error) (err error) {
+	ctx, span := otel.GetTracerProvider().Tracer("proxy-tracer").Start(ctx, "grpc-proxy.nats_send",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(attribute.String("nats.send", send)))
+	attempts := 0
+	defer func() {
+		span.SetAttributes(attribute.Int("nats.send.attempts", attempts))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "")
+			span.SetAttributes(attribute.Bool("error", true))
+		}
+		span.End()
+	}()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
 		if err := f.waitDispatchConnected(ctx, send); err != nil {
 			return err
 		}
+		attempts++
 		err := publish(ctx)
 		recordPublishRejection(send, err)
 		if !errors.Is(err, nats.ErrReconnectBufExceeded) {
@@ -473,9 +482,11 @@ func (f *FunctionInvoker) waitDispatchConnected(ctx context.Context, send string
 	return err
 }
 
-// recordPublishRejection counts an attempt that nats.go rejected because the
-// dispatch connection was reconnecting or closed, including one a later retry
-// sends. Other errors, such as no
+// recordPublishRejection counts an attempt that failed on the dispatch
+// connection's state. ErrReconnectBufExceeded is a rejection before any bytes
+// were sent, counted even when a later retry sends the message.
+// ErrConnectionClosed can come from the publish or from the wait for a reply or
+// ack, so NATS may have received that attempt. Other errors, such as no
 // responders or a missing ack, are not about the connection and are not
 // counted.
 func recordPublishRejection(send string, err error) {

@@ -446,12 +446,15 @@ func TestConnStateFollowsTheConnection(t *testing.T) {
 	gauge := metrics.NatsConnected.WithLabelValues(t.Name())
 	assert.Equal(t, 1.0, testutil.ToFloat64(gauge))
 
-	require.Eventually(t, func() bool { return !state.Connected() }, 5*time.Second, time.Millisecond)
+	// setConnected stores the state before it sets the gauge, so wait for both.
+	require.Eventually(t, func() bool {
+		return !state.Connected() && testutil.ToFloat64(gauge) == 0
+	}, 5*time.Second, time.Millisecond)
 	assert.False(t, state.Closed())
-	assert.Equal(t, 0.0, testutil.ToFloat64(gauge))
 
-	require.Eventually(t, state.Connected, 5*time.Second, time.Millisecond)
-	assert.Equal(t, 1.0, testutil.ToFloat64(gauge))
+	require.Eventually(t, func() bool {
+		return state.Connected() && testutil.ToFloat64(gauge) == 1
+	}, 5*time.Second, time.Millisecond)
 
 	nc.Close()
 	require.Eventually(t, state.Closed, 5*time.Second, time.Millisecond)
@@ -577,14 +580,26 @@ func TestConnStateDoesNotWaitOnTheConnectionLock(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	assert.False(t, state.Connected())
-	assert.False(t, state.Closed())
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	assert.ErrorIs(t, waitConnected(ctx, state), context.DeadlineExceeded)
-	assert.Less(t, time.Since(start), time.Second)
+	// Run in a goroutine so a check that blocks on the lock fails the test
+	// here instead of hanging it.
+	type stateReads struct {
+		connected, closed bool
+		waitErr           error
+	}
+	read := make(chan stateReads, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		read <- stateReads{state.Connected(), state.Closed(), waitConnected(ctx, state)}
+	}()
+	select {
+	case r := <-read:
+		assert.False(t, r.connected)
+		assert.False(t, r.closed)
+		assert.ErrorIs(t, r.waitErr, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("reading the connection state waited on the connection's lock")
+	}
 
 	sampling := make(chan struct{})
 	go func() {
@@ -815,7 +830,7 @@ func TestSendsRacingADisconnectAreNotSentAfterTheirDeadline(t *testing.T) {
 	_, _, _, err = f.startNewSession(shortDeadline(), nil, requestId, auth, "token", version)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.ErrorIs(t, f.joinExistingSession(shortDeadline(), requestId, auth, "token"), context.DeadlineExceeded)
-	assert.ErrorIs(t, f.tryRegionForLLS(context.Background(), "default", requestId, version, nil), nats.ErrReconnectBufExceeded)
+	assert.ErrorIs(t, f.tryRegionForLLS(shortDeadline(), "default", requestId, version, nil), context.DeadlineExceeded)
 	for _, send := range metrics.NatsSends {
 		assert.Greater(t, testutil.ToFloat64(rejectedAttempts(send)), before[send], send)
 	}
@@ -827,8 +842,8 @@ func TestSendsRacingADisconnectAreNotSentAfterTheirDeadline(t *testing.T) {
 	assert.NotContains(t, published, llsRequestSubject("default", version.FunctionVersionId, requestId))
 }
 
-// The same race, but NATS is back before the deadline. A work item or session
-// join rejected by nats.go waits and tries again, so a brief outage does not
+// The same race, but NATS is back before the deadline. A send rejected by
+// nats.go waits and tries again, so a brief outage does not
 // fail it, and it reaches the server exactly once.
 func TestSendsRacingADisconnectAreRetriedWithinTheirDeadline(t *testing.T) {
 	server, err := test.NewFakeNatsServer()
@@ -841,7 +856,8 @@ func TestSendsRacingADisconnectAreRetriedWithinTheirDeadline(t *testing.T) {
 	auth := &pb.ProxyAuthResponse{ClientNcaId: "nca"}
 	workItem := rejectedAttempts(metrics.NatsSendWorkItem)
 	sessionJoin := rejectedAttempts(metrics.NatsSendSessionJoin)
-	workItemBefore, sessionJoinBefore := testutil.ToFloat64(workItem), testutil.ToFloat64(sessionJoin)
+	dispatch := rejectedAttempts(metrics.NatsSendDispatch)
+	workItemBefore, sessionJoinBefore, dispatchBefore := testutil.ToFloat64(workItem), testutil.ToFloat64(sessionJoin), testutil.ToFloat64(dispatch)
 
 	endOutage := outage(t, server, conns)
 	conns.DispatchState.setConnected(true)
@@ -855,17 +871,25 @@ func TestSendsRacingADisconnectAreRetriedWithinTheirDeadline(t *testing.T) {
 		workItemErr <- err
 	}()
 	go func() { sessionJoinErr <- f.joinExistingSession(ctx, requestId, auth, "token") }()
+	// One LLS attempt has 3 s, so its retry must succeed within that attempt
+	// rather than fail into the next region's backoff.
+	dispatchErr := make(chan error, 1)
+	go func() { dispatchErr <- f.tryRegionForLLS(ctx, "default", requestId, version, []byte("request")) }()
 	require.Eventually(t, func() bool {
-		return testutil.ToFloat64(workItem) > workItemBefore && testutil.ToFloat64(sessionJoin) > sessionJoinBefore
-	}, 5*time.Second, time.Millisecond, "both sends should be rejected while NATS is down")
+		return testutil.ToFloat64(workItem) > workItemBefore &&
+			testutil.ToFloat64(sessionJoin) > sessionJoinBefore &&
+			testutil.ToFloat64(dispatch) > dispatchBefore
+	}, 5*time.Second, time.Millisecond, "every send should be rejected while NATS is down")
 	endOutage()
 
 	require.NoError(t, <-workItemErr)
 	require.NoError(t, <-sessionJoinErr)
+	require.NoError(t, <-dispatchErr)
 	require.NoError(t, conns.Dispatch.Flush())
 	published := server.Published()
 	assert.Equal(t, 1, countOf(published, f.requestStreamSubject(version.FunctionVersionId, requestId)))
 	assert.Equal(t, 1, countOf(published, reconnectSubject(requestId)))
+	assert.Equal(t, 1, countOf(published, llsRequestSubject("default", version.FunctionVersionId, requestId)))
 }
 
 // A work item whose ack never comes may already be with NATS, so it must not
@@ -1221,8 +1245,8 @@ func TestSendBlockedByAReconnectGoesOutAfterItsCallerLeft(t *testing.T) {
 
 // BenchmarkDispatchRequest compares nats.go's request styles on a connection
 // without a reconnect buffer, as the dispatch connection is. It runs against
-// the in-process fake server, whose parsing and recording count toward the
-// time and allocations, so it measures the client plus the fake server, not
+// the in-process fake server, whose parsing counts toward the time and
+// allocations, so it measures the client plus the fake server, not
 // the client alone, and not latency through a real NATS cluster.
 func BenchmarkDispatchRequest(b *testing.B) {
 	payload := make([]byte, 512)
@@ -1235,6 +1259,7 @@ func BenchmarkDispatchRequest(b *testing.B) {
 				server, err := test.NewFakeNatsServer()
 				require.NoError(b, err)
 				b.Cleanup(func() { _ = server.Close() })
+				server.DiscardPublished()
 				options := []nats.Option{nats.Token(test.FakeNatsToken), nats.ReconnectBufSize(-1)}
 				if style.old {
 					options = append(options, nats.UseOldRequestStyle())

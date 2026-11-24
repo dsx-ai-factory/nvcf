@@ -119,13 +119,15 @@ var (
 		Name:      "connected",
 		Help:      "1 while the nats connection is connected, 0 while it is reconnecting or closed, by connection.",
 	}, []string{"connection"})
-	// NatsSendFailures counts dispatch-connection sends that did not go out
-	// because the connection was down: in the wait before the send, or rejected
-	// by nats.go at the send because it was reconnecting or closed.
+	// NatsSendFailures counts dispatch-connection sends that failed on the
+	// connection's state: in the wait before the send, or at the send. At the
+	// send, reconnecting means nats.go rejected the attempt before sending any
+	// bytes; closed means the connection closed during the attempt, which NATS
+	// may have received.
 	NatsSendFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: NatsNamespace,
 		Name:      "send_failures_total",
-		Help:      "dispatch connection send attempts that nats rejected, and sends that gave up waiting for the connection, by send, stage and reason. A rejected attempt is counted even when a retry later sends it",
+		Help:      "dispatch connection sends that gave up waiting for the connection (stage wait), and send attempts that failed because the connection was reconnecting or closed (stage publish), by send, stage and reason. A reconnecting attempt sent nothing and is counted even when a retry later sends it; a closed attempt may have reached nats",
 	}, []string{"send", "stage", "reason"})
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
@@ -158,7 +160,7 @@ var (
 	_ = promauto.NewGaugeFunc(prometheus.GaugeOpts{
 		Namespace: NatsNamespace,
 		Name:      "reconnects",
-		Help:      "The number of reconnect attempts over this pod's nats connections.",
+		Help:      "The number of times this pod's nats connections reopened a network connection while reconnecting, counted before the handshake completes. Refused dials are not counted.",
 	}, func() float64 {
 		return float64(loadNatsStats().Reconnects)
 	})
@@ -619,14 +621,21 @@ func init() {
 // until it returns. The values read 0 until the first sample.
 const natsStatsSampleInterval = 5 * time.Second
 
-var (
-	statsGeneration atomic.Pointer[[]*nats.Conn]
-	natsStats       atomic.Pointer[nats.Statistics]
-)
+// statsGeneration is one SetNatsStatsConnections call: its connections and
+// its latest sample. A sampler writes only to its own generation and scrapes
+// read only the current one, so a retired sampler cannot bring back its totals.
+type statsGeneration struct {
+	conns  []*nats.Conn
+	sample atomic.Pointer[nats.Statistics]
+}
+
+var currentStats atomic.Pointer[statsGeneration]
 
 func loadNatsStats() nats.Statistics {
-	if stats := natsStats.Load(); stats != nil {
-		return *stats
+	if generation := currentStats.Load(); generation != nil {
+		if stats := generation.sample.Load(); stats != nil {
+			return *stats
+		}
 	}
 	return nats.Statistics{}
 }
@@ -636,9 +645,8 @@ func loadNatsStats() nats.Statistics {
 // takes a connection's lock itself, so it returns at once even while a
 // reconnect holds one.
 func SetNatsStatsConnections(conns ...*nats.Conn) {
-	generation := &conns
-	statsGeneration.Store(generation)
-	natsStats.Store(nil)
+	generation := &statsGeneration{conns: conns}
+	currentStats.Store(generation)
 	if len(conns) == 0 {
 		return
 	}
@@ -646,7 +654,7 @@ func SetNatsStatsConnections(conns ...*nats.Conn) {
 		ticker := time.NewTicker(natsStatsSampleInterval)
 		defer ticker.Stop()
 		for {
-			if statsGeneration.Load() != generation || allClosed(conns) {
+			if currentStats.Load() != generation || allClosed(conns) {
 				return
 			}
 			sampleNatsStats(generation)
@@ -664,9 +672,9 @@ func allClosed(conns []*nats.Conn) bool {
 	return true
 }
 
-func sampleNatsStats(generation *[]*nats.Conn) {
+func sampleNatsStats(generation *statsGeneration) {
 	var sum nats.Statistics
-	for _, nc := range *generation {
+	for _, nc := range generation.conns {
 		stats := nc.Stats()
 		sum.InMsgs += stats.InMsgs
 		sum.OutMsgs += stats.OutMsgs
@@ -674,9 +682,7 @@ func sampleNatsStats(generation *[]*nats.Conn) {
 		sum.OutBytes += stats.OutBytes
 		sum.Reconnects += stats.Reconnects
 	}
-	if statsGeneration.Load() == generation {
-		natsStats.Store(&sum)
-	}
+	generation.sample.Store(&sum)
 }
 
 func IncrFunctionRequest(functionID, functionVersionID, ncaID string) {

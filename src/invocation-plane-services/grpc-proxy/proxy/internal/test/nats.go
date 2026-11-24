@@ -62,6 +62,7 @@ type FakeNatsServer struct {
 	closed    bool
 	refusing  bool
 	published []string
+	discard   bool
 	withheld  map[string]bool
 }
 
@@ -149,10 +150,20 @@ func (s *FakeNatsServer) Published() []string {
 	return append([]string(nil), s.published...)
 }
 
+// DiscardPublished stops recording publishes, for benchmarks that never read
+// them.
+func (s *FakeNatsServer) DiscardPublished() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.discard = true
+}
+
 func (s *FakeNatsServer) recordPublish(subject string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.published = append(s.published, subject)
+	if !s.discard {
+		s.published = append(s.published, subject)
+	}
 }
 
 // Close stops listening and drops every open client connection, so a client
