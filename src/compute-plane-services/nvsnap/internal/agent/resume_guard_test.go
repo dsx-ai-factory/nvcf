@@ -325,6 +325,82 @@ func TestGroupCheckpoint_LeaveRunningWatchesThePods(t *testing.T) {
 	}
 }
 
+// Rolling upgrade: this driver over members on the released agent. They
+// serve the released fabric state (recorded: no holdsOpen, no resumed) and
+// ignore gpushareSyncOpen, so they resume at once. The driver must not wait
+// for them, send them a verdict, or fail the capture as stalled.
+func TestGroupCheckpoint_ReleasedMembersAreNotWaitedFor(t *testing.T) {
+	old := postResumeWatch
+	postResumeWatch = resumeWatchOpts{ReadyWait: 300 * time.Millisecond, Steady: 100 * time.Millisecond, Poll: 20 * time.Millisecond}
+	defer func() { postResumeWatch = old }()
+	state := compatFixture(t, "nvsnap-v0.3.2", "member-fabric-state.json")
+	var mu sync.Mutex
+	var verdicts []string
+	reads := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/gpushare/fabric/"), "/")
+		switch {
+		case r.URL.Path == "/v1/checkpoint":
+			// The member's capture returns only once the driver has read
+			// its state a few times: the driver sees it running.
+			var req CheckpointRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				mu.Lock()
+				n := reads[req.PodName]
+				mu.Unlock()
+				if n >= 3 {
+					break
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"checkpointId":"c"}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/gpushare/fabric/") && r.Method == http.MethodGet && len(parts) == 3:
+			mu.Lock()
+			reads[parts[2]]++
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(state)
+		case strings.HasPrefix(r.URL.Path, "/v1/gpushare/fabric/") && len(parts) == 4 && parts[3] == "open":
+			mu.Lock()
+			verdicts = append(verdicts, parts[2]+" "+r.URL.Query().Get("verdict"))
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: "InternalIP", Address: u.Hostname()}}}}
+	a, b := memberPod("a", true, 0), memberPod("b", true, 0)
+	a.Spec.NodeName, b.Spec.NodeName = "n1", "n1"
+	ag := &Agent{kubeClient: fake.NewClientset(node, a, b), config: Config{ListenAddr: ":" + u.Port()}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err = ag.groupCheckpoint(ctx, GroupCheckpointRequest{LeaveRunning: true,
+		Members: []CheckpointRequest{{Namespace: "ns", PodName: "a"}, {Namespace: "ns", PodName: "b"}}}, guardLog())
+	if err != nil {
+		t.Fatalf("released members: %v", err)
+	}
+	if took := time.Since(start); took > 20*time.Second {
+		t.Errorf("the driver waited %s for released members", took)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reads["a"] < 3 || reads["b"] < 3 {
+		t.Errorf("the driver read the members' state %v times; want it seen while they ran", reads)
+	}
+	if len(verdicts) != 0 {
+		t.Errorf("released members got open verdicts %v", verdicts)
+	}
+}
+
 // groupOpenFixture runs a leave-running group checkpoint of pods a and b
 // against a fake peer agent that plays both members' tools on the fabric
 // routes: each holds its launches and reports resumed as its checkpoint
