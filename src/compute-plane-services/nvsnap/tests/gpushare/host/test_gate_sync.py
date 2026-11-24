@@ -81,23 +81,20 @@ static int probe_lock(pthread_mutex_t *m);
 #define pthread_mutex_lock(m) probe_lock(m)
 /* FAIL_PIDFD: pidfd_open fails (EMFILE), so no lease can be taken. */
 #include <errno.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
-static long probe_syscall(long nr, ...)
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+static int probe_pidfd_open(pid_t pid)
 {
-    va_list ap;
-    long a[6];
-    va_start(ap, nr);
-    for (int i = 0; i < 6; i++) a[i] = va_arg(ap, long);
-    va_end(ap);
-    if (nr == SYS_pidfd_open && getenv("FAIL_PIDFD")) { errno = EMFILE; return -1; }
-    return syscall(nr, a[0], a[1], a[2], a[3], a[4], a[5]);
+    if (getenv("FAIL_PIDFD")) { errno = EMFILE; return -1; }
+    return (int)syscall(SYS_pidfd_open, pid, 0);
 }
-#define syscall probe_syscall
+#define GPUSHARE_PIDFD_OPEN(pid) probe_pidfd_open(pid)
 #include "gpushare.c"
-#undef syscall
 #undef pthread_mutex_lock
 #include <sys/wait.h>
 
@@ -194,6 +191,30 @@ int main(int argc, char **argv)
         do_hold(rep, sizeof(rep));
         do_quiesce(rep, sizeof(rep));
         printf("held=%s:%d:%d\n", rep[0] == 'e' ? "busy" : "ok", lgate.closed, mgate.closed);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "leasenotrelease")) {
+        /* A child sends "hold", then a command that only starts like
+         * "release" (unknown here), then exits: its lease must stand. */
+        start_ctl();
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return 3;
+        pid_t c = fork();
+        if (!c) {
+            char b, r2[256] = "";
+            int ok = request(getppid(), "hold", -1, rep, sizeof(rep), NULL) == 0 && !strcmp(rep, "ok held");
+            request(getppid(), "release-status", -1, r2, sizeof(r2), NULL);
+            ok = ok && !strcmp(r2, "err unknown command");
+            if (write(up[1], ok ? "1" : "0", 1) != 1 || read(down[0], &b, 1) != 1) _exit(1);
+            _exit(0);
+        }
+        char b = 0;
+        if (read(up[0], &b, 1) != 1) return 4;
+        printf("hold=%c closed_while_alive=%d\n", b, closed(&lgate));
+        if (write(down[1], "x", 1) != 1) return 5;
+        waitpid(c, NULL, 0);
+        for (int i = 0; i < 300 && closed(&lgate); i++) usleep(10000);
+        printf("closed_after_exit=%d\n", closed(&lgate));
         return 0;
     }
     if (argc > 1 && (!strcmp(argv[1], "lease") || !strcmp(argv[1], "leaseopen"))) {
@@ -487,6 +508,11 @@ class GateSync(unittest.TestCase):
         self.assertEqual(out["resume"], "1", out)
         self.assertEqual(out["closed_while_alive"], "1", "the held resume let the launches through")
         self.assertEqual(out["closed_after_exit"], "0", "the tool that sent the held resume exited: launches stayed held")
+
+    def test_command_that_is_not_release_keeps_the_lease(self):
+        out = self.probe("leasenotrelease")
+        self.assertEqual((out["hold"], out["closed_while_alive"]), ("1", "1"), out)
+        self.assertEqual(out["closed_after_exit"], "0", "an unknown command starting with release ended the lease")
 
     def test_no_lease_never_leaves_launches_held(self):
         # A held resume that cannot take its lease resumes without the hold,

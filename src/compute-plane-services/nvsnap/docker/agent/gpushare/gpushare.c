@@ -2332,6 +2332,9 @@ static void do_ipcget(unsigned long long base, int s)
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434  /* the same on every architecture */
 #endif
+#ifndef GPUSHARE_PIDFD_OPEN  /* the host tests name their own */
+#define GPUSHARE_PIDFD_OPEN(pid) ((int)syscall(SYS_pidfd_open, (pid), 0))
+#endif
 static int lease_fd = -1;
 static pid_t lease_pid;
 /* The holder exited while the state lock was busy: the gates are reopened
@@ -2367,7 +2370,7 @@ static int lease_take(int s, char *why, size_t n)
     } else {
         lease_end();
         expiry_pid = 0;
-        fd = (int)syscall(SYS_pidfd_open, c.pid, 0);
+        fd = GPUSHARE_PIDFD_OPEN(c.pid);
         gone = fd < 0 && errno == ESRCH;  /* the sender is already gone: as if it exited holding */
         if (fd < 0 && !gone) snprintf(why, n, "pidfd_open: %s", strerror(errno));
     }
@@ -2894,7 +2897,8 @@ static void serve(int s)
      * (a busy state lock), the holder's exit still reopens them. "hold",
      * "lease" and "resume hold lease" took their lease above, before
      * answering. */
-    if ((!strncmp(buf, "release", 7) && strcmp(rep, "err busy (state lock)") && strcmp(rep, "err not quiesced")) ||
+    if (((!strcmp(buf, "release") || !strncmp(buf, "release ", 8)) && strcmp(rep, "err busy (state lock)") &&
+         strcmp(rep, "err not quiesced")) ||
              (!strncmp(buf, "resume", 6) && strcmp(buf, "resume hold lease") && !strncmp(rep, "ok", 2)) ||
              (!strcmp(buf, "open") && !strcmp(rep, "ok opened"))) {
         lease_end();
