@@ -456,6 +456,15 @@ PROBE = r"""
  * restore and resume before it returns that the old descriptor is ready. */
 static int probe_poll(struct pollfd *p, nfds_t n, int t);
 #define poll(p, n, t) probe_poll(p, n, t)
+/* openrace: nvsnap_ibv_open stops after its check of the doomed state
+ * (NVSNAP_IBV_OPEN_HOOK) until the probe lets it go. */
+static int open_pause, open_paused, open_go;
+#define NVSNAP_IBV_OPEN_HOOK() do { \
+        if (__atomic_load_n(&open_pause, __ATOMIC_SEQ_CST)) { \
+            __atomic_store_n(&open_paused, 1, __ATOMIC_SEQ_CST); \
+            while (!__atomic_load_n(&open_go, __ATOMIC_SEQ_CST)) usleep(1000); \
+        } \
+    } while (0)
 /* Set once stop_calls is in its wait for verbs calls in progress. */
 static int in_drain_wait;
 #define NVSNAP_IBV_WAITING_HOOK() __atomic_store_n(&in_drain_wait, 1, __ATOMIC_SEQ_CST)
@@ -568,6 +577,7 @@ static void *query_port(void *a)
 static void *alloc_pd(void *a) { (void)a; return ibv_alloc_pd(ctx); }
 static int sus_rc;
 static void *suspend_t(void *a) { (void)a; sus_rc = nvsnap_ibv_suspend(rep, sizeof(rep)); return NULL; }
+static void *open_t(void *a) { (void)a; nvsnap_ibv_open(); return NULL; }
 static int fence_rc;
 static void *fence_t(void *a) { (void)a; __atomic_store_n(&fence_rc, nvsnap_ibv_fence(rep, sizeof(rep)), __ATOMIC_SEQ_CST); return NULL; }
 static struct ibv_async_event ev;
@@ -796,7 +806,7 @@ int main(int argc, char **argv)
         /* After a release, opening does not let calls reach destroyed objects. */
         nvsnap_ibv_suspend(rep, sizeof(rep));
         nvsnap_ibv_open();
-        printf("held_after_release=%d\n", __atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
+        printf("held_after_release=%d\n", !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
         return 0;
     }
     if (!strcmp(c, "sge5")) {
@@ -808,6 +818,26 @@ int main(int argc, char **argv)
         printf("fence=%d\n", nvsnap_ibv_fence(rep, sizeof(rep)));
         return 0;
     }
+    if (!strcmp(c, "openrace")) {
+        /* An open that has checked the doomed state, and not yet let the
+         * calls go, when the release (state lock busy) dooms the process:
+         * the calls must stay held for good, and a send must not go. */
+        up(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        __atomic_store_n(&open_pause, 1, __ATOMIC_SEQ_CST);
+        pthread_create(&t, NULL, open_t, NULL);
+        for (int i = 0; i < 5000 && !__atomic_load_n(&open_paused, __ATOMIC_SEQ_CST); i++) usleep(1000);
+        int paused = __atomic_load_n(&open_paused, __ATOMIC_SEQ_CST);
+        int (*doom)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "nvsnap_ibv_doom_if_fenced");
+        int d = doom ? doom() : -1;
+        __atomic_store_n(&open_go, 1, __ATOMIC_SEQ_CST);
+        pthread_join(t, NULL);
+        pthread_create(&t2, NULL, send_t, NULL);
+        usleep(200000);  /* held: the send stays blocked */
+        printf("fence=%d paused=%d doom=%d doomed=%d held=%d sent=%d\n", f, paused, d, nvsnap_ibv_doomed(),
+               !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST), __atomic_load_n(&sent, __ATOMIC_SEQ_CST));
+        return 0;  /* a held send stays blocked */
+    }
     if (!strcmp(c, "doomiffenced") || !strcmp(c, "doomunfenced")) {
         /* gpushare's release could not run (its state lock busy): after a
          * fence NCCL's calls stay held for good; without one nothing
@@ -818,7 +848,7 @@ int main(int argc, char **argv)
         int d = doom ? doom() : -1;
         nvsnap_ibv_open();
         printf("fence=%d doom=%d doomed=%d held_after_open=%d\n", f, d, nvsnap_ibv_doomed(),
-               __atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
+               !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST));
         return 0;
     }
     if (!strcmp(c, "refusetimeout")) {
@@ -832,7 +862,7 @@ int main(int argc, char **argv)
         int before = __atomic_load_n(&gate_opens, __ATOMIC_SEQ_CST);
         int s = nvsnap_ibv_suspend(rep, sizeof(rep));
         printf("fence=%d suspend=%d opens=%d held=%d timeout=%d\n", f, s, __atomic_load_n(&gate_opens, __ATOMIC_SEQ_CST) - before,
-               __atomic_load_n(&suspended, __ATOMIC_SEQ_CST), strstr(rep, "did not return") != NULL);
+               !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST), strstr(rep, "did not return") != NULL);
         return 0;
     }
     if (!strcmp(c, "refusefenced") || !strcmp(c, "refuseunfenced")) {
@@ -844,9 +874,9 @@ int main(int argc, char **argv)
         int f = !strcmp(c, "refusefenced") ? nvsnap_ibv_fence(rep, sizeof(rep)) : 0;
         ((struct vqp *)qa)->failed = 1;
         int s = nvsnap_ibv_suspend(rep, sizeof(rep));
-        int after_refusal = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int after_refusal = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         nvsnap_ibv_open();
-        int after_open = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int after_open = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         pthread_create(&t, NULL, send_t, NULL);
         /* Open: the send goes out, so wait for it (no time decides it).
          * Held: it must stay blocked; give it 200 ms to show otherwise. */
@@ -1163,6 +1193,12 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["held_after_refusal"], out["held_after_open"], out["sent"]), ("1", "1", "0"),
                          "a rank whose peers may be releasing let NCCL post again: %s" % out)
         self.assertEqual(out["doomed"], "1", out)
+
+    def test_doom_while_an_open_is_deciding_still_wins(self):
+        out = self.probe("openrace")
+        self.assertEqual((out["fence"], out["paused"], out["doom"]), ("0", "1", "1"), out)
+        self.assertEqual((out["doomed"], out["held"], out["sent"]), ("1", "1", "0"),
+                         "an open decided before the doom let NCCL's calls go after it: %s" % out)
 
     def test_release_that_could_not_run_after_the_fence_keeps_nccl_held(self):
         out = self.probe("doomiffenced")

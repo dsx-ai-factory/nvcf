@@ -194,12 +194,16 @@ static void drop(void **arr, int *n, void *x)
 /* ── the data path gate ───────────────────────────────────────────────── */
 
 /* suspended: the real objects are gone (or going), or a fence holds them
- * until release; every call that uses a real object waits. Each such call
+ * until release; every call that uses a real object waits while it is not
+ * 0. It is one word of two bits, changed only atomically: G_HELD, and
+ * G_DOOM (held for good, see doom()), which reopen() never clears: a doom
+ * and an open racing each other always end held. Each such call
  * stays in (inflight) until its shadow is up to date, so a suspend that
  * has waited for inflight to reach 0 sees every object there is.
  * translated: the real keys and queue pair numbers differ from NCCL's.
  * released: the real objects are gone until a restore brings them back. */
 static int suspended, translated, inflight, released;
+enum { G_HELD = 1, G_DOOM = 2 };
 static pthread_mutex_t gmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gcv = PTHREAD_COND_INITIALIZER;
 
@@ -1040,10 +1044,15 @@ static int fence(char *reply, size_t n, int mark)
     return 0;
 }
 
+/* Let NCCL's calls go, unless they are held for good (G_DOOM): decided and
+ * done in one compare-and-swap, so a doom that comes at any point before
+ * it wins, and one that comes after holds the calls again. */
 static void reopen(void)
 {
     pthread_mutex_lock(&gmu);
-    __atomic_store_n(&suspended, 0, __ATOMIC_SEQ_CST);
+    int s = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+    while (s && !(s & G_DOOM) &&
+           !__atomic_compare_exchange_n(&suspended, &s, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
     pthread_cond_broadcast(&gcv);
     pthread_mutex_unlock(&gmu);
 }
@@ -1051,13 +1060,19 @@ static void reopen(void)
 /* Set by nvsnap_ibv_fence, cleared when NCCL's verbs open again. */
 static int fenced;
 
-/* Set for good when a release refuses after a fence that succeeded. Every
- * rank fenced, so the others may be destroying their queue pairs now, and
- * a rollback does not re-create this rank's (it released nothing): its
- * queue pairs would keep targeting peers that are gone. NCCL's verbs calls
- * then stay held, whatever asks to open them, and the process must be
- * replaced (gpushare refuses to let it run again: nvsnap_ibv_doomed). */
-static int doomed;
+/* Hold NCCL's calls for good (G_DOOM), when a release refuses after a
+ * fence that succeeded. Every rank fenced, so the others may be destroying
+ * their queue pairs now, and a rollback does not re-create this rank's (it
+ * released nothing): its queue pairs would keep targeting peers that are
+ * gone. NCCL's verbs calls then stay held, whatever asks to open them, and
+ * the process must be replaced (gpushare refuses to let it run again:
+ * nvsnap_ibv_doomed). Takes no lock. 1 the first time. */
+static int doom(void)
+{
+    return !(__atomic_fetch_or(&suspended, G_HELD | G_DOOM, __ATOMIC_SEQ_CST) & G_DOOM);
+}
+
+static int doomed(void) { return __atomic_load_n(&suspended, __ATOMIC_SEQ_CST) & G_DOOM; }
 
 /* A release refused: let NCCL's calls run again, unless it had been fenced. */
 static void release_refused(void)
@@ -1066,11 +1081,17 @@ static void release_refused(void)
         reopen();
         return;
     }
-    __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
-    if (!__atomic_exchange_n(&doomed, 1, __ATOMIC_SEQ_CST))
+    if (doom())
         logf_("release refused after the fence: NCCL's verbs calls stay held for good (its peers may be releasing); "
               "the process cannot run again");
 }
+
+/* Test hook: runs in nvsnap_ibv_open between its check of the doomed state
+ * and its decision to let NCCL's calls go (the host tests define it before
+ * including this file). Nothing in a build of the library. */
+#ifndef NVSNAP_IBV_OPEN_HOOK
+#define NVSNAP_IBV_OPEN_HOOK() do {} while (0)
+#endif
 
 /* Test hook: runs in each round of stop_calls' wait for calls in progress
  * (the host tests define it before including this file). Nothing in a
@@ -1087,7 +1108,7 @@ static int stop_calls(char *reply, size_t n)
         snprintf(reply, n, "err NCCL uses a verbs object this library cannot re-create (see the log)");
         return -1;
     }
-    __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_or(&suspended, G_HELD, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&omu);
     for (int i = 0; i < n_ctxs; i++) { uint64_t one = 1; ssize_t __attribute__((unused)) w = write(ctxs[i]->wake, &one, sizeof(one)); }
     pthread_mutex_unlock(&omu);
@@ -1136,7 +1157,7 @@ static int untracked(char *reply, size_t n)
  * process run again without a release calls nvsnap_ibv_open. */
 EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
 {
-    if (__atomic_load_n(&doomed, __ATOMIC_SEQ_CST)) {
+    if (doomed()) {
         snprintf(reply, n, "err a release refused after the fence: NCCL's verbs calls stay held");
         return -1;
     }
@@ -1145,7 +1166,7 @@ EXPORT int nvsnap_ibv_fence(char *reply, size_t n)
     pthread_mutex_lock(&omu);
     r = untracked(reply, n);
     if (r == 0) r = fence(reply, n, 1);
-    fenced = r == 0;
+    __atomic_store_n(&fenced, r == 0, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&omu);
     if (r < 0) reopen();
     return r;
@@ -1177,7 +1198,7 @@ EXPORT int nvsnap_ibv_suspend(char *reply, size_t n)
         release_refused();
         return -1;
     }
-    fenced = 0;
+    __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&released, 1, __ATOMIC_SEQ_CST);
     int bad = 0;
     for (int i = 0; i < n_qps; i++) if (R.destroy_qp(qps[i]->real)) bad++; else qps[i]->real = NULL;
@@ -1562,23 +1583,24 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
  * the real objects are gone: a call would use a destroyed one. */
 EXPORT void nvsnap_ibv_open(void)
 {
-    if (__atomic_load_n(&doomed, __ATOMIC_SEQ_CST)) {
+    if (doomed()) {
         static int said;
         if (!__atomic_exchange_n(&said, 1, __ATOMIC_SEQ_CST))
             logf_("open: a release refused after the fence: NCCL's verbs calls stay held");
         return;
     }
+    NVSNAP_IBV_OPEN_HOOK();
     pthread_mutex_lock(&omu);
     int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST);
-    if (!gone) fenced = 0;
+    if (!gone) __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&omu);
     if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
-    reopen();
+    reopen();  /* not if a doom came after the check above */
 }
 
 /* 1 once a release refused after a fence (see doomed): the process must
  * not run again. */
-EXPORT int nvsnap_ibv_doomed(void) { return __atomic_load_n(&doomed, __ATOMIC_SEQ_CST); }
+EXPORT int nvsnap_ibv_doomed(void) { return !!doomed(); }
 
 /* gpushare's "release" could not run at all (its state lock was busy)
  * after a fence: as a refused release, keep NCCL's calls held for good.
@@ -1586,8 +1608,7 @@ EXPORT int nvsnap_ibv_doomed(void) { return __atomic_load_n(&doomed, __ATOMIC_SE
 EXPORT int nvsnap_ibv_doom_if_fenced(void)
 {
     if (!__atomic_load_n(&fenced, __ATOMIC_SEQ_CST)) return 0;
-    __atomic_store_n(&suspended, 1, __ATOMIC_SEQ_CST);
-    if (!__atomic_exchange_n(&doomed, 1, __ATOMIC_SEQ_CST))
+    if (doom())
         logf_("release did not run after the fence: NCCL's verbs calls stay held for good; the process cannot run again");
     return 1;
 }
