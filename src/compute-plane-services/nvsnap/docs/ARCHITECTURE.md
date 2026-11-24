@@ -223,8 +223,12 @@ exception: a process that maps `libnvsnap_ibv.so`, the verbs library the
 webhook gives NCCL (`webhook.gpushareIBV` or `nvsnap.io/gpushare-ibv`),
 only warns. That library releases NCCL's RDMA state at `release` and
 creates it again at `load`. RDMA anything else holds (UCX, NIXL) cannot
-be told apart from the host, so the process's own `quiesce` refuses it
-before anything stops, and the workload runs on uncaptured.
+be told apart from the host, so the process's own `quiesce` refuses its
+open RDMA files (device files and verbs event files) and its mappings of
+other devices before anything stops, and the workload runs on
+uncaptured. A mapping of a device NCCL also has open, left without a file
+of its own, cannot be told from NCCL's and is not refused: the dump fails
+on it, and the capture rolls back.
 
 The full description, limits and validation are in
 [design/GPUSHARE.md](design/GPUSHARE.md); the sources are under

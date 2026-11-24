@@ -454,9 +454,12 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
 
 Every rank NCCL connects must be suspended and restored together, which the
 group checkpoint does. Not handled: a shared receive queue, an address
-handle, a completion channel, a queue pair other than reliable-connected, or
-a receive with more than four scatter entries. A process whose NCCL creates
-one refuses the suspend, and its workload runs on. So does a queue pair with
+handle, a queue pair other than reliable-connected, or a receive with more
+than four scatter entries. A process whose NCCL creates one refuses the
+suspend, and its workload runs on. A completion channel is refused earlier:
+`ibv_create_cq` with one fails with `EOPNOTSUPP` (NCCL polls its completion
+queues and asks for none), so a program that needs one fails where it
+creates the queue, at its start, not at a capture. So does a queue pair with
 a failed completion (which of its receives finished is unknown), and an
 async event of a queue pair or completion queue that NCCL does not
 acknowledge within 2 s (the provider cannot destroy the object before). Devices are matched by name (`mlx5_3`), so the restore node needs the

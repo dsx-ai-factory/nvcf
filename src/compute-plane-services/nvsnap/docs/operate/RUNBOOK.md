@@ -333,7 +333,9 @@ state"), and the configuration starts cold every time.
   `NCCL_DEBUG=INFO`) before it tries to load the library, so that line
   does not prove the load. To check the load, list the NCCL processes that
   have it mapped:
-  `kubectl exec <pod> -c <container> -- grep -l libnvsnap_ibv.so /proc/[0-9]*/maps`.
+  `kubectl exec <pod> -c <container> -- sh -c 'grep -l libnvsnap_ibv.so /proc/[0-9]*/maps'`
+  (the shell in the container expands the glob: unquoted, the local shell
+  would expand it to the local machine's processes).
   The capture preflight then reports those processes' RDMA devices as a
   warning ("… through libnvsnap_ibv.so"), not a block.
 - One workload out: annotate its pods `nvsnap.io/gpushare-ibv: "false"`, or
