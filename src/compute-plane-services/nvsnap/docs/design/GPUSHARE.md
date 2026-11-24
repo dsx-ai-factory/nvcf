@@ -263,7 +263,8 @@ the member's checkpoint request, set by a driver that runs this open
 phase). The suspend then runs as before, and so does `stop`:
 the holder leaves the processes stopped for CRIU and exits. After the dump,
 the agent runs `resume --fabric-map DIR --sync-open <ms>`. The tool loads,
-exchanges handles, remaps, and sends `resume hold`. It then thaws the
+exchanges handles, remaps, and sends `resume hold lease` (the launches
+held, with a lease on the tool). It then thaws the
 processes, writes `DIR/resumed` (`<token>`: its pid and round), and waits
 for `DIR/o`. The driver answers every member `<token> open` once all
 members that hold have reported resumed. The tool then sends `open` to
@@ -284,7 +285,9 @@ load before any remaps, so the markers normally come close together.
   report. No pod is deleted for this. The kernel-log check (`kmsg.go`) reads
   until after the open, so an Xid from an early launch is reported too.
 - The tool prints the same text when a process's library has no `resume
-  hold` (it opened at its resume), and when the resume goes through a
+  hold lease` (it got plain `resume`, and opened at its resume), when the
+  library could not take the lease ("no lease"), and when the resume goes
+  through a
   holder that is still there (the stop after the suspend failed): that
   node was not held.
 - A verdict counts only for the token the tool wrote. The tool removes
