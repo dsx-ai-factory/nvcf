@@ -520,6 +520,19 @@ func TestGPUSharePatches_IBVNeedsTheBundle(t *testing.T) {
 	if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e == nil || e.Value != GPUShareIBVLibPath {
 		t.Errorf("the current bundle at %s: %s = %+v, want %s", nvsnapToolsMountPath, ncclIBVerbsLibEnv, e, GPUShareIBVLibPath)
 	}
+	// A directory inside the current bundle is not its root.
+	for name, set := range map[string]func(*corev1.VolumeMount){
+		"subPath":     func(vm *corev1.VolumeMount) { vm.SubPath = "old" },
+		"subPathExpr": func(vm *corev1.VolumeMount) { vm.SubPathExpr = "$(POD_NAME)" },
+	} {
+		pod := other(m.bundleDir(m.BundleID))
+		mounts := pod.Spec.Containers[1].VolumeMounts
+		set(&mounts[len(mounts)-1])
+		got := applyPatches(t, pod, m.gpusharePatches(context.Background(), pod))
+		if e := envOf(got.Spec.Containers[1], ncclIBVerbsLibEnv); e != nil {
+			t.Errorf("the current bundle with a %s at %s: %s=%q", name, nvsnapToolsMountPath, ncclIBVerbsLibEnv, e.Value)
+		}
+	}
 }
 
 // Debug variables land on the GPU containers of the matching pods only,

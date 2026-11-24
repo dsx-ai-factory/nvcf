@@ -137,12 +137,16 @@ func envFromMaySet(c *corev1.Container, name string) bool {
 }
 
 // mountsBundle reports whether c's mount at nvsnapToolsMountPath is the
-// selected node bundle (a hostPath of bundleDir(BundleID)), which has
-// libnvsnap_ibv.so; an older bundle or another volume may not.
+// selected node bundle (a hostPath of bundleDir(BundleID), its root: no
+// subPath), which has libnvsnap_ibv.so; an older bundle, another volume or
+// a directory inside one may not.
 func (m *Mutator) mountsBundle(pod *corev1.Pod, c *corev1.Container) bool {
 	for _, vm := range c.VolumeMounts {
 		if vm.MountPath != nvsnapToolsMountPath {
 			continue
+		}
+		if vm.SubPath != "" || vm.SubPathExpr != "" {
+			return false
 		}
 		for _, v := range pod.Spec.Volumes {
 			if v.Name == vm.Name {
