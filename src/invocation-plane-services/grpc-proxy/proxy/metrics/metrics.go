@@ -541,7 +541,8 @@ const (
 
 	// NatsSendStageWait is the wait for the connection before a send.
 	NatsSendStageWait = "wait"
-	// NatsSendStagePublish is nats.go rejecting the send itself.
+	// NatsSendStagePublish is an attempt that failed at the send itself:
+	// rejected before sending (reconnecting) or with unknown delivery (closed).
 	NatsSendStagePublish = "publish"
 
 	NatsSendReasonCanceled     = "canceled"

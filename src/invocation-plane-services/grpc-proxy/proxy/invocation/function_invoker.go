@@ -450,7 +450,7 @@ func (f *FunctionInvoker) publishDispatch(ctx context.Context, send string, time
 		}
 		attempts++
 		err := publish(ctx)
-		recordPublishRejection(send, err)
+		recordPublishFailure(send, err)
 		if !errors.Is(err, nats.ErrReconnectBufExceeded) {
 			return err
 		}
@@ -482,14 +482,14 @@ func (f *FunctionInvoker) waitDispatchConnected(ctx context.Context, send string
 	return err
 }
 
-// recordPublishRejection counts an attempt that failed on the dispatch
-// connection's state. ErrReconnectBufExceeded is a rejection before any bytes
+// recordPublishFailure counts an attempt that failed on the dispatch
+// connection's state. It is not always a rejection. ErrReconnectBufExceeded is a rejection before any bytes
 // were sent, counted even when a later retry sends the message.
 // ErrConnectionClosed can come from the publish or from the wait for a reply or
 // ack, so NATS may have received that attempt. Other errors, such as no
 // responders or a missing ack, are not about the connection and are not
 // counted.
-func recordPublishRejection(send string, err error) {
+func recordPublishFailure(send string, err error) {
 	switch {
 	case errors.Is(err, nats.ErrReconnectBufExceeded):
 		metrics.NatsSendFailures.WithLabelValues(send, metrics.NatsSendStagePublish, metrics.NatsSendReasonReconnecting).Inc()
