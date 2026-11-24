@@ -73,10 +73,11 @@ int fake_open_contexts(void) { return open_ctxs; }
 void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
 
 /* Knobs for the white-box cases (test_ibv.py PROBE). */
-static int port_delay_ms, fail_marker, fail_init, fail_destroy, err_opcode, async_calls, live_pds;
+static int port_delay_ms, port_in, fail_marker, fail_init, fail_destroy, err_opcode, async_calls, live_pds;
 static uint32_t next_lkey;
 static struct fqp *event_qp;
 void fake_port_delay_ms(int ms) { port_delay_ms = ms; }
+int fake_port_in(void) { return __atomic_load_n(&port_in, __ATOMIC_SEQ_CST); }  /* port queries in the provider */
 void fake_fail_marker(int nth) { fail_marker = nth; }   /* the nth fence write's post fails */
 void fake_fail_init(int n) { fail_init = n; }           /* the next n moves to INIT fail */
 void fake_fail_destroy(int n) { fail_destroy = n; }     /* the next n queue pair destroys fail */
@@ -208,7 +209,9 @@ int ibv_query_device(struct ibv_context *c, struct ibv_device_attr *a) { (void)c
 int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_attr *a)
 {
     (void)c; (void)p;
+    __atomic_add_fetch(&port_in, 1, __ATOMIC_SEQ_CST);
     if (port_delay_ms) usleep(port_delay_ms * 1000);
+    __atomic_sub_fetch(&port_in, 1, __ATOMIC_SEQ_CST);
     struct ibv_port_attr *x = (struct ibv_port_attr *)a;
     memset(x, 0, sizeof(*x));
     x->state = IBV_PORT_ACTIVE; x->lid = 1 + epoch; x->link_layer = IBV_LINK_LAYER_ETHERNET;
@@ -449,13 +452,13 @@ static int probe_poll(struct pollfd *p, nfds_t n, int t);
 FK(void, fake_move, void); FK(void, fake_port_delay_ms, int); FK(void, fake_fail_marker, int);
 FK(void, fake_fail_init, int); FK(void, fake_fail_destroy, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
 FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
-FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *);
+FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *); FK(int, fake_port_in, void);
 static void fakes(void)
 {
 #define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
     G(fake_move); G(fake_port_delay_ms); G(fake_fail_marker); G(fake_fail_init); G(fake_fail_destroy); G(fake_err_opcode);
     G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
-    G(fake_qp_receives);
+    G(fake_qp_receives); G(fake_port_in);
 #undef G
 }
 
@@ -604,7 +607,11 @@ int main(int argc, char **argv)
         up(0);
         fake_port_delay_ms(300);
         pthread_create(&t, NULL, query_port, NULL);
-        usleep(50000);
+        /* The fence starts only once the query is in the provider, where
+         * it stays for 300 ms. */
+        int in = 0;
+        for (int i = 0; i < 5000 && !(in = fake_port_in()); i++) usleep(1000);
+        if (!in) { printf("query_never_entered=1\n"); return 9; }
         double t0 = now();
         int r = nvsnap_ibv_fence(rep, sizeof(rep));
         printf("fence=%d took_ms=%d\n", r, (int)((now() - t0) * 1000));
@@ -907,6 +914,7 @@ class Ibv(unittest.TestCase):
     def test_call_in_the_provider_finishes_during_suspend(self):
         out = self.probe("portdrain")
         self.assertEqual(out["fence"], "0", "a port query that finished during the suspend made it fail: %s" % out)
+        self.assertGreaterEqual(int(out["took_ms"]), 100, "the fence did not wait for the query in progress: %s" % out)
 
     def test_creation_counts_until_registered(self):
         out = self.probe("pdgate")
