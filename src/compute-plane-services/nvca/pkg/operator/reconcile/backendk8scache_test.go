@@ -3482,7 +3482,7 @@ func TestSyncNVCFBackend_RepairsWebhookCAMismatchWithoutRollout(t *testing.T) {
 			assert.Equal(t, "get", a.GetVerb(), "the repair must not roll the agent")
 		}
 	}
-	assert.True(t, hasEventContaining(recorder, "webhook caBundle"))
+	assert.True(t, hasEventContaining(recorder, "webhook CA that did not match"))
 }
 
 func TestCreateOrUpdateNVCFBackend_PropagatesNVCAOTELConfig(t *testing.T) {

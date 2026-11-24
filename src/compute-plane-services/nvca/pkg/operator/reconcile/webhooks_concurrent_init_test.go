@@ -517,6 +517,97 @@ func TestRepairWebhookCAMismatch_SkipsBeforeWebhooksArePublished(t *testing.T) {
 	assert.True(t, k8serrors.IsNotFound(err))
 }
 
+// A rotation that stores a new serving cert while the repair is republishing the
+// previous cert's CA must not leave the caBundles on the previous CA.
+func TestRepairWebhookCAMismatch_RechecksAfterConcurrentRotation(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.updateWebhookCABundles(ctx, other.CACertBytes))
+	rotated, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+
+	cs := bc.clients.K8s.(*fake.Clientset)
+	var rotatedDuringRepair atomic.Bool
+	cs.PrependReactor("update", "validatingwebhookconfigurations", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if rotatedDuringRepair.Swap(true) {
+			return false, nil, nil
+		}
+		ns := getSystemNamespace(nb)
+		secrets := v1.SchemeGroupVersion.WithResource("secrets")
+		require.NoError(t, cs.Tracker().Update(secrets, newTLSCertSecret(nb, rotated), ns))
+		require.NoError(t, cs.Tracker().Update(secrets, &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: NVCAWebhookTLSCASecretName, Namespace: ns},
+			Data:       map[string][]byte{TLSCAName: rotated.CACertBytes},
+		}, ns))
+		return false, nil, nil
+	})
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	assert.True(t, rotatedDuringRepair.Load())
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	assertWebhookCABundles(ctx, t, bc, rotated.CACertBytes)
+}
+
+// A CA Secret that no longer holds the CA of a usable serving cert must be rewritten
+// even when every caBundle already matches, and the serving cert must be kept.
+func TestRepairWebhookCAMismatch_RewritesStaleCASecret(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.setupTLSCASecret(ctx, nb, other))
+	require.Error(t, webhookCAConsistency(ctx, bc, nb, now))
+
+	secrets := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb))
+	before, err := secrets.Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	after, err := secrets.Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, before.Data, after.Data)
+}
+
+// A replacement that fails to write the CA Secret must report the error and leave
+// the mismatch detectable, so the next sync finishes the repair.
+func TestRepairWebhookCAMismatch_RetriesAfterFailedCASecretWrite(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now.AddDate(-2, 0, 0)))
+
+	cs := bc.clients.K8s.(*fake.Clientset)
+	var failed atomic.Bool
+	cs.PrependReactor("update", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		sec := a.(k8stesting.UpdateAction).GetObject().(*v1.Secret)
+		if sec.Name != NVCAWebhookTLSCASecretName || failed.Swap(true) {
+			return false, nil, nil
+		}
+		return true, nil, k8serrors.NewInternalError(fmt.Errorf("etcd unavailable"))
+	})
+
+	_, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.Error(t, err)
+	require.True(t, failed.Load())
+	require.Error(t, webhookCAConsistency(ctx, bc, nb, now))
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+}
+
 // A newly minted certificate is stored together with its CA in the serving cert
 // Secret, so the pair can never be written half by one reconcile and half by another.
 func TestEnsureWebhookCert_StoresCAWithServingCert(t *testing.T) {

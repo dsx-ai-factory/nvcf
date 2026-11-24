@@ -1423,7 +1423,7 @@ func (bc *BackendK8sCache) syncNVCFBackend(ctx context.Context, nb *nvidiaiov1.N
 		}
 		if repaired {
 			bc.eventRecorder.Eventf(nbMerged, corev1.EventTypeWarning,
-				string(nvcaoptypes.EventCategoryHealth), "Repaired %v webhook caBundle that did not match the serving cert", AgentName)
+				string(nvcaoptypes.EventCategoryHealth), "Repaired %v webhook CA that did not match the serving cert", AgentName)
 		}
 	}
 
