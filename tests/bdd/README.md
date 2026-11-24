@@ -54,6 +54,30 @@ It checks rolling workloads and the upgrade receipt. It does not apply an
 upgrade, replace OnDelete pods, or qualify data preservation across an
 upgrade. Run it alongside the live upgrade rehearsal.
 
+`TestAPIKeysUpgradeBefore` and `TestAPIKeysUpgradeAfter` check that an API key
+created with the legacy function service ID before an API Keys upgrade still
+works after it. They run against an existing installation and do not upgrade
+anything. Export `NVCF_CLI`, `UPGRADE_CLI_CONFIG`, `UPGRADE_KUBECONFIG`, and
+`UPGRADE_CONTEXT`. Use the same CLI config for both runs and do not run
+`nvcf-cli init` in between, because the config holds the key the first run
+creates.
+
+```sh
+unset BDD_CLEANUP_MODE
+cd tests/bdd
+go test -count=1 -run '^TestAPIKeysUpgradeBefore$' -timeout 10m -v
+# Upgrade API Keys, then wait for the account-index copy to finish.
+go test -count=1 -run '^TestAPIKeysUpgradeAfter$' -timeout 10m -v
+```
+
+The second run first checks the `keys_by_account_index_copy` completion marker
+in Cassandra, then uses the key and lists it. It reads the marker with `kubectl
+exec` into `cassandra-0` in `cassandra-system`.
+
+`TestAPIKeysUpgradeNewKey` runs after that. It creates a new key, uses it,
+checks that it is listed, and checks that `keys_by_owner_and_account_and_service`
+holds the canonical `cloud-functions` ID and no legacy ID.
+
 Wiring tests use a fake CommandRunner and do not touch a cluster. Safe in
 CI; fast.
 
