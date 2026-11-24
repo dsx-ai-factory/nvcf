@@ -1160,6 +1160,9 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			m.GroupSession = session
 		} else {
 			m.GPUShareFabricSession = session
+			// In place, this driver answers the members' held resumes
+			// (driveFabric's open phase, Open below).
+			m.GPUShareSyncOpen = req.LeaveRunning
 		}
 		m.GPUShareGroupIndex, m.GPUShareGroupSize = i, len(req.Members)
 		m.GroupFreeze = true

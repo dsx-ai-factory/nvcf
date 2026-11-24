@@ -100,28 +100,34 @@ func TestSettleSource_UnsyncedOpenIsNotLeftSuspended(t *testing.T) {
 }
 
 // A suspend holds the in-place resume's GPU launches (--sync-open) only in
-// place, across nodes, with a tool that has the option, and then declares
-// it to the driver before the suspend.
+// place, across nodes, when the driver runs the open phase, with a tool that
+// has the option, and then declares it to the driver before the suspend.
+// Rolling upgrade: an older driver omits the request field, so a newer
+// member resumes at once; an older member ignores the field and never
+// declares a hold, so a newer driver does not wait for it (fabricOpener).
 func TestSyncOpenFor(t *testing.T) {
 	log := logrus.NewEntry(logrus.New())
 	tool := "--sync-open MS: (suspend, with --fabric-map) ..."
 	for _, c := range []struct {
 		name         string
 		leaveRunning bool
+		driverOpens  bool
 		fabric       bool
 		tool         string
 		want         time.Duration
 	}{
-		{"in place across nodes", true, true, tool, gpushareSyncOpenWait},
-		{"dump for a move", false, true, tool, 0},
-		{"one node", true, false, tool, 0},
-		{"older tool", true, true, "--hold-gate --fabric-map DIR", 0},
+		{"in place across nodes, new driver and tool", true, true, true, tool, gpushareSyncOpenWait},
+		{"older driver, new tool", true, false, true, tool, 0},
+		{"new driver, older tool", true, true, true, "--hold-gate --fabric-map DIR", 0},
+		{"older driver and tool", true, false, true, "--hold-gate --fabric-map DIR", 0},
+		{"dump for a move", false, true, true, tool, 0},
+		{"one node", true, true, false, tool, 0},
 	} {
 		var f *fabricSessionDir
 		if c.fabric {
 			f = &fabricSessionDir{}
 		}
-		if got := syncOpenFor(c.leaveRunning, f, c.tool, "v1", log); got != c.want {
+		if got := syncOpenFor(c.leaveRunning, c.driverOpens, f, c.tool, "v1", log); got != c.want {
 			t.Errorf("%s: %s, want %s", c.name, got, c.want)
 		}
 		if f != nil && f.holdsOpen.Load() != (c.want > 0) {

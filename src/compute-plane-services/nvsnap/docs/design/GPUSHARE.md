@@ -258,7 +258,9 @@ bound its share would have its NVLink accesses refused (Xid 137 on the node
 that launched) and its kernels would spin. Before the suspend, each member's
 agent tells the driver that its tool will hold (`holdsOpen` in the member's
 fabric state, `syncOpenFor` in `internal/agent/checkpoint_v2.go`) when the
-tool has `--sync-open`. The suspend then runs as before, and so does `stop`:
+tool has `--sync-open` and the driver asked for it (`gpushareSyncOpen` in
+the member's checkpoint request, set by a driver that runs this open
+phase). The suspend then runs as before, and so does `stop`:
 the holder leaves the processes stopped for CRIU and exits. After the dump,
 the agent runs `resume --fabric-map DIR --sync-open <ms>`. The tool loads,
 exchanges handles, remaps, and sends `resume hold`. It then thaws the
@@ -310,7 +312,9 @@ load before any remaps, so the markers normally come close together.
   says "not every pid's GPU launches were let through").
 - A member whose tool has no `--sync-open` (an older node bundle) is not
   waited for. It opens at its own resume, as before, and the agent logs
-  that.
+  that. So does a member whose driver did not ask for the hold (an older
+  agent drives the session during a rolling upgrade, and would never
+  answer it).
 - A suspend that fails after `release` and rolls back does not wait: its
   rollback opens at once, as before. It runs while the other nodes may
   still be suspending or dumping, so a wait could only end at the deadline,

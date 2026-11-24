@@ -221,6 +221,9 @@ func runDump(ctx context.Context, deadline time.Duration, env []string, name str
 type dumpV2Opts struct {
 	LeaveRunning  bool
 	FabricSession string
+	// SyncOpen: the session's driver runs the open phase
+	// (CheckpointRequest.GPUShareSyncOpen).
+	SyncOpen bool
 	// Freeze, for a member of a group capture, returns once every member
 	// of the group is ready to be dumped (group_freeze.go); it runs right
 	// before criu starts, so the members stop together.
@@ -387,7 +390,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			faults = startGPUFaultWatch(log)
 			defer faults.close()
 		}
-		syncOpen = syncOpenFor(leaveRunning, fabric, tools.gpuToolText(), tools.version, log)
+		syncOpen = syncOpenFor(leaveRunning, o.SyncOpen, fabric, tools.gpuToolText(), tools.version, log)
 		gm, suspended, serr := gpushareSuspend(ctx, hostPID, gsPIDs, fabricDir, log)
 		if suspended {
 			// The source is stopped with its GPU memory released from
@@ -522,10 +525,17 @@ func settleSource(suspended, leaveRunning, dumpFailed bool, resume func() error)
 // nodes, the resume holds the GPU launches until every node has resumed
 // (gpushare_fabric.go, fabricOpener). It declares that to the driver
 // (holdsOpen) before the suspend, so that the driver waits for this member.
-// Zero (no hold) on one node, for a dump that does not resume in place, and
-// with a tool from before --sync-open, which is logged.
-func syncOpenFor(leaveRunning bool, fabric *fabricSessionDir, toolText, bundle string, log *logrus.Entry) time.Duration {
+// Zero (no hold) on one node, for a dump that does not resume in place,
+// when the driver did not ask for it (driverOpens: a driver from before the
+// open phase never answers, and the hold would only delay the engine by
+// gpushareSyncOpenWait and fail the capture), and with a tool from before
+// --sync-open; the last two are logged.
+func syncOpenFor(leaveRunning, driverOpens bool, fabric *fabricSessionDir, toolText, bundle string, log *logrus.Entry) time.Duration {
 	if !leaveRunning || fabric == nil {
+		return 0
+	}
+	if !driverOpens {
+		log.Warn("gpushare: the fabric session's driver does not open the GPU launches once every node has resumed (an older agent); this node lets them through at its own resume")
 		return 0
 	}
 	if !gpushareSyncOpenSupported(toolText) {

@@ -285,6 +285,12 @@ func groupOpenFixture(t *testing.T, failB bool) (map[string]string, error) {
 		case r.URL.Path == "/v1/checkpoint":
 			var req CheckpointRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			// A member holds its launches only when the driver asks
+			// (syncOpenFor): one not asked would never wait for a verdict.
+			if !req.GPUShareSyncOpen {
+				http.Error(w, "the driver did not ask for the held resume", http.StatusBadRequest)
+				return
+			}
 			if failB && req.PodName == "b" {
 				time.Sleep(5 * fabricPollInterval) // the driver sees it hold first
 				http.Error(w, "gpushare resume: remap failed", http.StatusInternalServerError)

@@ -213,6 +213,11 @@ type CheckpointRequest struct {
 	// session driven by another agent (see gpushare_fabric.go): the
 	// suspend and resume coordinate with the workload's other pods.
 	GPUShareFabricSession string `json:"gpushareFabricSession,omitempty"`
+	// GPUShareSyncOpen is set by a session's driver that runs the open
+	// phase (fabricOpener): only then does a member's in-place resume hold
+	// its GPU launches until every node has resumed (syncOpenFor). A
+	// driver from before it never answers the hold, and omits the field.
+	GPUShareSyncOpen bool `json:"gpushareSyncOpen,omitempty"`
 	// GPUShareGroupIndex and GPUShareGroupSize place this pod in its
 	// session's group; a group restore maps each checkpoint back to a pod
 	// by them.
@@ -757,7 +762,8 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	// legacy path — the artifact contract is identical.
 	_, criuSpan := tracing.Tracer().Start(ctx, "checkpoint.criu_dump")
 	criuSpan.SetAttributes(attribute.String("nvsnap.criu.mode", "v2-inns"))
-	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession, Snapshot: snapshot}
+	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession,
+		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot}
 	var (
 		frozenAt, dumpAt clocks
 		held             bool
