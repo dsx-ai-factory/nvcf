@@ -458,33 +458,37 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
   numbers, and `resume` lets NCCL's verbs calls run again.
 
 Every rank NCCL connects must be suspended and restored together, which the
-group checkpoint does. Not handled: a shared receive queue, an address
-handle, a queue pair other than reliable-connected, or a receive with more
-than four scatter entries. A process whose NCCL creates one refuses the
-suspend, and its workload runs on. So does a queue pair with a failed
-completion (which of its receives finished is unknown). A completion
-channel is refused earlier: `ibv_create_cq` with one fails with
-`EOPNOTSUPP` (NCCL polls its completion queues and asks for none), so a
-program that needs one fails where it creates the queue, at its start,
-not at a capture.
+group checkpoint does. What the library cannot save is refused at one of
+two points, and the two have different results:
 
-A refusal found at `release` is different when the process's `quiesce`
-fenced NCCL's queue pairs (an async event of a queue pair or completion
-queue that NCCL does not acknowledge within 2 s, since the provider
-cannot destroy the object before; or completions the release's own
-check finds failed or still coming). Every rank fenced, so the other ranks may already be
-destroying their queue pairs, and a rollback re-creates only theirs: this
-process's queue pairs would go on targeting peers that are gone. So
-libnvsnap_ibv keeps NCCL's verbs calls held for good
-(`nvsnap_ibv_doomed`), and gpushare answers every command that would let
-the process run again (`resume`, `resume hold`, `open`, `hold`, `step`,
-`quiesce`, `release`) with "it cannot run again (replace it)" and keeps
-its gates closed, also when a lease expires. The tool's rollback then
-fails ("suspend failed and so did the rollback"), and the agent replaces
-the workload: the pod alone, or every pod of the instance in a group
-capture. A refusal with no fence before it lets NCCL's calls run again,
-and the workload runs on. An older libnvsnap_ibv, without
-`nvsnap_ibv_doomed`, reopens NCCL's calls on any refusal, as before.
+- At the suspend, which refuses the capture: a shared receive queue, an
+  address handle, a queue pair other than reliable-connected, a receive
+  with more than four scatter entries, and a queue pair with a failed
+  completion (which of its receives finished is unknown) make `quiesce`
+  and `release` refuse. `release` also refuses on an async event of a
+  queue pair or completion queue that NCCL does not acknowledge within
+  2 s (the provider cannot destroy the object before). A refusal at
+  `quiesce`, or at a `release` with no fence before it, lets NCCL's calls
+  run again, and the workload runs on.
+- At queue creation, which fails the program at its start: a completion
+  channel. `ibv_create_cq` with one fails with `EOPNOTSUPP` (NCCL polls
+  its completion queues and asks for none), so a program that needs one
+  fails where it creates the queue, never at a capture.
+
+A refusal at `release` after the process's `quiesce` fenced NCCL's queue
+pairs does not let the workload run on. Every rank fenced, so the other
+ranks may already be destroying their queue pairs, and a rollback
+re-creates only theirs: this process's queue pairs would go on targeting
+peers that are gone. So libnvsnap_ibv keeps NCCL's verbs calls held for
+good (`nvsnap_ibv_doomed`), also when its wait for calls in progress
+times out. gpushare answers every command that would let the process run
+again (`resume`, `resume hold`, `open`, `hold`, `step`, `quiesce`,
+`release`) with "it cannot run again (replace it)" and keeps its gates
+closed, also when a lease expires. The tool's rollback then fails
+("suspend failed and so did the rollback"), and the agent replaces the
+workload: the pod alone, or every pod of the instance in a group capture.
+An older libnvsnap_ibv, without `nvsnap_ibv_doomed`, reopens NCCL's calls
+on any refusal, as before.
 
 Devices are matched by name (`mlx5_3`), so the restore node needs the
 same NIC names. Other users of verbs in the process (UCX, NIXL) are not
