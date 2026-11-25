@@ -380,15 +380,15 @@ func TestArchiveRoomCountsOtherMembersPendingDumps(t *testing.T) {
 	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
 	write := func() error { return nil }
 	reserveDisk("p/main", 15<<20, time.Now()) // own: does not count
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); err != nil {
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); err != nil {
 		t.Fatalf("own reservation counted: %v", err)
 	}
 	reserveDisk("q/main", 15<<20, time.Now()) // another member's pending dump
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); !errors.Is(err, errNoCheckpointRoom) {
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); !errors.Is(err, errNoCheckpointRoom) {
 		t.Fatalf("err = %v, want errNoCheckpointRoom with another member's dump pending", err)
 	}
 	releaseDisk("q/main") // its dump is on disk
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); err != nil {
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); err != nil {
 		t.Fatalf("after release: %v", err)
 	}
 }
@@ -402,7 +402,7 @@ func TestTarBytesCountHeadersAndPadding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	over, n, err := tarBytesOver(os.DirFS(dir), 1<<20)
+	over, n, err := tarBytesOver(os.DirFS(dir), 1<<20, nil)
 	if err != nil || !over {
 		t.Fatalf("2000 one-byte files: over=%v n=%d err=%v, want over 1 MiB", over, n, err)
 	}
@@ -449,5 +449,54 @@ func TestCatalogRetriesDoNotDelayReclamation(t *testing.T) {
 	ents, _ := os.ReadDir(filepath.Join(dir, catalogTombstoneDir))
 	if len(ents) != 21 {
 		t.Fatalf("tombstones = %d, want all 21 kept for later sweeps", len(ents))
+	}
+}
+
+// Sizing leaves out what the archive leaves out: a model cache the rootfs
+// diff excludes must not block an archive whose included files fit.
+func TestTarBytesLeaveOutTheWritersExclusions(t *testing.T) {
+	dir := t.TempDir()
+	hub := filepath.Join(dir, "root", ".cache", "huggingface", "hub")
+	if err := os.MkdirAll(hub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hub, "weights"), make([]byte, 4<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "proc-mount"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "proc-mount", "x"), make([]byte, 4<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.log"), make([]byte, 64<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exclude := append(tarPatternsForMountpoints([]string{"/proc-mount"}), rootfsDiffExcludeGlobs()...)
+	if over, n, err := tarBytesOver(os.DirFS(dir), 1<<20, exclude); err != nil || over {
+		t.Fatalf("with the exclusions: over=%v n=%d err=%v, want it to fit in 1 MiB", over, n, err)
+	}
+	if over, _, err := tarBytesOver(os.DirFS(dir), 1<<20, nil); err != nil || !over {
+		t.Fatalf("without the exclusions: over=%v err=%v, want over 1 MiB", over, err)
+	}
+}
+
+func TestTarExcluded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pats []string
+		want bool
+	}{
+		{"./root/.cache/huggingface/hub", []string{"*/huggingface/hub"}, true},
+		{"./root/.cache/huggingface/hub/x/y", []string{"*/huggingface/hub/*"}, true},
+		{"./root/.cache/huggingface", []string{"*/huggingface/hub"}, false},
+		{"./usr/bin/nvidia-smi", tarPatternsForMountpoints([]string{"/usr/bin/nvidia-smi"}), true},
+		{"./usr/bin/nvidia-smi-x", tarPatternsForMountpoints([]string{"/usr/bin/nvidia-smi"}), false},
+		{"./sub/mnt/f", tarMountPatterns([]string{"sub/mnt"}), false},
+		{"./sub/mnt", tarMountPatterns([]string{"sub/mnt"}), true},
+	} {
+		if got := tarExcluded(tc.name, tc.pats); got != tc.want {
+			t.Errorf("tarExcluded(%q, %q) = %v, want %v", tc.name, tc.pats, got, tc.want)
+		}
 	}
 }

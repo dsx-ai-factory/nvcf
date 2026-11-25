@@ -1473,8 +1473,9 @@ func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containe
 		// The tarball is written to the checkpoint filesystem: one that
 		// would take the room the kubelet's eviction threshold needs is not
 		// copied (capture_disk.go), as an emptyDir too large is not.
-		err := a.withWorkloadDirRoom(diskKey(containerInfo.Labels[podNameLabel], containerInfo.Name), int(containerInfo.PID), mi.MountPoint, func() error {
-			return tarMount(int(containerInfo.PID), mi.MountPoint, tarAbs, nestedMountPoints(mountPoints, mi.MountPoint), log)
+		nested := nestedMountPoints(mountPoints, mi.MountPoint)
+		err := a.withWorkloadDirRoom(diskKey(containerInfo.Labels[podNameLabel], containerInfo.Name), int(containerInfo.PID), mi.MountPoint, tarMountPatterns(nested), func() error {
+			return tarMount(int(containerInfo.PID), mi.MountPoint, tarAbs, nested, log)
 		})
 		if errors.Is(err, errNoCheckpointRoom) {
 			log.WithError(err).WithField("mp", mi.MountPoint).
@@ -1546,8 +1547,10 @@ func (a *Agent) mirrorRootfsDiff(ctx context.Context, key, checkpointDir, source
 	diffExcludes := append(append([]string{}, sourceMountPoints...), v2BinDirInContainer, v2ImagesDirInContainer)
 	// The archive is written to the checkpoint filesystem: it must not take
 	// the room the kubelet's eviction threshold needs (capture_disk.go).
-	if err := a.withCheckpointRoom(key, os.DirFS(sourceUpperdir), func() error {
-		return archiveOverlayDir(sourceUpperdir, diffDst, diffExcludes, rootfsDiffExcludeGlobs(), log)
+	globs := rootfsDiffExcludeGlobs()
+	sized := append(tarPatternsForMountpoints(diffExcludes), globs...)
+	if err := a.withCheckpointRoom(key, os.DirFS(sourceUpperdir), sized, func() error {
+		return archiveOverlayDir(sourceUpperdir, diffDst, diffExcludes, globs, log)
 	}); err != nil {
 		mirrorSpan.RecordError(err)
 		return fmt.Errorf("archive the container's overlay upperdir: %w", err)

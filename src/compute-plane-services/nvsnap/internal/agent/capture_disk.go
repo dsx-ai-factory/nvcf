@@ -30,6 +30,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -207,9 +208,12 @@ var errNoCheckpointRoom = errors.New("does not fit above the checkpoint filesyst
 // less the dumps the preflight passed on this node that are not yet on
 // disk (other than key's own); errNoCheckpointRoom when it does not. The node's
 // writes run one at a time, so two cannot both pass against the same room.
-func (a *Agent) withCheckpointRoom(key string, fsys fs.FS, write func() error) error {
+func (a *Agent) withCheckpointRoom(key string, fsys fs.FS, exclude []string, write func() error) error {
 	checkpointWriteMu.Lock()
 	defer checkpointWriteMu.Unlock()
+	// The reservations before the free space: a dump released between the
+	// two reads is then counted in one or the other, never in neither.
+	pending := reservedBytes(key, time.Now())
 	room, on, err := a.checkpointRoom()
 	if !on {
 		return write()
@@ -217,11 +221,11 @@ func (a *Agent) withCheckpointRoom(key string, fsys fs.FS, write func() error) e
 	if err != nil {
 		return fmt.Errorf("cannot tell the checkpoint filesystem's free space: %w", err)
 	}
-	room -= reservedBytes(key, time.Now())
+	room -= pending
 	if room < 0 {
 		room = 0
 	}
-	over, n, err := tarBytesOver(fsys, room)
+	over, n, err := tarBytesOver(fsys, room, exclude)
 	if err != nil {
 		return fmt.Errorf("cannot size the archive: %w", err)
 	}
@@ -233,14 +237,21 @@ func (a *Agent) withCheckpointRoom(key string, fsys fs.FS, write func() error) e
 
 // tarBytesOver bounds the tar archive of fsys: per entry a header block
 // and one more for a long name or extended attributes, file data padded
-// to 512-byte blocks, and the two end blocks. It stops once over limit.
-func tarBytesOver(fsys fs.FS, limit int64) (over bool, total int64, err error) {
+// to 512-byte blocks, and the two end blocks. It leaves out what the
+// writer's tar --exclude patterns exclude, and stops once over limit.
+func tarBytesOver(fsys fs.FS, limit int64, exclude []string) (over bool, total int64, err error) {
 	total = 1024
 	err = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if p == "." {
+			return nil
+		}
+		if tarExcluded("./"+p, exclude) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		total += 1024
@@ -352,11 +363,51 @@ const podNameLabel = "io.kubernetes.pod.name"
 
 // withWorkloadDirRoom is withCheckpointRoom for an archive of the
 // directory mp as process pid sees it (confined_fs.go).
-func (a *Agent) withWorkloadDirRoom(key string, pid int, mp string, write func() error) error {
+func (a *Agent) withWorkloadDirRoom(key string, pid int, mp string, exclude []string, write func() error) error {
 	d, err := openWorkloadDir("/proc", pid, mp)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = d.Close() }()
-	return a.withCheckpointRoom(key, d.root.FS(), write)
+	return a.withCheckpointRoom(key, d.root.FS(), exclude, write)
+}
+
+// tarExcluded reports whether GNU tar's --exclude patterns leave out the
+// member name (as "./path"). Its defaults for exclusion apply: a wildcard
+// matches "/" too, and a pattern matches the whole name or any part of it
+// that starts after a "/".
+func tarExcluded(name string, patterns []string) bool {
+	for _, pat := range patterns {
+		re, err := regexp.Compile("^" + tarGlobRegexp(pat) + "$")
+		if err != nil {
+			continue
+		}
+		for rest := name; ; {
+			if re.MatchString(rest) {
+				return true
+			}
+			i := strings.IndexByte(rest, '/')
+			if i < 0 {
+				break
+			}
+			rest = rest[i+1:]
+		}
+	}
+	return false
+}
+
+// tarGlobRegexp turns a tar wildcard pattern into a regular expression.
+func tarGlobRegexp(pat string) string {
+	var b strings.Builder
+	for _, r := range pat {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	return b.String()
 }
