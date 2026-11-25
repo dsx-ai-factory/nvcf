@@ -615,17 +615,18 @@ static int reconnect(void)
 static char drop_gid[33];  /* "nogid": leave out every row of this old GID (hex) */
 static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
 {
-    char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160], tail[16];
+    char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160];
     FILE *f = fdopen(mkstemp(full), "w+");
     FILE *o = fdopen(mkstemp(path), "w");
     nvsnap_ibv_map(f);
     rewind(f);
-    snprintf(tail, sizeof(tail), ":%u", qpn);
-    size_t nt = strlen(tail);
-    int keys = 0;
+    int keys = 0, silent = 0;
     while (fscanf(f, "%159s %159s", w1, w2) == 2) {
-        size_t n1 = strlen(w1);
-        int row = !strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tail);
+        /* ibvq:<32 hex>:<qpn>[:<sender>] */
+        int row = !strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && strtoul(w1 + 38, NULL, 10) == qpn;
+        /* "silent": a queue pair row from a second sender on the port, which
+         * sends no key count row. */
+        if (!strncmp(w1, "ibvq:", 5) && !strcmp(how, "silent") && !silent++) fprintf(o, "%.38s99999:7 12345\n", w1);
         if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
         if (!strcmp(how, "nogid") && !strncmp(w1 + 5, drop_gid, 32)) continue;
         if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
@@ -1060,19 +1061,17 @@ int main(int argc, char **argv)
         if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
         fake_move();
         if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
-        char *buf = NULL, w1[160], w2[160], hex0[33], tc[16];
+        char *buf = NULL, w1[160], w2[160], hex0[33];
         size_t len = 0;
         FILE *f = open_memstream(&buf, &len);
         nvsnap_ibv_map(f);
         fclose(f);
         hex16(&g0, hex0);
-        snprintf(tc, sizeof(tc), ":%u", qc->qp_num);
         int rows_qc = 0, port0 = 0, rows_qa = 0, ports = 0, off = 0, k;
         while (sscanf(buf + off, "%159s %159s%n", w1, w2, &k) == 2) {
             off += k;
-            size_t n1 = strlen(w1), nt = strlen(tc);
-            if (!strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tc)) rows_qc++;
-            if (!strncmp(w1, "ibvq:", 5) && strtoul(strrchr(w1, ':') + 1, NULL, 10) == qa->qp_num) rows_qa++;
+            uint32_t q = !strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 ? strtoul(w1 + 38, NULL, 10) : 0;
+            rows_qc += q == qc->qp_num, rows_qa += q == qa->qp_num;
             if (!strncmp(w1, "ibvp:", 5)) ports++, port0 += !strncmp(w1 + 5, hex0, 32);
         }
         free(buf);
@@ -1584,7 +1583,9 @@ class Ibv(unittest.TestCase):
         "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
         "unreadable": r"err cannot read the verbs exchange /tmp/ibvmap\w{6} \(No such file or directory\): "
                       r"no new number for the peer of queue pair \d+",
-        "dupq": r"err the verbs exchange has two different rows for ibvq:%s:\d+ \(\d+ and \d+\)" % GID,
+        "dupq": r"err the verbs exchange has two different rows for ibvq:%s:\d+:\d+ \(\d+ and \d+\)" % GID,
+        "silent": r"err the verbs exchange has queue pair rows from a sender \(7\) with no key count row, for the peer "
+                  r"of queue pair \d+",
         "dupp": r"err the verbs exchange has two different rows for ibvp:%s:\d+" % GID,
         "dupk": r"err the verbs exchange has two different rows for ibvk:%s:\d+ \(\d+ and \d+\)" % GID,
         "nokey": r"err the verbs exchange has 0 of the 1 key rows for the peer of queue pair \d+",
@@ -1669,7 +1670,7 @@ class Ibv(unittest.TestCase):
     def test_missing_key_rows_fail_the_connect(self):
         # A peer's key rows, or their count, missing from the exchange: a
         # key NCCL sends would otherwise go out untranslated.
-        for how in ("nokey", "nokeys", "nocount"):
+        for how in ("nokey", "nokeys", "nocount", "silent"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0", "connected without the peer's keys (%s): %s" % (how, out))
@@ -1895,7 +1896,7 @@ class Ibv(unittest.TestCase):
         self.assertNotEqual(rc, 0, "the second remap connected without a queue pair row:\n" + res)
         self.assertIn("remap failed; pids left SIGSTOPped", res)
         self.assertRegex(res, r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ "
-                              r"\(peer qpn %s\)" % first_q.split()[0].rsplit(":", 1)[1])
+                              r"\(peer qpn %s\)" % first_q.split()[0].split(":")[2])
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")

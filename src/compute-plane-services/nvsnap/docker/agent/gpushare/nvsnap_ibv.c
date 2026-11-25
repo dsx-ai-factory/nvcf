@@ -294,10 +294,11 @@ static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
  * its new GID and LID, and its keys and queue pair numbers old -> new, as
  * the current restore's exchange gives them (port: it has the port row).
  * kcount: each sending process's count of its key rows (by its token);
- * nkeys: their sum, the key rows the exchange must hold. */
+ * nkeys: their sum, the key rows the exchange must hold; qsend: the tokens
+ * of the processes that sent queue pair rows (each must send a count). */
 struct rport {
     union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; int port;
-    struct u32map kcount; uint32_t nkeys; int counted;
+    struct u32map kcount, qsend; uint32_t nkeys; int counted;
 };
 static struct rport *rports; static int n_rports;
 #define QCHUNK 1024
@@ -1546,7 +1547,7 @@ static struct vport *qp_port(struct vqp *q)
  *   ibvn:<old GID>:<token> <count>                  how many ibvk lines this
  *                                                   process sends for it (token:
  *                                                   random, one per process)
- *   ibvq:<old GID>:<old qpn> <new qpn>              a queue pair on it
+ *   ibvq:<old GID>:<old qpn>:<token> <new qpn>      a queue pair on it
  *   ibvk:<old GID>:<old rkey> <new rkey>            a registration on its device */
 /* The GID entry a queue pair's exchange rows go under: only for one NCCL
  * connected (it has an RTR address), the entries the restore picks again
@@ -1585,7 +1586,7 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
                 if (mrs[k]->pd->c == q->pd->c && mrs[k]->real)
                     fprintf(fp, "ibvk:%s:%u %u\n", a, mrs[k]->v.rkey, mrs[k]->real->rkey), lines++;
         }
-        fprintf(fp, "ibvq:%s:%u %u\n", a, q->v.qp_num, q->real->qp_num);
+        fprintf(fp, "ibvq:%s:%u:%u %u\n", a, q->v.qp_num, map_token, q->real->qp_num);
         lines++;
     }
     pthread_mutex_unlock(&omu);
@@ -1644,6 +1645,15 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
         snprintf(reply, n, "err the verbs exchange has no key count row for the peer of queue pair %u", q->v.qp_num);
         return -1;
     }
+    const struct u32tab *st = rports[i].qsend.t;
+    for (int k = 0; st && k < st->cap; k++) {
+        uint32_t had;
+        if (st->k[k] != 0xffffffff && map_get(&rports[i].kcount, st->k[k], &had)) {
+            snprintf(reply, n, "err the verbs exchange has queue pair rows from a sender (%u) with no key count row, "
+                     "for the peer of queue pair %u", st->k[k], q->v.qp_num);
+            return -1;
+        }
+    }
     if (nk != rports[i].nkeys) {
         snprintf(reply, n, "err the verbs exchange has %u of the %u key rows for the peer of queue pair %u", nk,
                  rports[i].nkeys, q->v.qp_num);
@@ -1697,7 +1707,7 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     }
     for (int i = 0; i < n_rports; i++) {
         struct rport *r = &rports[i];
-        map_clear(&r->keys), map_clear(&r->qpns), map_clear(&r->kcount);
+        map_clear(&r->keys), map_clear(&r->qpns), map_clear(&r->kcount), map_clear(&r->qsend);
         r->port = 0, r->nkeys = 0, r->counted = 0;
     }
     FILE *fp = path ? fopen(path, "re") : NULL;
@@ -1713,7 +1723,8 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
                      strncmp(line, "ibvn:", 5)))
             continue;
         union ibv_gid g, ng;
-        unsigned x, y;
+        unsigned x, y, tok;
+        int end = 0;
         if (!whole || sscanf(line, "%159s %159s %1s", w1, w2, extra) != 2) {
             line[strcspn(line, "\n")] = 0;
             snprintf(reply, n, "err the verbs exchange has a malformed row: %.80s", line);
@@ -1726,9 +1737,11 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
                 bad = 1;
             }
             r->cur = ng, r->old_lid = x, r->cur_lid = y, r->port = 1;
-        } else if (!strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
-                   sscanf(w2, "%u", &y) == 1) {
-            bad = put_once(&rport_get(&g)->qpns, x, y, w1, reply, n) < 0;
+        } else if (!strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) &&
+                   sscanf(w1 + 38, "%u:%u%n", &x, &tok, &end) == 2 && !w1[38 + end] && sscanf(w2, "%u", &y) == 1) {
+            struct rport *r = rport_get(&g);
+            bad = put_once(&r->qpns, x, y, w1, reply, n) < 0;
+            if (!bad) map_put(&r->qsend, tok, 1);
         } else if (!strncmp(w1, "ibvk:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
                    sscanf(w2, "%u", &y) == 1) {
             bad = put_once(&rport_get(&g)->keys, x, y, w1, reply, n) < 0;
