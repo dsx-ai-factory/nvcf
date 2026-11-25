@@ -460,7 +460,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		// resume is checked: a paused engine takes no requests, so a
 		// source that runs on and does not resume is replaced.
 		var nixlErr error
-		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.procBase, d.targetHostPID, d.toolText, d.hostPID, d.pids, log)
+		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.procBase, d.targetHostPID, d.fabricSession, d.toolText, d.hostPID, d.pids, log)
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}

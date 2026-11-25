@@ -55,6 +55,10 @@ const (
 // RDMA after the pause. The tool has resumed every pid.
 var errNIXLPauseRefused = errors.New("the NIXL KV connector could not release the engine's RDMA state")
 
+// errNIXLPauseUnsupported is a pod opted in to nixl-pause that it does not
+// handle yet: nothing was paused.
+var errNIXLPauseUnsupported = errors.New("nixl-pause: not supported for this workload")
+
 // gpushareNIXLSupported reports whether the GPU tool (its binary's text,
 // gpuToolText) has nixl-pause and nixl-resume. "" is false.
 func gpushareNIXLSupported(toolText string) bool {
@@ -383,14 +387,24 @@ func (a *Agent) nixlPausable(procBase string, sessionHostPID int) map[int]bool {
 }
 
 // pauseNIXLFor is pauseNIXL for the capture of the container whose init is
-// sessionHostPID, opted in when its processes carry the marker and the
-// agent's switch is on. A marker with the switch off is logged and
-// ignored.
-func (a *Agent) pauseNIXLFor(ctx context.Context, procBase string, sessionHostPID int, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
-	optedIn := envOptsIntoNIXLPause(procBase, sessionPIDs(procBase, sessionHostPID))
+// sessionHostPID, opted in when any of its processes carries the marker
+// and the agent's switch is on. A marker with the switch off is logged and
+// ignored. An engine that spans nodes (nixlSpansNodes: the capture joins
+// fabricSession, or a process of the container says so) is refused here,
+// before anything is paused, whether or not a preflight ran: a capture
+// requested through POST /v1/checkpoints runs none.
+func (a *Agent) pauseNIXLFor(ctx context.Context, procBase string, sessionHostPID int, fabricSession, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
+	session := sessionPIDs(procBase, sessionHostPID)
+	optedIn := envOptsIntoNIXLPause(procBase, session)
 	if optedIn && !a.nixlPauseOn() {
 		log.Warn("gpushare: the workload sets " + nixlPauseEnv + "=1, but this cluster does not enable nixl-pause (webhook.nixlPause.enabled); not pausing it")
 		optedIn = false
+	}
+	if optedIn && gpushareNIXLSupported(toolText) {
+		if why := nixlSpansNodes(procBase, session, fabricSession); why != "" {
+			return false, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
+				errNIXLPauseUnsupported, why)
+		}
 	}
 	return pauseNIXL(ctx, optedIn, toolText, hostPID, pids, log)
 }

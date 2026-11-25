@@ -369,7 +369,7 @@ func TestNIXLPause_NeedsTheAgentSwitch(t *testing.T) {
 				t.Errorf("rdma finding severity %q, want %q", fs[0].Severity, tc.wantSev)
 			}
 			calls := fakeNIXL(t, nil, nil)
-			paused, err := a.pauseNIXLFor(context.Background(), base, 5000, nixlToolText, 42, []int{2}, testLog())
+			paused, err := a.pauseNIXLFor(context.Background(), base, 5000, "", nixlToolText, 42, []int{2}, testLog())
 			if err != nil || paused != tc.wantPaused {
 				t.Errorf("pauseNIXLFor = %v, %v; want %v, nil", paused, err, tc.wantPaused)
 			}

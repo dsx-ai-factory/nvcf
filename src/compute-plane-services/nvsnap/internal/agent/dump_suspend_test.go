@@ -158,3 +158,37 @@ func TestDumpAroundSuspend_SwitchOffPausesNoConnector(t *testing.T) {
 		t.Error("the checkpoint records a paused connector")
 	}
 }
+
+// The capture refuses nixl-pause for an engine that spans nodes itself,
+// not only in the preflight (a capture through POST /v1/checkpoints runs
+// none): a capture that joins a multi-node session, or a container one of
+// whose processes says so. Nothing is paused or suspended; ModelExpress,
+// paused first, is resumed.
+func TestDumpAroundSuspend_RefusesNIXLPauseAcrossNodes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		session string
+		initEnv []string
+	}{
+		{"multi-node session", "s1", nil},
+		{"fabric marker on the init", "", []string{"NVSNAP_GPUSHARE_FABRIC=1"}},
+		{"group of two", "", []string{"LWS_GROUP_SIZE=2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, pids := fakeDumpSource(t)
+			fakeMXProc(t, base, 5000, tc.initEnv, []string{"/bin/sh"})
+			s := &dumpSteps{}
+			s.install(t)
+			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}
+			d := s.source(base, pids, false, true)
+			d.fabricSession = tc.session
+			_, err := a.dumpAroundSuspend(context.Background(), d, testLog())
+			if err == nil || !strings.Contains(err.Error(), "spans nodes") || sourceMustBeReplaced(err) {
+				t.Errorf("err = %v, want a refusal naming the limit, source kept", err)
+			}
+			if want := []string{"mx-pause", "mx-resume"}; !slices.Equal(s.calls, want) {
+				t.Errorf("steps = %v, want %v", s.calls, want)
+			}
+		})
+	}
+}
