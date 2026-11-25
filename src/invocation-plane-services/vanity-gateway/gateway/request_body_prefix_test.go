@@ -25,6 +25,7 @@ import (
 	stdjson "encoding/json"
 	"errors"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -879,6 +880,18 @@ func TestShadowReplayLongerThanRouteLimitReachesTarget(t *testing.T) {
 	}
 	assert.Equal(t, len(body), sizes["acme/shadowed"])
 	assert.Greater(t, sizes[prefixTestModel], limit, "the shadow copy must be longer than the route limit")
+}
+
+// TestReadRequestPrefixWithLargestDeclaredLength reads the prefix of a body
+// that declares the largest Content-Length a streamed limit can allow into an
+// empty, zero-capacity buffer. Sizing the buffer from that length must not
+// overflow.
+func TestReadRequestPrefixWithLargestDeclaredLength(t *testing.T) {
+	prefix := &bytebufferpool.ByteBuffer{}
+	complete, err := readRequestPrefix(prefix, strings.NewReader(filler(requestPrefixLimit+1)), math.MaxInt64)
+	require.NoError(t, err)
+	assert.False(t, complete)
+	assert.Len(t, prefix.B, requestPrefixLimit)
 }
 
 func TestPrefixReplayBodyCloseDuringRead(t *testing.T) {

@@ -212,7 +212,9 @@ func readRequestPrefix(prefix *bytebufferpool.ByteBuffer, body io.Reader, conten
 		if len(prefix.B) == cap(prefix.B) {
 			grow := max(cap(prefix.B), requestPrefixMinRead)
 			if contentLength >= 0 && len(prefix.B) == 0 {
-				grow = int(min(contentLength+1, requestPrefixLimit))
+				// Clamp before adding one, so the largest declared length
+				// does not overflow.
+				grow = int(min(contentLength, requestPrefixLimit-1) + 1)
 			}
 			prefix.B = slices.Grow(prefix.B, min(grow, requestPrefixLimit-len(prefix.B)))
 		}
