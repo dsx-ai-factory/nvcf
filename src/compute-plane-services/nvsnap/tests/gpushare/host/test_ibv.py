@@ -104,6 +104,8 @@ static void sysfs_sync(void)
 void fake_gid(int i, int kind) { gkind[i] = kind; sysfs_sync(); }
 void fake_gid_ex_fail(int on) { gid_ex_fail = on; }  /* the GID type query fails */
 void fake_ib(int on) { ib_link = on; sysfs_sync(); }
+static int gid_queries;
+int fake_gid_queries(void) { return gid_queries; }  /* GID table reads, either call */
 /* After a move the two NICs number apart: a number looked up under the
  * wrong device is one the right device rejects. */
 void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
@@ -264,12 +266,13 @@ static void gid_at(struct ibv_context *c, int i, union ibv_gid *g)
     if (!gkind[i]) { g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return; }
     gid_of(epoch, di(c), g);
 }
-int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g) { (void)p; gid_at(c, i, g); return 0; }
+int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g) { (void)p; gid_queries++; gid_at(c, i, g); return 0; }
 /* ibv_query_gid_ex (rdma-core's inline calls this): the entry and its type.
  * Built with NO_GID_EX: a libibverbs older than rdma-core 32, without it. */
 #ifndef NO_GID_EX
 int _ibv_query_gid_ex(struct ibv_context *c, uint32_t p, uint32_t i, struct ibv_gid_entry *e, uint32_t flags, size_t size)
 {
+    gid_queries++;
     if (flags || size < sizeof(*e)) return EINVAL;
     if (gid_ex_fail) return EOPNOTSUPP;
     memset(e, 0, sizeof(*e));
@@ -535,13 +538,13 @@ FK(void, fake_move, void); FK(void, fake_port_block, int); FK(void, fake_fail_ma
 FK(void, fake_fail_init, int); FK(void, fake_fail_destroy, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
 FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
 FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *); FK(int, fake_port_in, void);
-FK(void, fake_gid, int, int); FK(void, fake_gid_ex_fail, int); FK(int, fake_qp_sgid, struct ibv_qp *); FK(void, fake_ib, int);
+FK(void, fake_gid, int, int); FK(void, fake_gid_ex_fail, int); FK(int, fake_qp_sgid, struct ibv_qp *); FK(void, fake_ib, int); FK(int, fake_gid_queries, void);
 static void fakes(void)
 {
 #define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
     G(fake_move); G(fake_port_block); G(fake_fail_marker); G(fake_fail_init); G(fake_fail_destroy); G(fake_err_opcode);
     G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
-    G(fake_qp_receives); G(fake_port_in); G(fake_gid); G(fake_gid_ex_fail); G(fake_qp_sgid); G(fake_ib);
+    G(fake_qp_receives); G(fake_port_in); G(fake_gid); G(fake_gid_ex_fail); G(fake_qp_sgid); G(fake_ib); G(fake_gid_queries);
 #undef G
 }
 
@@ -996,8 +999,9 @@ int main(int argc, char **argv)
         if (!strcmp(c, "roce_type")) fake_gid(4, 1 + IBV_GID_TYPE_ROCE_V2);
         if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
         fake_move();
+        int q0 = fake_gid_queries();
         int r = nvsnap_ibv_restore(rep, sizeof(rep));
-        printf("restore=%d\n", r);
+        printf("restore=%d restore_gid_queries=%d\n", r, fake_gid_queries() - q0);
         if (r) {
             printf("restore_error=%s\n", strstr(rep, "did not report") ? "unknown" : strstr(rep, "no GID of") ? "nomatch" : "other");
             fprintf(stderr, "%s\n", rep);
@@ -1357,6 +1361,13 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["sgid_a"], out["sgid_b"]), ("4", "4"),
                          "the restore took a GID of the same address family but another RoCE type: %s" % out)
         self.assertEqual(out["completed"], "1", out)
+
+    def test_restore_reads_only_the_gids_queue_pairs_use(self):
+        # NCCL read 24 entries; one is in use. The others are not searched
+        # for on the new port (up to 256 reads each).
+        out = self.probe("roce_type")
+        self.assertEqual(out["restore"], "0", out)
+        self.assertLess(int(out["restore_gid_queries"]), 16, out)
 
     def test_restore_without_a_gid_of_the_same_roce_type_is_refused(self):
         out = self.probe("roce_none")

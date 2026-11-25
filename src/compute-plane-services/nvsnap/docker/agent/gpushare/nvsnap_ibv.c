@@ -1386,10 +1386,11 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
         }
         __atomic_add_fetch(&c->gen, 1, __ATOMIC_SEQ_CST);
         /* NCCL reads many GID entries to choose one (some empty); only the
-         * ones a queue pair uses must exist again. A device that fails the
-         * check is closed again, so a retry checks it again. */
+         * ones a queue pair uses must exist again, and only those are
+         * looked for (map and connect read no other). A device that fails
+         * the check is closed again, so a retry checks it again. */
         for (int k = 0; k < c->n_gids && !bad; k++)
-            if (pick_gid(c, &c->gids[k]) && gid_used(c, &c->gids[k])) {
+            if (gid_used(c, &c->gids[k]) && pick_gid(c, &c->gids[k])) {
                 struct vgid *g = &c->gids[k];
                 if (g->type < 0)
                     snprintf(reply, n, "err %s port %d: GID index %d: the provider did not report its type (IB, RoCE v1 or v2) "
