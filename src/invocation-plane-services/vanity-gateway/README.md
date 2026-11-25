@@ -560,6 +560,10 @@ the outcome is known:
 - A `Content-Length` between the two limits on a request that falls back to
   the buffered path is rejected right after the prefix, with the buffered
   limit, and nothing is forwarded.
+- These two rejections answer without reading the rest of the upload. On
+  HTTP/1.1 the response carries `Connection: close` and the gateway closes the
+  connection after it, so the client gets the error even if it waits for a
+  response before sending more.
 - A body of unknown length on the buffered path stops at the buffered limit.
 
 With the streamed limit unset, both limits are equal and requests are handled

@@ -122,3 +122,18 @@ func (b *promotedRequestBody) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+// abandonRequestBody stops a model request body that is rejected unread or
+// after the prefix, without reading more of it. On HTTP/1, closing the body
+// reads up to 256 KiB of the remaining upload, and so does writing the reply
+// on a connection that stays open, so a client that pauses would hold the
+// error. There the reply instead closes the connection, and the server
+// closes the body after the reply is sent. Other bodies are closed now.
+func abandonRequestBody(request *http.Request) {
+	limited, ok := request.Context().Value(limitedRequestBodyKey{}).(*limitedRequestBody)
+	if ok && request.ProtoMajor == 1 {
+		limited.writer.Header().Set("Connection", "close")
+		return
+	}
+	_ = request.Body.Close()
+}

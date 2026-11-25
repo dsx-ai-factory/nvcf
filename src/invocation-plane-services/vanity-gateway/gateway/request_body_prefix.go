@@ -126,7 +126,7 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 	if limit, over := d.declaredLengthOverLimit(request, isMultipart); over {
 		// The body cannot fit any limit that can apply to it, so fail as
 		// reading it would, without reading or forwarding any of it.
-		_ = request.Body.Close()
+		abandonRequestBody(request)
 		return openAIRequestBody{}, requestBodyMode{}, fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: limit})
 	}
 	if isMultipart {
@@ -159,7 +159,7 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 		if d.declaredOverBufferedLimit(request) {
 			// Only a streamed request may pass the buffered limit, and the
 			// declared length already does, so reject before reading more.
-			_ = request.Body.Close()
+			abandonRequestBody(request)
 			releaseRequestBodyBuffer(prefix)
 			return openAIRequestBody{Model: scan.model}, bufferedBodyRead(reason), fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
 		}

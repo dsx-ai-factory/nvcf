@@ -31,9 +31,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
 )
@@ -255,4 +257,53 @@ func TestLimitOverflowConnectionHandling(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestRejectionDoesNotWaitForPausedUpload sends a request that is rejected
+// for its declared length on a real HTTP/1 keep-alive connection, with an
+// unread remainder small enough that net/http would drain it before
+// replying. The client sends only what the gateway reads before it decides,
+// then waits: the error must arrive while the client is paused.
+func TestRejectionDoesNotWaitForPausedUpload(t *testing.T) {
+	const buffered = requestPrefixLimit
+	lateFields := `{"input":"` + filler(3*requestPrefixLimit) + `","model":"` + prefixTestModel + `","stream":false}`
+	tests := []struct {
+		name     string
+		streamed int64
+		body     string
+		sent     int
+		limit    int64
+	}{
+		// Falls back after the prefix with a length between the limits.
+		{"fallback after the prefix", 1 << 20, lateFields, requestPrefixLimit, buffered},
+		// Declares more than the streamed limit, so nothing is read.
+		{"over the streamed limit", 2 * requestPrefixLimit, lateFields, 0, 2 * requestPrefixLimit},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Less(t, len(tc.body)-tc.sent, 256<<10, "the remainder must fit the window net/http drains")
+			var upstreamCalls atomic.Int32
+			addr := assembledSplitLimitServer(t, buffered, tc.streamed, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			conn, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer conn.Close()
+			head := fmt.Sprintf("POST /v1/chat/completions HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", overLimitTestHost, len(tc.body))
+			_, err = io.WriteString(conn, head+tc.body[:tc.sent])
+			require.NoError(t, err)
+
+			// The client sends nothing more. The deadline only bounds a
+			// gateway that waits for the rest of the upload.
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			require.NoError(t, err, "the gateway must answer while the client is paused")
+			payload, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			requireBodyLimitError(t, "/v1/chat/completions", resp.StatusCode, string(payload), tc.limit)
+			assert.True(t, resp.Close, "the connection must close after the reply, since the body was not read")
+			assert.Zero(t, upstreamCalls.Load())
+		})
+	}
 }
