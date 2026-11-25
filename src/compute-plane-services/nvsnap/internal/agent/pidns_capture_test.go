@@ -391,3 +391,45 @@ func TestPIDNSFDs(t *testing.T) {
 		}
 	}
 }
+
+// A checkpoint whose capture paused the NIXL KV connector carries its
+// pid-namespace marker under the NIXL name: an agent from before
+// nixl-resume, which reads only the plain name, finds none and refuses the
+// restore before CRIU (its pod starts cold), while an agent that resumes
+// NIXL reads it. Any other checkpoint keeps the plain name.
+func TestFenceNIXLCheckpoint(t *testing.T) {
+	want := pidNSCapture{Mounts: []string{"/models"}}
+	for _, tc := range []struct {
+		name   string
+		gs     *GPUShareInfo
+		fenced bool
+	}{
+		{"not gpushare", nil, false},
+		{"connector not paused", &GPUShareInfo{PIDs: []int{7}}, false},
+		{"connector paused", &GPUShareInfo{PIDs: []int{7}, NIXL: true, NIXLPIDs: []int{7}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := writePIDNSMarker(dir, want); err != nil {
+				t.Fatal(err)
+			}
+			if err := fenceNIXLCheckpoint(dir, tc.gs); err != nil {
+				t.Fatal(err)
+			}
+			// What an agent from before nixl-resume reads.
+			_, oldErr := os.Stat(filepath.Join(dir, pidNSMarkerFile))
+			if oldVisible := oldErr == nil; oldVisible == tc.fenced {
+				t.Errorf("plain marker present %v, want %v", oldVisible, !tc.fenced)
+			}
+			got, ok, err := readPIDNSMarker(dir)
+			if err != nil || !ok || !reflect.DeepEqual(got, want) {
+				t.Errorf("readPIDNSMarker = %+v, %v, %v; want the marker", got, ok, err)
+			}
+		})
+	}
+	// No marker to fence: the capture fails rather than leave a paused
+	// checkpoint an old agent would restore.
+	if err := fenceNIXLCheckpoint(t.TempDir(), &GPUShareInfo{NIXL: true}); err == nil {
+		t.Error("fenced a checkpoint without a marker")
+	}
+}

@@ -41,6 +41,14 @@ import (
 // carries its pid namespace and lists its external mounts.
 const pidNSMarkerFile = "pidns-restore.json"
 
+// pidNSNIXLMarkerFile is pidNSMarkerFile under the name a checkpoint whose
+// capture paused the NIXL KV connector carries instead (fenceNIXLCheckpoint).
+// An agent from before nixl-resume reads only pidNSMarkerFile: it finds
+// none, and refuses the restore before CRIU as a checkpoint it does not
+// restore, so its pod starts cold rather than run an engine whose
+// connector stays paused. Agents that resume NIXL read either name.
+const pidNSNIXLMarkerFile = "pidns-restore-nixl.json"
+
 // pidNSCapture is the content of pidNSMarkerFile.
 type pidNSCapture struct {
 	// Mounts are the mountpoints declared external at dump, each keyed by
@@ -624,11 +632,29 @@ func writePIDNSMarker(checkpointDir string, c pidNSCapture) error {
 	return os.WriteFile(filepath.Join(checkpointDir, pidNSMarkerFile), b, 0o644)
 }
 
+// fenceNIXLCheckpoint renames the pid-namespace marker of a checkpoint
+// whose capture paused the NIXL KV connector (gs.NIXL) to
+// pidNSNIXLMarkerFile, so that only an agent that can resume the connector
+// restores it. Any other checkpoint keeps its marker.
+func fenceNIXLCheckpoint(checkpointDir string, gs *GPUShareInfo) error {
+	if gs == nil || !gs.NIXL {
+		return nil
+	}
+	if err := os.Rename(filepath.Join(checkpointDir, pidNSMarkerFile), filepath.Join(checkpointDir, pidNSNIXLMarkerFile)); err != nil {
+		return fmt.Errorf("fence the NIXL checkpoint from agents that cannot resume it: %w", err)
+	}
+	return nil
+}
+
 // readPIDNSMarker returns the marker of a checkpoint that carries its pid
-// namespace; ok is false for an in-namespace checkpoint.
+// namespace, under either name (pidNSNIXLMarkerFile); ok is false for an
+// in-namespace checkpoint.
 func readPIDNSMarker(checkpointDir string) (pidNSCapture, bool, error) {
 	var c pidNSCapture
 	b, err := os.ReadFile(filepath.Join(checkpointDir, pidNSMarkerFile))
+	if os.IsNotExist(err) {
+		b, err = os.ReadFile(filepath.Join(checkpointDir, pidNSNIXLMarkerFile))
+	}
 	if os.IsNotExist(err) {
 		return c, false, nil
 	}

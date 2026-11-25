@@ -363,7 +363,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
-	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+	gs, err := a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
 		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
 		closeFabric: closeFabric,
@@ -373,6 +373,14 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return ran, done, cleanup, err
 		},
 	}, log), log)
+	if err != nil {
+		return nil, err
+	}
+	// Only an agent that can resume a paused connector may restore it.
+	if err := fenceNIXLCheckpoint(checkpointDir, gs); err != nil {
+		return nil, err
+	}
+	return gs, nil
 }
 
 // sourceDumpFor completes d, the dump of containerInfo's container, with
