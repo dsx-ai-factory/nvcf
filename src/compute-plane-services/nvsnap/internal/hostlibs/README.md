@@ -10,8 +10,8 @@ of a container's libc, for amd64 and arm64 nodes.
 
 ## Used by
 
-- [`internal/agent`](../agent/): `checkpoint.go` and `gpu_probe.go`
-  (`Dir`, `DriverDir`).
+- [`internal/agent`](../agent/): `checkpoint.go` (`DriverDir`) and
+  `gpu_probe.go` (`Dir`, `DriverDir`).
 - [`internal/cuda`](../cuda/): `checkpoint.go` (`Dir`, `DriverDir`).
 
 ## Key files

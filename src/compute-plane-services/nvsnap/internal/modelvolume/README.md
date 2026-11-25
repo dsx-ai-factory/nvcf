@@ -16,10 +16,16 @@ removes the PersistentVolumes the flow leaves behind.
 
 - [`internal/agent`](../agent/): `modelvolume_controller.go` (claim and PV
   names, staging state, marker files), `l2_integration.go` (`ReaderMode`),
-  and `agent.go`, which runs the `Reaper`.
+  `agent.go` (the `Provisioner` and the `Reaper` it runs),
+  `modelvolume_trust.go` (`State`, `ScopedURI`), `bundle_versions.go`
+  (`HelperVolumeName`), and the rank annotations
+  (`CacheOrdinalAnnotation`, `CacheGroupSizeAnnotation`) in
+  `criu_group.go`, `criu_fallback.go`, `capture_hold.go`,
+  `capture_preflight.go`, `grove_replicas.go` and `lifecycle_metrics.go`.
 - [`internal/webhook`](../webhook/): `model_volume.go`, `cache_volume.go`,
   `reader_steps.go` and `helper.go` (`Key`, `ScopedURI`, `Harden`,
-  `HelperMount`).
+  `HelperMount`), `mutate.go` (`Provisioner`) and `criu_identity.go`
+  (the rank annotations).
 
 ## Key files
 

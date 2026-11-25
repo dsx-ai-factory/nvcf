@@ -9,7 +9,7 @@ nvsnap's logic lives here; `cmd/` binaries wire these together.
 
 ## Package map
 
-Each package has its own README.
+Each Go package has its own README (`criu/` holds only `mountinfo/`).
 
 **Capture / restore core**
 
