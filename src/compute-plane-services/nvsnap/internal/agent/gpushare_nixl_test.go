@@ -518,6 +518,39 @@ func TestNIXL_ProcessWithoutAControlSocket(t *testing.T) {
 	}
 }
 
+// A pause that fails partway resumes every pid it addressed, each of
+// which must answer: a pid that released its connector and then lost its
+// control socket gets no answer, so the source is replaced rather than
+// left with one process paused.
+func TestPauseNIXL_FailedPauseRequiresEveryAddressedPID(t *testing.T) {
+	fakeControlSockets(t, nil)
+	var calls [][]int
+	prev := gpushareNIXL
+	gpushareNIXL = func(_ context.Context, _ int, verb, _ string, pids []int) (string, error) {
+		calls = append(calls, append([]int(nil), pids...))
+		if verb == "nixl-pause" {
+			// 8 released its connector, then its socket went away.
+			fakeControlSockets(t, map[int]bool{8: true})
+			return "pid=7 nixl pause: err engine did not go idle\n", errors.New("exit status 1")
+		}
+		var b strings.Builder
+		for _, p := range pids {
+			if p != 8 {
+				fmt.Fprintf(&b, "pid=%d nixl resume: ok not paused\n", p)
+			}
+		}
+		return b.String(), nil
+	}
+	t.Cleanup(func() { gpushareNIXL = prev })
+	_, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8}, testLog())
+	if !errors.Is(err, errNIXLPauseRefused) || !sourceMustBeReplaced(err) {
+		t.Errorf("err = %v, want the refusal and the source replaced", err)
+	}
+	if len(calls) != 2 || !slices.Contains(calls[1], 8) {
+		t.Errorf("calls = %v, want the resume to address pid 8", calls)
+	}
+}
+
 // The pause records the pids whose connector it released, and the
 // resume requires each of them to answer ok, whatever the socket scan
 // says then: a paused pid without a control socket at the resume is

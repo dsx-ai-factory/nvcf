@@ -192,7 +192,10 @@ func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, 
 	t0 := time.Now()
 	out, err := gpushareNIXL(ctx, hostPID, "nixl-pause", "", pids)
 	if err != nil {
-		return nil, resumeNIXLSource(ctx, hostPID, pids, nil, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
+		// Every pid the pause addressed may have released its connector
+		// before the failure: each must answer the resume ("not paused"
+		// is an answer), or the source is replaced.
+		return nil, resumeNIXLSource(ctx, hostPID, pids, pids, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
 	}
 	l := log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()})
 	paused = nixlPausedPIDs(out, pids)
