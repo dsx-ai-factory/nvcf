@@ -168,6 +168,9 @@ struct vqp {
     int failed;      /* a completion failed: which receives finished is unknown */
     int slot;
     int fresh;  /* re-created by a restore: 1 needs RTR and RTS, 2 RTS */
+    /* The peer "connect" moved it to RTR with, until NCCL's calls open
+     * again: a retried connect must find the same one in its exchange. */
+    struct { int set; uint32_t qpn; uint16_t lid; union ibv_gid gid; } rtr;
 };
 
 #define PUSHP(arr, n, x) do { \
@@ -282,8 +285,9 @@ static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
 }
 
 /* A remote port, by the GID (and LID) its process had before the restore:
- * its new GID and LID, and its keys and queue pair numbers old -> new. */
-struct rport { union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; };
+ * its new GID and LID, and its keys and queue pair numbers old -> new, as
+ * the current restore's exchange gives them (port: it has the port row). */
+struct rport { union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; int port; };
 static struct rport *rports; static int n_rports;
 #define QCHUNK 1024
 static struct vqp **qslots[64]; static int n_qslots;
@@ -1400,7 +1404,7 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
             struct ibv_qp_init_attr a = q->init;
             a.send_cq = ((struct vcq *)q->init.send_cq)->real;
             a.recv_cq = ((struct vcq *)q->init.recv_cq)->real;
-            q->fresh = 1;
+            q->fresh = 1, q->rtr.set = 0;
             if (!(q->real = R.create_qp(q->pd->real, &a))) {
                 snprintf(reply, n, "err create_qp: %s", strerror(errno));
                 bad = 1;
@@ -1512,20 +1516,72 @@ static struct rport *rport_get(const union ibv_gid *old)
     return &rports[n_rports - 1];
 }
 
+/* A queue pair "connect" must bring to its peer: re-created by a restore,
+ * or brought to RTR by an earlier try of this one; and NCCL connected it. */
+static int wants_peer(const struct vqp *q) { return (q->fresh || q->rtr.set) && q->mask[1] & IBV_QP_STATE; }
+
+/* NCCL's RTR attributes for q, with its peer's new GID, LID and queue pair
+ * number from the current exchange (rports). -1 and reply when the
+ * exchange lacks them, or when q is already at RTR with another peer (it
+ * cannot go back without a reset). */
+static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *path, int ferr, char *reply, size_t n)
+{
+    *a = q->attr[1];
+    int i = a->ah_attr.is_global ? rport_find(&a->ah_attr.grh.dgid, 0) : rport_find(NULL, a->ah_attr.dlid);
+    uint32_t qpn;
+    if (i < 0 || !rports[i].port || map_get(&rports[i].qpns, a->dest_qp_num, &qpn)) {
+        if (ferr)
+            snprintf(reply, n, "err cannot read the verbs exchange %s (%s): no new number for the peer of queue pair %u",
+                     path ? path : "(none)", strerror(ferr), q->v.qp_num);
+        else
+            snprintf(reply, n, "err the verbs exchange has no %s for the peer of queue pair %u (peer qpn %u)",
+                     i < 0 || !rports[i].port ? "port row" : "queue pair row", q->v.qp_num, a->dest_qp_num);
+        return -1;
+    }
+    struct vgid *g = qp_gid(q);
+    a->dest_qp_num = qpn;
+    if (a->ah_attr.is_global) {
+        a->ah_attr.grh.dgid = rports[i].cur;
+        if (g) a->ah_attr.grh.sgid_index = g->cur_index;
+    }
+    a->ah_attr.dlid = rports[i].cur_lid;
+    if (q->rtr.set && (q->rtr.qpn != a->dest_qp_num || q->rtr.lid != a->ah_attr.dlid ||
+                       (a->ah_attr.is_global && memcmp(q->rtr.gid.raw, a->ah_attr.grh.dgid.raw, 16)))) {
+        snprintf(reply, n, "err queue pair %u is at RTR with peer qpn %u, and this exchange gives %u: it cannot be retried",
+                 q->v.qp_num, q->rtr.qpn, a->dest_qp_num);
+        return -1;
+    }
+    *ri = i;
+    return 0;
+}
+
 /* Read every process's lines, then bring each queue pair to RTR and RTS
- * as NCCL did, with the peer's new GID, LID and queue pair number. */
+ * as NCCL did, with the peer's new GID, LID and queue pair number. Only
+ * this exchange counts: what an earlier restore's said is forgotten, and
+ * every queue pair is checked against it before any is changed. */
 EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
 {
-    FILE *fp = path ? fopen(path, "re") : NULL;
     char w1[160], w2[160];
     pthread_mutex_lock(&omu);
+    int want = 0;
+    for (int i = 0; i < n_qps; i++) want += wants_peer(qps[i]);
+    if (!want) {  /* nothing re-created: NCCL's calls may be running, leave its mapping alone */
+        pthread_mutex_unlock(&omu);
+        snprintf(reply, n, "ok reconnected 0 queue pair(s)");
+        return 0;
+    }
+    /* NCCL's calls are held (a restore re-created its queue pairs): nobody
+     * reads the tables. */
+    for (int i = 0; i < n_rports; i++) map_clear(&rports[i].keys), map_clear(&rports[i].qpns), rports[i].port = 0;
+    FILE *fp = path ? fopen(path, "re") : NULL;
+    int ferr = fp ? 0 : path ? errno : ENOENT;
     while (fp && fscanf(fp, "%159s %159s", w1, w2) == 2) {
         union ibv_gid g, ng;
         unsigned x, y;
         if (!strncmp(w1, "ibvp:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
             !unhex16(w2, &ng) && sscanf(w2 + 33, "%u", &y) == 1) {
             struct rport *r = rport_get(&g);
-            r->cur = ng, r->old_lid = x, r->cur_lid = y;
+            r->cur = ng, r->old_lid = x, r->cur_lid = y, r->port = 1;
         } else if (!strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
                    sscanf(w2, "%u", &y) == 1) {
             map_put(&rport_get(&g)->qpns, x, y);
@@ -1535,32 +1591,24 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
         }
     }
     if (fp) fclose(fp);
-    int bad = 0, nq = 0;
+    int bad = 0, nq = 0, ri;
+    struct ibv_qp_attr a;
+    for (int i = 0; i < n_qps && !bad; i++)
+        if (wants_peer(qps[i]) && peer_attr(qps[i], &a, &ri, path, ferr, reply, n)) bad = 1;
     for (int i = 0; i < n_qps && !bad; i++) {
         struct vqp *q = qps[i];
-        if (!q->fresh || !(q->mask[1] & IBV_QP_STATE)) continue;  /* not re-created, or never connected */
-        struct ibv_qp_attr a = q->attr[1];
-        int ri = a.ah_attr.is_global ? rport_find(&a.ah_attr.grh.dgid, 0) : rport_find(NULL, a.ah_attr.dlid);
-        uint32_t qpn;
-        if (ri < 0 || map_get(&rports[ri].qpns, a.dest_qp_num, &qpn)) {
-            snprintf(reply, n, "err no new number for the peer of queue pair %u (peer qpn %u)", q->v.qp_num, a.dest_qp_num);
-            bad = 1;
-            break;
-        }
-        struct vgid *g = qp_gid(q);
-        a.dest_qp_num = qpn;
-        if (a.ah_attr.is_global) {
-            a.ah_attr.grh.dgid = rports[ri].cur;
-            if (g) a.ah_attr.grh.sgid_index = g->cur_index;
-        }
-        a.ah_attr.dlid = rports[ri].cur_lid;
-        /* A retry after a failure past RTR goes on from RTR. */
+        if (!wants_peer(q)) continue;  /* not re-created, or never connected */
+        (void)peer_attr(q, &a, &ri, path, ferr, reply, n);  /* checked above */
+        /* A retry after a failure past RTR goes on from RTR (same peer). */
         int e = 0;
         if (q->fresh == 1) {
             if (q->has_ece && R.set_ece) R.set_ece(q->real, &q->ece);
-            if (!(e = R.modify_qp(q->real, &a, q->mask[1]))) q->fresh = 2;
+            if (!(e = R.modify_qp(q->real, &a, q->mask[1]))) {
+                q->fresh = 2;
+                q->rtr.set = 1, q->rtr.qpn = a.dest_qp_num, q->rtr.lid = a.ah_attr.dlid, q->rtr.gid = a.ah_attr.grh.dgid;
+            }
         }
-        if (!e && q->mask[2]) e = R.modify_qp(q->real, &q->attr[2], q->mask[2]);
+        if (!e && q->fresh == 2 && q->mask[2]) e = R.modify_qp(q->real, &q->attr[2], q->mask[2]);
         if (e) {
             snprintf(reply, n, "err reconnect queue pair %u to %s: %s", q->v.qp_num, q->fresh == 1 ? "RTR" : "RTS",
                      strerror(e > 0 ? e : errno));
@@ -1593,6 +1641,7 @@ EXPORT void nvsnap_ibv_open(void)
     pthread_mutex_lock(&omu);
     int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST);
     if (!gone) __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n_qps && !gone; i++) qps[i]->rtr.set = 0;  /* connected: no retry from here */
     pthread_mutex_unlock(&omu);
     if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
     reopen();  /* not if a doom came after the check above */

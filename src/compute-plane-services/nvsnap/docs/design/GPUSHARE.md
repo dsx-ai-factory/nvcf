@@ -458,7 +458,12 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
   exchange. Across nodes, the agent's fabric session merges them. Without
   `--fabric-map`, the tool merges the lists of the pods' own processes.
   `remap` then brings each queue pair to RTR and RTS with its peer's new
-  numbers, and `resume` lets NCCL's verbs calls run again.
+  numbers, and `resume` lets NCCL's verbs calls run again. The peer
+  numbers come from this restore's exchange only, never an earlier
+  one's: `remap` checks every queue pair before it changes any, and
+  fails when the exchange cannot be read or lacks a peer's port or queue
+  pair row. A retried `remap` goes on from RTR only with the same peer
+  numbers; a queue pair at RTR with others fails it.
 
 Every rank NCCL connects must be suspended and restored together, which the
 group checkpoint does. What the library cannot save is refused at one of

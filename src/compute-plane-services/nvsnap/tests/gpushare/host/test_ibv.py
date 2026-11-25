@@ -546,6 +546,35 @@ static int reconnect(void)
     return r;
 }
 
+/* reconnect() with the exchange changed: without the queue pair row of
+ * qpn ("omit"), without the port rows ("noport"), with another new number
+ * for qpn ("bump"), with no file to read ("unreadable"), or as it is. */
+static int reconnect_edited(const char *how, uint32_t qpn)
+{
+    char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160], tail[16];
+    FILE *f = fdopen(mkstemp(full), "w+");
+    FILE *o = fdopen(mkstemp(path), "w");
+    nvsnap_ibv_map(f);
+    rewind(f);
+    snprintf(tail, sizeof(tail), ":%u", qpn);
+    size_t nt = strlen(tail);
+    while (fscanf(f, "%159s %159s", w1, w2) == 2) {
+        size_t n1 = strlen(w1);
+        int row = !strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tail);
+        if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
+        if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+        fprintf(o, "%s %s\n", w1, w2);
+    }
+    fclose(f);
+    fclose(o);
+    unlink(full);
+    if (!strcmp(how, "unreadable")) unlink(path);
+    int r = nvsnap_ibv_connect(path, rep, sizeof(rep));
+    unlink(path);
+    if (r) printf("connect: %s\n", rep);
+    return r;
+}
+
 /* suspend, "move to another node", restore, exchange, reconnect, resume */
 static int cycle(void)
 {
@@ -779,6 +808,62 @@ int main(int argc, char **argv)
         a->attr[2].qp_state = IBV_QPS_RTS;
         int r2 = reconnect();
         printf("first=%d retry=%d state_rts=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTS);
+        return 0;
+    }
+    if (!strcmp(c, "stalemap")) {
+        /* A second restore whose exchange (argv[2]) lacks what a queue
+         * pair needs: the first restore's numbers must not be used, and no
+         * queue pair may move past INIT. */
+        const char *how = argc > 2 ? argv[2] : "";
+        up(1);
+        if (cycle()) return 1;  /* the first restore, with every row */
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        /* qa's row: qb (connected after qa) lacks its peer, so a check
+         * made queue pair by queue pair would already have moved qa. */
+        int k = reconnect_edited(how, qa->qp_num);
+        struct vqp *a = (struct vqp *)qa, *b = (struct vqp *)qb;
+        int untouched = fake_qp_state(a->real) == IBV_QPS_INIT && fake_qp_state(b->real) == IBV_QPS_INIT;
+        int ok = 0;
+        if (!k) {
+            nvsnap_ibv_open();
+            send_t(NULL);
+            struct ibv_wc wc[8];
+            int n = cq->context->ops.poll_cq(cq, 8, wc);
+            for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        }
+        printf("connect=%d untouched=%d completed=%d names_peer=%d\n", k, untouched, ok, !!strstr(rep, "peer"));
+        return 0;
+    }
+    if (!strcmp(c, "remapnorelease")) {
+        /* A remap with nothing re-created (a rollback after a refused
+         * fence: NCCL's calls run) leaves NCCL's mapping alone, whatever
+         * the exchange says. */
+        up(1);
+        if (cycle()) return 1;
+        int k = reconnect_edited("unreadable", 0);
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("connect=%d completed=%d\n", k, ok);
+        return 0;
+    }
+    if (!strcmp(c, "remapchanged")) {
+        /* "connect" fails moving qa to RTS after its RTR; the retry's
+         * exchange gives qa's peer another number. qa is connected to the
+         * old one: the retry must fail, not finish qa from RTR. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *a = (struct vqp *)qa;
+        a->attr[2].qp_state = IBV_QPS_RTR;  /* fails: RTR from RTR */
+        int r1 = reconnect();
+        a->attr[2].qp_state = IBV_QPS_RTS;
+        int r2 = reconnect_edited("bump", qb->qp_num);
+        printf("first=%d retry=%d still_rtr=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTR);
         return 0;
     }
     if (!strcmp(c, "fenceheld")) {
@@ -1111,8 +1196,9 @@ class Ibv(unittest.TestCase):
         moved = [x for x in rounds if "lines" in x]
         self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
 
-    def probe(self, case, **env):
-        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60,
+    def probe(self, case, how=None, **env):
+        p = subprocess.run([os.path.join(self.tmp, "probe"), case] + ([how] if how else []), capture_output=True,
+                           text=True, timeout=60,
                            env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, **env))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
@@ -1175,6 +1261,31 @@ class Ibv(unittest.TestCase):
         out = self.probe("remapretry")
         self.assertNotEqual(out["first"], "0", out)
         self.assertEqual((out["retry"], out["state_rts"]), ("0", "1"), out)
+
+    def test_second_restore_never_uses_the_first_restores_numbers(self):
+        # The second restore's exchange lacks qa's peer: its queue pair
+        # row, its port row, or the whole file. The connect must fail
+        # before any queue pair leaves INIT.
+        for how in ("omit", "noport", "unreadable"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0",
+                                    "connected with the previous restore's mapping (%s): %s" % (how, out))
+                self.assertEqual((out["untouched"], out["names_peer"]), ("1", "1"), out)
+
+    def test_second_restore_with_a_complete_exchange_connects(self):
+        out = self.probe("stalemap", how="complete")
+        self.assertEqual((out["connect"], out["untouched"], out["completed"]), ("0", "0", "1"), out)
+
+    def test_remap_without_a_restore_keeps_the_mapping(self):
+        out = self.probe("remapnorelease")
+        self.assertEqual((out["connect"], out["completed"]), ("0", "1"), out)
+
+    def test_retried_connect_with_another_mapping_fails(self):
+        out = self.probe("remapchanged")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
+        self.assertEqual(out["still_rtr"], "1", out)
 
     def test_sends_after_the_fence_wait_for_the_restore(self):
         out = self.probe("fenceheld")
