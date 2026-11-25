@@ -68,6 +68,10 @@ type Config struct {
 	// CRIUGhostLimit bounds, in bytes, the contents of one deleted file a
 	// dump saves (criu --ghost-limit); 0 is defaultGhostLimit.
 	CRIUGhostLimit int64
+	// CaptureDiskKeepPercent is the share of the checkpoint filesystem, in
+	// percent, a capture must leave free (capture_disk.go); 0 turns the
+	// check off.
+	CaptureDiskKeepPercent int
 	// CRIUMinDriverMajor is the oldest NVIDIA driver major CRIU serves on;
 	// 0 is DefaultCRIUMinDriverMajor (driver_gate.go).
 	CRIUMinDriverMajor int

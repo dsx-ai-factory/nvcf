@@ -188,6 +188,7 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 // (releaseFindings).
 func (a *Agent) containerFindings(ctx context.Context, procBase string, initPID int, pids []int, ns, pod, container string) []PreflightFinding {
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
+	fs = append(fs, a.diskFindings(ctx, procBase, pids, pod, container)...)
 	// The capture runs its tools from the node bundle mounted in the
 	// container, and only there (bundle_tools.go). A companion that started
 	// before its version was mounted here has it mounted into it, when the

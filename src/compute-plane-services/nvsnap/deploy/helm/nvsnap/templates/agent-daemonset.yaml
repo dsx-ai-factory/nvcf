@@ -184,6 +184,7 @@ spec:
             # specs with paths built off this root, and kubelet runs
             # in host namespace.
             - --overlay-root={{ .Values.agent.hostPaths.nvsnapOverlays | default "/var/lib/containerd/nvsnap-overlays" }}
+            - --capture-disk-keep-percent={{ if kindIs "invalid" .Values.agent.captureDiskKeepPercent }}20{{ else }}{{ int .Values.agent.captureDiskKeepPercent }}{{ end }}
             {{- with .Values.agent.criuGhostLimit }}
             - --criu-ghost-limit={{ int64 . }}
             {{- end }}

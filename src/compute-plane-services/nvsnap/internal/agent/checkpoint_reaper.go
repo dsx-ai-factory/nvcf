@@ -12,17 +12,25 @@ package agent
 //     checkpointRetireAge first, past any capture and L2 promote still
 //     running.
 // A checkpoint a pod on this node is restoring from or restored from is
-// kept either way.
+// kept either way. A record abandoned before its verification
+// (verify_abandoned.go) names nothing: its namespace is gone, and it is
+// restored only there. While the checkpoint filesystem is low
+// (capture_disk.go) the age is pressureRetireAge. A retired checkpoint's
+// catalog row goes with it.
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,8 +42,9 @@ import (
 const checkpointRetireAge = 3 * time.Hour
 
 // retirableCheckpoints returns the checkpoints under the agent's
-// checkpoint directory to retire, with their metadata.
-func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) (map[string]*CheckpointMetadata, error) {
+// checkpoint directory to retire, with their metadata: an unnamed instance
+// capture once it is older than age.
+func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time, age time.Duration) (map[string]*CheckpointMetadata, error) {
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
 	blocked := map[string]bool{}
 	if cm, err := cms.Get(ctx, criuRestoreFailedConfigMap, metav1.GetOptions{}); err == nil {
@@ -62,7 +71,7 @@ func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now
 		}
 	}
 	for _, r := range records.Items {
-		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) || !recordUsable(r.Data) {
+		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) || !recordUsable(r.Data) || r.Data[groupAbandonedKey] != "" {
 			continue
 		}
 		for k, v := range r.Data {
@@ -96,7 +105,7 @@ func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now
 			continue
 		}
 		instance := md.CatalogInfo != nil && md.CatalogInfo.InstanceCapture
-		if blocked[id] || (instance && !named[id] && now.Sub(md.CreatedAt) > checkpointRetireAge) {
+		if blocked[id] || (instance && !named[id] && now.Sub(md.CreatedAt) > age) {
 			out[id] = &md
 		}
 	}
@@ -175,6 +184,16 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 
 // reapCheckpoints retires this node's dead checkpoints and their L2 copies.
 func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) {
+	age := checkpointRetireAge
+	if a.checkpointDiskLow() {
+		age = pressureRetireAge
+	}
+	a.reapCheckpointsOlderThan(ctx, pods, now, age)
+}
+
+// reapCheckpointsOlderThan is reapCheckpoints with the age an unnamed
+// instance capture must have.
+func (a *Agent) reapCheckpointsOlderThan(ctx context.Context, pods []corev1.Pod, now time.Time, age time.Duration) {
 	if ids, err := a.retirableCachedirCaptures(ctx, pods, now); err != nil {
 		a.log.WithError(err).Warn("checkpoint reaper: cannot tell the dead cachedir captures; keeping all")
 	} else {
@@ -187,7 +206,7 @@ func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time
 			a.log.WithField("capture", id).Info("checkpoint reaper: retired a cachedir capture that is never seeded from again")
 		}
 	}
-	dead, err := a.retirableCheckpoints(ctx, pods, now)
+	dead, err := a.retirableCheckpoints(ctx, pods, now, age)
 	if err != nil {
 		a.log.WithError(err).Warn("checkpoint reaper: cannot tell the dead checkpoints; keeping all")
 		return
@@ -213,5 +232,32 @@ func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time
 			continue
 		}
 		log.Info("checkpoint reaper: retired a checkpoint that is never restored again")
+		a.dropCatalogRow(ctx, id, log)
+	}
+}
+
+// dropCatalogRow deletes a retired checkpoint's catalog row, and its
+// copies on other nodes, through nvsnap-server (its delete cascades to
+// them); kept rows would list a checkpoint that no longer exists. A
+// failure leaves the row to nvsnap-server's own delete.
+func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry) {
+	if a.config.CatalogURL == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	u := fmt.Sprintf("%s/api/v1/checkpoints/%s", a.config.CatalogURL, url.PathEscape(id))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.WithError(err).Warn("checkpoint reaper: cannot delete the retired checkpoint's catalog row")
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		log.WithField("status", resp.StatusCode).Warn("checkpoint reaper: nvsnap-server kept the retired checkpoint's catalog row")
 	}
 }
