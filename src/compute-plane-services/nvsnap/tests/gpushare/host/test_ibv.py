@@ -79,8 +79,10 @@ static void gid_of(int e, int d, union ibv_gid *g)
 
 int fake_open_contexts(void) { return open_ctxs; }
 /* The GID table of every port: an index below 16 set here holds the IPv4
- * address (gid_of) with RoCE type kind - 1; every other index holds a
- * link-local address, type RoCE v1. As a RoCE NIC: index 3, IPv4 RoCE v2. */
+ * address (gid_of) with RoCE type kind - 1; every other index below 16
+ * holds a link-local address, type RoCE v1; indices from 16 are empty (a
+ * zero GID, ENODATA from the type query). As a RoCE NIC: index 3, IPv4
+ * RoCE v2. */
 static int gkind[16] = { [3] = 1 + IBV_GID_TYPE_ROCE_V2 }, gid_ex_fail;
 void fake_gid(int i, int kind) { gkind[i] = kind; }
 void fake_gid_ex_fail(int on) { gid_ex_fail = on; }  /* the GID type query fails */
@@ -238,7 +240,9 @@ int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_a
 /* static: the probe exports its own ibv_query_gid (the library's). */
 static void gid_at(struct ibv_context *c, int i, union ibv_gid *g)
 {
-    if (i < 0 || i >= 16 || !gkind[i]) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return; }
+    memset(g, 0, sizeof(*g));
+    if (i < 0 || i >= 16) return;
+    if (!gkind[i]) { g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return; }
     gid_of(epoch, di(c), g);
 }
 int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g) { (void)p; gid_at(c, i, g); return 0; }
@@ -249,6 +253,7 @@ int _ibv_query_gid_ex(struct ibv_context *c, uint32_t p, uint32_t i, struct ibv_
     if (gid_ex_fail) return EOPNOTSUPP;
     memset(e, 0, sizeof(*e));
     gid_at(c, i, &e->gid);
+    if (!memcmp(e->gid.raw, (uint8_t[16]){ 0 }, 16)) return ENODATA;
     e->gid_index = i; e->port_num = p;
     e->gid_type = i < 16 && gkind[i] ? gkind[i] - 1 : IBV_GID_TYPE_ROCE_V1;
     return 0;
@@ -953,6 +958,8 @@ int main(int argc, char **argv)
          * when NCCL read it. */
         if (!strcmp(c, "roce_unknown")) { up(0); fake_gid_ex_fail(1); }
         up(1);
+        /* NCCL reads the port's table to choose an entry, empty ones too. */
+        for (int i = 0; i < 24; i++) { union ibv_gid x; ibv_query_gid(ctx, 1, i, &x); }
         fake_gid_ex_fail(0);  /* the new node's provider reports types */
         fake_gid(3, 1 + IBV_GID_TYPE_ROCE_V1);
         if (!strcmp(c, "roce_type")) fake_gid(4, 1 + IBV_GID_TYPE_ROCE_V2);
@@ -961,7 +968,7 @@ int main(int argc, char **argv)
         int r = nvsnap_ibv_restore(rep, sizeof(rep));
         printf("restore=%d\n", r);
         if (r) {
-            printf("restore_error=%s\n", strstr(rep, "type") ? "type" : "other");
+            printf("restore_error=%s\n", strstr(rep, "did not report") ? "unknown" : strstr(rep, "no GID of") ? "nomatch" : "other");
             fprintf(stderr, "%s\n", rep);
             return 0;
         }
@@ -1163,8 +1170,9 @@ class Ibv(unittest.TestCase):
         self.assertGreaterEqual(int(moved[0]["lines"]), 10, p.stdout)  # per device: a port, 2 keys, 2 queue pairs
 
     def probe(self, case, **env):
-        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, **env))
+        e = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake)
+        e.update(env)
+        p = subprocess.run([os.path.join(self.tmp, "probe"), case], capture_output=True, text=True, timeout=60, env=e)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
 
@@ -1314,12 +1322,12 @@ class Ibv(unittest.TestCase):
     def test_restore_without_a_gid_of_the_same_roce_type_is_refused(self):
         out = self.probe("roce_none")
         self.assertNotEqual(out["restore"], "0", "a restore with no GID of the captured RoCE type went on: %s" % out)
-        self.assertEqual(out["restore_error"], "type", out)
+        self.assertEqual(out["restore_error"], "nomatch", out)
 
     def test_restore_without_the_captured_gid_type_is_refused(self):
         out = self.probe("roce_unknown")
         self.assertNotEqual(out["restore"], "0", "a restore whose captured GID type is unknown went on: %s" % out)
-        self.assertEqual(out["restore_error"], "type", out)
+        self.assertEqual(out["restore_error"], "unknown", out)
 
     def test_untracked_queue_pair_refuses_the_checkpoint(self):
         out = self.probe("noslot")
