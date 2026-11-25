@@ -32,7 +32,7 @@ func capturedInstance(t *testing.T) (*criuAutoRestorer, *fake.Clientset, []*core
 	a := &Agent{kubeClient: kc, log: logrus.New()}
 	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("k1"), Namespace: "nvsnap-system"},
 		Data: map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn", "size": "2", "captures": "1",
-			"checkpoint.0": "c0", "checkpoint.1": "c1"}}
+			"startedAt": "t0", "checkpoint.0": "c0", "checkpoint.1": "c1"}}
 	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Create(ctx, record, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestDeleteInstance_ReplacementAdmittedBeforeSiblingDelete(t *testing.T) {
 	}
 	t.Cleanup(func() { deleteMember = prev })
 
-	c.deleteInstance(context.Background(), "k1", members, c.a.log.WithField("t", 1))
+	c.deleteInstance(context.Background(), "k1", "t0", members, c.a.log.WithField("t", 1))
 
 	if !got {
 		t.Errorf("rank 0's replacement, admitted before rank 1's delete was accepted, starts cold: %s", why)
@@ -223,6 +223,41 @@ func TestCommitCapture_StoppedFailureDeletesWithoutRecordRead(t *testing.T) {
 	}
 }
 
+// A capture whose commit is rejected (another capture took the record
+// over since it claimed it) neither publishes nor touches the newer
+// capture's leaving list. Its own pods were stopped by its dump, so they
+// are still deleted, unlisted: their controllers replace them, cold.
+func TestCommitCapture_StaleCommitKeepsNewerListing(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	ctx := context.Background()
+	newerAt := time.Now().UTC().Format(time.RFC3339)
+	if err := c.updateGroupRecord(ctx, "k1", func(d map[string]string) bool {
+		d["startedAt"], d[groupLeavingKey], d[groupLeavingAtKey] = "t1", "newer-0,newer-1", newerAt
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data := map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn", "size": "2", "captures": "1",
+		"startedAt": "t0", "checkpoint.0": "old0", "checkpoint.1": "old1"}
+	published := false
+
+	c.commitCapture(ctx, "k1", "t0", data, members, false, func() { published = true }, c.a.log.WithField("t", 1))
+
+	if published {
+		t.Error("a capture whose commit was rejected was published")
+	}
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data[groupLeavingKey] != "newer-0,newer-1" || cm.Data[groupLeavingAtKey] != newerAt || cm.Data["checkpoint.0"] != "c0" {
+		t.Errorf("record %v, want the newer capture's record and leaving list intact", cm.Data)
+	}
+	if left := remainingPods(t, kc); len(left) != 0 {
+		t.Errorf("pods left %v, want the stale capture's stopped pods deleted", left)
+	}
+}
+
 // admitReplacement is the webhook's decision for a replacement rank: the
 // record it restores from, then the group admission against it.
 func admitReplacement(t *testing.T, a *Agent, pod *corev1.Pod) (bool, string) {
@@ -245,7 +280,7 @@ func TestDeleteInstance_ListsLeavingOnlyOnVerifyingRecord(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	c.deleteInstance(ctx, "k1", members, c.a.log.WithField("t", 1))
+	c.deleteInstance(ctx, "k1", "t0", members, c.a.log.WithField("t", 1))
 	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -255,6 +290,22 @@ func TestDeleteInstance_ListsLeavingOnlyOnVerifyingRecord(t *testing.T) {
 	}
 	if left := remainingPods(t, kc); len(left) != 0 {
 		t.Errorf("pods left %v, want the captured pods deleted all the same", left)
+	}
+}
+
+// The list is written only on the record generation the deleting capture
+// claimed: a record verifying another capture (claimed at another time)
+// keeps its own list.
+func TestDeleteInstance_ListsLeavingOnlyOnOwnCapture(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	ctx := context.Background()
+	c.deleteInstance(ctx, "k1", "t-other", members, c.a.log.WithField("t", 1))
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data[groupLeavingKey] != "" {
+		t.Errorf("another capture's record lists %q leaving", cm.Data[groupLeavingKey])
 	}
 }
 

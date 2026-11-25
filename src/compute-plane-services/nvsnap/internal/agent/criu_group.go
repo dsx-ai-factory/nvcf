@@ -852,10 +852,15 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 
 // commitCapture writes data, a capture's outcome, over group record key,
 // unless another capture took the record over since this one claimed it
-// (started). A capture to verify (data's state verifying) then has
-// published run once the record says so, and its pods, dumped and gone,
-// deleted: their replacements are admitted as the restore's placeholders
-// (or cold, without the record).
+// (started). A capture to verify (data's state verifying) whose outcome
+// was written then has published run, and its pods, dumped and gone,
+// deleted: listed as leaving first, so their replacements are admitted as
+// the restore's placeholders (or cold, without the record).
+//
+// An outcome not written (the record taken over, or unwritable) is not
+// published, and lists nothing: a newer capture's list stays. Its pods
+// were stopped by the dump all the same, so they are deleted, and their
+// controllers replace them, cold.
 //
 // A failed capture that stopped its instance (replaceStopped) has its pods
 // deleted first, without listing them: rather than resume a stopped
@@ -866,9 +871,11 @@ func (c *criuAutoRestorer) commitCapture(ctx context.Context, key, started strin
 		// No key: the record is not being verified, so no replacement of
 		// theirs restores and nothing is listed; a read of it would only
 		// hold the stopped pods back.
-		c.deleteInstance(ctx, "", members, log)
+		c.deleteInstance(ctx, "", "", members, log)
 	}
+	written := false
 	if uerr := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		written = false
 		if d["state"] != criuGroupStateCapturing || d["startedAt"] != started {
 			return false // another capture took the record over
 		}
@@ -878,15 +885,24 @@ func (c *criuAutoRestorer) commitCapture(ctx context.Context, key, started strin
 		for k, v := range data {
 			d[k] = v
 		}
+		written = true
 		return true
 	}); uerr != nil {
+		written = false
 		log.WithError(uerr).Error("CRIU group capture: cannot update the group record")
-	} else if data["state"] == criuGroupStateVerifying {
-		published()
+	} else if !written {
+		log.Warn("CRIU group capture: another capture took the group record over; this one is not recorded")
 	}
-	if data["state"] == criuGroupStateVerifying {
-		c.deleteInstance(ctx, key, members, log)
+	if data["state"] != criuGroupStateVerifying {
+		return
 	}
+	if !written {
+		log.Warn("CRIU group capture: deleting the captured pods unlisted; their replacements start fresh")
+		c.deleteInstance(ctx, "", "", members, log)
+		return
+	}
+	published()
+	c.deleteInstance(ctx, key, started, members, log)
 }
 
 // companionMaxFailures bounds the attempts to tell an instance's
@@ -929,15 +945,16 @@ var deleteMember = (*Agent).deletePodRetrying
 // and a rank's controller can recreate it, and its replacement be
 // admitted, before the API server accepts a sibling's delete. So before
 // the first delete, the members are listed as leaving on the record their
-// replacements restore from (key, when it is being verified): admission
+// replacements restore from (key, when it is being verified by the
+// capture claimed at started): admission
 // takes a listed pod for leaving whether or not its delete is visible yet.
 // Members not listed (the record could not be written) are deleted all the
 // same; a replacement admitted beside one starts cold.
 //
 // Every member's delete is then issued at once, each retried on its own,
 // so the listed pods are gone soon after they are listed.
-func (c *criuAutoRestorer) deleteInstance(ctx context.Context, key string, members []*corev1.Pod, log *logrus.Entry) {
-	c.listLeaving(ctx, key, members, log)
+func (c *criuAutoRestorer) deleteInstance(ctx context.Context, key, started string, members []*corev1.Pod, log *logrus.Entry) {
+	c.listLeaving(ctx, key, started, members, log)
 	var wg sync.WaitGroup
 	for _, p := range members {
 		wg.Add(1)
@@ -952,11 +969,12 @@ func (c *criuAutoRestorer) deleteInstance(ctx context.Context, key string, membe
 }
 
 // listLeaving lists members as leaving on group record key
-// (groupLeavingKey), only when the record is being verified: the capture
-// the members' replacements restore from. Any other record restores no
-// replacement of theirs, and is left as it is.
-func (c *criuAutoRestorer) listLeaving(ctx context.Context, key string, members []*corev1.Pod, log *logrus.Entry) {
-	if key == "" {
+// (groupLeavingKey), only when the record is being verified by the capture
+// claimed at started: the capture the members' replacements restore from.
+// Any other record, or a newer capture's, restores no replacement of
+// theirs, and is left as it is.
+func (c *criuAutoRestorer) listLeaving(ctx context.Context, key, started string, members []*corev1.Pod, log *logrus.Entry) {
+	if key == "" || started == "" {
 		return
 	}
 	uids := make([]string, 0, len(members))
@@ -966,7 +984,7 @@ func (c *criuAutoRestorer) listLeaving(ctx context.Context, key string, members 
 		}
 	}
 	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
-		if d["state"] != criuGroupStateVerifying || len(uids) == 0 {
+		if d["state"] != criuGroupStateVerifying || d["startedAt"] != started || len(uids) == 0 {
 			return false
 		}
 		d[groupLeavingKey], d[groupLeavingAtKey] = strings.Join(uids, ","), time.Now().UTC().Format(time.RFC3339)

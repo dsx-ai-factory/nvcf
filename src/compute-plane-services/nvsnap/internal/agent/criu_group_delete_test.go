@@ -51,7 +51,7 @@ func TestDeleteInstance_RanksTogether(t *testing.T) {
 	}
 	t.Cleanup(func() { deleteMember = prev })
 
-	c.deleteInstance(context.Background(), "k1", []*corev1.Pod{leader, r1}, c.a.log.WithField("t", 1))
+	c.deleteInstance(context.Background(), "k1", "", []*corev1.Pod{leader, r1}, c.a.log.WithField("t", 1))
 
 	if !together {
 		t.Error("one rank's delete waited for another's before both were issued")
