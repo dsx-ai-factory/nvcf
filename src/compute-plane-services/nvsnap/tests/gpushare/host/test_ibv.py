@@ -548,8 +548,12 @@ static int reconnect(void)
 
 /* reconnect() with the exchange changed: without the queue pair row of
  * qpn ("omit"), without the port rows ("noport"), with another new number
- * for qpn ("bump"), with no file to read ("unreadable"), or as it is. */
-static int reconnect_edited(const char *how, uint32_t qpn)
+ * for qpn ("bump"), with a second row for qpn giving alt ("dupq"), with a
+ * second port row giving another LID ("dupp"), with a second row for each
+ * key giving another new key ("dupk"), with every row twice ("twice"),
+ * with no file to read
+ * ("unreadable"), or as it is. */
+static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
 {
     char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160], tail[16];
     FILE *f = fdopen(mkstemp(full), "w+");
@@ -564,6 +568,13 @@ static int reconnect_edited(const char *how, uint32_t qpn)
         if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
         if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
         fprintf(o, "%s %s\n", w1, w2);
+        if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
+        if (!strcmp(how, "twice")) fprintf(o, "%s %s\n", w1, w2);
+        if (!strncmp(w1, "ibvk:", 5) && !strcmp(how, "dupk")) fprintf(o, "%s %lu\n", w1, strtoul(w2, NULL, 10) + 1);
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "dupp")) {
+            char *lid = strrchr(w2, ':');
+            fprintf(o, "%s %.*s:%lu\n", w1, (int)(lid - w2), w2, strtoul(lid + 1, NULL, 10) + 7);
+        }
     }
     fclose(f);
     fclose(o);
@@ -822,7 +833,9 @@ int main(int argc, char **argv)
         if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
         /* qa's row: qb (connected after qa) lacks its peer, so a check
          * made queue pair by queue pair would already have moved qa. */
-        int k = reconnect_edited(how, qa->qp_num);
+        /* dupq: a second row for qa's number gives qb's own: qb, qa's
+         * peer, would be connected to itself. */
+        int k = reconnect_edited(how, qa->qp_num, ((struct vqp *)qb)->real->qp_num);
         struct vqp *a = (struct vqp *)qa, *b = (struct vqp *)qb;
         int untouched = fake_qp_state(a->real) == IBV_QPS_INIT && fake_qp_state(b->real) == IBV_QPS_INIT;
         int ok = 0;
@@ -833,7 +846,8 @@ int main(int argc, char **argv)
             int n = cq->context->ops.poll_cq(cq, 8, wc);
             for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
         }
-        printf("connect=%d untouched=%d completed=%d names_peer=%d\n", k, untouched, ok, !!strstr(rep, "peer"));
+        printf("connect=%d untouched=%d completed=%d names_peer=%d dup=%d\n", k, untouched, ok, !!strstr(rep, "peer"),
+               !!strstr(rep, "two different"));
         return 0;
     }
     if (!strcmp(c, "remapnorelease")) {
@@ -842,7 +856,7 @@ int main(int argc, char **argv)
          * the exchange says. */
         up(1);
         if (cycle()) return 1;
-        int k = reconnect_edited("unreadable", 0);
+        int k = reconnect_edited("unreadable", 0, 0);
         send_t(NULL);
         struct ibv_wc wc[8];
         int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
@@ -862,7 +876,7 @@ int main(int argc, char **argv)
         a->attr[2].qp_state = IBV_QPS_RTR;  /* fails: RTR from RTR */
         int r1 = reconnect();
         a->attr[2].qp_state = IBV_QPS_RTS;
-        int r2 = reconnect_edited("bump", qb->qp_num);
+        int r2 = reconnect_edited("bump", qb->qp_num, 0);
         printf("first=%d retry=%d still_rtr=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTR);
         return 0;
     }
@@ -1273,9 +1287,22 @@ class Ibv(unittest.TestCase):
                                     "connected with the previous restore's mapping (%s): %s" % (how, out))
                 self.assertEqual((out["untouched"], out["names_peer"]), ("1", "1"), out)
 
+    def test_conflicting_duplicate_rows_fail_the_connect(self):
+        # Two rows for one queue pair (or one port) with different values:
+        # the last one must not win.
+        for how in ("dupq", "dupp", "dupk"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0", "a conflicting duplicate row was used (%s): %s" % (how, out))
+                self.assertEqual((out["untouched"], out["dup"]), ("1", "1"), out)
+
     def test_second_restore_with_a_complete_exchange_connects(self):
-        out = self.probe("stalemap", how="complete")
-        self.assertEqual((out["connect"], out["untouched"], out["completed"]), ("0", "0", "1"), out)
+        # As it is, and with every row twice (two processes on one port
+        # both send its rows): identical duplicates are fine.
+        for how in ("complete", "twice"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertEqual((out["connect"], out["untouched"], out["completed"]), ("0", "0", "1"), out)
 
     def test_remap_without_a_restore_keeps_the_mapping(self):
         out = self.probe("remapnorelease")

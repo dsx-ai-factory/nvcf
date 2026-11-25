@@ -1516,6 +1516,18 @@ static struct rport *rport_get(const union ibv_gid *old)
     return &rports[n_rports - 1];
 }
 
+/* One row of the exchange into m: a second row for the same key must give
+ * the same value (two processes on one port both send its rows), else -1
+ * and reply. */
+static int put_once(struct u32map *m, uint32_t k, uint32_t v, const char *row, char *reply, size_t n)
+{
+    uint32_t had;
+    if (map_get(m, k, &had)) { map_put(m, k, v); return 0; }
+    if (had == v) return 0;
+    snprintf(reply, n, "err the verbs exchange has two different rows for %s (%u and %u)", row, had, v);
+    return -1;
+}
+
 /* A queue pair "connect" must bring to its peer: re-created by a restore,
  * or brought to RTR by an earlier try of this one; and NCCL connected it. */
 static int wants_peer(const struct vqp *q) { return (q->fresh || q->rtr.set) && q->mask[1] & IBV_QP_STATE; }
@@ -1574,24 +1586,27 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
      * reads the tables. */
     for (int i = 0; i < n_rports; i++) map_clear(&rports[i].keys), map_clear(&rports[i].qpns), rports[i].port = 0;
     FILE *fp = path ? fopen(path, "re") : NULL;
-    int ferr = fp ? 0 : path ? errno : ENOENT;
-    while (fp && fscanf(fp, "%159s %159s", w1, w2) == 2) {
+    int ferr = fp ? 0 : path ? errno : ENOENT, bad = 0, nq = 0, ri;
+    while (fp && !bad && fscanf(fp, "%159s %159s", w1, w2) == 2) {
         union ibv_gid g, ng;
         unsigned x, y;
         if (!strncmp(w1, "ibvp:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
             !unhex16(w2, &ng) && sscanf(w2 + 33, "%u", &y) == 1) {
             struct rport *r = rport_get(&g);
+            if (r->port && (memcmp(r->cur.raw, ng.raw, 16) || r->old_lid != x || r->cur_lid != y)) {
+                snprintf(reply, n, "err the verbs exchange has two different rows for %s", w1);
+                bad = 1;
+            }
             r->cur = ng, r->old_lid = x, r->cur_lid = y, r->port = 1;
         } else if (!strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
                    sscanf(w2, "%u", &y) == 1) {
-            map_put(&rport_get(&g)->qpns, x, y);
+            bad = put_once(&rport_get(&g)->qpns, x, y, w1, reply, n) < 0;
         } else if (!strncmp(w1, "ibvk:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
                    sscanf(w2, "%u", &y) == 1) {
-            map_put(&rport_get(&g)->keys, x, y);
+            bad = put_once(&rport_get(&g)->keys, x, y, w1, reply, n) < 0;
         }
     }
     if (fp) fclose(fp);
-    int bad = 0, nq = 0, ri;
     struct ibv_qp_attr a;
     for (int i = 0; i < n_qps && !bad; i++)
         if (wants_peer(qps[i]) && peer_attr(qps[i], &a, &ri, path, ferr, reply, n)) bad = 1;
