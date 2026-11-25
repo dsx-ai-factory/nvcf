@@ -541,7 +541,7 @@ capture-once state machine and its hooks are NVCA's code
 | Workload | Hardware | Cold | Restore | Source |
 |---|---|---:|---:|---|
 | Qwen2.5-32B-Instruct, vLLM v0.20.0 TP=4, cachedir | 4x H100, 2026-09-25, agent v0.2.75-election6 | 325 s | 170 s | [BENCHMARKS.md](BENCHMARKS.md#vllm-on-h100-september-2026) |
-| TinyLlama 1.1B, vLLM v0.31.0, disaggregated prefill pod, CRIU with gpushare (scheduled to Ready) | 1x GB300, 2026-11-25, agent v0.2.91-rc22w | 131 s | 28 s | [BENCHMARKS.md](BENCHMARKS.md#disaggregated-vllm-with-nixl-over-rdma-gb300) |
+| TinyLlama 1.1B, vLLM v0.31.0, disaggregated prefill pod, CRIU with gpushare (cold: scheduled to `/health` 200, as nvsnap holds the cold pod out of Ready until its capture; restore: scheduled to Ready) | 1x GB300, 2026-11-25, agent v0.2.91-rc22w | 131 s | 28 s | [BENCHMARKS.md](BENCHMARKS.md#disaggregated-vllm-with-nixl-over-rdma-gb300) |
 | Qwen2.5-72B-Instruct, vLLM 0.20.0 TP=4, CRIU with gpushare, restored on another node (new pod to first token) | 4x GB300, driver 610.57.04 | 363 s (242 s without the download) | 87.8 s from the store, 66.7 s from the node's copy | [design/GPUSHARE.md](design/GPUSHARE.md#validation) |
 
 These are headline rows. Every number whose nvsnap version is recorded is in

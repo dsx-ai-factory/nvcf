@@ -160,8 +160,8 @@ prewarm init container reading the 237 GB capture.
 
 | Result | Where it was | Why it is left out |
 |---|---|---|
-| cachedir on GKE H100, June 2026 (DeepSeek-V4-Flash, gemma-4-31B-it, gpt-oss-120b and 5 more) | the removed `docs/results/BENCHMARK.md` | nvsnap version not recorded |
-| Single-GPU CRIU restore times, July 2026 (v0.2.20 to v0.2.22) | the removed `docs/results/BENCHMARK.md` | Measured on a restore path without gpushare (GPU memory saved by `cuda-checkpoint`); automatic captures now run only under gpushare (`captureGroup`, `internal/agent/criu_group.go`) |
+| cachedir on GKE H100, June 2026 (DeepSeek-V4-Flash, gemma-4-31B-it, gpt-oss-120b and 5 more) | `results/BENCHMARK.md`, removed 2026-11-25 (git history keeps it) | nvsnap version not recorded |
+| Single-GPU CRIU restore times, July 2026 (v0.2.20 to v0.2.22) | `results/BENCHMARK.md`, removed 2026-11-25 (git history keeps it) | Measured on a restore path without gpushare (GPU memory saved by `cuda-checkpoint`); automatic captures now run only under gpushare (`captureGroup`, `internal/agent/criu_group.go`) |
 | gpushare validation runs, October 2026 (Qwen2.5-72B on 4x GB300 and others) | [GPUSHARE.md](design/GPUSHARE.md#validation) | nvsnap version not recorded |
 | Kimi K3 group restores on 2 nodes, 2026-10-24 | [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | An earlier build (v0.2.76-mv194) of the same workload, superseded by the November runs above |
 | Node model cache download and harvest times, November 2026 | [NODE-MODEL-CACHE-2026-11.md](results/NODE-MODEL-CACHE-2026-11.md) | nvsnap version not recorded there; the versioned cold starts above replace it |
