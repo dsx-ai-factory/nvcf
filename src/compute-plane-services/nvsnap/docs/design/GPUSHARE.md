@@ -455,7 +455,9 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
   new dma-buf of the same range from CUDA. The queue pairs go to INIT, and
   the receives NCCL had posted that were still outstanding are posted again.
 - `fabmap` adds the new GIDs, LIDs, queue pair numbers and keys to the
-  exchange, with each process's count of its keys per port. Across
+  exchange, with each process's count of its keys per port. It adds them
+  only for the queue pairs NCCL had connected, whose GID entries the
+  restore picked again. Across
   nodes, the agent's fabric session merges them. Without `--fabric-map`,
   the tool merges the lists of the pods' own processes. `remap` then
   brings each queue pair to RTR and RTS with its peer's new numbers, and

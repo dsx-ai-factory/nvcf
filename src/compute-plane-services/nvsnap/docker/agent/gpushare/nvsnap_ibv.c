@@ -1547,6 +1547,11 @@ static struct vport *qp_port(struct vqp *q)
  *                                                   random, one per process)
  *   ibvq:<old GID>:<old qpn> <new qpn>              a queue pair on it
  *   ibvk:<old GID>:<old rkey> <new rkey>            a registration on its device */
+/* The GID entry a queue pair's exchange rows go under: only for one NCCL
+ * connected (it has an RTR address), the entries the restore picks again
+ * (gid_used); NULL for others, whose rows no peer can need. */
+static struct vgid *map_gid(struct vqp *q) { return q->real && q->mask[1] & IBV_QP_AV ? qp_gid(q) : NULL; }
+
 static uint32_t map_token; static pid_t map_token_pid;  /* this process's token in ibvn lines */
 EXPORT int nvsnap_ibv_map(FILE *fp)
 {
@@ -1561,13 +1566,13 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
     }
     for (int i = 0; i < n_qps; i++) {
         struct vqp *q = qps[i];
-        struct vgid *g = qp_gid(q);
+        struct vgid *g = map_gid(q);
         struct vport *p = qp_port(q);
-        if (!g || !q->real) continue;
+        if (!g) continue;
         hex16(&g->old, a);
         hex16(&g->cur, b);
         int seen = 0;
-        for (int k = 0; k < i && !seen; k++) seen = qp_gid(qps[k]) == g;
+        for (int k = 0; k < i && !seen; k++) seen = map_gid(qps[k]) == g;
         if (!seen) {
             fprintf(fp, "ibvp:%s:%u %s:%u\n", a, p ? p->old_lid : 0, b, p ? p->cur_lid : 0);
             lines++;

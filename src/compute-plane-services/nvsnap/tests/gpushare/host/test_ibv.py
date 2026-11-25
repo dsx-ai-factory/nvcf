@@ -955,6 +955,42 @@ int main(int argc, char **argv)
         printf("nccl_connect=%d held_after_open=%d remap=%d\n", r1 || r2, held, k);
         return 0;
     }
+    if (!strcmp(c, "mapnoav")) {
+        /* qc is at INIT (no RTR address) at the capture, and NCCL read GID
+         * index 0, which no connected queue pair uses: the restore does not
+         * pick that entry again, so the exchange must not send it, nor rows
+         * for qc (no peer can be connected to it). qa and qb's rows stay. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        union ibv_gid g0;
+        ibv_query_gid(ctx, 1, 0, &g0);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        char *buf = NULL, w1[160], w2[160], hex0[33], tc[16];
+        size_t len = 0;
+        FILE *f = open_memstream(&buf, &len);
+        nvsnap_ibv_map(f);
+        fclose(f);
+        hex16(&g0, hex0);
+        snprintf(tc, sizeof(tc), ":%u", qc->qp_num);
+        int rows_qc = 0, port0 = 0, rows_qa = 0, ports = 0, off = 0, k;
+        while (sscanf(buf + off, "%159s %159s%n", w1, w2, &k) == 2) {
+            off += k;
+            size_t n1 = strlen(w1), nt = strlen(tc);
+            if (!strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tc)) rows_qc++;
+            if (!strncmp(w1, "ibvq:", 5) && strtoul(strrchr(w1, ':') + 1, NULL, 10) == qa->qp_num) rows_qa++;
+            if (!strncmp(w1, "ibvp:", 5)) ports++, port0 += !strncmp(w1 + 5, hex0, 32);
+        }
+        free(buf);
+        int k2 = reconnect();
+        printf("rows_qc=%d port0=%d rows_qa=%d ports=%d connect=%d\n", rows_qc, port0, rows_qa, ports, k2);
+        return 0;
+    }
     if (!strcmp(c, "forktoken")) {
         /* A process that forks after its first exchange: the child sends
          * its key counts under a token of its own. */
@@ -1585,6 +1621,12 @@ class Ibv(unittest.TestCase):
         self.assertEqual(out["nccl_connect"], "0", out)
         self.assertEqual(out["held_after_open"], "0", "NCCL's calls stayed held for a queue pair NCCL connected: %s" % out)
         self.assertEqual(out["remap"], "0", out)
+
+    def test_exchange_sends_only_connected_queue_pairs_and_their_ports(self):
+        out = self.probe("mapnoav")
+        self.assertEqual((out["rows_qc"], out["port0"]), ("0", "0"),
+                         "rows for a queue pair without an RTR address, or a GID the restore did not pick: %s" % out)
+        self.assertEqual((out["rows_qa"], out["ports"], out["connect"]), ("1", "1", "0"), out)
 
     def test_forked_process_sends_its_own_key_count_token(self):
         out = self.probe("forktoken")
