@@ -434,7 +434,9 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 	// its suspend to after its resume (kmsg.go, resume_guard.go).
 	var faults *gpuFaultWatch
 	dumped := false
-	nixlPaused := false
+	// nixlResumed: the source's connector came back before the store's
+	// harvest; the deferred rollback has nothing left to do.
+	nixlPaused, nixlResumed := false, false
 	if d.on {
 		// ModelExpress drops its RDMA state, which the dump cannot save,
 		// right before the suspend (gpushare_mx.go). Deferred before the
@@ -464,7 +466,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		}
 		if nixlPaused {
 			defer func() {
-				if sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
+				if !nixlResumed && sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
 					retErr = resumeNIXLSource(ctx, d.hostPID, d.pids, retErr, log)
 				}
 			}()
@@ -519,6 +521,15 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		return nil, errors.Join(resumed, err, resumeErr)
 	}
 	if d.on {
+		// A source left running serves nothing until its connector is back:
+		// resume it before the store's harvest, which may copy across
+		// mounts.
+		if nixlPaused && d.leaveRunning {
+			nixlResumed = true
+			if rerr := resumeNIXLSource(ctx, d.hostPID, d.pids, nil, log); rerr != nil {
+				return nil, rerr
+			}
+		}
 		d.closeFabric()
 		if err := d.collect(gpuMap); err != nil {
 			return nil, err

@@ -113,10 +113,10 @@ func TestDumpAroundSuspend_StepsInOrder(t *testing.T) {
 		{name: "GPU resume fails", dumpRuns: true, fail: []string{"dump", "gpu-resume"}, wantErr: true, wantReplaced: true,
 			want: []string{"mx-pause", "nixl-pause", "suspend", "dump", "gpu-resume"}},
 		{name: "leave running", leaveRunning: true, dumpRuns: true,
-			want: []string{"mx-pause", "nixl-pause", "suspend", "dump", "gpu-resume", "collect", "nixl-resume", "mx-resume"}},
+			want: []string{"mx-pause", "nixl-pause", "suspend", "dump", "gpu-resume", "nixl-resume", "collect", "mx-resume"}},
 		{name: "leave running, connector does not resume", leaveRunning: true, dumpRuns: true, fail: []string{"nixl-resume"},
 			wantErr: true, wantReplaced: true,
-			want: []string{"mx-pause", "nixl-pause", "suspend", "dump", "gpu-resume", "collect", "nixl-resume"}},
+			want: []string{"mx-pause", "nixl-pause", "suspend", "dump", "gpu-resume", "nixl-resume"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base, pids := fakeDumpSource(t)
