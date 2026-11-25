@@ -502,6 +502,7 @@ int main(int argc, char **argv)
 # verbs; each prints key=value words (see the test_ methods below).
 PROBE = r"""
 #define _GNU_SOURCE
+#include <malloc.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/resource.h>
@@ -614,6 +615,9 @@ static int reconnect(void)
  * ("unreadable"), or as it is. */
 static char drop_gid[33];  /* "nogid": leave out every row of this old GID (hex) */
 static char add_row[96];   /* "addrow": one more line */
+/* "bump", "lidbump", "gidbump": the value the exchange had (installed by
+ * the first connect) and the one it gives instead, as a reply prints them. */
+static char edit_was[160], edit_now[160];
 static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
 {
     char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160];
@@ -632,14 +636,43 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
         if (!strcmp(how, "nogid") && !strncmp(w1 + 5, drop_gid, 32)) continue;
         if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
         if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
-        if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+        if (row && !strcmp(how, "bump")) {
+            snprintf(edit_was, sizeof(edit_was), "%s", w2);
+            snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+            snprintf(edit_now, sizeof(edit_now), "%s", w2);
+        }
         if (row && !strcmp(how, "qjunk")) strncat(w2, "junk", sizeof(w2) - strlen(w2) - 1);  /* "1101junk" */
         /* "lidbump" / "gidbump": the port's new LID, or the last byte of its new GID, changed */
         if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "lidbump")) {
             char *lid = strrchr(w2, ':');
+            snprintf(edit_was, sizeof(edit_was), "%s", lid + 1);
             snprintf(lid + 1, sizeof(w2) - (lid + 1 - w2), "%lu", strtoul(lid + 1, NULL, 10) + 7);
+            snprintf(edit_now, sizeof(edit_now), "%s", lid + 1);
         }
-        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "gidbump")) w2[31] = w2[31] == 'f' ? 'e' : 'f';
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "gidbump")) {
+            snprintf(edit_was, sizeof(edit_was), "%.32s", w2);
+            w2[31] = w2[31] == 'f' ? 'e' : 'f';
+            snprintf(edit_now, sizeof(edit_now), "%.32s", w2);
+        }
+        /* "nosep": qpn's row with no blank between its two words: the name
+         * padded to 159 characters with zeros before the sender token, the
+         * value right after it. */
+        if (row && !strcmp(how, "nosep")) {
+            char *tok = strrchr(w1, ':') + 1;
+            fprintf(o, "%.*s%0*lu%s\n", (int)(tok - w1), w1, (int)(159 - (tok - w1)), strtoul(tok, NULL, 10), w2);
+            continue;
+        }
+        /* "wrapcount": 256 more senders on the port, each counting 0xffffff
+         * key rows, and one counting 256: 2^32 more key rows in all, which a
+         * 32-bit total would read as none. "growcount": 40 more senders
+         * counting 0 key rows (a count of 0 is valid), so the count table
+         * outgrows its first allocation, then a malformed row. */
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "wrapcount") && !silent++) {
+            for (int i = 0; i < 256; i++) fprintf(o, "%.38s%d 16777215\n", w1, 1000 + i);
+            fprintf(o, "%.38s1256 256\n", w1);
+        }
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "growcount") && !silent++)
+            for (int i = 0; i < 40; i++) fprintf(o, "%.38s%d 0\n", w1, 2000 + i);
         fprintf(o, "%s %s\n", w1, w2);
         if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
         if (!strcmp(how, "twice")) fprintf(o, "%s %s\n", w1, w2);
@@ -656,7 +689,8 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
     /* "dangling": a last queue pair row with no value; "foreign": a line
      * of another record type (fabric handles share the file). */
     if (!strcmp(how, "dangling")) fprintf(o, "ibvq:%s:99999\n", drop_gid[0] ? drop_gid : "00000000000000000000000000000000");
-    if (!strcmp(how, "wsdangling")) fprintf(o, "  ibvq:%s:99999\n", "00000000000000000000000000000000");
+    if (!strcmp(how, "wsdangling") || !strcmp(how, "growcount"))
+        fprintf(o, "  ibvq:%s:99999\n", "00000000000000000000000000000000");
     if (!strcmp(how, "foreign")) fprintf(o, "fabric:0123456789abcdef 42\n");
     if (!strcmp(how, "addrow")) fprintf(o, "%s\n", add_row);
     fclose(f);
@@ -937,6 +971,21 @@ int main(int argc, char **argv)
         printf("connect=%d untouched=%d completed=%d\n", k, untouched, ok);
         return 0;
     }
+    if (!strcmp(c, "leakretry")) {
+        /* Refused retries whose exchange outgrows a count table before its
+         * malformed row: the memory in use must not grow with them. */
+        up(1);
+        if (cycle()) return 1;
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        int refused = reconnect_edited("growcount", qa->qp_num, 0) != 0;  /* warm up stdio and the tables */
+        size_t before = mallinfo2().uordblks;
+        for (int i = 0; i < 200; i++) refused += reconnect_edited("growcount", qa->qp_num, 0) != 0;
+        size_t after = mallinfo2().uordblks;
+        printf("refused=%d grew=%ld\n", refused, (long)after - (long)before);
+        return 0;
+    }
     if (!strcmp(c, "remapnorelease")) {
         /* A remap with nothing re-created (a rollback after a refused
          * fence: NCCL's calls run) leaves NCCL's mapping alone, whatever
@@ -1139,7 +1188,7 @@ int main(int argc, char **argv)
         b->attr[2].qp_state = IBV_QPS_RTS;
         int qa_rts = fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_RTS;
         int r2 = reconnect_edited(argc > 2 ? argv[2] : "bump", qb->qp_num, 0);
-        printf("first=%d qa_rts=%d retry=%d\n", r1, qa_rts, r2);
+        printf("first=%d qa_rts=%d retry=%d was=%s now=%s\n", r1, qa_rts, r2, edit_was, edit_now);
         return 0;
     }
     if (!strcmp(c, "lateqp")) {
@@ -1717,6 +1766,8 @@ class Ibv(unittest.TestCase):
         "portshort": r"err the verbs exchange has a malformed row: ibvp:%s:\d+ 0" % GID,
         "qjunk": r"err the verbs exchange has a malformed row: ibvq:%s:\d+:\d+ \d+junk" % GID,
         "maxtoken": r"err the verbs exchange has a malformed row: ibvq:%s:99999:4294967295 12345" % GID,
+        "nosep": r"err the verbs exchange has a malformed row: ibvq:%s:\d+:0+" % GID,
+        "wrapcount": r"err the verbs exchange has \d+ of the 4294967\d{3} key rows for the peer of queue pair \d+",
         "dir": r"err cannot read the verbs exchange /tmp/ibvmap\w{6}: Is a directory",
         "omit": r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ \(peer qpn \d+\)",
         "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
@@ -1798,7 +1849,8 @@ class Ibv(unittest.TestCase):
         # The second restore's exchange lacks qa's peer: its queue pair
         # row, its port row, or the whole file. The connect must fail
         # before any queue pair leaves INIT.
-        for how in ("omit", "noport", "unreadable", "dangling", "dir", "wsdangling", "portshort", "qjunk", "maxtoken"):
+        for how in ("omit", "noport", "unreadable", "dangling", "dir", "wsdangling", "portshort", "qjunk", "maxtoken",
+                    "nosep"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0",
@@ -1809,12 +1861,20 @@ class Ibv(unittest.TestCase):
     def test_missing_key_rows_fail_the_connect(self):
         # A peer's key rows, or their count, missing from the exchange: a
         # key NCCL sends would otherwise go out untranslated.
-        for how in ("nokey", "nokeys", "nocount", "silent"):
+        for how in ("nokey", "nokeys", "nocount", "silent", "wrapcount"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0", "connected without the peer's keys (%s): %s" % (how, out))
                 self.assertEqual(out["untouched"], "1", out)
                 self.assertRefused(how, out)
+
+    def test_refused_retries_free_the_tables_they_outgrow(self):
+        # 40 count rows outgrow the first count table, then a malformed row
+        # refuses the exchange: 200 such retries must not grow the heap
+        # (each kept a superseded table before).
+        out = self.probe("leakretry")
+        self.assertEqual(out["refused"], "201", self.probe_stdout)
+        self.assertLess(int(out["grew"]), 16384, "the heap grew %s bytes over 200 refused retries" % out["grew"])
 
     def test_conflicting_duplicate_rows_fail_the_connect(self):
         # Two rows for one queue pair (or one port) with different values:
@@ -1893,9 +1953,13 @@ class Ibv(unittest.TestCase):
                 self.assertEqual((out["qa_rts"]), "1", out)
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "qa at RTS kept its old peer while the retry gave another: %s" % out)
-                f = field[how]
-                self.assertRegex(self.probe_stdout, r"(?m)^connect: err queue pair \d+ was connected to peer %s in this "
-                                                    r"restore, and this exchange gives %s$" % (f, f.split(" ", 1)[1]))
+                # The values the exchange had and gives instead, not only
+                # their shape: the installed one first.
+                self.assertNotEqual(out["was"], out["now"], out)
+                self.assertRegex(out["now"], {"bump": r"^\d+$", "lidbump": r"^\d+$", "gidbump": r"^[0-9a-f]{32}$"}[how], out)
+                self.assertRegex(self.probe_stdout, r"(?m)^connect: err queue pair \d+ was connected to peer %s %s in this "
+                                                    r"restore, and this exchange gives %s$"
+                                 % (field[how].split(" ", 1)[0], re.escape(out["was"]), re.escape(out["now"])))
 
     def test_queue_pair_nccl_connects_after_the_restore_is_not_pending(self):
         out = self.probe("lateqp")

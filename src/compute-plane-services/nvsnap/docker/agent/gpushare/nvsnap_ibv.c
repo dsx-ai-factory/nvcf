@@ -273,6 +273,15 @@ static void map_put(struct u32map *m, uint32_t k, uint32_t v)
     tab_put(t, k, v);
 }
 
+/* map_put for a map no reader can reach (a peer table being built while
+ * NCCL's calls are held): the table it outgrows is freed, not kept. */
+static void map_put_staged(struct u32map *m, uint32_t k, uint32_t v)
+{
+    struct u32tab *t = m->t;
+    map_put(m, k, v);
+    if (t && m->t != t) free(t->k), free(t->v), free(t);
+}
+
 static void map_clear(struct u32map *m)
 {
     if (m->t) memset(m->t->k, 0xff, m->t->cap * 4), m->t->used = 0;
@@ -295,11 +304,12 @@ static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
  * its new GID and LID, and its keys and queue pair numbers old -> new, as
  * the current restore's exchange gives them (port: it has the port row).
  * kcount: each sending process's count of its key rows (by its token);
- * nkeys: their sum, the key rows the exchange must hold; qsend: the tokens
+ * nkeys: their sum (64 bits: the counts cannot wrap), the key rows the
+ * exchange must hold; qsend: the tokens
  * of the processes that sent queue pair rows (each must send a count). */
 struct rport {
     union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; int port;
-    struct u32map kcount, qsend; uint32_t nkeys; int counted;
+    struct u32map kcount, qsend; uint64_t nkeys; int counted;
 };
 static struct rport *rports; static int n_rports;
 #define QCHUNK 1024
@@ -1673,8 +1683,13 @@ static int hex_gid(const char **s, union ibv_gid *g)
 static int row_parse(const char *row, char *w1, char *w2, union ibv_gid *g, uint32_t *x, uint32_t *tok,
                      union ibv_gid *ng, uint32_t *y)
 {
-    char extra[2];
-    if (sscanf(row, "%159s %159s %1s", w1, w2, extra) != 2) return -1;
+    /* Exactly two words, split at blanks: no field width ends a word. */
+    size_t l1 = strcspn(row, " \t");
+    const char *r2 = row + l1 + strspn(row + l1, " \t");
+    size_t l2 = strcspn(r2, " \t");
+    if (!l1 || l1 > 159 || r2 == row + l1 || !l2 || l2 > 159 || r2[l2 + strspn(r2 + l2, " \t")]) return -1;
+    memcpy(w1, row, l1), w1[l1] = 0;
+    memcpy(w2, r2, l2), w2[l2] = 0;
     const char *p = w1 + 5, *q = w2;
     if (strlen(w1) < 5 || hex_gid(&p, g) || *p++ != ':') return -1;
     switch (w1[3]) {
@@ -1704,7 +1719,7 @@ static int row_parse(const char *row, char *w1, char *w2, union ibv_gid *g, uint
 static int put_once(struct u32map *m, uint32_t k, uint32_t v, const char *row, char *reply, size_t n)
 {
     uint32_t had;
-    if (map_get(m, k, &had)) { map_put(m, k, v); return 0; }
+    if (map_get(m, k, &had)) { map_put_staged(m, k, v); return 0; }
     if (had == v) return 0;
     snprintf(reply, n, "err the verbs exchange has two different rows for %s (%u and %u)", row, had, v);
     return -1;
@@ -1750,9 +1765,9 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
             return -1;
         }
     }
-    if (nk != rports[i].nkeys) {
-        snprintf(reply, n, "err the verbs exchange has %u of the %u key rows for the peer of queue pair %u", nk,
-                 rports[i].nkeys, q->v.qp_num);
+    if ((uint64_t)nk != rports[i].nkeys) {
+        snprintf(reply, n, "err the verbs exchange has %u of the %llu key rows for the peer of queue pair %u", nk,
+                 (unsigned long long)rports[i].nkeys, q->v.qp_num);
         return -1;
     }
     struct vgid *g = qp_gid(q);
@@ -1848,7 +1863,7 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
         } else if (row[3] == 'q') {
             struct rport *r = rport_get(&g);
             bad = put_once(&r->qpns, x, y, w1, reply, n) < 0;
-            if (!bad) map_put(&r->qsend, tok, 1);
+            if (!bad) map_put_staged(&r->qsend, tok, 1);
         } else if (row[3] == 'k') {
             bad = put_once(&rport_get(&g)->keys, x, y, w1, reply, n) < 0;
         } else {
