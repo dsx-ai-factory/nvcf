@@ -455,31 +455,44 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
   new dma-buf of the same range from CUDA. The queue pairs go to INIT, and
   the receives NCCL had posted that were still outstanding are posted again.
 - `fabmap` adds the new GIDs, LIDs, queue pair numbers and keys to the
-  exchange, with each process's count of its keys per port. It adds them
-  only for the queue pairs NCCL had connected, whose GID entries the
-  restore picked again. Across
-  nodes, the agent's fabric session merges them. Without `--fabric-map`,
-  the tool merges the lists of the pods' own processes. `remap` then
-  brings each queue pair to RTR and RTS with its peer's new numbers, and
-  `resume` lets NCCL's verbs calls run again. The peer numbers come from
-  this restore's exchange only, never an earlier one's.
-  - `remap` checks every queue pair before it changes any. It fails when
-    the exchange cannot be read, lacks a peer's port or queue pair row,
-    lacks the peer's key count row or any of the keys it counts, or has
-    two rows with different values for one port, queue pair or key.
-    Identical rows are fine.
-  - A retried `remap` goes on from RTR only with the same peer numbers;
-    a queue pair at RTR with others fails it.
-  - `remap` refuses unless NCCL's calls are held, with none in progress
-    after a wait of up to 2 s.
-  - Until every re-created queue pair that NCCL had connected is
-    connected again, an open (`resume`, a `hold`, a gate opening) leaves
-    NCCL's calls held.
+  exchange (`nvsnap_ibv_map`), with each process's count of its keys per
+  port and, on each queue pair row, the process's token. It adds them only
+  for the queue pairs NCCL had connected, whose GID entries the restore
+  picked again. Across nodes, the agent's fabric session merges them.
+  Without `--fabric-map`, the tool merges the lists of the pods' own
+  processes. `remap` (`nvsnap_ibv_connect`) then brings each queue pair to
+  RTR and RTS with its peer's new numbers, and `resume` lets NCCL's verbs
+  calls run again (`nvsnap_ibv_open`). The peer numbers come from this
+  restore's exchange only, never an earlier one's.
+  - A `remap` with no queue pair to reconnect (none re-created since NCCL's
+    calls last ran) is a no-op: `nvsnap_ibv_connect` returns success
+    without reading the exchange, and the rules below do not apply.
+  - A `remap` that reconnects queue pairs checks the exchange for every
+    queue pair of this restore before it changes any (`nvsnap_ibv_connect`,
+    `peer_attr`). That includes queue pairs an earlier try already brought
+    to RTS. It fails when:
+    - the exchange cannot be read, or a verbs row in it does not parse;
+    - it lacks a peer's port or queue pair row;
+    - it lacks the peer's key count row, a count row from a process that
+      sent queue pair rows for that port, or any of the keys counted;
+    - it has two rows with different values for one port, queue pair or
+      key (identical rows are fine).
+  - A retried `remap` goes on from RTR only with the same peer numbers.
+    A queue pair that reached RTR or RTS with other peer numbers in this
+    restore fails it.
+  - A `remap` that reconnects queue pairs refuses unless NCCL's calls are
+    held, with none in progress after a wait of up to 2 s.
+  - `nvsnap_ibv_open` leaves NCCL's calls held while a re-created queue
+    pair that NCCL had connected still needs RTR or RTS. This applies to
+    any open: `resume`, a `hold`, a gate opening.
   - A queue pair NCCL had not connected at the capture is NCCL's to
     connect after the restore. Once NCCL has connected it, nothing waits
-    for it.
-  - Every process of a restore needs a library that sends the key
-    counts. With an older one among them, `remap` fails.
+    for it. If its peer was already connected to it (a capture
+    mid-connect), it sends no row and the `remap` refuses: NCCL would
+    connect it with the peer's old numbers.
+  - A `remap` that reconnects queue pairs needs every process of the
+    restore to run a library that sends key counts and tokens. With an
+    older one among them, it fails.
 
 Every rank NCCL connects must be suspended and restored together, which the
 group checkpoint does. What the library cannot save is refused at one of
