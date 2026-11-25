@@ -566,17 +566,26 @@ impl PylonRuntimeState {
         if let Some(tx) = &self.observation_tx
             && let Err(error) = tx.try_send(event)
         {
-            let (drop_cause, event) = match error {
-                flume::TrySendError::Full(event) => ("full", event),
-                flume::TrySendError::Disconnected(event) => ("disconnected", event),
-            };
-            tracing::warn!(
-                request_id = %event.observation.request_id,
-                model_id = %event.observation.model_id,
-                state = ?event.observation.state,
-                drop_cause,
-                "dropping request observation"
-            );
+            match error {
+                flume::TrySendError::Full(event) => {
+                    tracing::warn!(
+                        request_id = %event.observation.request_id,
+                        model_id = %event.observation.model_id,
+                        state = ?event.observation.state,
+                        drop_cause = "full",
+                        "dropping request observation"
+                    );
+                }
+                flume::TrySendError::Disconnected(event) => {
+                    tracing::debug!(
+                        request_id = %event.observation.request_id,
+                        model_id = %event.observation.model_id,
+                        state = ?event.observation.state,
+                        drop_cause = "disconnected",
+                        "dropping request observation"
+                    );
+                }
+            }
         }
     }
 
@@ -844,14 +853,15 @@ mod tests {
         )
     }
 
-    fn assert_drop_warning(
+    fn assert_drop_event(
         subscriber: &RecordingTracingSubscriber,
         request_id: &str,
         drop_cause: &str,
+        level: tracing::Level,
     ) {
         let events = subscriber.events();
         let event = tracing_event_by_message(&events, "dropping request observation");
-        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(event.level, level);
         assert_tracing_event_field(event, "request_id", request_id);
         assert_tracing_event_field(event, "model_id", "model-a");
         assert_tracing_event_field(event, "state", "UpstreamConnecting");
@@ -1056,11 +1066,16 @@ mod tests {
             ));
         });
 
-        assert_drop_warning(&subscriber, "req-dropped-full", "full");
+        assert_drop_event(
+            &subscriber,
+            "req-dropped-full",
+            "full",
+            tracing::Level::WARN,
+        );
     }
 
     #[test]
-    fn disconnected_observation_channel_warns_with_request_context() {
+    fn stats_collector_stop_disconnected_observation_is_debug() {
         let (runtime_state, observation_rx) = PylonRuntimeState::observed(
             InferenceServerStatus::Active,
             &["model-a".to_string()],
@@ -1077,7 +1092,12 @@ mod tests {
             ));
         });
 
-        assert_drop_warning(&subscriber, "req-dropped-disconnected", "disconnected");
+        assert_drop_event(
+            &subscriber,
+            "req-dropped-disconnected",
+            "disconnected",
+            tracing::Level::DEBUG,
+        );
     }
 
     #[test]

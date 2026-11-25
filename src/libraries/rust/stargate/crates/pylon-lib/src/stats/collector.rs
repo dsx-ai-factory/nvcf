@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -90,11 +92,30 @@ pub(crate) struct StatsCollectorControl {
     tx: flume::Sender<StatsCollectorCommand>,
     /// Cancelled when the collector task ends, however it ends.
     exited: CancellationToken,
+    shutdown_started: CancellationToken,
+    ended_by_shutdown: Arc<AtomicBool>,
 }
 
 pub struct StatsCollectorHandle {
     task: OwnedTask,
     control: StatsCollectorControl,
+    /// Keeps the engine stats stream from mistaking a collector exit for its own.
+    _stats_updates: Option<flume::Receiver<StatsAggregatorUpdate>>,
+}
+
+struct StatsCollectorExitGuard {
+    exited: CancellationToken,
+    shutdown_started: CancellationToken,
+    ended_by_shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for StatsCollectorExitGuard {
+    fn drop(&mut self) {
+        let ended_by_shutdown = self.shutdown_started.is_cancelled() && !std::thread::panicking();
+        self.ended_by_shutdown
+            .store(ended_by_shutdown, Ordering::Release);
+        self.exited.cancel();
+    }
 }
 
 impl StatsCollectorHandle {
@@ -107,10 +128,37 @@ impl StatsCollectorHandle {
     }
 
     pub async fn shutdown(self) {
+        self.control.shutdown_started.cancel();
         self.task
             .shutdown(stargate_runtime::TASK_SHUTDOWN_TIMEOUT)
             .await;
     }
+
+    /// Stops the collector and reports an abnormal exit without resuming a panic.
+    pub async fn shutdown_reporting_panic(self) -> anyhow::Result<()> {
+        let control = self.control.clone();
+        let shutdown =
+            futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(self.shutdown())).await;
+        match shutdown {
+            Err(panic) => Err(match panic_message(&*panic) {
+                Some(message) => {
+                    anyhow::anyhow!(
+                        "stats collector failed: task panicked with message {message:?}"
+                    )
+                }
+                None => anyhow::anyhow!("stats collector failed: task panicked"),
+            }),
+            Ok(()) if control.ended_by_shutdown().await => Ok(()),
+            Ok(()) => Err(anyhow::anyhow!("stats collector exited unexpectedly")),
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +265,12 @@ impl StatsCollectorControl {
                 acknowledged.try_recv().map_err(|_| StatsCollectorStopped)
             }
         }
+    }
+
+    /// Waits for the exit record because reply senders can drop before it is written.
+    pub(crate) async fn ended_by_shutdown(&self) -> bool {
+        self.exited.cancelled().await;
+        self.ended_by_shutdown.load(Ordering::Acquire)
     }
 }
 
@@ -330,9 +384,16 @@ pub fn start_stats_collector_with_engine_stats(
     }
     let (control_tx, control_rx) = flume::bounded(aggregator.config.observation_channel_capacity);
     let exited = CancellationToken::new();
-    let exited_guard = exited.clone().drop_guard();
+    let shutdown_started = CancellationToken::new();
+    let ended_by_shutdown = Arc::new(AtomicBool::new(false));
+    let exit_guard = StatsCollectorExitGuard {
+        exited: exited.clone(),
+        shutdown_started: shutdown_started.clone(),
+        ended_by_shutdown: ended_by_shutdown.clone(),
+    };
+    let stats_updates = stats_update_rx.clone();
     let task = OwnedTask::spawn("stats collector", move |stop| async move {
-        let _exited = exited_guard;
+        let _exit_guard = exit_guard;
         run_stats_collector(
             aggregator,
             observation_rx,
@@ -347,7 +408,10 @@ pub fn start_stats_collector_with_engine_stats(
         control: StatsCollectorControl {
             tx: control_tx,
             exited,
+            shutdown_started,
+            ended_by_shutdown,
         },
+        _stats_updates: stats_updates,
     }
 }
 
@@ -4749,6 +4813,8 @@ mod tests {
             let control = StatsCollectorControl {
                 tx,
                 exited: exited.clone(),
+                shutdown_started: CancellationToken::new(),
+                ended_by_shutdown: Arc::new(AtomicBool::new(false)),
             };
             let request_state = Arc::new(std::sync::atomic::AtomicU8::new(REQUEST_NOT_POLLED));
             let (polled_tx, polled_rx) = std::sync::mpsc::channel();
@@ -4821,5 +4887,51 @@ mod tests {
              was never opened. tokio-util's CancellationToken may no longer hold the \
              parent's lock while it wakes a child. Results: {skipped:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_collector_stop_panic_during_shutdown_is_not_a_clean_shutdown() {
+        let (_observation_tx, observation_rx) = flume::bounded(1);
+        let collector = start_stats_collector(
+            StatsCollectorConfig {
+                kv_cache_poll_interval: Duration::ZERO,
+                ..StatsCollectorConfig::default()
+            },
+            observation_rx,
+            PylonRuntimeState::default(),
+        );
+        let control = collector.control();
+
+        let error = collector
+            .shutdown_reporting_panic()
+            .await
+            .expect_err("the collector panic should be returned");
+        assert!(error.to_string().contains("period"));
+        assert!(
+            !control.ended_by_shutdown().await,
+            "a panic during shutdown must remain an abnormal collector exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_keeps_engine_stats_channel_open_while_handle_exists() {
+        let config = StatsCollectorConfig {
+            kv_cache_poll_interval: Duration::ZERO,
+            ..StatsCollectorConfig::default()
+        };
+        let (stats_update_tx, stats_update_rx) = stats_aggregator_update_channel(&config);
+        let (_observation_tx, observation_rx) = flume::bounded(1);
+        let mut collector = start_stats_collector_with_engine_stats(
+            config,
+            observation_rx,
+            Some(stats_update_rx),
+            PylonRuntimeState::default(),
+        );
+
+        let exit = collector.wait_for_exit().await;
+        assert!(matches!(exit, Err(error) if error.is_panic()));
+        stats_update_tx
+            .try_send(StatsAggregatorUpdate::EnableOpenAiFallback)
+            .expect("the collector handle should keep the engine stats channel open");
     }
 }

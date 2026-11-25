@@ -82,6 +82,13 @@ pub(crate) fn assert_tracing_event_field(
 }
 
 impl tracing::Subscriber for RecordingTracingSubscriber {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         metadata.level() <= &tracing::Level::DEBUG
     }
