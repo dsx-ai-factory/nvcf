@@ -437,7 +437,7 @@ func TestRegrant(t *testing.T) {
 
 	// A failed write revokes the grant: nothing half-written stays.
 	g := newFakeEtcd(t)
-	g.setFail("/v3/kv/put", true)
+	g.setFail("/v3/kv/txn", true)
 	if err := regrant(ctx, g.client(), id, idNewIP); identityDecision(err) != identityRefusedError {
 		t.Fatalf("failed put: %v", err)
 	}
@@ -506,12 +506,13 @@ func TestClaimIdentity_Concurrent(t *testing.T) {
 	// Both read the record before either writes (the fake has no
 	// versions of its own: the reactor gives them).
 	var mu sync.Mutex
-	version := 0
+	version, conflicts := 0, 0
 	kc.PrependReactor("update", "configmaps", func(act k8stesting.Action) (bool, runtime.Object, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		cm := act.(k8stesting.UpdateAction).GetObject().(*corev1.ConfigMap)
 		if cm.ResourceVersion != strconv.Itoa(version) {
+			conflicts++
 			return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), cm.Name, errors.New("stale"))
 		}
 		version++
@@ -522,6 +523,18 @@ func TestClaimIdentity_Concurrent(t *testing.T) {
 		}
 		return true, cm, nil
 	})
+	// Both claimants read the record before either writes: the first two
+	// reads wait for each other.
+	var gets sync.WaitGroup
+	gets.Add(2)
+	var getN atomic.Int32
+	identityClaimReadHook = func() {
+		if getN.Add(1) <= 2 {
+			gets.Done()
+			gets.Wait()
+		}
+	}
+	t.Cleanup(func() { identityClaimReadHook = nil })
 	c := idAgent(kc, true).criuRestorer()
 	errs := make([]error, 2)
 	var wg sync.WaitGroup
@@ -541,8 +554,8 @@ func TestClaimIdentity_Concurrent(t *testing.T) {
 			t.Errorf("loser: %v", err)
 		}
 	}
-	if won != 1 {
-		t.Fatalf("%d claims won: %v", won, errs)
+	if won != 1 || conflicts != 1 {
+		t.Fatalf("%d claims won, %d conflicts: %v", won, conflicts, errs)
 	}
 }
 
@@ -626,6 +639,19 @@ func TestLeaseKeeper(t *testing.T) {
 		if _, z, _ := calls.get(); k.outcome != identityHandoffTimeout || z != 1 {
 			t.Fatalf("outcome %s, zombie %d", k.outcome, z)
 		}
+	})
+	t.Run("a renewal right after resume (a leader change) is not a handoff", func(t *testing.T) {
+		f := newFakeEtcd(t)
+		k, _ := start(f, 4)
+		k.restored(nil)
+		time.Sleep(2 * time.Second)
+		f.refresh(idLease) // the TTL now runs ahead of the agent's own renewal
+		select {
+		case <-k.done:
+			t.Fatalf("ended %s on one renewal not its own", k.outcome)
+		case <-time.After(5 * time.Second):
+		}
+		k.restored(errors.New("stop")) // no effect: already resumed
 	})
 	t.Run("restored engine already running: handed off, not revoked", func(t *testing.T) {
 		f := newFakeEtcd(t)
@@ -788,6 +814,7 @@ func TestLoneRestore_AgentRestartAdoptsIdentity(t *testing.T) {
 	rec := idRecord(t, keys, f)
 	pod := idPlaceholder("w-new", idNewIP)
 	rec.Data[identityHolderKey] = holderOf(pod)
+	rec.Data[identityGrantedKey] = holderOf(pod)
 	f.grant(idLease, 2)
 	stop := make(chan struct{})
 	defer close(stop)
@@ -902,7 +929,9 @@ func TestLoneRestore_LiveLeaseRefused(t *testing.T) {
 		t.Error("the checkpoint was blocked for a refusal")
 	}
 	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
-	if cm.Data["stalls"] != "" || cm.Data["state"] != criuGroupStateComplete || cm.Data[identityHolderKey] != "" {
+	// Deleted (it could not start cold here): its replacement may be
+	// refused the same way, so the refusal counts toward the stall bound.
+	if cm.Data["stalls"] != "1" || cm.Data["state"] != criuGroupStateComplete || cm.Data[identityHolderKey] != "" {
 		t.Errorf("record after a refusal: stalls %q state %q holder %q", cm.Data["stalls"], cm.Data["state"], cm.Data[identityHolderKey])
 	}
 	if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
@@ -969,7 +998,7 @@ func TestIdentityRestore_FlagOff(t *testing.T) {
 	plain0 := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("k0"), Namespace: "nvsnap-system"},
 		Data: map[string]string{"state": criuGroupStateComplete, "size": "1", "checkpoint.0": "c0"}}
 	_, _ = kc.CoreV1().ConfigMaps("nvsnap-system").Create(ctx, plain0, metav1.CreateOptions{})
-	k, _, err := c.loneIdentityBeforeRestore(ctx, ctx, "k0", "shared", "w-new", "c0", idLog())
+	k, _, err := c.loneIdentityBeforeRestore(ctx, ctx, "k0", "shared", "w-new", "w-new-uid", "c0", idLog())
 	if k != nil || err != nil || opened.Load() != 0 {
 		t.Fatalf("flag off: keeper %v err %v, registry opened %d", k, err, opened.Load())
 	}
@@ -1235,8 +1264,8 @@ func TestGroupRestore_Identity(t *testing.T) {
 				if cm.Data[identityHolderKey] != "" {
 					t.Errorf("a refused restore kept the claim %q", cm.Data[identityHolderKey])
 				}
-				if cm.Data["stalls"] != "" {
-					t.Errorf("a refusal counted a stall: %q", cm.Data["stalls"])
+				if cm.Data["stalls"] != "1" {
+					t.Errorf("a refusal whose pods were deleted counted %q stalls; want 1, so the cycle is bounded", cm.Data["stalls"])
 				}
 				return
 			}
@@ -1311,5 +1340,159 @@ func TestSharedRecheck(t *testing.T) {
 	c = idAgent(fake.NewSimpleClientset(leader), true).criuRestorer()
 	if _, skip := c.sharedRecheck(ctx, leader, false, idLog()); skip {
 		t.Error("a capture in an unshared namespace was skipped")
+	}
+}
+
+// An adoption needs the grant on record: a claim alone (an agent that
+// stopped before it had the lease) does not skip the wait for the source's
+// lease or the grant.
+func TestLoneRestore_ClaimAloneIsNotAdopted(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	rec.Data[identityHolderKey] = holderOf(pod) // claimed, never granted
+	f.grant(idLease, 2)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() { // the source's lease, still renewed by someone
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(300 * time.Millisecond):
+				f.refresh(idLease)
+			}
+		}
+	}()
+	useFakeEtcd(t, f)
+	kc := fake.NewSimpleClientset(rec, pod)
+	c := idAgent(kc, true).criuRestorer()
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restored := false
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		restored = true
+		return &RestoreResult{}, nil
+	}
+	c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
+	if restored {
+		t.Fatal("a claim alone adopted a live lease it never had granted")
+	}
+}
+
+// A key another lease holds now is not taken over by the restore.
+func TestWriteIdentityKeys_KeyOfAnotherLease(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	id, err := identityFromRecord(idRecord(t, keys, f).Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.kvs = map[string]etcdKV{}
+	f.mu.Unlock()
+	f.grant(idLease, 30)
+	f.grant(99, 30)
+	f.put(keys[3], "another worker's", 99)
+	if err := writeIdentityKeys(ctx, f.client(), id, idNewIP); err == nil {
+		t.Fatal("a key of another lease was overwritten")
+	}
+	if v, _ := f.value(keys[3]); v != "another worker's" {
+		t.Fatalf("the other worker's key changed: %q", v)
+	}
+	// Absent keys, and keys already under the lease, are written.
+	f.put(keys[3], "old", idLease)
+	if err := writeIdentityKeys(ctx, f.client(), id, idNewIP); err != nil {
+		t.Fatal(err)
+	}
+	keysName(t, f, keys, idNewIP, idOldIP)
+}
+
+// A registration that changes between the reads is not saved.
+func TestReadIdentity_ChangedWhileRead(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	f.grant(idLease, 30)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	f.onTimeToLive = func() {
+		f.kvs[keys[3]] = etcdKV{Key: []byte(keys[3]), Value: []byte(`{"path":"http://` + idOldIP + `:9091/new"}`), Lease: idLease}
+	}
+	if _, err := readIdentity(ctx, f.client(), []string{idOldIP}, idEtcdEP); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("a changing registration was saved: %v", err)
+	}
+}
+
+// A worker that renews a short lease often enough that every poll reads
+// the same whole-second TTL is still seen keeping it (no rise between
+// polls is needed).
+func TestLeaseKeeper_FlatSamples(t *testing.T) {
+	fastIdentity(t)
+	f := newFakeEtcd(t)
+	f.grant(idLease, 2)
+	k := newLeaseKeeper(f.client(), idLease, 2, idLog())
+	zombie := false
+	k.onZombie = func() { zombie = true }
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(100 * time.Millisecond):
+				f.refresh(idLease) // the fake reads 1 s nearly always
+			}
+		}
+	}()
+	go k.run(context.Background())
+	k.restored(nil)
+	select {
+	case <-k.done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("keeper did not end")
+	}
+	if k.outcome != identityHandoffSeen || zombie {
+		t.Fatalf("outcome %s, zombie %v", k.outcome, zombie)
+	}
+}
+
+// A stale attempt for a pod since replaced under the same name touches
+// neither the replacement nor the identity.
+func TestLoneRestore_ReplacedPodLeftAlone(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	opened, _ := useFakeEtcd(t, f)
+	pod := idPlaceholder("w-new", idNewIP) // the replacement, UID w-new-uid
+	kc := fake.NewSimpleClientset(rec, pod)
+	c := idAgent(kc, true).criuRestorer()
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restored := false
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) { restored = true; return nil, nil }
+	c.restore(ctx, "shared", "w-new", "stale-uid", "ck", "main", idKey)
+	if restored || opened.Load() != 0 {
+		t.Fatalf("restored %v, registry opened %d", restored, opened.Load())
+	}
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the replacement was deleted: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); cm.Data[identityHolderKey] != "" {
+		t.Errorf("claimed for a stale attempt: %q", cm.Data[identityHolderKey])
+	}
+}
+
+// Every address of a dual-stack member is kept.
+func TestMemberAddresses_DualStack(t *testing.T) {
+	p := idWorker("w", "10.0.0.1")
+	p.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.1"}, {IP: "fd00::1"}}
+	if got := strings.Join(memberAddresses([]*corev1.Pod{p}), ","); got != "10.0.0.1,fd00::1" {
+		t.Fatalf("addresses %s", got)
 	}
 }

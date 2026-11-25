@@ -276,7 +276,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			// admitted under the cluster's drivers as they are now.
 			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
 		}
-		keeper, target, ierr := c.loneIdentityBeforeRestore(rctx, ctx, groupKey, ns, pod, id, log)
+		keeper, target, ierr := c.loneIdentityBeforeRestore(rctx, ctx, groupKey, ns, pod, uid, id, log)
 		if ierr != nil {
 			refusedPod = target
 			return ierr
@@ -319,7 +319,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			refusedPod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid,
 				Annotations: map[string]string{webhook.CRIURestoreContainerAnnotation: container}}}
 		}
-		c.identityRefused(context.WithoutCancel(ctx), []*corev1.Pod{refusedPod}, err, log)
+		c.identityRefused(context.WithoutCancel(ctx), groupKey, id, []*corev1.Pod{refusedPod}, err, log)
 		return
 	}
 	if errors.Is(err, errNotPlaceholder) {

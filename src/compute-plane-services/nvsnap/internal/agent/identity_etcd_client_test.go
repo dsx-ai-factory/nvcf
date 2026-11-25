@@ -107,6 +107,7 @@ func TestIdentityRoundTrip_RealEtcd(t *testing.T) {
 		t.Skip("NVSNAP_TEST_ETCD_URL not set")
 	}
 	fastIdentity(t)
+	identityExpirySlack = 3 * time.Second // a real etcd expires leases on its own ticks
 	ctx := context.Background()
 	e := &etcdGateway{bases: []string{u}, client: http.DefaultClient}
 	id := time.Now().UnixNano() &^ 0xff
@@ -140,4 +141,35 @@ func TestIdentityRoundTrip_RealEtcd(t *testing.T) {
 		t.Fatalf("rewritten key: %+v %v", kv, err)
 	}
 	_ = e.Revoke(ctx, id)
+}
+
+// PutOwned against a real etcd: absent and own keys are written, another
+// lease's key is left as it is.
+func TestPutOwned_RealEtcd(t *testing.T) {
+	u := os.Getenv("NVSNAP_TEST_ETCD_URL")
+	if u == "" {
+		t.Skip("NVSNAP_TEST_ETCD_URL not set")
+	}
+	ctx := context.Background()
+	e := &etcdGateway{bases: []string{u}, client: http.DefaultClient}
+	mine, other := time.Now().UnixNano()&^0xff, time.Now().UnixNano()|0xff
+	t.Cleanup(func() { _ = e.Revoke(ctx, mine); _ = e.Revoke(ctx, other) })
+	for _, id := range []int64{mine, other} {
+		if err := e.Grant(ctx, id, 30); err != nil {
+			t.Fatal(err)
+		}
+	}
+	k := []byte("v1/putowned/" + strconv.FormatInt(mine, 16))
+	if ok, err := e.PutOwned(ctx, k, []byte("a"), mine); err != nil || !ok {
+		t.Fatalf("absent key: %v %v", ok, err)
+	}
+	if ok, err := e.PutOwned(ctx, k, []byte("b"), mine); err != nil || !ok {
+		t.Fatalf("own key: %v %v", ok, err)
+	}
+	if ok, err := e.PutOwned(ctx, k, []byte("c"), other); err != nil || ok {
+		t.Fatalf("another lease's key: %v %v", ok, err)
+	}
+	if kv, _ := e.Get(ctx, k); kv == nil || string(kv.Value) != "b" || kv.Lease != mine {
+		t.Fatalf("key now %+v", kv)
+	}
 }

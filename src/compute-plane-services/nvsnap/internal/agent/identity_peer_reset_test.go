@@ -57,11 +57,15 @@ func TestPeerResetContext(t *testing.T) {
 		t.Fatal("lost")
 	}
 	if a := (&Agent{}); true {
-		if r, err := a.beginPeerReset(dumpV2Opts{}, "/proc", 1, idLog()); r != nil || err != nil {
+		if r, err := a.beginPeerReset(dumpV2Opts{}, 1, idLog()); r != nil || err != nil {
 			t.Fatal("a dump not asked to reset began one")
 		}
-		if r, err := a.beginPeerReset(dumpV2Opts{ResetPeersOutside: []string{"10.0.0.1"}, LeaveRunning: true}, "/proc", 1, idLog()); r != nil || err != nil {
+		if r, err := a.beginPeerReset(dumpV2Opts{ResetPeersOutside: []string{"10.0.0.1"}, LeaveRunning: true}, 1, idLog()); r != nil || err != nil {
 			t.Fatal("a leave-running dump began a reset")
+		}
+		// Flag off: a direct request asking for the reset is not obeyed.
+		if r, err := a.beginPeerReset(dumpV2Opts{ResetPeersOutside: []string{"10.0.0.1"}}, os.Getpid(), idLog()); r != nil || err != nil {
+			t.Fatal("a reset began with identity restore off")
 		}
 	}
 }
@@ -77,12 +81,12 @@ func TestEndPeerReset(t *testing.T) {
 	a := &Agent{}
 	ctx := context.Background()
 	dumpErr := errors.New("dump failed")
-	if err := a.endPeerReset(ctx, nil, dumpErr, false, "/x"); !errors.Is(err, dumpErr) {
-		t.Fatal("no reset changed the dump's outcome")
+	if err := a.endPeerReset(ctx, nil, dumpErr, false, "/x"); err != nil {
+		t.Fatal("no reset reported a failure")
 	}
 	conns := []tcpTuple{{Local: netip.MustParseAddrPort("10.0.0.1:1"), Remote: netip.MustParseAddrPort("10.0.0.9:2379")}}
 	r := &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
-	if err := a.endPeerReset(ctx, r, dumpErr, false, "/x"); !errors.Is(err, dumpErr) || unlocks != 0 {
+	if err := a.endPeerReset(ctx, r, dumpErr, false, "/x"); err != nil || unlocks != 0 {
 		t.Fatal("a failed dump was unlocked")
 	}
 	r = &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
@@ -98,6 +102,21 @@ func TestEndPeerReset(t *testing.T) {
 	}
 	if decisions(t, identityPeersResetFailed) != before+1 {
 		t.Error("failure not counted")
+	}
+	// The failure reaches the capture as one whose source must be
+	// replaced, never a dump to roll back; a capture that failed anyway
+	// keeps its own error.
+	o := &peerResetOutcome{}
+	o.set(errors.New("unlock failed"))
+	if err := o.fail(nil); !errors.Is(err, errSourceLeftSuspended) || !sourceMustBeReplaced(err) {
+		t.Fatalf("reset failure: %v", err)
+	}
+	if err := o.fail(dumpErr); !errors.Is(err, dumpErr) {
+		t.Fatal("a capture's own failure was replaced")
+	}
+	var none *peerResetOutcome
+	if none.fail(nil) != nil {
+		t.Fatal("no outcome failed a capture")
 	}
 	// Nothing to reset: nothing run.
 	r = &sourcePeerReset{ns: netns.None(), log: idLog()}
@@ -213,5 +232,28 @@ func TestSourcePeerReset_AfterDump(t *testing.T) {
 		if err := readErr(s, 2*time.Second); !errors.Is(err, syscall.ECONNRESET) {
 			t.Errorf("peer %d saw %v; want a reset", i, err)
 		}
+	}
+}
+
+// A probe nobody answers (an address that drops the SYN) is not counted as
+// a reset: the capture would otherwise leave a session open.
+func TestProbeReset_UnansweredIsNotConfirmed(t *testing.T) {
+	needNetAdmin(t)
+	var local netip.Addr
+	ifs, _ := net.InterfaceAddrs()
+	for _, a := range ifs {
+		if p, err := netip.ParsePrefix(a.String()); err == nil && p.Addr().Is4() && !p.Addr().IsLoopback() {
+			local = p.Addr()
+		}
+	}
+	if !local.IsValid() {
+		t.Skip("no non-loopback IPv4 address")
+	}
+	saved := peerProbeWait
+	peerProbeWait = 300 * time.Millisecond
+	t.Cleanup(func() { peerProbeWait = saved })
+	err := probeReset(tcpTuple{Local: netip.AddrPortFrom(local, 0), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
+	if !errors.Is(err, errProbeUnconfirmed) && err == nil {
+		t.Fatalf("an unanswered probe passed: %v", err)
 	}
 }

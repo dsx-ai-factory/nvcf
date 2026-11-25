@@ -55,6 +55,9 @@ type identityEtcd interface {
 	TimeToLive(ctx context.Context, id int64, keys bool) (etcdLeaseInfo, error)
 	Grant(ctx context.Context, id, ttl int64) error
 	Put(ctx context.Context, key, value []byte, lease int64) error
+	// PutOwned writes key under lease only when no key is there or it is
+	// already under lease; owned is false when another lease holds it.
+	PutOwned(ctx context.Context, key, value []byte, lease int64) (owned bool, err error)
 	KeepAlive(ctx context.Context, id int64) (ttl int64, err error)
 	Revoke(ctx context.Context, id int64) error
 }
@@ -344,4 +347,30 @@ func (g *etcdGateway) Revoke(ctx context.Context, id int64) error {
 		return nil // gone already: what a revoke wants
 	}
 	return err
+}
+
+// PutOwned is two transactions, each atomic: put when the key is absent;
+// else put when the key is under lease.
+func (g *etcdGateway) PutOwned(ctx context.Context, key, value []byte, lease int64) (bool, error) {
+	put := map[string]any{"requestPut": map[string]string{
+		"key":   base64.StdEncoding.EncodeToString(key),
+		"value": base64.StdEncoding.EncodeToString(value),
+		"lease": strconv.FormatInt(lease, 10),
+	}}
+	k := base64.StdEncoding.EncodeToString(key)
+	for _, cmp := range []map[string]string{
+		{"key": k, "result": "EQUAL", "target": "VERSION", "version": "0"},
+		{"key": k, "result": "EQUAL", "target": "LEASE", "lease": strconv.FormatInt(lease, 10)},
+	} {
+		var out struct {
+			Succeeded bool `json:"succeeded"`
+		}
+		if err := g.post(ctx, "/v3/kv/txn", map[string]any{"compare": []any{cmp}, "success": []any{put}}, &out); err != nil {
+			return false, err
+		}
+		if out.Succeeded {
+			return true, nil
+		}
+	}
+	return false, nil
 }

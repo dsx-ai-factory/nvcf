@@ -245,8 +245,11 @@ type dumpV2Opts struct {
 	// snapshot was not taken fails. criuSaves names the mountpoints the
 	// dump saves itself, contents included (nil when it saves none).
 	Snapshot func(criuSaves map[string]bool) error
-	// ResetPeersOutside: CheckpointRequest.ResetPeersOutside.
+	// ResetPeersOutside: CheckpointRequest.ResetPeersOutside. peerReset
+	// carries a reset's failure after a dump that killed its source out
+	// of the dump's own outcome: such a source is not resumed.
 	ResetPeersOutside []string
+	peerReset         *peerResetOutcome
 	// nixlFence: the capture paused the NIXL KV connector, so its marker
 	// fences the checkpoint from agents that cannot resume it
 	// (pidNSMarkerName). dumpAroundSuspend sets it, through
@@ -370,16 +373,18 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
+	o.peerReset = &peerResetOutcome{}
 	nixlPaused, dump := fencedDumpSteps(o, func(o dumpV2Opts) (ran, done bool, cleanup func(), err error) {
 		ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
 		dumped = done
 		return ran, done, cleanup, err
 	})
-	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+	gs, err := a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
 		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
 		closeFabric: closeFabric, nixlPaused: nixlPaused, dump: dump,
 	}, log), log)
+	return gs, o.peerReset.fail(err)
 }
 
 // fencedDumpSteps returns a capture's sourceDump.nixlPaused and
@@ -656,10 +661,11 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 	// written after CRIU dumped the container is nvsnap's failure.
 	// A reset that cannot begin fails the dump before it runs, through
 	// the same tail as a failed dump (identity_peer_reset.go).
-	peerReset, err := a.beginPeerReset(o, procBase, targetHostPID, log)
+	peerReset, err := a.beginPeerReset(o, targetHostPID, log)
 	if err == nil {
+		hooks.Frozen = peerReset.inventoryHook(procBase, targetHostPID)
 		done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
-		err = a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir)
+		o.peerReset.set(a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir))
 	}
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)

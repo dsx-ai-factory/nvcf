@@ -40,6 +40,9 @@ type fakeEtcd struct {
 	fail  map[string]bool
 	// puts records every put, in order.
 	puts []etcdKV
+	// onTimeToLive, when set, runs (under the lock) before a timetolive
+	// answer: a registration that changes between a capture's reads.
+	onTimeToLive func()
 }
 
 func newFakeEtcd(t *testing.T) *fakeEtcd {
@@ -186,6 +189,47 @@ func (f *fakeEtcd) serve(w http.ResponseWriter, r *http.Request) {
 		f.kvs[string(kv.Key)] = kv
 		f.puts = append(f.puts, kv)
 		reply(map[string]any{})
+	case "/v3/kv/txn":
+		var txn struct {
+			Compare []struct {
+				Key     string `json:"key"`
+				Target  string `json:"target"`
+				Version string `json:"version"`
+				Lease   string `json:"lease"`
+			} `json:"compare"`
+			Success []struct {
+				RequestPut struct {
+					Key   string `json:"key"`
+					Value string `json:"value"`
+					Lease string `json:"lease"`
+				} `json:"requestPut"`
+			} `json:"success"`
+		}
+		b, _ := json.Marshal(body)
+		_ = json.Unmarshal(b, &txn)
+		ok := true
+		for _, c := range txn.Compare {
+			kv, exists := f.kvs[string(unb64(f.t, c.Key))]
+			switch c.Target {
+			case "VERSION":
+				ok = ok && !exists && c.Version == "0"
+			case "LEASE":
+				ok = ok && exists && kv.Lease == i64(c.Lease)
+			}
+		}
+		if ok {
+			for _, op := range txn.Success {
+				lease := i64(op.RequestPut.Lease)
+				if lease != 0 && f.leases[lease] == nil {
+					fail(http.StatusNotFound, "etcdserver: requested lease not found")
+					return
+				}
+				kv := etcdKV{Key: unb64(f.t, op.RequestPut.Key), Value: unb64(f.t, op.RequestPut.Value), Lease: lease}
+				f.kvs[string(kv.Key)] = kv
+				f.puts = append(f.puts, kv)
+			}
+		}
+		reply(map[string]any{"succeeded": ok})
 	case "/v3/lease/grant":
 		id, ttl := i64(str("ID")), i64(str("TTL"))
 		if f.leases[id] != nil {
@@ -195,6 +239,9 @@ func (f *fakeEtcd) serve(w http.ResponseWriter, r *http.Request) {
 		f.leases[id] = &fakeLease{ttl: ttl, expires: time.Now().Add(time.Duration(ttl) * time.Second)}
 		reply(map[string]string{"ID": strconv.FormatInt(id, 10), "TTL": strconv.FormatInt(ttl, 10)})
 	case "/v3/lease/timetolive":
+		if f.onTimeToLive != nil {
+			f.onTimeToLive()
+		}
 		id := i64(str("ID"))
 		l := f.leases[id]
 		if l == nil {
@@ -202,7 +249,7 @@ func (f *fakeEtcd) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out := map[string]any{"ID": strconv.FormatInt(id, 10), "grantedTTL": strconv.FormatInt(l.ttl, 10),
-			"TTL": strconv.FormatInt(int64(time.Until(l.expires).Round(time.Second)/time.Second), 10)}
+			"TTL": strconv.FormatInt(int64(time.Until(l.expires)/time.Second), 10)} // whole seconds, rounded down, as etcd
 		if body["keys"] == true {
 			var keys []string
 			for _, kv := range f.kvs {
@@ -263,7 +310,7 @@ func (f *fakeEtcd) dynamoWorkerKeys(lease int64, ip string) []string {
 
 // keysWith reports whether every key of keys holds a value naming ip
 // where the worker's did, and none names old.
-func keysName(t *testing.T, f *fakeEtcd, keys []string, ip, old string) {
+func keysName(t *testing.T, f *fakeEtcd, keys []string, ip, old string) { //nolint:unparam // the address of the test
 	t.Helper()
 	for _, k := range keys {
 		v, ok := f.value(k)

@@ -66,7 +66,9 @@ worker's own network namespace (`podNetnsDialer`):
   instance registration named by its own ID in hex and a value naming the
   worker's pod address as a URL host. None, or more than one, refuses the
   capture.
-- the lease's granted TTL and every key attached to it, with their values.
+- the lease's granted TTL and every key attached to it, with their values,
+  read twice: a registration that changes between the reads is read again
+  once, then refuses the capture.
   A key whose name, or whose value outside a URL host, names a rank's address
   refuses the capture: a restore could not rewrite it.
 
@@ -89,15 +91,21 @@ After a dump that killed its source (`endPeerReset`), the member's agent:
    which removes the dump's lock (the table is named by the dump's run id in
    the images);
 2. for each connection the container had to a peer that is neither loopback
-   nor a member of the group (listed before the dump from the container's
-   sockets), binds a socket to the connection's own address and port and
+   nor a member of the group (any of its addresses), listed from the
+   container's sockets once it is frozen and before CRIU runs, so the list
+   is the sockets the dump takes, binds a socket to the connection's own address and port and
    connects to the peer. The peer, still holding the connection, answers the
    SYN with an ACK of its own sequence (RFC 5961); the probe answers that
    with a reset whose sequence is the ACK's, which the peer accepts
-   (RFC 793), and drops the connection. The probe is closed.
+   (RFC 793), and drops the connection. The probe counts only when
+   confirmed: a segment came back (the challenge ACK), the connection opened
+   (the peer had dropped the old one) or was refused; an unanswered probe
+   is tried once more, then fails the capture. The probe is closed.
 
-This needs no sequence numbers, no raw sockets and no change to the dump. A
-failure fails the capture (the source is replaced cold), so no identity is
+This needs no sequence numbers, no raw sockets and no change to the dump. It
+runs only with the flag on, whatever a checkpoint request asks. A failure
+fails the capture as one whose source must be replaced (the dead source is
+never resumed), so no identity is
 recorded whose source may still hold sessions. The connections listed are the
 container's own, both directions: a frontend's connection into the worker on a
 TCP request plane is reset too, which both discovery backends need.
@@ -118,24 +126,28 @@ restored:
    address nothing listens on while the checkpoint is fetched and restored;
 4. keep the lease alive from the agent through the restore, renewing it when
    a quarter of its TTL is left. Once the process resumed, write every saved
-   key with the captured pod address replaced by the new pod's, then watch
-   for renewals the agent did not make: after two (one alone may be etcd's,
-   which renews every lease on a leader change), the process's own
-   keep-alive holds the lease and the agent stops. A process whose
+   key with the captured pod address replaced by the new pod's (a key that
+   another lease holds now is left as it is and fails the write), then
+   watch the lease's TTL against what the agent's own last renewal explains:
+   held above it for a whole TTL, the lease is renewed by the process and
+   the agent stops. One renewal not its own (etcd renews every lease on a
+   leader change) keeps it above for under three quarters of a TTL. A process whose
    keep-alive is not seen within three TTLs (at least a minute), or whose
    keys cannot be written, has its lease revoked and its pod deleted, so
    the frontend stops routing to a worker that does not keep its
    registration and no second restore takes the identity while it lives. A
    restore that fails revokes the lease and releases the claim.
 
-A pod that already holds the identity (an agent that stopped after its
-claim, whether or not it restored the pod) adopts it: a live lease is kept
+A pod whose restore already had the lease granted (an agent that stopped
+after the grant, which the record notes, whether or not it restored the
+pod) adopts it; a claim alone is not enough: a live lease is kept
 alive rather than refused, and a restore that finds the engine already
 running hands the lease over to it instead of revoking it.
 
-A refused restore starts its pods' workload cold in place (or, for a pod
-that cannot, deletes it for its controller to replace); nothing is counted
-against the capture and no checkpoint is blocked.
+A refused restore starts its pods' workload cold in place; no checkpoint is
+blocked. A pod that cannot start cold in place is deleted for its controller
+to replace, and the record counts a stall for it, so replacements refused
+the same way stop at the stall bound.
 
 ## 6. One live restore per identity
 
@@ -195,8 +207,6 @@ Against the invariants in `AGENTS.md`:
   later work.
 - A refused placeholder still fetches its checkpoint before it is refused;
   a holder check at admission would save that.
-- Keys are written unconditionally; a key name shared with another worker
-  would be taken over (Dynamo's keys are named per instance).
 - The dead source stays registered until its lease expires (its TTL) after
   the dump; the verification restore waits that long.
 - Dual-stack pods: only the primary pod address is matched and rewritten.

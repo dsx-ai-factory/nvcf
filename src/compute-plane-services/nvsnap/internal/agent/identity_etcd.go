@@ -32,6 +32,7 @@ package agent
 // restored without its regrant: with the flag off, such a pod starts cold.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -66,6 +68,9 @@ const (
 	// identityHolderKey names the restore that holds the identity
 	// ("namespace/pod/uid"): one live restore per identity.
 	identityHolderKey = "identity.holder"
+	// identityGrantedKey names the holder whose restore had the lease
+	// granted: only it may adopt a live lease after an agent restart.
+	identityGrantedKey = "identity.granted"
 )
 
 const (
@@ -147,6 +152,7 @@ func (i *capturedIdentity) write(d map[string]string) error {
 	d[identityEndpointsKey] = i.Endpoints
 	d[identityKeysKey] = string(b)
 	delete(d, identityHolderKey)
+	delete(d, identityGrantedKey)
 	return nil
 }
 
@@ -154,7 +160,7 @@ func (i *capturedIdentity) write(d map[string]string) error {
 // not.
 func hasIdentity(d map[string]string) bool {
 	for k := range d {
-		if strings.HasPrefix(k, "identity.") && k != identityHolderKey {
+		if strings.HasPrefix(k, "identity.") && k != identityHolderKey && k != identityGrantedKey {
 			return true
 		}
 	}
@@ -443,6 +449,27 @@ func readIdentity(ctx context.Context, e identityEtcd, ips []string, endpoints s
 		}
 		id.Keys = append(id.Keys, identityKey{Key: kv.Key, Value: kv.Value})
 	}
+	// One consistent registration: the keys read again must be the same,
+	// under the same lease, and still name the worker's address.
+	again, err := e.RangePrefix(ctx, []byte(dynamoKeyRoot))
+	if err != nil {
+		return nil, fmt.Errorf("read the registry: %w", err)
+	}
+	now := map[string]etcdKV{}
+	for _, kv := range again {
+		now[string(kv.Key)] = kv
+	}
+	named := false
+	for _, k := range id.Keys {
+		if cur, ok := now[string(k.Key)]; strings.HasPrefix(string(k.Key), dynamoKeyRoot) &&
+			(!ok || cur.Lease != lease || !bytes.Equal(cur.Value, k.Value)) {
+			return nil, errors.New("the worker's registration changed while it was read")
+		}
+		named = named || mentions(k.Value, ips[member])
+	}
+	if !named {
+		return nil, errors.New("the worker's saved keys no longer name its address")
+	}
 	return id, nil
 }
 
@@ -473,6 +500,9 @@ func (c *criuAutoRestorer) captureIdentity(ctx context.Context, leader *corev1.P
 	}
 	defer closeFn()
 	id, err = readIdentity(ctx, e, ips, endpoints)
+	if err != nil {
+		id, err = readIdentity(ctx, e, ips, endpoints) // once more: a registration may have been changing
+	}
 	if err != nil {
 		return nil, err.Error()
 	}
@@ -616,6 +646,9 @@ func (c *criuAutoRestorer) claimIdentity(ctx context.Context, key string, pod *c
 	var refused error
 	err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
 		refused = nil
+		if identityClaimReadHook != nil {
+			identityClaimReadHook()
+		}
 		if !hasIdentity(d) {
 			refused = refuseIdentity(identityRefusedError, errors.New("the record no longer holds an identity"))
 			return false
@@ -636,6 +669,7 @@ func (c *criuAutoRestorer) claimIdentity(ctx context.Context, key string, pod *c
 			}
 		}
 		d[identityHolderKey] = me
+		delete(d, identityGrantedKey)
 		return true
 	})
 	if refused != nil {
@@ -647,6 +681,28 @@ func (c *criuAutoRestorer) claimIdentity(ctx context.Context, key string, pod *c
 	return nil
 }
 
+// identityClaimReadHook, when set, runs in a claim between its read of the
+// record and its write; for tests.
+var identityClaimReadHook func()
+
+// markGranted records that pod's restore had record key's lease granted.
+func (c *criuAutoRestorer) markGranted(ctx context.Context, key string, pod *corev1.Pod) error {
+	me := holderOf(pod)
+	var lost bool
+	err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		lost = d[identityHolderKey] != me
+		if lost || d[identityGrantedKey] == me {
+			return false
+		}
+		d[identityGrantedKey] = me
+		return true
+	})
+	if err == nil && lost {
+		err = errors.New("the claim was lost")
+	}
+	return err
+}
+
 // releaseIdentity clears pod's claim on record key's identity.
 func (c *criuAutoRestorer) releaseIdentity(ctx context.Context, key string, pod *corev1.Pod, log *logrus.Entry) {
 	me := holderOf(pod)
@@ -655,6 +711,7 @@ func (c *criuAutoRestorer) releaseIdentity(ctx context.Context, key string, pod 
 			return false
 		}
 		delete(d, identityHolderKey)
+		delete(d, identityGrantedKey)
 		return true
 	}); err != nil && !apierrors.IsNotFound(err) {
 		log.WithError(err).Warn("identity restore: cannot release the claim on the identity; it is released once the pod is gone")
@@ -704,11 +761,16 @@ func grantLease(ctx context.Context, e identityEtcd, id *capturedIdentity) error
 }
 
 // writeIdentityKeys writes the identity's keys under its lease, with the
-// captured address replaced by newIP.
+// captured address replaced by newIP. A key another lease holds now is
+// left as it is and fails the write: another worker owns it.
 func writeIdentityKeys(ctx context.Context, e identityEtcd, id *capturedIdentity, newIP string) error {
 	for _, k := range id.Keys {
-		if err := e.Put(ctx, k.Key, rewriteHost(k.Value, id.PodIP, newIP), id.Lease); err != nil {
+		owned, err := e.PutOwned(ctx, k.Key, rewriteHost(k.Value, id.PodIP, newIP), id.Lease)
+		if err != nil {
 			return fmt.Errorf("write the identity's keys: %w", err)
+		}
+		if !owned {
+			return errors.New("write the identity's keys: a key is held by another lease")
 		}
 	}
 	return nil
@@ -768,17 +830,15 @@ func (k *leaseKeeper) restored(err error) {
 	})
 }
 
-// handoffRenewals is how many renewals the agent did not make it must see
-// before it leaves the lease to the process: one alone may be etcd's (a
-// leader change renews every lease).
-const handoffRenewals = 2
-
 // run keeps the lease alive. Before the process resumes it renews the
 // lease whenever a quarter of its TTL is left. Once it resumed, the keeper
 // writes the identity's keys (the frontend routes to the worker only then),
-// and watches for renewals it did not make (the lease's TTL rising above
-// what its own last renewal explains): the process's keep-alive has taken
-// over, and it stops. It fails closed: a process whose keep-alive is not
+// and watches the lease's TTL against what its own last renewal explains.
+// Held above that for a whole TTL, the lease is renewed by someone else
+// all along: the process's keep-alive has taken over, and it stops. One
+// renewal not its own (etcd renews every lease on a leader change) keeps
+// it above for under three quarters of a TTL, after which the keeper
+// renews it again; samples need not rise between polls. It fails closed: a process whose keep-alive is not
 // seen within max(3 TTL, identityHandoffFloor), or whose keys cannot be
 // written, has its lease revoked and its pod ended, so the frontend stops
 // routing to a worker that does not keep its registration and no second
@@ -788,10 +848,13 @@ func (k *leaseKeeper) run(ctx context.Context) {
 	defer k.release()
 	ttl := time.Duration(k.ttl) * time.Second
 	handoffWait := max(3*ttl, identityHandoffFloor)
+	tolerance := min(identityTolerance, ttl/2)
 	own, ownTTL := time.Now(), ttl
 	var deadline time.Time
 	resumed := k.resumed
-	prev, ownSincePrev, renewals := int64(-1), false, 0
+	// above is when the lease's TTL first ran ahead of what the agent's
+	// own last renewal explains, zero while it does not.
+	var above time.Time
 	end := func(outcome string, revoke bool, then func()) {
 		k.outcome = outcome
 		observeIdentity(outcome)
@@ -820,6 +883,12 @@ func (k *leaseKeeper) run(ctx context.Context) {
 			resumed = nil
 			if k.writeKeys != nil {
 				if err := k.writeKeys(ctx); err != nil {
+					if ctx.Err() != nil {
+						// The agent stops: the claim stays, and the next
+						// agent adopts the identity and registers it.
+						end(identityKeeperAgentStopped, false, nil)
+						return
+					}
 					k.log.WithError(err).Error("identity restore: cannot register the restored worker; revoking its lease and ending its pod")
 					end(identityKeysFailed, true, k.onZombie)
 					return
@@ -838,12 +907,14 @@ func (k *leaseKeeper) run(ctx context.Context) {
 			end(identityHandoffLost, false, k.onZombie)
 			return
 		default:
-			if !deadline.IsZero() && prev >= 0 && !ownSincePrev && info.TTL > prev &&
-				time.Duration(info.TTL)*time.Second > ownTTL-time.Since(own)+identityTolerance {
-				renewals++
+			if !deadline.IsZero() && time.Duration(info.TTL)*time.Second > ownTTL-time.Since(own)+tolerance {
+				if above.IsZero() {
+					above = time.Now()
+				}
+			} else {
+				above = time.Time{}
 			}
-			prev, ownSincePrev = info.TTL, false
-			if renewals >= handoffRenewals {
+			if !above.IsZero() && time.Since(above) >= ttl {
 				k.log.WithField("waited", time.Since(deadline.Add(-handoffWait)).Round(time.Second).String()).
 					Info("identity restore: the restored process keeps its lease alive; the agent stops keeping it")
 				end(identityHandoffSeen, false, nil)
@@ -865,7 +936,7 @@ func (k *leaseKeeper) run(ctx context.Context) {
 				end(identityHandoffLost, false, k.onZombie)
 				return
 			default:
-				own, ownTTL, ownSincePrev = time.Now(), time.Duration(got)*time.Second, true
+				own, ownTTL, above = time.Now(), time.Duration(got)*time.Second, time.Time{}
 			}
 		}
 	}
@@ -919,7 +990,9 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 		return nil, refuseIdentity(identityRefusedError, errors.New("the placeholder has no pod address"))
 	}
 	log = log.WithField("identityKeys", len(id.Keys))
-	adopt := d[identityHolderKey] == holderOf(holder)
+	// Adopted only once this pod's restore had the lease granted: a claim
+	// alone proves nothing about the lease.
+	adopt := d[identityHolderKey] == holderOf(holder) && d[identityGrantedKey] == holderOf(holder)
 	if !adopt {
 		if cerr := c.claimIdentity(ctx, key, holder); cerr != nil {
 			return nil, cerr
@@ -951,6 +1024,12 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 			release()
 			return nil, err
 		}
+		if merr := c.markGranted(ctx, key, holder); merr != nil {
+			_ = e.Revoke(context.WithoutCancel(ctx), id.Lease)
+			closeFn()
+			release()
+			return nil, refuseIdentity(identityRefusedError, fmt.Errorf("record the grant: %w", merr))
+		}
 		observeIdentity(identityRegranted)
 		log.Info("identity restore: the captured lease is granted again; restoring")
 	} else {
@@ -973,16 +1052,30 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 // identityRefused handles the pods (by slot) of a restore the identity
 // restore refused: each starts its workload cold in place, nothing counted
 // against the capture; a pod that cannot is deleted, for its controller to
-// replace.
-func (c *criuAutoRestorer) identityRefused(ctx context.Context, pods []*corev1.Pod, err error, log *logrus.Entry) {
+// replace, and the record key counts a stall for it, so replacements that
+// are refused the same way end at criuGroupMaxStalls. A pod that cannot be
+// read is handed back to the next event (its attempt cleared).
+func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) {
 	decision := identityDecision(err)
 	observeIdentity(decision)
 	log = log.WithError(err).WithField("decision", decision)
+	deleted := false
 	for _, p := range pods {
 		pl := log.WithField("pod", p.Namespace+"/"+p.Name)
-		pod, gerr := c.a.kubeClient.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
-		if gerr != nil || pod.UID != p.UID {
+		var pod *corev1.Pod
+		gerr := retry.OnError(retry.DefaultBackoff, func(e error) bool { return !apierrors.IsNotFound(e) }, func() error {
+			var e error
+			pod, e = c.a.kubeClient.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+			return e
+		})
+		if apierrors.IsNotFound(gerr) || (gerr == nil && pod.UID != p.UID) {
 			pl.Warn("identity restore refused; the pod is gone or replaced")
+			continue
+		}
+		if gerr != nil {
+			pl.WithError(gerr).Warn("identity restore refused, and the pod cannot be read; trying again on its next event")
+			c.attempted.Delete(p.UID)
+			c.attempted.Delete("restore/" + string(p.UID))
 			continue
 		}
 		cerr := c.a.coldStartInPlace(ctx, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation], pl)
@@ -993,6 +1086,12 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, pods []*corev1.P
 		pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused, and the pod cannot start cold in place; deleting it")
 		if derr := c.a.deletePodRetrying(ctx, pod.Namespace, pod.Name, pod.UID); derr != nil {
 			pl.WithError(derr).Error("identity restore: cannot delete the refused pod")
+		}
+		deleted = true
+	}
+	if deleted && key != "" {
+		if uerr := c.updateGroupRecord(ctx, key, func(d map[string]string) bool { return recordFailure(d, checkpoint, false, err) }); uerr != nil && !apierrors.IsNotFound(uerr) {
+			log.WithError(uerr).Warn("identity restore: cannot count the refusal on the group record")
 		}
 	}
 }
@@ -1018,7 +1117,7 @@ var (
 // loneIdentityBeforeRestore is identityBeforeRestore for the lone restore
 // of checkpoint id into placeholder ns/name. It returns the placeholder it
 // read, for a refusal.
-func (c *criuAutoRestorer) loneIdentityBeforeRestore(ctx, keep context.Context, key, ns, name, id string, log *logrus.Entry) (*leaseKeeper, *corev1.Pod, error) {
+func (c *criuAutoRestorer) loneIdentityBeforeRestore(ctx, keep context.Context, key, ns, name string, uid types.UID, id string, log *logrus.Entry) (*leaseKeeper, *corev1.Pod, error) {
 	if key == "" {
 		return nil, nil, nil
 	}
@@ -1032,8 +1131,10 @@ func (c *criuAutoRestorer) loneIdentityBeforeRestore(ctx, keep context.Context, 
 	if err != nil {
 		return nil, nil, refuseIdentity(identityRefusedError, fmt.Errorf("read the placeholder: %w", err))
 	}
-	if pod.Annotations[webhook.CRIURestoreAnnotation] != id {
-		return nil, nil, refuseIdentity(identityRefusedError, errors.New("the placeholder no longer names this checkpoint"))
+	if pod.UID != uid || pod.Annotations[webhook.CRIURestoreAnnotation] != id {
+		// Not this attempt's pod: nothing is claimed, and the refusal
+		// finds the pod replaced and leaves it.
+		return nil, nil, refuseIdentity(identityRefusedError, errors.New("the placeholder was replaced or no longer names this checkpoint"))
 	}
 	k, err := c.identityBeforeRestore(ctx, keep, key, []*corev1.Pod{pod}, pod, log)
 	return k, pod, err
