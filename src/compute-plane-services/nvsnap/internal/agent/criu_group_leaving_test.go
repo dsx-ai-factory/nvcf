@@ -226,6 +226,16 @@ func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(at)}}}}
 		}
 	}
+	// In restart backoff: no current start; the run that started after the
+	// listing and ended is the last termination.
+	backingOff := func(at time.Time) func(*corev1.Pod) {
+		return func(p *corev1.Pod) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "engine", RestartCount: 1,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					StartedAt: metav1.NewTime(at), FinishedAt: metav1.NewTime(at.Add(time.Second))}}}}
+		}
+	}
 	for _, tc := range []struct {
 		name     string
 		siblings []string // pods besides the replacement of rank 0
@@ -246,6 +256,8 @@ func TestCRIUGroupAdmits_Leaving(t *testing.T) {
 		{"listed, still Ready from before the listing (status not yet updated)", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), readySince(now.Add(-time.Hour)), true, ""},
 		{"listed but became Ready after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), readySince(now.Add(-10 * time.Second)), false, "already runs"},
 		{"listed but its container started after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), startedAt(now.Add(-10 * time.Second)), false, "already runs"},
+		{"listed, in restart backoff after a run started after the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), backingOff(now.Add(-10 * time.Second)), false, "already runs"},
+		{"listed, in backoff after a run that started before the listing", []string{"engine-1"}, []string{"engine-1"}, now.Add(-time.Minute), backingOff(now.Add(-time.Hour)), true, ""},
 		{"one sibling listed, another not", []string{"engine-1", "engine-2"}, []string{"engine-1"}, now, nil, false, "engine-2 of the instance already runs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

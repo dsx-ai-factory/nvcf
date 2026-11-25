@@ -235,8 +235,9 @@ const leavingSkew = time.Minute
 // listed pod does not count as leaving after all, which also refuses:
 //   - the listing is stale (its delete may never have happened) or
 //     stamped more than leavingSkew ahead of now (the writer's clock);
-//   - the pod became Ready, or a container of it started, after the
-//     listing: it was restarted after its dump and may run an engine. A
+//   - the pod became Ready, or a container of it started (its current or
+//     its last run), after the listing: it was restarted after its dump
+//     and may run an engine. A
 //     pod still Ready from before the listing is not: its status may lag
 //     its dump (no capture hold gate keeps it unready).
 func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) (ok bool, ignored string) {
@@ -255,18 +256,26 @@ func leaving(g webhook.CRIUGroup, p *corev1.Pod, now time.Time) (ok bool, ignore
 		}
 	}
 	for _, cs := range p.Status.ContainerStatuses {
-		var started metav1.Time
-		switch {
-		case cs.State.Running != nil:
-			started = cs.State.Running.StartedAt
-		case cs.State.Terminated != nil:
-			started = cs.State.Terminated.StartedAt
-		}
-		if started.After(g.LeavingAt) {
-			return false, "a container restarted after the listing"
+		// The current run, and the last one: a container in restart
+		// backoff (Waiting) has no current start, only its last run's.
+		for _, st := range []corev1.ContainerState{cs.State, cs.LastTerminationState} {
+			if started := containerStart(st); started.After(g.LeavingAt) {
+				return false, "a container restarted after the listing"
+			}
 		}
 	}
 	return true, ""
+}
+
+// containerStart is when the run st describes started; zero for none.
+func containerStart(st corev1.ContainerState) time.Time {
+	switch {
+	case st.Running != nil:
+		return st.Running.StartedAt.Time
+	case st.Terminated != nil:
+		return st.Terminated.StartedAt.Time
+	}
+	return time.Time{}
 }
 
 // leavingPod is leaving, logging a listing it ignores once per record,
