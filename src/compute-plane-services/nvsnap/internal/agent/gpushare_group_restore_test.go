@@ -453,6 +453,32 @@ func TestGroupRestore_NIXLResumeUnavailableIsNotRun(t *testing.T) {
 	}
 }
 
+// A member refused for its node (it cannot resume NIXL): the error
+// groupRestore returns, whose members' errors are only strings, still
+// carries errNIXLResumeUnavailable, so failGroup records a node refusal,
+// not a stall that would turn the configuration cold.
+func TestGroupRestore_NIXLNodeRefusalReachesTheRecordAsOne(t *testing.T) {
+	h := newGroupRestoreHarness(t, groupCkpts())
+	h.failCkpt = "c1"
+	h.failText = fmt.Errorf("%w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable).Error()
+	groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "new-1": "10.1.0.11"})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := h.a.groupRestore(ctx, groupRestoreReq(), quietFabricLog())
+	if !errors.Is(err, errNIXLResumeUnavailable) {
+		t.Fatalf("err = %v, want it to carry errNIXLResumeUnavailable", err)
+	}
+	c, kc, leader := groupFixture(t)
+	c.failGroup(ctx, leader, "k1", errors.As(err, new(*groupRestoreFailure)), err, quietFabricLog())
+	cm, gerr := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if cm.Data["stalls"] != "" || cm.Data[groupNodeRefusalsKey] != "1" {
+		t.Errorf("record = %v, want one node refusal and no stall", cm.Data)
+	}
+}
+
 // One member refused (its node cannot resume NIXL) and another failed on
 // its own: the group's failure is the other member's, a restore that ran
 // and failed, not masked as one that did not run.

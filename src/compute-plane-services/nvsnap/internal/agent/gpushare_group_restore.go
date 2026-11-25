@@ -387,8 +387,10 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	if nixlResumeUnavailable(res.Members) {
 		// A member's node cannot bring its paused NIXL KV connector back:
 		// it refused before CRIU ran, and the others failed with it. The
-		// checkpoint is not at fault.
-		return res, fmt.Errorf("%w: %w", errCheckpointUnavailable, membersFailed("group restore", res.Session, len(res.Members), failed))
+		// checkpoint is not at fault. The members' errors are strings, so
+		// the sentinel is wrapped here, for recordFailure to count a node
+		// refusal rather than a stall.
+		return res, fmt.Errorf("%w: %w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable, membersFailed("group restore", res.Session, len(res.Members), failed))
 	}
 	failure := &groupRestoreFailure{err: membersFailed("group restore", res.Session, len(res.Members), failed)}
 	var faults []gpuFault
