@@ -633,6 +633,7 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
         if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
         if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
         if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+        if (row && !strcmp(how, "qjunk")) strncat(w2, "junk", sizeof(w2) - strlen(w2) - 1);  /* "1101junk" */
         /* "lidbump" / "gidbump": the port's new LID, or the last byte of its new GID, changed */
         if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "lidbump")) {
             char *lid = strrchr(w2, ':');
@@ -642,6 +643,10 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
         fprintf(o, "%s %s\n", w1, w2);
         if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
         if (!strcmp(how, "twice")) fprintf(o, "%s %s\n", w1, w2);
+        /* "portshort": the port row again with a cut value; "maxtoken": a
+         * queue pair row whose sender is the table's empty-slot value. */
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "portshort")) fprintf(o, "%s 0\n", w1);
+        if (!strncmp(w1, "ibvq:", 5) && !strcmp(how, "maxtoken") && !silent++) fprintf(o, "%.38s99999:4294967295 12345\n", w1);
         if (!strncmp(w1, "ibvk:", 5) && !strcmp(how, "dupk")) fprintf(o, "%s %lu\n", w1, strtoul(w2, NULL, 10) + 1);
         if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "dupp")) {
             char *lid = strrchr(w2, ':');
@@ -651,6 +656,7 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
     /* "dangling": a last queue pair row with no value; "foreign": a line
      * of another record type (fabric handles share the file). */
     if (!strcmp(how, "dangling")) fprintf(o, "ibvq:%s:99999\n", drop_gid[0] ? drop_gid : "00000000000000000000000000000000");
+    if (!strcmp(how, "wsdangling")) fprintf(o, "  ibvq:%s:99999\n", "00000000000000000000000000000000");
     if (!strcmp(how, "foreign")) fprintf(o, "fabric:0123456789abcdef 42\n");
     if (!strcmp(how, "addrow")) fprintf(o, "%s\n", add_row);
     fclose(f);
@@ -1703,6 +1709,10 @@ class Ibv(unittest.TestCase):
     GID = r"[0-9a-f]{32}"
     REFUSAL = {
         "dangling": r"err the verbs exchange has a malformed row: ibvq:[0-9a-f]{32}:99999",
+        "wsdangling": r"err the verbs exchange has a malformed row: ibvq:0{32}:99999",
+        "portshort": r"err the verbs exchange has a malformed row: ibvp:%s:\d+ 0" % GID,
+        "qjunk": r"err the verbs exchange has a malformed row: ibvq:%s:\d+:\d+ \d+junk" % GID,
+        "maxtoken": r"err the verbs exchange has a malformed row: ibvq:%s:99999:4294967295 12345" % GID,
         "dir": r"err cannot read the verbs exchange /tmp/ibvmap\w{6}: Is a directory",
         "omit": r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ \(peer qpn \d+\)",
         "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
@@ -1784,7 +1794,7 @@ class Ibv(unittest.TestCase):
         # The second restore's exchange lacks qa's peer: its queue pair
         # row, its port row, or the whole file. The connect must fail
         # before any queue pair leaves INIT.
-        for how in ("omit", "noport", "unreadable", "dangling", "dir"):
+        for how in ("omit", "noport", "unreadable", "dangling", "dir", "wsdangling", "portshort", "qjunk", "maxtoken"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0",

@@ -33,6 +33,7 @@
  * for good, and the process must be replaced (nvsnap_ibv_doomed).
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <cuda.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -1585,6 +1586,7 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
         clock_gettime(CLOCK_MONOTONIC, &t);
         map_token_pid = getpid();
         map_token = hash32((uint32_t)map_token_pid ^ hash32((uint32_t)t.tv_nsec) ^ (uint32_t)t.tv_sec) | 1;
+        if (map_token == 0xffffffff) map_token = 1;  /* the tables' empty slot (row_parse refuses it) */
     }
     for (int i = 0; i < n_qps; i++) {
         struct vqp *q = qps[i];
@@ -1634,6 +1636,66 @@ static struct rport *rport_get(const union ibv_gid *old)
     struct rport r = { .old = *old };
     PUSHP(rports, n_rports, r);
     return &rports[n_rports - 1];
+}
+
+/* A decimal number at *s, digits only, at most max: its value, and *s
+ * moved past it. -1 for none, a sign, or a value above max. */
+static int dec_u32(const char **s, uint32_t max, uint32_t *v)
+{
+    uint64_t x = 0;
+    const char *p = *s;
+    for (; *p >= '0' && *p <= '9'; p++)
+        if ((x = x * 10 + (uint64_t)(*p - '0')) > max) return -1;
+    if (p == *s) return -1;
+    *v = (uint32_t)x, *s = p;
+    return 0;
+}
+
+/* Exactly 32 hex digits at *s, as a GID; *s moved past them. */
+static int hex_gid(const char **s, union ibv_gid *g)
+{
+    for (int i = 0; i < 32; i++)
+        if (!isxdigit((unsigned char)(*s)[i])) return -1;
+    if (unhex16(*s, g)) return -1;
+    *s += 32;
+    return 0;
+}
+
+/* One verbs row of the exchange, whole: its two words into w1 and w2 (for
+ * replies), the old GID g, and per type
+ *   ibvp:<GID>:<LID> <GID>:<LID>          x old LID, ng and y the new ones
+ *   ibvq:<GID>:<qpn>:<token> <qpn>        x old qpn, tok sender, y new qpn
+ *   ibvk:<GID>:<rkey> <rkey>              x old rkey, y new rkey
+ *   ibvn:<GID>:<token> <count>            x sender, y count
+ * Numbers are decimal and in range (a qpn has 24 bits, a LID 16). A key of
+ * a table (old qpn, old rkey, token) is never 0xffffffff, the tables' empty
+ * slot; a token is never 0. -1 for anything else. */
+static int row_parse(const char *row, char *w1, char *w2, union ibv_gid *g, uint32_t *x, uint32_t *tok,
+                     union ibv_gid *ng, uint32_t *y)
+{
+    char extra[2];
+    if (sscanf(row, "%159s %159s %1s", w1, w2, extra) != 2) return -1;
+    const char *p = w1 + 5, *q = w2;
+    if (strlen(w1) < 5 || hex_gid(&p, g) || *p++ != ':') return -1;
+    switch (w1[3]) {
+    case 'p':
+        if (dec_u32(&p, 0xffff, x) || *p || hex_gid(&q, ng) || *q++ != ':' || dec_u32(&q, 0xffff, y)) return -1;
+        break;
+    case 'q':
+        if (dec_u32(&p, 0xffffff, x) || *p++ != ':' || dec_u32(&p, 0xfffffffe, tok) || !*tok || *p ||
+            dec_u32(&q, 0xffffff, y))
+            return -1;
+        break;
+    case 'k':
+        if (dec_u32(&p, 0xfffffffe, x) || *p || dec_u32(&q, 0xffffffff, y)) return -1;
+        break;
+    case 'n':
+        if (dec_u32(&p, 0xfffffffe, x) || !*x || *p || dec_u32(&q, 0xffffff, y)) return -1;
+        break;
+    default:
+        return -1;
+    }
+    return *q ? -1 : 0;
 }
 
 /* One row of the exchange into m: a second row for the same key must give
@@ -1759,48 +1821,42 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     FILE *fp = path ? fopen(path, "re") : NULL;
     int ferr = fp ? 0 : path ? errno : ENOENT, bad = 0, nq = 0, ri;
     /* One row a line. Other record types (fabric handles) share the file:
-     * only the verbs rows are read, and one that does not parse fails it. */
-    char line[400], extra[2];
+     * only the verbs rows are read (classified after leading blanks), and
+     * one that does not parse exactly (row_parse) fails it. */
+    char line[400];
     int cont = 0;
     while (fp && !bad && fgets(line, sizeof(line), fp)) {
         int whole = strchr(line, '\n') || feof(fp), skip = cont;
         cont = !whole;
-        if (skip || (strncmp(line, "ibvp:", 5) && strncmp(line, "ibvq:", 5) && strncmp(line, "ibvk:", 5) &&
-                     strncmp(line, "ibvn:", 5)))
+        char *row = line + strspn(line, " \t");
+        if (skip || (strncmp(row, "ibvp:", 5) && strncmp(row, "ibvq:", 5) && strncmp(row, "ibvk:", 5) &&
+                     strncmp(row, "ibvn:", 5)))
             continue;
         union ibv_gid g, ng;
-        unsigned x, y, tok;
-        int end = 0;
-        if (!whole || sscanf(line, "%159s %159s %1s", w1, w2, extra) != 2) {
-            line[strcspn(line, "\n")] = 0;
-            snprintf(reply, n, "err the verbs exchange has a malformed row: %.80s", line);
+        uint32_t x = 0, y = 0, tok = 0;
+        row[strcspn(row, "\n")] = 0;
+        if (!whole || row_parse(row, w1, w2, &g, &x, &tok, &ng, &y)) {
+            snprintf(reply, n, "err the verbs exchange has a malformed row: %.100s", row);
             bad = 1;
-        } else if (!strncmp(w1, "ibvp:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
-            !unhex16(w2, &ng) && sscanf(w2 + 33, "%u", &y) == 1) {
+        } else if (row[3] == 'p') {
             struct rport *r = rport_get(&g);
             if (r->port && (memcmp(r->cur.raw, ng.raw, 16) || r->old_lid != x || r->cur_lid != y)) {
                 snprintf(reply, n, "err the verbs exchange has two different rows for %s", w1);
                 bad = 1;
             }
             r->cur = ng, r->old_lid = x, r->cur_lid = y, r->port = 1;
-        } else if (!strncmp(w1, "ibvq:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) &&
-                   sscanf(w1 + 38, "%u:%u%n", &x, &tok, &end) == 2 && !w1[38 + end] && sscanf(w2, "%u", &y) == 1) {
+        } else if (row[3] == 'q') {
             struct rport *r = rport_get(&g);
             bad = put_once(&r->qpns, x, y, w1, reply, n) < 0;
             if (!bad) map_put(&r->qsend, tok, 1);
-        } else if (!strncmp(w1, "ibvk:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
-                   sscanf(w2, "%u", &y) == 1) {
+        } else if (row[3] == 'k') {
             bad = put_once(&rport_get(&g)->keys, x, y, w1, reply, n) < 0;
-        } else if (!strncmp(w1, "ibvn:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
-                   sscanf(w2, "%u", &y) == 1) {
+        } else {
             struct rport *r = rport_get(&g);
             uint32_t had;
             int fresh = map_get(&r->kcount, x, &had) != 0;
             bad = put_once(&r->kcount, x, y, w1, reply, n) < 0;
             if (!bad && fresh) r->nkeys += y, r->counted = 1;
-        } else {
-            snprintf(reply, n, "err the verbs exchange has a malformed row: %.80s", w1);
-            bad = 1;
         }
     }
     if (fp && !bad && ferror(fp)) {  /* not the end of the file: a read error */
