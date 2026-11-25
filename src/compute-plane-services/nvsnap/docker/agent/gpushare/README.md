@@ -21,9 +21,14 @@ node bundle:
   run by the `nvsnap gpushare` GitHub workflow, compiles it with warnings as
   errors; the workflow then runs the host tests in
   [`tests/gpushare/host`](../../../tests/gpushare/host/).
-- The webhook sets up pods annotated `nvsnap.io/gpushare=true`
-  ([`internal/webhook/gpushare.go`](../../../internal/webhook/gpushare.go));
-  `webhook.gpushareIBV` (default `false`) points NCCL at `libnvsnap_ibv.so`.
+- The webhook preloads the library into the GPU containers of pods annotated
+  `nvsnap.io/gpushare: "true"`. Where CRIU is the capture method it does so by
+  default for every GPU pod that does not run to completion; a pod opts out
+  with `nvsnap.io/gpushare: "false"`
+  ([`internal/webhook/gpushare.go`](../../../internal/webhook/gpushare.go)).
+- `webhook.gpushareIBV` (default `false`) points NCCL at `libnvsnap_ibv.so`;
+  a pod's `nvsnap.io/gpushare-ibv` annotation (`"true"` or `"false"`)
+  overrides it.
 
 ## Key files
 

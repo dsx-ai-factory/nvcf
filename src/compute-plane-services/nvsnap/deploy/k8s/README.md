@@ -15,6 +15,10 @@ The supported install is the Helm chart in [`../helm/nvsnap`](../helm/nvsnap/).
 - [`scripts/build-agent.sh`](../../scripts/build-agent.sh) rewrites image tags
   in `agent-daemonset*.yaml`, `nvsnap-server.yaml`, `nvsnap-blobstore.yaml`
   and `workloads/*.yaml`.
+- [`scripts/sync-versions.sh`](../../scripts/sync-versions.sh) rewrites the
+  nvsnap image references in every `*.yaml` here to the versions in
+  `scripts/versions.sh`. `scripts/test-e2e.sh` runs it on startup, so a test
+  run can leave manifest edits behind.
 - [`scripts/bringup-cluster.sh`](../../scripts/bringup-cluster.sh) applies
   `namespace.yaml` and `nvcf-cluster-prep/storage-classes.yaml`.
 

@@ -15,7 +15,8 @@ outside Helm.
 - [`scripts/test-helm-chart.sh`](../../scripts/test-helm-chart.sh) checks that
   the chart's copy in `deploy/helm/nvsnap/crds/` matches
   `nvsnap.io_gpucheckpoints.yaml`.
-- nvsnap-server reads and writes `gpucheckpoints` objects
+- nvsnap-server reads and writes `gpucheckpoints` and `gpurestores` objects;
+  it creates restores, lists and gets them, and updates their status
   ([`internal/server/server.go`](../../internal/server/server.go)).
 
 ## Key files

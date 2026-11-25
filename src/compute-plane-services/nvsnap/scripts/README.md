@@ -78,7 +78,12 @@ NIM), and the script stops with a hint (`internal/agent/nim_backend.go`
 
 `test-e2e.sh` does not read the `nvsnap.io/path` annotation of a workload
 manifest (nvsnap-server's demo page and `internal/manifests` do).
-`test-bench.sh` uses `CAPTURE_PATH=rootfs` unless the environment sets it. The agent's `--pod-cache-dir` flag is what decides
+`test-bench.sh` uses `CAPTURE_PATH=rootfs` unless the environment sets it,
+with two exceptions: the `deepseek-v4-flash` and `gpt-oss-120b` case arms set
+`rootfs` themselves, before that default, so the environment does not change
+them. A run also switches to `rootfs` when the agent redirects a CRIU capture
+(exit code 42, a Riva or Triton NIM). The agent's `--pod-cache-dir` flag is
+what decides
 whether a `rootfs`-family capture is really cachedir. If those two disagree,
 believe the flag.
 
@@ -152,16 +157,36 @@ Captures are content-addressed. A second run with the same pod identity reuses
 the existing capture rather than making a new one -- normally what you want, and
 confusing when you are trying to test the capture path itself.
 
-To force a fresh capture, remove what claims the hash:
+The agent's store is a chain: the manifest ConfigMap in front of the
+node-local cache, then the L2 PVC tier when it is configured
+(`internal/agent/rootfsonly_integration.go` `buildAgentBackend`). The capture
+is skipped when the first tier that claims the hash returns a manifest with
+files in it (`internal/rootfsonly/orchestrator.go` `usableCapture`). Each tier
+behaves differently:
+
+- ConfigMap `nvsnap-capture-<short-hash>`: if it is missing but the node
+  running the capture still has `<pod-cache-dir>/<hash>/manifest.json` from
+  the earlier one, `Stat` rebuilds the ConfigMap from it and the capture is
+  skipped again
+  (`internal/checkpointstore/cmregistry.go`).
+- L2 PVC `rox-<short-hash>`: its `Stat` returns only the hash, which is not a
+  usable manifest, so on its own it does not skip the capture. But when the
+  re-capture is promoted to L2, an existing `rox-<short-hash>` in the source
+  pod's namespace is taken as already done and is reused, not rewritten
+  (`internal/checkpointstore/percapture_pvc.go`).
+
+For a clean test, remove all three before the run (the cache directory on
+the node that captured):
 
 ```sh
-kubectl delete cm -n nvsnap-system nvsnap-capture-<hash-prefix>   # manifest tier
-kubectl delete pvc -n nvsnap-system rox-<short-hash>              # L2 tier
+kubectl delete cm -n nvsnap-system nvsnap-capture-<short-hash>
+kubectl delete pvc -n nvsnap-system rox-<short-hash>   # the test scripts' namespace
+kubectl exec -n nvsnap-system "$AGENT" -c agent -- rm -rf "$CACHE/<hash>"
 ```
 
-The capture is skipped when the first tier that claims the hash returns a
-usable manifest (`internal/rootfsonly/orchestrator.go`), so remove both. A schema change bumps `CaptureFormatVersion`, which changes the
-hash and re-captures everything automatically.
+`$AGENT` and `$CACHE` are found as in [When a run fails](#when-a-run-fails).
+A schema change bumps `CaptureFormatVersion`, which changes the hash and
+re-captures everything automatically.
 
 ## Adding a workload
 

@@ -7,8 +7,14 @@ SPDX-License-Identifier: Apache-2.0
 
 Pairs of pod manifests, `<id>.yaml` (the source pod to capture) and
 `<id>-restore.yaml` (the pod that restores it), one pair per test workload.
-Source pods carry `nvsnap.io/*` annotations (display name, model, port, GPU
-count, capture path) that the scripts and the server's demo page read.
+Source pods carry `nvsnap.io/*` annotations. The readers use different ones:
+
+- nvsnap-server's demo catalog reads the display name, model, port, GPU count
+  and capture path (`nvsnap.io/demo-name`, `model`, `port`, `gpus`, `path`).
+- `scripts/test-e2e.sh` takes the model and port from its `case` arms, not the
+  manifest. It reads `nvsnap.io/gpushare` (to pick the capture path) and
+  `nvsnap.io/gpus` (to size the capture timeout), and does not read
+  `nvsnap.io/path`.
 
 ## Used by
 
