@@ -65,8 +65,8 @@ Labels:
 - For the identity restore ([IDENTITY-RESTORE.md](../design/IDENTITY-RESTORE.md), off by default):
   `nvsnap_identity_restore_decisions_total{decision}` counts `captured`, `capture_refused`, `peers_reset`,
   `peers_reset_failed`, `refused_live_lease`, `refused_held`, `refused_error`, `refused_disabled`, `regranted`,
-  `keepalive_handoff`, `keepalive_handoff_timeout`, `keepalive_lease_lost`, `restore_aborted` and
-  `keeper_agent_stopped`.
+  `keepalive_handoff`, `keepalive_handoff_timeout`, `keepalive_lease_lost`, `keys_write_failed`,
+  `restore_aborted` and `keeper_agent_stopped`.
 - `method`: `criu` (restored from a CRIU capture), `cachedir` (seeded from a
   cachedir capture, the fallback), `cold`.
 - `gpu`: the node's GPU product (`nvidia.com/gpu.product`).

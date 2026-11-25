@@ -107,26 +107,35 @@ TCP request plane is reset too, which both discovery backends need.
 A placeholder of a record with an identity is restored by the lone path
 (`criu_auto_restore.go` `restore`) or the group path (`criu_group.go`
 `restoreGroup`); both call `identityBeforeRestore` before anything is
-restored, after the checkpoint is local:
+restored:
 
 1. claim the identity in the record (section 6);
 2. wait for the captured lease to expire: at most the recorded TTL and a few
    seconds, since the source is dead. A lease whose TTL is renewed meanwhile,
    or that outlives the wait, is held by a live process: refused;
-3. grant the lease with the same ID and TTL (etcd refuses a live ID: refused),
-   then write every saved key with the captured pod address replaced by the
-   new pod's. A failed write revokes the grant;
+3. grant the lease with the same ID and TTL (etcd refuses a live ID:
+   refused). The keys are not written yet: the frontend would route to an
+   address nothing listens on while the checkpoint is fetched and restored;
 4. keep the lease alive from the agent through the restore, renewing it when
-   a quarter of its TTL is left. Once the process resumed, the agent watches
-   for a renewal it did not make, which is the process's own keep-alive, and
-   stops. A process whose keep-alive is not seen within three TTLs (at least a
-   minute) has its lease revoked, so the frontend stops routing to a worker
-   that does not keep its registration. A restore that fails revokes it.
+   a quarter of its TTL is left. Once the process resumed, write every saved
+   key with the captured pod address replaced by the new pod's, then watch
+   for renewals the agent did not make: after two (one alone may be etcd's,
+   which renews every lease on a leader change), the process's own
+   keep-alive holds the lease and the agent stops. A process whose
+   keep-alive is not seen within three TTLs (at least a minute), or whose
+   keys cannot be written, has its lease revoked and its pod deleted, so
+   the frontend stops routing to a worker that does not keep its
+   registration and no second restore takes the identity while it lives. A
+   restore that fails revokes the lease and releases the claim.
 
-A refused lone restore starts the pod's workload cold in place (or, when it
-cannot, deletes the pod for its controller to replace); nothing is counted
-against the capture and no checkpoint is blocked. A refused group restore ends
-as not run.
+A pod that already holds the identity (an agent that stopped after its
+claim, whether or not it restored the pod) adopts it: a live lease is kept
+alive rather than refused, and a restore that finds the engine already
+running hands the lease over to it instead of revoking it.
+
+A refused restore starts its pods' workload cold in place (or, for a pod
+that cannot, deletes it for its controller to replace); nothing is counted
+against the capture and no checkpoint is blocked.
 
 ## 6. One live restore per identity
 
@@ -142,11 +151,14 @@ Two guards:
 
 ## 7. Flag off, and rollback
 
-With the flag off nothing of this runs: capture and restore behave as before,
-and the chart renders as before. A record with an identity, written while the
-flag was on, is invisible to admission with the flag off
-(`identityRecordVisible`), so its configuration starts cold rather than restore
-without its lease. Turning the flag off is the rollback.
+With the flag off, capture behaves as before and the chart renders as
+before. A record with an identity, written while the flag was on, is
+invisible to admission with the flag off (`identityRecordVisible`), so its
+configuration starts cold rather than restore without its lease; a
+placeholder admitted while the flag was on and restored after it was turned
+off is refused and starts cold (`refused_disabled`). For that, a restore reads
+its group record once more with the flag off; records without an identity
+restore exactly as before. Turning the flag off is the rollback.
 
 ## 8. Observability
 
@@ -154,7 +166,8 @@ without its lease. Turning the flag off is the rollback.
 `captured`, `capture_refused`, `peers_reset`, `peers_reset_failed`,
 `refused_live_lease`, `refused_held`, `refused_error`, `refused_disabled`,
 `regranted`, `keepalive_handoff`, `keepalive_handoff_timeout`,
-`keepalive_lease_lost`, `restore_aborted`, `keeper_agent_stopped`. Every
+`keepalive_lease_lost`, `keys_write_failed`, `restore_aborted`,
+`keeper_agent_stopped`. Every
 value exists at zero from the agent's start. Each decision also logs one line
 with the group key and reason, never the lease ID, keys or addresses.
 
@@ -162,15 +175,16 @@ with the group key and reason, never the lease ID, keys or addresses.
 
 Against the invariants in `AGENTS.md`:
 
-1. The source is stopped by its own dump only; the shared companions keep
-   running throughout.
-2. One restore per pod, and one live restore per identity (section 6).
-3. An identity record holds one worker and no companions; admission still
-   matches size and process configuration.
-5. Every unreadable state refuses: registry, record, holder, lease.
-7. The claim is released on refusal and failure; the agent's keep-alive ends
-   on handoff, timeout, failure or agent stop, and the lease then lives only
-   as long as the process keeps it.
+- Invariant 1: The source is stopped by its own dump only; the shared companions keep
+  running throughout.
+- Invariant 2: One restore per pod, and one live restore per identity (section 6).
+- Invariant 3: An identity record holds one worker and no companions; admission still
+  matches size and process configuration.
+- Invariant 5: Every unreadable state refuses: registry, record, holder, lease.
+- Invariant 7: The claim is released on refusal and on a failed restore, and
+  kept for a pod that lost its identity until that pod is gone; the agent's
+  keep-alive ends on handoff, timeout, failure or agent stop, and the lease
+  then lives only as long as the process keeps it.
 
 ## 10. Not built, and not verified
 
@@ -179,8 +193,13 @@ Against the invariants in `AGENTS.md`:
 - One identity per configuration: a second replica restored while the first
   holds the identity starts cold. A pool of identities per configuration is
   later work.
-- A refused group restore is counted as a restore that did not run, which
-  after three such refusals starts the configuration cold.
+- A refused placeholder still fetches its checkpoint before it is refused;
+  a holder check at admission would save that.
+- Keys are written unconditionally; a key name shared with another worker
+  would be taken over (Dynamo's keys are named per instance).
+- The dead source stays registered until its lease expires (its TTL) after
+  the dump; the verification restore waits that long.
+- Dual-stack pods: only the primary pod address is matched and rewritten.
 - Not run on hardware with this code: the network-namespace dialer, the
   net-unlock of a dump's lock and the probe through a Service address, and
   Dynamo's own keep-alive resuming on the granted lease after a CRIU restore

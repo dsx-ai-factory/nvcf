@@ -834,7 +834,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	// Again just before the instance is held: the namespace's scaling
 	// groups may have grown while the instance warmed up.
-	if again, skip, _ := c.sharedBlocksCapture(ctx, leader, nil, log); skip {
+	if again, skip := c.sharedRecheck(ctx, leader, alone, log); skip {
 		return again
 	}
 	// Held for the capture before it is claimed: a member already
@@ -1710,10 +1710,13 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
 	defer cancel()
-	keeper, ierr := c.identityBeforeRestore(rctx, key, ranks, leader, log)
+	keeper, ierr := c.identityBeforeRestore(rctx, ctx, key, ranks, leader, log)
 	if ierr != nil {
-		observeIdentity(identityDecision(ierr))
-		c.failGroup(ctx, leader, key, false, fmt.Errorf("%w: %w", errCheckpointUnavailable, ierr), log)
+		if ctx.Err() != nil {
+			return // the agent stops; the next one drives the restore
+		}
+		// Nothing restored, nothing counted against the capture.
+		c.identityRefused(context.WithoutCancel(ctx), ranks, ierr, log)
 		return
 	}
 	_, err := restoreInstance(a, rctx, req, log)

@@ -269,14 +269,16 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	defer cancel()
 	t0 := time.Now()
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid}}
+	var refusedPod *corev1.Pod
 	err := func() error {
 		if why := c.driverMismatch(rctx, groupKey); why != "" {
 			// Not run, and not held against the capture: the replacement is
 			// admitted under the cluster's drivers as they are now.
 			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
 		}
-		keeper, ierr := c.loneIdentityBeforeRestore(rctx, groupKey, ns, pod, id, log)
+		keeper, target, ierr := c.loneIdentityBeforeRestore(rctx, ctx, groupKey, ns, pod, id, log)
 		if ierr != nil {
+			refusedPod = target
 			return ierr
 		}
 		_, err := restoreLone(a, rctx, RestoreRequest{
@@ -313,7 +315,11 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	}
 	if errors.Is(err, errIdentityRefused) {
 		// Nothing restored, nothing held against the capture.
-		c.identityRefused(context.WithoutCancel(ctx), ns, pod, uid, container, err, log)
+		if refusedPod == nil || refusedPod.UID == "" {
+			refusedPod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid,
+				Annotations: map[string]string{webhook.CRIURestoreContainerAnnotation: container}}}
+		}
+		c.identityRefused(context.WithoutCancel(ctx), []*corev1.Pod{refusedPod}, err, log)
 		return
 	}
 	if errors.Is(err, errNotPlaceholder) {

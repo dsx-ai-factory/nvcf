@@ -469,12 +469,13 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// with the agent's own CRIU (pidns_capture.go).
 	// dumped is CRIU's completion, not the error: a marker that cannot be
 	// written after CRIU dumped the container is nvsnap's failure.
+	// A reset that cannot begin fails the dump before it runs, through
+	// the same tail as a failed dump (identity_peer_reset.go).
 	peerReset, err := a.beginPeerReset(o, procBase, targetHostPID, log)
-	if err != nil {
-		return nil, err
+	if err == nil {
+		dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+		err = a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir)
 	}
-	dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
-	err = a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir)
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}

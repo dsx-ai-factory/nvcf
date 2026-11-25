@@ -13,7 +13,7 @@ import "github.com/prometheus/client_golang/prometheus"
 var IdentityRestoreDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Namespace: namespace,
 	Name:      "identity_restore_decisions_total",
-	Help:      "Identity restore decisions: captured, capture_refused, peers_reset, peers_reset_failed, refused_*, regranted, keepalive_* and restore_aborted.",
+	Help:      "Identity restore decisions: captured, capture_refused, peers_reset, peers_reset_failed, refused_*, regranted, keepalive_*, restore_aborted, keeper_agent_stopped and keys_write_failed.",
 }, []string{"decision"})
 
 // IdentityDecisions are every label value of IdentityRestoreDecisions,
@@ -23,5 +23,5 @@ var IdentityDecisions = []string{
 	"captured", "capture_refused", "peers_reset", "peers_reset_failed",
 	"refused_live_lease", "refused_held", "refused_error", "refused_disabled",
 	"regranted", "keepalive_handoff", "keepalive_handoff_timeout", "keepalive_lease_lost",
-	"restore_aborted", "keeper_agent_stopped",
+	"restore_aborted", "keeper_agent_stopped", "keys_write_failed",
 }
