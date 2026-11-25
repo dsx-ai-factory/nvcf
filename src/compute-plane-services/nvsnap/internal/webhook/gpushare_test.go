@@ -778,6 +778,20 @@ func TestEngineSpansPods(t *testing.T) {
 		{"scaling group", func(p *corev1.Pod) {
 			p.Spec.Containers[1].Env = append(p.Spec.Containers[1].Env, corev1.EnvVar{Name: groveScalingGroupSizeEnv, Value: "2"})
 		}, true},
+		{"scaling group size from a reference", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Env = append(p.Spec.Containers[1].Env, corev1.EnvVar{Name: groveScalingGroupSizeEnv,
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.annotations['n']"}}})
+		}, true},
+		{"Ray cluster pod", func(p *corev1.Pod) { p.Labels = map[string]string{"ray.io/node-type": "worker"} }, true},
+		{"--num-nodes 2", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--num-nodes", "2"} }, true},
+		{"--nnodes=1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--nnodes=1"} }, false},
+		{"--node-rank 1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--node-rank", "1"} }, true},
+		{"single node, data-parallel address", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-address", "127.0.0.1"}
+		}, false},
+		{"single node, master address", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Command = []string{"/bin/sh", "-c", "torchrun --master-addr=127.0.0.1 serve.py"}
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := gpushareTestPod(true, nil)

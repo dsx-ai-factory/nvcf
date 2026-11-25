@@ -339,6 +339,8 @@ func TestNIXLSpansNodes(t *testing.T) {
 		{"scaling group", []string{"GROVE_PCSG_TEMPLATE_NUM_PODS=3"}, nil, "", 0, true},
 		{"headless engine", nil, []string{"vllm", "serve", "m", "--headless"}, "", 0, true},
 		{"flag in a shell line", nil, []string{"/bin/sh", "-c", "vllm serve m --nnodes=2"}, "", 0, true},
+		{"single node with a data-parallel address", nil, []string{"vllm", "serve", "m", "--data-parallel-address", "127.0.0.1"}, "", 0, false},
+		{"--num-nodes 2", nil, []string{"vllm", "serve", "m", "--num-nodes", "2"}, "", 0, true},
 		{"session, ranks on two nodes", nil, nil, "s1", 2, true},
 		{"session, ranks on one node (with companions)", nil, nil, "s1", 1, false},
 		{"session, driver does not say", nil, nil, "s1", 0, true},
@@ -365,7 +367,7 @@ func TestNIXLSpansNodes(t *testing.T) {
 func TestPodPreflight_NIXLPauseRefusesAnEngineSpanningNodes(t *testing.T) {
 	pod := func(ann map[string]string) *corev1.Pod {
 		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns", Annotations: ann},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "engine"}}}}
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "engine", Env: []corev1.EnvVar{{Name: nixlPauseEnv, Value: "1"}}}}}}
 	}
 	spans := map[string]string{webhook.NIXLPauseAnnotation: "true", webhook.GPUShareFabricAnnotation: "false",
 		"leaderworkerset.sigs.k8s.io/size": "2"}

@@ -357,8 +357,8 @@ func nixlSpansNodes(procBase string, pids []int, fabricSession string, rankNodes
 			}
 		}
 		cmd, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "cmdline"))
-		if f := webhook.MultiNodeEngineArg(strings.Split(string(cmd), "\x00")); f != "" {
-			return "its engine is started with " + f
+		if why := webhook.EngineSpansArg(strings.Split(string(cmd), "\x00")); why != "" {
+			return why
 		}
 	}
 	return ""

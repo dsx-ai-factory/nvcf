@@ -127,10 +127,10 @@ func (a *Agent) podPreflight(pod *corev1.Pod, container string, rank bool) []Pre
 	if rank && !a.gpushareEnabledFor(pod) {
 		add(container, preflightBlock, "gpushare", "a GPU rank without the gpushare library: its GPU memory cannot be saved")
 	}
-	// An engine that spans nodes is refused nixl-pause by its spec too: its
-	// processes may not show it (a fabric annotation "false", a renamed
-	// process).
-	if rank && a.nixlPauseOn() && pod.Annotations[webhook.NIXLPauseAnnotation] == "true" {
+	// An opted-in engine (nixlOptIn) that spans nodes is refused
+	// nixl-pause by its spec too: its processes may not show it (a fabric
+	// annotation "false", a renamed process).
+	if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), pod, container); rank && opted {
 		if why := webhook.EngineSpansPods(pod); why != "" {
 			add(container, preflightBlock, "nixl-pause", "the pod opted in to nixl-pause, but its engine spans nodes ("+why+"); nixl-pause is not supported for an engine that spans nodes yet")
 		}

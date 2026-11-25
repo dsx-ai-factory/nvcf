@@ -233,7 +233,7 @@ func multiNodeFlag(pod *corev1.Pod) string {
 		if _, ok := c.Resources.Limits["nvidia.com/gpu"]; !ok {
 			continue
 		}
-		if f := MultiNodeEngineArg(append(append([]string{}, c.Command...), c.Args...)); f != "" {
+		if f := multiNodeEngineArg(append(append([]string{}, c.Command...), c.Args...)); f != "" {
 			return f
 		}
 	}
@@ -241,37 +241,84 @@ func multiNodeFlag(pod *corev1.Pod) string {
 }
 
 // EngineSpansPods says why pod's engine spans pods (nodes) by its spec,
-// or "": the gpushare fabric annotation "true", a multi-node engine flag
-// on a GPU container's command line, or a group size above one from its
-// controller (a LeaderWorkerSet's size annotation, a Grove scaling group's
-// pod count). It reads nothing else, unlike groupSize: a StatefulSet's
-// replicas are not an engine's ranks.
+// or "": the gpushare fabric annotation "true"; a GPU container's command
+// line that only an engine on more than one node has (EngineSpansArg); a
+// Ray cluster's pod (KubeRay's ray.io/node-type label); or a group size
+// above one from its controller (a LeaderWorkerSet's size annotation, a
+// Grove scaling group's pod count, which a reference the webhook cannot
+// read counts as). It reads nothing else, unlike groupSize: a
+// StatefulSet's replicas are not an engine's ranks.
 func EngineSpansPods(pod *corev1.Pod) string {
 	if pod.Annotations[GPUShareFabricAnnotation] == "true" {
 		return GPUShareFabricAnnotation + `: "true"`
 	}
-	if f := multiNodeFlag(pod); f != "" {
-		return "its engine is started with " + f
+	if t := pod.Labels["ray.io/node-type"]; t != "" {
+		return "it is a Ray cluster's " + t + " pod (ray.io/node-type)"
+	}
+	for _, c := range pod.Spec.Containers {
+		if _, ok := c.Resources.Limits["nvidia.com/gpu"]; !ok {
+			continue
+		}
+		if why := EngineSpansArg(append(append([]string{}, c.Command...), c.Args...)); why != "" {
+			return why
+		}
 	}
 	if n, err := strconv.Atoi(pod.Annotations[lwsSizeAnnotation]); err == nil && n > 1 {
 		return fmt.Sprintf("%s=%d", lwsSizeAnnotation, n)
 	}
 	for _, c := range pod.Spec.Containers {
 		for _, e := range c.Env {
-			if e.Name == groveScalingGroupSizeEnv {
-				if n, err := strconv.Atoi(e.Value); err == nil && n > 1 {
-					return fmt.Sprintf("%s=%d", groveScalingGroupSizeEnv, n)
-				}
+			if e.Name != groveScalingGroupSizeEnv {
+				continue
+			}
+			if e.ValueFrom != nil {
+				return groveScalingGroupSizeEnv + " comes from a reference the webhook cannot read"
+			}
+			if n, err := strconv.Atoi(e.Value); err == nil && n > 1 {
+				return fmt.Sprintf("%s=%d", groveScalingGroupSizeEnv, n)
 			}
 		}
 	}
 	return ""
 }
 
-// MultiNodeEngineArg returns the first flag in args (each split on
+// EngineSpansArg says why a command line (args, each split on spaces, as
+// in a shell line) is one only an engine on more than one node is started
+// with, or "": --headless (a node without the API server), a node count
+// above one (--nnodes, --num-nodes), a node rank above zero (--node-rank),
+// or --dist-init-addr. An address alone (--data-parallel-address,
+// --master-addr) does not say: single-node engines set them too.
+func EngineSpansArg(args []string) string {
+	var words []string
+	for _, a := range args {
+		words = append(words, strings.Fields(a)...)
+	}
+	for i, w := range words {
+		name, val, hasVal := strings.Cut(w, "=")
+		if !hasVal && i+1 < len(words) {
+			val = words[i+1]
+		}
+		n, nerr := strconv.Atoi(val)
+		switch name {
+		case "--headless", "--dist-init-addr":
+			return "its engine is started with " + name
+		case "--nnodes", "--num-nodes":
+			if nerr != nil || n > 1 {
+				return fmt.Sprintf("its engine is started with %s %s", name, val)
+			}
+		case "--node-rank", "--node_rank":
+			if nerr != nil || n > 0 {
+				return fmt.Sprintf("its engine is started with %s %s", name, val)
+			}
+		}
+	}
+	return ""
+}
+
+// multiNodeEngineArg returns the first flag in args (each split on
 // spaces, as in a shell command line) that only an engine spanning nodes
 // is started with, or "".
-func MultiNodeEngineArg(args []string) string {
+func multiNodeEngineArg(args []string) string {
 	for _, a := range args {
 		for _, w := range strings.Fields(a) {
 			for _, f := range multiNodeEngineFlags {
