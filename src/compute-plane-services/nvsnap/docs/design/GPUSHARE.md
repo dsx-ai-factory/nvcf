@@ -647,7 +647,11 @@ rollback.
   (`webhook.nixlPause.enabled`), right before the suspend, and calls
   `nixl-resume` after the restore, as for ModelExpress, except that a paused
   engine serves nothing: a source that does not resume is replaced, and a
-  restore whose resume fails starts cold. NIXL-PAUSE.md.
+  restore whose resume fails starts cold. NIXL-PAUSE.md. The capture side is
+  `internal/agent/checkpoint_v2.go` `dumpAroundSuspend` (through
+  `pauseNIXLFor`); the restore side is `internal/agent/gpushare_nixl.go`
+  `nixlResumeFor`, run by `restoreTail.run` in
+  `internal/agent/restore_v2.go`.
   `nvsnap-gpu-suspend nixl-pause`, before the suspend, makes the engine take
   no new requests, waits up to 60 s for KV transfers in flight, stops the
   handshake listener and shuts the connector down on every TP worker, which

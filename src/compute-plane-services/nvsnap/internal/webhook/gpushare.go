@@ -75,10 +75,11 @@ const (
 	gpushareFabricEnv   = "NVSNAP_GPUSHARE_FABRIC"
 	ncclIBVerbsLibEnv   = "NCCL_IBVERBS_LIB"
 
-	// NIXLPauseAnnotation opts a gpushare pod in to nixl-pause: a capture
-	// has its vLLM NIXL KV connector release its RDMA state right before
-	// the suspend, and a restore brings it back (docs/design/NIXL-PAUSE.md).
-	// Honored only with the cluster's switch on (Mutator.NIXLPause).
+	// NIXLPauseAnnotation opts a gpushare pod in to nixl-pause when it is
+	// "true" and webhook.nixlPause.enabled is on (default off; alone, the
+	// annotation does nothing). Its NIXL KV connector then releases its
+	// RDMA before the suspend and comes back after the restore
+	// (docs/design/NIXL-PAUSE.md; Mutator.NIXLPause).
 	NIXLPauseAnnotation = "nvsnap.io/nixl-pause"
 	// nixlPauseEnv tells the agent the process's pod opted in.
 	nixlPauseEnv = "NVSNAP_NIXL_PAUSE"
