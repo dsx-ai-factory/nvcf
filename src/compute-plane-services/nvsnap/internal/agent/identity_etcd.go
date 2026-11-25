@@ -1012,7 +1012,6 @@ func (a *Agent) identityRecordVisible(key string, d map[string]string) bool {
 // Call sites the identity restore wraps; tests stub them.
 var (
 	checkpointMember = (*Agent).Checkpoint
-	restoreLone      = (*Agent).restoreProbed
 	restoreInstance  = (*Agent).groupRestore
 )
 

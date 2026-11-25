@@ -711,10 +711,10 @@ func TestLoneRestore_RegrantsBeforeRestoring(t *testing.T) {
 	a.config.CheckpointDir = t.TempDir()
 	c := a.criuRestorer()
 
-	saved := restoreLone
-	t.Cleanup(func() { restoreLone = saved })
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
 	var grantedFirst, registeredEarly bool
-	restoreLone = func(_ *Agent, _ context.Context, req RestoreRequest) (*RestoreResult, error) {
+	restoreForRequest = func(_ *Agent, _ context.Context, req RestoreRequest) (*RestoreResult, error) {
 		grantedFirst = f.live(idLease)
 		_, registeredEarly = f.value(keys[0])
 		return &RestoreResult{}, nil
@@ -804,9 +804,9 @@ func TestLoneRestore_AgentRestartAdoptsIdentity(t *testing.T) {
 	useFakeEtcd(t, f)
 	kc := fake.NewSimpleClientset(rec, pod)
 	c := idAgent(kc, true).criuRestorer()
-	saved := restoreLone
-	t.Cleanup(func() { restoreLone = saved })
-	restoreLone = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
 		return nil, fmt.Errorf("criu-v2: %w", errNotPlaceholder)
 	}
 	refused := decisions(t, identityRefusedLiveLease)
@@ -839,10 +839,10 @@ func TestLoneRestore_FlagOffRefusesIdentityRecord(t *testing.T) {
 	pod := idPlaceholder("w-new", idNewIP)
 	kc := fake.NewSimpleClientset(rec, pod)
 	c := idAgent(kc, false).criuRestorer()
-	saved := restoreLone
-	t.Cleanup(func() { restoreLone = saved })
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
 	restored := false
-	restoreLone = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
 		restored = true
 		return nil, nil
 	}
@@ -883,10 +883,10 @@ func TestLoneRestore_LiveLeaseRefused(t *testing.T) {
 	kc := fake.NewSimpleClientset(rec, pod)
 	a := idAgent(kc, true)
 	c := a.criuRestorer()
-	saved := restoreLone
-	t.Cleanup(func() { restoreLone = saved })
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
 	restored := false
-	restoreLone = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
 		restored = true
 		return nil, nil
 	}
@@ -929,9 +929,9 @@ func TestLoneRestore_FailedRestoreRevokes(t *testing.T) {
 	pod := idPlaceholder("w-new", idNewIP)
 	kc := fake.NewSimpleClientset(rec, pod)
 	c := idAgent(kc, true).criuRestorer()
-	saved := restoreLone
-	t.Cleanup(func() { restoreLone = saved })
-	restoreLone = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
 		return nil, fmt.Errorf("%w: test", errCheckpointUnavailable)
 	}
 	c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)

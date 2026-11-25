@@ -281,7 +281,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			refusedPod = target
 			return ierr
 		}
-		_, err := restoreLone(a, rctx, RestoreRequest{
+		_, err := restoreForRequest(a, rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
 			PlaceholderPodName:       pod,
@@ -338,7 +338,15 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		outcome = metrics.RestoreGPUFault
 	}
 	c.observeRestore(groupKey, ref, a.nodeGPU(ctx, a.config.NodeName), 1, outcome, err, 0, log)
+	inPlace := false
 	switch {
+	case errors.Is(err, errNIXLResumeUnavailable):
+		// The node's, not the checkpoint's nor the configuration's: not a
+		// stall (recordFailure). The pod starts cold in place, where a
+		// replacement could land on this node again.
+		log.WithError(err).Warn("CRIU auto-restore refused: this node cannot resume the pod's NIXL KV connector; the pod starts cold in place")
+		record(func(d map[string]string) bool { return recordFailure(d, id, false, err) })
+		inPlace = true
 	case fault != nil:
 		log.WithError(err).Warn("CRIU auto-restore failed on a faulty GPU; it is not counted against the checkpoint, and the pod is deleted so its replacement restores again")
 		record(func(d map[string]string) bool { return recordGPUFault(d, id, fault) })
@@ -353,7 +361,9 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	default:
 		log.WithError(err).Error("CRIU auto-restore failed; its capture was verified, so it is kept and the replacement restores from it again")
 	}
-	a.disposeFailedPlaceholder(context.WithoutCancel(ctx), ns, pod, uid, container, log)
+	if a.disposeFailedPlaceholderIn(context.WithoutCancel(ctx), ns, pod, uid, container, inPlace, log) {
+		releaseNotServing(err)
+	}
 }
 
 func (a *Agent) criuFailedNamespace() string {
