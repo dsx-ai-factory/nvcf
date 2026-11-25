@@ -30,6 +30,9 @@ package agent
 //
 // Kubernetes discovery stays refused. A record with an identity is never
 // restored without its regrant: with the flag off, such a pod starts cold.
+// With the flag on, a placeholder restores only from the record of its own
+// capture (identityBeforeRestore); a record gone, or replaced since, is
+// refused, the pod starting cold.
 
 import (
 	"bytes"
@@ -72,6 +75,9 @@ const (
 	// identityGrantedKey names the holder whose restore had the lease
 	// granted: only it may adopt a live lease after an agent restart.
 	identityGrantedKey = "identity.granted"
+	// identityHandoffKey names the holder whose process was seen keeping
+	// the lease: no agent keeps it for that pod any more.
+	identityHandoffKey = "identity.handoff"
 )
 
 const (
@@ -154,6 +160,7 @@ func (i *capturedIdentity) write(d map[string]string) error {
 	d[identityKeysKey] = string(b)
 	delete(d, identityHolderKey)
 	delete(d, identityGrantedKey)
+	delete(d, identityHandoffKey)
 	return nil
 }
 
@@ -161,7 +168,7 @@ func (i *capturedIdentity) write(d map[string]string) error {
 // not.
 func hasIdentity(d map[string]string) bool {
 	for k := range d {
-		if strings.HasPrefix(k, "identity.") && k != identityHolderKey && k != identityGrantedKey {
+		if strings.HasPrefix(k, "identity.") && k != identityHolderKey && k != identityGrantedKey && k != identityHandoffKey {
 			return true
 		}
 	}
@@ -644,7 +651,7 @@ func holderOf(pod *corev1.Pod) string {
 }
 
 // holderAlive reports whether the pod holder names exists, with that UID,
-// and is not being deleted.
+// being deleted or not.
 func (a *Agent) holderAlive(ctx context.Context, holder string) (bool, error) {
 	parts := strings.SplitN(holder, "/", 3)
 	if len(parts) != 3 {
@@ -657,7 +664,9 @@ func (a *Agent) holderAlive(ctx context.Context, holder string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return p.UID == types.UID(parts[2]) && p.DeletionTimestamp == nil, nil
+	// A pod being deleted still runs until it is gone: a worker that
+	// drains keeps its subscriptions meanwhile.
+	return p.UID == types.UID(parts[2]), nil
 }
 
 // claimIdentity makes pod the holder of record key's identity. A holder
@@ -693,6 +702,7 @@ func (c *criuAutoRestorer) claimIdentity(ctx context.Context, key string, pod *c
 		}
 		d[identityHolderKey] = me
 		delete(d, identityGrantedKey)
+		delete(d, identityHandoffKey)
 		return true
 	})
 	if refused != nil {
@@ -735,6 +745,7 @@ func (c *criuAutoRestorer) releaseIdentity(ctx context.Context, key string, pod 
 		}
 		delete(d, identityHolderKey)
 		delete(d, identityGrantedKey)
+		delete(d, identityHandoffKey)
 		return true
 	}); err != nil && !apierrors.IsNotFound(err) {
 		log.WithError(err).Warn("identity restore: cannot release the claim on the identity; it is released once the pod is gone")
@@ -788,6 +799,16 @@ func grantLease(ctx context.Context, e identityEtcd, id *capturedIdentity) error
 // left as it is and fails the write: another worker owns it.
 func writeIdentityKeys(ctx context.Context, e identityEtcd, id *capturedIdentity, newIP string) error {
 	for _, k := range id.Keys {
+		// A key already under the lease is the process's own, maybe
+		// newer than the capture's (an agent that adopts after a
+		// restart): left as it is.
+		cur, err := e.Get(ctx, k.Key)
+		if err != nil {
+			return fmt.Errorf("write the identity's keys: %w", err)
+		}
+		if cur != nil && cur.Lease == id.Lease {
+			continue
+		}
 		owned, err := e.PutOwned(ctx, k.Key, rewriteHost(k.Value, id.PodIP, newIP), id.Lease)
 		if err != nil {
 			return fmt.Errorf("write the identity's keys: %w", err)
@@ -820,9 +841,10 @@ type leaseKeeper struct {
 	log     *logrus.Entry
 	// release closes the registry; writeKeys registers the identity once
 	// the process runs; onAborted releases the claim of a restore that
-	// failed; onZombie ends a restored pod whose identity was lost.
-	release, onAborted, onZombie func()
-	writeKeys                    func(context.Context) error
+	// failed; onZombie ends a restored pod whose identity was lost;
+	// onHandoff records that the process keeps its lease.
+	release, onAborted, onZombie, onHandoff func()
+	writeKeys                               func(context.Context) error
 
 	once    sync.Once
 	resumed chan struct{}
@@ -854,14 +876,16 @@ func (k *leaseKeeper) restored(err error) {
 }
 
 // run keeps the lease alive. Before the process resumes it renews the
-// lease whenever a quarter of its TTL is left. Once it resumed, the keeper
+// lease whenever half its TTL is left: a gateway call may take seconds. Once it resumed, the keeper
 // writes the identity's keys (the frontend routes to the worker only then),
 // and watches the lease's TTL against what its own last renewal explains.
 // Held above that for a whole TTL, the lease is renewed by someone else
 // all along: the process's keep-alive has taken over, and it stops. One
 // renewal not its own (etcd renews every lease on a leader change) keeps
-// it above for under three quarters of a TTL, after which the keeper
-// renews it again; samples need not rise between polls. It fails closed: a process whose keep-alive is not
+// it above for under half a TTL, after which the keeper renews it again;
+// samples need not rise between polls. Before it hands off, the keeper
+// renews the lease once more: a late sample may tell of a lease that has
+// expired since. It fails closed: a process whose keep-alive is not
 // seen within max(3 TTL, identityHandoffFloor), or whose keys cannot be
 // written, has its lease revoked and its pod ended, so the frontend stops
 // routing to a worker that does not keep its registration and no second
@@ -944,10 +968,23 @@ func (k *leaseKeeper) run(ctx context.Context) {
 				above = time.Time{}
 			}
 			if !above.IsZero() && at.Sub(above) >= ttl {
-				k.log.WithField("waited", time.Since(deadline.Add(-handoffWait)).Round(time.Second).String()).
-					Info("identity restore: the restored process keeps its lease alive; the agent stops keeping it")
-				end(identityHandoffSeen, false, nil)
-				return
+				// A late reply may tell of a lease that expired since:
+				// renewed once more, it is shown live now, or lost.
+				got, kerr := k.e.KeepAlive(ctx, k.id)
+				switch {
+				case kerr != nil:
+					k.log.WithError(kerr).Warn("identity restore: cannot confirm the lease before handing it off; trying again")
+					own, ownTTL, above = time.Now(), ttl, time.Time{}
+				case got <= 0:
+					k.log.Error("identity restore: the lease expired before the handoff; ending the restored pod")
+					end(identityHandoffLost, false, k.onZombie)
+					return
+				default:
+					k.log.WithField("waited", time.Since(deadline.Add(-handoffWait)).Round(time.Second).String()).
+						Info("identity restore: the restored process keeps its lease alive; the agent stops keeping it")
+					end(identityHandoffSeen, false, k.onHandoff)
+					return
+				}
 			}
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
@@ -955,7 +992,9 @@ func (k *leaseKeeper) run(ctx context.Context) {
 			end(identityHandoffTimeout, true, k.onZombie)
 			return
 		}
-		if err != nil || time.Duration(info.TTL)*time.Second <= ttl/4 {
+		// etcd reports whole seconds, rounded down: renewed once at most
+		// half the TTL can be left.
+		if err != nil || time.Duration(info.TTL+1)*time.Second <= max(ttl/2, time.Second) {
 			got, kerr := k.e.KeepAlive(ctx, k.id)
 			switch {
 			case kerr != nil:
@@ -995,10 +1034,25 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 	}
 	d, key, err := c.a.identityRecord(ctx, key)
 	if err != nil {
-		if apierrors.IsNotFound(err) || !c.a.identityEnabled() {
+		if !c.a.identityEnabled() {
 			return nil, nil // the restore decides as it always has
 		}
+		// With the flag on, a checkpoint whose record cannot be read may
+		// hold an identity nothing would grant: refused (fail closed).
 		return nil, refuseIdentity(identityRefusedError, fmt.Errorf("read the group record: %w", err))
+	}
+	if c.a.identityEnabled() {
+		// The identity a record holds is its capture's: a record replaced
+		// since the placeholder was admitted (recaptured, or capturing
+		// now) says nothing of this checkpoint's identity.
+		if !recordUsable(d) {
+			return nil, refuseIdentity(identityRefusedError, fmt.Errorf("the group record is %q, not a capture to restore", d["state"]))
+		}
+		for _, s := range slots {
+			if s != nil && !recordOf(d, s.Annotations[webhook.CRIURestoreAnnotation]) {
+				return nil, refuseIdentity(identityRefusedError, errors.New("the group record no longer names the placeholder's checkpoint"))
+			}
+		}
 	}
 	if !hasIdentity(d) {
 		return nil, nil
@@ -1059,56 +1113,185 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 			release()
 			return nil, err
 		}
-		if merr := c.markGranted(ctx, key, holder); merr != nil {
-			_ = e.Revoke(context.WithoutCancel(ctx), id.Lease)
-			closeFn()
-			release()
-			return nil, refuseIdentity(identityRefusedError, fmt.Errorf("record the grant: %w", merr))
-		}
-		observeIdentity(identityRegranted)
-		log.Info("identity restore: the captured lease is granted again; restoring")
-	} else {
-		log.Info("identity restore: this pod already holds the identity; keeping its lease alive")
 	}
+	k := c.identityKeeper(keep, key, id, e, closeFn, holder, newIP, log)
+	// The keeper renews the lease from the grant on, while the grant is
+	// recorded.
+	go k.run(keep)
+	if granted {
+		log.Info("identity restore: this pod already holds the identity; keeping its lease alive")
+		return k, nil
+	}
+	if merr := c.markGranted(ctx, key, holder); merr != nil {
+		rerr := refuseIdentity(identityRefusedError, fmt.Errorf("record the grant: %w", merr))
+		k.restored(rerr) // revokes the lease and releases the claim
+		<-k.done
+		return nil, rerr
+	}
+	observeIdentity(identityRegranted)
+	log.Info("identity restore: the captured lease is granted again; restoring")
+	return k, nil
+}
+
+// identityKeeper is the keeper of identity id of record key for holder,
+// restored at newIP, over registry e (closed by closeFn).
+func (c *criuAutoRestorer) identityKeeper(keep context.Context, key string, id *capturedIdentity, e identityEtcd, closeFn func(), holder *corev1.Pod, newIP string, log *logrus.Entry) *leaseKeeper {
 	k := newLeaseKeeper(e, id.Lease, id.TTL, log)
-	k.release = closeFn
+	// One keeper per identity in this agent: an agent that restarted finds
+	// none and adopts the restored pod's lease (considerRestoredIdentity).
+	c.attempted.Store("identity-keeper/"+key, struct{}{})
+	k.release = func() {
+		closeFn()
+		c.attempted.Delete("identity-keeper/" + key)
+	}
 	k.writeKeys = func(ctx context.Context) error { return writeIdentityKeys(ctx, e, id, newIP) }
-	k.onAborted = func() { c.releaseIdentity(context.WithoutCancel(ctx), key, holder, log) }
+	k.onAborted = func() { c.releaseIdentity(context.WithoutCancel(keep), key, holder, log) }
+	k.onHandoff = func() {
+		if err := c.updateGroupRecord(context.WithoutCancel(keep), key, func(d map[string]string) bool {
+			if d[identityHolderKey] != holderOf(holder) || d[identityHandoffKey] == holderOf(holder) {
+				return false
+			}
+			d[identityHandoffKey] = holderOf(holder)
+			return true
+		}); err != nil {
+			log.WithError(err).Warn("identity restore: cannot record the handoff; an agent that restarts checks the lease again")
+		}
+	}
 	k.onZombie = func() {
+		// A restore whose process does not keep its registration counts
+		// against its capture, as any failed restore (recordFailure), so
+		// replacements that fail the same way end; then the pod is ended.
 		// The claim stays until the pod is gone (holderAlive).
+		cause := fmt.Errorf("identity restore: the restored worker lost its registration (%s)", k.outcome)
+		ck := holder.Annotations[webhook.CRIURestoreAnnotation]
+		if uerr := c.updateGroupRecord(context.WithoutCancel(keep), key, func(d map[string]string) bool { return recordFailure(d, ck, true, cause) }); uerr != nil && !apierrors.IsNotFound(uerr) {
+			log.WithError(uerr).Error("identity restore: cannot count the lost registration against the capture")
+		}
 		if derr := c.a.deletePodRetrying(context.WithoutCancel(keep), holder.Namespace, holder.Name, holder.UID); derr != nil {
 			log.WithError(derr).Error("identity restore: cannot delete the pod that lost its identity")
 		}
 	}
-	go k.run(keep)
-	return k, nil
+	return k
+}
+
+// considerRestoredIdentity adopts, after an agent restart, the identity of
+// a restored pod that no agent keeps: the restore's agent stopped after
+// the restore and before the restored process was seen keeping its lease
+// (the pod is marked restored, so no restore is tried in it again, and
+// its keys may never have been written). The agent of the pod that drove
+// the restore (a lone pod, or a group's leader) runs a keeper for it, as
+// the restore's would have from the process's resume on: it registers
+// the keys the lease does not hold yet and waits for the handoff; a lease
+// lost, or never kept, ends the holder's pod (onZombie).
+func (c *criuAutoRestorer) considerRestoredIdentity(ctx context.Context, pod *corev1.Pod) {
+	key := pod.Annotations[webhook.CRIUGroupAnnotation]
+	if !c.a.identityEnabled() || key == "" || pod.Annotations[webhook.CRIURestoredAnnotation] == "" ||
+		pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return
+	}
+	if o, _, ok := podRank(pod, webhook.CRIUGroupOrdinalAnnotation, webhook.CRIUGroupSizeAnnotation); isGroupPlaceholder(pod) && (!ok || o != 0) {
+		return // a group's identity is kept from its leader's node
+	}
+	d, key, err := c.a.identityRecord(ctx, key)
+	if err != nil || !hasIdentity(d) {
+		return
+	}
+	h := d[identityHolderKey]
+	if h == "" || d[identityGrantedKey] != h || d[identityHandoffKey] == h {
+		return
+	}
+	if _, running := c.attempted.Load("identity-keeper/" + key); running {
+		return
+	}
+	if _, busy := c.attempted.LoadOrStore("identity-adopt/"+key, struct{}{}); busy {
+		return
+	}
+	go func() {
+		defer c.attempted.Delete("identity-adopt/" + key)
+		log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": key})
+		id, err := identityFromRecord(d)
+		if err != nil {
+			log.WithError(err).Warn("identity restore: the restored pod's identity record cannot be read")
+			return
+		}
+		parts := strings.SplitN(h, "/", 3)
+		if len(parts) != 3 {
+			return
+		}
+		holder, err := c.a.kubeClient.CoreV1().Pods(parts[0]).Get(ctx, parts[1], metav1.GetOptions{})
+		if err != nil || string(holder.UID) != parts[2] || holder.Annotations[webhook.CRIURestoredAnnotation] == "" ||
+			(holder.UID != pod.UID && holder.Annotations[webhook.CRIUGroupAnnotation] != pod.Annotations[webhook.CRIUGroupAnnotation]) {
+			return // not this restore's pod, or not restored: its restore adopts it
+		}
+		if net.ParseIP(holder.Status.PodIP) == nil {
+			return
+		}
+		e, closeFn, err := newIdentityEtcd(ctx, c.a, id.Endpoints, pod.Namespace, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation])
+		if err != nil {
+			log.WithError(err).Warn("identity restore: cannot reach the registry to adopt the restored pod's lease; trying again on its next event")
+			return
+		}
+		if _, running := c.attempted.Load("identity-keeper/" + key); running {
+			closeFn()
+			return
+		}
+		log.Info("identity restore: adopting the lease of a restored pod no agent keeps")
+		k := c.identityKeeper(ctx, key, id, e, closeFn, holder, holder.Status.PodIP, log)
+		go k.run(ctx)
+		k.restored(nil) // the process runs: register it and wait for its keep-alive
+	}()
 }
 
 // identityRefused handles the pods (by slot) of a restore the identity
-// restore refused (settleRefused). When a pod's refusal is left unfinished,
-// or a pod kept for the workload it runs was refused for an error that may
-// pass (an adopted lease that could not be read), and nothing was done to
-// any pod, again hands the refusal to the restore's next event, which
-// decides it anew. Once a pod has started cold or been deleted the restore
-// cannot run again (its leader may be gone), so this agent finishes the
-// pods left unfinished itself (finishRefused), wherever they run: what is
-// left to do then is reading and deleting them, which the API does for
-// any node.
+// restore refused (settleRefused).
+//
+// The refusal is recorded on record key first (identityRefusingKey, by pod
+// UID), before any pod is acted on, so that a pod left unfinished is
+// finished even by another agent, or after this one restarts: the pod's
+// own agent finishes it on its next event (considerRefusing). When the
+// refusal cannot be recorded, nothing is done and again hands it to the
+// restore's next event.
+//
+// When a pod's refusal is left unfinished, or a pod kept for the workload
+// it runs was refused for an error that may pass (an adopted lease that
+// could not be read), and nothing was done to any pod, again hands the
+// refusal to the restore's next event, which decides it anew. Once a pod
+// has started cold or been deleted the restore cannot run again (its
+// leader may be gone), so this agent also finishes the pods left
+// unfinished itself (finishRefused).
 func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, again func(), log *logrus.Entry) {
 	decision := identityDecision(err)
 	observeIdentity(decision)
 	log = log.WithError(err).WithField("decision", decision)
-	pending, running, acted := c.settleRefused(ctx, key, checkpoint, pods, err, log)
-	if len(pending) == 0 && (len(running) == 0 || decision != identityRefusedError) {
+	if merr := c.markRefusing(ctx, key, pods, nil); merr != nil {
+		log.WithError(merr).Warn("identity restore: cannot record the refusal on the group record; nothing done, it is tried again")
+		if again != nil {
+			again()
+		}
 		return
 	}
-	if !acted && again != nil {
+	pending, running, acted := c.settleRefused(ctx, key, checkpoint, pods, err, log)
+	retry := len(pending) > 0 || (len(running) > 0 && decision == identityRefusedError)
+	if retry && !acted && again != nil {
+		c.unmarkRefusing(ctx, key, pods, false, log)
 		again()
 		return
 	}
+	c.unmarkRefusing(ctx, key, settledOf(pods, pending), true, log)
 	if len(pending) > 0 {
 		go c.finishRefused(ctx, key, checkpoint, pending, err, log)
 	}
+}
+
+// settledOf is pods without pending, by UID.
+func settledOf(pods, pending []*corev1.Pod) []*corev1.Pod {
+	var out []*corev1.Pod
+	for _, p := range pods {
+		if !slices.ContainsFunc(pending, func(q *corev1.Pod) bool { return q.UID == p.UID }) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // identityFinishRetry paces finishRefused, as recoverRetry paces what an
@@ -1119,47 +1302,170 @@ var (
 )
 
 // finishRefused tries pods' unfinished refusal again until every pod is
-// settled, for at most identityFinishRetry's total or until ctx ends.
+// settled, for at most identityFinishRetry's total or until ctx ends. Past
+// that, each pod's own agent finishes it (considerRefusing).
 func (c *criuAutoRestorer) finishRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) {
 	identityFinishRetryMu.RLock()
 	b := identityFinishRetry
 	identityFinishRetryMu.RUnlock()
 	time.Sleep(b.first)
 	if rerr := retryUntil(ctx, b.first, b.max, b.total, func() (bool, error) {
-		pods, _, _ = c.settleRefused(ctx, key, checkpoint, pods, err, log)
+		pending, _, _ := c.settleRefused(ctx, key, checkpoint, pods, err, log)
+		c.unmarkRefusing(ctx, key, settledOf(pods, pending), true, log)
+		pods = pending
 		return len(pods) == 0, nil
 	}); len(pods) > 0 {
-		log.WithError(rerr).WithField("pods", len(pods)).Error("identity restore: a refusal could not be finished; its pods are left as they are")
+		log.WithError(rerr).WithField("pods", len(pods)).Error("identity restore: a refusal could not be finished here; each pod's own agent finishes it")
 	}
+}
+
+// Record keys of refusals in progress: the UIDs (comma-separated) of the
+// pods a refusal acts on, until each is settled, and of those a stall was
+// counted for (chargeRefusal), until each is gone. At most
+// identityRefusalListMax each; the oldest go first.
+const (
+	identityRefusingKey    = "refusingPods"
+	identityRefusedPodsKey = "refusedPods"
+	identityRefusalListMax = 512
+)
+
+// listed returns record list v as UIDs.
+func listed(v string) []string {
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
+}
+
+// setListed stores UIDs uids as record list k of d, at most
+// identityRefusalListMax of them; an empty list is removed.
+func setListed(d map[string]string, k string, uids []string) {
+	if n := len(uids); n > identityRefusalListMax {
+		uids = uids[n-identityRefusalListMax:]
+	}
+	if len(uids) == 0 {
+		delete(d, k)
+		return
+	}
+	d[k] = strings.Join(uids, ",")
+}
+
+// markRefusing records pods' refusal in progress on record key. A record
+// gone is no error: nothing can be recorded, or restored, from it.
+func (c *criuAutoRestorer) markRefusing(ctx context.Context, key string, pods []*corev1.Pod, _ *logrus.Entry) error {
+	if key == "" || len(pods) == 0 {
+		return nil
+	}
+	err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		uids := listed(d[identityRefusingKey])
+		changed := false
+		for _, p := range pods {
+			if !slices.Contains(uids, string(p.UID)) {
+				uids, changed = append(uids, string(p.UID)), true
+			}
+		}
+		if changed {
+			setListed(d, identityRefusingKey, uids)
+		}
+		return changed
+	})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// unmarkRefusing drops pods from record key's refusals in progress, and,
+// once settled (not acted on again), from its counted stalls; pods handed
+// back to their restore's next event stay counted. A failure leaves them
+// listed, which only has their agents find them settled.
+func (c *criuAutoRestorer) unmarkRefusing(ctx context.Context, key string, pods []*corev1.Pod, settled bool, log *logrus.Entry) {
+	if key == "" || len(pods) == 0 {
+		return
+	}
+	drop := func(uids []string) ([]string, bool) {
+		n := len(uids)
+		uids = slices.DeleteFunc(uids, func(u string) bool {
+			return slices.ContainsFunc(pods, func(p *corev1.Pod) bool { return string(p.UID) == u })
+		})
+		return uids, len(uids) != n
+	}
+	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		a, ca := drop(listed(d[identityRefusingKey]))
+		b, cb := listed(d[identityRefusedPodsKey]), false
+		if settled {
+			b, cb = drop(b)
+		}
+		if ca {
+			setListed(d, identityRefusingKey, a)
+		}
+		if cb {
+			setListed(d, identityRefusedPodsKey, b)
+		}
+		return ca || cb
+	}); err != nil && !apierrors.IsNotFound(err) {
+		log.WithError(err).Warn("identity restore: cannot clear settled pods from the group record's refusal")
+	}
+}
+
+// considerRefusing finishes, on a pod's own event and on its own node, a
+// refusal recorded for it (markRefusing) that the agent which refused it
+// left unfinished: that agent may have restarted, or the pod may be on
+// another node. It reports whether the pod is under such a refusal, which
+// then is the only thing done for it.
+func (c *criuAutoRestorer) considerRefusing(ctx context.Context, pod *corev1.Pod) bool {
+	key := pod.Annotations[webhook.CRIUGroupAnnotation]
+	ck, _, ready := criuRestoreTarget(pod)
+	if !c.a.identityEnabled() || key == "" || !ready {
+		return false
+	}
+	d, _, err := c.a.identityRecord(ctx, key)
+	if err != nil || !slices.Contains(listed(d[identityRefusingKey]), string(pod.UID)) {
+		return false
+	}
+	if _, busy := c.attempted.LoadOrStore("refusing/"+string(pod.UID), struct{}{}); busy {
+		return true
+	}
+	go func() {
+		defer c.attempted.Delete("refusing/" + string(pod.UID))
+		log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": key})
+		cause := refuseIdentity(identityRefusedError, errors.New("a refusal recorded on the group record, finished by the pod's own agent"))
+		pending, _, _ := c.settleRefused(context.WithoutCancel(ctx), key, ck, []*corev1.Pod{pod}, cause, log)
+		c.unmarkRefusing(context.WithoutCancel(ctx), key, settledOf([]*corev1.Pod{pod}, pending), true, log)
+	}()
+	return true
 }
 
 // podRunsWorkload reports whether pod's container runs a GPU workload,
 // as a restore would refuse it (errNotPlaceholder): a restored engine an
-// earlier agent left. Only a pod on this node can be inspected; one on
-// another node is reported as running none, and is decided with the
+// earlier agent left. Only a pod on this node can be inspected (local); one
+// on another node is reported as running none, and is decided with the
 // instance's pods on this node (settleRefused). Without a runtime client
 // nothing can be inspected, nor started cold, so it reports none. Tests
 // replace it.
-var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, container string) (bool, error) {
-	if a.runtime == nil || pod.Spec.NodeName != a.config.NodeName {
-		return false, nil
+var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, container string) (runs, local bool, err error) {
+	if a.runtime == nil {
+		return false, true, nil
+	}
+	if pod.Spec.NodeName != a.config.NodeName {
+		return false, false, nil
 	}
 	info, err := a.runtime.FindContainerByPod(ctx, pod.Namespace, pod.Name, container)
 	if err != nil {
-		return false, err
+		return false, true, err
 	}
 	if info == nil || info.PID == 0 {
-		return false, nil
+		return false, true, nil
 	}
 	pid, err := a.gpuProcessInSamePidNS(ctx, hostProcBase(), int(info.PID))
-	return pid != 0, err
+	return pid != 0, true, err
 }
 
 // settleRefused acts on pods (as refused, by UID and restore annotation)
 // for a refused restore, nothing counted against the capture:
 //
-//   - a pod gone, replaced, or that no longer names its refused
-//     checkpoint is left as it is;
+//   - a pod gone, replaced, no longer naming its refused checkpoint, or
+//     started cold already is left as it is;
 //   - when any pod runs a workload already (podRunsWorkload), the restore
 //     ran before (an agent that stopped before it marked the pods): every
 //     pod is kept as it is (running), none started cold or deleted;
@@ -1167,17 +1473,27 @@ var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, conta
 //     deleted, for its controller to replace, only once record key counts
 //     a stall for the refusal (chargeRefusal), so the replacements,
 //     admitted at once and refused the same way, end at
-//     criuGroupMaxStalls. A pod of which it cannot be told whether it runs
-//     a workload is never deleted: it starts cold, or stays unfinished.
+//     criuGroupMaxStalls;
+//   - a pod of which it cannot be told whether it runs a workload is never
+//     deleted: it starts cold, or is kept and tried again. When a pod on
+//     this node cannot be inspected, neither can be told of a pod on
+//     another node, which is decided with them.
 //
-// A pod that cannot be read, or deleted, or whose stall cannot be counted,
-// is returned unfinished (pending), and nothing is deleted then. acted
-// reports whether a pod started cold or was deleted.
+// A pod started cold or deleted gives up its claim on the identity. A pod
+// that cannot be read, or deleted, or whose stall cannot be counted, or
+// that another refusal of this agent is acting on, is returned unfinished
+// (pending), and nothing is deleted then. acted reports whether a pod
+// started cold or was deleted.
 func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) (pending, running []*corev1.Pod, acted bool) {
-	var live, unsure []*corev1.Pod
+	var live, unsure, remote []*corev1.Pod
 	runs := false
 	for _, p := range pods {
 		pl := log.WithField("pod", p.Namespace+"/"+p.Name)
+		if _, busy := c.attempted.LoadOrStore("settling/"+string(p.UID), struct{}{}); busy {
+			pending = append(pending, p)
+			continue
+		}
+		defer c.attempted.Delete("settling/" + string(p.UID))
 		var pod *corev1.Pod
 		gerr := retry.OnError(retry.DefaultBackoff, func(e error) bool { return !apierrors.IsNotFound(e) }, func() error {
 			var e error
@@ -1185,8 +1501,8 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 			return e
 		})
 		if apierrors.IsNotFound(gerr) || (gerr == nil && (pod.UID != p.UID ||
-			pod.Annotations[webhook.CRIURestoreAnnotation] != p.Annotations[webhook.CRIURestoreAnnotation])) {
-			pl.Warn("identity restore refused; the pod is gone, replaced, or no longer names the refused checkpoint: left as it is")
+			pod.Annotations[webhook.CRIURestoreAnnotation] != p.Annotations[webhook.CRIURestoreAnnotation] || coldStarted(pod))) {
+			pl.Warn("identity restore refused; the pod is gone, replaced, started cold, or no longer names the refused checkpoint: left as it is")
 			continue
 		}
 		if gerr != nil {
@@ -1195,18 +1511,23 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 			continue
 		}
 		live = append(live, pod)
-		r, rerr := podRunsWorkload(ctx, c.a, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation])
+		r, local, rerr := podRunsWorkload(ctx, c.a, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation])
 		switch {
 		case rerr != nil:
 			pl.WithError(rerr).Warn("identity restore refused, and whether the pod runs a workload cannot be told; it is not deleted")
 			unsure = append(unsure, pod)
 		case r:
 			runs = true
+		case !local:
+			remote = append(remote, pod)
 		}
 	}
 	if runs {
 		log.Warn("identity restore refused, and the instance already runs its workload: its pods are kept as they are")
 		return pending, live, false
+	}
+	if len(unsure) > 0 {
+		unsure = append(unsure, remote...)
 	}
 	var cold []*corev1.Pod
 	for _, pod := range live {
@@ -1215,6 +1536,7 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 		switch {
 		case cerr == nil:
 			pl.Warn("identity restore refused; the pod starts cold in place")
+			c.releaseIdentity(ctx, key, pod, pl)
 			acted = true
 		case slices.Contains(unsure, pod):
 			pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused; the pod cannot start cold in place, and may run a workload: kept, trying again")
@@ -1241,29 +1563,21 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 			pending = append(pending, pod)
 			continue
 		}
+		c.releaseIdentity(ctx, key, pod, log)
 		acted = true
 	}
 	return pending, nil, acted
 }
 
-// identityRefusedPodsKey lists, on a group record, the UIDs of the last
-// pods refusals counted a stall for: at most identityRefusedPodsMax, or
-// every pod of the last refusal when it has more.
-const (
-	identityRefusedPodsKey = "refusedPods"
-	identityRefusedPodsMax = 32
-)
-
 // chargeRefusal counts on group record d one stall for the refusal of all,
 // whose pods cold are deleted next (recordFailure). A refusal is counted
-// once: when every pod of cold is listed already (the refusal tried again
-// after a delete failed, or a rank that could not be read before), nothing
-// is counted again.
+// once: when every pod of cold is listed already (identityRefusedPodsKey:
+// the refusal tried again after a delete failed, or a rank that could not
+// be read before), nothing is counted again. A pod stays listed until it
+// is settled (unmarkRefusing), so refusals of other instances sharing the
+// record do not push it out.
 func chargeRefusal(d map[string]string, checkpoint string, cold, all []*corev1.Pod, cause error) bool {
-	var charged []string
-	if v := d[identityRefusedPodsKey]; v != "" {
-		charged = strings.Split(v, ",")
-	}
+	charged := listed(d[identityRefusedPodsKey])
 	fresh := false
 	for _, p := range cold {
 		fresh = fresh || !slices.Contains(charged, string(p.UID))
@@ -1271,18 +1585,12 @@ func chargeRefusal(d map[string]string, checkpoint string, cold, all []*corev1.P
 	if !fresh || !recordFailure(d, checkpoint, false, cause) {
 		return false
 	}
-	// The refusal's own pods go last, so trimming the list to its bound
-	// drops older refusals' pods only, never one of this refusal's.
-	charged = slices.DeleteFunc(charged, func(u string) bool {
-		return slices.ContainsFunc(all, func(p *corev1.Pod) bool { return string(p.UID) == u })
-	})
 	for _, p := range all {
-		charged = append(charged, string(p.UID))
+		if !slices.Contains(charged, string(p.UID)) {
+			charged = append(charged, string(p.UID))
+		}
 	}
-	if n, most := len(charged), max(identityRefusedPodsMax, len(all)); n > most {
-		charged = charged[n-most:]
-	}
-	d[identityRefusedPodsKey] = strings.Join(charged, ",")
+	setListed(d, identityRefusedPodsKey, charged)
 	return true
 }
 
@@ -1293,8 +1601,12 @@ func (a *Agent) identityRecordVisible(key string, d map[string]string) bool {
 	if a.identityEnabled() || !hasIdentity(d) {
 		return true
 	}
-	observeIdentity(identityRefusedDisabled)
-	a.log.WithField("criuGroup", key).Info("CRIU group restore: the capture holds an etcd identity and identity restore is off; cold start")
+	// Admission asks for every pod: one decision per capture, counted
+	// and logged once.
+	if _, seen := a.identityDisabledSeen.LoadOrStore(key+"\x00"+d["checkpoint.0"], struct{}{}); !seen {
+		observeIdentity(identityRefusedDisabled)
+		a.log.WithField("criuGroup", key).Info("CRIU group restore: the capture holds an etcd identity and identity restore is off; cold start")
+	}
 	return false
 }
 

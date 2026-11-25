@@ -183,9 +183,13 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	c.considerRestored(ctx, pod)
 	c.considerRestoredCondition(ctx, pod)
 	c.considerColdStart(ctx, pod)
+	c.considerRestoredIdentity(ctx, pod)
 	c.considerRestoredStacks(ctx, pod)
 	c.considerTeardown(ctx, pod)
 	c.observePodReady(ctx, pod)
+	if c.considerRefusing(ctx, pod) {
+		return
+	}
 	if !c.admitted(ctx, pod) {
 		return
 	}

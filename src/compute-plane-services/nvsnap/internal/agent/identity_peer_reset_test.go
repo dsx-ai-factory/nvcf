@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -87,23 +88,23 @@ func TestEndPeerReset(t *testing.T) {
 	a := &Agent{}
 	ctx := context.Background()
 	dumpErr := errors.New("dump failed")
-	if err := a.endPeerReset(ctx, nil, dumpErr, false, "/x"); err != nil {
+	if err := a.endPeerReset(ctx, nil, false, false, "/x"); err != nil {
 		t.Fatal("no reset reported a failure")
 	}
 	conns := []tcpTuple{{Local: netip.MustParseAddrPort("10.0.0.1:1"), Remote: netip.MustParseAddrPort("10.0.0.9:2379")}}
 	r := &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
-	if err := a.endPeerReset(ctx, r, dumpErr, false, "/x"); err != nil || unlocks != 0 {
-		t.Fatal("a failed dump was unlocked")
+	if err := a.endPeerReset(ctx, r, false, false, "/x"); err != nil || unlocks != 0 {
+		t.Fatal("a dump CRIU did not complete was unlocked")
 	}
 	r = &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
-	if err := a.endPeerReset(ctx, r, nil, true, "/x"); err != nil || unlocks != 0 {
+	if err := a.endPeerReset(ctx, r, true, true, "/x"); err != nil || unlocks != 0 {
 		t.Fatal("a leave-running dump was unlocked")
 	}
 	// Fail closed: the source's sessions cannot be reset, so the capture
 	// fails.
 	before := decisions(t, identityPeersResetFailed)
 	r = &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
-	if err := a.endPeerReset(ctx, r, nil, false, "/x"); err == nil || unlocks != 1 {
+	if err := a.endPeerReset(ctx, r, true, false, "/x"); err == nil || unlocks != 1 {
 		t.Fatalf("a failed unlock passed: %v", err)
 	}
 	if decisions(t, identityPeersResetFailed) != before+1 {
@@ -128,7 +129,7 @@ func TestEndPeerReset(t *testing.T) {
 	}
 	// Nothing to reset: nothing run.
 	r = &sourcePeerReset{ns: netns.None(), log: idLog()}
-	if err := a.endPeerReset(ctx, r, nil, false, "/x"); err != nil || unlocks != 1 {
+	if err := a.endPeerReset(ctx, r, true, false, "/x"); err != nil || unlocks != 1 {
 		t.Fatal("a source without outside connections was unlocked")
 	}
 	if args := netUnlockCmd(ctx, "/criu-bundle/criu", "/ck").Args; strings.Join(args, " ") !=
@@ -230,7 +231,7 @@ func TestSourcePeerReset_AfterDump(t *testing.T) {
 	s1, t1 := silentlyClosed(t)
 	s2, t2 := silentlyClosed(t)
 	r := &sourcePeerReset{ns: h, conns: []tcpTuple{t1, t2}, log: idLog()}
-	if err := (&Agent{}).endPeerReset(context.Background(), r, nil, false, os.TempDir()); err != nil {
+	if err := (&Agent{}).endPeerReset(context.Background(), r, true, false, os.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if !unlocked {
@@ -412,5 +413,47 @@ func TestRunNetUnlock_KeepsTheNamespaceHandle(t *testing.T) {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(h), &st); err != nil {
 		t.Fatalf("the namespace handle was closed: %v", err)
+	}
+}
+
+// The reset of a dumped source's connections ends within its budget,
+// however many peers never answer, and fails the capture then: every
+// connection must be confirmed. Probes of one local port never overlap.
+func TestSourcePeerReset_BoundedAndFailsUnconfirmed(t *testing.T) {
+	savedUnlock, savedProbe, savedBudget := runNetUnlock, probeInNS, peerResetBudget
+	t.Cleanup(func() { runNetUnlock, probeInNS, peerResetBudget = savedUnlock, savedProbe, savedBudget })
+	runNetUnlock = func(context.Context, netns.NsHandle, string, string) error { return nil }
+	peerResetBudget = 300 * time.Millisecond
+	var mu sync.Mutex
+	inFlight := map[netip.AddrPort]bool{}
+	overlap := false
+	probeInNS = func(ctx context.Context, _ netns.NsHandle, c tcpTuple) error {
+		mu.Lock()
+		overlap = overlap || inFlight[c.Local]
+		inFlight[c.Local] = true
+		mu.Unlock()
+		defer func() { mu.Lock(); delete(inFlight, c.Local); mu.Unlock() }()
+		if c.Remote.Port() == 1 {
+			return nil // confirmed
+		}
+		<-ctx.Done() // a peer that never answers
+		return errProbeUnconfirmed
+	}
+	var conns []tcpTuple
+	for i := range 40 {
+		conns = append(conns, tcpTuple{Local: netip.MustParseAddrPort("10.0.0.1:9090"), Remote: netip.AddrPortFrom(netip.MustParseAddr("10.0.0.7"), uint16(i+1))})       //nolint:gosec // small
+		conns = append(conns, tcpTuple{Local: netip.AddrPortFrom(netip.MustParseAddr("10.0.0.1"), uint16(40000+i)), Remote: netip.MustParseAddrPort("10.96.0.10:2379")}) //nolint:gosec // small
+	}
+	r := &sourcePeerReset{ns: netns.None(), conns: conns, log: idLog()}
+	t0 := time.Now()
+	err := r.afterDump(context.Background(), "criu", "/x")
+	if err == nil || !errors.Is(err, errProbeUnconfirmed) {
+		t.Fatalf("unconfirmed peers passed: %v", err)
+	}
+	if took := time.Since(t0); took > 2*time.Second {
+		t.Fatalf("the reset took %s; want it within its budget", took)
+	}
+	if overlap {
+		t.Error("two probes of one local port overlapped")
 	}
 }

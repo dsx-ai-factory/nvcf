@@ -47,6 +47,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -221,41 +222,80 @@ var runNetUnlock = func(ctx context.Context, ns netns.NsHandle, criu, imagesDir 
 	return nil
 }
 
+// peerResetBudget bounds a dumped source's whole reset; peerResetParallel
+// bounds the probes in flight. Probes of one local address and port run
+// one after another: two sockets cannot both be bound to it.
+var (
+	peerResetBudget   = 30 * time.Second
+	peerResetParallel = 16
+)
+
+// probeInNS runs probe in network namespace ns; tests replace it.
+var probeInNS = func(ctx context.Context, ns netns.NsHandle, c tcpTuple) error {
+	return inNetNSHandle(ns, func() error {
+		// One more try: a lost packet leaves the exchange unconfirmed.
+		perr := probeReset(ctx, c)
+		if errors.Is(perr, errProbeUnconfirmed) && ctx.Err() == nil {
+			perr = probeReset(ctx, c)
+		}
+		return perr
+	})
+}
+
 // afterDump resets the listed connections once the dump has killed the
-// source: removes the dump's network lock, then probes each connection.
-// Any failure is returned: the capture fails rather than leave a dead
-// identity's sessions open beside its restore.
+// source: removes the dump's network lock, then probes each connection,
+// all within peerResetBudget. The rule: every connection must be
+// confirmed reset (probeReset) within the budget, else the capture fails
+// and its source, dead, is replaced cold. A peer that drops the probe (a
+// node gone, a firewall, a network policy) therefore fails the capture:
+// a session that cannot be shown closed may still hold the source's
+// subscription beside its restore.
 func (r *sourcePeerReset) afterDump(ctx context.Context, criu, imagesDir string) error {
 	defer r.close()
 	if len(r.conns) == 0 {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, peerResetBudget)
+	defer cancel()
 	if err := runNetUnlock(ctx, r.ns, criu, imagesDir); err != nil {
 		return err
 	}
-	var errs []error
-	err := inNetNSHandle(r.ns, func() error {
-		for _, c := range r.conns {
-			if cerr := ctx.Err(); cerr != nil {
-				errs = append(errs, fmt.Errorf("the capture's time ran out with connections left: %w", cerr))
-				break
-			}
-			// One more try: a lost packet leaves the exchange unconfirmed.
-			perr := probeReset(ctx, c)
-			if errors.Is(perr, errProbeUnconfirmed) && ctx.Err() == nil {
-				perr = probeReset(ctx, c)
-			}
-			if perr != nil {
-				errs = append(errs, fmt.Errorf("%s -> %s: %w", c.Local, c.Remote, perr))
-			}
+	byLocal := map[netip.AddrPort][]tcpTuple{}
+	var order []netip.AddrPort
+	for _, c := range r.conns {
+		if _, ok := byLocal[c.Local]; !ok {
+			order = append(order, c.Local)
 		}
-		return nil
-	})
-	if err != nil {
-		return err
+		byLocal[c.Local] = append(byLocal[c.Local], c)
 	}
+	var mu sync.Mutex
+	var errs []error
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, peerResetParallel)
+	for _, l := range order {
+		wg.Add(1)
+		go func(conns []tcpTuple) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			for _, c := range conns {
+				err := ctx.Err()
+				if err == nil {
+					err = probeInNS(ctx, r.ns, c)
+				} else {
+					err = fmt.Errorf("the reset's time ran out first: %w", err)
+				}
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("%s -> %s: %w", c.Local, c.Remote, err))
+					mu.Unlock()
+				}
+			}
+		}(byLocal[l])
+	}
+	wg.Wait()
 	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("reset the source's connections to peers outside the group: %w", err)
+		return fmt.Errorf("reset the source's connections to peers outside the group (%d of %d unconfirmed): %w", len(errs), len(r.conns), err)
 	}
 	r.log.WithField("connections", len(r.conns)).Info("identity capture: the dumped source's connections to peers outside the group were reset")
 	return nil
@@ -442,15 +482,16 @@ func (a *Agent) beginPeerReset(o dumpV2Opts, hostPID int, log *logrus.Entry) (*s
 	return r, nil
 }
 
-// endPeerReset finishes r after the dump (dumpErr): a dump that killed
-// its source has the source's outside connections reset; any other
-// outcome only releases r. It returns the reset's own failure, which
-// fails the capture without resuming the dead source (peerResetOutcome).
-func (a *Agent) endPeerReset(ctx context.Context, r *sourcePeerReset, dumpErr error, leaveRunning bool, imagesDir string) error {
+// endPeerReset finishes r after the dump: a dump CRIU completed (dumped)
+// that killed its source has the source's outside connections reset,
+// whatever failed after CRIU (its marker, say); any other outcome only
+// releases r. It returns the reset's own failure, which fails the capture
+// without resuming the dead source (peerResetOutcome).
+func (a *Agent) endPeerReset(ctx context.Context, r *sourcePeerReset, dumped, leaveRunning bool, imagesDir string) error {
 	if r == nil {
 		return nil
 	}
-	if dumpErr != nil || leaveRunning {
+	if !dumped || leaveRunning {
 		r.close()
 		return nil
 	}

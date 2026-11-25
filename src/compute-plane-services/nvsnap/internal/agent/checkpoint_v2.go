@@ -665,7 +665,7 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 	if err == nil {
 		hooks.Frozen = peerReset.inventoryHook(procBase, targetHostPID)
 		done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
-		o.peerReset.set(a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir))
+		o.peerReset.set(a.endPeerReset(ctx, peerReset, done, leaveRunning, checkpointDir))
 	}
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)

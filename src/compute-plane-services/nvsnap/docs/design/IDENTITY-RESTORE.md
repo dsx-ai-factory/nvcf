@@ -111,10 +111,36 @@ runs only with the flag on, whatever a checkpoint request asks. A failure
 fails the capture as one whose source must be replaced (the dead source is
 never resumed), so no identity is
 recorded whose source may still hold sessions. The connections listed are the
-container's own, both directions: a frontend's connection into the worker on a
-TCP request plane is reset too, which both discovery backends need.
+container's own, both directions.
+
+The whole reset is bounded by `peerResetBudget` (30 s,
+`identity_peer_reset.go` `afterDump`); probes run in parallel, those of one
+local address and port one after another. The rule: every listed connection
+must be confirmed reset within the budget, else the capture fails and its
+dead source is replaced cold. A peer that drops the probe (a node gone, a
+firewall or network policy, an SNAT path that loses it) therefore fails the
+capture. Not verified: a peer reached through a Service address. The probe's
+SYN goes to the Service address the connection used and is translated by the
+node; that it reaches the same backend (the old connection's conntrack
+entry) rather than another one, which would accept it and count as
+confirmed, is assumed, not shown. A connection the kernel completes into a
+listening socket's backlog after the inventory (the container is frozen, so
+nothing accepts it) is not listed and not reset.
+
+Only Dynamo's NATS request plane (`DYN_REQUEST_PLANE=nats`) is supported. On
+the TCP request plane, Dynamo's default, an endpoint registers its address
+as `{"transport":{"tcp":"<ip>:<port>/<path>"}}`; a restore does not rewrite
+that form (`identity_etcd.go` `urlHostForms`), so the capture refuses the
+identity (`readIdentity`, `strayAddress`) and the worker is not captured
+with one.
 
 ## 5. Restore
+
+With the flag on, a placeholder restores only from the record of its own
+capture: when the record cannot be read, is not a capture to restore
+(`recordUsable`), or no longer names the placeholder's checkpoint (replaced
+by another capture, which may hold another identity), the restore is
+refused and the pod starts cold (`identityBeforeRestore`).
 
 A placeholder of a record with an identity is restored by the lone path
 (`criu_auto_restore.go` `restore`) or the group path (`criu_group.go`
@@ -128,19 +154,34 @@ restored:
 3. grant the lease with the same ID and TTL (etcd refuses a live ID:
    refused). The keys are not written yet: the frontend would route to an
    address nothing listens on while the checkpoint is fetched and restored;
-4. keep the lease alive from the agent through the restore, renewing it when
-   a quarter of its TTL is left. Once the process resumed, write every saved
+4. keep the lease alive from the agent from the grant on (before the grant
+   is recorded) through the restore, renewing it once at most half its TTL
+   can be left. Once the process resumed, write every saved
    key with the captured pod address replaced by the new pod's (a key that
    another lease holds now is left as it is and fails the write), then
    watch the lease's TTL against what the agent's own last renewal explains:
    held above it for a whole TTL, the lease is renewed by the process and
-   the agent stops. One renewal not its own (etcd renews every lease on a
-   leader change) keeps it above for under three quarters of a TTL. A process whose
+   the agent stops, once it has renewed the lease one last time (a late
+   sample may tell of a lease that expired since) and recorded the handoff
+   (`identity.handoff`). A lease counts as above from the reply that showed
+   it, and how long it stays above is measured to the latest sample's
+   request. One renewal not its own (etcd renews every lease on a leader
+   change) keeps it above for under half a TTL. A process whose
    keep-alive is not seen within three TTLs (at least a minute), or whose
    keys cannot be written, has its lease revoked and its pod deleted, so
    the frontend stops routing to a worker that does not keep its
-   registration and no second restore takes the identity while it lives. A
+   registration and no second restore takes the identity while it lives;
+   that restore counts as a failed restore of its capture
+   (`recordFailure`), so replacements that fail the same way end (a capture
+   being verified fails, a verified one after its failure bound). A
    restore that fails revokes the lease and releases the claim.
+
+An agent that restarts after a restore succeeded, before the handoff was
+recorded, adopts the restored pod's lease on the pod's next event
+(`considerRestoredIdentity`, from the lone pod's or the group leader's
+node): it registers the keys the lease does not hold yet, keeps the ones it
+holds (they may be newer than the capture's), and waits for the handoff as
+above. A lease lost by then ends the pod and counts the restore failed.
 
 A pod whose restore already had the lease granted (an agent that stopped
 after the grant, which the record notes, whether or not it restored the
@@ -187,7 +228,12 @@ the restore's next event decides it anew (the lone pod's, or the group
 leader's). Otherwise the restore cannot run again, and the agent that
 refused it finishes the unfinished pods itself (`finishRefused`, backing
 off up to 30 s, for at most a day): reading and deleting a pod works for
-pods on any node.
+pods on any node. A refusal is also recorded on the group record before any
+pod is acted on (`refusingPods`, by pod UID; when it cannot be recorded,
+nothing is done and the restore's next event decides again), so that a pod
+it left unfinished is finished by the pod's own agent on its next event
+(`considerRefusing`), after the refusing agent restarted or past its retry
+window. A pod started cold or deleted gives up its claim on the identity.
 
 ## 6. One live restore per identity
 
@@ -196,7 +242,8 @@ Two guards:
 - the record names the restore that holds the identity
   (`identity.holder`, `namespace/pod/uid`), written with the record's
   version, so of two agents claiming at once one wins. A holder whose pod is
-  gone or replaced is taken over; one whose pod lives refuses the claim; an
+  gone or replaced is taken over; one whose pod lives, being deleted or
+  not (a draining worker keeps its subscriptions), refuses the claim; an
   unreadable holder refuses it (fail closed). A refused or failed restore
   releases its claim;
 - etcd refuses a grant of a live lease ID, whatever the record says.
@@ -208,9 +255,12 @@ before. A record with an identity, written while the flag was on, is
 invisible to admission with the flag off (`identityRecordVisible`), so its
 configuration starts cold rather than restore without its lease; a
 placeholder admitted while the flag was on and restored after it was turned
-off is refused and starts cold (`refused_disabled`). For that, a restore reads
-its group record once more with the flag off; records without an identity
-restore exactly as before. Turning the flag off is the rollback.
+off is refused and starts cold (`refused_disabled`, counted once per
+capture). For that, a restore reads its group record once more with the flag
+off; records without an identity restore exactly as before. Turning the flag
+off is the rollback. With the flag on, a restore whose record cannot be read,
+or no longer names its checkpoint, is refused even when the capture held no
+identity (section 5).
 
 ## 8. Observability
 
@@ -250,9 +300,13 @@ Against the invariants in `AGENTS.md`:
 - The dead source stays registered until its lease expires (its TTL) after
   the dump; the verification restore waits that long.
 - Dual-stack pods: only the primary pod address is matched and rewritten.
-- A refusal left unfinished is finished by the agent that refused it, from
-  its memory only: an agent that restarts before it is finished leaves the
-  unfinished placeholders idle.
+- Dynamo's TCP request plane (its default): its registrations are not
+  rewritten, so such workers are not captured with an identity (section 4).
+- The identity is read before the freeze, not under it: a key the worker
+  changes between the read and the freeze is not recorded (the read is
+  repeated and compared, `identityStillHeld`, but not under the freeze).
+- A member agent of an older version ignores a request to reset its
+  source's outside connections; nothing checks that the member reset them.
 - Not run on hardware with this code: the network-namespace dialer, the
   net-unlock of a dump's lock and the probe through a Service address, and
   Dynamo's own keep-alive resuming on the granted lease after a CRIU restore

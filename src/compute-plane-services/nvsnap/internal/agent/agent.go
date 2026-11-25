@@ -326,6 +326,10 @@ const DefaultWriterPullSecret = "nvsnap-agent-pull" //nolint:gosec // secret nam
 
 // Agent is the NVSNAP node agent
 type Agent struct {
+	// identityDisabledSeen holds the identity records admission found
+	// with identity restore off, each counted once (identityRecordVisible).
+	identityDisabledSeen sync.Map
+
 	// drivers is the cluster's GPU drivers as the agents report them
 	// (driver_gate.go).
 	drivers driverView
