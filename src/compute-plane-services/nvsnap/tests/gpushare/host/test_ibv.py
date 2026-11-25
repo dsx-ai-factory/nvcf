@@ -65,7 +65,7 @@ struct fmr { struct ibv_mr m; int live; };
 struct fwc { struct ibv_wc w; };
 struct fcq { struct ibv_cq c; struct ibv_wc q[256]; int n; int live; };
 struct frecv { uint64_t wr_id; struct ibv_sge sg; };
-struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; int global;
+struct fqp { struct ibv_qp q; uint32_t dest; union ibv_gid dgid; uint16_t dlid; int global; int sgid;
              struct frecv r[64]; int nr; int live; int unacked; };
 static struct fmr *mrs[256]; static int n_mrs;
 static struct fqp *qps[256]; static int n_qps;
@@ -78,6 +78,12 @@ static void gid_of(int e, int d, union ibv_gid *g)
 }
 
 int fake_open_contexts(void) { return open_ctxs; }
+/* The GID table of every port: an index below 16 set here holds the IPv4
+ * address (gid_of) with RoCE type kind - 1; every other index holds a
+ * link-local address, type RoCE v1. As a RoCE NIC: index 3, IPv4 RoCE v2. */
+static int gkind[16] = { [3] = 1 + IBV_GID_TYPE_ROCE_V2 }, gid_ex_fail;
+void fake_gid(int i, int kind) { gkind[i] = kind; }
+void fake_gid_ex_fail(int on) { gid_ex_fail = on; }  /* the GID type query fails */
 /* After a move the two NICs number apart: a number looked up under the
  * wrong device is one the right device rejects. */
 void fake_move(void) { epoch++; counter[0] = 0; counter[1] = 50; }
@@ -99,6 +105,7 @@ int fake_async_calls(void) { return async_calls; }
 int fake_live_pds(void) { return live_pds; }
 int fake_qp_state(struct ibv_qp *q) { return q->state; }
 int fake_qp_receives(struct ibv_qp *q) { return ((struct fqp *)q)->nr; }
+int fake_qp_sgid(struct ibv_qp *q) { return ((struct fqp *)q)->sgid; }
 
 static void push(struct fcq *c, struct ibv_wc w) { if (c->n < 256) c->q[c->n++] = w; }
 
@@ -228,11 +235,22 @@ int (ibv_query_port)(struct ibv_context *c, uint8_t p, struct _compat_ibv_port_a
     x->state = IBV_PORT_ACTIVE; x->lid = 1 + epoch; x->link_layer = IBV_LINK_LAYER_ETHERNET;
     return 0;
 }
-int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g)
+/* static: the probe exports its own ibv_query_gid (the library's). */
+static void gid_at(struct ibv_context *c, int i, union ibv_gid *g)
 {
-    (void)p;
-    if (i != 3) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return 0; }
+    if (i < 0 || i >= 16 || !gkind[i]) { memset(g, 0, sizeof(*g)); g->raw[0] = 0xfe; g->raw[1] = 0x80; g->raw[14] = di(c); g->raw[15] = i; return; }
     gid_of(epoch, di(c), g);
+}
+int ibv_query_gid(struct ibv_context *c, uint8_t p, int i, union ibv_gid *g) { (void)p; gid_at(c, i, g); return 0; }
+/* ibv_query_gid_ex (rdma-core's inline calls this): the entry and its type. */
+int _ibv_query_gid_ex(struct ibv_context *c, uint32_t p, uint32_t i, struct ibv_gid_entry *e, uint32_t flags, size_t size)
+{
+    if (flags || size < sizeof(*e)) return EINVAL;
+    if (gid_ex_fail) return EOPNOTSUPP;
+    memset(e, 0, sizeof(*e));
+    gid_at(c, i, &e->gid);
+    e->gid_index = i; e->port_num = p;
+    e->gid_type = i < 16 && gkind[i] ? gkind[i] - 1 : IBV_GID_TYPE_ROCE_V1;
     return 0;
 }
 int ibv_query_pkey(struct ibv_context *c, uint8_t p, int i, __be16 *k) { (void)c; (void)p; (void)i; *k = 0xffff; return 0; }
@@ -279,7 +297,8 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
                                   (a->qp_state == IBV_QPS_RTS && q->q.state != IBV_QPS_RTR)))
         return EINVAL;
     if (mask & IBV_QP_DEST_QPN) q->dest = a->dest_qp_num;
-    if (mask & IBV_QP_AV) q->dgid = a->ah_attr.grh.dgid, q->dlid = a->ah_attr.dlid, q->global = a->ah_attr.is_global;
+    if (mask & IBV_QP_AV)
+        q->dgid = a->ah_attr.grh.dgid, q->dlid = a->ah_attr.dlid, q->global = a->ah_attr.is_global, q->sgid = a->ah_attr.grh.sgid_index;
     if (mask & IBV_QP_STATE) q->q.state = a->qp_state;
     return 0;
 }
@@ -307,6 +326,7 @@ IBVERBS_1.1 {
     ibv_create_qp; ibv_modify_qp; ibv_destroy_qp; ibv_fork_init; ibv_event_type_str;
   local: *;
 };
+IBVERBS_1.11 { global: _ibv_query_gid_ex; } IBVERBS_1.1;
 FAKE_1 { global: fake_*; };
 """
 
@@ -486,12 +506,13 @@ FK(void, fake_move, void); FK(void, fake_port_block, int); FK(void, fake_fail_ma
 FK(void, fake_fail_init, int); FK(void, fake_fail_destroy, int); FK(void, fake_err_opcode, int); FK(void, fake_next_lkey, uint32_t);
 FK(void, fake_raise_qp_event, struct ibv_qp *); FK(int, fake_async_calls, void); FK(int, fake_live_pds, void);
 FK(int, fake_qp_state, struct ibv_qp *); FK(int, fake_qp_receives, struct ibv_qp *); FK(int, fake_port_in, void);
+FK(void, fake_gid, int, int); FK(void, fake_gid_ex_fail, int); FK(int, fake_qp_sgid, struct ibv_qp *);
 static void fakes(void)
 {
 #define G(name) *(void **)&name = dlsym(real_lib, #name); if (!name) { printf("no %s\n", #name); exit(2); }
     G(fake_move); G(fake_port_block); G(fake_fail_marker); G(fake_fail_init); G(fake_fail_destroy); G(fake_err_opcode);
     G(fake_next_lkey); G(fake_raise_qp_event); G(fake_async_calls); G(fake_live_pds); G(fake_qp_state);
-    G(fake_qp_receives); G(fake_port_in);
+    G(fake_qp_receives); G(fake_port_in); G(fake_gid); G(fake_gid_ex_fail); G(fake_qp_sgid);
 #undef G
 }
 
@@ -924,6 +945,36 @@ int main(int argc, char **argv)
         printf("fence=%d\n", fence_rc);
         return 0;
     }
+    if (!strcmp(c, "roce_type") || !strcmp(c, "roce_none") || !strcmp(c, "roce_unknown")) {
+        /* NCCL connected through index 3, IPv4 RoCE v2. On the node of the
+         * restore, index 3 holds the same IPv4 address as RoCE v1, and
+         * index 4 (roce_type) holds it as RoCE v2; roce_none has no RoCE v2
+         * entry. roce_unknown: the provider could not tell the GID's type
+         * when NCCL read it. */
+        if (!strcmp(c, "roce_unknown")) { up(0); fake_gid_ex_fail(1); }
+        up(1);
+        fake_gid_ex_fail(0);  /* the new node's provider reports types */
+        fake_gid(3, 1 + IBV_GID_TYPE_ROCE_V1);
+        if (!strcmp(c, "roce_type")) fake_gid(4, 1 + IBV_GID_TYPE_ROCE_V2);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        int r = nvsnap_ibv_restore(rep, sizeof(rep));
+        printf("restore=%d\n", r);
+        if (r) {
+            printf("restore_error=%s\n", strstr(rep, "type") ? "type" : "other");
+            fprintf(stderr, "%s\n", rep);
+            return 0;
+        }
+        if (reconnect()) return 1;
+        nvsnap_ibv_open();
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int n = cq->context->ops.poll_cq(cq, 8, wc), ok = 0;
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("sgid_a=%d sgid_b=%d completed=%d\n", fake_qp_sgid(((struct vqp *)qa)->real),
+               fake_qp_sgid(((struct vqp *)qb)->real), ok);
+        return 0;
+    }
     if (!strcmp(c, "noslot")) {
         up(0);
         pd = ibv_alloc_pd(ctx);
@@ -1252,6 +1303,23 @@ class Ibv(unittest.TestCase):
     def test_receive_recorded_while_the_fence_waits_refuses_the_checkpoint(self):
         self.assertNotEqual(self.probe("sge5drain")["fence"], "0",
                             "a receive cut short while the fence waited for its call was checkpointed")
+
+    def test_restore_picks_a_gid_of_the_same_roce_type(self):
+        out = self.probe("roce_type")
+        self.assertEqual(out["restore"], "0", out)
+        self.assertEqual((out["sgid_a"], out["sgid_b"]), ("4", "4"),
+                         "the restore took a GID of the same address family but another RoCE type: %s" % out)
+        self.assertEqual(out["completed"], "1", out)
+
+    def test_restore_without_a_gid_of_the_same_roce_type_is_refused(self):
+        out = self.probe("roce_none")
+        self.assertNotEqual(out["restore"], "0", "a restore with no GID of the captured RoCE type went on: %s" % out)
+        self.assertEqual(out["restore_error"], "type", out)
+
+    def test_restore_without_the_captured_gid_type_is_refused(self):
+        out = self.probe("roce_unknown")
+        self.assertNotEqual(out["restore"], "0", "a restore whose captured GID type is unknown went on: %s" % out)
+        self.assertEqual(out["restore_error"], "type", out)
 
     def test_untracked_queue_pair_refuses_the_checkpoint(self):
         out = self.probe("noslot")

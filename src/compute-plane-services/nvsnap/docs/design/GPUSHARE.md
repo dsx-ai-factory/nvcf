@@ -498,7 +498,13 @@ An older libnvsnap_ibv, without `nvsnap_ibv_doomed`, reopens NCCL's calls
 on any refusal, as before.
 
 Devices are matched by name (`mlx5_3`), so the restore node needs the
-same NIC names. Other users of verbs in the process (UCX, NIXL) are not
+same NIC names. A queue pair's source GID is matched by address family and
+GID type (IB, RoCE v1 or RoCE v2, which the library reads with
+`ibv_query_gid_ex` when NCCL reads the GID): `load` uses the entry at the
+index NCCL used if it still matches, otherwise the first matching index on
+the port, and refuses the restore when none matches or the type could not
+be read (a RoCE version that differs from the peer's would not
+connect). Other users of verbs in the process (UCX, NIXL) are not
 covered: their devices still fail the dump, which rolls the workload back,
 unless they release them first. ModelExpress (`mx-pause`) and vLLM's NIXL
 KV connector (`nixl-pause`) do, before `quiesce`, while NCCL still holds its
