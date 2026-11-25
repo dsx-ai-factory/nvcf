@@ -621,3 +621,30 @@ func TestPidsUseGPU(t *testing.T) {
 		t.Fatal("descriptors unreadable: want an error")
 	}
 }
+
+// A deleted file that cannot be sized fails the estimate; one gone since
+// it was listed is skipped.
+func TestDumpBytesFailsOnAnUnsizableDeletedFile(t *testing.T) {
+	h := &diskHost{avail: uint64(3 * tib), total: uint64(4 * tib)}
+	h.install(t)
+	proc := diskProc(t, 7, 1<<30, false)
+	files := t.TempDir()
+	gone := filepath.Join(files, "gone (deleted)")
+	if err := os.Symlink(gone, filepath.Join(proc, "7", "fd", "3")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := diskAgent(t, 20).dumpBytes(proc, 7, []int{7}, 2*tib); err != nil {
+		t.Fatalf("a deleted file gone since: %v, want no error", err)
+	}
+	// A link that loops: stat fails with ELOOP, not ENOENT.
+	loop := filepath.Join(files, "loop (deleted)")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(loop, filepath.Join(proc, "7", "fd", "4")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := diskAgent(t, 20).dumpBytes(proc, 7, []int{7}, 2*tib); err == nil {
+		t.Fatal("an unsizable deleted file: want an error")
+	}
+}

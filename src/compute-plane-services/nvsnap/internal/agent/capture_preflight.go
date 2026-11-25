@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -239,7 +240,9 @@ func processFindings(procBase string, pids []int, pod, container string, ghostLi
 	ghosts, anon, rdma := map[string]ghostFile{}, int64(0), map[int][]string{}
 	var sockets socketScan
 	for _, pid := range pids {
-		deletedFiles(procBase, pid, ghosts)
+		// The host check reports what it could see; the disk estimate
+		// (capture_disk.go) fails on a file it could not size.
+		_ = deletedFiles(procBase, pid, ghosts)
 		anon += anonymousBytes(procBase, pid)
 		if devs := rdmaDevices(procBase, pid); len(devs) > 0 {
 			rdma[pid] = devs
@@ -479,16 +482,25 @@ func cgroupPIDs(dir string) ([]int, error) {
 
 // deletedFiles adds the deleted regular files process pid holds open or
 // mapped to ghosts, keyed by device and inode. memfd files are not ghost
-// files (criu dumps them as memfd) and are left out.
-func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) {
+// files (criu dumps them as memfd) and are left out. It returns the first
+// error statting such a file, other than one gone since it was listed:
+// the file was left out, which a size estimate must not ignore.
+func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) error {
 	base := filepath.Join(procBase, strconv.Itoa(pid))
 	mounts := readMountinfo(filepath.Join(base, "mountinfo"))
+	var firstErr error
 	see := func(link, target string) {
 		if !strings.HasSuffix(target, " (deleted)") || strings.HasPrefix(target, "/memfd:") || !strings.HasPrefix(target, "/") {
 			return
 		}
 		var st syscall.Stat_t
-		if err := syscall.Stat(link, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		if err := syscall.Stat(link, &st); err != nil {
+			if !errors.Is(err, syscall.ENOENT) && firstErr == nil {
+				firstErr = fmt.Errorf("cannot size the deleted file %s of pid %d: %w", strings.TrimSuffix(target, " (deleted)"), pid, err)
+			}
+			return
+		}
+		if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
 			return
 		}
 		key := fmt.Sprintf("%d:%d", st.Dev, st.Ino)
@@ -513,6 +525,7 @@ func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) {
 			}
 		}
 	}
+	return firstErr
 }
 
 // anonymousBytes is the anonymous memory of process pid.

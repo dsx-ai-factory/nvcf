@@ -235,7 +235,9 @@ func (a *Agent) dumpBytes(procBase string, initPID int, pids []int, limit int64)
 			return 0, err
 		}
 		n += anon
-		deletedFiles(procBase, pid, ghosts)
+		if err := deletedFiles(procBase, pid, ghosts); err != nil {
+			return 0, err
+		}
 	}
 	for _, g := range ghosts {
 		if g.allocated <= a.ghostLimit() {
