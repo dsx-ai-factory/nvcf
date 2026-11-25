@@ -127,9 +127,10 @@ optional webhook). Full guide, options, and troubleshooting:
 ```
 
 A restore fetches a checkpoint from the first tier that has it: the node's
-own copy, then cluster storage, then peer agents (with `agent.rails.enabled`,
-a checkpoint the rails tier judges small goes to the peers before cluster
-storage, `internal/agent/cascade_fetch.go`). The cross-cluster object
+own copy; with `agent.rails.enabled`, peer nodes over their RDMA NICs (a
+checkpoint smaller than `agent.rails.minSize` goes to the peer agents over
+HTTP instead, before cluster storage); then cluster storage; then peer agents
+over HTTP (`EnsureLocal`, `internal/agent/cascade_fetch.go`). The cross-cluster object
 store (L4) is filled and pulled by replication in the background, not tried
 by a restore. Cluster config decides which tiers are present. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-where-bytes-live-and-how-they-move).

@@ -60,7 +60,7 @@ built. Anything not listed here is not claimed.
 | Multi-GPU CRIU capture and restore on one node, under gpushare | Measured | [design/GPUSHARE.md](design/GPUSHARE.md#validation) (4x GB300 TP=4, restored on another node; 4x H100 TP=4) |
 | In-place suspend and resume of a two-node instance under gpushare | Measured | [design/GPUSHARE.md](design/GPUSHARE.md#validation) (2 nodes x 4 GB300) |
 | Group capture and restore of a multi-pod instance, with companions | Measured | [BENCHMARKS.md](BENCHMARKS.md#gpu-checkpointrestore) (Kimi K3.1 Pro, 4 pods × 4 GB300, November 2026); `internal/agent/criu_group_test.go`, `gpushare_group_restore_test.go`, `group_freeze_test.go` |
-| Model volume, one download per model per cluster | Measured | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) results (H100, NVMesh, 2026-09-26) |
+| Model volume, one download per model artifact and tenant | Measured | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) results (H100, NVMesh, 2026-09-26) |
 | Election, one downloader per hash | Measured | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (H100, NVMesh, 2026-09-25) |
 | Cache-set refresh | Measured once | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (GB300, 2026-10-01; off by default) |
 | L2 volume pair and promotion | Exercised | `internal/checkpointstore/*_test.go` (`TestPerCapturePVCBackend_*`) |
@@ -552,8 +552,12 @@ holds the full record with its method.
 
 In the order they matter for multi-node instances:
 
-1. **End-to-end group restore on hardware has no recorded result.** The
-   mechanism is covered by unit tests only (section 0).
+1. **End-to-end group restore on hardware is recorded for one instance shape
+   only**: Dynamo + vLLM serving Kimi K3.1 Pro on 4 pods × 4 GB300, with its
+   etcd, NATS and frontend (section 0;
+   [results/KIMI-K3-GB300-2026-11.md](results/KIMI-K3-GB300-2026-11.md)).
+   Two scale-from-zero restores on one cluster did not run, cause not
+   verified (section 3 there).
 2. **Checkpoint transfer is bound by cluster storage unless the rails tier is
    on.** L2 and L3 move bytes over the storage network and HTTP; only the
    opt-in rails tier (`agent.rails`) uses the RDMA NICs.

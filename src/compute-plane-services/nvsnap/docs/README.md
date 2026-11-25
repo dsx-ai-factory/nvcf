@@ -41,7 +41,7 @@ was not re-checked against the code.
 
 | Page | Answers | Status |
 |---|---|---|
-| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with three measured numbers | Current, 2026-10-21 |
+| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with links to the measured numbers | Current, 2026-10-21 |
 | [SUPPORT.md](SUPPORT.md) | Will nvsnap work for my workload: every shape, runtime, GPU and storage choice, with its status and evidence | Current, 2026-11-25 |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every measured number, with model, engine, GPUs, storage, nvsnap version, date and raw data | Current, 2026-11-25 |
 | [GLOSSARY.md](GLOSSARY.md) | What each nvsnap word means, including the storage tiers L1–L4, and which words are retired | Current, 2026-10-21 |
@@ -87,7 +87,7 @@ the column below is that status, corrected where the code disagrees.
 | [VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md) | How the node bundle (CRIU, gpushare, helper) is versioned so upgrades do not break running pods | Built (`internal/webhook/bundle_mount.go` `BundleVersionsDir`) |
 | [node-model-cache.md](design/node-model-cache.md) | A cold pod's model download seeded from a copy on its node or a peer node, with no shared volume | Built, behind `agent.nodeModelCache` (`internal/modelcache`, `internal/agent/node_model_cache.go`) |
 | [model-cache-single-flight.md](design/model-cache-single-flight.md) | One registry download per model; the other pods stream it from the downloading node as files land | Built, behind `agent.nodeModelCache.singleFlight` (`internal/agent/model_cache_flight.go`, `internal/agent/model_cache_stream.go`) |
-| [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model per cluster, and the cache set | Built and verified (as the doc states) |
+| [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model artifact and tenant, and the cache set | Built and verified (as the doc states) |
 | [cross-cluster-replication.md](design/cross-cluster-replication.md) | Replicating checkpoints across clusters | Partly built, cachedir captures and GCS only (as the doc states) |
 | [STORAGE-AGNOSTIC-L2-PROMOTION.md](design/STORAGE-AGNOSTIC-L2-PROMOTION.md) | Promoting the L2 volume on any storage | Built (as the doc states) |
 | [THIRD-PARTY-FORKS.md](design/THIRD-PARTY-FORKS.md) | What the CRIU fork carries and why | Current, 2026-10-21 (pin and check in `scripts/versions.sh`, `scripts/build-agent.sh`) |

@@ -120,7 +120,9 @@ cluster access during the run). Their causes are not verified (raw data, section
 | Restored, scheduled to Ready | 2 s | none | 26 s: 8 s to the CRIU restore's start, 16 s to the processes resuming, 2 s to Ready | 28 s |
 
 The cold pod is timed to `/health` because nvsnap holds a pod it may capture out of Ready until the capture
-(`webhook.captureHold`). After the restore, 19,144 KV transfers to the decode pod succeeded and 0 failed.
+(`webhook.captureHold`). In 5 minutes of load after the restore, the decode pod's NIXL metrics show 19,144 KV
+transfers succeeded and 0 failed. The load script counted 18,821 requests good and 319 bad (an empty completion or
+missing KV parameters); why those 319 were bad is not verified.
 
 ## cachedir
 

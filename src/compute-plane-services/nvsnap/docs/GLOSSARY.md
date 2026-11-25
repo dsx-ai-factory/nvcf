@@ -73,7 +73,7 @@ background.
 
 | Word | Meaning |
 |---|---|
-| model volume | One volume per model per cluster, downloaded once and read by every pod that runs the model (`internal/modelvolume`). |
+| model volume | One volume per model artifact and tenant, downloaded once and read by every pod of that tenant that runs the model (`internal/modelvolume`). |
 | identity | The model a pod will download, as a URI (`hf://`, `ngc://`, `s3://`, `nim://`), decided at admission (`internal/modelid`). |
 | landing | Where a pod finds the model volume: the path the engine already reads, mounted from the volume. |
 | primary | The volume a model or cache set is written to; readers mount read-only views of it. |

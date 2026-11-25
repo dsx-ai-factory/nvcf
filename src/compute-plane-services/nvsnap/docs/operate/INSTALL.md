@@ -95,7 +95,7 @@ pod is prepared for capture or restore, and every pod starts cold.
 | `agent.captureMethod` | `cachedir` | `cachedir` captures caches and the model; `criu` captures the processes ([ARCHITECTURE.md §2](../ARCHITECTURE.md#2-the-two-capture-methods-and-how-one-is-chosen)) |
 | `agent.criuCaptureOptIn` | `[]` | Under `criu`, which multi-pod instances are captured, by pod label (for example `function-id`); an entry without `values` opts in every pod carrying the label |
 | `webhook.injectScope` | `all` | `all` namespaces not labelled `nvsnap.io/inject=false`, or `optIn`: only namespaces labelled `nvsnap.io/inject=true` |
-| `agent.modelVolume.enabled` | `false` | One model volume per model per cluster |
+| `agent.modelVolume.enabled` | `false` | One model volume per model artifact and tenant |
 | `agent.election.enabled` | `false` | One downloader per hash when a chart starts many workers (cachedir only) |
 | `agent.l2.storageClass` | | The StorageClass of the per-checkpoint volume pair; empty keeps checkpoints on their nodes |
 | `agent.auth.enabled`, `agent.auth.mode` | `false`, `permissive` | Bearer-token checks on the agent API. Turn on, run `permissive` until no unauthenticated calls are counted, then `required` |
