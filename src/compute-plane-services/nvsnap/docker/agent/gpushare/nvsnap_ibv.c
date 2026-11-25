@@ -168,8 +168,8 @@ struct vqp {
     int failed;      /* a completion failed: which receives finished is unknown */
     int slot;
     int fresh;  /* re-created by a restore: 1 needs RTR and RTS, 2 RTS */
-    /* The peer "connect" moved it to RTR with, until NCCL's calls open
-     * again: a retried connect must find the same one in its exchange. */
+    /* The peer "connect" moved it to RTR with, until it reaches RTS: a
+     * retried connect must find the same one in its exchange. */
     struct { int set; uint32_t qpn; uint16_t lid; union ibv_gid gid; } rtr;
 };
 
@@ -1546,9 +1546,9 @@ static int put_once(struct u32map *m, uint32_t k, uint32_t v, const char *row, c
     return -1;
 }
 
-/* A queue pair "connect" must bring to its peer: re-created by a restore,
- * or brought to RTR by an earlier try of this one; and NCCL connected it. */
-static int wants_peer(const struct vqp *q) { return (q->fresh || q->rtr.set) && q->mask[1] & IBV_QP_STATE; }
+/* A queue pair "connect" must bring to its peer: re-created by a restore
+ * (or at RTR after an earlier try), and NCCL connected it. */
+static int wants_peer(const struct vqp *q) { return q->fresh && q->mask[1] & IBV_QP_STATE; }
 
 /* NCCL's RTR attributes for q, with its peer's new GID, LID and queue pair
  * number from the current exchange (rports). -1 and reply when the
@@ -1607,8 +1607,15 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
         snprintf(reply, n, "ok reconnected 0 queue pair(s)");
         return 0;
     }
-    /* NCCL's calls are held (a restore re-created its queue pairs): nobody
-     * reads the tables. */
+    /* The data path reads the tables without a lock: NCCL's calls must be
+     * held, with none in progress (nvsnap_ibv_open keeps them held while a
+     * queue pair waits here). */
+    if (!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST) || __atomic_load_n(&inflight, __ATOMIC_SEQ_CST)) {
+        pthread_mutex_unlock(&omu);
+        snprintf(reply, n, "err NCCL's verbs calls are not held (or one is in progress): cannot reconnect %d queue pair(s)",
+                 want);
+        return -1;
+    }
     for (int i = 0; i < n_rports; i++) {
         struct rport *r = &rports[i];
         map_clear(&r->keys), map_clear(&r->qpns), map_clear(&r->kcount);
@@ -1667,7 +1674,7 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
             break;
         }
         q->remote = ri;
-        q->fresh = 0;
+        q->fresh = 0, q->rtr.set = 0;
         nq++;
     }
     pthread_mutex_unlock(&omu);
@@ -1690,11 +1697,12 @@ EXPORT void nvsnap_ibv_open(void)
     }
     NVSNAP_IBV_OPEN_HOOK();
     pthread_mutex_lock(&omu);
-    int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST);
-    if (!gone) __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
-    for (int i = 0; i < n_qps && !gone; i++) qps[i]->rtr.set = 0;  /* connected: no retry from here */
+    int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST), pending = 0;
+    for (int i = 0; i < n_qps; i++) pending += wants_peer(qps[i]);  /* re-created, not reconnected yet */
+    if (!gone && !pending) __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&omu);
     if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
+    if (pending) { logf_("open: %d queue pair(s) not reconnected yet: NCCL's calls stay held", pending); return; }
     reopen();  /* not if a doom came after the check above */
 }
 

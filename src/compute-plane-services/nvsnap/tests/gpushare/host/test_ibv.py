@@ -869,6 +869,43 @@ int main(int argc, char **argv)
         printf("connect=%d completed=%d\n", k, ok);
         return 0;
     }
+    if (!strcmp(c, "openfresh")) {
+        /* An open after the restore and before "connect": NCCL's calls
+         * stay held while its queue pairs are not connected. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int k = reconnect();
+        nvsnap_ibv_open();
+        int held_after = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("held_after_open=%d connect=%d held_after_connect_open=%d completed=%d\n", held, k, held_after, ok);
+        return 0;
+    }
+    if (!strcmp(c, "connectunheld")) {
+        /* "connect" with NCCL's calls let go (reopen), or with a call in
+         * progress (inflight): it must refuse and change nothing. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        int k_inflight = reconnect();
+        __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        int why_inflight = !!strstr(rep, "not held");
+        reopen();
+        int k_open = reconnect();
+        int why_open = !!strstr(rep, "not held");
+        printf("connect_inflight=%d connect_open=%d why=%d untouched=%d\n", k_inflight, k_open, why_inflight && why_open,
+               fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_INIT && fake_qp_state(((struct vqp *)qb)->real) == IBV_QPS_INIT);
+        return 0;
+    }
     if (!strcmp(c, "remapchanged")) {
         /* "connect" fails moving qa to RTS after its RTR; the retry's
          * exchange gives qa's peer another number. qa is connected to the
@@ -881,8 +918,12 @@ int main(int argc, char **argv)
         a->attr[2].qp_state = IBV_QPS_RTR;  /* fails: RTR from RTR */
         int r1 = reconnect();
         a->attr[2].qp_state = IBV_QPS_RTS;
+        /* "open": something asks NCCL's calls to run between the tries
+         * (a hold, a gate opening); they must stay held. */
+        if (argc > 2 && !strcmp(argv[2], "open")) nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         int r2 = reconnect_edited("bump", qb->qp_num, 0);
-        printf("first=%d retry=%d still_rtr=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTR);
+        printf("first=%d retry=%d still_rtr=%d held=%d\n", r1, r2, fake_qp_state(a->real) == IBV_QPS_RTR, held);
         return 0;
     }
     if (!strcmp(c, "fenceheld")) {
@@ -1323,10 +1364,24 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["connect"], out["completed"]), ("0", "1"), out)
 
     def test_retried_connect_with_another_mapping_fails(self):
-        out = self.probe("remapchanged")
-        self.assertNotEqual(out["first"], "0", out)
-        self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
-        self.assertEqual(out["still_rtr"], "1", out)
+        # Also when something asked NCCL's calls to run between the tries.
+        for how in (None, "open"):
+            with self.subTest(how=how):
+                out = self.probe("remapchanged", how=how)
+                self.assertNotEqual(out["first"], "0", out)
+                self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
+                self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_open_before_connect_keeps_nccl_held(self):
+        out = self.probe("openfresh")
+        self.assertEqual(out["held_after_open"], "1", "NCCL's calls ran on queue pairs not yet connected: %s" % out)
+        self.assertEqual((out["connect"], out["held_after_connect_open"], out["completed"]), ("0", "0", "1"), out)
+
+    def test_connect_refuses_while_nccl_can_run(self):
+        out = self.probe("connectunheld")
+        self.assertNotEqual(out["connect_inflight"], "0", out)
+        self.assertNotEqual(out["connect_open"], "0", out)
+        self.assertEqual((out["why"], out["untouched"]), ("1", "1"), out)
 
     def test_sends_after_the_fence_wait_for_the_restore(self):
         out = self.probe("fenceheld")
