@@ -22,4 +22,4 @@ Tests that are not Go unit tests. Go tests live next to their packages
 `cuda_va_pytorch_test.py` are standalone GPU probes of the CUDA virtual
 memory API (save device memory, free it, map it again at the same address).
 They call `libcuda` through `ctypes` and use no nvsnap code; each is run
-with `python3 tests/<file>`. No script, workflow or build file runs them.
+with `python3 tests/<file>` from `src/compute-plane-services/nvsnap`. No script, workflow or build file runs them.

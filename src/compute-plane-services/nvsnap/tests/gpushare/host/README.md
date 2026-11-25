@@ -15,8 +15,9 @@ control-socket timeouts, the verbs library or NIXL pause and resume.
 - The `nvsnap gpushare` GitHub workflow runs every `test_*.py` here with
   `CUDA_INC` pointing at a `cuda.h`, and fails a run in which a test
   reports itself skipped.
-- By hand: `python3 -I tests/gpushare/host/<test>.py` (each file's
-  docstring shows how).
+- By hand, from `src/compute-plane-services/nvsnap`:
+  `python3 -I tests/gpushare/host/<test>.py` (each file's docstring shows
+  how).
 
 ## Key files
 

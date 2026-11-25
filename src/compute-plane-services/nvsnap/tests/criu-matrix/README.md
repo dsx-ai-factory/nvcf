@@ -20,7 +20,9 @@ function or with plain Helm. `cases/` holds one values file per matrix case.
   `vllm-llama-8b.yaml`.
 - `create-functions.sh`: for each selected case, pushes the chart with the
   case's values as its defaults and creates an NVCF Helm function, plus a
-  container function for single-pod Deployment cases. Its header lists the
+  container function for single-pod Deployment cases. `MODE=helm` skips the
+  container functions and `MODE=container` the chart push and Helm
+  functions (default `both`). Its header lists the
   environment it reads (`ORG`, `NGC_CLI_API_KEY`, `CASES`, `ARCH`,
   `DRY_RUN`, ...).
 
