@@ -356,6 +356,47 @@ func fallbackCases(t *testing.T) []fallbackCase {
 	}
 }
 
+// TestBodyLimitHintNamesRoutingFields checks the hint added to the buffered
+// limit error when a larger streamed limit is set and the routing fields were
+// not in the prefix. The status and error shape stay as before. Other
+// fallback reasons, and equal limits, get no hint.
+func TestBodyLimitHintNamesRoutingFields(t *testing.T) {
+	pad := filler(splitTestBetween)
+	lateFields := `{"input":"` + pad + `","model":"` + prefixTestModel + `","stream":false}`
+	streamHint := "Bodies up to 4194304 bytes can be accepted when the model and stream fields are in the first 65536 bytes of the JSON body."
+	modelHint := "Bodies up to 4194304 bytes can be accepted when the model field is in the first 65536 bytes of the JSON body."
+	split := int64Ptr(splitTestStreamed)
+	tests := []struct {
+		name     string
+		path     string
+		body     string
+		streamed *int64
+		hint     string
+	}{
+		{"late fields", "/v1/chat/completions", lateFields, split, streamHint},
+		{"messages late fields", messagesPath, lateFields, split, streamHint},
+		{"decision late fields", decisionsPath, `{"input":"` + pad + `","model":"` + prefixTestModel + `"}`, split, modelHint},
+		{"fields absent", "/v1/chat/completions", `{"input":"x"}` + strings.Repeat(" ", splitTestBetween), split, streamHint},
+		{"nonstandard fields", "/v1/chat/completions", `{"model":null,"stream":false,"input":"` + pad + `"}`, split, ""},
+		{"model not found", "/v1/chat/completions", earlyFieldsBody("acme/missing", false, splitTestBetween), split, ""},
+		{"equal limits", "/v1/chat/completions", lateFields, nil, ""},
+	}
+	for _, tc := range tests {
+		for _, knownLength := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s known length %v", tc.name, knownLength), func(t *testing.T) {
+				g := newSplitLimitGateway(t, splitTestBuffered, tc.streamed, nil)
+				status, payload := g.post(t, tc.path, "application/json", tc.body, knownLength)
+				requireBodyLimitError(t, tc.path, status, payload, splitTestBuffered)
+				if tc.hint == "" {
+					assert.NotContains(t, payload, "Bodies up to")
+					return
+				}
+				assert.Contains(t, payload, tc.hint)
+			})
+		}
+	}
+}
+
 // TestBufferedFallbackKeepsBufferedLimit sends bodies above the buffered
 // limit and within the streamed limit that the gateway must buffer. With a
 // known length the request is rejected with the buffered limit after the

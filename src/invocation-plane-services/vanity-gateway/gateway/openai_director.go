@@ -834,7 +834,7 @@ func (d *ModelDirector) resolveModelMappedRequest(writer http.ResponseWriter, re
 		}
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeOpenAIRequestTooLarge(writer, maxBytesErr)
+			writeOpenAIRequestTooLarge(writer, maxBytesErr, bodyLimitHint(err))
 			return resolvedOpenAIRequest{}, true
 		}
 		if errors.Is(err, errInvalidJSONBody) {
@@ -1131,15 +1131,20 @@ func (d *ModelDirector) proxyResolvedRequest(writer http.ResponseWriter, resolve
 
 // writeOpenAIRequestTooLarge writes the OpenAI-shaped response for a body
 // over the route limit. The forwarding path uses it too, when the limit is
-// reached after the request was dispatched but before any response.
-func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError) {
+// reached after the request was dispatched but before any response. A
+// non-empty hint is appended to the message.
+func writeOpenAIRequestTooLarge(writer http.ResponseWriter, maxBytesErr *http.MaxBytesError, hint string) {
 	writer.WriteHeader(http.StatusBadRequest)
+	message := fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
+		"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit)
+	if hint != "" {
+		message += " " + hint
+	}
 	errorMessage := OpenAIError{
 		Error: CustomOpenAIError{
-			Message: fmt.Sprintf("Please make sure your payload is below %d bytes in size. "+
-				"If larger assets are required please refer to our Assets API.", maxBytesErr.Limit),
-			Type: "invalid_request_error",
-			Code: "invalid_image_format",
+			Message: message,
+			Type:    "invalid_request_error",
+			Code:    "invalid_image_format",
 		},
 	}
 	if err := json.NewEncoder(writer).Encode(errorMessage); err != nil {
@@ -1389,6 +1394,9 @@ func requestReadFailure(protocol nativeProtocol, err error) (int, string, string
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
 		status, kind, message = http.StatusRequestEntityTooLarge, "", fmt.Sprintf("request body is too large (limit %d bytes)", maxBytesErr.Limit)
+		if hint := bodyLimitHint(err); hint != "" {
+			message += ". " + hint
+		}
 	}
 	if errors.Is(err, errModelFieldMissing) {
 		kind, message = errKindInvalidRequest, "model field is required"

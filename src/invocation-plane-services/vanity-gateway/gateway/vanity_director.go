@@ -204,7 +204,7 @@ func writeRequestTooLargeAfterDispatch(writer http.ResponseWriter, request *http
 		writeNativeError(writer, request, status, kind, message)
 		return
 	}
-	writeOpenAIRequestTooLarge(writer, maxBytesErr)
+	writeOpenAIRequestTooLarge(writer, maxBytesErr, "")
 }
 
 func writeBadGatewayProblem(writer http.ResponseWriter, request *http.Request, err error) {

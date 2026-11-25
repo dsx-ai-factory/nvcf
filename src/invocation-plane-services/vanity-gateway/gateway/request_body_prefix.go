@@ -161,16 +161,50 @@ func (d *ModelDirector) readModelRequestBody(request *http.Request, modelToNVCFU
 			// declared length already does, so reject before reading more.
 			abandonRequestBody(request)
 			releaseRequestBodyBuffer(prefix)
-			return openAIRequestBody{Model: scan.model}, bufferedBodyRead(reason), fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit})
+			return openAIRequestBody{Model: scan.model}, bufferedBodyRead(reason), d.withFieldOrderHint(fmt.Errorf("failed to read body: %w", &http.MaxBytesError{Limit: d.requestBodyLimit}), reason, needStream)
 		}
 		body, mode, err := finishBufferedRequestBody(request, prefix, decode, reason)
 		if err != nil {
 			body.Model = scan.model
 		}
-		return body, mode, err
+		return body, mode, d.withFieldOrderHint(err, reason, needStream)
 	}
 	request.Body = newPrefixReplayBody(prefix, promoteRequestBody(request, d.streamedBodyLimit()))
 	return openAIRequestBody{Model: scan.model, Stream: scan.stream}, streamedBodyRead(), nil
+}
+
+// bodyLimitHintError adds a hint for the client to a body limit error.
+type bodyLimitHintError struct {
+	error
+	hint string
+}
+
+func (e *bodyLimitHintError) Unwrap() error { return e.error }
+
+// bodyLimitHint returns the hint added to err, or "".
+func bodyLimitHint(err error) string {
+	var hintErr *bodyLimitHintError
+	if errors.As(err, &hintErr) {
+		return hintErr.hint
+	}
+	return ""
+}
+
+// withFieldOrderHint adds a hint to a buffered limit error when a larger
+// streamed limit is set and the request took the buffered path only because
+// its routing fields were not in the prefix. The hint names those fields.
+func (d *ModelDirector) withFieldOrderHint(err error, reason string, needStream bool) error {
+	var maxBytesErr *http.MaxBytesError
+	if (reason != requestBodyReasonLateFields && reason != requestBodyReasonFieldsAbsent) ||
+		d.streamedBodyLimit() <= d.requestBodyLimit ||
+		!errors.As(err, &maxBytesErr) || maxBytesErr.Limit != d.requestBodyLimit {
+		return err
+	}
+	fields := "model and stream fields are"
+	if !needStream {
+		fields = "model field is"
+	}
+	return &bodyLimitHintError{error: err, hint: fmt.Sprintf("Bodies up to %d bytes can be accepted when the %s in the first %d bytes of the JSON body.", d.streamedBodyLimit(), fields, requestPrefixLimit)}
 }
 
 // streamedBodyLimit is the body limit for a request on the streamed path.

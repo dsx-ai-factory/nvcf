@@ -552,8 +552,16 @@ Two limits apply. The buffered limit, `MAX_REQUEST_SIZE_BYTES`, bounds every
 read until the gateway chooses the streamed path. Only then is the rest of the
 upload allowed up to the streamed limit, `MAX_STREAMED_REQUEST_SIZE_BYTES`,
 with the prefix counted once. Any other read keeps the buffered limit. The
-too-large error names the limit that applied. The gateway rejects as early as
-the outcome is known:
+too-large error names the limit that applied: `400` with `Please make sure
+your payload is below <limit> bytes in size.` on OpenAI routes, and `413` with
+`request body is too large (limit <limit> bytes)` on native routes. When the
+streamed limit is above the buffered limit and the request used the buffered
+path because of `late_fields` or `fields_absent`, the message ends with a hint,
+for example `Bodies up to 134217728 bytes can be accepted when the model and
+stream fields are in the first 65536 bytes of the JSON body.` On
+`/v1/decisions` and `/v1/systemone` it names only the model field. Other
+reasons, and equal limits, get no hint. The gateway rejects as early as the
+outcome is known:
 
 - A `Content-Length` over the streamed limit, or a multipart `Content-Length`
   over the buffered limit, is rejected without reading the body.
