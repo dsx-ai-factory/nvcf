@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -824,5 +825,29 @@ func TestRestoreGroup_PlaceholderWithoutAgent(t *testing.T) {
 				t.Errorf("record = %v; a node an agent is on its way to must be waited for\n%s", cm.Data, logs.String())
 			}
 		})
+	}
+}
+
+// A restore refused before CRIU because its node cannot resume the NIXL KV
+// connector says nothing about the capture, nor about the configuration:
+// it is not a stall (three stalls start the configuration cold for good),
+// nor a restore failure. It is counted on its own, and the pods go so
+// their replacements try again.
+func TestFailGroup_NIXLNodeRefusalIsNotAStall(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	cause := fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	for range criuGroupMaxStalls {
+		c.failGroup(ctx, leader, "k1", false, cause, logrus.NewEntry(logrus.New()))
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["stalls"] != "" || cm.Data["state"] != "complete" || cm.Data[groupNodeRefusalsKey] != strconv.Itoa(criuGroupMaxStalls) {
+		t.Errorf("record = %v, want complete, no stall, %d node refusals", cm.Data, criuGroupMaxStalls)
+	}
+	if _, ok := parseCRIUGroup("k1", cm.Data); !ok {
+		t.Error("the configuration no longer restores")
+	}
+	if c.Blocked(ctx, "c0") {
+		t.Error("a node refusal blocked the checkpoint")
 	}
 }

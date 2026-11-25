@@ -66,6 +66,14 @@ var errNoColdStart = errors.New("the placeholder cannot start its workload in pl
 // A pod that is no longer the one whose restore failed (deleted, or
 // replaced under the same name) is left alone.
 func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, uid types.UID, container string, log *logrus.Entry) {
+	a.disposeFailedPlaceholderIn(ctx, ns, name, uid, container, false, log)
+}
+
+// disposeFailedPlaceholderIn is disposeFailedPlaceholder; inPlace starts
+// the workload cold in place even in a pod its controller would replace
+// (deleted only when it cannot): for a failure of the node, where a
+// replacement could land again.
+func (a *Agent) disposeFailedPlaceholderIn(ctx context.Context, ns, name string, uid types.UID, container string, inPlace bool, log *logrus.Entry) {
 	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -77,7 +85,7 @@ func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, u
 		log.Warn("CRIU auto-restore failed in a pod that has since been replaced; the replacement is left alone")
 		return
 	}
-	if !podRecreatedOnDelete(pod) {
+	if inPlace || !podRecreatedOnDelete(pod) {
 		// A failure that may pass (the runtime or the API server busy, the
 		// pod's status behind its container) is tried again: deleting the
 		// pod is for good. Only a pod that cannot start in place, or keeps

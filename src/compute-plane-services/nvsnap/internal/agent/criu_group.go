@@ -103,6 +103,13 @@ const (
 	// groupLastRestoreFailureKey holds the last one's cause.
 	groupRestoreFailuresKey    = "restoreFailures"
 	groupLastRestoreFailureKey = "lastRestoreFailure"
+	// groupNodeRefusalsKey counts the restores refused before CRIU because
+	// their node could not resume a paused NIXL KV connector
+	// (errNIXLResumeUnavailable): node-local, they count neither as a
+	// stall nor as a restore failure. groupLastNodeRefusalKey holds the
+	// last one's cause.
+	groupNodeRefusalsKey    = "nodeRefusals"
+	groupLastNodeRefusalKey = "lastNodeRefusal"
 	// groupGPUFaultsKey counts the restores of a capture that failed on a
 	// GPU the probe found faulty (gpu_probe.go): they say nothing about the
 	// capture and do not count toward criuGroupMaxRestoreFailures.
@@ -1968,6 +1975,11 @@ func recordFailure(d map[string]string, id string, restoreFailed bool, cause err
 		delete(d, groupRestoreFailuresKey)
 		delete(d, groupLastRestoreFailureKey)
 		d["state"], d["reason"] = criuGroupStateRestoreFailed, truncate(cause.Error(), groupReasonMax)
+		return true
+	}
+	if errors.Is(cause, errNIXLResumeUnavailable) {
+		n, _ := strconv.Atoi(d[groupNodeRefusalsKey])
+		d[groupNodeRefusalsKey], d[groupLastNodeRefusalKey] = strconv.Itoa(n+1), truncate(cause.Error(), groupReasonMax)
 		return true
 	}
 	n, _ := strconv.Atoi(d["stalls"])

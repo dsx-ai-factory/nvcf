@@ -434,16 +434,31 @@ func (e *groupRestoreFailure) Unwrap() []error {
 	return []error{e.err}
 }
 
-// nixlResumeUnavailable reports whether a member refused its restore
-// because its node cannot resume the NIXL KV connector
-// (errNIXLResumeUnavailable, as text from its agent).
+// nixlResumeUnavailable reports whether the group's restore did not run,
+// as far as its capture goes: a member refused it before CRIU because its
+// node cannot resume the NIXL KV connector (errNIXLResumeUnavailable, as
+// text from its agent), and every other member that failed was aborted
+// for it (openHeldGPUOnUnlock, or no unlock in time). Another member that
+// failed on its own makes the failure that member's.
 func nixlResumeUnavailable(members []GroupRestoreMemberResult) bool {
+	refused := false
 	for _, m := range members {
-		if strings.Contains(m.Error, errNIXLResumeUnavailable.Error()) {
-			return true
+		switch {
+		case m.Error == "":
+		case strings.Contains(m.Error, errNIXLResumeUnavailable.Error()):
+			refused = true
+		case !abortedByAPeer(m.Error):
+			return false
 		}
 	}
-	return false
+	return refused
+}
+
+// abortedByAPeer reports whether a member's restore error (text from its
+// agent) says it failed because another member did.
+func abortedByAPeer(e string) bool {
+	return strings.Contains(e, "aborted: another pod of the instance failed to restore") ||
+		strings.Contains(e, "the other pods did not finish restoring")
 }
 
 // allRefusedAsRestored reports whether every member refused the restore

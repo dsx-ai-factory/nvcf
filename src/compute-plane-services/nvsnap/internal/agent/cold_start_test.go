@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -390,6 +391,36 @@ func TestDisposeFailedPlaceholder_RetriesAFailureThatMayPass(t *testing.T) {
 	}
 	if !failed || !coldStarted(got) {
 		t.Errorf("not retried to a cold start: failed once %v, marked %v", failed, coldStarted(got))
+	}
+	if _, err := os.Stat(marker); err != nil || !exited(cmd) {
+		t.Errorf("not restarted to start cold: marker %v", err)
+	}
+}
+
+// A restore refused because this node cannot resume the pod's paused NIXL
+// KV connector starts the workload cold in place, even in a pod its
+// controller would replace: a replacement could land on the same node and
+// be refused again.
+func TestCRIUAutoRestore_NIXLNodeRefusalStartsColdInPlace(t *testing.T) {
+	cmd, marker := startPlaceholder(t, "/bin/sh", "-c", "exec sleep 30")
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	kc := fake.NewSimpleClientset(pod)
+	a := &Agent{kubeClient: kc, log: logrus.New(), runtime: pidRuntime{pid: procPID(cmd)}}
+	prev := restoreForRequest
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		return nil, fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	}
+	t.Cleanup(func() { restoreForRequest = prev })
+	ctx := context.Background()
+
+	a.criuRestorer().restore(ctx, pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "")
+
+	got, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("the pod was deleted: %v", err)
+	}
+	if !coldStarted(got) {
+		t.Error("the pod is not marked started cold")
 	}
 	if _, err := os.Stat(marker); err != nil || !exited(cmd) {
 		t.Errorf("not restarted to start cold: marker %v", err)

@@ -928,8 +928,8 @@ func (a *Agent) checkpointHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Restore handler
-// restoreForRequest runs a /v1/restore request's restore. A variable for
-// tests.
+// restoreForRequest runs a restore: a /v1/restore request's, or an
+// automatic one's (criu_auto_restore.go). A variable for tests.
 var restoreForRequest = (*Agent).restoreProbed
 
 func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {

@@ -36,6 +36,8 @@ type groupRestoreHarness struct {
 	failCkpt string
 	// failText is failCkpt's restore error (default: CRIU's).
 	failText string
+	// failOther fails more checkpoints, each with its error.
+	failOther map[string]string
 	// spans are the checkpoints' restore-span-ms on their nodes.
 	spans map[string]string
 
@@ -92,6 +94,10 @@ func (h *groupRestoreHarness) restore(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.requests = append(h.requests, req)
 	h.mu.Unlock()
+	if text, ok := h.failOther[req.CheckpointID]; ok {
+		http.Error(w, "restore failed: "+text, http.StatusInternalServerError)
+		return
+	}
 	if req.CheckpointID == h.failCkpt {
 		text := h.failText
 		if text == "" {
@@ -148,8 +154,8 @@ func (h *groupRestoreHarness) restore(w http.ResponseWriter, r *http.Request) {
 		h.mu.Unlock()
 	}
 	v, err := sess.awaitUnlock(r.Context(), quietFabricLog())
-	if err != nil || v != "unlock" {
-		http.Error(w, fmt.Sprintf("restore failed: verdict %q %v", v, err), http.StatusInternalServerError)
+	if err := openHeldGPUOnUnlock(req.GPUShareFabricSession, v, err, func() error { return nil }); err != nil {
+		http.Error(w, "restore failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(&RestoreResult{NewPodName: req.PlaceholderPodName})
@@ -444,5 +450,31 @@ func TestGroupRestore_NIXLResumeUnavailableIsNotRun(t *testing.T) {
 	}
 	if pods, _ := kc.CoreV1().Pods("llm").List(ctx, metav1.ListOptions{}); len(pods.Items) != 0 {
 		t.Errorf("%d target pods left; they go as after any failure", len(pods.Items))
+	}
+}
+
+// One member refused (its node cannot resume NIXL) and another failed on
+// its own: the group's failure is the other member's, a restore that ran
+// and failed, not masked as one that did not run.
+func TestGroupRestore_NIXLRefusalDoesNotMaskAnotherFailure(t *testing.T) {
+	ckpts := map[string]*CheckpointMetadata{
+		"c0": {SourcePodIP: "10.0.0.1", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 0, Size: 3}},
+		"c1": {SourcePodIP: "10.0.0.2", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 1, Size: 3}},
+		"c2": {SourcePodIP: "10.0.0.3", GPUShareGroup: &GPUShareGroupInfo{Session: "sx", Index: 2, Size: 3}},
+	}
+	h := newGroupRestoreHarness(t, ckpts)
+	h.failCkpt = "c1"
+	h.failText = fmt.Errorf("%w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable).Error()
+	h.failOther = map[string]string{"c2": "criu-v2 restore: exit status 1"}
+	groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "new-1": "10.1.0.11", "new-2": "10.1.0.12"})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := h.a.groupRestore(ctx, GroupRestoreRequest{Members: []GroupRestoreMember{
+		{CheckpointID: "c0", PlaceholderNamespace: "llm", PlaceholderPodName: "new-0"},
+		{CheckpointID: "c1", PlaceholderNamespace: "llm", PlaceholderPodName: "new-1"},
+		{CheckpointID: "c2", PlaceholderNamespace: "llm", PlaceholderPodName: "new-2"},
+	}}, quietFabricLog())
+	if !errors.As(err, new(*groupRestoreFailure)) {
+		t.Fatalf("err = %v (%T), want a restore that ran and failed", err, err)
 	}
 }
