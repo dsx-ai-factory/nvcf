@@ -640,11 +640,19 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
             fprintf(o, "%s %.*s:%lu\n", w1, (int)(lid - w2), w2, strtoul(lid + 1, NULL, 10) + 7);
         }
     }
+    /* "dangling": a last queue pair row with no value; "foreign": a line
+     * of another record type (fabric handles share the file). */
+    if (!strcmp(how, "dangling")) fprintf(o, "ibvq:%s:99999\n", drop_gid[0] ? drop_gid : "00000000000000000000000000000000");
+    if (!strcmp(how, "foreign")) fprintf(o, "fabric:0123456789abcdef 42\n");
     fclose(f);
     fclose(o);
     unlink(full);
     if (!strcmp(how, "unreadable")) unlink(path);
-    int r = nvsnap_ibv_connect(path, rep, sizeof(rep));
+    char dir[] = "/tmp/ibvmapXXXXXX";
+    const char *cpath = path;
+    if (!strcmp(how, "dir")) cpath = mkdtemp(dir);  /* opens, but reading it fails (EISDIR) */
+    int r = nvsnap_ibv_connect(cpath, rep, sizeof(rep));
+    if (!strcmp(how, "dir")) rmdir(dir);
     unlink(path);
     if (r) printf("connect: %s\n", rep);
     return r;
@@ -1570,6 +1578,8 @@ class Ibv(unittest.TestCase):
     # The connect replies the probe prints ("connect: <reply>"), exactly.
     GID = r"[0-9a-f]{32}"
     REFUSAL = {
+        "dangling": r"err the verbs exchange has a malformed row: ibvq:[0-9a-f]{32}:99999",
+        "dir": r"err cannot read the verbs exchange /tmp/ibvmap\w{6}: Is a directory",
         "omit": r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ \(peer qpn \d+\)",
         "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
         "unreadable": r"err cannot read the verbs exchange /tmp/ibvmap\w{6} \(No such file or directory\): "
@@ -1648,7 +1658,7 @@ class Ibv(unittest.TestCase):
         # The second restore's exchange lacks qa's peer: its queue pair
         # row, its port row, or the whole file. The connect must fail
         # before any queue pair leaves INIT.
-        for how in ("omit", "noport", "unreadable"):
+        for how in ("omit", "noport", "unreadable", "dangling", "dir"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0",
@@ -1679,7 +1689,7 @@ class Ibv(unittest.TestCase):
     def test_second_restore_with_a_complete_exchange_connects(self):
         # As it is, and with every row twice (two processes on one port
         # both send its rows): identical duplicates are fine.
-        for how in ("complete", "twice"):
+        for how in ("complete", "twice", "foreign"):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertEqual((out["connect"], out["untouched"], out["completed"]), ("0", "0", "1"), out)

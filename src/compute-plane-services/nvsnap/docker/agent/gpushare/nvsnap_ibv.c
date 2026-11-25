@@ -1702,10 +1702,23 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     }
     FILE *fp = path ? fopen(path, "re") : NULL;
     int ferr = fp ? 0 : path ? errno : ENOENT, bad = 0, nq = 0, ri;
-    while (fp && !bad && fscanf(fp, "%159s %159s", w1, w2) == 2) {
+    /* One row a line. Other record types (fabric handles) share the file:
+     * only the verbs rows are read, and one that does not parse fails it. */
+    char line[400], extra[2];
+    int cont = 0;
+    while (fp && !bad && fgets(line, sizeof(line), fp)) {
+        int whole = strchr(line, '\n') || feof(fp), skip = cont;
+        cont = !whole;
+        if (skip || (strncmp(line, "ibvp:", 5) && strncmp(line, "ibvq:", 5) && strncmp(line, "ibvk:", 5) &&
+                     strncmp(line, "ibvn:", 5)))
+            continue;
         union ibv_gid g, ng;
         unsigned x, y;
-        if (!strncmp(w1, "ibvp:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
+        if (!whole || sscanf(line, "%159s %159s %1s", w1, w2, extra) != 2) {
+            line[strcspn(line, "\n")] = 0;
+            snprintf(reply, n, "err the verbs exchange has a malformed row: %.80s", line);
+            bad = 1;
+        } else if (!strncmp(w1, "ibvp:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
             !unhex16(w2, &ng) && sscanf(w2 + 33, "%u", &y) == 1) {
             struct rport *r = rport_get(&g);
             if (r->port && (memcmp(r->cur.raw, ng.raw, 16) || r->old_lid != x || r->cur_lid != y)) {
@@ -1726,7 +1739,14 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
             int fresh = map_get(&r->kcount, x, &had) != 0;
             bad = put_once(&r->kcount, x, y, w1, reply, n) < 0;
             if (!bad && fresh) r->nkeys += y, r->counted = 1;
+        } else {
+            snprintf(reply, n, "err the verbs exchange has a malformed row: %.80s", w1);
+            bad = 1;
         }
+    }
+    if (fp && !bad && ferror(fp)) {  /* not the end of the file: a read error */
+        snprintf(reply, n, "err cannot read the verbs exchange %s: %s", path, strerror(errno));
+        bad = 1;
     }
     if (fp) fclose(fp);
     struct ibv_qp_attr a;
