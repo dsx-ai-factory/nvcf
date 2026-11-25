@@ -12,9 +12,12 @@ version from them. The records stay the source of truth.
 
 ## Used by
 
-- [`internal/agent`](../agent/): `record_identity.go` (`Identity`).
+- [`internal/agent`](../agent/): `record_identity.go` (`Identity`) and
+  `verify_abandoned.go` (`AbandonedKey`).
 - [`internal/server`](../server/): `function_status.go` (`Project`,
-  `ObjectName`, `GPURanks`, `RecordRestoreSeconds`).
+  `ObjectName`, `GPURanks`, `RecordRestoreSeconds`) and
+  `restore_history.go`, which follows restores from the pods' group labels
+  and restore annotations and records each `Restore` and its outcome.
 
 ## Key files
 

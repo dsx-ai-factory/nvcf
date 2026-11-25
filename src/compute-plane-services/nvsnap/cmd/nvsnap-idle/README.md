@@ -8,15 +8,20 @@ SPDX-License-Identifier: Apache-2.0
 `nvsnap-idle`, a static, single-threaded C program that keeps a container
 alive until it is stopped. The webhook sets it as the command of a CRIU
 restore placeholder's container, which holds the pod until the agent
-restores the captured processes into it.
+restores the captured processes into it. Model staging uses it too, as
+the hold container of a block-storage download Job.
 
 ## Used by
 
 - [`internal/webhook/criu_restore.go`](../../internal/webhook/criu_restore.go)
   writes its path (`IdleBin`, from the node bundle) as the container
   command.
+- [`internal/modelvolume/modelvolume.go`](../../internal/modelvolume/modelvolume.go)
+  (`EnsureDownloadJob`) runs it in the hold container that keeps a
+  block-storage download Job's pod running until the agent has copied the
+  staged tree.
 - Built with `gcc -static` in
-  [`docker/agent/Dockerfile.app`](../../docker/agent/).
+  [`docker/agent/Dockerfile.app`](../../docker/agent/Dockerfile.app).
 - Compiled and run by the tests here and by the agent's cold-start tests
   (`internal/agent/cold_start_test.go`).
 

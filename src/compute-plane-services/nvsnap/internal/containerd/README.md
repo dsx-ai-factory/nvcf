@@ -11,10 +11,12 @@ pod's containers and their rootfs on a containerd node.
 
 ## Used by
 
-- [`internal/agent`](../agent/) (`agent.go`, `checkpoint.go`,
-  `gpushare_nixl.go`): it gets the client through `runtime.New`, which this
-  package's `init` registers with `runtime.RegisterFactory`, and
-  type-asserts it to `*containerd.Client` for containerd-only calls.
+- [`internal/agent`](../agent/): it gets the client through `runtime.New`,
+  which this package's `init` registers with `runtime.RegisterFactory`, and
+  calls it through the `runtime.Runtime` interface. `agent.go` also keeps
+  the `*containerd.Client` in `Agent.containerd`, which nothing reads yet.
+  Several agent files import the package only for its `ContainerInfo`
+  alias of `runtime.ContainerInfo`.
 
 ## Key files
 

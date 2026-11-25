@@ -16,7 +16,7 @@ whether to retry.
 - [`internal/webhook`](../../internal/webhook/): `buildL2WaitContainer` in
   `l2_mount.go`, added to pods by `election.go` when an image is set
   (agent flag `--webhook-l2-wait-image`, Helm `agent.l2.waitImage`).
-- Built by [`docker/nvsnap-l2-wait/Dockerfile`](../../docker/nvsnap-l2-wait/)
+- Built by [`docker/nvsnap-l2-wait/Dockerfile`](../../docker/nvsnap-l2-wait/Dockerfile)
   (`ci/build-image.sh l2-wait`).
 - Entry point: `main.go:main`.
 

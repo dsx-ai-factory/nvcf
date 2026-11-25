@@ -8,16 +8,16 @@ Entry points (`main` packages). One directory per binary.
 
 ## Binaries
 
-- [`agent/`](agent/): **nvsnap-agent**, the node DaemonSet. It also serves
+- [`agent/`](agent/): `nvsnap-agent`, the node DaemonSet. It also serves
   the mutating admission webhook and runs as a helper subcommand
-  (`capture-write`, `pidns-dump-exec`, `pidns-restore-exec`,
-  `placeholder-files`).
+  (`pidns-dump-exec`, `pidns-restore-exec`, `placeholder-files`, and
+  `capture-write`, kept for writer Jobs from older agents).
 - [`nvsnap-server/`](nvsnap-server/): REST API, web UI and checkpoint catalog.
 - [`nvsnap/`](nvsnap/): the `nvsnap` CLI.
 - [`nvsnap-rootfs-restore/`](nvsnap-rootfs-restore/): the command the webhook
   puts in front of a workload for a rootfs restore: builds the overlay,
-  pivots into it and execs the workload. With `NVSNAP_NO_OVERLAY` (cachedir)
-  it only prewarms `NVSNAP_PREWARM_DIR` and execs.
+  pivots into it and execs the workload. Its `NVSNAP_NO_OVERLAY` mode is a
+  legacy cachedir path the webhook no longer sets.
 - [`nvsnap-mount-prep/`](nvsnap-mount-prep/): init container that asks the
   agent to prepare restore mounts and waits for them.
 - [`nvsnap-l2-wait/`](nvsnap-l2-wait/): init container that waits until a

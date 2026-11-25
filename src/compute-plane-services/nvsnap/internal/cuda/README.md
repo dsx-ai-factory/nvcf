@@ -5,8 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # internal/cuda
 
-Runs the `cuda-checkpoint` binary for the agent (lock, checkpoint, restore,
-unlock a process) and finds the GPU processes on the node or in a container.
+Finds the GPU processes on the node or in a container for the agent. It
+also wraps the `cuda-checkpoint` binary (lock, checkpoint, restore, unlock
+a process), but nothing outside this package calls those methods: on the
+capture path CRIU's CUDA plugin runs `cuda-checkpoint`, and a workload
+under gpushare is dumped without the plugin.
 
 ## Used by
 

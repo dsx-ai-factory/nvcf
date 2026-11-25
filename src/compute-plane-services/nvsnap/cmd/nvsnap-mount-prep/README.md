@@ -19,7 +19,7 @@ polls `GET /v1/restore/prep/{pod-uid}` until the job is ready or failed.
 - Served by the handlers in `restore_prep_http.go` of
   [`internal/agent`](../../internal/agent/), routed in `agent.go`.
 - Built into the agent image by
-  [`docker/agent/Dockerfile.app`](../../docker/agent/).
+  [`docker/agent/Dockerfile.app`](../../docker/agent/Dockerfile.app).
 - Entry point: `main.go:main`.
 
 ## Key files

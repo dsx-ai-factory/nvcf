@@ -16,7 +16,10 @@ others become gated pods that nvsnap-server releases later.
   `PodIdentity` in several files.
 - [`internal/server`](../server/): `election_release.go` (`LeaseName`,
   `ResolveLeader`) removes the gates or evicts the followers.
-- [`internal/agent`](../agent/): `companion_tools.go` (`Admits`).
+- [`internal/agent`](../agent/): `l2_integration.go` builds the
+  `LeaseElector` and `NodeArchScope` that the webhook
+  (`webhook_integration.go`) and the capture watcher
+  (`rootfsonly_integration.go`) use; `companion_tools.go` calls `Admits`.
 
 ## Key files
 

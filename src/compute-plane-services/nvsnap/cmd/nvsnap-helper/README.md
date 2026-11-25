@@ -15,7 +15,7 @@ the pod, so a step runs in the workload's own image without a shell.
   ([`internal/webhook/helper.go`](../../internal/webhook/helper.go)) and by
   [`internal/modelvolume`](../../internal/modelvolume/).
 - Built into the agent image by
-  [`docker/agent/Dockerfile.app`](../../docker/agent/).
+  [`docker/agent/Dockerfile.app`](../../docker/agent/Dockerfile.app).
 - Entry point: `main.go:main`, which dispatches on the first argument:
   `skip`, `wait`, `write`, `seed`, `model-cache`, `prewarm`,
   `await-pid-floor`.

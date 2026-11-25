@@ -19,10 +19,12 @@ Each package has its own README.
   service while it may be captured.
 - [`criu/mountinfo/`](criu/mountinfo/): /proc mountinfo parsing for capture
   and restore.
-- [`cuda/`](cuda/): runs `cuda-checkpoint` and finds GPU processes.
+- [`cuda/`](cuda/): finds GPU processes for the agent; its
+  `cuda-checkpoint` wrappers are not on the capture path.
 - [`rootfsonly/`](rootfsonly/): rootfs and cachedir capture and the warm-pod
   watcher.
-- [`treecopy/`](treecopy/): file-tree copier (`sendfile`, parallel files).
+- [`treecopy/`](treecopy/): file-tree copier (`sendfile`, or direct I/O in
+  faithful mode; parallel files).
 - [`tarstream/`](tarstream/): moves a directory tree between agents as a tar
   stream that cannot escape its destination.
 - [`hostlibs/`](hostlibs/): per-architecture driver and libc directories.

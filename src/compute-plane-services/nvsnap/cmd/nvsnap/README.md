@@ -8,9 +8,13 @@ SPDX-License-Identifier: Apache-2.0
 The `nvsnap` command-line client. `pods` reads pods from the Kubernetes API
 directly, `version` prints the CLI version, and the other subcommands call
 nvsnap-server over HTTP (`--server`, default `http://localhost:8080`).
-`ps`, `checkpoint` and `restore` call `/api/v1/processes...` and
-`/api/v1/checkpoints/{id}/restore`, which
-[`internal/server`](../../internal/server/) does not register.
+`ps`, `checkpoint`, `restore` and `status` call routes that
+[`internal/server`](../../internal/server/) does not register
+(`/api/v1/processes...`, `/api/v1/checkpoints/{id}/restore`,
+`/api/v1/status`; the server has `/api/v1/health`). `checkpoints` reaches
+the server but decodes snake_case fields (`size_bytes`, `created_at`),
+while the server returns `db.Checkpoint`'s camelCase ones
+(`checkpointSize`, `createdAt`).
 
 ## Used by
 

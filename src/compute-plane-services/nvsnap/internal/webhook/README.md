@@ -29,7 +29,11 @@ shared model volumes or node model cache steps.
 - `cachedir.go`, `rootfs_l2_overlay.go`, `l2_mount.go`: cachedir and rootfs
   restore mounts.
 - `criu_restore.go`, `criu_group.go`: CRIU restore placeholders and groups.
-- `gpushare.go`: pods annotated `nvsnap.io/gpushare=true`.
+- `gpushare.go`: gpushare for pods annotated `nvsnap.io/gpushare=true`
+  and, when `GPUShareByDefault` is set (the agent sets it when
+  `NVSNAP_DEFAULT_CAPTURE_PATH` is `criu`),
+  for GPU pods that do not run to completion; `nvsnap.io/gpushare=false`
+  opts out.
 - `model_volume.go`, `node_model_cache.go`, `election.go`: model sharing.
 - `capture_hold.go`, `helper.go`, `bundle_mount.go`: the readiness gate,
   `nvsnap-helper` steps and the node bundle mount.
