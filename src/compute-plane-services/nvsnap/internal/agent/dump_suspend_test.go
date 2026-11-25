@@ -138,8 +138,48 @@ func TestDumpAroundSuspend_StepsInOrder(t *testing.T) {
 			if !slices.Equal(s.calls, tc.want) {
 				t.Errorf("steps = %v\n want %v", s.calls, tc.want)
 			}
-			if err == nil && (info == nil || !info.NIXL || !info.ModelExpress) {
-				t.Errorf("info = %+v, want the pauses recorded", info)
+			if err == nil && (info == nil || !info.NIXL || !info.ModelExpress || !slices.Equal(info.NIXLPIDs, pids)) {
+				t.Errorf("info = %+v, want the pauses recorded, with the pids the NIXL pause released (%v)", info, pids)
+			}
+		})
+	}
+}
+
+// A source that runs on resumes the pids its pause released even when
+// the socket scan no longer finds them: the leave-running resume and the
+// resume after a failed dump both address them, rather than skip them and
+// leave the engine paused.
+func TestDumpAroundSuspend_ResumesThePausedPIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		leaveRunning bool
+		fail         []string
+		wantErr      bool
+	}{
+		{name: "leave running", leaveRunning: true},
+		{name: "dump fails", fail: []string{"dump"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, pids := fakeDumpSource(t)
+			s := &dumpSteps{fail: map[string]bool{}}
+			for _, f := range tc.fail {
+				s.fail[f] = true
+			}
+			s.install(t)
+			// After the pause, no process shows a control socket.
+			controlSocketPIDs = func(_ int, pids []int) []int {
+				if slices.Contains(s.calls, "nixl-pause") {
+					return nil
+				}
+				return pids
+			}
+			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}
+			_, err := a.dumpAroundSuspend(context.Background(), s.source(base, pids, tc.leaveRunning, true), testLog())
+			if (err != nil) != tc.wantErr || sourceMustBeReplaced(err) {
+				t.Errorf("err = %v; want err %v, the source not replaced", err, tc.wantErr)
+			}
+			if !slices.Contains(s.calls, "nixl-resume") {
+				t.Errorf("steps = %v: the paused pids were not resumed", s.calls)
 			}
 		})
 	}

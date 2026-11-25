@@ -457,7 +457,8 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 	dumped := false
 	// nixlResumed: the source's connector came back before the store's
 	// harvest; the deferred rollback has nothing left to do.
-	nixlPaused, nixlResumed := false, false
+	var nixlPaused []int
+	nixlResumed := false
 	if d.on {
 		// ModelExpress drops its RDMA state, which the dump cannot save,
 		// right before the suspend (gpushare_mx.go). Deferred before the
@@ -485,10 +486,10 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}
-		if nixlPaused {
+		if len(nixlPaused) > 0 {
 			defer func() {
 				if !nixlResumed && sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
-					retErr = resumeNIXLSource(ctx, d.hostPID, d.pids, retErr, log)
+					retErr = resumeNIXLSource(ctx, d.hostPID, d.pids, nixlPaused, retErr, log)
 				}
 			}()
 		}
@@ -515,7 +516,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 			return nil, fmt.Errorf("gpushare suspend: %w", serr)
 		}
 		gpuMap = gm
-		gsInfo = &GPUShareInfo{PIDs: d.pids, StorePath: GPUShareStoreInContainer, LibPath: d.lib, ModelExpress: paused, NIXL: nixlPaused}
+		gsInfo = &GPUShareInfo{PIDs: d.pids, StorePath: GPUShareStoreInContainer, LibPath: d.lib, ModelExpress: paused, NIXL: len(nixlPaused) > 0, NIXLPIDs: nixlPaused}
 	}
 
 	ran, done, cleanup, err := d.dump()
@@ -545,9 +546,9 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		// A source left running serves nothing until its connector is back:
 		// resume it before the store's harvest, which may copy across
 		// mounts.
-		if nixlPaused && d.leaveRunning {
+		if len(nixlPaused) > 0 && d.leaveRunning {
 			nixlResumed = true
-			if rerr := resumeNIXLSource(ctx, d.hostPID, d.pids, nil, log); rerr != nil {
+			if rerr := resumeNIXLSource(ctx, d.hostPID, d.pids, nixlPaused, nil, log); rerr != nil {
 				return nil, rerr
 			}
 		}

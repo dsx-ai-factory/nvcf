@@ -119,7 +119,7 @@ func TestPauseNIXL(t *testing.T) {
 			}
 			calls := fakeNIXL(t, out, map[string]bool{"nixl-pause": tc.fail})
 			paused, err := pauseNIXL(context.Background(), tc.optedIn, tc.text, 42, []int{7, 8}, testLog())
-			if paused != tc.wantPaused || (err != nil) != tc.wantErr {
+			if (len(paused) > 0) != tc.wantPaused || (err != nil) != tc.wantErr {
 				t.Errorf("pauseNIXL = %v, %v; want paused %v, err %v", paused, err, tc.wantPaused, tc.wantErr)
 			}
 			if tc.wantErr && (!errors.Is(err, errNIXLPauseRefused) || !strings.Contains(err.Error(), "RDMA device file") || sourceMustBeReplaced(err)) {
@@ -137,7 +137,7 @@ func TestPauseNIXL(t *testing.T) {
 func TestPauseNIXL_RefusedAndNotResumed(t *testing.T) {
 	calls := fakeNIXL(t, nil, map[string]bool{"nixl-pause": true, "nixl-resume": true})
 	paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7}, testLog())
-	if paused || !errors.Is(err, errNIXLPauseRefused) || !sourceMustBeReplaced(err) {
+	if len(paused) > 0 || !errors.Is(err, errNIXLPauseRefused) || !sourceMustBeReplaced(err) {
 		t.Errorf("pauseNIXL = %v, %v; want errNIXLPauseRefused and the source replaced", paused, err)
 	}
 	if !slices.Equal(*calls, []string{"nixl-pause@42 [7]", "nixl-resume@42 [7]"}) {
@@ -151,7 +151,7 @@ func TestPauseNIXL_RefusedAndNotResumed(t *testing.T) {
 func TestResumeNIXLSource(t *testing.T) {
 	captureErr := errors.New("dump failed")
 	calls := fakeNIXL(t, nil, nil)
-	if err := resumeNIXLSource(context.Background(), 42, []int{7}, captureErr, testLog()); !errors.Is(err, captureErr) || errors.Is(err, errSourceLeftSuspended) {
+	if err := resumeNIXLSource(context.Background(), 42, []int{7}, []int{7}, captureErr, testLog()); !errors.Is(err, captureErr) || errors.Is(err, errSourceLeftSuspended) {
 		t.Errorf("resume ok: err = %v, want the capture's own", err)
 	}
 	if !slices.Equal(*calls, []string{"nixl-resume@42 [7]"}) {
@@ -159,11 +159,11 @@ func TestResumeNIXLSource(t *testing.T) {
 	}
 
 	fakeNIXL(t, nil, map[string]bool{"nixl-resume": true})
-	err := resumeNIXLSource(context.Background(), 42, []int{7}, captureErr, testLog())
+	err := resumeNIXLSource(context.Background(), 42, []int{7}, []int{7}, captureErr, testLog())
 	if !errors.Is(err, errSourceLeftSuspended) || !errors.Is(err, captureErr) || !sourceMustBeReplaced(err) {
 		t.Errorf("resume failed: err = %v, want errSourceLeftSuspended joined with the capture's error", err)
 	}
-	if err := resumeNIXLSource(context.Background(), 42, []int{7}, nil, testLog()); !errors.Is(err, errSourceLeftSuspended) {
+	if err := resumeNIXLSource(context.Background(), 42, []int{7}, []int{7}, nil, testLog()); !errors.Is(err, errSourceLeftSuspended) {
 		t.Errorf("resume failed after a good leave-running dump: err = %v, want errSourceLeftSuspended", err)
 	}
 }
@@ -301,7 +301,7 @@ func TestNIXLPauseFindings(t *testing.T) {
 
 // The capture records that it paused the connector, for its restore.
 func TestGPUShareInfo_NIXLRoundTrip(t *testing.T) {
-	for _, gs := range []GPUShareInfo{{PIDs: []int{7}}, {PIDs: []int{7}, NIXL: true}} {
+	for _, gs := range []GPUShareInfo{{PIDs: []int{7}}, {PIDs: []int{7}, NIXL: true, NIXLPIDs: []int{7}}} {
 		raw, err := json.Marshal(gs)
 		if err != nil {
 			t.Fatal(err)
@@ -313,8 +313,8 @@ func TestGPUShareInfo_NIXLRoundTrip(t *testing.T) {
 		if !gs.NIXL && strings.Contains(string(raw), "nixl") {
 			t.Errorf("%s: an unpaused capture's record names nixl", raw)
 		}
-		if b.NIXL != gs.NIXL {
-			t.Errorf("NIXL %v came back %v", gs.NIXL, b.NIXL)
+		if b.NIXL != gs.NIXL || !slices.Equal(b.NIXLPIDs, gs.NIXLPIDs) {
+			t.Errorf("NIXL %v %v came back %v %v", gs.NIXL, gs.NIXLPIDs, b.NIXL, b.NIXLPIDs)
 		}
 	}
 }
@@ -410,7 +410,7 @@ func TestPauseNIXL_UnclearOutputCountsAsPaused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeNIXL(t, map[string]string{"nixl-pause": tc.out}, nil)
 			paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8}, testLog())
-			if err != nil || paused != tc.want {
+			if err != nil || (len(paused) > 0) != tc.want {
 				t.Errorf("pauseNIXL = %v, %v; want %v, nil", paused, err, tc.want)
 			}
 		})
@@ -434,7 +434,7 @@ func TestResumeNIXL_EveryPidAnswersOK(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeNIXL(t, map[string]string{"nixl-resume": tc.out}, nil)
-			err := resumeNIXL(context.Background(), 42, "", []int{7, 8}, testLog())
+			err := resumeNIXL(context.Background(), 42, "", []int{7, 8}, nil, testLog())
 			if (err != nil) != tc.wantErr {
 				t.Errorf("resumeNIXL = %v, want err %v", err, tc.wantErr)
 			}
@@ -493,11 +493,11 @@ func TestNIXL_ProcessWithoutAControlSocket(t *testing.T) {
 	socketless := map[int]bool{9: true}
 	fakeControlSockets(t, socketless)
 	given := fakeNIXLTool(t, socketless)
-	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, testLog()); err != nil {
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, nil, testLog()); err != nil {
 		t.Errorf("resume with a socketless pid: %v", err)
 	}
 	paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog())
-	if err != nil || !paused {
+	if err != nil || len(paused) == 0 {
 		t.Errorf("pause = %v, %v; want paused", paused, err)
 	}
 	for _, g := range *given {
@@ -508,11 +508,59 @@ func TestNIXL_ProcessWithoutAControlSocket(t *testing.T) {
 	// No process with a socket: nothing to pause; a restore that must
 	// resume one cannot.
 	fakeControlSockets(t, map[int]bool{7: true, 8: true, 9: true})
-	if paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog()); err != nil || paused {
+	if paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog()); err != nil || len(paused) > 0 {
 		t.Errorf("pause with no control socket = %v, %v; want not paused", paused, err)
 	}
-	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, testLog()); err == nil {
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, nil, testLog()); err == nil {
 		t.Error("resume with no control socket succeeded")
+	}
+}
+
+// The pause records the pids whose connector it released, and the
+// resume requires each of them to answer ok, whatever the socket scan
+// says then: a paused pid without a control socket at the resume is
+// still addressed, gets no answer, and the resume fails rather than
+// report an engine that stays paused as resumed. A checkpoint from before
+// the pids were recorded resumes the pids with a socket, as before.
+func TestNIXL_ResumeRequiresEveryPausedPID(t *testing.T) {
+	fakeNIXL(t, map[string]string{"nixl-pause": "pid=7 nixl pause: ok no NIXL KV connector\n" +
+		"pid=8 nixl pause: ok engine paused, NIXL connector released on 1 worker(s)\n" +
+		"pid=9 nixl pause: ok TP worker: NIXL connector released\n"}, nil)
+	paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog())
+	if err != nil || !slices.Equal(paused, []int{8, 9}) {
+		t.Fatalf("pause = %v, %v; want [8 9] paused", paused, err)
+	}
+
+	// At the resume, 9 has lost its control socket.
+	socketless := map[int]bool{9: true}
+	fakeControlSockets(t, socketless)
+	given := fakeNIXLTool(t, socketless)
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, paused, testLog()); err == nil {
+		t.Error("resume succeeded with a paused pid that did not answer: the engine would stay paused while its pod reads Ready")
+	}
+	if len(*given) != 1 || !slices.Contains((*given)[0], 9) {
+		t.Errorf("the tool was given %v, want the paused pid 9 addressed", *given)
+	}
+	gs := &GPUShareInfo{PIDs: []int{7, 8, 9}, NIXL: true, NIXLPIDs: paused}
+	if err := resumeRestoredNIXL(context.Background(), gs, nixlToolText, 42, "", testLog()); err == nil {
+		t.Error("restore resume succeeded with a paused pid that did not answer")
+	}
+	if err := resumeNIXLSource(context.Background(), 42, []int{7, 8, 9}, paused, nil, testLog()); !errors.Is(err, errSourceLeftSuspended) {
+		t.Errorf("source resume = %v, want errSourceLeftSuspended", err)
+	}
+
+	// Every paused pid answers: the resume succeeds.
+	fakeControlSockets(t, nil)
+	fakeNIXLTool(t, nil)
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, paused, testLog()); err != nil {
+		t.Errorf("resume with every paused pid answering: %v", err)
+	}
+
+	// A checkpoint that did not record them: the pids with a socket.
+	fakeControlSockets(t, socketless)
+	fakeNIXLTool(t, socketless)
+	if err := resumeRestoredNIXL(context.Background(), &GPUShareInfo{PIDs: []int{7, 8, 9}, NIXL: true}, nixlToolText, 42, "", testLog()); err != nil {
+		t.Errorf("resume of a checkpoint without the paused pids: %v", err)
 	}
 }
 
@@ -619,7 +667,7 @@ func TestPauseNIXLFor_NotOptedInPausesNothing(t *testing.T) {
 	base, _ := retitledSession(t, []string{"NVSNAP_NIXL_PAUSE=1"})
 	calls := fakeNIXL(t, nil, nil)
 	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, base, 5000, "", 1, nixlToolText, 42, []int{2}, testLog())
-	if err != nil || paused || len(*calls) != 0 {
+	if err != nil || len(paused) > 0 || len(*calls) != 0 {
 		t.Errorf("pauseNIXLFor = %v, %v, calls %v; want nothing paused", paused, err, *calls)
 	}
 }

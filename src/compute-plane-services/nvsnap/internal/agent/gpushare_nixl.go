@@ -119,6 +119,21 @@ func nixlReplies(out string) map[int]string {
 	return reps
 }
 
+// nixlPausedPIDs are the pids among pids whose connector the pause's
+// output shows released: every pid that did not answer "ok no ..." (a pid
+// without an answer, or output the agent cannot read, counts as paused,
+// as in nixlNothingPaused).
+func nixlPausedPIDs(out string, pids []int) []int {
+	reps := nixlReplies(out)
+	var paused []int
+	for _, pid := range pids {
+		if !strings.HasPrefix(reps[pid], "ok no ") {
+			paused = append(paused, pid)
+		}
+	}
+	return paused
+}
+
 // nixlNothingPaused reports whether the pause's output shows that no
 // process of pids released a connector: every pid answered "ok no ..."
 // ("ok no NIXL KV connector", "ok no Python"). Anything else (a pid
@@ -150,8 +165,9 @@ func nixlAllOK(out string, pids []int) bool {
 
 // pauseNIXL has the NIXL KV connector in pids release its RDMA state
 // before a capture's suspend, when the pod opted in (optedIn) and the GPU
-// tool can (toolText). paused: a connector was released, and the source
-// must get resumeNIXL whenever it runs on. A pod that did not opt in, or a
+// tool can (toolText). paused: the pids whose connector was released
+// (nixlPausedPIDs), empty when none was; the source must get resumeNIXL
+// for them whenever it runs on. A pod that did not opt in, or a
 // tool without nixl-pause, is not paused and captures as before (the
 // preflight refuses RDMA it cannot release). A pod that opted in but has
 // no connector is not paused either. A failed pause returns
@@ -161,37 +177,47 @@ func nixlAllOK(out string, pids []int) bool {
 // (a resume of an engine that is not paused answers "not paused"); if
 // that fails, the error also carries errSourceLeftSuspended and the
 // source is replaced.
-func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, pids []int, log *logrus.Entry) (paused bool, err error) {
+func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, pids []int, log *logrus.Entry) (paused []int, err error) {
 	if !optedIn || len(pids) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	if !gpushareNIXLSupported(toolText) {
 		log.Info("gpushare: the pod opted in to nixl-pause, but the GPU tool has no nixl-pause; capturing it as it is")
-		return false, nil
+		return nil, nil
 	}
 	if pids = controlSocketPIDs(hostPID, pids); len(pids) == 0 {
 		log.Info("gpushare: the pod opted in to nixl-pause, but no process has a control socket, so none has a NIXL KV connector the tool could reach")
-		return false, nil
+		return nil, nil
 	}
 	t0 := time.Now()
 	out, err := gpushareNIXL(ctx, hostPID, "nixl-pause", "", pids)
 	if err != nil {
-		return false, resumeNIXLSource(ctx, hostPID, pids, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
+		return nil, resumeNIXLSource(ctx, hostPID, pids, nil, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
 	}
 	l := log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()})
-	if nixlNothingPaused(out, pids) {
+	paused = nixlPausedPIDs(out, pids)
+	if len(paused) == 0 {
 		l.Info("gpushare: the pod opted in to nixl-pause, but no process has a NIXL KV connector")
-		return false, nil
+		return nil, nil
 	}
-	l.Info("gpushare: the NIXL KV connector released its RDMA state for the capture: " + lastLines(out, 1))
-	return true, nil
+	l.WithField("paused", paused).Info("gpushare: the NIXL KV connector released its RDMA state for the capture: " + lastLines(out, 1))
+	return paused, nil
 }
 
 // resumeNIXL has the NIXL KV connector in pids come back under a new
-// engine id, at host when set. It runs to its end under its own deadline.
-// An error means the engine takes no requests.
-func resumeNIXL(ctx context.Context, hostPID int, host string, pids []int, log *logrus.Entry) error {
-	if pids = controlSocketPIDs(hostPID, pids); len(pids) == 0 {
+// engine id, at host when set: the pids with a control socket, and every
+// pid of paused (the ones the pause released) whether or not it has one
+// now, each of which must answer ok, or the resume fails rather than
+// leave one paused. It runs to its end under its own deadline. An error
+// means the engine takes no requests.
+func resumeNIXL(ctx context.Context, hostPID int, host string, pids, paused []int, log *logrus.Entry) error {
+	pids = controlSocketPIDs(hostPID, pids)
+	for _, pid := range paused {
+		if !slices.Contains(pids, pid) {
+			pids = append(pids, pid)
+		}
+	}
+	if len(pids) == 0 {
 		return errors.New("nixl-resume: no process has a control socket to resume")
 	}
 	t0 := time.Now()
@@ -209,11 +235,11 @@ func resumeNIXL(ctx context.Context, hostPID int, host string, pids []int, log *
 }
 
 // resumeNIXLSource resumes a source whose capture paused its connector
-// and that runs on. A failure leaves an engine that takes no requests in a
+// (in paused; nil when not known) and that runs on. A failure leaves an engine that takes no requests in a
 // pod that still reads Ready: reported as errSourceLeftSuspended, joined
 // with the capture's err, so the caller replaces it.
-func resumeNIXLSource(ctx context.Context, hostPID int, pids []int, err error, log *logrus.Entry) error {
-	if rerr := resumeNIXL(ctx, hostPID, "", pids, log); rerr != nil {
+func resumeNIXLSource(ctx context.Context, hostPID int, pids, paused []int, err error, log *logrus.Entry) error {
+	if rerr := resumeNIXL(ctx, hostPID, "", pids, paused, log); rerr != nil {
 		return errors.Join(err, fmt.Errorf("%w: %w", errSourceLeftSuspended, rerr))
 	}
 	return err
@@ -231,7 +257,7 @@ func resumeRestoredNIXL(ctx context.Context, gs *GPUShareInfo, toolText string, 
 	if !gpushareNIXLSupported(toolText) {
 		return errors.New("gpushare: the capture paused the NIXL KV connector, but this node's GPU tool has no nixl-resume")
 	}
-	return resumeNIXL(ctx, toolPID, host, gs.PIDs, log)
+	return resumeNIXL(ctx, toolPID, host, gs.PIDs, gs.NIXLPIDs, log)
 }
 
 // restoredNIXLHost is the address a restored engine's side channel
@@ -508,10 +534,10 @@ func (a *Agent) nixlOptIn(ctx context.Context, ns, name, container string) (bool
 // the container says so) is refused here, before anything is paused,
 // whether or not a preflight ran: a capture requested through
 // POST /v1/checkpoints runs none.
-func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession string, rankNodes int, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
+func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession string, rankNodes int, toolText string, hostPID int, pids []int, log *logrus.Entry) ([]int, error) {
 	if optedIn && gpushareNIXLSupported(toolText) {
 		if why := nixlSpansNodes(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession, rankNodes); why != "" {
-			return false, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
+			return nil, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
 				errNIXLPauseUnsupported, why)
 		}
 	}
