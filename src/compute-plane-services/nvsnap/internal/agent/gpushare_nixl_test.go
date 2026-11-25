@@ -688,3 +688,31 @@ func TestControlSocketPIDsIn(t *testing.T) {
 		t.Errorf("unreadable namespace: %v, want every pid", got)
 	}
 }
+
+// The shape a disaggregated vLLM prefill pod showed on GPUs: its API
+// server (pid 1) maps the library and holds GPU device files but has no
+// control socket; only the engine (pid 460) listens. The restore's
+// nixl-resume reaches the engine alone, the tool prints its reply only,
+// and the resume succeeds.
+func TestNIXL_ResumeWithAnAPIServerWithoutASocket(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "4242", "net"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unix := "Num       RefCount Protocol Flags    Type St Inode Path\n" +
+		"0000000000000000: 00000002 00000000 00010000 0005 01 2201 @nvsnap-gpushare.460\n"
+	if err := os.WriteFile(filepath.Join(base, "4242", "net", "unix"), []byte(unix), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := controlSocketPIDs
+	controlSocketPIDs = func(hostPID int, pids []int) []int { return controlSocketPIDsIn(base, hostPID, pids) }
+	t.Cleanup(func() { controlSocketPIDs = prev })
+	given := fakeNIXLTool(t, map[int]bool{1: true})
+	gs := &GPUShareInfo{PIDs: []int{1, 460}, NIXL: true}
+	if err := resumeRestoredNIXL(context.Background(), gs, nixlToolText, 4242, "10.245.18.115", testLog()); err != nil {
+		t.Errorf("restore's nixl-resume: %v", err)
+	}
+	if len(*given) != 1 || !slices.Equal((*given)[0], []int{460}) {
+		t.Errorf("the tool was given %v, want [[460]]", *given)
+	}
+}
