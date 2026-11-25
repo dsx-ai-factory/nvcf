@@ -1604,6 +1604,20 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
     return lines;
 }
 
+static void map_free(struct u32map *m)
+{
+    if (m->t) free(m->t->k), free(m->t->v), free(m->t);
+    m->t = NULL;
+}
+
+/* A peer table no reader can reach any more (NCCL's calls are held). */
+static void rports_free(struct rport *t, int nt)
+{
+    for (int i = 0; i < nt; i++)
+        map_free(&t[i].keys), map_free(&t[i].qpns), map_free(&t[i].kcount), map_free(&t[i].qsend);
+    free(t);
+}
+
 static struct rport *rport_get(const union ibv_gid *old)
 {
     int i = rport_find(old, 0);
@@ -1716,11 +1730,14 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
                  want);
         return -1;
     }
-    for (int i = 0; i < n_rports; i++) {
-        struct rport *r = &rports[i];
-        map_clear(&r->keys), map_clear(&r->qpns), map_clear(&r->kcount), map_clear(&r->qsend);
-        r->port = 0, r->nkeys = 0, r->counted = 0;
-    }
+    /* This exchange goes into a table of its own, which replaces the last
+     * validated one only once every queue pair checks out: a refused remap
+     * leaves the last one in place (the data path reads rports[q->remote]
+     * without a lock, and NCCL's calls are held). rport_get and peer_attr
+     * work on rports, so the new table stands in while it is built. */
+    struct rport *keep = rports;
+    int n_keep = n_rports;
+    rports = NULL, n_rports = 0;
     FILE *fp = path ? fopen(path, "re") : NULL;
     int ferr = fp ? 0 : path ? errno : ENOENT, bad = 0, nq = 0, ri;
     /* One row a line. Other record types (fabric handles) share the file:
@@ -1776,6 +1793,12 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     struct ibv_qp_attr a;
     for (int i = 0; i < n_qps && !bad; i++)
         if (wants_peer(qps[i]) && peer_attr(qps[i], &a, &ri, path, ferr, reply, n)) bad = 1;
+    struct rport *gone = bad ? rports : keep;  /* the table that loses: this one if refused */
+    int n_gone = bad ? n_rports : n_keep;
+    if (bad) rports = keep, n_rports = n_keep;
+    for (int i = 0; i < n_qps && !bad; i++)  /* every index into the new table, before any can fail */
+        qps[i]->remote = wants_peer(qps[i]) && !peer_attr(qps[i], &a, &ri, path, ferr, reply, n) ? ri : -1;
+    rports_free(gone, n_gone);
     for (int i = 0; i < n_qps && !bad; i++) {
         struct vqp *q = qps[i];
         if (!wants_peer(q)) continue;  /* not re-created, or never connected */

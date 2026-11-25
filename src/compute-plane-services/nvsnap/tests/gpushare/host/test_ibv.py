@@ -939,6 +939,25 @@ int main(int argc, char **argv)
         printf("connect=%d completed=%d\n", k, ok);
         return 0;
     }
+    if (!strcmp(c, "refusedretry")) {
+        /* The remap succeeds; a second remap of the same restore is refused
+         * (its exchange lacks the key rows). The tables of the first stay:
+         * after the open, a write with NCCL's keys lands. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        if (reconnect()) return 1;
+        int k2 = reconnect_edited("nokeys", 0, 0);
+        nvsnap_ibv_open();
+        if (__atomic_load_n(&suspended, __ATOMIC_SEQ_CST)) return printf("held after the open\n"), 1;
+        send_t(NULL);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("retry=%d completed=%d\n", k2, ok);
+        return 0;
+    }
     if (!strcmp(c, "stalertr")) {
         /* A restore and its remap finish, and NCCL is then let go by a
          * failed fence (reopen(), not nvsnap_ibv_open). A later remap with
@@ -1782,6 +1801,11 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_refused_retry_keeps_the_last_valid_tables(self):
+        out = self.probe("refusedretry")
+        self.assertNotEqual(out["retry"], "0", out)
+        self.assertEqual(out["completed"], "1", "a refused remap left the peer tables cleared: %s" % out)
 
     def test_remap_after_nccl_was_let_go_without_an_open_is_a_noop(self):
         out = self.probe("stalertr")
