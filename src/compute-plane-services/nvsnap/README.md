@@ -4,22 +4,31 @@
 their GPU memory, across every pod and node of the instance) and restores it into new pods, so a scale-up resumes a
 warm engine instead of downloading the model and starting the engine again. It works on unmodified inference images.
 
-Measured on GB300 ([benchmarks](docs/BENCHMARKS.md)):
+Measured on GB300 with pre-release agent builds (`v0.2.x-rc` tags; the chart's default agent image,
+`v0.2.70-rminject1`, is older), [benchmarks](docs/BENCHMARKS.md):
 
-- **Kimi K3.1 Pro, 4 pods × 4 GPUs, Dynamo with vLLM.** A cold start took about 45 to 46 minutes from the first
-  download start (scheduling and image pull not included), 30 to 33 of them downloading 1.56 TB per pod (agent v0.2.91-rc22d, 2026-11-22). On another GB300 cluster, deleting the captured
-  instance's 7 pods and restoring them to all Ready took a median of 306.5 s, teardown included, in 30 of 32 cycles
-  (agent v0.2.91-rc9 to rc14, 2026-11-12 and 13).
+- **Kimi K3.1 Pro, Dynamo with vLLM, 4 GPU pods (4 GPUs each, per the run notes).** No cold start and restore were
+  measured on the same cluster with the same settings, so the two numbers below are not a speedup.
+  - CRI-O cluster, no cluster storage: a cold start took about 45 to 46 minutes from the first download start
+    (scheduling and image pull not included), 30 to 33 of them downloading 1.56 TB per pod (agent v0.2.91-rc22d,
+    2026-11-22). After a capture, the agent's own group restore time had a median of 123.5 s over 11 runs (agent
+    v0.2.91-rc21 to v0.2.92-rc1); it does not include scheduling the pods or their readiness after the restore.
+  - containerd cluster (GB300 inferred from other runs there) with cluster storage, rails, agent authentication, the
+    election, the model volume and `agent.restoreCapturedAddress` on: deleting the captured instance's 7 pods and
+    restoring them to all Ready took a median of 306.5 s, teardown included, in 30 of 32 cycles (agent v0.2.91-rc9
+    to rc14, 2026-11-12 and 13). A cold start was not timed there.
+
   [Raw data](docs/results/KIMI-K3-GB300-2026-11.md).
 - **Disaggregated vLLM v0.31.0 with NIXL over RDMA, TinyLlama 1.1B.** The restored prefill pod was Ready 28 s after
   scheduling; the cold one answered `/health` 131 s after scheduling (agent v0.2.91-rc22w, 2026-11-25, one run).
   [Raw data](docs/results/DISAGG-NIXL-GB300-2026-11-25.md).
 
 When a CRIU capture or restore of a configuration fails, its pods do not start under gpushare, or the cluster's
-GPU drivers are too old for CRIU, nvsnap falls back to **cachedir**: it captures the engine's model and compile
-caches, and the engine starts again with them (Qwen2.5-32B on 4x H100: 170 s against 325 s cold, agent
-v0.2.75-election6, 2026-09-25, [raw data](docs/results/HELM-CHART-CACHE-2026-09.md)). cachedir is also the chart's
-default method; GPU checkpoint/restore is `agent.captureMethod: criu`.
+GPU drivers are too old for CRIU, nvsnap falls back to **cachedir**: each rank's model and compile caches are
+captured on its node, and later pods start the engine again with them. No timing of this fallback is on record.
+cachedir is also the chart's default method, where a pod is captured only when labelled `nvsnap.io/capture: "true"`
+(or picked by the opt-in election); its measured runs, on H100 with the election and a cluster storage volume on,
+are in [BENCHMARKS.md](docs/BENCHMARKS.md#cachedir). GPU checkpoint/restore is `agent.captureMethod: criu`.
 
 - What works for your workload, and what is refused: [docs/SUPPORT.md](docs/SUPPORT.md)
 - Every measured number, with its raw data: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
@@ -49,7 +58,9 @@ capture on the cluster:
 - **cachedir (`cachedir`), any GPU count.** NvSnap captures the warm pod's
   model and JIT/compile caches into one cache directory and mounts it on
   restore. The engine starts again, but skips the weight download and reuses
-  compiled kernels and graphs. A CRIU cluster uses it as the fallback for a
+  compiled kernels and graphs. Only pods labelled `nvsnap.io/capture: "true"`
+  are captured, unless the admission election (`agent.election.enabled`)
+  picks one. A CRIU cluster uses it as the fallback for a
   configuration CRIU cannot serve
   ([SUPPORT.md](docs/SUPPORT.md#capture-method)).
 
@@ -69,8 +80,9 @@ Deeper design docs:
 ## Quickstart
 
 Prerequisites: a Kubernetes cluster with GPU nodes, an NVIDIA driver with the
-CUDA checkpoint driver API (`cuCheckpointProcess*`; multi-GPU capture under
-gpushare needs 610 or later, see [gpushare](docs/design/GPUSHARE.md#requirements-and-limits)),
+CUDA checkpoint driver API (`cuCheckpointProcess*`; every CRIU capture and
+restore needs driver major 610 or later, the same on every GPU node, see
+[SUPPORT.md](docs/SUPPORT.md#platform)),
 containerd or CRI-O, and `kubectl` + `helm` 3.
 
 ```bash
@@ -85,6 +97,8 @@ kubectl create secret docker-registry nvsnap-pull-secret \
 # 2. Install (agent, server, webhook; also cert-manager and the GPU Operator
 #    as subcharts unless you set cert-manager.enabled / gpu-operator.enabled false)
 helm dependency build deploy/helm/nvsnap
+#    agent.image.tag defaults to v0.2.70-rminject1, older than every build in
+#    docs/BENCHMARKS.md and docs/SUPPORT.md; set it to the build you run.
 helm install nvsnap deploy/helm/nvsnap --namespace nvsnap-system
 
 # 3. Verify
@@ -129,8 +143,10 @@ optional webhook). Full guide, options, and troubleshooting:
 A restore fetches a checkpoint from the first tier that has it: the node's
 own copy; with `agent.rails.enabled`, peer nodes over their RDMA NICs (a
 checkpoint smaller than `agent.rails.minSize` goes to the peer agents over
-HTTP instead, before cluster storage); then cluster storage; then peer agents
-over HTTP (`EnsureLocal`, `internal/agent/cascade_fetch.go`). The cross-cluster object
+HTTP instead, before cluster storage); then a shared filesystem, when the
+agent is given one (`--fsstore-path`, not set by the chart); then the L2
+volume; then peer agents over HTTP (`EnsureLocal`,
+`internal/agent/cascade_fetch.go`). The cross-cluster object
 store (L4) is filled and pulled by replication in the background, not tried
 by a restore. Cluster config decides which tiers are present. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-where-bytes-live-and-how-they-move).

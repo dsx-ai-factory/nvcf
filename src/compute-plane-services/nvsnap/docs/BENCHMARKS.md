@@ -5,7 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 # Benchmarks
 
 Measured results only. Every number names its model, engine, GPUs, storage, nvsnap version and date (or says which
-of them the run did not record), and links the raw data it was read from. A run whose nvsnap version is not recorded is not listed
+of them the run did not record), and links the raw data it was read from. The nvsnap versions are pre-release agent
+builds (`v0.2.x-rc`, `-mv` and `-election` tags); the chart's default agent image, `v0.2.70-rminject1`, is older than
+all of them. A run whose nvsnap version is not recorded is not listed
 ([what was left out](#left-out-and-why)). What each workload shape needs is in [SUPPORT.md](SUPPORT.md).
 
 nvsnap has two ways to start a GPU workload warm. **GPU checkpoint/restore** (CRIU with the gpushare library,
@@ -29,8 +31,9 @@ compile caches, and the engine starts again with them.
 
 ## How the times are measured
 
-- **Ready** is Kubernetes Ready: every container of the pod passes its readiness probe. For an instance of several
-  pods, Ready is when the last of them is.
+- **Ready** depends on the run. The Kimi harness counts a pod Ready when every one of its containers is ready, and an
+  instance when the last of its pods is. The disaggregated restore uses the pod's `Ready` condition, which also waits
+  for nvsnap's readiness gate `nvsnap.io/capture-settled` (`internal/capturehold/capturehold.go`).
 - **Container** is the time from the pod being scheduled until its first container starts (image pull and container
   creation). **Model** is the model download or copy. **Init** is the engine's start after that, up to Ready.
   **Total** is all of it. A run that did not record a phase says "not recorded".
@@ -46,7 +49,8 @@ compile caches, and the engine starts again with them.
 ### Kimi K3.1 Pro, 4 pods × 4 GB300, CRI-O
 
 - Model: `moonshotai/kimi-k3.1-pro`, 1.56 TB of weights downloaded by each pod. Engine: Dynamo with vLLM, versions not
-  recorded. 4 GPU pods, one per node, 4 GPUs each, plus the instance's etcd, NATS and frontend pods.
+  recorded. 4 GPU pods, one per node, 4 GPUs each (from the run notes; the harness did not record it), plus the
+  instance's etcd, NATS and frontend pods.
 - Storage: node-local disk; no cluster storage tier. Driver major 610.
 - Non-default settings: agent authentication, the node model cache, the election, `agent.restoreCapturedAddress`,
   `webhook.skipUnusedInits` and `webhook.gpushareIBV` were on, and rails for `v0.2.91-rc22h` (the raw data lists
@@ -55,7 +59,8 @@ compile caches, and the engine starts again with them.
 
 Cold start, 2026-11-22, agent `v0.2.91-rc22d`, one run each. The download times are exact (Kubernetes timestamps); Ready
 was polled about every 70 s, so Init and Total are given as the interval between the last poll before Ready and the
-first one after it.
+first one after it. Init starts at the end of the last pod's download (03:22:43 in the first run, where the leader's
+ended at 03:20:00; 06:42:55 in the second).
 
 | | Container | Model | Init | Total |
 |---|---|---|---|---|
@@ -64,8 +69,8 @@ first one after it.
 
 Restore, verification restores after a capture, 11 runs from 2026-11-21 to 2026-11-25. Container, Model and Init are
 not recorded for these restores. A restore does not start the engine; its placeholder pods did not download the model
-because `webhook.skipUnusedInits` was on (off by default: without it each placeholder downloads the model again first,
-`values.yaml`).
+because `webhook.skipUnusedInits` was on (off by default: without it each placeholder downloads the model again first).
+The chart says to keep it off in production until the restore's verification sends inference requests (`values.yaml`).
 
 | Agent | Date | Restore (agent) |
 |---|---|---:|
@@ -87,8 +92,8 @@ cluster access during the run). Their causes are not verified (raw data, section
 
 ### Kimi K3.1 Pro, scale from zero, GB300, containerd
 
-- The same model and workload shape on a second GB300 cluster: containerd, a cluster storage tier on. GPUs per pod:
-  not recorded. Non-default settings: agent authentication, the election, the model volume, rails and
+- The same model and workload shape on a second cluster: containerd, a cluster storage tier on. GB300 is inferred from
+  other runs on that cluster; this output does not record it. GPUs per pod: not recorded. Non-default settings: agent authentication, the election, the model volume, rails and
   `agent.restoreCapturedAddress`.
 - Each cycle deletes all 7 pods of a captured instance and times until all 7 replacements are restored and Ready,
   polling every 20 s. The time includes the old pods' teardown (120 s to 146 s in the passing cycles).
@@ -112,6 +117,9 @@ cluster access during the run). Their causes are not verified (raw data, section
 - Model: TinyLlama 1.1B (`TinyLlama/TinyLlama-1.1B-Chat-v1.0`). Engine: vLLM v0.31.0, NIXL KV connector over UCX on
   RDMA. One prefill pod and one decode pod, 1 GPU each, 2 nodes. The prefill pod was captured and restored.
 - Storage: node-local disk; restored on the capture node. CRI-O. Agent `v0.2.91-rc22w`, `webhook.nixlPause.enabled`.
+  The prefill pod was annotated `nvsnap.io/nixl-pause: "true"`, `nvsnap.io/gpushare: "true"` and
+  `nvsnap.io/gpushare-fabric: "false"`, and requested `nvidia.com/mlnxnics: "4"`; whether the last three are required
+  is not verified.
 - 2026-11-25, one run. Raw data: [DISAGG-NIXL-GB300-2026-11-25.md](results/DISAGG-NIXL-GB300-2026-11-25.md).
 
 | Prefill pod | Container | Model | Init | Total |
@@ -120,7 +128,8 @@ cluster access during the run). Their causes are not verified (raw data, section
 | Restored, scheduled to Ready | 2 s | none | 26 s: 8 s to the CRIU restore's start, 16 s to the processes resuming, 2 s to Ready | 28 s |
 
 The cold pod is timed to `/health` because nvsnap holds a pod it may capture out of Ready until the capture
-(`webhook.captureHold`). In 5 minutes of load after the restore, the decode pod's NIXL metrics show 19,144 KV
+(`webhook.captureHold`). The agent's own `criu-v2: restore completed duration=23.55s` counts from its restore request
+(`Restore`, `internal/agent/restore.go`), which came before the 16 s restore of the processes began. In 5 minutes of load after the restore, the decode pod's NIXL metrics show 19,144 KV
 transfers succeeded and 0 failed. The load script counted 18,821 requests good and 319 bad (an empty completion or
 missing KV parameters); why those 319 were bad is not verified.
 
@@ -129,12 +138,15 @@ missing KV parameters); why those 319 were bad is not verified.
 ### When cachedir is used
 
 - On every capture of a cluster whose `agent.captureMethod` is `cachedir`, the chart default.
-- On a cluster whose `agent.captureMethod` is `criu`, for a configuration CRIU cannot serve: its group record says
-  its capture failed, its restore failed, or its pods do not start under the gpushare library (`gpushare-failed`),
-  and CRIU will not try it again under the running agent version; or the cluster's GPU drivers are older than
-  `agent.criuMinDriverMajor` (610 when empty) or of more than one major (`driver`)
-  (`criuFallbackReason`, `internal/agent/criu_fallback.go`;
-  [CRIU-CAPTURE-FALLBACK.md](design/CRIU-CAPTURE-FALLBACK.md) §2.2 and §2.8).
+- On a cluster whose `agent.captureMethod` is `criu`, for a configuration CRIU cannot serve, once CRIU will not try
+  it again: its group record says its capture failed or its pods do not start under the gpushare library
+  (`gpushare-failed`), and it failed under the running agent version or its 3 capture attempts are used up; or its
+  restore failed (`restore-failed`) and its 3 capture attempts are used up, whatever the version (`criuGroupRecaptures`,
+  `internal/agent/criu_group.go`; `criuFallbackReason`, `internal/agent/criu_fallback.go`).
+- On a cluster whose `agent.captureMethod` is `criu` and whose GPU drivers are older than `agent.criuMinDriverMajor`
+  (610 when empty) or of more than one major: every configuration, whatever its record (`driver`; `criuFallbackFor`,
+  `internal/agent/criu_fallback.go`, and `clusterDriver.Gate`, `internal/agent/driver_gate.go`).
+- Design: [CRIU-CAPTURE-FALLBACK.md](design/CRIU-CAPTURE-FALLBACK.md) §2.2 and §2.8.
 
 ### vLLM on H100, September 2026
 
@@ -167,6 +179,7 @@ prewarm init container reading the 237 GB capture.
 | gpushare validation runs, October 2026 (Qwen2.5-72B on 4x GB300 and others) | [GPUSHARE.md](design/GPUSHARE.md#validation) | nvsnap version not recorded |
 | Kimi K3 group restores on 2 nodes, 2026-10-24 | [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | An earlier build (v0.2.76-mv194) of the same workload, superseded by the November runs above |
 | Node model cache download and harvest times, November 2026 | [NODE-MODEL-CACHE-2026-11.md](results/NODE-MODEL-CACHE-2026-11.md) | nvsnap version not recorded there; the versioned cold starts above replace it |
+| Llama-3.1-70B-Instruct cachedir, vLLM TP=4, H100, 2026-09-25: 632 s cold, 246 s restore | `RESULTS.md` and `results/BENCHMARK.md`, removed 2026-11-25 (git history keeps them); the cold time is in [PREWARM-2026-09.md](results/PREWARM-2026-09.md) | nvsnap version not recorded |
 | Page-cache prewarm A/B, September 2026 | [PREWARM-2026-09.md](results/PREWARM-2026-09.md) | nvsnap version not recorded |
 | Cache-set refresh, GB300, 2026-10-01 | [HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) section 6 | nvsnap version not recorded |
 | Workload-shape conformance runs, 2026-11-02 | [CONFORMANCE-GB300-2026-11-02.md](results/CONFORMANCE-GB300-2026-11-02.md) | Pass/fail evidence for [SUPPORT.md](SUPPORT.md); its timers are not comparable across scenarios |

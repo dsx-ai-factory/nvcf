@@ -41,7 +41,7 @@ was not re-checked against the code.
 
 | Page | Answers | Status |
 |---|---|---|
-| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with links to the measured numbers | Current, 2026-10-21 |
+| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with links to the measured numbers | Current, 2026-11-25 |
 | [SUPPORT.md](SUPPORT.md) | Will nvsnap work for my workload: every shape, runtime, GPU and storage choice, with its status and evidence | Current, 2026-11-25 |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every measured number, with model, engine, GPUs, storage, nvsnap version, date and raw data | Current, 2026-11-25 |
 | [GLOSSARY.md](GLOSSARY.md) | What each nvsnap word means, including the storage tiers L1–L4, and which words are retired | Current, 2026-10-21 |
