@@ -426,3 +426,55 @@ func TestCRIUAutoRestore_NIXLNodeRefusalStartsColdInPlace(t *testing.T) {
 		t.Errorf("not restarted to start cold: marker %v", err)
 	}
 }
+
+// A restored pod whose engine died, and which cannot be read for its
+// disposal, keeps its restore record, marked failed: the next event
+// retries only the disposal, so the failure is counted once, and the
+// record goes once the pod is disposed of.
+func TestFailRestored_KeepsTheRecordUntilTheDisposal(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	pod.Annotations[webhook.CRIURestoredAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	pod.Annotations[webhook.CRIUGroupAnnotation] = "k1"
+	const id = "abc__20261008-101010"
+	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("k1"), Namespace: "nvsnap-system"},
+		Data: map[string]string{"state": "complete", "size": "1", "captures": "1", "checkpoint.0": id}}
+	kc := fake.NewSimpleClientset(pod, record)
+	readFails := true
+	kc.PrependReactor("get", "pods", func(k8stesting.Action) (bool, kruntime.Object, error) {
+		if readFails {
+			return true, nil, errors.New("the API server is unavailable")
+		}
+		return false, nil, nil
+	})
+	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{CheckpointDir: t.TempDir()}}
+	c := a.criuRestorer()
+	ctx := context.Background()
+	if err := c.recordRestore(pod.UID, restoreRecord{Checkpoint: id, Container: "inference", Namespace: pod.Namespace, Pod: pod.Name}); err != nil {
+		t.Fatal(err)
+	}
+	fail := func() {
+		ref, ok, err := c.restoredBy(ctx, pod)
+		if err != nil || !ok {
+			t.Fatalf("restoredBy = %v, %v", ok, err)
+		}
+		c.failRestored(ctx, pod, ref, errors.New("the restored engine is gone"))
+	}
+
+	fail()
+	rec, ok := c.restoredRecordOf(pod.UID)
+	if !ok || !rec.Failed {
+		t.Fatalf("record = %+v, %v; want it kept, marked failed", rec, ok)
+	}
+	readFails = false
+	fail()
+	if _, ok := c.restoredRecordOf(pod.UID); ok {
+		t.Error("the record outlived the disposal")
+	}
+	if _, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{}); err == nil {
+		t.Error("the placeholder was not disposed of")
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if got := cm.Data[groupRestoreFailuresKey]; got != "1" {
+		t.Errorf("restore failures = %q, want the failure counted once", got)
+	}
+}
