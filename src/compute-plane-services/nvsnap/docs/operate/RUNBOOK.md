@@ -12,6 +12,7 @@ records are in `nvsnap-system`.
 **Contents**
 
 - [Following one capture or restore](#following-one-capture-or-restore)
+- [Group restores that skip setup (`webhook.skipUnusedInits`)](#group-restores-that-skip-setup-webhookskipunusedinits)
 - [NvsnapAgentMetricsMissing](#nvsnapagentmetricsmissing)
 - [NvsnapAgentDown](#nvsnapagentdown)
 - [NvsnapWebhookErrors](#nvsnapwebhookerrors)
@@ -22,6 +23,7 @@ records are in `nvsnap-system`.
 - [NvsnapCaptureFailed](#nvsnapcapturefailed)
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
+- [Node model cache](#node-model-cache)
 <!-- /toc -->
 
 ## Following one capture or restore
@@ -83,6 +85,40 @@ Everything below takes `kubectl` alone.
 6. **Where the time went, across many.** The dashboard
    (`deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`) has
    scale-up, restore phases, teardown and the cached captures per cluster.
+
+## Group restores that skip setup (`webhook.skipUnusedInits`)
+
+With `webhook.skipUnusedInits: true` (default off), a group capture reads
+each member's dump for the mounts its processes use. When an emptyDir too
+large to copy into the checkpoint (typically the model download) is used
+by no member, the record lists it, and every placeholder of that group
+skips the init containers that fill only it.
+
+- **Did a capture decide to skip?** The leader agent logs
+  `CRIU group capture: no restored process uses these volumes`, with
+  `volumes=[...]`. When it decides not to, it logs
+  `CRIU group capture: its restores run all their setup` with a `reason`.
+  The record has the decision too:
+
+  ```bash
+  kubectl -n nvsnap-system get cm nvsnap-criu-group-<key> -o jsonpath='{.data.unusedVolumes}'
+  ```
+
+- **Did a placeholder skip?** Its annotation `nvsnap.io/skipped-inits`
+  names the inits it skipped.
+- **A workload must keep its setup.** Annotate its pods
+  `nvsnap.io/keep-inits: "true"`. Its next placeholders skip no init for
+  unused volumes: they run the same inits as with the flag off.
+- **Turn it off.** Set `webhook.skipUnusedInits: false` and roll the agents.
+  Records that already list volumes are then ignored. Placeholders admitted
+  before the change keep their patches until they are replaced.
+- **Pods with no recreating controller, and Jobs' pods,** never skip: a
+  failed restore of them would start cold in place, which needs the
+  setup's output.
+- **Known gap.** Verify checks that the pods stay Ready, not that they
+  serve. A workload that reads its model files again after it starts would
+  pass verify and then fail requests. Keep the flag off in production until
+  verify sends inference.
 
 ## NvsnapAgentMetricsMissing
 
@@ -240,3 +276,50 @@ for 6 minutes; until then only its own namespace restores from it.
 - Its namespace's pods: deleted and restored again and again within 6
   minutes (a test that cycles its instance) never verify it. Otherwise
   [follow its last restore](#following-one-capture-or-restore).
+
+## Node model cache
+
+Not an alert. The cache ([node-model-cache.md](../design/node-model-cache.md)) seeds cold pods' model downloads from
+a copy on the node.
+
+- **Is it working?** `sum by (result) (increase(nvsnap_model_cache_inits_total[1h]))`: `seeded` against
+  `downloaded`. A wrapped init logs `nvsnap: model cache: seeded <bytes> ...` or `... downloading`. The agent logs
+  `model cache: harvested`, `fetched from peer` and `evicted` with the key.
+- **Which nodes have a model?** `kubectl -n nvsnap-system get cm -l app.kubernetes.io/component=model-cache -o yaml`:
+  one ConfigMap per key, one entry per node. `nvsnap-system` is the default; the ConfigMaps are in the agent's
+  `--rootfs-cm-namespace`, so use that namespace if it is set.
+- **A pod seeded a bad model.** Every copy is checked against its manifest, so a bad tree was bad when it was
+  downloaded, and every node that has the key may serve it to its peers. Remove it everywhere, and keep it from being
+  kept again:
+  1. Turn the cache off (below), so no init waits on a fetch and no download is kept while you clean up.
+  2. Turning it off does not change pods already admitted: their init still mounts the cache and can seed from the
+     bad copy. List them with `kubectl get pods -A -l nvsnap.io/model-cache-key=<key>`, and scale their workloads
+     to zero (or delete those pods and keep them from being replaced) until step 5.
+  3. Delete `<root>/<key>` on every node of the cluster that could hold it, not only the nodes listed in
+     `nvsnap-model-cache-<key>`: a node can keep a copy whose registration failed. For example, for each node,
+     `kubectl debug node/<node> -it --image=busybox -- rm -rf /host<root>/<key>`. A node you cannot reach now
+     (cordoned, down) must be cleaned before it runs pods again, or before the cache is turned back on. Then delete
+     the ConfigMap.
+  4. Fix what made the download bad (the model version, the init's inputs) before turning the cache back on. A
+     download with the same inputs has the same key, and the first cold start after that keeps a copy of it again.
+  5. Only then turn the cache back on and scale the workloads back up.
+- **Turn it off.** Set `agent.nodeModelCache.enabled=false` and upgrade. New pods are admitted unwrapped. The files
+  under `root` stay until removed by hand.
+
+**Single flight** (`agent.nodeModelCache.singleFlight`, [model-cache-single-flight.md](../design/model-cache-single-flight.md)):
+one pod per model downloads, and the others stream its download.
+
+- **Who downloads?** `kubectl -n nvsnap-system get lease -l app.kubernetes.io/component=model-cache`: one Lease
+  `nvsnap-model-dl-<key>` per model being downloaded. Its holder is `<node>/<pod uid>`. Its `nvsnap.io/feeds`
+  annotation says which pod streams from which.
+- **What was a pod told?** On its node, `<root>/<key>/.plan-<pod uid>` holds `download` or `wait`. The init logs
+  `this pod downloads; other nodes copy from it` or `another node downloads this model; the agent copies it here`,
+  then `copied from another node in ...`. The agent logs `single flight:` lines with the key.
+- **A pod waits too long.** It waits while the agent's `<root>/<key>/.streaming-<pod uid>` heartbeat is fresh. The agent
+  stops it after 5 minutes without progress at the source, and the pod then downloads. Deleting the downloading
+  pod moves the download to a waiting pod within about 30 seconds.
+- **Is it on?** With it on, the agent mounts the kubelet pods directory read-write (`kubeletPodsDir`) to write
+  waiting pods' volumes. If it cannot write there, it logs `single flight needs a writable kubelet pods directory; it
+  is off` and admission adds no plans.
+- **Turn it off.** Set `agent.nodeModelCache.singleFlight=false` and upgrade. New pods are admitted without plans,
+  and each downloads or seeds as without single flight. Leases left by a running download expire on their own.
