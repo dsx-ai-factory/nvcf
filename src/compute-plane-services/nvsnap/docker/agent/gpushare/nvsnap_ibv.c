@@ -415,14 +415,31 @@ EXPORT int (ibv_query_port)(struct ibv_context *ctx, uint8_t port, struct _compa
     return r;
 }
 
-/* The type of a GID table entry (enum ibv_gid_type), and its GID; -1 if the
- * provider cannot tell. */
-static int gid_entry(struct ibv_context *real, uint8_t port, int index, union ibv_gid *gid)
+#ifndef NVSNAP_IBV_SYSFS
+#define NVSNAP_IBV_SYSFS "/sys/class/infiniband"
+#endif
+
+/* The type (enum ibv_gid_type) of entry index of c's port, -1 if it cannot
+ * be told: IB on an InfiniBand port; else what ibv_query_gid_ex reports
+ * (rdma-core 32 and later), or else what the kernel's sysfs says, where
+ * NCCL reads it ("IB/RoCE v1", "RoCE v2"). */
+static int gid_type(struct vctx *c, uint8_t port, int index)
 {
+    struct ibv_port_attr pa;
+    memset(&pa, 0, sizeof(pa));
+    if (!R.query_port(c->real, port, (struct _compat_ibv_port_attr *)&pa) && pa.link_layer == IBV_LINK_LAYER_INFINIBAND)
+        return IBV_GID_TYPE_IB;
     struct ibv_gid_entry e;
-    if (!R.query_gid_ex || index < 0 || R.query_gid_ex(real, port, index, &e, 0, sizeof(e))) return -1;
-    if (gid) *gid = e.gid;
-    return e.gid_type;
+    if (R.query_gid_ex && index >= 0 && !R.query_gid_ex(c->real, port, index, &e, 0, sizeof(e))) return e.gid_type;
+    char p[256], t[32] = "";
+    snprintf(p, sizeof(p), "%s/%s/ports/%u/gid_attrs/types/%d", NVSNAP_IBV_SYSFS, c->dev.name, port, index);
+    FILE *f = fopen(p, "re");
+    if (!f) return -1;
+    int ok = fgets(t, sizeof(t), f) != NULL;
+    fclose(f);
+    if (ok && !strncmp(t, "RoCE v2", 7)) return IBV_GID_TYPE_ROCE_V2;
+    if (ok && !strncmp(t, "IB/RoCE v1", 10)) return IBV_GID_TYPE_ROCE_V1;  /* not an InfiniBand port */
+    return -1;
 }
 
 EXPORT int ibv_query_gid(struct ibv_context *ctx, uint8_t port, int index, union ibv_gid *gid)
@@ -440,7 +457,7 @@ EXPORT int ibv_query_gid(struct ibv_context *ctx, uint8_t port, int index, union
     int r = R.query_gid(c->real, port, index, gid);
     /* Its type too: a restore must use an entry of the same type, or the
      * queue pair's RoCE version differs from its peer's. */
-    int type = r ? -1 : gid_entry(c->real, port, index, NULL);
+    int type = r ? -1 : gid_type(c, port, index);
     leave();
     if (!r) {
         struct vgid g = { .port = port, .index = index, .old = *gid, .cur = *gid, .cur_index = index, .type = type };
@@ -1323,8 +1340,8 @@ static int gid_kind(const union ibv_gid *g)
 
 static int gid_like(struct vctx *c, const struct vgid *g, int i, union ibv_gid *x)
 {
-    int t = gid_entry(c->real, g->port, i, x);
-    return t >= 0 && t == g->type && gid_kind(x) == gid_kind(&g->old) && memcmp(x->raw, (uint8_t[16]){ 0 }, 16);
+    return g->type >= 0 && !R.query_gid(c->real, g->port, i, x) && memcmp(x->raw, (uint8_t[16]){ 0 }, 16) &&
+           gid_kind(x) == gid_kind(&g->old) && gid_type(c, g->port, i) == g->type;
 }
 
 static int pick_gid(struct vctx *c, struct vgid *g)
@@ -1376,7 +1393,8 @@ EXPORT int nvsnap_ibv_restore(char *reply, size_t n)
                 struct vgid *g = &c->gids[k];
                 if (g->type < 0)
                     snprintf(reply, n, "err %s port %d: GID index %d: the provider did not report its type (IB, RoCE v1 or v2) "
-                             "when NCCL read it (ibv_query_gid_ex); cannot match it", c->dev.name, g->port, g->index);
+                             "when NCCL read it (ibv_query_gid_ex, sysfs gid_attrs/types); cannot match it",
+                             c->dev.name, g->port, g->index);
                 else
                     snprintf(reply, n, "err %s port %d: no GID of the address family and type (%s) index %d had",
                              c->dev.name, g->port, gid_type_name(g->type), g->index);
