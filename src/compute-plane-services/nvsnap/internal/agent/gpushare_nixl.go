@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 const (
@@ -230,49 +232,96 @@ func (a *Agent) resumeRestoredNIXLFor(ctx context.Context, gs *GPUShareInfo, too
 }
 
 // nixlPausableByEnv are the processes of the container whose init is
-// sessionHostPID (host numbering) that a capture's nixl-pause addresses
-// and whose pod opted in: the GPU processes under the library, the ones
-// the capture suspends (gpushareTargets). nixl-pause checks the RDMA of
-// these only.
+// sessionHostPID (host numbering) that a capture's nixl-pause addresses,
+// when the container opted in: the GPU processes under the library, the
+// ones the capture suspends (gpushareTargets). nixl-pause checks the RDMA
+// of these only. The opt-in is the container's: any of its processes
+// carrying the marker. A process's own environ does not decide: vLLM
+// renames its engine and workers with setproctitle, which overwrites the
+// environ in place, so the engine that holds the RDMA no longer shows the
+// marker the webhook set for its container.
 func nixlPausableByEnv(procBase string, sessionHostPID int) map[int]bool {
 	out := map[int]bool{}
-	for _, pid := range sessionPIDs(procBase, sessionHostPID) {
+	pids := sessionPIDs(procBase, sessionHostPID)
+	if !envOptsIntoNIXLPause(procBase, pids) {
+		return out
+	}
+	for _, pid := range pids {
 		dir := filepath.Join(procBase, strconv.Itoa(pid))
 		shim, gpu, _ := scanMaps(filepath.Join(dir, "maps"))
 		if !gpu {
 			gpu = holdsNvidiaFD(filepath.Join(dir, "fd"))
 		}
-		if shim && gpu && envOptsIntoNIXLPause(procBase, []int{pid}) {
+		if shim && gpu {
 			out[pid] = true
 		}
 	}
 	return out
 }
 
+// groupSizeEnvs are variables a pod's controller sets to the number of
+// pods its engine spans (LeaderWorkerSet, Grove).
+var groupSizeEnvs = []string{"LWS_GROUP_SIZE", "GROVE_PCSG_TEMPLATE_NUM_PODS"}
+
+// nixlSpansNodes says why the engine of the container whose processes are
+// pids (host numbering) spans nodes, or "" when nothing says it does:
+// the capture joins a multi-node session (fabricSession), or any of its
+// processes carries the fabric marker, a group size above one, or a
+// multi-node engine flag on its command line. Any process counts, since a
+// process renamed with setproctitle has lost its environ and its command
+// line; a container whose processes all lost theirs never opted in.
+func nixlSpansNodes(procBase string, pids []int, fabricSession string) string {
+	if fabricSession != "" {
+		return "the capture joins the multi-node session " + fabricSession
+	}
+	if procEnvSet(procBase, pids, fabricEnv, "1") {
+		return "the pod shares its GPU memory across nodes (" + fabricEnv + "=1)"
+	}
+	for _, pid := range pids {
+		env, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "environ"))
+		for _, kv := range bytes.Split(env, []byte{0}) {
+			k, v, ok := bytes.Cut(kv, []byte("="))
+			if !ok || !slices.Contains(groupSizeEnvs, string(k)) {
+				continue
+			}
+			if n, err := strconv.Atoi(string(v)); err == nil && n > 1 {
+				return fmt.Sprintf("its pod is one of a group of %d (%s)", n, k)
+			}
+		}
+		cmd, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "cmdline"))
+		if f := webhook.MultiNodeEngineArg(strings.Split(string(cmd), "\x00")); f != "" {
+			return "its engine is started with " + f
+		}
+	}
+	return ""
+}
+
+// nixlPauseLimit is why nixl-pause cannot handle the container whose
+// processes are pids, or "": ModelExpress in the same pod (each pause
+// fails while the other still holds RDMA), or an engine that spans nodes
+// (nixlSpansNodes; untested, and its remote workers are released through
+// the engine's own RPC).
+func nixlPauseLimit(procBase string, pids []int, fabricSession string) string {
+	if usesModelExpress(procBase, pids) {
+		return "the pod opted in to nixl-pause and also loads through ModelExpress; NIXL KV and ModelExpress in one pod are not supported yet"
+	}
+	if why := nixlSpansNodes(procBase, pids, fabricSession); why != "" {
+		return "the pod opted in to nixl-pause, but its engine spans nodes (" + why + "); nixl-pause is not supported for an engine that spans nodes yet"
+	}
+	return ""
+}
+
 // nixlPauseFindings applies nixl-pause to a container's preflight
 // findings fs. The rdma findings of the processes in pausable
 // (nixlPausable) become information: the capture has their connector
 // release its RDMA right before the suspend, and fails there, before the
-// instance is stopped, if any is still held. Two cases nixl-pause does
-// not handle yet block instead, once per container: a pod that also loads
-// through ModelExpress (each pause fails while the other still holds
-// RDMA), and an engine that spans nodes (untested; its remote workers are
-// released through the engine's own RPC). RDMA of any other process still
-// blocks: nixl-pause does not check it, and the dump would fail on it.
-func nixlPauseFindings(fs []PreflightFinding, pausable map[int]bool, procBase, pod, container string) []PreflightFinding {
+// instance is stopped, if any is still held. A container nixl-pause does
+// not handle (limit, from nixlPauseLimit) is blocked instead, once. RDMA of
+// any other process still blocks: nixl-pause does not check it, and the
+// dump would fail on it.
+func nixlPauseFindings(fs []PreflightFinding, pausable map[int]bool, limit, pod, container string) []PreflightFinding {
 	if len(pausable) == 0 {
 		return fs
-	}
-	pids := make([]int, 0, len(pausable))
-	for pid := range pausable {
-		pids = append(pids, pid)
-	}
-	var limit string
-	switch {
-	case usesModelExpress(procBase, pids):
-		limit = "the pod opted in to nixl-pause and also loads through ModelExpress; NIXL KV and ModelExpress in one pod are not supported yet"
-	case procEnvSet(procBase, pids, fabricEnv, "1"):
-		limit = "the pod opted in to nixl-pause, but its engine spans nodes; nixl-pause is not supported for an engine that spans nodes yet"
 	}
 	out := make([]PreflightFinding, 0, len(fs)+1)
 	for _, f := range fs {

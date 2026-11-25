@@ -20,6 +20,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -232,12 +233,50 @@ func multiNodeFlag(pod *corev1.Pod) string {
 		if _, ok := c.Resources.Limits["nvidia.com/gpu"]; !ok {
 			continue
 		}
-		for _, a := range append(append([]string{}, c.Command...), c.Args...) {
-			for _, w := range strings.Fields(a) {
-				for _, f := range multiNodeEngineFlags {
-					if w == f || strings.HasPrefix(w, f+"=") {
-						return f
-					}
+		if f := MultiNodeEngineArg(append(append([]string{}, c.Command...), c.Args...)); f != "" {
+			return f
+		}
+	}
+	return ""
+}
+
+// EngineSpansPods says why pod's engine spans pods (nodes) by its spec,
+// or "": the gpushare fabric annotation "true", a multi-node engine flag
+// on a GPU container's command line, or a group size above one from its
+// controller (a LeaderWorkerSet's size annotation, a Grove scaling group's
+// pod count). It reads nothing else, unlike groupSize: a StatefulSet's
+// replicas are not an engine's ranks.
+func EngineSpansPods(pod *corev1.Pod) string {
+	if pod.Annotations[GPUShareFabricAnnotation] == "true" {
+		return GPUShareFabricAnnotation + `: "true"`
+	}
+	if f := multiNodeFlag(pod); f != "" {
+		return "its engine is started with " + f
+	}
+	if n, err := strconv.Atoi(pod.Annotations[lwsSizeAnnotation]); err == nil && n > 1 {
+		return fmt.Sprintf("%s=%d", lwsSizeAnnotation, n)
+	}
+	for _, c := range pod.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == groveScalingGroupSizeEnv {
+				if n, err := strconv.Atoi(e.Value); err == nil && n > 1 {
+					return fmt.Sprintf("%s=%d", groveScalingGroupSizeEnv, n)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// MultiNodeEngineArg returns the first flag in args (each split on
+// spaces, as in a shell command line) that only an engine spanning nodes
+// is started with, or "".
+func MultiNodeEngineArg(args []string) string {
+	for _, a := range args {
+		for _, w := range strings.Fields(a) {
+			for _, f := range multiNodeEngineFlags {
+				if w == f || strings.HasPrefix(w, f+"=") {
+					return f
 				}
 			}
 		}

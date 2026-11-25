@@ -126,6 +126,14 @@ func (a *Agent) podPreflight(pod *corev1.Pod, container string, rank bool) []Pre
 	if rank && !a.gpushareEnabledFor(pod) {
 		add(container, preflightBlock, "gpushare", "a GPU rank without the gpushare library: its GPU memory cannot be saved")
 	}
+	// An engine that spans nodes is refused nixl-pause by its spec too: its
+	// processes may not show it (a fabric annotation "false", a renamed
+	// process).
+	if rank && a.nixlPauseOn() && pod.Annotations[webhook.NIXLPauseAnnotation] == "true" {
+		if why := webhook.EngineSpansPods(pod); why != "" {
+			add(container, preflightBlock, "nixl-pause", "the pod opted in to nixl-pause, but its engine spans nodes ("+why+"); nixl-pause is not supported for an engine that spans nodes yet")
+		}
+	}
 	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		add("", preflightInfo, "shared-pid-namespace", "the containers share one pid namespace: the restore recreates the dumped container's pids beside the sidecars' own")
 	}
@@ -182,14 +190,29 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	if err != nil {
 		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
 	} else {
-		if gpushareMXSupported(tools.gpuToolText()) {
-			fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
-		}
-		if gpushareNIXLSupported(tools.gpuToolText()) {
-			fs = nixlPauseFindings(fs, a.nixlPausable(procBase, int(info.PID)), procBase, pod, container)
-		}
+		fs = a.releaseFindings(fs, tools.gpuToolText(), procBase, int(info.PID), pod, container)
 	}
 	return fs, nil
+}
+
+// releaseFindings applies to a container's findings fs what the capture
+// releases before its suspend, with a GPU tool (its text, toolText) that
+// can: ModelExpress's RDMA (mx-pause) and, for a pod that opted in, the
+// NIXL KV connector's (nixl-pause). sessionHostPID is the container's
+// init.
+func (a *Agent) releaseFindings(fs []PreflightFinding, toolText, procBase string, sessionHostPID int, pod, container string) []PreflightFinding {
+	if gpushareMXSupported(toolText) {
+		fs = releasedByMXPause(fs, mxPausable(procBase, sessionHostPID))
+	}
+	if gpushareNIXLSupported(toolText) {
+		pausable := a.nixlPausable(procBase, sessionHostPID)
+		limit := ""
+		if len(pausable) > 0 {
+			limit = nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), "")
+		}
+		fs = nixlPauseFindings(fs, pausable, limit, pod, container)
+	}
+	return fs
 }
 
 // processFindings is the host checks of a container's processes pids.

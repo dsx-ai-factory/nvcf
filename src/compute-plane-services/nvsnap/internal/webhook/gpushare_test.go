@@ -758,3 +758,33 @@ func TestGPUShareMounted(t *testing.T) {
 		}
 	}
 }
+
+// EngineSpansPods reads the pod's spec only: the fabric annotation "true",
+// a multi-node engine flag, or a group size above one.
+func TestEngineSpansPods(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		edit  func(*corev1.Pod)
+		spans bool
+	}{
+		{"single pod", func(*corev1.Pod) {}, false},
+		{"fabric annotated true", func(p *corev1.Pod) { p.Annotations[GPUShareFabricAnnotation] = "true" }, true},
+		{"fabric false, group of two", func(p *corev1.Pod) {
+			p.Annotations[GPUShareFabricAnnotation] = "false"
+			p.Annotations[lwsSizeAnnotation] = "2"
+		}, true},
+		{"group of one", func(p *corev1.Pod) { p.Annotations[lwsSizeAnnotation] = "1" }, false},
+		{"headless engine", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--headless"} }, true},
+		{"scaling group", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Env = append(p.Spec.Containers[1].Env, corev1.EnvVar{Name: groveScalingGroupSizeEnv, Value: "2"})
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := gpushareTestPod(true, nil)
+			tc.edit(p)
+			if why := EngineSpansPods(p); (why != "") != tc.spans {
+				t.Errorf("EngineSpansPods = %q, want spans %v", why, tc.spans)
+			}
+		})
+	}
+}
