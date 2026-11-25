@@ -119,6 +119,15 @@ var (
 		Name:      "connected",
 		Help:      "1 while the nats connection is connected, 0 while it is reconnecting or closed, by connection.",
 	}, []string{"connection"})
+	// NatsSendDuration times each dispatch-connection send from start to its
+	// final result, including the wait for the connection and any retries. Its
+	// count by result gives the send rate and error rate.
+	NatsSendDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: NatsNamespace,
+		Name:      "send_duration_seconds",
+		Help:      "Time from the start of a dispatch connection send to its final result, including the wait for the connection and retries, by send and result.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"send", "result"})
 	// NatsSendFailures counts dispatch-connection sends that failed on the
 	// connection's state: in the wait before the send, or at the send. At the
 	// send, reconnecting means nats.go rejected the attempt before sending any
@@ -549,12 +558,16 @@ const (
 	NatsSendReasonTimeout      = "timeout"
 	NatsSendReasonClosed       = "closed"
 	NatsSendReasonReconnecting = "reconnecting"
+
+	NatsSendResultSuccess = "success"
+	NatsSendResultError   = "error"
 )
 
 var (
 	NatsSends       = []string{NatsSendWorkItem, NatsSendDispatch, NatsSendSessionJoin}
 	NatsSendStages  = []string{NatsSendStageWait, NatsSendStagePublish}
 	NatsSendReasons = []string{NatsSendReasonCanceled, NatsSendReasonTimeout, NatsSendReasonClosed, NatsSendReasonReconnecting}
+	NatsSendResults = []string{NatsSendResultSuccess, NatsSendResultError}
 )
 
 var NatsErrorReasons = []string{
@@ -593,6 +606,9 @@ func init() {
 		NatsConnected.WithLabelValues(connection)
 	}
 	for _, send := range NatsSends {
+		for _, result := range NatsSendResults {
+			NatsSendDuration.WithLabelValues(send, result)
+		}
 		for _, stage := range NatsSendStages {
 			for _, reason := range NatsSendReasons {
 				NatsSendFailures.WithLabelValues(send, stage, reason)

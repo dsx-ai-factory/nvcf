@@ -433,7 +433,13 @@ func (f *FunctionInvoker) publishDispatch(ctx context.Context, send string, time
 		trace.WithSpanKind(trace.SpanKindProducer),
 		trace.WithAttributes(attribute.String("nats.send", send)))
 	attempts := 0
+	start := time.Now()
 	defer func() {
+		result := metrics.NatsSendResultSuccess
+		if err != nil {
+			result = metrics.NatsSendResultError
+		}
+		metrics.NatsSendDuration.WithLabelValues(send, result).Observe(time.Since(start).Seconds())
 		span.SetAttributes(attribute.Int("nats.send.attempts", attempts))
 		if err != nil {
 			span.RecordError(err)

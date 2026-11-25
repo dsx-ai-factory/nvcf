@@ -1066,6 +1066,53 @@ func TestPublishDispatchRetriesOnlyRejectedAttempts(t *testing.T) {
 	}
 }
 
+// Every send is timed once, by its final result, however many attempts it took.
+func TestPublishDispatchTimesEachSendByResult(t *testing.T) {
+	f := connectedInvoker(t)
+	f.retryPause = func(context.Context) {}
+	send := metrics.NatsSendSessionJoin
+	successes, errs := sendDurationCount(t, send, metrics.NatsSendResultSuccess), sendDurationCount(t, send, metrics.NatsSendResultError)
+
+	attempts := 0
+	require.NoError(t, f.publishDispatch(context.Background(), send, 5*time.Second, func(context.Context) error {
+		attempts++
+		if attempts == 1 {
+			return nats.ErrReconnectBufExceeded
+		}
+		return nil
+	}))
+	assert.Error(t, f.publishDispatch(context.Background(), send, 5*time.Second, func(context.Context) error {
+		return nats.ErrNoResponders
+	}))
+
+	assert.Equal(t, successes+1, sendDurationCount(t, send, metrics.NatsSendResultSuccess))
+	assert.Equal(t, errs+1, sendDurationCount(t, send, metrics.NatsSendResultError))
+}
+
+// sendDurationCount reads how many sends NatsSendDuration has observed for the
+// labels.
+func sendDurationCount(t *testing.T, send, result string) uint64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != metrics.NatsNamespace+"_send_duration_seconds" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["send"] == send && labels["result"] == result {
+				return m.GetHistogram().GetSampleCount()
+			}
+		}
+	}
+	t.Fatalf("no send duration series for send=%s result=%s", send, result)
+	return 0
+}
+
 func connectedInvoker(t *testing.T) *FunctionInvoker {
 	t.Helper()
 	state := testConnState(t)
