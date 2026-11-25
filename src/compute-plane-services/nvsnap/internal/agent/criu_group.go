@@ -809,13 +809,6 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	if err != nil {
 		log.WithError(err).Error("CRIU group capture failed; this configuration starts fresh")
 		data["state"], data["reason"] = criuGroupStateFailed, truncate(err.Error(), groupReasonMax)
-		if stopped || sourceMustBeReplacedText(err.Error()) {
-			// The instance was stopped for the capture: rather than resume
-			// a stopped instance, its controllers replace every pod of it,
-			// cold.
-			log.Error("CRIU group capture: the instance was stopped for it; replacing its pods, which start fresh")
-			c.deleteInstance(context.WithoutCancel(ctx), key, members, log)
-		}
 	} else {
 		// The dump stopped the instance for good. Its replacements restore
 		// from the capture, which verifies it: until then, only they may.
@@ -843,7 +836,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
 	c.observeGroupCapture(ctx, key, leader, len(ranks), len(members), err, time.Since(t0), log)
-	c.commitCapture(context.WithoutCancel(ctx), key, record.Data["startedAt"], data, members, func() {
+	// A failed capture that stopped the instance replaces its pods.
+	replaceStopped := err != nil && (stopped || sourceMustBeReplacedText(err.Error()))
+	c.commitCapture(context.WithoutCancel(ctx), key, record.Data["startedAt"], data, members, replaceStopped, func() {
 		c.writeGroupAliases(context.WithoutCancel(ctx), key, scope, drv, uris, len(ranks), log)
 		nodes := make([]string, len(members))
 		for i, m := range members {
@@ -861,7 +856,18 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 // published run once the record says so, and its pods, dumped and gone,
 // deleted: their replacements are admitted as the restore's placeholders
 // (or cold, without the record).
-func (c *criuAutoRestorer) commitCapture(ctx context.Context, key, started string, data map[string]string, members []*corev1.Pod, published func(), log *logrus.Entry) {
+//
+// A failed capture that stopped its instance (replaceStopped) has its pods
+// deleted first, without listing them: rather than resume a stopped
+// instance, its controllers replace every pod of it, cold.
+func (c *criuAutoRestorer) commitCapture(ctx context.Context, key, started string, data map[string]string, members []*corev1.Pod, replaceStopped bool, published func(), log *logrus.Entry) {
+	if replaceStopped {
+		log.Error("CRIU group capture: the instance was stopped for it; replacing its pods, which start fresh")
+		// No key: the record is not being verified, so no replacement of
+		// theirs restores and nothing is listed; a read of it would only
+		// hold the stopped pods back.
+		c.deleteInstance(ctx, "", members, log)
+	}
 	if uerr := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
 		if d["state"] != criuGroupStateCapturing || d["startedAt"] != started {
 			return false // another capture took the record over

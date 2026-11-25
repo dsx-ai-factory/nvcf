@@ -14,8 +14,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/modelvolume"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
@@ -154,7 +156,7 @@ func TestCommitCapture_ListsLeavingBeforeFirstDelete(t *testing.T) {
 	t.Cleanup(func() { deleteMember = prev })
 	published := false
 
-	c.commitCapture(ctx, "k1", "t0", data, members, func() { published = true }, c.a.log.WithField("t", 1))
+	c.commitCapture(ctx, "k1", "t0", data, members, false, func() { published = true }, c.a.log.WithField("t", 1))
 
 	if !published {
 		t.Error("the capture to verify was not published")
@@ -167,6 +169,57 @@ func TestCommitCapture_ListsLeavingBeforeFirstDelete(t *testing.T) {
 	}
 	if left := remainingPods(t, kc); len(left) != 0 {
 		t.Errorf("pods left %v, want the captured pods deleted", left)
+	}
+}
+
+// A failed capture that stopped its instance deletes its pods without
+// reading the group record first: the record is not being verified, so
+// nothing is listed, and a stalled read would only hold the stopped pods.
+// The failure is then recorded and nothing is published.
+func TestCommitCapture_StoppedFailureDeletesWithoutRecordRead(t *testing.T) {
+	c, kc, members := capturedInstance(t)
+	ctx := context.Background()
+	if err := c.updateGroupRecord(ctx, "k1", func(d map[string]string) bool {
+		d["state"], d["startedAt"] = criuGroupStateCapturing, "t0"
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	reads, readsBeforeDelete, deletes := 0, -1, 0
+	kc.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return false, nil, nil
+	})
+	prev := deleteMember
+	deleteMember = func(a *Agent, ctx context.Context, ns, name string, uid types.UID) error {
+		mu.Lock()
+		if deletes == 0 {
+			readsBeforeDelete = reads
+		}
+		deletes++
+		mu.Unlock()
+		return prev(a, ctx, ns, name, uid)
+	}
+	t.Cleanup(func() { deleteMember = prev })
+	data := map[string]string{"state": criuGroupStateFailed, "reason": "dump failed", "startedAt": "t0"}
+
+	c.commitCapture(ctx, "k1", "t0", data, members, true, func() { t.Error("a failed capture was published") }, c.a.log.WithField("t", 1))
+
+	if readsBeforeDelete != 0 {
+		t.Errorf("%d group record read(s) before the first delete, want none", readsBeforeDelete)
+	}
+	if left := remainingPods(t, kc); len(left) != 0 {
+		t.Errorf("pods left %v, want the stopped instance's pods deleted", left)
+	}
+	cm, err := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data["state"] != criuGroupStateFailed || cm.Data[groupLeavingKey] != "" {
+		t.Errorf("record %v, want the failure recorded and nothing listed", cm.Data)
 	}
 }
 
