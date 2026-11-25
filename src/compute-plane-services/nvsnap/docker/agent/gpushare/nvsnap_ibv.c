@@ -1100,6 +1100,12 @@ static int fence(char *reply, size_t n, int mark)
  * it wins, and one that comes after holds the calls again. */
 static void reopen(void)
 {
+    /* NCCL runs on its connected queue pairs again: this restore's connect
+     * is done for them (as in nvsnap_ibv_open). One still waiting for RTR
+     * or RTS keeps its record for the retry. Callers do not hold omu. */
+    pthread_mutex_lock(&omu);
+    for (int i = 0; i < n_qps; i++) if (!qps[i]->fresh) qps[i]->rtr.set = 0;
+    pthread_mutex_unlock(&omu);
     pthread_mutex_lock(&gmu);
     int s = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
     while (s && !(s & G_DOOM) &&

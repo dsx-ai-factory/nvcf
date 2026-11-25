@@ -939,6 +939,24 @@ int main(int argc, char **argv)
         printf("connect=%d completed=%d\n", k, ok);
         return 0;
     }
+    if (!strcmp(c, "stalertr")) {
+        /* A restore and its remap finish, and NCCL is then let go by a
+         * failed fence (reopen(), not nvsnap_ibv_open). A later remap with
+         * nothing re-created (a rollback) must be the no-op it is after an
+         * open, not refuse because this restore's records are still set. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        int k = reconnect();
+        fake_fail_marker(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int noop = nvsnap_ibv_connect(NULL, rep, sizeof(rep));
+        if (noop) printf("connect: %s\n", rep);
+        printf("connect=%d fence=%d held=%d rtr_a=%d noop=%d\n", k, f, held, ((struct vqp *)qa)->rtr.set, noop);
+        return 0;
+    }
     if (!strcmp(c, "midconnect")) {
         /* Captured mid-connect: qd is at RTS targeting qc, and qc is still
          * at INIT (NCCL had not connected it yet). qc sends no row, so the
@@ -1764,6 +1782,12 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_remap_after_nccl_was_let_go_without_an_open_is_a_noop(self):
+        out = self.probe("stalertr")
+        self.assertEqual((out["connect"], out["held"]), ("0", "0"), out)
+        self.assertNotEqual(out["fence"], "0", out)
+        self.assertEqual((out["rtr_a"], out["noop"]), ("0", "0"), "a stale record made a no-op remap refuse: %s" % out)
 
     def test_remap_refuses_a_queue_pair_captured_mid_connect(self):
         out = self.probe("midconnect")
