@@ -16,7 +16,8 @@ Entry points (`main` packages). One directory per binary.
 - [`nvsnap/`](nvsnap/): the `nvsnap` CLI.
 - [`nvsnap-rootfs-restore/`](nvsnap-rootfs-restore/): the command the webhook
   puts in front of a workload for a rootfs restore: builds the overlay,
-  pivots into it and execs the workload.
+  pivots into it and execs the workload. With `NVSNAP_NO_OVERLAY` (cachedir)
+  it only prewarms `NVSNAP_PREWARM_DIR` and execs.
 - [`nvsnap-mount-prep/`](nvsnap-mount-prep/): init container that asks the
   agent to prepare restore mounts and waits for them.
 - [`nvsnap-l2-wait/`](nvsnap-l2-wait/): init container that waits until a

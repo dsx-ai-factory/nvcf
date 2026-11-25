@@ -5,9 +5,10 @@ SPDX-License-Identifier: Apache-2.0
 
 # internal/modelvolume
 
-The per-model volume: one volume per model URI per cluster, written once,
-then immutable and read through read-only views by every other pod that
-needs that model. The package holds the names, labels and annotations of
+The per-model volume: one volume per model URI and tenant scope
+(`ScopedURI`; a namespace is its own scope when no tenant label applies),
+written once, then immutable and read through read-only views by every
+other pod in that scope that needs the model. The package holds the names, labels and annotations of
 that lifecycle, the `Provisioner` the agent drives, and the `Reaper` that
 removes the PersistentVolumes the flow leaves behind.
 

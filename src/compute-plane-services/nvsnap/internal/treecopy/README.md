@@ -8,8 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 Copies a directory tree file by file with `sendfile(2)`, regular files in
 parallel. By default it skips what does not belong in a copy of a live
 root filesystem (sockets, FIFOs, devices, overlay whiteouts) and keeps
-symlinks and hardlinks. Faithful mode instead reproduces a stored tree
-exactly, owners, modes and device nodes included, with direct reads.
+symlinks and hardlinks. Faithful mode instead re-creates a stored
+tree with owners, modes, device nodes and FIFOs, and keeps regular files'
+modification times and extended attributes (except `trusted.overlay.*`),
+reading with direct I/O. It does not keep directory modification times, or
+extended attributes of symlinks, devices and FIFOs.
 
 ## Used by
 
