@@ -1546,6 +1546,9 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 			return nil, false, cerr
 		}
 		out := []*CheckpointResult{r}
+		if err := peersResetDone(reqs, out); err != nil {
+			return nil, true, err
+		}
 		if ierr := identityUnchecked(idc, out); ierr != nil {
 			return nil, true, ierr // dumped: the source is gone
 		}
@@ -1563,10 +1566,27 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 		}
 		out[i] = m.Result
 	}
+	if err := peersResetDone(reqs, out); err != nil {
+		return nil, true, err
+	}
 	if ierr := identityUnchecked(idc, out); ierr != nil {
 		return nil, true, ierr // every member was dumped: the instance is gone
 	}
 	return out, stopped, nil
+}
+
+// peersResetDone fails a capture one of whose members was asked to reset
+// its source's outside connections and did not say it did (an agent of a
+// version that ignores the request): its dead source's sessions may stay
+// open beside a restore. The dump stopped the source, so the capture's
+// pods are replaced.
+func peersResetDone(reqs []CheckpointRequest, results []*CheckpointResult) error {
+	for i, r := range results {
+		if i < len(reqs) && len(reqs[i].ResetPeersOutside) > 0 && (r == nil || !r.PeersReset) {
+			return fmt.Errorf("identity capture: member %s/%s did not reset its source's connections to peers outside the group (an agent without identity restore?)", reqs[i].Namespace, reqs[i].PodName)
+		}
+	}
+	return nil
 }
 
 // identityBlocksCapture returns the env variable through which a GPU pod

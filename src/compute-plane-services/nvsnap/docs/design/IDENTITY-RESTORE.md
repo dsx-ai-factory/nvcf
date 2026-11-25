@@ -130,6 +130,11 @@ never resumed), so no identity is
 recorded whose source may still hold sessions. The connections listed are the
 container's own, both directions.
 
+Each member asked to reset reports it did (`CheckpointResult.PeersReset`);
+a member that does not (an agent of an older version, or one with the flag
+off, ignores the request) fails the capture, whose stopped pods are
+replaced (`criu_group.go` `peersResetDone`).
+
 The whole reset is bounded by `peerResetBudget` (30 s,
 `identity_peer_reset.go` `afterDump`); probes run in parallel, those of one
 local address and port one after another. The rule: every listed connection
@@ -367,8 +372,6 @@ Against the invariants in `AGENTS.md`:
 - During a rolling upgrade of the agents, an identity capture whose
   holder is dumped by an agent that predates the check under the freeze
   fails after the dump, and its instance starts cold (section 3).
-- A member agent of an older version ignores a request to reset its
-  source's outside connections; nothing checks that the member reset them.
 - Not run on hardware with this code: the network-namespace dialer, the
   net-unlock of a dump's lock and the probe through a Service address, and
   Dynamo's own keep-alive resuming on the granted lease after a CRIU restore

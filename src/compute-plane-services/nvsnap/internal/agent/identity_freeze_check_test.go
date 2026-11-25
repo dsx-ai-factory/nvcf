@@ -159,7 +159,8 @@ func TestCaptureGroup_IdentityNotConfirmedFails(t *testing.T) {
 		if req.IdentityCheck == nil {
 			t.Error("the holder's dump was not asked to check the identity")
 		}
-		return &CheckpointResult{CheckpointID: "ck-a"}, nil // an agent that predates the check
+		// Peers reset, the identity not checked: an agent that predates the check.
+		return &CheckpointResult{CheckpointID: "ck-a", PeersReset: len(req.ResetPeersOutside) > 0}, nil
 	}
 	var deleted []string
 	deleteMember = func(_ *Agent, _ context.Context, _, name string, _ types.UID) error {
@@ -172,8 +173,8 @@ func TestCaptureGroup_IdentityNotConfirmedFails(t *testing.T) {
 	}
 	cms, _ := kc.CoreV1().ConfigMaps("nvsnap-system").List(ctx, metav1.ListOptions{})
 	for _, cm := range cms.Items {
-		if hasIdentity(cm.Data) || cm.Data["state"] == criuGroupStateVerifying {
-			t.Fatalf("record %v; want a failed capture without an identity", cm.Data)
+		if hasIdentity(cm.Data) || cm.Data["state"] != criuGroupStateFailed || !strings.Contains(cm.Data["reason"], "did not confirm its etcd identity") {
+			t.Fatalf("record %v; want a capture failed for the unconfirmed identity, without one", cm.Data)
 		}
 	}
 	if decisions(t, identityCaptured) != before {

@@ -285,6 +285,10 @@ type CheckpointResult struct {
 	// Job uses to name the per-capture PVC and ConfigMap.
 	Hash string `json:"hash,omitempty"`
 
+	// PeersReset reports a dump that reset its dead source's connections
+	// to peers outside the captured group, as ResetPeersOutside asked.
+	PeersReset bool `json:"peersReset,omitempty"`
+
 	// ReaderPVCName is the per-capture reader PVC the artifact lives
 	// on. Restorers mount this PVC at /checkpoints (subPath="criu")
 	// instead of hostPath. Set together with Hash when rootfs-capture
@@ -1025,6 +1029,10 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 		CatalogInfo:     &catalog,
 		LargeEmptyDirs:  largeEmptyDirs,
 		IdentityChecked: identityChecked,
+		// The reset of the source's outside connections was asked and
+		// done (beginPeerReset): an agent too old to know the request
+		// leaves this false, and the capture's driver fails the capture.
+		PeersReset: len(req.ResetPeersOutside) > 0 && !req.LeaveRunning && a.identityEnabled(),
 	}
 	if req.VolumeUse {
 		if used, uerr := dumpUsedMounts(checkpointDir); uerr != nil {
