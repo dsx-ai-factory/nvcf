@@ -23,12 +23,16 @@ node bundle:
   [`tests/gpushare/host`](../../../tests/gpushare/host/).
 - The webhook preloads the library into the GPU containers of pods annotated
   `nvsnap.io/gpushare: "true"`. Where CRIU is the capture method it does so by
-  default for every GPU pod that does not run to completion; a pod opts out
-  with `nvsnap.io/gpushare: "false"`
+  default for the GPU containers of every pod that does not run to
+  completion; a pod opts out with `nvsnap.io/gpushare: "false"`. A container
+  whose `LD_PRELOAD` comes from a ConfigMap or Secret reference gets no
+  library, and so cannot be checkpointed
   ([`internal/webhook/gpushare.go`](../../../internal/webhook/gpushare.go)).
 - `webhook.gpushareIBV` (default `false`) points NCCL at `libnvsnap_ibv.so`;
   a pod's `nvsnap.io/gpushare-ibv` annotation (`"true"` or `"false"`)
-  overrides it.
+  overrides it. The webhook never replaces a `NCCL_IBVERBS_LIB` the container
+  sets in `env`, and skips a container whose `envFrom` may set it unless the
+  annotation is `"true"`.
 
 ## Key files
 

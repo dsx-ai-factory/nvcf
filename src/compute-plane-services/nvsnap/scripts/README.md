@@ -241,8 +241,11 @@ behaves differently:
   pod's namespace is taken as already done and is reused, not rewritten
   (`internal/checkpointstore/percapture_pvc.go`).
 
-For a clean test, remove all three before the run (the cache directory on
-the node that captured):
+For a clean test, remove all three before the run, with no pod of the
+workload running, so that no capture rebuilds the ConfigMap in between.
+Set `NODE` to the node that captured (the source pod's node, recorded before
+the pod is deleted), not the restored pod's node, and find `$AGENT` from it and
+`$CACHE` as in [When a run fails](#when-a-run-fails):
 
 ```sh
 kubectl delete cm -n nvsnap-system nvsnap-capture-<short-hash>
@@ -250,7 +253,6 @@ kubectl delete pvc -n nvsnap-system rox-<short-hash>   # the test scripts' names
 kubectl exec -n nvsnap-system "$AGENT" -c agent -- rm -rf "$CACHE/<hash>"
 ```
 
-`$AGENT` and `$CACHE` are found as in [When a run fails](#when-a-run-fails).
 A schema change bumps `CaptureFormatVersion`, which changes the hash and
 re-captures everything automatically.
 
