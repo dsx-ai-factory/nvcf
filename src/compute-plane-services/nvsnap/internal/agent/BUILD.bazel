@@ -215,6 +215,7 @@ go_test(
         "dump_settle_test.go",
         "dump_snapshot_rootfs_test.go",
         "dump_snapshot_test.go",
+        "dump_suspend_test.go",
         "exec_sessions_test.go",
         "failure_logs_test.go",
         "frozen_clock_test.go",
