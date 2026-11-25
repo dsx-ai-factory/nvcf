@@ -111,19 +111,17 @@ func (bc *BackendK8sCache) rotateTLSCert(ctx context.Context, nb *nvidiaiov1.NVC
 	if err != nil {
 		return fmt.Errorf("generate updated webhook TLS certs: %w", err)
 	}
-	webhookCert, err := bc.claimOrAdoptWebhookCert(ctx, nb, generated, stored, now)
-	if err != nil {
+	if _, err := bc.claimOrAdoptWebhookCert(ctx, nb, generated, stored, now); err != nil {
 		return err
-	}
-	if err := bc.setupWebhookSecrets(ctx, nb, webhookCert); err != nil {
-		return fmt.Errorf("update webhook secrets: %w", err)
 	}
 	// The API server only trusts the caBundle in the webhook configurations, so a
 	// rotated CA that is written only to the Secrets rejects every admission call.
-	if err := bc.updateWebhookCABundles(ctx, webhookCert.CACertBytes); err != nil {
-		return fmt.Errorf("update webhook caBundles: %w", err)
+	// The CA of whatever cert is stored now is published, not the one claimed above:
+	// an overlapping rotation on another replica may have stored a newer one since.
+	if err := bc.publishStoredCAToSecret(ctx, nb, now); err != nil {
+		return err
 	}
-	return nil
+	return bc.publishStoredCAToWebhooks(ctx, nb, now)
 }
 
 // repairWebhookCAMismatch republishes the webhook CA when the stored serving cert
@@ -178,16 +176,18 @@ func (bc *BackendK8sCache) repairWebhookCAMismatch(ctx context.Context, nb *nvid
 	}
 	if caSecretStale {
 		log.Warnf("%s does not hold the CA of the webhook serving cert, rewriting it", NVCAWebhookTLSCASecretName)
-		if err := bc.publishStoredCAToSecret(ctx, nb, now); err != nil {
-			return false, err
-		}
 	}
 	if len(mismatched) > 0 {
 		log.Warnf("Webhook serving cert does not verify against the caBundle of %v, republishing the stored CA",
 			strings.Join(mismatched, ", "))
-		if err := bc.publishStoredCAToWebhooks(ctx, nb, now); err != nil {
-			return false, err
-		}
+	}
+	// Both are published whichever was found stale: the serving cert can rotate
+	// after the check, and each publish skips objects that already match.
+	if err := bc.publishStoredCAToSecret(ctx, nb, now); err != nil {
+		return false, err
+	}
+	if err := bc.publishStoredCAToWebhooks(ctx, nb, now); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -374,51 +374,6 @@ func mismatchedWebhookCABundles(servingCert *x509.Certificate, bundles map[strin
 	}
 	sort.Strings(mismatched)
 	return mismatched
-}
-
-// updateWebhookCABundles sets caBundle on every webhook in the NVCA validating and
-// mutating webhook configurations and leaves the rest of each configuration as setup
-// wrote it. A configuration that does not exist yet is skipped; setup creates it.
-func (bc *BackendK8sCache) updateWebhookCABundles(ctx context.Context, caBundle []byte) error {
-	admission := bc.clients.K8s.AdmissionregistrationV1()
-	name := nvcaoptypes.NVCAModuleName
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		vwc, err := admission.ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		for i := range vwc.Webhooks {
-			vwc.Webhooks[i].ClientConfig.CABundle = caBundle
-		}
-		_, err = admission.ValidatingWebhookConfigurations().Update(ctx, vwc, metav1.UpdateOptions{})
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("update %v ValidatingWebhookConfiguration: %w", name, err)
-	}
-
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		mwc, err := admission.MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		for i := range mwc.Webhooks {
-			mwc.Webhooks[i].ClientConfig.CABundle = caBundle
-		}
-		_, err = admission.MutatingWebhookConfigurations().Update(ctx, mwc, metav1.UpdateOptions{})
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("update %v MutatingWebhookConfiguration: %w", name, err)
-	}
-	return nil
 }
 
 // parseCertPEM decodes a single PEM-encoded CERTIFICATE block and parses it into

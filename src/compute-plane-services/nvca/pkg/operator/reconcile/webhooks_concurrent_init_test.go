@@ -40,6 +40,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/util/retry"
 
 	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/internal/kubeclients"
@@ -267,6 +268,50 @@ func conflictFirstUpdate(cs *fake.Clientset, resource, name string) *atomic.Bool
 			fmt.Errorf("the object has been modified"))
 	})
 	return &conflicted
+}
+
+// updateWebhookCABundles sets caBundle on every webhook in the NVCA validating and
+// mutating webhook configurations, as a manual edit or an earlier operator could.
+func (bc *BackendK8sCache) updateWebhookCABundles(ctx context.Context, caBundle []byte) error {
+	admission := bc.clients.K8s.AdmissionregistrationV1()
+	name := nvcaoptypes.NVCAModuleName
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		vwc, err := admission.ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for i := range vwc.Webhooks {
+			vwc.Webhooks[i].ClientConfig.CABundle = caBundle
+		}
+		_, err = admission.ValidatingWebhookConfigurations().Update(ctx, vwc, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("update %v ValidatingWebhookConfiguration: %w", name, err)
+	}
+
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		mwc, err := admission.MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		for i := range mwc.Webhooks {
+			mwc.Webhooks[i].ClientConfig.CABundle = caBundle
+		}
+		_, err = admission.MutatingWebhookConfigurations().Update(ctx, mwc, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("update %v MutatingWebhookConfiguration: %w", name, err)
+	}
+	return nil
 }
 
 func assertWebhookCABundles(ctx context.Context, t *testing.T, bc *BackendK8sCache, want []byte) {
@@ -637,6 +682,110 @@ func TestRepairWebhookCAMismatch_NeverOverwritesConcurrentRotationOfCASecret(t *
 	assert.True(t, rotatedDuringRepair.Load())
 	assert.False(t, staleAfterRotation.Load(), "the previous CA was published after the rotation")
 	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+}
+
+// storeCertInTracker writes cert to both webhook cert Secrets directly through the
+// tracker, as another writer would, so it can be called from a reactor.
+func storeCertInTracker(t *testing.T, cs *fake.Clientset, nb *nvidiaiov1.NVCFBackend, cert WebhookCert) {
+	ns := getSystemNamespace(nb)
+	secrets := v1.SchemeGroupVersion.WithResource("secrets")
+	require.NoError(t, cs.Tracker().Update(secrets, newTLSCertSecret(nb, cert), ns))
+	require.NoError(t, cs.Tracker().Update(secrets, newTLSCASecret(nb, cert.CACertBytes), ns))
+}
+
+// A rotation that stored a new cert and stopped before publishing its CA leaves the
+// caBundles on the previous CA; the repair must publish the new one.
+func TestRepairWebhookCAMismatch_RepairsInterruptedRotation(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	rotated, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.setupWebhookSecrets(ctx, nb, rotated))
+	require.Error(t, webhookCAConsistency(ctx, bc, nb, now))
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	assertWebhookCABundles(ctx, t, bc, rotated.CACertBytes)
+}
+
+// When the serving cert rotates after the repair found only the CA Secret stale, the
+// repair must still publish the new CA to the caBundles.
+func TestRepairWebhookCAMismatch_PublishesBundlesWhenCertRotatesAfterCheck(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.setupTLSCASecret(ctx, nb, other))
+	rotated, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+
+	cs := bc.clients.K8s.(*fake.Clientset)
+	var rotatedDuringRepair atomic.Bool
+	cs.PrependReactor("update", "secrets", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		sec := a.(k8stesting.UpdateAction).GetObject().(*v1.Secret)
+		if sec.Name != NVCAWebhookTLSCASecretName || rotatedDuringRepair.Swap(true) {
+			return false, nil, nil
+		}
+		storeCertInTracker(t, cs, nb, rotated)
+		return true, nil, k8serrors.NewConflict(schema.GroupResource{Resource: "secrets"}, sec.Name,
+			fmt.Errorf("the object has been modified"))
+	})
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	assert.True(t, rotatedDuringRepair.Load())
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	assertWebhookCABundles(ctx, t, bc, rotated.CACertBytes)
+}
+
+// Two rotations that both found the cert expiring can overlap on different
+// replicas. A rotation that stored its cert and was delayed while another stored and
+// published a newer one must not then publish its own, older CA.
+func TestRotateTLSCert_DelayedRotationDoesNotOverwriteNewerCA(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now.AddDate(-1, 0, 10)))
+	newer, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+
+	cs := bc.clients.K8s.(*fake.Clientset)
+	var overlapped atomic.Bool
+	cs.PrependReactor("get", "validatingwebhookconfigurations", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if overlapped.Swap(true) {
+			return false, nil, nil
+		}
+		storeCertInTracker(t, cs, nb, newer)
+		res := admissionregistrationv1.SchemeGroupVersion.WithResource("validatingwebhookconfigurations")
+		obj, err := cs.Tracker().Get(res, "", nvcaoptypes.NVCAModuleName)
+		require.NoError(t, err)
+		vwc := obj.(*admissionregistrationv1.ValidatingWebhookConfiguration).DeepCopy()
+		for i := range vwc.Webhooks {
+			vwc.Webhooks[i].ClientConfig.CABundle = newer.CACertBytes
+		}
+		require.NoError(t, cs.Tracker().Update(res, vwc, ""))
+		res = admissionregistrationv1.SchemeGroupVersion.WithResource("mutatingwebhookconfigurations")
+		obj, err = cs.Tracker().Get(res, "", nvcaoptypes.NVCAModuleName)
+		require.NoError(t, err)
+		mwc := obj.(*admissionregistrationv1.MutatingWebhookConfiguration).DeepCopy()
+		for i := range mwc.Webhooks {
+			mwc.Webhooks[i].ClientConfig.CABundle = newer.CACertBytes
+		}
+		require.NoError(t, cs.Tracker().Update(res, mwc, ""))
+		return false, nil, nil
+	})
+
+	require.NoError(t, bc.rotateTLSCert(ctx, nb, now))
+	assert.True(t, overlapped.Load())
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
+	assertWebhookCABundles(ctx, t, bc, newer.CACertBytes)
 }
 
 // A CA Secret that no longer holds the CA of a usable serving cert must be rewritten
