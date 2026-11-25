@@ -1752,7 +1752,8 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 			return // the agent stops; the next one drives the restore
 		}
 		// Nothing restored, nothing counted against the capture.
-		c.identityRefused(context.WithoutCancel(ctx), key, leader.Annotations[webhook.CRIURestoreAnnotation], ranks, ierr, log)
+		c.identityRefused(context.WithoutCancel(ctx), key, leader.Annotations[webhook.CRIURestoreAnnotation], ranks, ierr,
+			func() { c.attempted.Delete("restore/" + string(leader.UID)) }, log)
 		return
 	}
 	_, err := restoreInstance(a, rctx, req, log)

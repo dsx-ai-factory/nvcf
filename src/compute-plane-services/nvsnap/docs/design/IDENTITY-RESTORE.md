@@ -67,8 +67,10 @@ worker's own network namespace (`podNetnsDialer`):
   worker's pod address as a URL host. None, or more than one, refuses the
   capture.
 - the lease's granted TTL and every key attached to it, with their values,
-  read twice: a registration that changes between the reads is read again
-  once, then refuses the capture.
+  read twice: the second read must find the same key set under the lease,
+  each value unchanged, with an instance registration named by the lease
+  and a key naming the address. A registration that changes between the
+  reads is read again once, then refuses the capture.
   A key whose name, or whose value outside a URL host, names a rank's address
   refuses the capture: a restore could not rewrite it.
 
@@ -97,10 +99,12 @@ After a dump that killed its source (`endPeerReset`), the member's agent:
    connects to the peer. The peer, still holding the connection, answers the
    SYN with an ACK of its own sequence (RFC 5961); the probe answers that
    with a reset whose sequence is the ACK's, which the peer accepts
-   (RFC 793), and drops the connection. The probe counts only when
-   confirmed: a segment came back (the challenge ACK), the connection opened
-   (the peer had dropped the old one) or was refused; an unanswered probe
-   is tried once more, then fails the capture. The probe is closed.
+   (RFC 793), and drops the connection. The probe counts only when the
+   peer is seen without the old connection: a SYN of the probe (its first,
+   or the kernel's retransmit after the reset) is accepted, or refused. A
+   challenge ACK alone proves only that the reset was sent. An unconfirmed
+   probe is tried once more, then fails the capture; no probe runs past
+   the capture's deadline. The probe is closed.
 
 This needs no sequence numbers, no raw sockets and no change to the dump. It
 runs only with the flag on, whatever a checkpoint request asks. A failure
@@ -140,14 +144,17 @@ restored:
 
 A pod whose restore already had the lease granted (an agent that stopped
 after the grant, which the record notes, whether or not it restored the
-pod) adopts it; a claim alone is not enough: a live lease is kept
+pod) adopts it; a claim alone is not enough, and a lease that cannot be
+read is refused: a live lease is kept
 alive rather than refused, and a restore that finds the engine already
 running hands the lease over to it instead of revoking it.
 
 A refused restore starts its pods' workload cold in place; no checkpoint is
 blocked. A pod that cannot start cold in place is deleted for its controller
-to replace, and the record counts a stall for it, so replacements refused
-the same way stop at the stall bound.
+to replace only once the record counts a stall for the refusal, so
+replacements refused the same way stop at the stall bound. When the stall
+cannot be recorded, or a pod cannot be read, nothing is deleted and the
+refusal is handed back to the restore's next event.
 
 ## 6. One live restore per identity
 

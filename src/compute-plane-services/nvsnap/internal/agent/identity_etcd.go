@@ -449,28 +449,50 @@ func readIdentity(ctx context.Context, e identityEtcd, ips []string, endpoints s
 		}
 		id.Keys = append(id.Keys, identityKey{Key: kv.Key, Value: kv.Value})
 	}
-	// One consistent registration: the keys read again must be the same,
-	// under the same lease, and still name the worker's address.
-	again, err := e.RangePrefix(ctx, []byte(dynamoKeyRoot))
-	if err != nil {
-		return nil, fmt.Errorf("read the registry: %w", err)
-	}
-	now := map[string]etcdKV{}
-	for _, kv := range again {
-		now[string(kv.Key)] = kv
-	}
-	named := false
-	for _, k := range id.Keys {
-		if cur, ok := now[string(k.Key)]; strings.HasPrefix(string(k.Key), dynamoKeyRoot) &&
-			(!ok || cur.Lease != lease || !bytes.Equal(cur.Value, k.Value)) {
-			return nil, errors.New("the worker's registration changed while it was read")
-		}
-		named = named || mentions(k.Value, ips[member])
-	}
-	if !named {
-		return nil, errors.New("the worker's saved keys no longer name its address")
+	if err := identityStillHeld(ctx, e, id, ips[member]); err != nil {
+		return nil, err
 	}
 	return id, nil
+}
+
+// identityStillHeld reads the lease's whole key set again: the same keys,
+// each with the same value under the same lease, among them an instance
+// registration named by the lease and a key naming the holder's address.
+// Anything else is a registration that changed while it was read.
+func identityStillHeld(ctx context.Context, e identityEtcd, id *capturedIdentity, holderIP string) error {
+	changed := errors.New("the worker's registration changed while it was read")
+	info, err := e.TimeToLive(ctx, id.Lease, true)
+	if err != nil {
+		return fmt.Errorf("read the worker's lease: %w", err)
+	}
+	if info.TTL <= 0 || len(info.Keys) != len(id.Keys) {
+		return changed
+	}
+	saved := map[string][]byte{}
+	for _, k := range id.Keys {
+		saved[string(k.Key)] = k.Value
+	}
+	registered, named := false, false
+	hex := strconv.FormatUint(uint64(id.Lease), 16) //nolint:gosec // a lease ID's bits, as etcd names it in hex
+	for _, k := range info.Keys {
+		v, ok := saved[string(k)]
+		if !ok {
+			return changed
+		}
+		cur, gerr := e.Get(ctx, k)
+		if gerr != nil {
+			return fmt.Errorf("read a key of the worker's lease: %w", gerr)
+		}
+		if cur == nil || cur.Lease != id.Lease || !bytes.Equal(cur.Value, v) {
+			return changed
+		}
+		registered = registered || (strings.HasPrefix(string(k), dynamoInstancesRoot) && strings.HasSuffix(string(k), "/"+hex))
+		named = named || mentions(v, holderIP)
+	}
+	if !registered || !named {
+		return errors.New("the worker's saved keys no longer hold its instance registration and address")
+	}
+	return nil
 }
 
 // captureIdentity reads the identity of leader's instance (ranks) for its
@@ -1011,7 +1033,13 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 	granted := false
 	if adopt {
 		info, terr := e.TimeToLive(ctx, id.Lease, false)
-		granted = terr != nil || info.TTL >= 0 // held already: keep it, not refuse it
+		if terr != nil {
+			// Fail closed: whether the lease is still this restore's
+			// grant cannot be told. The claim stays this pod's.
+			closeFn()
+			return nil, refuseIdentity(identityRefusedError, fmt.Errorf("read the adopted lease: %w", terr))
+		}
+		granted = info.TTL >= 0 // held already: keep it, not refuse it
 	}
 	if !granted {
 		if err := awaitLeaseFree(ctx, e, id.Lease, id.TTL); err != nil {
@@ -1051,15 +1079,18 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 
 // identityRefused handles the pods (by slot) of a restore the identity
 // restore refused: each starts its workload cold in place, nothing counted
-// against the capture; a pod that cannot is deleted, for its controller to
-// replace, and the record key counts a stall for it, so replacements that
-// are refused the same way end at criuGroupMaxStalls. A pod that cannot be
-// read is handed back to the next event (its attempt cleared).
-func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) {
+// against the capture. A pod that cannot is deleted, for its controller to
+// replace, only once the record key counts a stall for the refusal, so the
+// replacements, admitted at once and refused the same way, end at
+// criuGroupMaxStalls. When the stall cannot be counted, or a pod cannot be
+// read, nothing is deleted and again hands the refusal to the restore's
+// next event.
+func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, again func(), log *logrus.Entry) {
 	decision := identityDecision(err)
 	observeIdentity(decision)
 	log = log.WithError(err).WithField("decision", decision)
-	deleted := false
+	retryLater := false
+	var cold []*corev1.Pod
 	for _, p := range pods {
 		pl := log.WithField("pod", p.Namespace+"/"+p.Name)
 		var pod *corev1.Pod
@@ -1073,9 +1104,8 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint 
 			continue
 		}
 		if gerr != nil {
-			pl.WithError(gerr).Warn("identity restore refused, and the pod cannot be read; trying again on its next event")
-			c.attempted.Delete(p.UID)
-			c.attempted.Delete("restore/" + string(p.UID))
+			pl.WithError(gerr).Warn("identity restore refused, and the pod cannot be read; trying again on the restore's next event")
+			retryLater = true
 			continue
 		}
 		cerr := c.a.coldStartInPlace(ctx, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation], pl)
@@ -1083,16 +1113,28 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint 
 			pl.Warn("identity restore refused; the pod starts cold in place")
 			continue
 		}
-		pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused, and the pod cannot start cold in place; deleting it")
-		if derr := c.a.deletePodRetrying(ctx, pod.Namespace, pod.Name, pod.UID); derr != nil {
-			pl.WithError(derr).Error("identity restore: cannot delete the refused pod")
-		}
-		deleted = true
+		pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused, and the pod cannot start cold in place")
+		cold = append(cold, pod)
 	}
-	if deleted && key != "" {
-		if uerr := c.updateGroupRecord(ctx, key, func(d map[string]string) bool { return recordFailure(d, checkpoint, false, err) }); uerr != nil && !apierrors.IsNotFound(uerr) {
-			log.WithError(uerr).Warn("identity restore: cannot count the refusal on the group record")
+	if len(cold) > 0 {
+		var uerr error
+		if key != "" {
+			uerr = c.updateGroupRecord(ctx, key, func(d map[string]string) bool { return recordFailure(d, checkpoint, false, err) })
 		}
+		if uerr != nil && !apierrors.IsNotFound(uerr) {
+			log.WithError(uerr).Warn("identity restore: cannot count the refusal on the group record; its pods are kept and the refusal tried again")
+			retryLater = true
+		} else {
+			for _, pod := range cold {
+				if derr := c.a.deletePodRetrying(ctx, pod.Namespace, pod.Name, pod.UID); derr != nil {
+					log.WithError(derr).WithField("pod", pod.Namespace+"/"+pod.Name).Error("identity restore: cannot delete the refused pod")
+					retryLater = true
+				}
+			}
+		}
+	}
+	if retryLater && again != nil {
+		again()
 	}
 }
 

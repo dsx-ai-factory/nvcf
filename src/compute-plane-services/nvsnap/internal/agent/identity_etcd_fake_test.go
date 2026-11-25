@@ -112,7 +112,7 @@ func (f *fakeEtcd) value(key string) (string, bool) {
 	return string(kv.Value), ok
 }
 
-func (f *fakeEtcd) setFail(path string, fail bool) {
+func (f *fakeEtcd) setFail(path string, fail bool) { //nolint:unparam // tests turn failures on
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fail[path] = fail

@@ -319,7 +319,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			refusedPod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid,
 				Annotations: map[string]string{webhook.CRIURestoreContainerAnnotation: container}}}
 		}
-		c.identityRefused(context.WithoutCancel(ctx), groupKey, id, []*corev1.Pod{refusedPod}, err, log)
+		c.identityRefused(context.WithoutCancel(ctx), groupKey, id, []*corev1.Pod{refusedPod}, err, func() { c.attempted.Delete(uid) }, log)
 		return
 	}
 	if errors.Is(err, errNotPlaceholder) {

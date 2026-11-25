@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func diagSocket(src, dst string, sport, dport uint16, state uint8, inode uint32) *netlink.Socket {
@@ -37,8 +41,10 @@ func TestOutsidePeers(t *testing.T) {
 		diagSocket("10.0.0.1", "10.0.0.9", 44001, 2379, tcpStateEstablished, 500),  // a sidecar's: not the container's
 		diagSocket("10.0.0.1", "10.0.0.9", 44002, 2379, tcpStateListen, 6),         // not established
 		diagSocket("::ffff:10.0.0.1", "::ffff:10.0.0.10", 44003, 2379, tcpStateEstablished, 7),
+		diagSocket("fd00::1", "fd00::2", 44004, 29500, tcpStateEstablished, 8), // a member's secondary address: kept
 	}
-	got := outsidePeers(sockets, own, []string{"10.0.0.1", "10.0.0.2"})
+	members := []*corev1.Pod{{Status: corev1.PodStatus{PodIP: "10.0.0.1"}}, {Status: corev1.PodStatus{PodIP: "10.0.0.2", PodIPs: []corev1.PodIP{{IP: "10.0.0.2"}, {IP: "fd00::2"}}}}}
+	got := outsidePeers(sockets, own, memberAddresses(members))
 	s := make([]string, 0, len(got))
 	for _, c := range got {
 		s = append(s, c.Local.String()+">"+c.Remote.String())
@@ -111,8 +117,10 @@ func TestEndPeerReset(t *testing.T) {
 	if err := o.fail(nil); !errors.Is(err, errSourceLeftSuspended) || !sourceMustBeReplaced(err) {
 		t.Fatalf("reset failure: %v", err)
 	}
-	if err := o.fail(dumpErr); !errors.Is(err, dumpErr) {
-		t.Fatal("a capture's own failure was replaced")
+	// With a later failure too (a store that cannot be collected), both
+	// are kept, and the source is still replaced.
+	if err := o.fail(dumpErr); !errors.Is(err, dumpErr) || !errors.Is(err, errSourceLeftSuspended) || !sourceMustBeReplaced(err) {
+		t.Fatalf("combined failure: %v", err)
 	}
 	var none *peerResetOutcome
 	if none.fail(nil) != nil {
@@ -195,7 +203,7 @@ func TestProbeReset_PeerDropsSilentlyClosedConnection(t *testing.T) {
 		t.Fatalf("without the probe the peer saw %v; want it still holding the connection", err)
 	}
 	server, tup := silentlyClosed(t)
-	if err := probeReset(tup); err != nil {
+	if err := probeReset(context.Background(), tup); err != nil {
 		t.Fatal(err)
 	}
 	if err := readErr(server, 2*time.Second); !errors.Is(err, syscall.ECONNRESET) {
@@ -252,8 +260,97 @@ func TestProbeReset_UnansweredIsNotConfirmed(t *testing.T) {
 	saved := peerProbeWait
 	peerProbeWait = 300 * time.Millisecond
 	t.Cleanup(func() { peerProbeWait = saved })
-	err := probeReset(tcpTuple{Local: netip.AddrPortFrom(local, 0), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
+	err := probeReset(context.Background(), tcpTuple{Local: netip.AddrPortFrom(local, 0), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
 	if !errors.Is(err, errProbeUnconfirmed) && err == nil {
 		t.Fatalf("an unanswered probe passed: %v", err)
+	}
+}
+
+// A probe stops when the capture's time is up, and does not report
+// success then.
+func TestProbeReset_RespectsContext(t *testing.T) {
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = probeReset(ctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: netip.MustParseAddrPort(ln.Addr().String())})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("probe with its time up: %v", err)
+	}
+	// A deadline shorter than the probe's own wait bounds it.
+	saved := peerProbeWait
+	peerProbeWait = 5 * time.Second
+	t.Cleanup(func() { peerProbeWait = saved })
+	dctx, dcancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer dcancel()
+	t0 := time.Now()
+	err = probeReset(dctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
+	if err == nil || time.Since(t0) > 2*time.Second {
+		t.Fatalf("probe past its deadline: %v after %s", err, time.Since(t0))
+	}
+}
+
+// The reset the kernel sends in answer to the peer's challenge ACK may be
+// lost: the probe then sees the challenge ACK but never the peer accept
+// its retransmitted SYN, and must not report success. Needs iptables in
+// the test's network namespace (NVSNAP_TEST_IPTABLES=1).
+func TestProbeReset_LostResetIsNotConfirmed(t *testing.T) {
+	needNetAdmin(t)
+	if os.Getenv("NVSNAP_TEST_IPTABLES") == "" {
+		t.Skip("NVSNAP_TEST_IPTABLES not set")
+	}
+	server, tup := silentlyClosed(t)
+	rule := []string{"OUTPUT", "-p", "tcp", "--tcp-flags", "RST", "RST", "--sport", strconv.Itoa(int(tup.Local.Port())), "-j", "DROP"}
+	add := exec.CommandContext(context.Background(), "iptables", append([]string{"-A"}, rule...)...) //nolint:gosec // a test rule it builds
+	if out, err := add.CombinedOutput(); err != nil {
+		t.Skipf("iptables: %v %s", err, out)
+	}
+	del := exec.CommandContext(context.Background(), "iptables", append([]string{"-D"}, rule...)...) //nolint:gosec // a test rule it builds
+	t.Cleanup(func() { _ = del.Run() })
+	saved := peerProbeWait
+	peerProbeWait = 1500 * time.Millisecond
+	t.Cleanup(func() { peerProbeWait = saved })
+	if err := probeReset(context.Background(), tup); !errors.Is(err, errProbeUnconfirmed) {
+		t.Fatalf("a probe whose reset was lost passed: %v", err)
+	}
+	var ne net.Error
+	if err := readErr(server, 300*time.Millisecond); !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("the peer saw %v; want it still holding the connection", err)
+	}
+}
+
+// runNetUnlock runs criu with a duplicate of the namespace handle: the
+// handle the probes use stays open and valid after it, garbage collection
+// included. Needs a container with nsenter (CAP_SYS_ADMIN).
+func TestRunNetUnlock_KeepsTheNamespaceHandle(t *testing.T) {
+	needNetAdmin(t)
+	if _, err := exec.LookPath("nsenter"); err != nil {
+		t.Skip("no nsenter")
+	}
+	h, err := netns.Get()
+	if err != nil {
+		t.Skip(err)
+	}
+	defer func() { _ = h.Close() }()
+	dir := t.TempDir()
+	criu := dir + "/criu"
+	if err := os.WriteFile(criu, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil { //nolint:gosec // a test script
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := runNetUnlock(context.Background(), h, criu, dir); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		runtime.GC()
+	}
+	if err := inNetNSHandle(h, func() error { return nil }); err != nil {
+		t.Fatalf("the namespace handle is no longer usable: %v", err)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(h), &st); err != nil {
+		t.Fatalf("the namespace handle was closed: %v", err)
 	}
 }

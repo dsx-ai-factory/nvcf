@@ -56,10 +56,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// peerProbeWait bounds each probe's connect: the peer's challenge ACK and
-// the reset that answers it come within a round trip; a SYN retransmit
-// (after a second) is not wanted.
-var peerProbeWait = 500 * time.Millisecond
+// peerProbeWait bounds each probe: the peer's challenge ACK and the reset
+// that answers it come within a round trip, and the probe's own SYN
+// retransmits (at about 1 s and 3 s) must find the peer's side gone, which
+// it answers by accepting the connection.
+var peerProbeWait = 3500 * time.Millisecond
 
 // peerResetKey carries, in a capture's context, the addresses of the
 // captured group's members: the connections between them are kept.
@@ -240,9 +241,9 @@ func (r *sourcePeerReset) afterDump(ctx context.Context, criu, imagesDir string)
 				break
 			}
 			// One more try: a lost packet leaves the exchange unconfirmed.
-			perr := probeReset(c)
-			if errors.Is(perr, errProbeUnconfirmed) {
-				perr = probeReset(c)
+			perr := probeReset(ctx, c)
+			if errors.Is(perr, errProbeUnconfirmed) && ctx.Err() == nil {
+				perr = probeReset(ctx, c)
 			}
 			if perr != nil {
 				errs = append(errs, fmt.Errorf("%s -> %s: %w", c.Local, c.Remote, perr))
@@ -260,16 +261,18 @@ func (r *sourcePeerReset) afterDump(ctx context.Context, criu, imagesDir string)
 	return nil
 }
 
-// errProbeUnconfirmed is a probe that saw no answer from its peer.
-var errProbeUnconfirmed = errors.New("the peer did not answer the probe")
+// errProbeUnconfirmed is a probe whose peer was not seen to drop the old
+// connection.
+var errProbeUnconfirmed = errors.New("the peer was not seen to drop the old connection")
 
-// probeReset sends, from the calling thread's network namespace, a SYN
-// on connection c's own address pair (see the file comment), waits up to
-// peerProbeWait for the exchange, and closes the probe. It succeeds only
-// on a confirmed outcome: the peer answered (its challenge ACK, which the
-// kernel answers with the reset, counts as a segment in), the connection
-// opened (the peer had dropped the old one), or the peer refused it.
-func probeReset(c tcpTuple) error {
+// probeReset sends, from the calling thread's network namespace, a SYN on
+// connection c's own address pair (see the file comment) and waits, at
+// most peerProbeWait and never past ctx's deadline, for proof that the
+// peer no longer holds the old connection: a SYN of the probe (its first,
+// or a retransmit after the challenge ACK was answered with the reset) is
+// accepted, or refused. A challenge ACK alone proves only that the reset
+// was sent, not that it arrived, so it is not enough. The probe is closed.
+func probeReset(ctx context.Context, c tcpTuple) error {
 	family := unix.AF_INET
 	if c.Local.Addr().Is6() {
 		family = unix.AF_INET6
@@ -293,42 +296,41 @@ func probeReset(c tcpTuple) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	deadline := time.Now().Add(peerProbeWait)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
 	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("probe: %w", cerr)
+		}
 		left := time.Until(deadline)
 		if left <= 0 {
-			break
+			return errProbeUnconfirmed
 		}
 		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}} //nolint:gosec // a file descriptor fits in 32 bits
-		n, perr := unix.Poll(pfd, int(left/time.Millisecond)+1)
-		if errors.Is(perr, unix.EINTR) {
-			continue
-		}
-		if perr != nil {
+		_, perr := unix.Poll(pfd, int(min(left, 100*time.Millisecond)/time.Millisecond)+1)
+		if perr != nil && !errors.Is(perr, unix.EINTR) {
 			return fmt.Errorf("poll: %w", perr)
 		}
-		if n > 0 {
-			break
+		soErr, gerr := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
+		if gerr != nil {
+			return fmt.Errorf("probe outcome: %w", gerr)
+		}
+		if soErr != 0 {
+			e := unix.Errno(soErr)
+			if errors.Is(e, unix.ECONNREFUSED) || errors.Is(e, unix.ECONNRESET) {
+				return nil
+			}
+			return fmt.Errorf("probe: %w", e)
+		}
+		info, ierr := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+		if ierr != nil {
+			return fmt.Errorf("probe outcome: %w", ierr)
+		}
+		if info.State == tcpStateEstablished {
+			return nil // accepted: the peer holds no old connection
 		}
 	}
-	soErr, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
-	if err != nil {
-		return fmt.Errorf("probe outcome: %w", err)
-	}
-	switch e := unix.Errno(soErr); {
-	case soErr == 0:
-	case errors.Is(e, unix.ECONNREFUSED) || errors.Is(e, unix.ECONNRESET):
-		return nil
-	default:
-		return fmt.Errorf("probe: %w", e)
-	}
-	info, err := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
-	if err != nil {
-		return fmt.Errorf("probe outcome: %w", err)
-	}
-	if info.State == tcpStateEstablished || info.Segs_in > 0 {
-		return nil
-	}
-	return errProbeUnconfirmed
 }
 
 func sockaddrOf(ap netip.AddrPort) unix.Sockaddr {
@@ -475,8 +477,10 @@ func (o *peerResetOutcome) set(err error) {
 // fail returns err, or the reset's failure when the capture otherwise
 // succeeded.
 func (o *peerResetOutcome) fail(err error) error {
-	if err != nil || o == nil || o.err == nil {
+	if o == nil || o.err == nil {
 		return err
 	}
-	return fmt.Errorf("%w: %w", errSourceLeftSuspended, o.err)
+	// Kept with any later failure (a store that cannot be collected): the
+	// source is dead either way and must be replaced.
+	return errors.Join(err, fmt.Errorf("%w: %w", errSourceLeftSuspended, o.err))
 }

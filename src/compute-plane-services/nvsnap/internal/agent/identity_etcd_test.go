@@ -1138,6 +1138,7 @@ func TestCaptureGroup_IdentityRecorded(t *testing.T) {
 	f.dynamoWorkerKeys(idLease+1, "10.0.0.9") // the other worker
 	useFakeEtcd(t, f)
 	leader := idWorker("w-a", idOldIP)
+	leader.Status.PodIPs = []corev1.PodIP{{IP: idOldIP}, {IP: "fd00::8"}} // dual-stack: both kept
 	other := idWorker("w-b", "10.0.0.9")
 	other.OwnerReferences[0].UID = "rs2"
 	agentPod := ready(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nvsnap-agent-x", Namespace: "nvsnap-system",
@@ -1155,7 +1156,7 @@ func TestCaptureGroup_IdentityRecorded(t *testing.T) {
 	if retry := a.criuRestorer().captureGroup(ctx, leader, "", 1); retry {
 		t.Fatal("retried")
 	}
-	if len(reqs) != 1 || reqs[0].PodName != "w-a" || strings.Join(reqs[0].ResetPeersOutside, ",") != idOldIP {
+	if len(reqs) != 1 || reqs[0].PodName != "w-a" || strings.Join(reqs[0].ResetPeersOutside, ",") != idOldIP+",fd00::8" {
 		t.Fatalf("checkpoint requests %+v; want the worker alone, its outside connections reset", reqs)
 	}
 	cms, _ := kc.CoreV1().ConfigMaps("nvsnap-system").List(ctx, metav1.ListOptions{})
@@ -1475,7 +1476,10 @@ func TestLoneRestore_ReplacedPodLeftAlone(t *testing.T) {
 	saved := restoreForRequest
 	t.Cleanup(func() { restoreForRequest = saved })
 	restored := false
-	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) { restored = true; return nil, nil }
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		restored = true
+		return nil, nil
+	}
 	c.restore(ctx, "shared", "w-new", "stale-uid", "ck", "main", idKey)
 	if restored || opened.Load() != 0 {
 		t.Fatalf("restored %v, registry opened %d", restored, opened.Load())
@@ -1494,5 +1498,229 @@ func TestMemberAddresses_DualStack(t *testing.T) {
 	p.Status.PodIPs = []corev1.PodIP{{IP: "10.0.0.1"}, {IP: "fd00::1"}}
 	if got := strings.Join(memberAddresses([]*corev1.Pod{p}), ","); got != "10.0.0.1,fd00::1" {
 		t.Fatalf("addresses %s", got)
+	}
+}
+
+// The second read covers the lease's whole key set: a worker whose
+// instance registrations went away, or that gained a key, is not saved.
+func TestReadIdentity_KeySetChangedWhileRead(t *testing.T) {
+	ctx := context.Background()
+	t.Run("instance registrations removed", func(t *testing.T) {
+		f := newFakeEtcd(t)
+		f.grant(idLease, 30)
+		keys := f.dynamoWorkerKeys(idLease, idOldIP)
+		calls := 0
+		f.onTimeToLive = func() {
+			calls++
+			if calls == 1 {
+				for _, k := range keys[:3] {
+					delete(f.kvs, k)
+				}
+			}
+		}
+		if _, err := readIdentity(ctx, f.client(), []string{idOldIP}, idEtcdEP); err == nil {
+			t.Fatal("an identity without its instance registration was saved")
+		}
+	})
+	t.Run("key added under the lease", func(t *testing.T) {
+		f := newFakeEtcd(t)
+		f.grant(idLease, 30)
+		f.dynamoWorkerKeys(idLease, idOldIP)
+		calls := 0
+		f.onTimeToLive = func() {
+			calls++
+			if calls == 2 {
+				f.kvs["other/late"] = etcdKV{Key: []byte("other/late"), Value: []byte("x"), Lease: idLease}
+			}
+		}
+		if _, err := readIdentity(ctx, f.client(), []string{idOldIP}, idEtcdEP); err == nil {
+			t.Fatal("a key added while it was read was missed")
+		}
+	})
+	t.Run("key removed from the lease", func(t *testing.T) {
+		f := newFakeEtcd(t)
+		f.grant(idLease, 30)
+		keys := f.dynamoWorkerKeys(idLease, idOldIP)
+		calls := 0
+		f.onTimeToLive = func() {
+			calls++
+			if calls == 2 {
+				delete(f.kvs, keys[len(keys)-1])
+			}
+		}
+		if _, err := readIdentity(ctx, f.client(), []string{idOldIP}, idEtcdEP); err == nil {
+			t.Fatal("a key removed while it was read was saved")
+		}
+	})
+	t.Run("key outside the Dynamo root changed", func(t *testing.T) {
+		f := newFakeEtcd(t)
+		f.grant(idLease, 30)
+		f.dynamoWorkerKeys(idLease, idOldIP)
+		f.put("other/x", "1", idLease)
+		calls := 0
+		f.onTimeToLive = func() {
+			calls++
+			if calls == 2 {
+				f.kvs["other/x"] = etcdKV{Key: []byte("other/x"), Value: []byte("2"), Lease: idLease}
+			}
+		}
+		if _, err := readIdentity(ctx, f.client(), []string{idOldIP}, idEtcdEP); err == nil {
+			t.Fatal("a changed key outside v1/ was saved")
+		}
+	})
+}
+
+// A pod that would be deleted for a refusal is deleted only once the
+// stall is on record, so its replacement, admitted at once, sees it; when
+// the stall cannot be recorded the pod is kept and the refusal is handed
+// back to the next event.
+func TestIdentityRefused_StallBeforeDelete(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	refusal := refuseIdentity(identityRefusedLiveLease, errors.New("live"))
+	t.Run("stall first", func(t *testing.T) {
+		rec := idRecord(t, keys, f)
+		pod := idPlaceholder("w-new", idNewIP)
+		kc := fake.NewSimpleClientset(rec, pod)
+		stallAtDelete := ""
+		kc.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+			cm, _ := kc.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), "nvsnap-system", rec.Name)
+			stallAtDelete = cm.(*corev1.ConfigMap).Data["stalls"]
+			return false, nil, nil
+		})
+		again := false
+		idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck", []*corev1.Pod{pod}, refusal, func() { again = true }, idLog())
+		if stallAtDelete != "1" || again {
+			t.Fatalf("stall at delete %q, again %v", stallAtDelete, again)
+		}
+	})
+	t.Run("stall cannot be recorded", func(t *testing.T) {
+		rec := idRecord(t, keys, f)
+		pod := idPlaceholder("w-new", idNewIP)
+		kc := fake.NewSimpleClientset(rec, pod)
+		kc.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("api down")
+		})
+		again := false
+		idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck", []*corev1.Pod{pod}, refusal, func() { again = true }, idLog())
+		if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); err != nil || !again {
+			t.Fatalf("pod kept: %v, again %v", err, again)
+		}
+	})
+	t.Run("a rank that cannot be read", func(t *testing.T) {
+		rec := idRecord(t, keys, f)
+		r0, r1, _ := idGroupPlaceholders()
+		kc := fake.NewSimpleClientset(rec, r0, r1)
+		kc.PrependReactor("get", "pods", func(act k8stesting.Action) (bool, runtime.Object, error) {
+			if act.(k8stesting.GetAction).GetName() == r1.Name {
+				return true, nil, errors.New("api down")
+			}
+			return false, nil, nil
+		})
+		again := false
+		idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck0", []*corev1.Pod{r0, r1}, refusal, func() { again = true }, idLog())
+		if !again {
+			t.Fatal("an unreadable rank was left without its refusal being tried again")
+		}
+	})
+}
+
+// The group path hands an unfinished refusal back to the leader's next
+// event: its attempt is cleared.
+func TestGroupRestore_RefusalRetriedOnLeader(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	rec.Data["size"], rec.Data[identityMemberKey] = "2", "1"
+	rec.Data["checkpoint.0"], rec.Data["checkpoint.1"], rec.Data["node.1"] = "ck0", "ck1", "n0"
+	f.grant(idLease, 2)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(300 * time.Millisecond):
+				f.refresh(idLease)
+			}
+		}
+	}()
+	useFakeEtcd(t, f)
+	r0, r1, other := idGroupPlaceholders()
+	kc := fake.NewSimpleClientset(rec, r0, r1, other)
+	c := idAgent(kc, true).criuRestorer()
+	for _, p := range []*corev1.Pod{r0, r1} {
+		c.verdicts.Store(string(p.UID)+"\x00"+p.Annotations[webhook.CRIURestoreAnnotation]+"\x00"+idKey, "")
+	}
+	fail := atomic.Bool{}
+	kc.PrependReactor("get", "pods", func(act k8stesting.Action) (bool, runtime.Object, error) {
+		if fail.Load() && act.(k8stesting.GetAction).GetName() == r1.Name {
+			return true, nil, errors.New("api down")
+		}
+		return false, nil, nil
+	})
+	c.attempted.Store("restore/"+string(r0.UID), struct{}{})
+	saved := restoreInstance
+	t.Cleanup(func() { restoreInstance = saved })
+	restoreInstance = func(*Agent, context.Context, GroupRestoreRequest, *logrus.Entry) (*GroupRestoreResult, error) {
+		return &GroupRestoreResult{}, nil
+	}
+	fail.Store(true)
+	c.restoreGroup(ctx, r0, idKey, 2)
+	if _, still := c.attempted.Load("restore/" + string(r0.UID)); still {
+		t.Fatal("the leader's attempt was kept: the unreadable rank's refusal is never tried again")
+	}
+}
+
+// Adoption fails closed when the adopted lease cannot be read.
+func TestLoneRestore_AdoptUnreadableLeaseRefused(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	rec.Data[identityHolderKey], rec.Data[identityGrantedKey] = holderOf(pod), holderOf(pod)
+	f.setFail("/v3/lease/timetolive", true)
+	useFakeEtcd(t, f)
+	kc := fake.NewSimpleClientset(rec, pod)
+	c := idAgent(kc, true).criuRestorer()
+	k, _, err := c.loneIdentityBeforeRestore(ctx, ctx, idKey, "shared", "w-new", pod.UID, "ck", idLog())
+	if k != nil || identityDecision(err) != identityRefusedError {
+		t.Fatalf("adopted an unreadable lease: keeper %v, %v", k, err)
+	}
+}
+
+// An agent that stops while it registers the restored worker leaves the
+// identity as it is: no revoke, no pod ended, for the next agent to adopt.
+func TestLeaseKeeper_StopDuringKeyWrite(t *testing.T) {
+	fastIdentity(t)
+	f := newFakeEtcd(t)
+	f.grant(idLease, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	k := newLeaseKeeper(f.client(), idLease, 5, idLog())
+	zombie, aborted := false, false
+	k.onZombie, k.onAborted = func() { zombie = true }, func() { aborted = true }
+	writing := make(chan struct{})
+	k.writeKeys = func(ctx context.Context) error {
+		close(writing)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	go k.run(ctx)
+	k.restored(nil)
+	<-writing
+	cancel()
+	select {
+	case <-k.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("keeper did not end")
+	}
+	if k.outcome != identityKeeperAgentStopped || zombie || aborted || !f.live(idLease) {
+		t.Fatalf("outcome %s zombie %v aborted %v live %v", k.outcome, zombie, aborted, f.live(idLease))
 	}
 }
