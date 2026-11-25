@@ -43,6 +43,9 @@ type fakeEtcd struct {
 	// onTimeToLive, when set, runs (under the lock) before a timetolive
 	// answer: a registration that changes between a capture's reads.
 	onTimeToLive func()
+	// onTimeToLiveReply, when set, runs (under the lock) once a
+	// timetolive answer is computed and before it is sent: a late reply.
+	onTimeToLiveReply func()
 }
 
 func newFakeEtcd(t *testing.T) *fakeEtcd {
@@ -259,6 +262,9 @@ func (f *fakeEtcd) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			sort.Strings(keys)
 			out["keys"] = keys
+		}
+		if f.onTimeToLiveReply != nil {
+			f.onTimeToLiveReply()
 		}
 		reply(out)
 	case "/v3/lease/keepalive":

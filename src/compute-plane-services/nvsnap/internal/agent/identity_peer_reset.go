@@ -153,7 +153,7 @@ func (r *sourcePeerReset) inventoryHook(procBase string, hostPID int) func() err
 		return nil
 	}
 	return func() error {
-		inodes, err := containerSocketInodes(procBase, hostPID)
+		inodes, err := containerSocketInodesStrict(procBase, hostPID)
 		if err != nil {
 			return fmt.Errorf("identity capture: list the container's sockets: %w", err)
 		}

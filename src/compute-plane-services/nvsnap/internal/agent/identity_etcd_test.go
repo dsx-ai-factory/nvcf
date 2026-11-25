@@ -1619,16 +1619,27 @@ func TestIdentityRefused_StallBeforeDelete(t *testing.T) {
 			return false, nil, nil
 		})
 		again := false
-		idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck0", []*corev1.Pod{r0, r1}, refusal, func() { again = true }, idLog())
-		if !again {
+		c := idAgent(kc, true).criuRestorer()
+		c.identityRefused(ctx, idKey, "ck", []*corev1.Pod{r0, r1}, refusal, func() { again = true }, idLog())
+		// r0 was deleted: the restore cannot run again, so the unreadable
+		// rank's refusal waits for that rank's own event.
+		if _, err := kc.CoreV1().Pods("shared").Get(ctx, r0.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("r0 kept: %v", err)
+		}
+		if again {
+			t.Error("handed back to a restore that cannot run again")
+		}
+		if _, ok := c.attempted.Load(identityRetryKey(r1.UID)); !ok {
 			t.Fatal("an unreadable rank was left without its refusal being tried again")
 		}
 	})
 }
 
-// The group path hands an unfinished refusal back to the leader's next
-// event: its attempt is cleared.
-func TestGroupRestore_RefusalRetriedOnLeader(t *testing.T) {
+// Through the group path: when the leader is dealt with (deleted here,
+// started cold alike) and a rank cannot be read, the leader's next event
+// can never restore again, so the rank's refusal is finished on the rank's
+// own next event, counting no second stall.
+func TestGroupRestore_RefusalRetriedOnTheRank(t *testing.T) {
 	fastIdentity(t)
 	ctx := context.Background()
 	f := newFakeEtcd(t)
@@ -1669,10 +1680,29 @@ func TestGroupRestore_RefusalRetriedOnLeader(t *testing.T) {
 	restoreInstance = func(*Agent, context.Context, GroupRestoreRequest, *logrus.Entry) (*GroupRestoreResult, error) {
 		return &GroupRestoreResult{}, nil
 	}
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
 	fail.Store(true)
 	c.restoreGroup(ctx, r0, idKey, 2)
-	if _, still := c.attempted.Load("restore/" + string(r0.UID)); still {
-		t.Fatal("the leader's attempt was kept: the unreadable rank's refusal is never tried again")
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, r0.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the leader was kept: %v", err)
+	}
+	if _, ok := c.attempted.Load(identityRetryKey(r1.UID)); !ok {
+		t.Fatal("the unreadable rank's refusal is never tried again")
+	}
+	fail.Store(false)
+	c.consider(ctx, r1)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := kc.CoreV1().Pods("shared").Get(ctx, r1.Name, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, r1.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the rank was left idle: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); cm.Data["stalls"] != "1" {
+		t.Errorf("stalls %q; want 1 for one refusal", cm.Data["stalls"])
 	}
 }
 
@@ -1711,9 +1741,16 @@ func TestLeaseKeeper_StopDuringKeyWrite(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	defer cancel()
 	go k.run(ctx)
 	k.restored(nil)
-	<-writing
+	select {
+	case <-writing:
+	case <-k.done:
+		t.Fatalf("keeper ended (%s) before it registered the worker", k.outcome)
+	case <-time.After(3 * time.Second):
+		t.Fatal("keeper never registered the worker")
+	}
 	cancel()
 	select {
 	case <-k.done:
@@ -1722,5 +1759,189 @@ func TestLeaseKeeper_StopDuringKeyWrite(t *testing.T) {
 	}
 	if k.outcome != identityKeeperAgentStopped || zombie || aborted || !f.live(idLease) {
 		t.Fatalf("outcome %s zombie %v aborted %v live %v", k.outcome, zombie, aborted, f.live(idLease))
+	}
+}
+
+// A keep-alive sample whose reply comes late tells of the lease as of its
+// request: a lease renewed once by someone else and then left to expire is
+// not handed off on a reply that arrives after it expired.
+func TestLeaseKeeper_LateSampleIsNotAHandoff(t *testing.T) {
+	fastIdentity(t)
+	f := newFakeEtcd(t)
+	f.grant(idLease, 4)
+	t0 := time.Now()
+	delayed := false
+	f.onTimeToLiveReply = func() { // under the fake's lock
+		if !delayed && time.Since(t0) >= 3800*time.Millisecond {
+			delayed = true // asked at 3.8 s (TTL 2), answered at 6.4 s
+			time.Sleep(time.Until(t0.Add(6400 * time.Millisecond)))
+		}
+	}
+	k := newLeaseKeeper(f.client(), idLease, 4, idLog())
+	var zombie atomic.Bool
+	k.onZombie = func() { zombie.Store(true) }
+	go k.run(context.Background())
+	k.restored(nil)
+	time.Sleep(time.Until(t0.Add(2 * time.Second)))
+	f.refresh(idLease) // one renewal not the agent's: the lease now expires at 6 s
+	select {
+	case <-k.done:
+	case <-time.After(12 * time.Second):
+		t.Fatal("keeper did not end")
+	}
+	if k.outcome != identityHandoffLost || !zombie.Load() {
+		t.Fatalf("outcome %s, zombie %v; want the lost lease to end the pod", k.outcome, zombie.Load())
+	}
+}
+
+// A placeholder replaced under its name while its identity is set up is
+// not restored into: the restore finds its target by name, and the
+// identity was set up for the replaced pod. The regranted lease is revoked
+// and the claim released; the replacement is left for its own restore.
+func TestLoneRestore_PlaceholderReplacedDuringIdentitySetup(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	f.mu.Lock()
+	f.kvs = map[string]etcdKV{}
+	f.mu.Unlock()
+	useFakeEtcd(t, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	kc := fake.NewSimpleClientset(rec, pod)
+	c := idAgent(kc, true).criuRestorer()
+	replaced := false
+	f.onTimeToLive = func() { // the wait for the captured lease
+		if replaced {
+			return
+		}
+		replaced = true
+		gvr := corev1.SchemeGroupVersion.WithResource("pods")
+		if err := kc.Tracker().Delete(gvr, "shared", "w-new"); err != nil {
+			t.Error(err)
+		}
+		r := pod.DeepCopy()
+		r.UID = "w-new-replacement"
+		if err := kc.Tracker().Create(gvr, r, "shared"); err != nil {
+			t.Error(err)
+		}
+	}
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restored := false
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		restored = true
+		return &RestoreResult{}, nil
+	}
+	c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
+	if !replaced {
+		t.Fatal("the pod was not replaced during the identity setup")
+	}
+	if restored {
+		t.Fatal("restored into the replacement, whose identity was not set up")
+	}
+	got, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{})
+	if err != nil || got.UID != "w-new-replacement" || coldStarted(got) {
+		t.Fatalf("the replacement was touched: %v %+v", err, got)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for f.live(idLease) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+	if f.live(idLease) || cm.Data[identityHolderKey] != "" {
+		t.Fatalf("lease live %v, holder %q; want it revoked and released", f.live(idLease), cm.Data[identityHolderKey])
+	}
+}
+
+// A refusal leaves a pod that no longer names the refused checkpoint as
+// it is, even under its UID: it is not this restore's.
+func TestLoneRestore_CheckpointChangedLeftAlone(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	useFakeEtcd(t, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	pod.Annotations[webhook.CRIURestoreAnnotation] = "ck2"
+	kc := fake.NewSimpleClientset(rec, pod)
+	c := idAgent(kc, true).criuRestorer()
+	saved := restoreForRequest
+	t.Cleanup(func() { restoreForRequest = saved })
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		t.Error("restored a pod that names another checkpoint")
+		return &RestoreResult{}, nil
+	}
+	c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); err != nil {
+		t.Fatalf("the pod was deleted: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); cm.Data["stalls"] != "" {
+		t.Errorf("stalls %q; want none", cm.Data["stalls"])
+	}
+}
+
+// A refused pod that already runs its workload (a restored engine an
+// earlier agent left) is kept: neither started cold nor deleted, nothing
+// counted; a lone restore is handed back to its next event, which may
+// adopt the identity once the lease can be read.
+func TestIdentityRefused_RunningWorkloadKept(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	saved := podRunsWorkload
+	t.Cleanup(func() { podRunsWorkload = saved })
+	podRunsWorkload = func(context.Context, *Agent, *corev1.Pod, string) (bool, error) { return true, nil }
+	rec := idRecord(t, keys, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	kc := fake.NewSimpleClientset(rec, pod)
+	again := false
+	refusal := refuseIdentity(identityRefusedError, errors.New("read the adopted lease: unreachable"))
+	idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck", []*corev1.Pod{pod}, refusal, func() { again = true }, idLog())
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); err != nil {
+		t.Fatalf("a running worker was deleted: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); cm.Data["stalls"] != "" {
+		t.Errorf("stalls %q; want none", cm.Data["stalls"])
+	}
+	if !again {
+		t.Error("the restore was not handed back to its next event")
+	}
+	// A refusal that will not pass (identity restore off) keeps the pod and
+	// is not tried again.
+	again = false
+	disabled := refuseIdentity(identityRefusedDisabled, errors.New("off"))
+	idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck", []*corev1.Pod{pod}, disabled, func() { again = true }, idLog())
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, "w-new", metav1.GetOptions{}); err != nil || again {
+		t.Fatalf("kept: %v, tried again %v", err, again)
+	}
+}
+
+// A refusal whose delete failed, tried again, is still one refusal: it
+// counts one stall, not one per try.
+func TestIdentityRefused_StallOncePerPod(t *testing.T) {
+	ctx := context.Background()
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 20*time.Millisecond)
+	f := newFakeEtcd(t)
+	keys := f.dynamoWorkerKeys(idLease, idOldIP)
+	rec := idRecord(t, keys, f)
+	pod := idPlaceholder("w-new", idNewIP)
+	kc := fake.NewSimpleClientset(rec, pod)
+	kc.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("api down")
+	})
+	c := idAgent(kc, true).criuRestorer()
+	refusal := refuseIdentity(identityRefusedLiveLease, errors.New("live"))
+	for i := range 3 {
+		again := false
+		c.identityRefused(ctx, idKey, "ck", []*corev1.Pod{pod}, refusal, func() { again = true }, idLog())
+		if !again {
+			t.Fatalf("try %d: a refusal whose delete failed was not tried again", i)
+		}
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); cm.Data["stalls"] != "1" {
+		t.Fatalf("stalls %q after three tries of one refusal; want 1", cm.Data["stalls"])
 	}
 }

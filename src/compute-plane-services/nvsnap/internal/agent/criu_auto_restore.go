@@ -183,6 +183,7 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	c.considerRestored(ctx, pod)
 	c.considerRestoredCondition(ctx, pod)
 	c.considerColdStart(ctx, pod)
+	c.considerIdentityRefused(ctx, pod)
 	c.considerRestoredStacks(ctx, pod)
 	c.considerTeardown(ctx, pod)
 	c.observePodReady(ctx, pod)
@@ -281,6 +282,16 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			refusedPod = target
 			return ierr
 		}
+		if keeper != nil {
+			// The identity is set up for pod uid, which the wait for the
+			// captured lease may have outlived; the restore below finds its
+			// target by name alone.
+			if _, serr := c.samePlaceholder(rctx, ns, pod, uid, id); serr != nil {
+				keeper.restored(serr)
+				refusedPod = target
+				return serr
+			}
+		}
 		_, err := restoreForRequest(a, rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
@@ -317,7 +328,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		// Nothing restored, nothing held against the capture.
 		if refusedPod == nil || refusedPod.UID == "" {
 			refusedPod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid,
-				Annotations: map[string]string{webhook.CRIURestoreContainerAnnotation: container}}}
+				Annotations: map[string]string{webhook.CRIURestoreAnnotation: id, webhook.CRIURestoreContainerAnnotation: container}}}
 		}
 		c.identityRefused(context.WithoutCancel(ctx), groupKey, id, []*corev1.Pod{refusedPod}, err, func() { c.attempted.Delete(uid) }, log)
 		return

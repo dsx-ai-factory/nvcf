@@ -243,26 +243,44 @@ func TestSourcePeerReset_AfterDump(t *testing.T) {
 	}
 }
 
-// A probe nobody answers (an address that drops the SYN) is not counted as
-// a reset: the capture would otherwise leave a session open.
+// silentListener is a loopback address whose listener drops every new
+// SYN, without privileges: its accept queue (backlog 0) is full with one
+// connection never accepted, and Linux drops a SYN to a full queue.
+func silentListener(t *testing.T) netip.AddrPort {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Listen(fd, 0); err != nil {
+		t.Fatal(err)
+	}
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(sa.(*unix.SockaddrInet4).Port)) //nolint:gosec // a port fits
+	filler, err := net.DialTimeout("tcp4", addr.String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = filler.Close() })
+	return addr
+}
+
+// A probe nobody answers (a peer that drops the SYN) is not counted as a
+// reset: the capture would otherwise leave a session open.
 func TestProbeReset_UnansweredIsNotConfirmed(t *testing.T) {
-	needNetAdmin(t)
-	var local netip.Addr
-	ifs, _ := net.InterfaceAddrs()
-	for _, a := range ifs {
-		if p, err := netip.ParsePrefix(a.String()); err == nil && p.Addr().Is4() && !p.Addr().IsLoopback() {
-			local = p.Addr()
-		}
-	}
-	if !local.IsValid() {
-		t.Skip("no non-loopback IPv4 address")
-	}
 	saved := peerProbeWait
 	peerProbeWait = 300 * time.Millisecond
 	t.Cleanup(func() { peerProbeWait = saved })
-	err := probeReset(context.Background(), tcpTuple{Local: netip.AddrPortFrom(local, 0), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
-	if !errors.Is(err, errProbeUnconfirmed) && err == nil {
-		t.Fatalf("an unanswered probe passed: %v", err)
+	err := probeReset(context.Background(), tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: silentListener(t)})
+	if !errors.Is(err, errProbeUnconfirmed) {
+		t.Fatalf("an unanswered probe: %v; want it unconfirmed", err)
 	}
 }
 
@@ -280,16 +298,57 @@ func TestProbeReset_RespectsContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("probe with its time up: %v", err)
 	}
-	// A deadline shorter than the probe's own wait bounds it.
+	// A deadline shorter than the probe's own wait bounds it: the probe
+	// waits on a peer that never answers until the deadline, not its own
+	// wait, and ends unconfirmed or with the deadline.
 	saved := peerProbeWait
 	peerProbeWait = 5 * time.Second
 	t.Cleanup(func() { peerProbeWait = saved })
-	dctx, dcancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	dctx, dcancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer dcancel()
 	t0 := time.Now()
-	err = probeReset(dctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: netip.MustParseAddrPort("192.0.2.1:9")})
-	if err == nil || time.Since(t0) > 2*time.Second {
-		t.Fatalf("probe past its deadline: %v after %s", err, time.Since(t0))
+	err = probeReset(dctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: silentListener(t)})
+	took := time.Since(t0)
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, errProbeUnconfirmed) {
+		t.Fatalf("probe past its deadline: %v", err)
+	}
+	if took < 250*time.Millisecond || took > 2*time.Second {
+		t.Fatalf("probe took %s; want it to wait until its 300ms deadline", took)
+	}
+}
+
+// The inventory fails when a process of the container cannot be inspected:
+// a connection it missed would go unreset while the capture reports
+// success.
+func TestSourcePeerReset_InventoryFailsOnAnUninspectableProcess(t *testing.T) {
+	proc := t.TempDir()
+	mk := func(pid string) string {
+		d := proc + "/" + pid
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(d+"/cgroup", []byte("0::/kubepods/pod1/main\n"), 0o644); err != nil { //nolint:gosec // a test file
+			t.Fatal(err)
+		}
+		return d
+	}
+	if err := os.MkdirAll(mk("100")+"/fd", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Its fd directory cannot be read (not a directory here).
+	if err := os.WriteFile(mk("101")+"/fd", nil, 0o644); err != nil { //nolint:gosec // a test file
+		t.Fatal(err)
+	}
+	r := &sourcePeerReset{log: idLog()}
+	if err := r.inventoryHook(proc, 100)(); err == nil || !strings.Contains(err.Error(), "list the container's sockets") {
+		t.Fatalf("inventory with a process it cannot inspect: %v; want it to fail", err)
+	}
+	// One that went away is skipped.
+	if err := os.RemoveAll(proc + "/101"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := containerSocketInodesStrict(proc, 100); err != nil {
+		t.Fatalf("a process gone: %v", err)
 	}
 }
 
