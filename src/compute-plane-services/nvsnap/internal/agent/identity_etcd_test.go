@@ -1111,7 +1111,7 @@ func TestCheckpointInstance_PeerResetRequest(t *testing.T) {
 	var got []string
 	checkpointMember = func(_ *Agent, _ context.Context, req CheckpointRequest) (*CheckpointResult, error) {
 		got = req.ResetPeersOutside
-		return &CheckpointResult{CheckpointID: "ck"}, nil
+		return &CheckpointResult{CheckpointID: "ck", PeersReset: len(req.ResetPeersOutside) > 0}, nil
 	}
 	c := idAgent(fake.NewSimpleClientset(), true).criuRestorer()
 	w := idWorker("w", idOldIP)
@@ -1151,7 +1151,7 @@ func TestCaptureGroup_IdentityRecorded(t *testing.T) {
 	var reqs []CheckpointRequest
 	checkpointMember = func(_ *Agent, _ context.Context, req CheckpointRequest) (*CheckpointResult, error) {
 		reqs = append(reqs, req)
-		return &CheckpointResult{CheckpointID: "ck-a"}, nil
+		return &CheckpointResult{CheckpointID: "ck-a", PeersReset: len(req.ResetPeersOutside) > 0}, nil
 	}
 	deleteMember = func(*Agent, context.Context, string, string, types.UID) error { return nil }
 	before := decisions(t, identityCaptured)
@@ -2481,5 +2481,29 @@ func TestLoneRestore_LeaseKeptWhileTheGrantIsRecorded(t *testing.T) {
 	c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
 	if !liveAtRestore {
 		t.Fatal("the lease expired while its grant was recorded")
+	}
+}
+
+// A member that was asked to reset its source's outside connections and
+// does not say it did (an agent of an older version) fails the capture,
+// whose stopped pods are then replaced.
+func TestCheckpointInstance_PeerResetNotDoneFails(t *testing.T) {
+	saved := checkpointMember
+	t.Cleanup(func() { checkpointMember = saved })
+	checkpointMember = func(*Agent, context.Context, CheckpointRequest) (*CheckpointResult, error) {
+		return &CheckpointResult{CheckpointID: "ck"}, nil // an older agent: no peersReset
+	}
+	c := idAgent(fake.NewSimpleClientset(), true).criuRestorer()
+	w := idWorker("w", idOldIP)
+	ctx := withPeerReset(context.Background(), memberAddresses([]*corev1.Pod{w}))
+	if _, stopped, err := c.checkpointInstance(ctx, []*corev1.Pod{w}, nil, nil, idLog()); err == nil || !stopped {
+		t.Fatalf("stopped %v, %v; want the capture failed and its pods replaced", stopped, err)
+	}
+	reqs := []CheckpointRequest{{PodName: "r0", ResetPeersOutside: []string{idOldIP}}, {PodName: "c0"}}
+	if peersResetDone(reqs, []*CheckpointResult{{PeersReset: true}, {}}) != nil {
+		t.Fatal("a companion not asked to reset failed the capture")
+	}
+	if peersResetDone(reqs, []*CheckpointResult{{}, {}}) == nil {
+		t.Fatal("a rank that did not reset passed")
 	}
 }
