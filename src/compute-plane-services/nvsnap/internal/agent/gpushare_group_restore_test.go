@@ -319,6 +319,29 @@ func TestGroupRestore_FailedRankSkipsCompanions(t *testing.T) {
 	}
 }
 
+// A GPU rank refused for its node (it cannot resume NIXL) leaves the
+// companions unrestored; the group's restore is still one that did not
+// run for its node (errNIXLResumeUnavailable), not a restore failure.
+func TestGroupRestore_NIXLNodeRefusalWithACompanion(t *testing.T) {
+	ckpts := map[string]*CheckpointMetadata{
+		"c0": {SourcePodIP: "10.0.0.1", GPUShareGroup: &GPUShareGroupInfo{Session: "sy", Index: 0, Size: 2}},
+		"e":  {SourcePodIP: "10.0.0.5", GPUShareGroup: &GPUShareGroupInfo{Session: "sy", Index: 1, Size: 2, Companion: true}},
+	}
+	h := newGroupRestoreHarness(t, ckpts)
+	h.failCkpt = "c0"
+	h.failText = fmt.Errorf("%w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable).Error()
+	groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "etcd": "10.1.0.15"})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := h.a.groupRestore(ctx, GroupRestoreRequest{Members: []GroupRestoreMember{
+		{CheckpointID: "c0", PlaceholderNamespace: "llm", PlaceholderPodName: "new-0"},
+		{CheckpointID: "e", PlaceholderNamespace: "llm", PlaceholderPodName: "etcd"},
+	}}, quietFabricLog())
+	if !errors.Is(err, errNIXLResumeUnavailable) || errors.As(err, new(*groupRestoreFailure)) {
+		t.Fatalf("err = %v (%T), want a node refusal, not a restore failure", err, err)
+	}
+}
+
 // Every GPU rank gets the slowest rank's last restore span, or "unknown"
 // when a rank's node has none, so that the ranks budget their clocks alike
 // and resume together; the companions keep their own.

@@ -332,7 +332,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 		if !awaitRestored(ctx, members, ranks, done) {
 			mu.Lock()
 			for _, i := range companions {
-				res.Members[i].Error = "not restored: a GPU rank of the instance did not restore"
+				res.Members[i].Error = companionNotRestored
 				finished[i] = true
 			}
 			mu.Unlock()
@@ -456,11 +456,17 @@ func nixlResumeUnavailable(members []GroupRestoreMemberResult) bool {
 	return refused
 }
 
+// companionNotRestored is the error of a companion (a member without GPU
+// state) not restored because a GPU rank of its instance did not.
+const companionNotRestored = "not restored: a GPU rank of the instance did not restore"
+
 // abortedByAPeer reports whether a member's restore error (text from its
-// agent) says it failed because another member did.
+// agent) says it failed because another member did; a companion that was
+// never launched for a rank's failure counts.
 func abortedByAPeer(e string) bool {
 	return strings.Contains(e, "aborted: another pod of the instance failed to restore") ||
-		strings.Contains(e, "the other pods did not finish restoring")
+		strings.Contains(e, "the other pods did not finish restoring") ||
+		e == companionNotRestored
 }
 
 // allRefusedAsRestored reports whether every member refused the restore
