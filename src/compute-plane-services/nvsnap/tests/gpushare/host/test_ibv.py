@@ -939,6 +939,29 @@ int main(int argc, char **argv)
         printf("connect=%d completed=%d\n", k, ok);
         return 0;
     }
+    if (!strcmp(c, "reopenpending")) {
+        /* qb's RTS fails, so it still needs connecting; a fence then fails
+         * (reopen(), not nvsnap_ibv_open). NCCL's calls must stay held, and
+         * qa keeps its record. A retry and an open then let them go. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *b = (struct vqp *)qb;
+        b->attr[2].qp_state = IBV_QPS_RTR;  /* its RTS fails */
+        int k1 = reconnect();
+        b->attr[2].qp_state = IBV_QPS_RTS;
+        fake_fail_marker(1);
+        int f = nvsnap_ibv_fence(rep, sizeof(rep));
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST), rtr_a = ((struct vqp *)qa)->rtr.set;
+        if (!held) return printf("first=%d fence=%d held_after_fence=0 rtr_a=%d\n", k1, f, rtr_a), 0;
+        int k2 = reconnect();
+        if (k2) return printf("retry failed\n"), 1;
+        nvsnap_ibv_open();
+        int held2 = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        printf("first=%d fence=%d held_after_fence=%d rtr_a=%d retry=%d held_after_open=%d\n", k1, f, held, rtr_a, k2, held2);
+        return 0;
+    }
     if (!strcmp(c, "refusedretry")) {
         /* The remap succeeds; a second remap of the same restore is refused
          * (its exchange lacks the key rows). The tables of the first stay:
@@ -1239,7 +1262,9 @@ int main(int argc, char **argv)
         __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
         int k_inflight = reconnect();
         __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
-        reopen();
+        /* NCCL's calls let go some other way than reopen() (which keeps
+         * them held while queue pairs need connecting). */
+        __atomic_store_n(&suspended, 0, __ATOMIC_SEQ_CST);
         int k_open = reconnect();
         printf("connect_inflight=%d connect_open=%d untouched=%d\n", k_inflight, k_open,
                fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_INIT && fake_qp_state(((struct vqp *)qb)->real) == IBV_QPS_INIT);
@@ -1801,6 +1826,13 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_failed_fence_keeps_nccl_held_while_a_queue_pair_needs_connecting(self):
+        out = self.probe("reopenpending")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["fence"], "0", out)
+        self.assertEqual((out["held_after_fence"], out["rtr_a"]), ("1", "1"), "NCCL let go with qb unconnected: %s" % out)
+        self.assertEqual((out["retry"], out["held_after_open"]), ("0", "0"), out)
 
     def test_refused_retry_keeps_the_last_valid_tables(self):
         out = self.probe("refusedretry")

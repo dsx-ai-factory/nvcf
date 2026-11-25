@@ -1098,14 +1098,23 @@ static int fence(char *reply, size_t n, int mark)
 /* Let NCCL's calls go, unless they are held for good (G_DOOM): decided and
  * done in one compare-and-swap, so a doom that comes at any point before
  * it wins, and one that comes after holds the calls again. */
+static int needs_connect(const struct vqp *q);
 static void reopen(void)
 {
-    /* NCCL runs on its connected queue pairs again: this restore's connect
-     * is done for them (as in nvsnap_ibv_open). One still waiting for RTR
-     * or RTS keeps its record for the retry. Callers do not hold omu. */
+    /* As nvsnap_ibv_open: while a re-created queue pair still needs RTR or
+     * RTS, NCCL's calls stay held (a failed fence, a stop_calls timeout or
+     * a release refused before the remap finished), and every record stays
+     * for the retry. Else this restore's connect is done: forget them.
+     * Callers do not hold omu. */
     pthread_mutex_lock(&omu);
-    for (int i = 0; i < n_qps; i++) if (!qps[i]->fresh) qps[i]->rtr.set = 0;
+    int pending = 0;
+    for (int i = 0; i < n_qps; i++) pending += needs_connect(qps[i]);
+    for (int i = 0; i < n_qps && !pending; i++) qps[i]->rtr.set = 0;
     pthread_mutex_unlock(&omu);
+    if (pending) {
+        logf_("%d queue pair(s) not reconnected yet: NCCL's calls stay held", pending);
+        return;
+    }
     pthread_mutex_lock(&gmu);
     int s = __atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
     while (s && !(s & G_DOOM) &&
