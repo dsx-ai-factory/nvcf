@@ -17,6 +17,12 @@ In scope:
 - The configuration that selects the secret backend, independently of the shared-data
   backend.
 
+This applies to Helm-chart (MiniService) workloads, where a separate utility pod writes files that
+other pods read. Container functions and tasks share `/var/run/nvcf/info` between the worker and
+the function container through an in-pod `emptyDir` volume
+(`common.NewInstanceDataVolume` in `icms-translate`), so they do not use SMB for that path and
+are not affected.
+
 Out of scope for this document:
 
 - `/var/task` and model-cache data. They stay on SMB until the RWX backend ships.
@@ -234,6 +240,19 @@ Secret size did not change the delay. File replacement is atomic: the kubelet sw
    notary service and has not been verified: see Open items. Validation must check the
    real margin before native mode is enabled.
 
+### Reader audit
+
+- **BYOO collector** (`accounts-secrets.json`). It polls the file on an interval, compares the
+  modification time and content, and regenerates its secret files and restarts the collector
+  process on a change (`internal/cli/cli.go`, `internal/secrets/secrets.go`). It does not cache
+  for the process lifetime, so it should work with a projected file, where the path is a symlink
+  to the current content. This was read from the code and has not been run against a projected
+  Secret.
+- **Worker.** It writes `self` through a temporary file and a rename. That does not work on a
+  read-only projected mount, which is why the worker patches the Secret instead when the
+  Kubernetes Secret settings are set.
+- **Other readers.** None found in this repository (see Open items).
+
 ## Security
 
 - The writer Role grants `get` and `patch` on the two named Secrets only. In the experiment,
@@ -277,9 +296,10 @@ tuning and verify it on your own cluster.
 ## Open items
 
 - Verify the real `exp` of the signed metadata token on a running function worker.
-- Audit which components read `/var/run/nvcf/info/self`, `/var/secrets/secrets.json` and
-  `/var/secrets/accounts-secrets.json` (including the BYOO collector), and confirm that none
-  cache the content.
+- Check that the workloads' own code does not cache `/var/run/nvcf/info/self` for the process
+  lifetime. The only writer in this repository is the worker (`metadata.go`), and no component
+  in the repository reads the file, so the readers are the workload's own code and cannot be
+  audited here. Document the re-read rule for workload authors.
 - Confirm the Secret naming scheme.
 - Decide how a workload waits for initial population.
 - Collect encryption-at-rest evidence for a non-local cluster.
