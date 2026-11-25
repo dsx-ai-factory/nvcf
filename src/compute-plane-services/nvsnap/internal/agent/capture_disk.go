@@ -62,11 +62,8 @@ var (
 		return mountinfo.ParseMountinfo(mountinfo.ProcMountinfoPath(pid))
 	}
 	// containerUpperdir returns the overlay upperdir of the container whose
-	// init is pid, as the capture resolves it; "" for none.
-	containerUpperdir = func(pid int) string {
-		u, _ := mountinfo.ResolveOverlayUpperdir(pid)
-		return u
-	}
+	// init is pid, as the capture resolves it; "" and no error for none.
+	containerUpperdir = mountinfo.ResolveOverlayUpperdir
 	// tmpfsUsed returns the bytes in use on the tmpfs mounted at mp in the
 	// container whose init is pid.
 	tmpfsUsed = func(pid int, mp string) (int64, error) {
@@ -122,21 +119,33 @@ func sumGPUUsed(out string, pids []int) (int64, error) {
 	return mib << 20, nil
 }
 
-// pidsUseGPU reports whether any of pids holds an NVIDIA device open.
-func pidsUseGPU(procBase string, pids []int) bool {
+// pidsUseGPU reports whether any of pids holds an NVIDIA device open; an
+// error when a live process's descriptors cannot be read. A process, or a
+// descriptor, gone since it was listed is skipped.
+func pidsUseGPU(procBase string, pids []int) (bool, error) {
 	for _, pid := range pids {
 		fdDir := filepath.Join(procBase, strconv.Itoa(pid), "fd")
 		ents, err := os.ReadDir(fdDir)
-		if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
+		if err != nil {
+			return false, fmt.Errorf("cannot tell whether pid %d uses a GPU: %w", pid, err)
+		}
 		for _, e := range ents {
-			if t, err := os.Readlink(filepath.Join(fdDir, e.Name())); err == nil && strings.HasPrefix(t, "/dev/nvidia") {
-				return true
+			t, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return false, fmt.Errorf("cannot tell whether pid %d uses a GPU: %w", pid, err)
+			}
+			if strings.HasPrefix(t, "/dev/nvidia") {
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // anonymousBytesOf is the anonymous memory of process pid, an error when
@@ -164,26 +173,39 @@ func anonymousBytesOf(procBase string, pid int) (int64, error) {
 
 // memfdBytes is the allocated size of the memfds pids hold or map, each
 // once: the dump saves their contents, and they are neither anonymous
-// memory nor deleted files.
-func memfdBytes(procBase string, pids []int) int64 {
+// memory nor deleted files. An error when a live process's descriptors or
+// mappings, or a memfd of them, cannot be read; what is gone since it was
+// listed is skipped.
+func memfdBytes(procBase string, pids []int) (int64, error) {
 	seen := map[string]bool{}
 	var n int64
 	for _, pid := range pids {
 		for _, dir := range []string{"fd", "map_files"} {
 			base := filepath.Join(procBase, strconv.Itoa(pid), dir)
 			ents, err := os.ReadDir(base)
-			if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
 				continue
+			}
+			if err != nil {
+				return 0, fmt.Errorf("cannot read the %s of pid %d: %w", dir, pid, err)
 			}
 			for _, e := range ents {
 				link := filepath.Join(base, e.Name())
 				t, err := os.Readlink(link)
-				if err != nil || !strings.HasPrefix(t, "/memfd:") {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				if err != nil {
+					return 0, fmt.Errorf("cannot read %s: %w", link, err)
+				}
+				if !strings.HasPrefix(t, "/memfd:") {
 					continue
 				}
 				var st syscall.Stat_t
-				if syscall.Stat(link, &st) != nil {
+				if err := syscall.Stat(link, &st); errors.Is(err, syscall.ENOENT) {
 					continue
+				} else if err != nil {
+					return 0, fmt.Errorf("cannot size the memfd %s of pid %d: %w", t, pid, err)
 				}
 				key := fmt.Sprintf("%d:%d", st.Dev, st.Ino)
 				if !seen[key] {
@@ -193,7 +215,7 @@ func memfdBytes(procBase string, pids []int) int64 {
 			}
 		}
 	}
-	return n
+	return n, nil
 }
 
 // dumpBytes estimates everything the capture of the container whose init
@@ -220,8 +242,16 @@ func (a *Agent) dumpBytes(procBase string, initPID int, pids []int, limit int64)
 			n += g.allocated
 		}
 	}
-	n += memfdBytes(procBase, pids)
-	if pidsUseGPU(procBase, pids) {
+	memfds, err := memfdBytes(procBase, pids)
+	if err != nil {
+		return 0, err
+	}
+	n += memfds
+	gpuOpen, err := pidsUseGPU(procBase, pids)
+	if err != nil {
+		return 0, err
+	}
+	if gpuOpen {
 		gpu, err := gpuUsedBytes(pids)
 		if err != nil {
 			return 0, fmt.Errorf("cannot read the GPU memory the dump saves: %w", err)
@@ -266,7 +296,11 @@ func (a *Agent) dumpBytes(procBase string, initPID int, pids []int, limit int64)
 			return n, nil
 		}
 	}
-	if upper := containerUpperdir(initPID); upper != "" {
+	upper, err := containerUpperdir(initPID)
+	if err != nil {
+		return 0, fmt.Errorf("cannot find the container's rootfs diff: %w", err)
+	}
+	if upper != "" {
 		exclude := append(tarPatternsForMountpoints(append(mountPoints, v2BinDirInContainer, v2ImagesDirInContainer)), rootfsDiffExcludeGlobs()...)
 		b, err := upperdirArchiveBytes(upper, exclude, limit-n)
 		if err != nil {
@@ -497,4 +531,18 @@ func tarGlobRegexp(pat string) string {
 		}
 	}
 	return b.String()
+}
+
+// hasDiskFinding reports whether fs, a member's host findings, has its
+// disk check: a block, or an estimate from the member's node.
+func hasDiskFinding(fs []PreflightFinding, pod, node string) bool {
+	for _, f := range fs {
+		if f.Check != diskCheck || f.Pod != pod {
+			continue
+		}
+		if f.Severity == preflightBlock || (f.Severity == preflightInfo && f.Node == node) {
+			return true
+		}
+	}
+	return false
 }

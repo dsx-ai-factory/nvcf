@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -279,7 +280,9 @@ func (a *Agent) writeCatalogTombstone(id string, log *logrus.Entry) {
 	}
 	dir := filepath.Join(a.config.CheckpointDir, catalogTombstoneDir)
 	if err := os.MkdirAll(dir, 0o755); err == nil {
-		err = os.WriteFile(filepath.Join(dir, id), nil, 0o644)
+		// Its content is when it was first written (the retry's age); its
+		// modification time, when it was last tried (the retry order).
+		err = os.WriteFile(filepath.Join(dir, id), []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
 		if err == nil {
 			return
 		}
@@ -292,29 +295,52 @@ func (a *Agent) clearCatalogTombstone(id string) {
 }
 
 // retryCatalogDrops retries the catalog deletes of retired checkpoints
-// that failed, dropping one tried for catalogTombstoneMaxAge.
+// that failed, least recently tried first, so a few that keep failing do
+// not starve the rest; it drops one first written catalogTombstoneMaxAge
+// ago.
 func (a *Agent) retryCatalogDrops(ctx context.Context, now time.Time) {
 	if a.config.CatalogURL == "" {
 		return
 	}
-	ents, err := os.ReadDir(filepath.Join(a.config.CheckpointDir, catalogTombstoneDir))
+	dir := filepath.Join(a.config.CheckpointDir, catalogTombstoneDir)
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
+	type tomb struct {
+		id            string
+		tried, posted time.Time
+	}
+	tombs := make([]tomb, 0, len(ents))
 	for _, e := range ents {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		t := tomb{id: e.Name(), tried: info.ModTime(), posted: info.ModTime()}
+		if b, err := os.ReadFile(filepath.Join(dir, t.id)); err == nil {
+			if p, err := time.Parse(time.RFC3339, strings.TrimSpace(string(b))); err == nil {
+				t.posted = p
+			}
+		}
+		tombs = append(tombs, t)
+	}
+	sort.Slice(tombs, func(i, j int) bool { return tombs[i].tried.Before(tombs[j].tried) })
+	for _, t := range tombs {
 		if ctx.Err() != nil {
 			return // the sweep's budget is spent; the rest wait for the next
 		}
-		id := e.Name()
-		log := a.log.WithField("checkpoint", id)
-		if a.dropCatalogRow(ctx, id, log) {
-			a.clearCatalogTombstone(id)
+		log := a.log.WithField("checkpoint", t.id)
+		if a.dropCatalogRow(ctx, t.id, log) {
+			a.clearCatalogTombstone(t.id)
 			continue
 		}
-		if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > catalogTombstoneMaxAge {
+		if now.Sub(t.posted) > catalogTombstoneMaxAge {
 			log.Warn("checkpoint reaper: gave up deleting the retired checkpoint's catalog row; delete it through nvsnap-server")
-			a.clearCatalogTombstone(id)
+			a.clearCatalogTombstone(t.id)
+			continue
 		}
+		_ = os.Chtimes(filepath.Join(dir, t.id), now, now) // tried: to the back of the queue
 	}
 }
 

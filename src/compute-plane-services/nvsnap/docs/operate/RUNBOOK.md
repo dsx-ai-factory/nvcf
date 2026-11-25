@@ -408,13 +408,13 @@ What the agent does:
   - a member's dump would leave less than `agent.captureDiskKeepPercent` (default 20) of the filesystem free;
   - the members on one node would do so together;
   - any part can't be measured (GPU memory unreadable, for example);
-  - a member's host checks did not run.
+  - a member's host checks did not run, or its node sent no disk check (its agent has the check off or predates it).
 
   The check keeps no state, and the on-demand preflight report changes nothing.
 - **While the filesystem has less than the setting plus 10 points free:** the reaper retires checkpoints no record names after 15 minutes instead of 3 hours. Checkpoints of a capture still running are kept.
 - **Records abandoned during verification** (their namespace is gone) no longer keep their checkpoints.
 - **A retired instance capture's catalog row** is deleted through nvsnap-server, from a tombstone in `<checkpoint dir>/.catalog-pending/`:
-  - It is retried after each sweep's local cleanup, within 2 minutes per sweep, for up to 7 days.
+  - It is retried after each sweep's local cleanup, least recently tried first, within 2 minutes per sweep, for up to 7 days.
   - A lone capture's row is left alone: nvsnap-server deletes by hash, and a lone capture shares its hash with later captures of its configuration.
   - An agent refuses (409) to delete a copy that a pod on its node restores from.
 

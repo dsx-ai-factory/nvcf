@@ -588,6 +588,12 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 				return
 			}
 			fs = append(fs, host...)
+			// Every member's node must have checked its disk: one whose
+			// agent has the check off, or predates it, sends none.
+			if a.config.CaptureDiskKeepPercent > 0 && !hasDiskFinding(host, m.pod.Name, m.pod.Spec.NodeName) {
+				fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightBlock, Check: diskCheck,
+					Detail: "the member's node did not check its checkpoint disk (its agent has the check off or predates it)"})
+			}
 		}(m)
 	}
 	wg.Wait()

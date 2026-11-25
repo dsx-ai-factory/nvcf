@@ -40,6 +40,7 @@ type diskHost struct {
 	tmpfs         map[string]int64
 	replay        map[string]int64
 	upperdir      string
+	upperdirErr   error
 	upperdirBytes int64
 }
 
@@ -52,7 +53,7 @@ func (h *diskHost) install(t *testing.T) {
 	diskSpace = func(string) (uint64, uint64, error) { return h.avail, h.total, nil }
 	gpuUsedBytes = func([]int) (int64, error) { return h.gpu, h.gpuErr }
 	containerMounts = func(int) ([]mountinfo.MountInfo, error) { return h.mounts, h.mountsErr }
-	containerUpperdir = func(int) string { return h.upperdir }
+	containerUpperdir = func(int) (string, error) { return h.upperdir, h.upperdirErr }
 	tmpfsUsed = func(_ int, mp string) (int64, error) {
 		if n, ok := h.tmpfs[mp]; ok {
 			return n, nil
@@ -132,7 +133,13 @@ func TestDumpBytesFailsClosed(t *testing.T) {
 		host    diskHost
 		gpuOpen bool
 		noAnon  bool
+		// breakDir replaces /proc/<pid>/<breakDir> with a file, so it
+		// cannot be read as a directory.
+		breakDir string
 	}{
+		"upperdir lookup fails":                 {host: diskHost{upperdirErr: errors.New("mountinfo unreadable")}},
+		"descriptors unreadable":                {breakDir: "fd"},
+		"memory mappings unreadable":            {breakDir: "map_files"},
 		"GPU open, nvidia-smi fails":            {host: diskHost{gpuErr: errors.New("driver not loaded")}, gpuOpen: true},
 		"GPU open, no nvidia-smi":               {host: diskHost{gpuErr: errNoNvidiaSMI}, gpuOpen: true},
 		"mounts unreadable":                     {host: diskHost{mountsErr: errors.New("no mountinfo")}},
@@ -144,6 +151,15 @@ func TestDumpBytesFailsClosed(t *testing.T) {
 			h.avail, h.total = uint64(3*tib), uint64(4*tib)
 			h.install(t)
 			proc := diskProc(t, 7, 1<<30, tc.gpuOpen)
+			if tc.breakDir != "" {
+				d := filepath.Join(proc, "7", tc.breakDir)
+				if err := os.RemoveAll(d); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(d, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if tc.noAnon {
 				if err := os.WriteFile(filepath.Join(proc, "7", "smaps_rollup"), []byte("Rss: 1 kB\n"), 0o644); err != nil {
 					t.Fatal(err)
@@ -512,4 +528,96 @@ func TestCapturePreflightAddsUpEachNodesMembers(t *testing.T) {
 		}
 	}
 	t.Fatalf("findings = %+v, want a disk block for node n1", fs)
+}
+
+// A member whose node sends no disk check (its agent has it off, or
+// predates it) blocks: its writes would go uncounted.
+func TestCapturePreflightRequiresEachMembersDiskCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]PreflightFinding{{Pod: filepath.Base(r.URL.Path), Check: "rdma", Severity: preflightInfo}})
+	}))
+	defer srv.Close()
+	port := srv.URL[strings.LastIndexByte(srv.URL, ':'):]
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "127.0.0.1"}}}}
+	rank := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w0", Namespace: "ns"}, Spec: corev1.PodSpec{NodeName: "n1", Containers: []corev1.Container{{Name: "main"}}}}
+	for _, keep := range []int{20, 0} {
+		a := &Agent{kubeClient: fake.NewSimpleClientset(node), log: logrus.New(), config: Config{ListenAddr: port, CaptureDiskKeepPercent: keep}}
+		blocked := false
+		for _, f := range a.capturePreflight(context.Background(), []*corev1.Pod{rank}, nil, nil, logrus.NewEntry(logrus.New())) {
+			blocked = blocked || (f.Check == diskCheck && f.Severity == preflightBlock)
+		}
+		if blocked != (keep > 0) {
+			t.Errorf("keep %d: blocked=%v, want %v", keep, blocked, keep > 0)
+		}
+	}
+}
+
+// Retries go least recently tried first: tombstones that keep failing do
+// not take every sweep's budget from the others.
+func TestCatalogRetriesRotate(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, filepath.Base(r.URL.Path))
+		mu.Unlock()
+		<-r.Context().Done() // never answers: each attempt uses its whole timeout
+	}))
+	defer srv.Close()
+	b, rt := catalogRetryBudget, catalogRequestTimeout
+	catalogRetryBudget, catalogRequestTimeout = 150*time.Millisecond, 100*time.Millisecond
+	defer func() { catalogRetryBudget, catalogRequestTimeout = b, rt }()
+	dir := t.TempDir()
+	tombs := filepath.Join(dir, catalogTombstoneDir)
+	if err := os.MkdirAll(tombs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for i, id := range []string{"a", "b", "c", "d"} {
+		p := filepath.Join(tombs, id)
+		if err := os.WriteFile(p, []byte(now.UTC().Format(time.RFC3339)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		old := now.Add(-time.Duration(10-i) * time.Minute)
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
+	a.reapCheckpoints(context.Background(), nil, now)
+	mu.Lock()
+	first := len(paths)
+	mu.Unlock()
+	a.reapCheckpoints(context.Background(), nil, now)
+	mu.Lock()
+	defer mu.Unlock()
+	if first == 0 || first >= 4 || len(paths) <= first {
+		t.Fatalf("attempts per sweep: %v (first sweep %d), want a budget that fits some, not all", paths, first)
+	}
+	if paths[first] != []string{"a", "b", "c", "d"}[first] {
+		t.Fatalf("second sweep started with %q, want the least recently tried %q: %v", paths[first], []string{"a", "b", "c", "d"}[first], paths)
+	}
+}
+
+// pidsUseGPU fails when a live process's descriptors can't be read,
+// skips a process that is gone, and finds a GPU device held open.
+func TestPidsUseGPU(t *testing.T) {
+	proc := diskProc(t, 7, 1<<30, true)
+	if got, err := pidsUseGPU(proc, []int{7, 99}); err != nil || !got {
+		t.Fatalf("GPU open, pid 99 gone: %v %v, want true and no error", got, err)
+	}
+	cpu := diskProc(t, 8, 1<<30, false)
+	if got, err := pidsUseGPU(cpu, []int{8}); err != nil || got {
+		t.Fatalf("no GPU open: %v %v, want false and no error", got, err)
+	}
+	fd := filepath.Join(cpu, "8", "fd")
+	if err := os.RemoveAll(fd); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fd, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pidsUseGPU(cpu, []int{8}); err == nil {
+		t.Fatal("descriptors unreadable: want an error")
+	}
 }
