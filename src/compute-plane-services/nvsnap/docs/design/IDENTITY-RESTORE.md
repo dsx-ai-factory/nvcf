@@ -151,36 +151,43 @@ running hands the lease over to it instead of revoking it.
 
 A lone restore checks again, once the identity is set up, that its
 placeholder is still the pod it was set up for (`criu_auto_restore.go`
-`restore`, `samePlaceholder`): a pod replaced under the same name during
-the wait for the lease is refused, the lease revoked and the claim
-released, and the replacement is left to its own restore.
+`restore`, `samePlaceholder`), and binds the restore to that pod's UID
+(`RestoreRequest.PlaceholderPodUID`): `Restore` refuses a container of
+another pod found under the same name (`placeholderOfPod`,
+`errPlaceholderReplaced`). A pod replaced under the same name is refused,
+the lease revoked and the claim released, and the replacement is left to
+its own restore.
 
 A refused restore blocks no checkpoint. `identity_etcd.go`
-`identityRefused` hands each pod to `settleRefused`, which decides it on
-its own:
+`identityRefused` hands the pods to `settleRefused`:
 
 - a pod gone, replaced, or no longer naming the refused checkpoint is left
   as it is;
-- a pod that already runs its workload (a GPU process in its pid namespace,
-  `podRunsWorkload`) is kept: neither started cold nor deleted. Refused for
-  an error that may pass (`refused_error`, an adopted lease that could not
-  be read), it is tried again below, so the identity can still be adopted.
-  When whether it runs cannot be told, the pod starts cold;
+- when any pod already runs its workload (a GPU process in its pid
+  namespace, `podRunsWorkload`; only pods on the agent's node can be
+  inspected, and the leader always is), the instance was restored before:
+  every pod is kept, none started cold or deleted. Refused for an error
+  that may pass (`refused_error`, an adopted lease that could not be read),
+  the restore's next event decides again, so the identity can still be
+  adopted;
 - any other pod starts its workload cold in place;
 - a pod that cannot start cold in place is deleted for its controller to
   replace, and only once the record counts a stall for the refusal
   (`chargeRefusal`), so replacements refused the same way stop at the stall
   bound. One refusal counts one stall, however often it is tried again
-  (`refusedPods` on the record).
+  (`refusedPods` on the record keeps every pod of the last refusal);
+- a pod of which it cannot be told whether it runs a workload is never
+  deleted: it starts cold in place, or is kept and tried again.
 
 Each pod's outcome is its own: a pod that cannot be read does not keep the
 other pods from starting cold or being deleted. A pod left unfinished (it
 cannot be read, its stall cannot be counted, or its delete fails) is kept,
 and its refusal is tried again. When no pod was started cold or deleted,
 the restore's next event decides it anew (the lone pod's, or the group
-leader's). Otherwise the restore cannot run again, and each unfinished pod's
-refusal is finished on that pod's own next event
-(`considerIdentityRefused`).
+leader's). Otherwise the restore cannot run again, and the agent that
+refused it finishes the unfinished pods itself (`finishRefused`, backing
+off up to 30 s, for at most a day): reading and deleting a pod works for
+pods on any node.
 
 ## 6. One live restore per identity
 
@@ -243,9 +250,9 @@ Against the invariants in `AGENTS.md`:
 - The dead source stays registered until its lease expires (its TTL) after
   the dump; the verification restore waits that long.
 - Dual-stack pods: only the primary pod address is matched and rewritten.
-- A refusal left unfinished on a pod's own next event is kept in the agent's
-  memory only: an agent that restarts before it is finished leaves that
-  pod's placeholder idle.
+- A refusal left unfinished is finished by the agent that refused it, from
+  its memory only: an agent that restarts before it is finished leaves the
+  unfinished placeholders idle.
 - Not run on hardware with this code: the network-namespace dialer, the
   net-unlock of a dump's lock and the probe through a Service address, and
   Dynamo's own keep-alive resuming on the granted lease after a CRIU restore

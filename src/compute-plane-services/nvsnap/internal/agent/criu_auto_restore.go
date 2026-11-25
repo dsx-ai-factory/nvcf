@@ -183,7 +183,6 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	c.considerRestored(ctx, pod)
 	c.considerRestoredCondition(ctx, pod)
 	c.considerColdStart(ctx, pod)
-	c.considerIdentityRefused(ctx, pod)
 	c.considerRestoredStacks(ctx, pod)
 	c.considerTeardown(ctx, pod)
 	c.observePodReady(ctx, pod)
@@ -282,24 +281,32 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			refusedPod = target
 			return ierr
 		}
-		if keeper != nil {
-			// The identity is set up for pod uid, which the wait for the
-			// captured lease may have outlived; the restore below finds its
-			// target by name alone.
-			if _, serr := c.samePlaceholder(rctx, ns, pod, uid, id); serr != nil {
-				keeper.restored(serr)
-				refusedPod = target
-				return serr
-			}
-		}
-		_, err := restoreForRequest(a, rctx, RestoreRequest{
+		req := RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
 			PlaceholderPodName:       pod,
 			PlaceholderContainerName: container,
 			ReservePIDs:              true,
-		})
+		}
+		if keeper != nil {
+			// The identity is set up for pod uid, which the wait for the
+			// captured lease may have outlived: the pod is read again, and
+			// the restore takes only that pod's container.
+			if _, serr := c.samePlaceholder(rctx, ns, pod, uid, id); serr != nil {
+				keeper.restored(serr)
+				refusedPod = target
+				return serr
+			}
+			req.PlaceholderPodUID = string(uid)
+		}
+		_, err := restoreForRequest(a, rctx, req)
 		keeper.restored(err)
+		if errors.Is(err, errPlaceholderReplaced) {
+			// Nothing restored: refused, so the replacement is left to its
+			// own restore and nothing is counted.
+			refusedPod = target
+			return refuseIdentity(identityRefusedError, err)
+		}
 		return err
 	}()
 	record := func(change func(map[string]string) bool) {

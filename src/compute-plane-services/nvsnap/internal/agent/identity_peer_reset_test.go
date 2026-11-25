@@ -304,10 +304,11 @@ func TestProbeReset_RespectsContext(t *testing.T) {
 	saved := peerProbeWait
 	peerProbeWait = 5 * time.Second
 	t.Cleanup(func() { peerProbeWait = saved })
+	silent := silentListener(t) // set up before the deadline starts
 	dctx, dcancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer dcancel()
 	t0 := time.Now()
-	err = probeReset(dctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: silentListener(t)})
+	err = probeReset(dctx, tcpTuple{Local: netip.MustParseAddrPort("127.0.0.1:0"), Remote: silent})
 	took := time.Since(t0)
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, errProbeUnconfirmed) {
 		t.Fatalf("probe past its deadline: %v", err)

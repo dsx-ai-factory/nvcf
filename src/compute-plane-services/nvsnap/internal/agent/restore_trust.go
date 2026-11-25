@@ -373,7 +373,6 @@ func (c *criuAutoRestorer) forgetPod(pod *corev1.Pod) {
 	c.attempted.Delete("capture/" + string(pod.UID))
 	c.attempted.Delete("teardown-hold/" + string(pod.UID))
 	c.attempted.Delete("teardown/" + string(pod.UID))
-	c.attempted.Delete(identityRetryKey(pod.UID))
 	prefix := string(pod.UID) + "\x00"
 	c.verdicts.Range(func(k, _ any) bool {
 		if strings.HasPrefix(k.(string), prefix) {

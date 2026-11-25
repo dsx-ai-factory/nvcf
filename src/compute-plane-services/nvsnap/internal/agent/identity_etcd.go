@@ -921,8 +921,11 @@ func (k *leaseKeeper) run(ctx context.Context) {
 			deadline = time.Now().Add(handoffWait)
 		case <-time.After(identityPoll):
 		}
-		// A sample is taken as of its request: a late reply then tells of
-		// a lease that may have expired since, never of one renewed later.
+		// etcd reads the TTL somewhere between the request (at) and the
+		// reply. Each bound is taken the way that cannot hand off early:
+		// the TTL is compared with what the agent's own renewal explains
+		// at the request, a lease seen ahead counts as ahead from the
+		// reply, and how long it stays ahead is measured to the request.
 		at := time.Now()
 		info, err := k.e.TimeToLive(ctx, k.id, false)
 		switch {
@@ -935,7 +938,7 @@ func (k *leaseKeeper) run(ctx context.Context) {
 		default:
 			if !deadline.IsZero() && time.Duration(info.TTL)*time.Second > ownTTL-at.Sub(own)+tolerance {
 				if above.IsZero() {
-					above = at
+					above = time.Now()
 				}
 			} else {
 				above = time.Time{}
@@ -1087,8 +1090,10 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 // pass (an adopted lease that could not be read), and nothing was done to
 // any pod, again hands the refusal to the restore's next event, which
 // decides it anew. Once a pod has started cold or been deleted the restore
-// cannot run again (its leader may be gone), so each pod left unfinished is
-// finished on its own next event instead (considerIdentityRefused).
+// cannot run again (its leader may be gone), so this agent finishes the
+// pods left unfinished itself (finishRefused), wherever they run: what is
+// left to do then is reading and deleting them, which the API does for
+// any node.
 func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, again func(), log *logrus.Entry) {
 	decision := identityDecision(err)
 	observeIdentity(decision)
@@ -1101,45 +1106,42 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint 
 		again()
 		return
 	}
-	for _, p := range pending {
-		c.attempted.Store(identityRetryKey(p.UID), &identityRefusalRetry{key: key, checkpoint: checkpoint, pod: p, err: err, log: log})
+	if len(pending) > 0 {
+		go c.finishRefused(ctx, key, checkpoint, pending, err, log)
 	}
 }
 
-// identityRetryKey is the attempted key under which a pod's unfinished
-// refusal waits for the pod's next event.
-func identityRetryKey(uid types.UID) string { return "identity-refused/" + string(uid) }
+// identityFinishRetry paces finishRefused, as recoverRetry paces what an
+// earlier run left. Tests shorten it (identityFinishRetryMu).
+var (
+	identityFinishRetry   = struct{ first, max, total time.Duration }{time.Second, 30 * time.Second, 24 * time.Hour}
+	identityFinishRetryMu sync.RWMutex
+)
 
-// identityRefusalRetry is a pod's unfinished refusal.
-type identityRefusalRetry struct {
-	key, checkpoint string
-	pod             *corev1.Pod // as refused: its UID and restore annotation
-	err             error
-	log             *logrus.Entry
-}
-
-// considerIdentityRefused finishes, on pod's event, a refusal
-// identityRefused left unfinished for it; it waits again for the next
-// event while it stays unfinished.
-func (c *criuAutoRestorer) considerIdentityRefused(ctx context.Context, pod *corev1.Pod) {
-	v, ok := c.attempted.LoadAndDelete(identityRetryKey(pod.UID))
-	if !ok {
-		return
+// finishRefused tries pods' unfinished refusal again until every pod is
+// settled, for at most identityFinishRetry's total or until ctx ends.
+func (c *criuAutoRestorer) finishRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) {
+	identityFinishRetryMu.RLock()
+	b := identityFinishRetry
+	identityFinishRetryMu.RUnlock()
+	time.Sleep(b.first)
+	if rerr := retryUntil(ctx, b.first, b.max, b.total, func() (bool, error) {
+		pods, _, _ = c.settleRefused(ctx, key, checkpoint, pods, err, log)
+		return len(pods) == 0, nil
+	}); len(pods) > 0 {
+		log.WithError(rerr).WithField("pods", len(pods)).Error("identity restore: a refusal could not be finished; its pods are left as they are")
 	}
-	r := v.(*identityRefusalRetry)
-	go func() {
-		if pending, _, _ := c.settleRefused(context.WithoutCancel(ctx), r.key, r.checkpoint, []*corev1.Pod{r.pod}, r.err, r.log); len(pending) > 0 {
-			c.attempted.Store(identityRetryKey(r.pod.UID), r)
-		}
-	}()
 }
 
 // podRunsWorkload reports whether pod's container runs a GPU workload,
 // as a restore would refuse it (errNotPlaceholder): a restored engine an
-// earlier agent left. Without a runtime client nothing on the node can be
-// inspected, nor started cold, so it reports none. Tests replace it.
+// earlier agent left. Only a pod on this node can be inspected; one on
+// another node is reported as running none, and is decided with the
+// instance's pods on this node (settleRefused). Without a runtime client
+// nothing can be inspected, nor started cold, so it reports none. Tests
+// replace it.
 var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, container string) (bool, error) {
-	if a.runtime == nil {
+	if a.runtime == nil || pod.Spec.NodeName != a.config.NodeName {
 		return false, nil
 	}
 	info, err := a.runtime.FindContainerByPod(ctx, pod.Namespace, pod.Name, container)
@@ -1153,27 +1155,27 @@ var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, conta
 	return pid != 0, err
 }
 
-// settleRefused acts on each of pods (as refused, by UID and restore
-// annotation) for a refused restore, nothing counted against the
-// capture:
+// settleRefused acts on pods (as refused, by UID and restore annotation)
+// for a refused restore, nothing counted against the capture:
 //
 //   - a pod gone, replaced, or that no longer names its refused
 //     checkpoint is left as it is;
-//   - a pod that runs a workload already (podRunsWorkload) is kept as it
-//     is (running): the refusal neither replaces nor deletes it. When that
-//     cannot be told, the pod is handled as one that does not (it starts
-//     cold);
+//   - when any pod runs a workload already (podRunsWorkload), the restore
+//     ran before (an agent that stopped before it marked the pods): every
+//     pod is kept as it is (running), none started cold or deleted;
 //   - any other pod starts its workload cold in place. One that cannot is
 //     deleted, for its controller to replace, only once record key counts
 //     a stall for the refusal (chargeRefusal), so the replacements,
 //     admitted at once and refused the same way, end at
-//     criuGroupMaxStalls.
+//     criuGroupMaxStalls. A pod of which it cannot be told whether it runs
+//     a workload is never deleted: it starts cold, or stays unfinished.
 //
 // A pod that cannot be read, or deleted, or whose stall cannot be counted,
 // is returned unfinished (pending), and nothing is deleted then. acted
 // reports whether a pod started cold or was deleted.
 func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) (pending, running []*corev1.Pod, acted bool) {
-	var cold []*corev1.Pod
+	var live, unsure []*corev1.Pod
+	runs := false
 	for _, p := range pods {
 		pl := log.WithField("pod", p.Namespace+"/"+p.Name)
 		var pod *corev1.Pod
@@ -1188,31 +1190,42 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 			continue
 		}
 		if gerr != nil {
-			pl.WithError(gerr).Warn("identity restore refused, and the pod cannot be read; trying again on its next event")
+			pl.WithError(gerr).Warn("identity restore refused, and the pod cannot be read; trying again")
 			pending = append(pending, p)
 			continue
 		}
-		container := pod.Annotations[webhook.CRIURestoreContainerAnnotation]
-		runs, rerr := podRunsWorkload(ctx, c.a, pod, container)
-		if rerr != nil {
-			pl.WithError(rerr).Warn("identity restore refused, and whether the pod runs a workload cannot be told; it starts cold")
+		live = append(live, pod)
+		r, rerr := podRunsWorkload(ctx, c.a, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation])
+		switch {
+		case rerr != nil:
+			pl.WithError(rerr).Warn("identity restore refused, and whether the pod runs a workload cannot be told; it is not deleted")
+			unsure = append(unsure, pod)
+		case r:
+			runs = true
 		}
-		if runs && rerr == nil {
-			pl.Warn("identity restore refused, and the pod already runs its workload: kept as it is")
-			running = append(running, p)
-			continue
-		}
-		cerr := c.a.coldStartInPlace(ctx, pod, container, pl)
-		if cerr == nil {
+	}
+	if runs {
+		log.Warn("identity restore refused, and the instance already runs its workload: its pods are kept as they are")
+		return pending, live, false
+	}
+	var cold []*corev1.Pod
+	for _, pod := range live {
+		pl := log.WithField("pod", pod.Namespace+"/"+pod.Name)
+		cerr := c.a.coldStartInPlace(ctx, pod, pod.Annotations[webhook.CRIURestoreContainerAnnotation], pl)
+		switch {
+		case cerr == nil:
 			pl.Warn("identity restore refused; the pod starts cold in place")
 			acted = true
-			continue
+		case slices.Contains(unsure, pod):
+			pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused; the pod cannot start cold in place, and may run a workload: kept, trying again")
+			pending = append(pending, pod)
+		default:
+			pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused, and the pod cannot start cold in place")
+			cold = append(cold, pod)
 		}
-		pl.WithField("coldStart", cerr.Error()).Warn("identity restore refused, and the pod cannot start cold in place")
-		cold = append(cold, pod)
 	}
 	if len(cold) == 0 {
-		return pending, running, acted
+		return pending, nil, acted
 	}
 	var uerr error
 	if key != "" {
@@ -1220,7 +1233,7 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 	}
 	if uerr != nil && !apierrors.IsNotFound(uerr) {
 		log.WithError(uerr).Warn("identity restore: cannot count the refusal on the group record; its pods are kept and the refusal tried again")
-		return append(pending, cold...), running, acted
+		return append(pending, cold...), nil, acted
 	}
 	for _, pod := range cold {
 		if derr := c.a.deletePodRetrying(ctx, pod.Namespace, pod.Name, pod.UID); derr != nil {
@@ -1230,11 +1243,12 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 		}
 		acted = true
 	}
-	return pending, running, acted
+	return pending, nil, acted
 }
 
 // identityRefusedPodsKey lists, on a group record, the UIDs of the last
-// pods refusals counted a stall for (at most identityRefusedPodsMax).
+// pods refusals counted a stall for: at most identityRefusedPodsMax, or
+// every pod of the last refusal when it has more.
 const (
 	identityRefusedPodsKey = "refusedPods"
 	identityRefusedPodsMax = 32
@@ -1257,13 +1271,16 @@ func chargeRefusal(d map[string]string, checkpoint string, cold, all []*corev1.P
 	if !fresh || !recordFailure(d, checkpoint, false, cause) {
 		return false
 	}
+	// The refusal's own pods go last, so trimming the list to its bound
+	// drops older refusals' pods only, never one of this refusal's.
+	charged = slices.DeleteFunc(charged, func(u string) bool {
+		return slices.ContainsFunc(all, func(p *corev1.Pod) bool { return string(p.UID) == u })
+	})
 	for _, p := range all {
-		if !slices.Contains(charged, string(p.UID)) {
-			charged = append(charged, string(p.UID))
-		}
+		charged = append(charged, string(p.UID))
 	}
-	if n := len(charged); n > identityRefusedPodsMax {
-		charged = charged[n-identityRefusedPodsMax:]
+	if n, most := len(charged), max(identityRefusedPodsMax, len(all)); n > most {
+		charged = charged[n-most:]
 	}
 	d[identityRefusedPodsKey] = strings.Join(charged, ",")
 	return true

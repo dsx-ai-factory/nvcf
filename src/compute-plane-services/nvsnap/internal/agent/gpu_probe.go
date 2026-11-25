@@ -470,7 +470,7 @@ func (a *Agent) onPodGPUFault(ctx context.Context, pod *corev1.Pod, container st
 func (a *Agent) restoreProbed(ctx context.Context, req RestoreRequest) (*RestoreResult, error) {
 	res, err := a.Restore(ctx, req)
 	if err == nil || ctx.Err() != nil || errors.Is(err, errCheckpointUnavailable) || errors.Is(err, errNotPlaceholder) ||
-		a.kubeClient == nil || req.PlaceholderPodName == "" {
+		errors.Is(err, errPlaceholderReplaced) || a.kubeClient == nil || req.PlaceholderPodName == "" {
 		return res, err
 	}
 	pod, gerr := a.kubeClient.CoreV1().Pods(req.PlaceholderNamespace).Get(ctx, req.PlaceholderPodName, metav1.GetOptions{})
