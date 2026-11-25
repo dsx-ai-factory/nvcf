@@ -275,13 +275,18 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			// admitted under the cluster's drivers as they are now.
 			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
 		}
-		_, err := a.restoreProbed(rctx, RestoreRequest{
+		keeper, ierr := c.loneIdentityBeforeRestore(rctx, groupKey, ns, pod, id, log)
+		if ierr != nil {
+			return ierr
+		}
+		_, err := restoreLone(a, rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
 			PlaceholderPodName:       pod,
 			PlaceholderContainerName: container,
 			ReservePIDs:              true,
 		})
+		keeper.restored(err)
 		return err
 	}()
 	record := func(change func(map[string]string) bool) {
@@ -305,6 +310,11 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	}
 	if ctx.Err() != nil {
 		return // the agent stops; the next one restores the pod
+	}
+	if errors.Is(err, errIdentityRefused) {
+		// Nothing restored, nothing held against the capture.
+		c.identityRefused(context.WithoutCancel(ctx), ns, pod, uid, container, err, log)
+		return
 	}
 	if errors.Is(err, errNotPlaceholder) {
 		// Restored already (by this agent before a restart, which kept its

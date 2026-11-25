@@ -118,6 +118,17 @@ agent:
   # when another pod has that address. docs/design/RESTORE-POD-ADDRESS.md.
   restoreCapturedAddress: false
 
+  # Identity restore (docs/design/IDENTITY-RESTORE.md). A Dynamo worker that
+  # registers in an etcd shared with other workers (several workers behind
+  # one frontend) is refused capture today. With this on, it is captured
+  # alone, its companions excluded, and restored as its own captured
+  # identity: its etcd lease is granted again with the same ID, its keys
+  # rewritten to the new pod address, before the process runs. A restore
+  # whose identity is still held starts cold. Kubernetes discovery stays
+  # refused. Turning it off makes such captures start cold.
+  identityRestore:
+    enabled: false
+
   # Namespace label naming the tenant a namespace belongs to: a label your
   # platform stamps with the account or tenant id, one namespace users
   # cannot edit (NVCF: nca-id). Captures and caches are shared only between

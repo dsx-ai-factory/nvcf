@@ -162,6 +162,13 @@ func (a *Agent) groveInstanceCount(ctx context.Context, ns string, pods []corev1
 // just before a hold, or before a restore) the namespace's pods are listed
 // now, so a worker that started since an earlier list is seen.
 func (a *Agent) sharedCompanionsReason(ctx context.Context, pod *corev1.Pod, pods []corev1.Pod) (string, error) {
+	// A placeholder of a worker captured alone with its identity restores
+	// nothing its namespace shares (identity_etcd.go).
+	if alone, err := a.identityPlaceholder(ctx, pod); err != nil {
+		return "", err
+	} else if alone {
+		return "", nil
+	}
 	if groveInstance(pod) == "" {
 		if webhook.DynamoComponent(pod) {
 			if pods == nil {

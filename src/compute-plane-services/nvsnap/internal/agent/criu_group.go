@@ -337,12 +337,18 @@ func (a *Agent) lookupCRIUGroup(ctx context.Context, key string) (webhook.CRIUGr
 		}
 		return webhook.CRIUGroup{}, false
 	}
+	if !a.identityRecordVisible(key, cm.Data) {
+		return webhook.CRIUGroup{}, false
+	}
 	if cm.Data["state"] == criuGroupStateAlias {
 		// A rank of an instance whose ranks differ in configuration finds
 		// the instance's record through the alias of its own.
 		// A companion's alias also names its slots.
 		target, slots := cm.Data["alias"], parseSlots(cm.Data)
 		if cm, err = a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(target), metav1.GetOptions{}); err != nil {
+			return webhook.CRIUGroup{}, false
+		}
+		if !a.identityRecordVisible(target, cm.Data) {
 			return webhook.CRIUGroup{}, false
 		}
 		g, ok := parseCRIUGroup(target, cm.Data)
@@ -653,7 +659,8 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods")
 		return true
 	}
-	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
+	again, skip, alone := c.sharedBlocksCapture(ctx, leader, pods.Items, log)
+	if skip {
 		return again
 	}
 	// A rank the webhook never mutated is never one of the instance's ranks
@@ -685,7 +692,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			return false
 		}
 	}
-	companions, companionContainers, err := a.discoverCompanions(ctx, ranks, log)
+	var companions []*corev1.Pod
+	var companionContainers map[string]string
+	if !alone {
+		// Captured alone with its identity, the instance takes none of
+		// what its namespace shares (identity_etcd.go).
+		companions, companionContainers, err = a.discoverCompanions(ctx, ranks, log)
+	}
 	if errors.Is(err, errAgentNotYet) {
 		// As agentsSettled below: an agent rollout ends. Bounded: an agent
 		// that does not come (a node it cannot run on for a reason the
@@ -714,8 +727,21 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
-		if webhook.DynamoComponent(r) && len(companions) == 0 {
+		if webhook.DynamoComponent(r) && len(companions) == 0 && !alone {
+			if alone = c.identityAlone(ranks, "a Dynamo rank is connected to no etcd or NATS of its namespace", log); alone {
+				break
+			}
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
+			return false
+		}
+	}
+	var identity *capturedIdentity
+	if alone {
+		// Read before the freeze, while the worker holds its lease.
+		var why string
+		if identity, why = c.captureIdentity(ctx, leader, ranks); identity == nil {
+			observeIdentity(identityCaptureRefused)
+			log.WithField("reason", why).Warn("CRIU group capture: skipped; the worker's etcd identity cannot be read")
 			return false
 		}
 	}
@@ -808,7 +834,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	// Again just before the instance is held: the namespace's scaling
 	// groups may have grown while the instance warmed up.
-	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
+	if again, skip, _ := c.sharedBlocksCapture(ctx, leader, nil, log); skip {
 		return again
 	}
 	// Held for the capture before it is claimed: a member already
@@ -862,6 +888,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	aliases := c.a.instanceServiceAliases(ctx, members)
 	cctx, cancel := context.WithTimeout(ctx, criuGroupCaptureTimeout)
 	defer cancel()
+	if identity != nil {
+		cctx = withPeerReset(cctx, memberAddresses(members))
+	}
 	t0 := time.Now()
 	// Read while the ranks run: a capture stops them.
 	entrypoints := make([]string, len(ranks))
@@ -903,6 +932,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
+		}
+		if identity != nil {
+			if ierr := identity.write(data); ierr != nil {
+				log.WithError(ierr).Error("CRIU group capture: cannot record the worker's etcd identity")
+			} else {
+				observeIdentity(identityCaptured)
+			}
 		}
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
@@ -1452,7 +1488,8 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	// placeholders may skip setup.
 	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
 	for _, p := range ranks {
-		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use})
+		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use,
+			ResetPeersOutside: peerResetFrom(ctx)})
 	}
 	for _, p := range companions {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: companionContainers[p.Name],
@@ -1460,7 +1497,7 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	}
 	if len(reqs) == 1 {
 		// A failed dump puts the pod back as it was.
-		r, cerr := c.a.Checkpoint(ctx, reqs[0])
+		r, cerr := checkpointMember(c.a, ctx, reqs[0])
 		if cerr != nil {
 			return nil, false, cerr
 		}
@@ -1673,7 +1710,14 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
 	defer cancel()
-	_, err := a.groupRestore(rctx, req, log)
+	keeper, ierr := c.identityBeforeRestore(rctx, key, ranks, leader, log)
+	if ierr != nil {
+		observeIdentity(identityDecision(ierr))
+		c.failGroup(ctx, leader, key, false, fmt.Errorf("%w: %w", errCheckpointUnavailable, ierr), log)
+		return
+	}
+	_, err := restoreInstance(a, rctx, req, log)
+	keeper.restored(err)
 	if ac := new(addressCollision); errors.As(err, &ac) {
 		c.replaceColliding(ctx, leader, key, ac, log)
 		return

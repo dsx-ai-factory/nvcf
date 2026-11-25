@@ -241,6 +241,12 @@ type CheckpointRequest struct {
 	// (CheckpointResult.UsedMounts), for a group capture's decision on the
 	// setup its placeholders skip (webhook/unused_volumes.go).
 	VolumeUse bool `json:"volumeUse,omitempty"`
+
+	// ResetPeersOutside, when set, holds the pod addresses of the captured
+	// group: after a dump that kills the source, its connections to any
+	// other peer are reset, so a registry or frontend outside the group
+	// drops the dead source at once (identity_peer_reset.go).
+	ResetPeersOutside []string `json:"resetPeersOutside,omitempty"`
 }
 
 // CheckpointResult is the result of a checkpoint operation
@@ -778,7 +784,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	_, criuSpan := tracing.Tracer().Start(ctx, "checkpoint.criu_dump")
 	criuSpan.SetAttributes(attribute.String("nvsnap.criu.mode", "v2-inns"))
 	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession,
-		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot}
+		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot, ResetPeersOutside: req.ResetPeersOutside}
 	var (
 		frozenAt, dumpAt clocks
 		held             bool

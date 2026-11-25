@@ -242,6 +242,8 @@ type dumpV2Opts struct {
 	// snapshot was not taken fails. criuSaves names the mountpoints the
 	// dump saves itself, contents included (nil when it saves none).
 	Snapshot func(criuSaves map[string]bool) error
+	// ResetPeersOutside: CheckpointRequest.ResetPeersOutside.
+	ResetPeersOutside []string
 }
 
 func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, o dumpV2Opts, log *logrus.Entry) (_ *GPUShareInfo, retErr error) {
@@ -467,7 +469,12 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 	// with the agent's own CRIU (pidns_capture.go).
 	// dumped is CRIU's completion, not the error: a marker that cannot be
 	// written after CRIU dumped the container is nvsnap's failure.
+	peerReset, err := a.beginPeerReset(o, procBase, targetHostPID, log)
+	if err != nil {
+		return nil, err
+	}
 	dumped, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+	err = a.endPeerReset(ctx, peerReset, err, leaveRunning, checkpointDir)
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}

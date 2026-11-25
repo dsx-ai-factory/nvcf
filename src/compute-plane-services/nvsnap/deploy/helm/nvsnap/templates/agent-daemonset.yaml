@@ -193,6 +193,9 @@ spec:
             {{- if .Values.agent.restoreCapturedAddress }}
             - --restore-captured-address
             {{- end }}
+            {{- if (.Values.agent.identityRestore).enabled }}
+            - --identity-restore
+            {{- end }}
             {{- with .Values.agent.tenantLabel }}
             - --tenant-label={{ . }}
             {{- end }}

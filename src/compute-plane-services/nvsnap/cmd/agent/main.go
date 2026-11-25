@@ -247,6 +247,9 @@ func main() {
 	flag.BoolVar(&config.RestoreCapturedAddress, "restore-captured-address", false,
 		"Give a restored pod its captured pod address on its loopback, translated to its new address at its edge, when no other pod uses that address, so sockets opened after the restore can use it (docs/design/RESTORE-POD-ADDRESS.md).")
 
+	flag.BoolVar(&config.IdentityRestore, "identity-restore", false,
+		"Capture a Dynamo worker that registers in an etcd shared with other workers alone, with its etcd identity, and restore it as that identity: its lease granted again with the same ID and its keys rewritten to the new pod address (docs/design/IDENTITY-RESTORE.md).")
+
 	flag.IntVar(&config.Webhook.DynamoLeaseTTL, "webhook-dynamo-lease-ttl", 0,
 		"etcd lease TTL in seconds (ETCD_LEASE_TTL) for the Dynamo components that get the fixed Dynamo namespace, unless they set one; it must outlast a capture's freeze. 0 keeps Dynamo's default.")
 
