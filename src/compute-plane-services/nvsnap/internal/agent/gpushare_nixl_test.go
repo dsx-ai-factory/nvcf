@@ -852,12 +852,20 @@ func TestCapturePreflight_NIXLRankNodes(t *testing.T) {
 	if !preflightBlocked(two, "nixl-pause") {
 		t.Errorf("ranks on two nodes: %+v, want a nixl-pause block", two)
 	}
+	// Annotated but admitted without the marker (before the switch was
+	// on): not opted in, so the capture does not pause them, and the
+	// rule does not block them.
+	unmarked := func(name, node string) *corev1.Pod {
+		p := rank(name, node)
+		p.Spec.Containers[1].Env = nil
+		return p
+	}
+	notOpted := a.capturePreflight(context.Background(), []*corev1.Pod{unmarked("w0", "n1"), unmarked("w1", "n2")}, nil, nil, testLog())
+	if preflightBlocked(notOpted, "nixl-pause") {
+		t.Errorf("annotated ranks not opted in, on two nodes: %+v, want no nixl-pause block", notOpted)
+	}
 }
 
-// restoreV2's NIXL step, as nixlResumeFor builds it: refused before CRIU
-// when the node cannot resume it; otherwise a resume, run later, through
-// the restored tree's tool pid (set after the build, by the GPU resume),
-// at the address read up front.
 // A refused step builder still hands back a step, which fails with the
 // refusal: a restore that ignored the builder's error and ran would fail
 // its tail closed (marked not serving, for disposal), not call a nil
@@ -877,6 +885,10 @@ func TestNIXLResumeFor_RefusedStepFailsClosed(t *testing.T) {
 	}
 }
 
+// restoreV2's NIXL step, as nixlResumeFor builds it: refused before CRIU
+// when the node cannot resume it; otherwise a resume, run later, through
+// the restored tree's tool pid (set after the build, by the GPU resume),
+// at the address read up front.
 func TestNIXLResumeFor_BuildsTheTailsStep(t *testing.T) {
 	a := &Agent{}
 	gs := &GPUShareInfo{PIDs: []int{7}, NIXL: true}

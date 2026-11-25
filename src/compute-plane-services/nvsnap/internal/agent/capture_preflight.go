@@ -549,9 +549,11 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 	}
 	// The capture's rule (nixlSpansNodes): an engine whose GPU ranks run on
 	// more than one node is not paused. One rank with its companions is.
+	// Only a rank opted in (nixlOptInFromPod) is paused: a rank annotated
+	// but admitted without the marker is captured as not opted in.
 	if n := rankNodes(ranks); n > 1 && a.nixlPauseOn() {
 		for _, r := range ranks {
-			if r.Annotations[webhook.NIXLPauseAnnotation] == "true" {
+			if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), r, gpuContainer(r)); opted {
 				fs = append(fs, PreflightFinding{Pod: r.Name, Container: gpuContainer(r), Severity: preflightBlock, Check: "nixl-pause",
 					Detail: fmt.Sprintf("the pod opted in to nixl-pause, but its engine spans nodes (its GPU ranks run on %d nodes); nixl-pause is not supported for an engine that spans nodes yet", n)})
 			}
