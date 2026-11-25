@@ -163,6 +163,30 @@ agent:
   # modelVolume.readerMode: pvc); readerMode: hostPath schedules readers
   # at once and binds the volume in, for gang-scheduled charts where
   # policy allows hostPath. Needs agent.l2. Off until qualified.
+  # Node-local model cache (docs/design/node-model-cache.md). A cold pod
+  # whose init downloads its model into an emptyDir seeds it from a copy on
+  # its node, or one the agent fetches from a peer node, instead of
+  # downloading; after a real download the agent keeps a copy. The pod's
+  # volumes, its main container and restores are unchanged, and any cache
+  # problem falls back to the pod's own download. Needs agent.auth
+  # enabled with mode required; not with modelVolume.
+  nodeModelCache:
+    enabled: false
+    # Host directory of the cache, on the node's local disk (NVMe).
+    root: /var/lib/containers/nvsnap-model-cache
+    # Most of root's filesystem the cache may use, in percent. 10% of the
+    # filesystem always stays free.
+    maxPercent: 30
+    # Most seconds a download init waits for a peer fetch in progress.
+    wait: 600
+    # Most time one fetch from one peer may take.
+    fetchTimeout: 30m
+    # One pod per model downloads from the registry; the other pods stream
+    # its download from its node as the files land, instead of each
+    # downloading (docs/design/model-cache-single-flight.md). The agent then
+    # mounts kubeletPodsDir read-write, to write those pods' volumes.
+    singleFlight: false
+    kubeletPodsDir: /var/lib/kubelet/pods
   modelVolume:
     enabled: false
     # How long a reader waits for the writer's download before it downloads
@@ -579,6 +603,16 @@ agent:
       memory: 64Gi
     # Share of the checkpoint filesystem a copy must leave free.
     keepFreePercent: 10
+    # How a rails pod gets its node's RDMA NICs. "claim": every NIC,
+    # through DRA (deviceClass). "host": none claimed; it runs in the
+    # host's network namespace, privileged, on `devices`. For clusters
+    # whose NICs are a device-plugin resource the workers take whole, with
+    # the physical functions left on the host (the workers hold virtual
+    # functions): the copy shares the ports with the workers' traffic.
+    nicMode: claim
+    # bedrock-peer --devices: all, netns, or comma-separated RDMA device
+    # names. Empty: all when claiming, netns on host NICs.
+    devices: ""
 
 # ─── NvSnap Server (REST API + UI) ───────────────────────────────────────
 
@@ -670,6 +704,18 @@ webhook:
   # or for a gradual rollout. The pod-level opt-out applies in both.
   injectScope: all
 
+  # Let a group restore's placeholders skip the init containers that fill
+  # only emptyDirs too large to copy into the checkpoint (over
+  # NVSNAP_REPLAY_EMPTYDIR_MAX_BYTES, 4 GiB) that no restored process of
+  # any member uses, typically a model download: without a model volume,
+  # every placeholder would download the whole model again before its
+  # restore could start. Decided once per group at capture, from the dumps;
+  # pods with no recreating controller, Jobs' pods, and pods annotated
+  # nvsnap.io/keep-inits never skip. Verify does not send inference
+  # requests, so a workload that reads its model files again after it
+  # starts would serve errors from a restore: keep off in production until
+  # verify checks inference.
+  skipUnusedInits: false
   # Fixed Dynamo namespace (DYN_NAMESPACE and DYN_NAMESPACE_PREFIX) for
   # Dynamo components whose etcd and NATS are services of their own
   # Kubernetes namespace. The operator derives the Dynamo namespace from the
@@ -711,6 +757,16 @@ webhook:
   # is down stays held until the agent is back. false: pods serve as soon
   # as they are Ready, and a capture may stop an instance that serves.
   captureHold: true
+
+  # Point NCCL in every GPU pod under the gpushare library at the bundled
+  # verbs library (libnvsnap_ibv.so, NCCL_IBVERBS_LIB), so that a workload
+  # whose NCCL uses RDMA (IB or RoCE) can be captured: the library releases
+  # NCCL's RDMA state before the checkpoint and creates it again after the
+  # restore. Without it, the capture of such a workload is refused and it
+  # starts cold. A pod annotated nvsnap.io/gpushare-ibv: "false", or one
+  # that sets NCCL_IBVERBS_LIB itself, keeps NCCL's own library. Other RDMA
+  # users in the pod (UCX, NIXL) are not covered.
+  gpushareIBV: false
 
   # Capture disaggregated vLLM pods whose KV transfer is NIXL over RDMA
   # (docs/design/NIXL-PAUSE.md). A pod opts in with the annotation

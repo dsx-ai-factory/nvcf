@@ -6,16 +6,28 @@ branch-based SemVer docs editions for qualified three-stack combinations.
 
 ## Chart image settings
 
-NATS, cert-manager, OpenBao and Cassandra expose their image settings in each
-wrapper's `values.yaml`. Helm consumes the existing image keys directly. No
-inventory command, mapping file or mirror generator is required to install.
-NVCF rebuilds retain their own release provenance and versions.
+Every image source must be explicit and overridable through values. Where
+the outermost configuration lives depends on the chart class:
 
-The `thirdPartyImages` and `ownedImages` maps are a CI index of those existing
-keys. They do not duplicate image versions and are not runtime overrides.
-Change the referenced image settings with an ordinary Helm values file.
+- Stack-deployed: a released stack (one with `release-inventory.yaml`)
+  deploys the chart. The stack `base.yaml` states the default source, and
+  users override it in layered values. CI requires each indexed image
+  `registry` and `repository` in the chart `values.yaml` to be empty, and the
+  chart to fail to render until a values file supplies them.
+- Standalone: no released stack deploys the chart, so users install it
+  directly with Helm. The chart `values.yaml` is the outermost configuration,
+  so CI requires each indexed `registry` and `repository` to hold a working
+  default that a plain `helm install` uses.
 
-For example, NATS accepts renamed repositories at the existing paths:
+Charts listed as pending-fix in `chart-image-exclusions.yaml` do not comply
+yet. Tags and digests may stay in the chart; they pin the version, not the
+source.
+
+The `thirdPartyImages` and `ownedImages` maps are a CI index of the image keys.
+They do not duplicate image versions and are not runtime overrides. Change the
+referenced image settings with an ordinary Helm values file.
+
+For example, NATS takes its sources at the existing paths:
 
 ```yaml
 nats:
@@ -46,16 +58,21 @@ helm upgrade --install nats deploy/helm/nats -f /path/images.yaml
 Use repositories containing the selected versions. Image copying and artifact
 identity verification belong to release preparation. Values overrides do not
 publish or verify images. A single global registry setting does not retarget
-every chart. cert-manager supports full `repository`, `tag` and `digest`
-overrides for all five images; empty tags inherit the vendored appVersion.
-OpenBao and Cassandra accept separate `registry`, `repository` and `tag` fields.
-Their tag fields also accept `tag@sha256:digest` references.
+every chart. cert-manager takes `registry`, `repository`, `tag` and `digest`
+for all five images; when both tag and digest are empty, the image inherits
+the vendored appVersion. OpenBao and Cassandra take separate `registry`,
+`repository` and `tag` fields. Their tag fields also accept
+`tag@sha256:digest` references.
 
-CI checks image coverage for every tracked chart. A chart either declares
+CI runs the chart image checks on every tracked chart. A chart either declares
 an image index and passes, or is listed in `chart-image-exclusions.yaml`. For
-covered charts it renders defaults, every CI values scenario and ordinary
-overrides, including hooks, init containers, injected agents and the ACME
-solver argument:
+an indexed chart it checks the chart values and templates for an implicit
+image source, requires the defaults render of a stack-deployed chart to fail
+with a guard that names the values path, and renders every CI values scenario
+with ordinary overrides, including hooks, init containers, injected agents and
+the ACME solver argument. Each finding names the chart class. Classification
+runs `helmfile build` on the released stacks, so the check needs `helmfile`
+as well as `helm`:
 
 ```sh
 NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestChartImageCoverage$' -count=1

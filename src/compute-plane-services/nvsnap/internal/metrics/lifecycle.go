@@ -262,12 +262,40 @@ var (
 )
 
 // lifecycleCollectors are registered with the agent's.
+// Node-local model cache (docs/design/node-model-cache.md).
+var (
+	// ModelCacheInits counts wrapped download inits that finished, by
+	// what filled the volume: seeded from the cache, downloaded, or the
+	// download failed.
+	ModelCacheInits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_inits_total",
+		Help:      "Model download inits the node cache wraps, by how the volume was filled: seeded, downloaded, failed.",
+	}, []string{"result"})
+
+	// ModelCacheOps counts the agent's cache operations: harvest (keep a
+	// finished download), fetch (copy a key from a peer), evict.
+	ModelCacheOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_operations_total",
+		Help:      "Node model cache operations by kind (harvest, fetch, evict) and result (ok, error, skipped).",
+	}, []string{"op", "result"})
+
+	// ModelCacheBytes counts the bytes harvests and fetches wrote.
+	ModelCacheBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_bytes_total",
+		Help:      "Bytes the node model cache wrote, by operation (harvest, fetch).",
+	}, []string{"op"})
+)
+
 var lifecycleCollectors = []prometheus.Collector{
 	CaptureOutcomes, CapturePhaseSeconds, CaptureBytes,
 	RestoreOutcomes, RestorePhaseSeconds, RestoreFetches, RestoreFetchSeconds,
 	PodReadySeconds, PodStartSeconds, TeardownOutcomes, TeardownSeconds,
 	CaptureRecords, CaptureRecordOldestSeconds, CaptureRecordsUnrestored, InventoryLeader, InventoryScanTimestamp,
 	Admissions, WebhookRequests, WebhookSeconds, GPUProbes, BuildInfo,
+	ModelCacheInits, ModelCacheOps, ModelCacheBytes,
 }
 
 // Ranks buckets an instance size: the label stays bounded for instances of
@@ -314,7 +342,29 @@ const (
 	// NoGPUProcessText: a multi-node instance's pod had no process on the
 	// GPU under the gpushare library to capture.
 	NoGPUProcessText = "no process of this pod runs on the gpu"
+	// ModelExpressVersionText: the workload loads its weights through a
+	// ModelExpress older than 0.7, which cannot release its state for a
+	// capture (the GPU tool's mx-pause refuses it). Not captured until
+	// the workload updates ModelExpress.
+	ModelExpressVersionText = "needs modelexpress >= 0.7"
 )
+
+// The texts Reason classes as a capture that broke the workload it left
+// running: nvsnap's doing, which the capture alert counts.
+const (
+	// GPUFaultText: the node's kernel reported a GPU fault (an NVLink
+	// Xid) on the workload's GPUs between the start of a leave-running
+	// capture and its resume (internal/agent/kmsg.go).
+	GPUFaultText = "the kernel reported a gpu fault during the capture"
+	// ResumeStalledText: a leave-running capture resumed the workload, but
+	// it stopped serving after (internal/agent/resume_guard.go).
+	ResumeStalledText = "the workload stopped making progress after resume"
+)
+
+// BundleUnavailableText starts the error of a restore that cannot run
+// because no node has the bundle version its checkpoint recorded (lower
+// case, as Reason matches it).
+const BundleUnavailableText = "bundle version unavailable"
 
 // Reason classes a failure's text into a bounded label value.
 func Reason(text string) string {
@@ -322,12 +372,24 @@ func Reason(text string) string {
 	switch {
 	case t == "":
 		return ""
-	// The workload's own doing, checked first: the rest of the text is
+	// An outcome the agent names itself, ahead of any text it carries
+	// (a peer's name may hold "mptcp" or "gpushare").
+	case strings.HasPrefix(t, BundleUnavailableText):
+		return "bundle_unavailable"
+	// A GPU fault the capture raised, next: a workload that exited, or
+	// stopped, after one did so because of it.
+	case strings.Contains(t, GPUFaultText):
+		return "gpu_xid"
+	// The workload's own doing, checked next: the rest of the text is
 	// what the capture ran into because of it.
 	case strings.Contains(t, WorkloadExitedText):
 		return "workload_exited"
 	case strings.Contains(t, NoGPUProcessText):
 		return "no_gpu_process"
+	case strings.Contains(t, ModelExpressVersionText):
+		return "modelexpress_version"
+	case strings.Contains(t, ResumeStalledText):
+		return "resume_stalled"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):
@@ -458,4 +520,25 @@ func SetBuildInfo(version string) {
 	}
 	BuildInfo.Reset()
 	BuildInfo.WithLabelValues(version).Set(1)
+}
+
+// CountModelCacheInit counts how a wrapped download init filled its
+// volume (seeded, downloaded, failed), held on first sight.
+func CountModelCacheInit(result string) {
+	count("model_cache_inits", ModelCacheInits, result)
+}
+
+// CountModelCacheOp counts a node model cache operation (harvest, fetch,
+// evict) by result, held on first sight.
+func CountModelCacheOp(op, result string) {
+	count("model_cache_operations", ModelCacheOps, op, result)
+}
+
+// AddModelCacheBytes adds the n bytes op wrote, held on first sight.
+func AddModelCacheBytes(op string, n int64) {
+	if n <= 0 {
+		return
+	}
+	sight.observe("model_cache_bytes", []string{op}, func() { ModelCacheBytes.WithLabelValues(op) },
+		func() { ModelCacheBytes.WithLabelValues(op).Add(float64(n)) })
 }

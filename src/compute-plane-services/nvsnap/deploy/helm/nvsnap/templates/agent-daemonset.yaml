@@ -116,6 +116,10 @@ spec:
             - --rails-fetch-cpu={{ .fetch.cpu }}
             - --rails-fetch-memory={{ .fetch.memory }}
             - --rails-keep-free-percent={{ .keepFreePercent }}
+            - --rails-nic-mode={{ .nicMode | default "claim" }}
+            {{- with .devices }}
+            - --rails-devices={{ . }}
+            {{- end }}
             {{- end }}
             {{- end }}
             - --rootfs-capture
@@ -149,6 +153,24 @@ spec:
             - --cache-set-refresh-cooldown={{ .Values.agent.cacheVolume.refreshCooldown }}
             {{- end }}
             - --model-volume-host-root={{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
+            {{- end }}
+            {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+            {{- if and .Values.agent.modelVolume .Values.agent.modelVolume.enabled }}
+            {{- fail "agent.nodeModelCache and agent.modelVolume cannot both be enabled" }}
+            {{- end }}
+            {{- if not (and .Values.agent.auth.enabled (eq .Values.agent.auth.mode "required")) }}
+            {{- fail "agent.nodeModelCache needs agent.auth.enabled=true and agent.auth.mode=required: its routes serve models between nodes" }}
+            {{- end }}
+            # node-local model cache (values: agent.nodeModelCache)
+            - --node-model-cache
+            - --node-model-cache-root={{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            - --node-model-cache-max-percent={{ .Values.agent.nodeModelCache.maxPercent | default 30 }}
+            - --node-model-cache-wait={{ .Values.agent.nodeModelCache.wait | default 600 }}
+            - --node-model-cache-fetch-timeout={{ .Values.agent.nodeModelCache.fetchTimeout | default "30m" }}
+            {{- if .Values.agent.nodeModelCache.singleFlight }}
+            - --node-model-cache-single-flight
+            - --node-model-cache-pods-root=/var/lib/nvsnap/kubelet-pods
+            {{- end }}
             {{- end }}
             {{- if and .Values.agent.election .Values.agent.election.enabled }}
             # one-downloader election (values: agent.election)
@@ -186,6 +208,9 @@ spec:
             {{- with .Values.webhook.dynamoNamespace }}
             - --webhook-dynamo-namespace={{ . }}
             {{- end }}
+            {{- if .Values.webhook.skipUnusedInits }}
+            - --webhook-skip-unused-inits
+            {{- end }}
             {{- with .Values.webhook.dynamoLeaseTTL }}
             - --webhook-dynamo-lease-ttl={{ . }}
             {{- end }}
@@ -194,6 +219,9 @@ spec:
             {{- end }}
             {{- if .Values.webhook.captureHold }}
             - --webhook-capture-hold=true
+            {{- end }}
+            {{- if .Values.webhook.gpushareIBV }}
+            - --webhook-gpushare-ibv=true
             {{- end }}
             {{- if .Values.webhook.nixlPause.enabled }}
             - --webhook-nixl-pause=true
@@ -364,8 +392,12 @@ spec:
             # Mounted at its host path so the agent's runtime probe sees the
             # right name: /run/containerd/containerd.sock is containerd,
             # /run/crio/crio.sock is CRI-O (hostPaths.containerdSock).
+            # The socket's directory is mounted, not the socket: a runtime
+            # restart replaces the socket file, and a mount of the file keeps
+            # the deleted one, so every runtime call is refused until the
+            # agent restarts.
             - name: containerd-sock
-              mountPath: {{ .Values.agent.hostPaths.containerdSock }}
+              mountPath: {{ dir .Values.agent.hostPaths.containerdSock }}
             - name: host-proc
               mountPath: /host/proc
               readOnly: true
@@ -411,6 +443,20 @@ spec:
               mountPath: {{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
               mountPropagation: Bidirectional
             {{- end }}
+            {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+            # Node model cache: same path in the agent and on the host, as
+            # admission mounts <root>/<key> read-only into download inits.
+            - name: nvsnap-model-cache
+              mountPath: {{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            {{- if .Values.agent.nodeModelCache.singleFlight }}
+            # Single flight writes waiting pods' model volumes; the host
+            # root above is read-only. HostToContainer: pods' in-memory
+            # emptyDirs (the signal volume) are mounts made after start.
+            - name: kubelet-pods
+              mountPath: /var/lib/nvsnap/kubelet-pods
+              mountPropagation: HostToContainer
+            {{- end }}
+            {{- end }}
             {{- if .Values.webhook.enabled }}
             - name: webhook-tls
               mountPath: /etc/nvsnap/webhook
@@ -445,6 +491,18 @@ spec:
             path: {{ .Values.agent.hostPaths.nvsnapModels | default "/var/lib/containerd/nvsnap-models" }}
             type: DirectoryOrCreate
         {{- end }}
+        {{- if and .Values.agent.nodeModelCache .Values.agent.nodeModelCache.enabled }}
+        - name: nvsnap-model-cache
+          hostPath:
+            path: {{ .Values.agent.nodeModelCache.root | default "/var/lib/containers/nvsnap-model-cache" }}
+            type: DirectoryOrCreate
+        {{- if .Values.agent.nodeModelCache.singleFlight }}
+        - name: kubelet-pods
+          hostPath:
+            path: {{ .Values.agent.nodeModelCache.kubeletPodsDir | default "/var/lib/kubelet/pods" }}
+            type: Directory
+        {{- end }}
+        {{- end }}
         {{- if .Values.agent.podCacheDir }}
         - name: cachedir-env
           configMap:
@@ -453,8 +511,8 @@ spec:
         {{- end }}
         - name: containerd-sock
           hostPath:
-            path: {{ .Values.agent.hostPaths.containerdSock }}
-            type: Socket
+            path: {{ dir .Values.agent.hostPaths.containerdSock }}
+            type: Directory
         - name: host-proc
           hostPath:
             path: /proc

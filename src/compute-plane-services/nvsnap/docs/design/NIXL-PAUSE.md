@@ -54,7 +54,7 @@ The variables are added after the process configuration is stamped from the pod 
 
   RDMA of any other process still blocks.
 - **Pause.** Right before the suspend, after the instance is held and the capture claimed, as `mx-pause`, the agent runs `nixl-pause` on the GPU processes. The agent allows 3 minutes. If the tool fails, the capture fails there with the tool's reason, before anything is stopped. The tool resumes the engine on failure, but the agent's timeout could stop it first, so the agent also runs `nixl-resume`; on an engine that is not paused it answers `not paused`. If that resume fails too, the source is replaced.
-  - The usual refusal is NCCL at TP > 1 in a pod with RDMA NICs: NCCL opens the RDMA devices even within one node and keeps them open until the process exits.
+  - The usual refusal is NCCL at TP > 1 in a pod with RDMA NICs: NCCL opens the RDMA devices even within one node and keeps them open until the process exits. The tool does not count NCCL's RDMA when NCCL takes its verbs from the bundled `libnvsnap_ibv.so` (chart `webhook.gpushareIBV` or pod annotation `nvsnap.io/gpushare-ibv`, GPUSHARE.md "NCCL over InfiniBand or RoCE"), which releases it at the GPU suspend. That combination has not been run with a NIXL KV engine yet.
   - Neither nvsnap nor this document suggests changing the workload's transport to get around a refusal.
 - **No connector.** A pod that opted in but has no NIXL KV connector answers `ok no NIXL KV connector`, and captures as before.
 - **Rollback.** On every path where the source runs on (a failed capture after the pause, a leave-running dump), the agent runs `nixl-resume` (without `--host`) after the source's GPU resume. If that fails, the source is reported as left suspended and is replaced, since it would read Ready and serve nothing.
@@ -73,7 +73,7 @@ A restore into another pod also needs the library's UCX route refresh. UCX reads
 ## Not covered
 
 - SGLang and TRT-LLM;
-- NCCL over InfiniBand or RoCE;
+- NCCL over InfiniBand or RoCE, unless NCCL loads `libnvsnap_ibv.so` (above);
 - engines that span nodes;
 - ModelExpress and NIXL KV in one pod;
 - push-mode connectors and host-buffer KV.

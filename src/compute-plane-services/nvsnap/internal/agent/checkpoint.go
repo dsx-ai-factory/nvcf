@@ -213,6 +213,11 @@ type CheckpointRequest struct {
 	// session driven by another agent (see gpushare_fabric.go): the
 	// suspend and resume coordinate with the workload's other pods.
 	GPUShareFabricSession string `json:"gpushareFabricSession,omitempty"`
+	// GPUShareSyncOpen is set by a session's driver that runs the open
+	// phase (fabricOpener): only then does a member's in-place resume hold
+	// its GPU launches until every node has resumed (syncOpenFor). A
+	// driver from before it never answers the hold, and omits the field.
+	GPUShareSyncOpen bool `json:"gpushareSyncOpen,omitempty"`
 	// GPUShareGroupIndex and GPUShareGroupSize place this pod in its
 	// session's group; a group restore maps each checkpoint back to a pod
 	// by them.
@@ -231,6 +236,11 @@ type CheckpointRequest struct {
 	// gets an identity of its own instead of the content hash, which
 	// several captures of one configuration share.
 	CaptureID string `json:"captureId,omitempty"`
+
+	// VolumeUse asks for the mounts the dumped processes use
+	// (CheckpointResult.UsedMounts), for a group capture's decision on the
+	// setup its placeholders skip (webhook/unused_volumes.go).
+	VolumeUse bool `json:"volumeUse,omitempty"`
 }
 
 // CheckpointResult is the result of a checkpoint operation
@@ -271,6 +281,15 @@ type CheckpointResult struct {
 	// these (the dedup-relevant subset per
 	// checkpointstore.HashInput).
 	CatalogInfo *CatalogInfo `json:"catalogInfo,omitempty"`
+
+	// UsedMounts are the mountpoints of the mounts the dumped processes
+	// use (volume_uses.go), when the request asked (VolumeUse): nil when
+	// not known, empty for none.
+	UsedMounts *[]string `json:"usedMounts,omitempty"`
+	// LargeEmptyDirs are the mountpoints of the emptyDirs too large to
+	// copy into the checkpoint (captureReplayMounts), whose contents a
+	// restore does not bring back.
+	LargeEmptyDirs []string `json:"largeEmptyDirs,omitempty"`
 }
 
 // SkippedResources tracks resources that were intentionally skipped during dump.
@@ -656,8 +675,7 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 		// A failed capture leaves nothing a restore could use; its logs are
 		// kept to say why.
 		if retErr != nil {
-			writeToolOutput(checkpointDir, retErr)
-			keepFailureLogs(a.config.CheckpointDir, checkpointDir, log)
+			retErr = keepFailedCapture(a.config.CheckpointDir, checkpointDir, retErr, log)
 			if err := os.RemoveAll(checkpointDir); err != nil {
 				log.WithError(err).WithField("dir", checkpointDir).Warn("cannot remove the failed capture's directory")
 			}
@@ -718,8 +736,9 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	// deletion). A checkpoint without its diff cannot restore, so a failed
 	// archive fails the dump, which CRIU then rolls back.
 	var replayMounts []ReplayMount
+	var largeEmptyDirs []string
 	times := &rankTimes{}
-	takeSnapshot := a.dumpSnapshot(ctx, containerInfo, checkpointDir, sourceUpperdir, sourceMountPoints, &replayMounts, log)
+	takeSnapshot := a.dumpSnapshot(ctx, containerInfo, checkpointDir, sourceUpperdir, sourceMountPoints, &replayMounts, &largeEmptyDirs, log)
 	snapshot := func(criuSaves map[string]bool) error {
 		defer func(t0 time.Time) { times.add("snapshot", time.Since(t0)) }(time.Now())
 		return takeSnapshot(criuSaves)
@@ -758,7 +777,8 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	// legacy path — the artifact contract is identical.
 	_, criuSpan := tracing.Tracer().Start(ctx, "checkpoint.criu_dump")
 	criuSpan.SetAttributes(attribute.String("nvsnap.criu.mode", "v2-inns"))
-	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession, Snapshot: snapshot}
+	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession,
+		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot}
 	var (
 		frozenAt, dumpAt clocks
 		held             bool
@@ -978,6 +998,15 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 		Timestamp:      time.Now(),
 		Hash:           catalog.Hash,
 		CatalogInfo:    &catalog,
+		LargeEmptyDirs: largeEmptyDirs,
+	}
+	if req.VolumeUse {
+		if used, uerr := dumpUsedMounts(checkpointDir); uerr != nil {
+			log.WithError(uerr).Warn("Cannot tell which mounts the dumped processes use; the group's restores run all their setup")
+		} else {
+			result.UsedMounts = &used
+			log.WithFields(logrus.Fields{"usedMounts": used, "largeEmptyDirs": largeEmptyDirs}).Info("Mounts the dumped processes use")
+		}
 	}
 
 	// Phase 5d: removed the legacy promoteCheckpointToBackend call. The
@@ -1376,7 +1405,10 @@ type CompressedFile struct {
 // them itself, and the restored process never sees a replayed copy (a
 // 64 GiB /dev/shm KV offload pool cost 42 s at capture and 52 s at
 // restore, dev2 2026-10-20).
-func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, criuSaves map[string]bool, log *logrus.Entry) []ReplayMount {
+//
+// The mountpoints of the emptyDirs too large to copy go into *tooLarge,
+// when not nil.
+func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, criuSaves map[string]bool, tooLarge *[]string, log *logrus.Entry) []ReplayMount {
 	var replayMounts []ReplayMount
 	_, replaySpan := tracing.Tracer().Start(ctx, "checkpoint.capture_replay_mounts")
 	allowlist := ReplayMountAllowlist()
@@ -1404,6 +1436,9 @@ func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containe
 			if err != nil || over {
 				log.WithError(err).WithFields(logrus.Fields{"mp": mi.MountPoint, "bytes": n, "limit": emptyDirMax}).
 					Warn("emptyDir not copied into the checkpoint: too large or unreadable; a restore that needs its files fails and starts cold")
+				if err == nil && tooLarge != nil {
+					*tooLarge = append(*tooLarge, mi.MountPoint)
+				}
 				continue
 			}
 		}
@@ -1446,9 +1481,9 @@ func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containe
 // hook (dump_snapshot.go): the replay mounts, into *replayMounts, then the
 // archive of the upperdir, whose failure fails the snapshot.
 func (a *Agent) dumpSnapshot(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir, sourceUpperdir string,
-	sourceMountPoints []string, replayMounts *[]ReplayMount, log *logrus.Entry) func(criuSaves map[string]bool) error {
+	sourceMountPoints []string, replayMounts *[]ReplayMount, tooLarge *[]string, log *logrus.Entry) func(criuSaves map[string]bool) error {
 	return func(criuSaves map[string]bool) error {
-		*replayMounts = a.captureReplayMounts(ctx, containerInfo, checkpointDir, criuSaves, log)
+		*replayMounts = a.captureReplayMounts(ctx, containerInfo, checkpointDir, criuSaves, tooLarge, log)
 		return a.mirrorRootfsDiff(ctx, checkpointDir, sourceUpperdir, sourceMountPoints, log)
 	}
 }
