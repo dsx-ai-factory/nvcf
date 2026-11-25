@@ -66,7 +66,7 @@ When the capture paused the connector:
 
 1. Once the restored processes' GPU launches run and the network is unlocked (after `open` and the network unlock for a group, after `resume` otherwise), the agent runs `nixl-resume`.
 2. If the restore moved the pod, it passes the pod's own IP as `--host`, which becomes the side channel's address. The IP comes from the restore's address map, else from the API server. If the pod's address can't be read, the restore fails instead of resuming at the captured address, which the pod may not own. Decode engines learn a prefill engine's address per request, so nothing else needs the new IP.
-3. The resume runs on the restore's path. If it fails, or the node's tool has no `nixl-resume`, **the restore fails and the replica starts cold**.
+3. The resume runs on the restore's path. If it fails, or the node's tool has no `nixl-resume`, **the restore fails and the replica starts cold**. The agent disposes of the placeholder, whose engine runs and takes no requests, on every path: a group's leader for its members, the automatic restore for its pod, and the agent itself for a single-pod restore requested through `POST /v1/restore` (the pod is deleted when its controller replaces it, else started cold in place).
 
 A restore into another pod also needs the library's UCX route refresh. UCX reads the routing table once per process, and a restored process would otherwise keep the old pod's routes. The library handles UCX 1.22; with another version it logs that UCX keeps the old routes, and `nixl-resume` fails as above.
 

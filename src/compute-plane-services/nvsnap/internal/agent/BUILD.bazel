@@ -276,6 +276,7 @@ go_test(
         "restore_address_test.go",
         "restore_clock_gpu_test.go",
         "restore_clock_test.go",
+        "restore_handler_test.go",
         "restore_prep_http_test.go",
         "restore_prep_test.go",
         "restore_span_learned_test.go",

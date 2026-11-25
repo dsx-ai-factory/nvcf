@@ -32,6 +32,9 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
 )
 
 const (
@@ -282,4 +285,31 @@ func nixlPauseFindings(fs []PreflightFinding, pausable map[int]bool, procBase, p
 		out = append(out, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "nixl-pause", Detail: limit})
 	}
 	return out
+}
+
+// restoredNotServingError is a restore that failed after the restored
+// processes ran in the placeholder, leaving an engine that takes no
+// requests in a pod that may read Ready: its NIXL KV connector did not
+// resume. Namespace, Pod, UID and Container name the placeholder, for
+// whoever disposes of it (disposeFailedPlaceholder).
+type restoredNotServingError struct {
+	Namespace, Pod, Container string
+	UID                       types.UID
+	err                       error
+}
+
+func (e *restoredNotServingError) Error() string { return e.err.Error() }
+func (e *restoredNotServingError) Unwrap() error { return e.err }
+
+// restoredNotServing marks err, a failure after the restored processes
+// ran in the placeholder info, as restoredNotServingError.
+func restoredNotServing(info *containerd.ContainerInfo, err error) error {
+	e := &restoredNotServingError{err: err}
+	if info != nil {
+		e.Namespace = info.Labels["io.kubernetes.pod.namespace"]
+		e.Pod = info.Labels["io.kubernetes.pod.name"]
+		e.Container = info.Labels["io.kubernetes.container.name"]
+		e.UID = types.UID(info.Labels["io.kubernetes.pod.uid"])
+	}
+	return e
 }

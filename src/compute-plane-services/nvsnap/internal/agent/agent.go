@@ -928,6 +928,10 @@ func (a *Agent) checkpointHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Restore handler
+// restoreForRequest runs a /v1/restore request's restore. A variable for
+// tests.
+var restoreForRequest = (*Agent).restoreProbed
+
 func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	var req RestoreRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -938,7 +942,7 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	metrics.ActiveOperations.WithLabelValues("restore").Inc()
 	start := time.Now()
 
-	result, err := a.restoreProbed(r.Context(), req)
+	result, err := restoreForRequest(a, r.Context(), req)
 
 	metrics.ActiveOperations.WithLabelValues("restore").Dec()
 	duration := time.Since(start).Seconds()
@@ -947,6 +951,14 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metrics.RestoreTotal.WithLabelValues("failed", workload, "default").Inc()
 		a.log.WithError(err).Error("Restore failed")
+		// A restored engine left taking no requests is disposed of, as the
+		// automatic restores do, rather than left to the caller. A group's
+		// member is its leader's to dispose of.
+		var ns *restoredNotServingError
+		if req.GPUShareFabricSession == "" && errors.As(err, &ns) && ns.Pod != "" {
+			a.disposeFailedPlaceholder(context.WithoutCancel(r.Context()), ns.Namespace, ns.Pod, ns.UID, ns.Container,
+				a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod}))
+		}
 		writeRestoreFailure(w, err)
 		return
 	}

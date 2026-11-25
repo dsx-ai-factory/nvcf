@@ -517,7 +517,10 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 			return nil, err
 		}
 		if err := a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log); err != nil {
-			return nil, err
+			// The restored engine runs and takes no requests: its
+			// placeholder is disposed of (restoreHandler, or the automatic
+			// restore that ran it).
+			return nil, restoredNotServing(placeholderInfo, err)
 		}
 		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
 	}
