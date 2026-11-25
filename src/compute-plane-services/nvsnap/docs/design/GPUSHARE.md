@@ -468,9 +468,14 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
     Identical rows are fine.
   - A retried `remap` goes on from RTR only with the same peer numbers;
     a queue pair at RTR with others fails it.
-  - `remap` refuses unless NCCL's calls are held with none in progress.
-    Until every re-created queue pair is connected, an open (`resume`, a
-    `hold`, a gate opening) leaves NCCL's calls held.
+  - `remap` refuses unless NCCL's calls are held, with none in progress
+    after a wait of up to 2 s.
+  - Until every re-created queue pair that NCCL had connected is
+    connected again, an open (`resume`, a `hold`, a gate opening) leaves
+    NCCL's calls held.
+  - A queue pair NCCL had not connected at the capture is NCCL's to
+    connect after the restore. Once NCCL has connected it, nothing waits
+    for it.
   - Every process of a restore needs a library that sends the key
     counts. With an older one among them, `remap` fails.
 
