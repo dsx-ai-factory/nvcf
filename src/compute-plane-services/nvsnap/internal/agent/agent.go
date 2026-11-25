@@ -989,6 +989,18 @@ func (a *Agent) deleteCheckpointHandler(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "checkpoint not found", http.StatusNotFound)
 		return
 	}
+	// A copy a pod on this node restores from, or restored from, stays: a
+	// delete cascaded from another node's reaper (dropCatalogRow) must not
+	// pull it from under a restore. Its own node retires it once no pod
+	// holds it.
+	if pod, err := a.podRestoringFrom(r.Context(), id); err != nil || pod != "" {
+		why := "pod " + pod + " on this node restores from it"
+		if err != nil {
+			why = "cannot tell whether a pod on this node restores from it: " + err.Error()
+		}
+		http.Error(w, "checkpoint kept: "+why, http.StatusConflict)
+		return
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		http.Error(w, fmt.Sprintf("failed to delete: %v", err), http.StatusInternalServerError)
 		return

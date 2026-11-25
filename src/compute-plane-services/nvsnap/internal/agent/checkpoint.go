@@ -20,6 +20,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -98,10 +99,16 @@ func countDistinctGPUDevices(pids []int, log *logrus.Entry) int {
 	return 1
 }
 
+// errNoNvidiaSMI: the node has no nvidia-smi, so no GPU to query.
+var errNoNvidiaSMI = errors.New("no nvidia-smi on this node")
+
 // hostNvidiaSMI runs the host's nvidia-smi with args, with the driver's
-// shared libraries it needs.
+// shared libraries it needs; errNoNvidiaSMI when the node has none.
 func hostNvidiaSMI(args ...string) ([]byte, error) {
-	nvidiaSmi := "nvidia-smi"
+	nvidiaSmi := ""
+	if p, err := exec.LookPath("nvidia-smi"); err == nil {
+		nvidiaSmi = p
+	}
 	for _, p := range []string{
 		"/host/run/nvidia/driver/usr/bin/nvidia-smi",
 		"/host/usr/bin/nvidia-smi",
@@ -111,6 +118,9 @@ func hostNvidiaSMI(args ...string) ([]byte, error) {
 			nvidiaSmi = p
 			break
 		}
+	}
+	if nvidiaSmi == "" {
+		return nil, errNoNvidiaSMI
 	}
 	cmd := exec.Command(nvidiaSmi, args...) //nolint:gosec // a fixed binary path, fixed query arguments
 	cmd.Env = append(os.Environ(),

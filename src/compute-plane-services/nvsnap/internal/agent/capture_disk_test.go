@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,10 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 const tib = uint64(1) << 40
@@ -27,7 +31,13 @@ const tib = uint64(1) << 40
 func stubDisk(t *testing.T, gpu int64, next func() (avail, total uint64)) {
 	t.Helper()
 	ds, gu := diskSpace, gpuUsedBytes
-	t.Cleanup(func() { diskSpace, gpuUsedBytes = ds, gu })
+	resetReservations := func() {
+		diskReserveMu.Lock()
+		diskReservations = map[string]diskReservation{}
+		diskReserveMu.Unlock()
+	}
+	resetReservations()
+	t.Cleanup(func() { diskSpace, gpuUsedBytes = ds, gu; resetReservations() })
 	diskSpace = func(string) (uint64, uint64, error) { a, tot := next(); return a, tot, nil }
 	gpuUsedBytes = func([]int) (int64, error) { return gpu, nil }
 }
@@ -180,5 +190,86 @@ func TestReaperDropsTheCatalogRow(t *testing.T) {
 	defer mu.Unlock()
 	if len(deleted) != 1 || deleted[0] != "/api/v1/checkpoints/orphan" {
 		t.Fatalf("catalog deletes = %v, want /api/v1/checkpoints/orphan", deleted)
+	}
+}
+
+// GPU memory that cannot be read on a node with GPUs blocks: the dump
+// could be far larger than its host memory.
+func TestDiskFindingsBlockWhenGPUMemoryIsUnknown(t *testing.T) {
+	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
+	gpuUsedBytes = func([]int) (int64, error) { return 0, errors.New("nvidia-smi: driver not loaded") }
+	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
+	fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main")
+	if len(fs) != 1 || fs[0].Severity != preflightBlock {
+		t.Fatalf("findings = %+v, want one disk block", fs)
+	}
+	// A node with no nvidia-smi has no GPU memory to save.
+	gpuUsedBytes = func([]int) (int64, error) { return 0, errNoNvidiaSMI }
+	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "etcd-0", "etcd"); len(fs) != 0 {
+		t.Fatalf("findings = %+v, want none on a node without GPUs", fs)
+	}
+}
+
+// Two members on one node: each fits alone, not together. The second is
+// blocked.
+func TestDiskFindingsCountTheOtherMembersOnTheNode(t *testing.T) {
+	stubDisk(t, 400<<30, func() (uint64, uint64) { return 1000 << 30, 2000 << 30 })
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
+	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
+		t.Fatalf("first member: %+v, want none", fs)
+	}
+	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-1", "main"); len(fs) != 1 || fs[0].Severity != preflightBlock {
+		t.Fatalf("second member: %+v, want one disk block", fs)
+	}
+	// The first member checked again does not count against itself.
+	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
+		t.Fatalf("first member again: %+v, want none", fs)
+	}
+}
+
+// A deleted file the dump saves whole counts in the estimate.
+func TestCaptureBytesCountDeletedFiles(t *testing.T) {
+	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
+	a := &Agent{log: logrus.New()}
+	before, err := a.captureBytes("/proc", []int{os.Getpid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(filepath.Join(t.TempDir(), "held"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Write(make([]byte, 64<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(f.Name()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := a.captureBytes("/proc", []int{os.Getpid()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after-before < 48<<20 {
+		t.Fatalf("estimate grew by %d bytes with a 64 MiB deleted file held, want about 64 MiB", after-before)
+	}
+}
+
+// A delete cascaded from another node's reaper keeps a copy a pod on this
+// node restores from.
+func TestDeleteKeepsACheckpointAPodRestoresFrom(t *testing.T) {
+	dir := t.TempDir()
+	writeCheckpoint(t, dir, "busy", time.Now())
+	writeCheckpoint(t, dir, "idle", time.Now())
+	kc := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns",
+		Annotations: map[string]string{webhook.CRIURestoreAnnotation: "busy"}}, Spec: corev1.PodSpec{NodeName: "n1"}})
+	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir}}
+	for id, want := range map[string]int{"busy": http.StatusConflict, "idle": http.StatusNoContent} {
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodDelete, "/v1/checkpoints/"+id, nil), map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		a.deleteCheckpointHandler(rec, req)
+		if rec.Code != want || exists(dir, id) != (want == http.StatusConflict) {
+			t.Errorf("%s: status %d (want %d), still there %v", id, rec.Code, want, exists(dir, id))
+		}
 	}
 }

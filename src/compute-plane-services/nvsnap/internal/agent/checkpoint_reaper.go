@@ -261,3 +261,22 @@ func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry
 		log.WithField("status", resp.StatusCode).Warn("checkpoint reaper: nvsnap-server kept the retired checkpoint's catalog row")
 	}
 }
+
+// podRestoringFrom returns a pod on this node that restores, or restored,
+// from checkpoint id; "" for none.
+func (a *Agent) podRestoringFrom(ctx context.Context, id string) (string, error) {
+	if a.kubeClient == nil || a.config.NodeName == "" {
+		return "", nil
+	}
+	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + a.config.NodeName})
+	if err != nil {
+		return "", err
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp == nil && p.Annotations[webhook.CRIURestoreAnnotation] == id {
+			return p.Namespace + "/" + p.Name, nil
+		}
+	}
+	return "", nil
+}
