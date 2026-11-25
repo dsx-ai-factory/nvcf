@@ -475,6 +475,7 @@ impl RunningPylon {
     {
         tokio::pin!(signal);
         loop {
+            let mut collector_was_critical = false;
             let error = tokio::select! {
                 result = signal.as_mut() => {
                     let result = result.context("failed to receive pylon termination signal");
@@ -507,7 +508,10 @@ impl RunningPylon {
                     }
                     critical_task_exit_error("engine stats stream", result)
                 }
-                result = self.stats_collector.wait_for_exit() => critical_task_exit_error("stats collector", result),
+                result = self.stats_collector.wait_for_exit() => {
+                    collector_was_critical = true;
+                    critical_task_exit_error("stats collector", result)
+                }
                 result = async {
                     self.model_lifecycle.wait_for_exit().await
                 } => critical_task_exit_error("model lifecycle supervisor", result),
@@ -522,11 +526,18 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown(ShutdownCause::CriticalTaskExit).await;
-            return Err(error);
+            let collector_error = self
+                .shutdown_reporting_collector_panic(ShutdownCause::CriticalTaskExit)
+                .await;
+            return Err(finish_critical_task_shutdown(
+                error,
+                collector_error,
+                collector_was_critical,
+            ));
         }
     }
 
+    #[cfg(test)]
     async fn shutdown(self, cause: ShutdownCause) {
         let _ = self.shutdown_reporting_collector_panic(cause).await;
     }
@@ -568,6 +579,17 @@ impl RunningPylon {
         );
         stats_collector.err()
     }
+}
+
+fn finish_critical_task_shutdown(
+    error: anyhow::Error,
+    collector_error: Option<anyhow::Error>,
+    collector_was_critical: bool,
+) -> anyhow::Error {
+    if !collector_was_critical && let Some(collector_error) = collector_error {
+        error!(error = %collector_error, "critical pylon task exited during shutdown");
+    }
+    error
 }
 
 /// What started Pylon's shutdown, for the drain summary.
@@ -2828,6 +2850,97 @@ mod tests {
             plan.auth_token_provider.as_deref(),
             Some(AuthTokenProvider::File(path)) if path == std::path::Path::new("/tmp/pylon-token")
         ));
+    }
+
+    #[derive(Clone, Default)]
+    struct CriticalErrorRecorder(Arc<StdMutex<Vec<String>>>);
+
+    impl CriticalErrorRecorder {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(
+                &mut *self
+                    .0
+                    .lock()
+                    .expect("recorded errors should not be poisoned"),
+            )
+        }
+    }
+
+    impl tracing::Subscriber for CriticalErrorRecorder {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.level() == &tracing::Level::ERROR
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(
+            &self,
+            _span: &tracing::span::Id,
+            _follows_from: &tracing::span::Id,
+        ) {
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct ErrorField(Option<String>);
+
+            impl tracing::field::Visit for ErrorField {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut error = ErrorField::default();
+            event.record(&mut error);
+            self.0
+                .lock()
+                .expect("recorded errors should not be poisoned")
+                .push(error.0.unwrap_or_default());
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn critical_shutdown_logs_only_unreported_collector_error() {
+        let recorder = CriticalErrorRecorder::default();
+        let dispatch = tracing::Dispatch::new(recorder.clone());
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        let original = finish_critical_task_shutdown(
+            anyhow::anyhow!("metrics server exited unexpectedly"),
+            Some(anyhow::anyhow!("collector cleanup failed")),
+            false,
+        );
+        assert_eq!(original.to_string(), "metrics server exited unexpectedly");
+        assert_eq!(recorder.take(), ["collector cleanup failed"]);
+
+        let original = finish_critical_task_shutdown(
+            anyhow::anyhow!("stats collector failed"),
+            Some(anyhow::anyhow!("stats collector failed")),
+            true,
+        );
+        assert_eq!(original.to_string(), "stats collector failed");
+        assert!(recorder.take().is_empty());
     }
 
     #[tokio::test]
