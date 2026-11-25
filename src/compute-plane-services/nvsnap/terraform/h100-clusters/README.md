@@ -1,7 +1,8 @@
 # NvSnap H100 bench clusters — Terraform
 
-Two GKE clusters (8 × a3-megagpu-8g each by default, single zone, one VPC
-used by both)
+Two GKE clusters (8 × a3-megagpu-8g each by default, single zone) on one
+primary VPC, with eight GPU networks that the GPU node pools of both
+clusters attach to,
 that consume from a cross-project shared H100 reservation
 (`reservation_project_id` and `zone` in `variables.tf`).
 

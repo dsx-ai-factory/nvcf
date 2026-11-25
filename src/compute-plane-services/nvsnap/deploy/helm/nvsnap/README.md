@@ -18,10 +18,10 @@ documented in [values.yaml](values.yaml); what the components do is in
 | `agent-daemonset.yaml`, `agent-rbac.yaml` | The agent DaemonSet, its Services (the node-local one only without `agent.hostNetwork`) and its RBAC | `agent.enabled` |
 | `agent-token-secret.yaml` | The agent API token | `agent.auth.enabled` |
 | `agent-servicemonitor.yaml`, `prometheus-rules.yaml` | Agent scrape config and alert rules | `agent.metrics.*.enabled` (`auto`: when the CRD exists) |
-| `server.yaml` | The server Deployment, Service, RBAC and catalog PVC | `server.enabled` |
+| `server.yaml` | The server Deployment, Service, RBAC and, with `server.persistence.enabled`, the catalog PVC and its mount | `server.enabled` |
 | `nvsnapfunction-crd.yaml` | The `NvsnapFunction` CRD and a ClusterRole for it | `server.enabled` |
 | `webhook.yaml` | The webhook Service, certificate and, with `webhook.inject`, the MutatingWebhookConfiguration | `webhook.enabled` |
-| `ephemeral-container-policy.yaml` | A ValidatingAdmissionPolicy that keeps ephemeral containers off nvsnap volumes | `webhook.ephemeralContainerPolicy.enabled` |
+| `ephemeral-container-policy.yaml` | A ValidatingAdmissionPolicy that keeps ephemeral containers off nvsnap volumes | `webhook.enabled` and `webhook.ephemeralContainerPolicy.enabled` |
 | `cachedir-env-configmap.yaml` | The cachedir environment template the webhook reads | `agent.podCacheDir` set |
 | `network-policy-restore-pods.yaml` | Lets restore pods in `agent.l2.restoreNamespaces` reach the server (and the agent with `webhook.restorePrepStrategy: init-container`) | `webhook.enabled` and that list set |
 | `rails.yaml` | The RDMA claim template and shared secret of the rails fetch tier | `agent.rails.enabled` |
