@@ -31,11 +31,15 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
@@ -184,6 +188,7 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 
 // reapCheckpoints retires this node's dead checkpoints and their L2 copies.
 func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) {
+	a.retryCatalogDrops(ctx, now)
 	age := checkpointRetireAge
 	if a.checkpointDiskLow() {
 		age = pressureRetireAge
@@ -227,12 +232,68 @@ func (a *Agent) reapCheckpointsOlderThan(ctx context.Context, pods []corev1.Pod,
 				continue
 			}
 		}
+		// The catalog row and the other nodes' copies go through
+		// nvsnap-server after the directory is gone; a tombstone keeps the
+		// request to retry it until it succeeds.
+		a.writeCatalogTombstone(id, log)
 		if err := os.RemoveAll(filepath.Join(a.config.CheckpointDir, id)); err != nil {
 			log.WithError(err).Warn("checkpoint reaper: cannot remove the checkpoint")
 			continue
 		}
 		log.Info("checkpoint reaper: retired a checkpoint that is never restored again")
-		a.dropCatalogRow(ctx, id, log)
+		if a.dropCatalogRow(ctx, id, log) {
+			a.clearCatalogTombstone(id)
+		}
+	}
+}
+
+// catalogTombstoneDir holds, by checkpoint id, the retired checkpoints
+// whose catalog row is still to be deleted; a dot directory, which the
+// reaper's scan skips.
+const catalogTombstoneDir = ".catalog-pending"
+
+// catalogTombstoneMaxAge is how long a catalog delete is retried.
+const catalogTombstoneMaxAge = 7 * 24 * time.Hour
+
+func (a *Agent) writeCatalogTombstone(id string, log *logrus.Entry) {
+	if a.config.CatalogURL == "" {
+		return
+	}
+	dir := filepath.Join(a.config.CheckpointDir, catalogTombstoneDir)
+	if err := os.MkdirAll(dir, 0o755); err == nil {
+		err = os.WriteFile(filepath.Join(dir, id), nil, 0o644)
+		if err == nil {
+			return
+		}
+	}
+	log.Warn("checkpoint reaper: cannot record the catalog delete to retry; it is tried once")
+}
+
+func (a *Agent) clearCatalogTombstone(id string) {
+	_ = os.Remove(filepath.Join(a.config.CheckpointDir, catalogTombstoneDir, id))
+}
+
+// retryCatalogDrops retries the catalog deletes of retired checkpoints
+// that failed, dropping one tried for catalogTombstoneMaxAge.
+func (a *Agent) retryCatalogDrops(ctx context.Context, now time.Time) {
+	if a.config.CatalogURL == "" {
+		return
+	}
+	ents, err := os.ReadDir(filepath.Join(a.config.CheckpointDir, catalogTombstoneDir))
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		id := e.Name()
+		log := a.log.WithField("checkpoint", id)
+		if a.dropCatalogRow(ctx, id, log) {
+			a.clearCatalogTombstone(id)
+			continue
+		}
+		if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > catalogTombstoneMaxAge {
+			log.Warn("checkpoint reaper: gave up deleting the retired checkpoint's catalog row; delete it through nvsnap-server")
+			a.clearCatalogTombstone(id)
+		}
 	}
 }
 
@@ -240,26 +301,35 @@ func (a *Agent) reapCheckpointsOlderThan(ctx context.Context, pods []corev1.Pod,
 // copies on other nodes, through nvsnap-server (its delete cascades to
 // them); kept rows would list a checkpoint that no longer exists. A
 // failure leaves the row to nvsnap-server's own delete.
-func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry) {
+func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry) bool {
 	if a.config.CatalogURL == "" {
-		return
+		return true
 	}
+	ctx, span := tracing.Tracer().Start(ctx, "checkpoint.drop_catalog_row")
+	defer span.End()
+	span.SetAttributes(attribute.String("nvsnap.checkpoint_id", id))
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	u := fmt.Sprintf("%s/api/v1/checkpoints/%s", a.config.CatalogURL, url.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
 	if err != nil {
-		return
+		span.RecordError(err)
+		return false
 	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.WithError(err).Warn("checkpoint reaper: cannot delete the retired checkpoint's catalog row")
-		return
+		span.RecordError(err)
+		log.WithError(err).Warn("checkpoint reaper: cannot delete the retired checkpoint's catalog row; retried on a later sweep")
+		return false
 	}
 	_ = resp.Body.Close()
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		log.WithField("status", resp.StatusCode).Warn("checkpoint reaper: nvsnap-server kept the retired checkpoint's catalog row")
+		log.WithField("status", resp.StatusCode).Warn("checkpoint reaper: nvsnap-server kept the retired checkpoint's catalog row; retried on a later sweep")
+		return false
 	}
+	return true
 }
 
 // podRestoringFrom returns a pod on this node that restores, or restored,

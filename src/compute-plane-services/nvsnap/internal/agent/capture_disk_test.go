@@ -273,3 +273,97 @@ func TestDeleteKeepsACheckpointAPodRestoresFrom(t *testing.T) {
 		}
 	}
 }
+
+// An unreadable memory measure blocks; a process gone since it was listed
+// counts 0.
+func TestCaptureBytesFailClosedOnUnreadableMemory(t *testing.T) {
+	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
+	proc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proc, "41"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proc, "41", "smaps_rollup"), []byte("Rss: 10 kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
+	if _, err := a.captureBytes(proc, []int{41}); err == nil {
+		t.Fatal("no Anonymous line: want an error")
+	}
+	if fs := a.diskFindings(context.Background(), proc, []int{41}, "rank-0", "main"); len(fs) != 1 || fs[0].Severity != preflightBlock {
+		t.Fatalf("findings = %+v, want one disk block", fs)
+	}
+	if n, err := a.captureBytes(proc, []int{42}); err != nil || n != 0 {
+		t.Fatalf("gone process: %d %v, want 0 and no error", n, err)
+	}
+}
+
+// A re-check of the same container (the on-demand preflight report) does
+// not lower the reservation of a dump still being written.
+func TestReserveDiskNeverLowersALiveReservation(t *testing.T) {
+	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
+	now := time.Now()
+	reserveDisk("p/main", 500<<30, now)
+	reserveDisk("p/main", 100<<30, now.Add(time.Minute))
+	if got := reservedBytes("other/main", now.Add(2*time.Minute)); got != 500<<30 {
+		t.Fatalf("reserved = %d GiB, want 500", got>>30)
+	}
+	if got := reservedBytes("other/main", now.Add(diskReserveTTL+time.Minute)); got != 0 {
+		t.Fatalf("reserved after the TTL = %d, want 0", got)
+	}
+}
+
+// The rootfs diff is not archived when it would take the room the kept
+// free space needs.
+func TestRootfsDiffChecksTheCheckpointRoom(t *testing.T) {
+	upper := t.TempDir()
+	if err := os.WriteFile(filepath.Join(upper, "db"), make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		avail uint64
+		fits  bool
+	}{{avail: 20<<20 + 1<<20, fits: false}, {avail: 20<<20 + 64<<20, fits: true}} {
+		stubDisk(t, 0, func() (uint64, uint64) { return tc.avail, 100 << 20 })
+		ckpt := t.TempDir()
+		a := &Agent{log: logrus.New(), config: Config{CheckpointDir: ckpt, CaptureDiskKeepPercent: 20}}
+		err := a.mirrorRootfsDiff(context.Background(), ckpt, upper, nil, logrus.NewEntry(logrus.New()))
+		if (err == nil) != tc.fits {
+			t.Errorf("avail %d MiB: err = %v, want fits=%v", tc.avail>>20, err, tc.fits)
+		}
+	}
+}
+
+// A catalog delete that fails is retried from its tombstone until it
+// succeeds.
+func TestCatalogDeleteIsRetriedFromItsTombstone(t *testing.T) {
+	var mu sync.Mutex
+	status, calls := http.StatusInternalServerError, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	now := time.Now()
+	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour))
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
+	a.reapCheckpointsOlderThan(context.Background(), nil, now, checkpointRetireAge)
+	tomb := filepath.Join(dir, catalogTombstoneDir, "orphan")
+	if exists(dir, "orphan") || !exists(filepath.Dir(tomb), "orphan") {
+		t.Fatal("want the checkpoint gone and its tombstone kept after a failed catalog delete")
+	}
+	mu.Lock()
+	status = http.StatusNoContent
+	mu.Unlock()
+	a.reapCheckpoints(context.Background(), nil, now) // each sweep retries first
+	if exists(filepath.Dir(tomb), "orphan") {
+		t.Fatal("tombstone kept after the catalog delete succeeded")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("catalog deletes = %d, want 2", calls)
+	}
+}

@@ -23,9 +23,13 @@ package agent
 // also retires them early while the filesystem is low.
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,7 +104,11 @@ func (a *Agent) captureBytes(procBase string, pids []int) (int64, error) {
 	var n int64
 	ghosts := map[string]ghostFile{}
 	for _, pid := range pids {
-		n += anonymousBytes(procBase, pid)
+		anon, err := anonymousBytesOf(procBase, pid)
+		if err != nil {
+			return 0, err
+		}
+		n += anon
 		deletedFiles(procBase, pid, ghosts)
 	}
 	limit := a.ghostLimit()
@@ -117,6 +125,33 @@ func (a *Agent) captureBytes(procBase string, pids []int) (int64, error) {
 		return 0, fmt.Errorf("cannot read the GPU memory the dump saves: %w", err)
 	}
 	return n + gpu, nil
+}
+
+// anonymousBytesOf is anonymousBytes that fails when the measure cannot
+// be read; a process gone since it was listed has nothing to dump.
+func anonymousBytesOf(procBase string, pid int) (int64, error) {
+	f, err := os.Open(filepath.Join(procBase, strconv.Itoa(pid), "smaps_rollup"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cannot read the memory of pid %d: %w", pid, err)
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if rest, ok := strings.CutPrefix(sc.Text(), "Anonymous:"); ok {
+			kb, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(rest), " kB"), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("pid %d: unreadable Anonymous line %q", pid, rest)
+			}
+			return kb << 10, nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, fmt.Errorf("cannot read the memory of pid %d: %w", pid, err)
+	}
+	return 0, fmt.Errorf("pid %d: no Anonymous line in smaps_rollup", pid)
 }
 
 // reservedBytes is the sum of the live reservations of pods other than
@@ -137,10 +172,36 @@ func reservedBytes(key string, now time.Time) int64 {
 	return n
 }
 
+// reserveDisk reserves bytes for key's dump. A live reservation of key that
+// is larger stays as it is: a re-check (the on-demand preflight report)
+// while the dump is still being written must not lower what it needs.
 func reserveDisk(key string, bytes int64, now time.Time) {
 	diskReserveMu.Lock()
 	defer diskReserveMu.Unlock()
+	if r, ok := diskReservations[key]; ok && now.Sub(r.at) <= diskReserveTTL && r.bytes >= bytes {
+		return
+	}
 	diskReservations[key] = diskReservation{bytes: bytes, at: now}
+}
+
+// checkpointRoom is how many bytes the checkpoint filesystem takes before
+// it has less than CaptureDiskKeepPercent free; on is false with the
+// check off. The capture's own writes after the dump (the rootfs diff, the
+// replay mounts) check it before they write.
+func (a *Agent) checkpointRoom() (room int64, on bool, err error) {
+	keep := a.config.CaptureDiskKeepPercent
+	if keep <= 0 || keep >= 100 {
+		return 0, false, nil
+	}
+	avail, total, err := diskSpace(a.config.CheckpointDir)
+	if err != nil {
+		return 0, true, err
+	}
+	reserve := total / 100 * uint64(keep) //nolint:gosec // keep checked to be 1..99
+	if avail <= reserve {
+		return 0, true, nil
+	}
+	return int64(avail - reserve), true, nil //nolint:gosec // bounded by the filesystem size
 }
 
 // diskFindings is the checkpoint-disk check of a container whose

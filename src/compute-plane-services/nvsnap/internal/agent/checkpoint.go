@@ -1464,6 +1464,20 @@ func (a *Agent) captureReplayMounts(ctx context.Context, containerInfo *containe
 				continue
 			}
 		}
+		// The tarball is written to the checkpoint filesystem: one that
+		// would take the room the kubelet's eviction threshold needs is
+		// not copied (capture_disk.go), as an emptyDir too large is not.
+		if room, on, err := a.checkpointRoom(); on {
+			over, n, werr := emptyDirOver(int(containerInfo.PID), mi.MountPoint, room)
+			if err != nil || werr != nil || over {
+				log.WithError(errors.Join(err, werr)).WithFields(logrus.Fields{"mp": mi.MountPoint, "bytes": n, "room": room}).
+					Warn("mount not copied into the checkpoint: it does not fit above the checkpoint filesystem's kept free space; a restore that needs its files fails and starts cold")
+				if tooLarge != nil {
+					*tooLarge = append(*tooLarge, mi.MountPoint)
+				}
+				continue
+			}
+		}
 		tarRel := filepath.Join("mounts", SanitizeMountPath(mi.MountPoint)+".tar")
 		tarAbs := filepath.Join(checkpointDir, tarRel)
 		var mountPoints []string
@@ -1524,6 +1538,24 @@ func (a *Agent) mirrorRootfsDiff(ctx context.Context, checkpointDir, sourceUpper
 	// images directory) is not the workload's state: leave it out, or
 	// a restore replays it over what the agent stages for itself.
 	diffExcludes := append(append([]string{}, sourceMountPoints...), v2BinDirInContainer, v2ImagesDirInContainer)
+	// The archive is written to the checkpoint filesystem: it must not take
+	// the room the kubelet's eviction threshold needs (capture_disk.go).
+	if room, on, err := a.checkpointRoom(); on {
+		if err != nil {
+			mirrorSpan.RecordError(err)
+			return fmt.Errorf("cannot tell the checkpoint filesystem's free space before the rootfs diff: %w", err)
+		}
+		over, n, werr := treeBytesOver(os.DirFS(sourceUpperdir), room)
+		if werr != nil {
+			mirrorSpan.RecordError(werr)
+			return fmt.Errorf("cannot size the container's overlay upperdir: %w", werr)
+		}
+		if over {
+			err := fmt.Errorf("the container's overlay upperdir (over %d GiB) does not fit in the checkpoint filesystem above its %d%% free", n>>30, a.config.CaptureDiskKeepPercent)
+			mirrorSpan.RecordError(err)
+			return err
+		}
+	}
 	if err := archiveOverlayDir(sourceUpperdir, diffDst, diffExcludes, rootfsDiffExcludeGlobs(), log); err != nil {
 		mirrorSpan.RecordError(err)
 		return fmt.Errorf("archive the container's overlay upperdir: %w", err)
