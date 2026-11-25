@@ -633,6 +633,12 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
         if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
         if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
         if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
+        /* "lidbump" / "gidbump": the port's new LID, or the last byte of its new GID, changed */
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "lidbump")) {
+            char *lid = strrchr(w2, ':');
+            snprintf(lid + 1, sizeof(w2) - (lid + 1 - w2), "%lu", strtoul(lid + 1, NULL, 10) + 7);
+        }
+        if (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "gidbump")) w2[31] = w2[31] == 'f' ? 'e' : 'f';
         fprintf(o, "%s %s\n", w1, w2);
         if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
         if (!strcmp(how, "twice")) fprintf(o, "%s %s\n", w1, w2);
@@ -1123,7 +1129,7 @@ int main(int argc, char **argv)
         int r1 = reconnect();
         b->attr[2].qp_state = IBV_QPS_RTS;
         int qa_rts = fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_RTS;
-        int r2 = reconnect_edited("bump", qb->qp_num, 0);
+        int r2 = reconnect_edited(argc > 2 ? argv[2] : "bump", qb->qp_num, 0);
         printf("first=%d qa_rts=%d retry=%d\n", r1, qa_rts, r2);
         return 0;
     }
@@ -1862,10 +1868,18 @@ class Ibv(unittest.TestCase):
         self.assertEqual((out["full"], out["completed"]), ("0", "1"), out)
 
     def test_retry_with_another_peer_for_a_queue_pair_at_rts_fails(self):
-        out = self.probe("rtschanged")
-        self.assertEqual((out["qa_rts"]), "1", out)
-        self.assertNotEqual(out["first"], "0", out)
-        self.assertNotEqual(out["retry"], "0", "qa at RTS kept its old peer while the retry gave another: %s" % out)
+        # The peer's queue pair number, LID or GID changes; the reply names
+        # the field and both values.
+        field = {"bump": r"qpn \d+", "lidbump": r"LID \d+", "gidbump": r"GID [0-9a-f]{32}"}
+        for how in ("bump", "lidbump", "gidbump"):
+            with self.subTest(how=how):
+                out = self.probe("rtschanged", how=how)
+                self.assertEqual((out["qa_rts"]), "1", out)
+                self.assertNotEqual(out["first"], "0", out)
+                self.assertNotEqual(out["retry"], "0", "qa at RTS kept its old peer while the retry gave another: %s" % out)
+                f = field[how]
+                self.assertRegex(self.probe_stdout, r"(?m)^connect: err queue pair \d+ was connected to peer %s in this "
+                                                    r"restore, and this exchange gives %s$" % (f, f.split(" ", 1)[1]))
 
     def test_queue_pair_nccl_connects_after_the_restore_is_not_pending(self):
         out = self.probe("lateqp")

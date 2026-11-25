@@ -1700,11 +1700,20 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
         if (g) a->ah_attr.grh.sgid_index = g->cur_index;
     }
     a->ah_attr.dlid = rports[i].cur_lid;
-    if (q->rtr.set && (q->rtr.qpn != a->dest_qp_num || q->rtr.lid != a->ah_attr.dlid ||
-                       (a->ah_attr.is_global && memcmp(q->rtr.gid.raw, a->ah_attr.grh.dgid.raw, 16)))) {
-        snprintf(reply, n, "err queue pair %u was connected to peer qpn %u in this restore, and this exchange gives %u",
-                 q->v.qp_num, q->rtr.qpn, a->dest_qp_num);
-        return -1;
+    if (q->rtr.set) {  /* connected in this restore: the same peer, field by field */
+        char was[33], now[33];
+        const char *f = NULL;
+        if (q->rtr.qpn != a->dest_qp_num)
+            f = "qpn", snprintf(was, sizeof(was), "%u", q->rtr.qpn), snprintf(now, sizeof(now), "%u", a->dest_qp_num);
+        else if (q->rtr.lid != a->ah_attr.dlid)
+            f = "LID", snprintf(was, sizeof(was), "%u", q->rtr.lid), snprintf(now, sizeof(now), "%u", a->ah_attr.dlid);
+        else if (a->ah_attr.is_global && memcmp(q->rtr.gid.raw, a->ah_attr.grh.dgid.raw, 16))
+            f = "GID", hex16(&q->rtr.gid, was), hex16(&a->ah_attr.grh.dgid, now);
+        if (f) {
+            snprintf(reply, n, "err queue pair %u was connected to peer %s %s in this restore, and this exchange gives %s",
+                     q->v.qp_num, f, was, now);
+            return -1;
+        }
     }
     *ri = i;
     return 0;
