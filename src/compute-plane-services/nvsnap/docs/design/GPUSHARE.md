@@ -217,7 +217,9 @@ node, and their tools must vote on the quiesce and exchange fabric handles
 fabric session:
 
 1. The webhook turns fabric on for a pod whose engine spans pods (a
-   multi-node flag, or a group of more than one pod) and sets
+   multi-node flag, or a group of more than one pod; `--nnodes 1` and
+   `--node-rank 0` alone are a single-node engine's, `multiNodeEngineArg`)
+   and sets
    `NVSNAP_GPUSHARE_FABRIC=1` unless the container's `env` list names it;
    `nvsnap.io/gpushare-fabric` overrides the webhook's choice, and a value in
    the container's `env` list wins over both. The webhook does not read

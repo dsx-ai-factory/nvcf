@@ -333,14 +333,29 @@ func EngineSpansArg(args []string) string {
 
 // multiNodeEngineArg returns the first flag in args (each split on
 // spaces, as in a shell command line) that only an engine spanning nodes
-// is started with, or "".
+// is started with, or "". A node count of one (--nnodes 1) and a node
+// rank of zero (--node-rank 0) do not count on their own, as in
+// EngineSpansArg: a single-node engine may be started with them.
 func multiNodeEngineArg(args []string) string {
+	var words []string
 	for _, a := range args {
-		for _, w := range strings.Fields(a) {
-			for _, f := range multiNodeEngineFlags {
-				if w == f || strings.HasPrefix(w, f+"=") {
-					return f
-				}
+		words = append(words, strings.Fields(a)...)
+	}
+	for i, w := range words {
+		for _, f := range multiNodeEngineFlags {
+			if w != f && !strings.HasPrefix(w, f+"=") {
+				continue
+			}
+			val, hasVal := strings.CutPrefix(w, f+"=")
+			if !hasVal && i+1 < len(words) {
+				val = words[i+1]
+			}
+			n, err := strconv.Atoi(val)
+			switch {
+			case f == "--nnodes" && err == nil && n <= 1:
+			case (f == "--node-rank" || f == "--node_rank") && err == nil && n == 0:
+			default:
+				return f
 			}
 		}
 	}
