@@ -14,6 +14,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -79,6 +80,12 @@ func (c *criuAutoRestorer) considerRestored(ctx context.Context, pod *corev1.Pod
 		}
 		if !ok {
 			return // not a restore of this agent's: nothing to watch
+		}
+		if ref.group == "" && ref.failed {
+			// Its failure is recorded; only its disposal is left, whatever
+			// the engine probe would say now.
+			c.failRestored(ctx, pod, ref, errors.New("the restored engine died; disposing of its placeholder again"))
+			return
 		}
 		reason, sure := c.restoredEngineGone(ctx, pod, ref.container)
 		if reason == "" {

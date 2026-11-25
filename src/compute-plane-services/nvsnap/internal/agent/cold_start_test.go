@@ -478,3 +478,35 @@ func TestFailRestored_KeepsTheRecordUntilTheDisposal(t *testing.T) {
 		t.Errorf("restore failures = %q, want the failure counted once", got)
 	}
 }
+
+// A lone restore whose failure is recorded and whose placeholder is not
+// yet disposed of is disposed of on the pod's next event, even while the
+// container runtime cannot find the container (the engine probe would see
+// nothing gone).
+func TestConsiderRestored_DisposesAFailedRestoreWithoutTheProbe(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	pod.Annotations[webhook.CRIURestoredAnnotation] = time.Now().UTC().Format(time.RFC3339)
+	pod.Status.Phase = corev1.PodRunning
+	kc := fake.NewSimpleClientset(pod)
+	// pid 0: the runtime has no container to probe.
+	a := &Agent{kubeClient: kc, log: logrus.New(), runtime: pidRuntime{pid: 0}, config: Config{CheckpointDir: t.TempDir()}}
+	c := a.criuRestorer()
+	ctx := context.Background()
+	if err := c.recordRestore(pod.UID, restoreRecord{Checkpoint: "abc__20261008-101010", Container: "inference",
+		Namespace: pod.Namespace, Pod: pod.Name, Failed: true}); err != nil {
+		t.Fatal(err)
+	}
+	c.considerRestored(ctx, pod)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := kc.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		_, recorded := c.restoredRecordOf(pod.UID)
+		if err != nil && !recorded {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pod still there (%v) or record kept (%v)", err == nil, recorded)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
