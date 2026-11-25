@@ -613,6 +613,7 @@ static int reconnect(void)
  * with no file to read
  * ("unreadable"), or as it is. */
 static char drop_gid[33];  /* "nogid": leave out every row of this old GID (hex) */
+static char add_row[96];   /* "addrow": one more line */
 static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
 {
     char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160];
@@ -645,6 +646,7 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
      * of another record type (fabric handles share the file). */
     if (!strcmp(how, "dangling")) fprintf(o, "ibvq:%s:99999\n", drop_gid[0] ? drop_gid : "00000000000000000000000000000000");
     if (!strcmp(how, "foreign")) fprintf(o, "fabric:0123456789abcdef 42\n");
+    if (!strcmp(how, "addrow")) fprintf(o, "%s\n", add_row);
     fclose(f);
     fclose(o);
     unlink(full);
@@ -935,6 +937,55 @@ int main(int argc, char **argv)
         int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
         for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
         printf("connect=%d completed=%d\n", k, ok);
+        return 0;
+    }
+    if (!strcmp(c, "midconnect")) {
+        /* Captured mid-connect: qd is at RTS targeting qc, and qc is still
+         * at INIT (NCCL had not connected it yet). qc sends no row, so the
+         * remap refuses (a cold start). The alternative, a row for qc,
+         * reconnects qd, but NCCL then connects qc itself with qd's old
+         * numbers (ibv_modify_qp does not translate them): qc's write fails
+         * after a restore that reported success. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia), *qd = ibv_create_qp(pd, &ia);
+        union ibv_gid gid;
+        ibv_query_gid(ctx, 1, 3, &gid);
+        struct ibv_port_attr pa;
+        (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        ibv_modify_qp(qd, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qc->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        ibv_modify_qp(qd, &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        ibv_modify_qp(qd, &z, IBV_QP_STATE);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        int refused = reconnect();
+        char hex[33];
+        hex16(&gid, hex);
+        snprintf(add_row, sizeof(add_row), "ibvq:%s:%u:%u %u", hex, qc->qp_num, map_token, ((struct vqp *)qc)->real->qp_num);
+        int alt = reconnect_edited("addrow", 0, 0);
+        nvsnap_ibv_open();
+        /* NCCL connects qc as it would have: to qd's number and GID as qd
+         * sent them before the capture. */
+        struct ibv_qp_attr y2 = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qd->qp_num,
+                                  .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                               .grh = { .dgid = gid, .sgid_index = 3 } } };
+        int nc = ibv_modify_qp(qc, &y2, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN) || ibv_modify_qp(qc, &z, IBV_QP_STATE);
+        struct ibv_sge sg = { (uintptr_t)buf, 4, mr->lkey };
+        struct ibv_send_wr w = { .wr_id = 12, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)buf + 32, mr->rkey } } }, *b;
+        qc->context->ops.post_send(qc, &w, &b);
+        struct ibv_wc wc[8];
+        int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 12 && wc[i].status == IBV_WC_SUCCESS;
+        printf("refused=%d alt_connect=%d nccl_connect=%d alt_completed=%d\n", refused, alt, nc, ok);
         return 0;
     }
     if (!strcmp(c, "partialkeys")) {
@@ -1707,6 +1758,15 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_remap_refuses_a_queue_pair_captured_mid_connect(self):
+        out = self.probe("midconnect")
+        self.assertNotEqual(out["refused"], "0", out)
+        self.assertRegex(self.probe_stdout, r"(?m)^connect: err the verbs exchange has no queue pair row for the peer "
+                                            r"of queue pair \d+ \(peer qpn \d+\)$")
+        # Why refuse: with a row for the INIT side, the remap succeeds, and
+        # the connection NCCL then makes itself does not work.
+        self.assertEqual((out["alt_connect"], out["nccl_connect"], out["alt_completed"]), ("0", "0", "0"), out)
 
     def test_retry_checks_queue_pairs_already_at_rts(self):
         out = self.probe("partialkeys")

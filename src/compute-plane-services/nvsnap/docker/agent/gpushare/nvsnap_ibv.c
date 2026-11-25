@@ -1551,7 +1551,12 @@ static struct vport *qp_port(struct vqp *q)
  *   ibvk:<old GID>:<old rkey> <new rkey>            a registration on its device */
 /* The GID entry a queue pair's exchange rows go under: only for one NCCL
  * connected (it has an RTR address), the entries the restore picks again
- * (gid_used); NULL for others, whose rows no peer can need. */
+ * (gid_used); NULL for others. A queue pair captured at INIT while its peer
+ * was already at RTR (mid-connect) sends no row on purpose: NCCL connects
+ * it itself after the restore with the peer's old numbers (ibv_modify_qp
+ * does not translate them), so a row would let the peer reconnect to a
+ * connection that does not work. Without it the remap refuses: a cold
+ * start (test_ibv.py test_remap_refuses_a_queue_pair_captured_mid_connect). */
 static struct vgid *map_gid(struct vqp *q) { return q->real && q->mask[1] & IBV_QP_AV ? qp_gid(q) : NULL; }
 
 static uint32_t map_token; static pid_t map_token_pid;  /* this process's token in ibvn lines */
