@@ -550,7 +550,9 @@ static int reconnect(void)
  * qpn ("omit"), without the port rows ("noport"), with another new number
  * for qpn ("bump"), with a second row for qpn giving alt ("dupq"), with a
  * second port row giving another LID ("dupp"), with a second row for each
- * key giving another new key ("dupk"), with every row twice ("twice"),
+ * key giving another new key ("dupk"), without the first key row
+ * ("nokey"), without any key row ("nokeys"), without the key count rows
+ * ("nocount"), with every row twice ("twice"),
  * with no file to read
  * ("unreadable"), or as it is. */
 static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
@@ -562,10 +564,13 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
     rewind(f);
     snprintf(tail, sizeof(tail), ":%u", qpn);
     size_t nt = strlen(tail);
+    int keys = 0;
     while (fscanf(f, "%159s %159s", w1, w2) == 2) {
         size_t n1 = strlen(w1);
         int row = !strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tail);
         if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
+        if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
+        if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
         if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
         fprintf(o, "%s %s\n", w1, w2);
         if (row && !strcmp(how, "dupq")) fprintf(o, "%s %u\n", w1, alt);
@@ -846,8 +851,8 @@ int main(int argc, char **argv)
             int n = cq->context->ops.poll_cq(cq, 8, wc);
             for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
         }
-        printf("connect=%d untouched=%d completed=%d names_peer=%d dup=%d\n", k, untouched, ok, !!strstr(rep, "peer"),
-               !!strstr(rep, "two different"));
+        printf("connect=%d untouched=%d completed=%d names_peer=%d dup=%d keyrows=%d\n", k, untouched, ok,
+               !!strstr(rep, "peer"), !!strstr(rep, "two different"), !!strstr(rep, "key"));
         return 0;
     }
     if (!strcmp(c, "remapnorelease")) {
@@ -1286,6 +1291,15 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["connect"], "0",
                                     "connected with the previous restore's mapping (%s): %s" % (how, out))
                 self.assertEqual((out["untouched"], out["names_peer"]), ("1", "1"), out)
+
+    def test_missing_key_rows_fail_the_connect(self):
+        # A peer's key rows, or their count, missing from the exchange: a
+        # key NCCL sends would otherwise go out untranslated.
+        for how in ("nokey", "nokeys", "nocount"):
+            with self.subTest(how=how):
+                out = self.probe("stalemap", how=how)
+                self.assertNotEqual(out["connect"], "0", "connected without the peer's keys (%s): %s" % (how, out))
+                self.assertEqual((out["untouched"], out["keyrows"]), ("1", "1"), out)
 
     def test_conflicting_duplicate_rows_fail_the_connect(self):
         # Two rows for one queue pair (or one port) with different values:

@@ -286,8 +286,13 @@ static int map_get(const struct u32map *m, uint32_t k, uint32_t *v)
 
 /* A remote port, by the GID (and LID) its process had before the restore:
  * its new GID and LID, and its keys and queue pair numbers old -> new, as
- * the current restore's exchange gives them (port: it has the port row). */
-struct rport { union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; int port; };
+ * the current restore's exchange gives them (port: it has the port row).
+ * kcount: each sending process's count of its key rows (by its token);
+ * nkeys: their sum, the key rows the exchange must hold. */
+struct rport {
+    union ibv_gid old, cur; uint16_t old_lid, cur_lid; struct u32map keys, qpns; int port;
+    struct u32map kcount; uint32_t nkeys; int counted;
+};
 static struct rport *rports; static int n_rports;
 #define QCHUNK 1024
 static struct vqp **qslots[64]; static int n_qslots;
@@ -1477,13 +1482,22 @@ static struct vport *qp_port(struct vqp *q)
 
 /* Lines for gpushare's exchange (two words each, as fabric handles):
  *   ibvp:<old GID>:<old LID> <new GID>:<new LID>   a port
+ *   ibvn:<old GID>:<token> <count>                  how many ibvk lines this
+ *                                                   process sends for it (token:
+ *                                                   random, one per process)
  *   ibvq:<old GID>:<old qpn> <new qpn>              a queue pair on it
  *   ibvk:<old GID>:<old rkey> <new rkey>            a registration on its device */
 EXPORT int nvsnap_ibv_map(FILE *fp)
 {
     char a[33], b[33];
     int lines = 0;
+    static uint32_t token;
     pthread_mutex_lock(&omu);
+    if (!token) {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        token = hash32((uint32_t)getpid() ^ hash32((uint32_t)t.tv_nsec) ^ (uint32_t)t.tv_sec) | 1;
+    }
     for (int i = 0; i < n_qps; i++) {
         struct vqp *q = qps[i];
         struct vgid *g = qp_gid(q);
@@ -1495,6 +1509,10 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
         for (int k = 0; k < i && !seen; k++) seen = qp_gid(qps[k]) == g;
         if (!seen) {
             fprintf(fp, "ibvp:%s:%u %s:%u\n", a, p ? p->old_lid : 0, b, p ? p->cur_lid : 0);
+            lines++;
+            int nk = 0;
+            for (int k = 0; k < n_mrs; k++) nk += mrs[k]->pd->c == q->pd->c && mrs[k]->real;
+            fprintf(fp, "ibvn:%s:%u %d\n", a, token, nk);
             lines++;
             for (int k = 0; k < n_mrs; k++)
                 if (mrs[k]->pd->c == q->pd->c && mrs[k]->real)
@@ -1550,6 +1568,13 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
                      i < 0 || !rports[i].port ? "port row" : "queue pair row", q->v.qp_num, a->dest_qp_num);
         return -1;
     }
+    const struct u32tab *kt = rports[i].keys.t;
+    uint32_t nk = kt ? (uint32_t)kt->used : 0;
+    if (!rports[i].counted || nk != rports[i].nkeys) {
+        snprintf(reply, n, "err the verbs exchange has %u of the %u key rows for the peer of queue pair %u%s", nk,
+                 rports[i].nkeys, q->v.qp_num, rports[i].counted ? "" : " (no key count row)");
+        return -1;
+    }
     struct vgid *g = qp_gid(q);
     a->dest_qp_num = qpn;
     if (a->ah_attr.is_global) {
@@ -1584,7 +1609,11 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
     }
     /* NCCL's calls are held (a restore re-created its queue pairs): nobody
      * reads the tables. */
-    for (int i = 0; i < n_rports; i++) map_clear(&rports[i].keys), map_clear(&rports[i].qpns), rports[i].port = 0;
+    for (int i = 0; i < n_rports; i++) {
+        struct rport *r = &rports[i];
+        map_clear(&r->keys), map_clear(&r->qpns), map_clear(&r->kcount);
+        r->port = 0, r->nkeys = 0, r->counted = 0;
+    }
     FILE *fp = path ? fopen(path, "re") : NULL;
     int ferr = fp ? 0 : path ? errno : ENOENT, bad = 0, nq = 0, ri;
     while (fp && !bad && fscanf(fp, "%159s %159s", w1, w2) == 2) {
@@ -1604,6 +1633,13 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
         } else if (!strncmp(w1, "ibvk:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
                    sscanf(w2, "%u", &y) == 1) {
             bad = put_once(&rport_get(&g)->keys, x, y, w1, reply, n) < 0;
+        } else if (!strncmp(w1, "ibvn:", 5) && strlen(w1) > 38 && !unhex16(w1 + 5, &g) && sscanf(w1 + 38, "%u", &x) == 1 &&
+                   sscanf(w2, "%u", &y) == 1) {
+            struct rport *r = rport_get(&g);
+            uint32_t had;
+            int fresh = map_get(&r->kcount, x, &had) != 0;
+            bad = put_once(&r->kcount, x, y, w1, reply, n) < 0;
+            if (!bad && fresh) r->nkeys += y, r->counted = 1;
         }
     }
     if (fp) fclose(fp);
