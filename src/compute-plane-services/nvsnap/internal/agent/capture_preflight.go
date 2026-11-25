@@ -224,7 +224,7 @@ func (a *Agent) releaseFindings(ctx context.Context, fs []PreflightFinding, tool
 		return fs
 	}
 	return nixlPauseFindings(fs, nixlGPUProcesses(procBase, sessionHostPID),
-		nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), ""), pod, container)
+		nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), "", 1), pod, container)
 }
 
 // processFindings is the host checks of a container's processes pids.
@@ -546,6 +546,16 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 	var fs []PreflightFinding
 	for _, m := range members {
 		fs = append(fs, a.podPreflight(m.pod, m.container, m.rank)...)
+	}
+	// The capture's rule (nixlSpansNodes): an engine whose GPU ranks run on
+	// more than one node is not paused. One rank with its companions is.
+	if n := rankNodes(ranks); n > 1 && a.nixlPauseOn() {
+		for _, r := range ranks {
+			if r.Annotations[webhook.NIXLPauseAnnotation] == "true" {
+				fs = append(fs, PreflightFinding{Pod: r.Name, Container: gpuContainer(r), Severity: preflightBlock, Check: "nixl-pause",
+					Detail: fmt.Sprintf("the pod opted in to nixl-pause, but its engine spans nodes (its GPU ranks run on %d nodes); nixl-pause is not supported for an engine that spans nodes yet", n)})
+			}
+		}
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup

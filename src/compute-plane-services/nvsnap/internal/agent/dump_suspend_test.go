@@ -12,6 +12,10 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
 )
 
 // dumpSteps records, in order, every step dumpAroundSuspend takes on the
@@ -163,18 +167,23 @@ func TestDumpAroundSuspend_NotOptedInPausesNoConnector(t *testing.T) {
 
 // The capture refuses nixl-pause for an engine that spans nodes itself,
 // not only in the preflight (a capture through POST /v1/checkpoints runs
-// none): a capture that joins a multi-node session, or a container one of
-// whose processes says so. Nothing is paused or suspended; ModelExpress,
-// paused first, is resumed.
+// none): GPU ranks on more than one node, a session whose driver does not
+// say, or a container one of whose processes says so. Nothing is paused
+// or suspended; ModelExpress, paused first, is resumed. One GPU rank with
+// its companions, captured in a session on one node, is paused.
 func TestDumpAroundSuspend_RefusesNIXLPauseAcrossNodes(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		session string
+		nodes   int
 		initEnv []string
+		want    []string
 	}{
-		{"multi-node session", "s1", nil},
-		{"fabric marker on the init", "", []string{"NVSNAP_GPUSHARE_FABRIC=1"}},
-		{"group of two", "", []string{"LWS_GROUP_SIZE=2"}},
+		{"ranks on two nodes", "s1", 2, nil, []string{"mx-pause", "mx-resume"}},
+		{"session, driver does not say", "s1", 0, nil, []string{"mx-pause", "mx-resume"}},
+		{"fabric marker on the init", "", 0, []string{"NVSNAP_GPUSHARE_FABRIC=1"}, []string{"mx-pause", "mx-resume"}},
+		{"group of two", "", 0, []string{"LWS_GROUP_SIZE=2"}, []string{"mx-pause", "mx-resume"}},
+		{"one rank with companions", "s1", 1, nil, []string{"mx-pause", "nixl-pause", "suspend", "dump", "collect"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base, pids := fakeDumpSource(t)
@@ -183,13 +192,56 @@ func TestDumpAroundSuspend_RefusesNIXLPauseAcrossNodes(t *testing.T) {
 			s.install(t)
 			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}
 			d := s.source(base, pids, false, true)
-			d.fabricSession = tc.session
+			d.fabricSession, d.rankNodes = tc.session, tc.nodes
 			_, err := a.dumpAroundSuspend(context.Background(), d, testLog())
-			if err == nil || !strings.Contains(err.Error(), "spans nodes") || sourceMustBeReplaced(err) {
+			refused := len(tc.want) == 2
+			if refused && (err == nil || !strings.Contains(err.Error(), "spans nodes") || sourceMustBeReplaced(err)) {
 				t.Errorf("err = %v, want a refusal naming the limit, source kept", err)
 			}
-			if want := []string{"mx-pause", "mx-resume"}; !slices.Equal(s.calls, want) {
-				t.Errorf("steps = %v, want %v", s.calls, want)
+			if !refused && err != nil {
+				t.Errorf("err = %v, want the capture", err)
+			}
+			if !slices.Equal(s.calls, tc.want) {
+				t.Errorf("steps = %v, want %v", s.calls, tc.want)
+			}
+		})
+	}
+}
+
+// sourceDumpFor, dumpV2's own completion of the dump, carries the pod's
+// opt-in (read from the pod as admitted) and the capture's session and
+// rank nodes into the dump: through it, a pod that opted in is paused on
+// one node and refused across two, and one that did not is not paused.
+func TestSourceDumpFor_CarriesTheNIXLChoices(t *testing.T) {
+	info := &containerd.ContainerInfo{Labels: map[string]string{"io.kubernetes.pod.namespace": "ns",
+		"io.kubernetes.pod.name": "w", "io.kubernetes.container.name": "engine"}}
+	for _, tc := range []struct {
+		name  string
+		pod   *corev1.Pod
+		nodes int
+		want  []string
+	}{
+		{"opted in, one node", nixlPod(true, true), 1, []string{"mx-pause", "nixl-pause", "suspend", "dump", "collect"}},
+		{"opted in, two nodes", nixlPod(true, true), 2, []string{"mx-pause", "mx-resume"}},
+		{"not opted in", nixlPod(false, false), 1, []string{"mx-pause", "suspend", "dump", "collect"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, pids := fakeDumpSource(t)
+			s := &dumpSteps{}
+			s.install(t)
+			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}, kubeClient: fake.NewSimpleClientset(tc.pod)}
+			steps := s.source(base, pids, false, true)
+			d := a.sourceDumpFor(context.Background(), info, base, dumpV2Opts{FabricSession: "s1", RankNodes: tc.nodes},
+				sourceDump{on: true, procBase: base, hostPID: 5000, targetHostPID: 5000, pids: pids, toolText: nixlToolText,
+					closeFabric: func() {}, dump: steps.dump}, testLog())
+			if d.suspend == nil || d.resume == nil || d.watchFaults == nil || d.collect == nil {
+				t.Fatal("sourceDumpFor left a step unset")
+			}
+			// The steps that act on the workload are the recorder's.
+			d.suspend, d.resume, d.watchFaults, d.collect = steps.suspend, steps.resume, steps.watchFaults, steps.collect
+			_, _ = a.dumpAroundSuspend(context.Background(), d, testLog())
+			if !slices.Equal(s.calls, tc.want) {
+				t.Errorf("steps = %v, want %v", s.calls, tc.want)
 			}
 		})
 	}

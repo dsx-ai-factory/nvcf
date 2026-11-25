@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -267,7 +268,7 @@ func TestNIXLPauseFindings(t *testing.T) {
 	base := t.TempDir()
 	fakeMXProc(t, base, 7, []string{"NVSNAP_NIXL_PAUSE=1"}, []string{"python3"})
 
-	out := nixlPauseFindings(in, map[int]bool{7: true}, nixlPauseLimit(base, []int{7}, ""), "w", "engine")
+	out := nixlPauseFindings(in, map[int]bool{7: true}, nixlPauseLimit(base, []int{7}, "", 1), "w", "engine")
 	if out[0].Severity != preflightInfo || !strings.Contains(out[0].Detail, "nixl-pause") {
 		t.Errorf("rdma finding of a pausable process = %+v, want info naming nixl-pause", out[0])
 	}
@@ -287,7 +288,7 @@ func TestNIXLPauseFindings(t *testing.T) {
 	} {
 		base := t.TempDir()
 		fakeMXProc(t, base, 7, env, []string{"python3"})
-		out := nixlPauseFindings(in, map[int]bool{7: true}, nixlPauseLimit(base, []int{7}, ""), "w", "engine")
+		out := nixlPauseFindings(in, map[int]bool{7: true}, nixlPauseLimit(base, []int{7}, "", 1), "w", "engine")
 		if out[0].Severity != preflightBlock {
 			t.Errorf("%s: the rdma finding was downgraded: %+v", name, out[0])
 		}
@@ -328,16 +329,19 @@ func TestNIXLSpansNodes(t *testing.T) {
 		env     []string
 		cmdline []string
 		session string
+		nodes   int
 		spans   bool
 	}{
-		{"single node", []string{"PATH=/bin"}, []string{"vllm", "serve", "m"}, "", false},
-		{"fabric marker", []string{"NVSNAP_GPUSHARE_FABRIC=1"}, nil, "", true},
-		{"leader-worker group", []string{"LWS_GROUP_SIZE=2"}, nil, "", true},
-		{"group of one", []string{"LWS_GROUP_SIZE=1", "GROVE_PCSG_TEMPLATE_NUM_PODS=1"}, nil, "", false},
-		{"scaling group", []string{"GROVE_PCSG_TEMPLATE_NUM_PODS=3"}, nil, "", true},
-		{"headless engine", nil, []string{"vllm", "serve", "m", "--headless"}, "", true},
-		{"flag in a shell line", nil, []string{"/bin/sh", "-c", "vllm serve m --data-parallel-address=10.0.0.1"}, "", true},
-		{"multi-node session", nil, nil, "s1", true},
+		{"single node", []string{"PATH=/bin"}, []string{"vllm", "serve", "m"}, "", 0, false},
+		{"fabric marker", []string{"NVSNAP_GPUSHARE_FABRIC=1"}, nil, "", 0, true},
+		{"leader-worker group", []string{"LWS_GROUP_SIZE=2"}, nil, "", 0, true},
+		{"group of one", []string{"LWS_GROUP_SIZE=1", "GROVE_PCSG_TEMPLATE_NUM_PODS=1"}, nil, "", 0, false},
+		{"scaling group", []string{"GROVE_PCSG_TEMPLATE_NUM_PODS=3"}, nil, "", 0, true},
+		{"headless engine", nil, []string{"vllm", "serve", "m", "--headless"}, "", 0, true},
+		{"flag in a shell line", nil, []string{"/bin/sh", "-c", "vllm serve m --nnodes=2"}, "", 0, true},
+		{"session, ranks on two nodes", nil, nil, "s1", 2, true},
+		{"session, ranks on one node (with companions)", nil, nil, "s1", 1, false},
+		{"session, driver does not say", nil, nil, "s1", 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := t.TempDir()
@@ -346,7 +350,7 @@ func TestNIXLSpansNodes(t *testing.T) {
 			fakeMXProc(t, base, 5000, tc.env, tc.cmdline)
 			fakeMXProc(t, base, 5100, nil, nil)
 			fakeRetitledProc(t, base, 5100, "VLLM::EngineCore")
-			why := nixlSpansNodes(base, sessionPIDs(base, 5000), tc.session)
+			why := nixlSpansNodes(base, sessionPIDs(base, 5000), tc.session, tc.nodes)
 			if (why != "") != tc.spans {
 				t.Errorf("nixlSpansNodes = %q, want spans %v", why, tc.spans)
 			}
@@ -612,7 +616,7 @@ func TestNIXLOptInFromPod(t *testing.T) {
 func TestPauseNIXLFor_NotOptedInPausesNothing(t *testing.T) {
 	base, _ := retitledSession(t, []string{"NVSNAP_NIXL_PAUSE=1"})
 	calls := fakeNIXL(t, nil, nil)
-	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, base, 5000, "", nixlToolText, 42, []int{2}, testLog())
+	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, base, 5000, "", 1, nixlToolText, 42, []int{2}, testLog())
 	if err != nil || paused || len(*calls) != 0 {
 		t.Errorf("pauseNIXLFor = %v, %v, calls %v; want nothing paused", paused, err, *calls)
 	}
@@ -772,5 +776,28 @@ func TestContainerFindings_ReleasesAnOptedInEngine(t *testing.T) {
 				t.Errorf("engine RDMA finding %q, want %q (findings %+v)", sev, tc.wantSev, fs)
 			}
 		})
+	}
+}
+
+// The instance's preflight applies the capture's rule: opted-in ranks on
+// two nodes are refused nixl-pause; one rank with its companions is not.
+func TestCapturePreflight_NIXLRankNodes(t *testing.T) {
+	rank := func(name, node string) *corev1.Pod {
+		p := nixlPod(true, true)
+		p.Name, p.Spec.NodeName = name, node
+		p.Spec.Containers[1].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+		return p
+	}
+	companion := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "etcd", Namespace: "ns"}, Spec: corev1.PodSpec{NodeName: "n1",
+		Containers: []corev1.Container{{Name: "etcd"}}}}
+	a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}, kubeClient: fake.NewSimpleClientset(), log: logrus.New()}
+	one := a.capturePreflight(context.Background(), []*corev1.Pod{rank("w0", "n1")}, []*corev1.Pod{companion},
+		map[string]string{"etcd": "etcd"}, testLog())
+	if preflightBlocked(one, "nixl-pause") {
+		t.Errorf("one rank with a companion: %+v, want no nixl-pause block", one)
+	}
+	two := a.capturePreflight(context.Background(), []*corev1.Pod{rank("w0", "n1"), rank("w1", "n2")}, nil, nil, testLog())
+	if !preflightBlocked(two, "nixl-pause") {
+		t.Errorf("ranks on two nodes: %+v, want a nixl-pause block", two)
 	}
 }

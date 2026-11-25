@@ -313,15 +313,22 @@ func nixlGPUProcesses(procBase string, sessionHostPID int) map[int]bool {
 var groupSizeEnvs = []string{"LWS_GROUP_SIZE", "GROVE_PCSG_TEMPLATE_NUM_PODS"}
 
 // nixlSpansNodes says why the engine of the container whose processes are
-// pids (host numbering) spans nodes, or "" when nothing says it does:
-// the capture joins a multi-node session (fabricSession), or any of its
-// processes carries the fabric marker, a group size above one, or a
-// multi-node engine flag on its command line. Any process counts, since a
+// pids (host numbering) spans nodes, or "" when nothing says it does: in a
+// session (fabricSession, a group capture of the instance), its GPU ranks
+// run on more than one node (rankNodes, from the session's driver; 0, a
+// driver that does not say, counts as more than one); or any of the
+// container's processes carries the fabric marker, a group size above one,
+// or a multi-node engine flag on its command line. A session alone does
+// not: one GPU rank with its companions (etcd, NATS, a frontend) is
+// captured in one. Any process counts, since a
 // process renamed with setproctitle has lost its environ and its command
 // line; a container whose processes all lost theirs never opted in.
-func nixlSpansNodes(procBase string, pids []int, fabricSession string) string {
-	if fabricSession != "" {
-		return "the capture joins the multi-node session " + fabricSession
+func nixlSpansNodes(procBase string, pids []int, fabricSession string, rankNodes int) string {
+	if fabricSession != "" && rankNodes != 1 {
+		if rankNodes == 0 {
+			return "the capture's session " + fabricSession + " does not say on how many nodes its GPU ranks run"
+		}
+		return fmt.Sprintf("its GPU ranks run on %d nodes", rankNodes)
 	}
 	if procEnvSet(procBase, pids, fabricEnv, "1") {
 		return "the pod shares its GPU memory across nodes (" + fabricEnv + "=1)"
@@ -350,11 +357,11 @@ func nixlSpansNodes(procBase string, pids []int, fabricSession string) string {
 // fails while the other still holds RDMA), or an engine that spans nodes
 // (nixlSpansNodes; untested, and its remote workers are released through
 // the engine's own RPC).
-func nixlPauseLimit(procBase string, pids []int, fabricSession string) string {
+func nixlPauseLimit(procBase string, pids []int, fabricSession string, rankNodes int) string {
 	if usesModelExpress(procBase, pids) {
 		return "the pod opted in to nixl-pause and also loads through ModelExpress; NIXL KV and ModelExpress in one pod are not supported yet"
 	}
-	if why := nixlSpansNodes(procBase, pids, fabricSession); why != "" {
+	if why := nixlSpansNodes(procBase, pids, fabricSession, rankNodes); why != "" {
 		return "the pod opted in to nixl-pause, but its engine spans nodes (" + why + "); nixl-pause is not supported for an engine that spans nodes yet"
 	}
 	return ""
@@ -476,9 +483,9 @@ func (a *Agent) nixlOptIn(ctx context.Context, ns, name, container string) (bool
 // the container says so) is refused here, before anything is paused,
 // whether or not a preflight ran: a capture requested through
 // POST /v1/checkpoints runs none.
-func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
+func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession string, rankNodes int, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
 	if optedIn && gpushareNIXLSupported(toolText) {
-		if why := nixlSpansNodes(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession); why != "" {
+		if why := nixlSpansNodes(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession, rankNodes); why != "" {
 			return false, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
 				errNIXLPauseUnsupported, why)
 		}
@@ -519,4 +526,13 @@ func controlSocketPIDsIn(procBase string, hostPID int, pids []int) []int {
 		}
 	}
 	return out
+}
+
+// rankNodes is how many nodes the GPU ranks ranks are scheduled on.
+func rankNodes(ranks []*corev1.Pod) int {
+	nodes := map[string]bool{}
+	for _, p := range ranks {
+		nodes[p.Spec.NodeName] = true
+	}
+	return len(nodes)
 }

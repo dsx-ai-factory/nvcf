@@ -221,6 +221,9 @@ func runDump(ctx context.Context, deadline time.Duration, env []string, name str
 type dumpV2Opts struct {
 	LeaveRunning  bool
 	FabricSession string
+	// RankNodes: on how many nodes the instance's GPU ranks run
+	// (CheckpointRequest.GPUShareRankNodes).
+	RankNodes int
 	// SyncOpen: the session's driver runs the open phase
 	// (CheckpointRequest.GPUShareSyncOpen).
 	SyncOpen bool
@@ -360,33 +363,37 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
-	// The pod's nixl-pause opt-in, as admitted (nixlOptIn).
-	nixlOptIn, why := false, ""
-	if gsOn {
-		nixlOptIn, why = a.nixlOptIn(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
-			containerInfo.Labels["io.kubernetes.pod.name"], containerInfo.Labels["io.kubernetes.container.name"])
-		if why != "" {
-			log.Warn("gpushare: not pausing the NIXL KV connector: " + why)
-		}
-	}
-	return a.dumpAroundSuspend(ctx, sourceDump{
-		on: gsOn, nixlOptIn: nixlOptIn, leaveRunning: leaveRunning, syncOpenAsked: o.SyncOpen, postDumpDir: o.PostDumpDir,
-		procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
-		toolText: tools.gpuToolText(), bundle: tools.version,
-		fabric: fabric, fabricDir: fabricDir, fabricSession: fabricSession, checkpointDir: checkpointDir,
-		suspend:     gpushareSuspend,
-		resume:      resumeSource,
-		watchFaults: startGPUFaultWatch,
+	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
+		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
 		closeFabric: closeFabric,
-		collect: func(gpuMap string) error {
-			return a.gpushareCollectStore(containerInfo, checkpointDir, gpuMap)
-		},
 		dump: func() (ran, done bool, cleanup func(), err error) {
 			ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
 			dumped = done
 			return ran, done, cleanup, err
 		},
-	}, log)
+	}, log), log)
+}
+
+// sourceDumpFor completes d, the dump of containerInfo's container, with
+// the capture's choices (o) and the production steps: the nixl-pause
+// opt-in, read from the pod as admitted (nixlOptIn), the session and the
+// nodes its GPU ranks run on, and the suspend, resume, fault watch and
+// harvest. d carries the container's state and its dump.
+func (a *Agent) sourceDumpFor(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, o dumpV2Opts, d sourceDump, log *logrus.Entry) sourceDump {
+	d.leaveRunning, d.syncOpenAsked, d.postDumpDir = o.LeaveRunning, o.SyncOpen, o.PostDumpDir
+	d.fabricSession, d.rankNodes, d.checkpointDir = o.FabricSession, o.RankNodes, checkpointDir
+	if d.on {
+		var why string
+		d.nixlOptIn, why = a.nixlOptIn(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
+			containerInfo.Labels["io.kubernetes.pod.name"], containerInfo.Labels["io.kubernetes.container.name"])
+		if why != "" {
+			log.Warn("gpushare: not pausing the NIXL KV connector: " + why)
+		}
+	}
+	d.suspend, d.resume, d.watchFaults = gpushareSuspend, resumeSource, startGPUFaultWatch
+	d.collect = func(gpuMap string) error { return a.gpushareCollectStore(containerInfo, checkpointDir, gpuMap) }
+	return d
 }
 
 // sourceDump is one capture's dump of its source, around the gpushare
@@ -413,6 +420,9 @@ type sourceDump struct {
 	fabric        *fabricSessionDir
 	fabricDir     string
 	fabricSession string
+	// rankNodes: on how many nodes the instance's GPU ranks run (0: not
+	// said).
+	rankNodes     int
 	checkpointDir string
 
 	suspend     func(ctx context.Context, hostPID int, pids []int, fabricDir string, log *logrus.Entry) (string, bool, error)
@@ -471,7 +481,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		// resume is checked: a paused engine takes no requests, so a
 		// source that runs on and does not resume is replaced.
 		var nixlErr error
-		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.procBase, d.targetHostPID, d.fabricSession, d.toolText, d.hostPID, d.pids, log)
+		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.procBase, d.targetHostPID, d.fabricSession, d.rankNodes, d.toolText, d.hostPID, d.pids, log)
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}
