@@ -129,16 +129,15 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
     @nvca-registration
     Scenario: Operator registers the local cluster and installs the NVCA operator
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
       When I successfully run command:
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml self-hosted --control-plane-stack deploy/stacks/self-managed --env local-bdd control-plane profile export --cluster-name ncp-local
         """
       Then file "deploy/stacks/self-managed/out/control-plane-profile.yaml" should exist
 
-      When I successfully run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
-        """
+      When I successfully initialize the NVCF CLI
 
       When I successfully run command:
         """
@@ -180,14 +179,31 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
     # This scenario intentionally has no Background. It depends on the
     # earlier NVCA registration scenario in this feature run, and is not a
-    # standalone tag target. The final init clears the narrowly scoped API
-    # key from CLI state so later scenarios start from the admin token.
+    # standalone tag target. The final api-key clear removes the narrowly
+    # scoped API key from CLI state so later scenarios start from the admin
+    # token. A repeated init keeps saved keys, so it cannot do this.
     @cluster-groups
     Scenario: Operator lists cluster groups with the admin token and with a scoped API key
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully initialize the NVCF CLI
+      # init keeps a saved key for the same route, so clear any key left in
+      # this fixture's state to make the first listing use the admin token.
       When I successfully run command:
         """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
         """
+      When I run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml cluster list
+        """
+      Then the command exit code should be 0
+      And the command output should contain "Found"
+
+      When I successfully generate a function API key with CLI options:
+        | option        | value               |
+        | --description | bdd-cluster-groups  |
+        | --scopes      | list_cluster_groups |
       When I run command:
         """
         ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml cluster list
@@ -197,19 +213,75 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
 
       When I successfully run command:
         """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key generate --description bdd-cluster-groups --for function --scopes list_cluster_groups
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
         """
-      When I run command:
-        """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml cluster list
-        """
-      Then the command exit code should be 0
-      And the command output should contain "Found"
+
+    # This scenario intentionally has no Background. It only needs the API
+    # Keys service from the earlier control-plane install, and is not a
+    # standalone tag target.
+    @init-keeps-api-keys
+    Scenario: Operator keeps saved API keys when init runs again against the same deployment
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+
+      When I successfully initialize the NVCF CLI
+      When I successfully generate a function API key with CLI options:
+        | option        | value                    |
+        | --description | bdd-init-keeps-api-keys  |
+        | --scopes      | list_cluster_groups      |
+
+      When I successfully initialize the NVCF CLI
+      # The header step fails when init dropped the saved key, and the request
+      # proves the key still works. The key never reaches argv or logs.
+      Given the HTTP request header "Authorization" is the NVCF CLI function API key with prefix "Bearer "
+      When I send a "GET" request to "http://api.localhost:8080/v2/nvcf/clusterGroups"
+      Then the HTTP status should be 200
 
       When I successfully run command:
         """
-        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml api-key clear --force
         """
+
+    @icms-api-key
+    Scenario: An ICMS audience key grants cluster listing but not cluster management
+      Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
+      When I successfully run command:
+        """
+        /bin/bash -c 'date -u -d "+1 day" +%Y-%m-%dT%H:%M:%S.000Z'
+        """
+      And I export command output to environment variable "BDD_ICMS_EXPIRES"
+      Given the HTTP request header "Authorization" is the NVCF CLI admin token with prefix "Bearer "
+      And the HTTP request header "Content-Type" is "application/json"
+      And the HTTP request header "Key-Issuer-Service" is "nvcf-api"
+      And the HTTP request header "Key-Issuer-Id" is "icms-api"
+      And the HTTP request header "Key-Owner-Id" is "svc@nvcf-api.local"
+      When I send a "POST" request to "http://api-keys.localhost:8080/v1/keys" with body:
+        """
+        {"description":"bdd-icms-cluster-groups","expires_at":"${BDD_ICMS_EXPIRES}",
+         "authorizations":{"policies":[{"aud":"icms-api",
+           "scopes":["cluster_listing"],"resources":[{"type":"account-clusters","id":"*"}]}]},
+         "audience_service_ids":["icms-api"]}
+        """
+      Then the HTTP status should be 200
+      When I export the HTTP response JSON field "id" to environment variable "BDD_ICMS_KEY_ID"
+      Given the HTTP request header "Authorization" is the NVCF CLI admin token with prefix "Bearer "
+      And the HTTP request header "Key-Issuer-Service" is "nvcf-api"
+      And the HTTP request header "Key-Issuer-Id" is "icms-api"
+      And the HTTP request header "Key-Owner-Id" is "svc@nvcf-api.local"
+      And I send a "DELETE" request to "http://api-keys.localhost:8080/v1/keys/${BDD_ICMS_KEY_ID}" at scenario teardown expecting status 204
+      When I export the HTTP response JSON field "value" to environment variable "BDD_ICMS_KEY"
+      Given the HTTP request header "Authorization" is "Bearer ${BDD_ICMS_KEY}"
+      When I send a "GET" request to "http://sis.localhost:8080/v1/si/accounts/nvcf-default/clusterGroups"
+      Then the HTTP status should be 200
+      Given the HTTP request header "Authorization" is "Bearer ${BDD_ICMS_KEY}"
+      And the HTTP request header "Content-Type" is "application/json"
+      When I send a "POST" request to "http://sis.localhost:8080/v1/accounts/nvcf-default/clusters" with body:
+        """
+        {}
+        """
+      Then the HTTP status should be 403
+      Given the HTTP request header "Authorization" is "Bearer nvapi-not-a-real-key"
+      When I send a "GET" request to "http://sis.localhost:8080/v1/si/accounts/nvcf-default/clusterGroups"
+      Then the HTTP status should be 401
 
   Rule: Helmfile-installed local NVCF can run a Helm task
 

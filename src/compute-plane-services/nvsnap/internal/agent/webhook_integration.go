@@ -61,6 +61,9 @@ type WebhookConfig struct {
 	// DynamoNamespace is the fixed Dynamo namespace for Dynamo components
 	// (webhook.Mutator.DynamoNamespace).
 	DynamoNamespace string
+	// SkipUnusedInits is webhook.Mutator.SkipUnusedInits; it also makes a
+	// group capture record the volumes its restores may skip filling.
+	SkipUnusedInits bool
 	// DynamoLeaseTTL is webhook.Mutator.DynamoLeaseTTL.
 	DynamoLeaseTTL int
 	// CaptureLivenessBudget is webhook.Mutator.CaptureLivenessBudget.
@@ -155,6 +158,7 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		Backend:               backend,
 		AgentPlacement:        placement,
 		DynamoNamespace:       cfg.DynamoNamespace,
+		SkipUnusedInits:       cfg.SkipUnusedInits,
 		DynamoLeaseTTL:        cfg.DynamoLeaseTTL,
 		CaptureLivenessBudget: cfg.CaptureLivenessBudget,
 		// nvsnap#194 + #88: per-pod OverlayFS unions over every captured
@@ -186,7 +190,9 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// off (docs/ARCHITECTURE.md, section 7).
 		Elector: a.elector,
 		// Write-once model volume for Helm functions; nil when off.
-		ModelVolume:       a.modelVolume,
+		ModelVolume: a.modelVolume,
+		// Node-local model cache; nil when off (node_model_cache.go).
+		NodeModelCache:    a.webhookNodeModelCache(),
 		CacheVolume:       a.cacheVolume,
 		ModelWaitDeadline: a.config.ModelVolume.WaitDeadline,
 		ModelHostRoot:     a.modelHostRoot(),

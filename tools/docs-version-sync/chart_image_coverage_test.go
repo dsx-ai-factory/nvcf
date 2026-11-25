@@ -47,18 +47,24 @@ func isolateHelmConfiguration(t *testing.T) {
 	t.Setenv("HELM_REGISTRY_CONFIG", filepath.Join(directory, "registry.json"))
 }
 
-// evaluateChartImageCoverage validates the matrix, then classifies and checks
-// every tracked chart. workspace returns a fresh temporary directory per chart.
-func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func() string) (*chartCoverageReport, error) {
+// evaluateChartImageCoverage resolves which released stacks deploy each chart,
+// validates the matrix, then classifies and checks every tracked chart.
+// workspace returns a fresh temporary directory per call.
+func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func() string) (*imageGateReport, error) {
 	charts, err := discoverTrackedCharts(repoRoot)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := loadChartImageExclusions(exclusionsPath)
+	entries, err := loadImageExclusions(exclusionsPath)
 	if err != nil {
 		return nil, err
 	}
-	report := &chartCoverageReport{Skipped: make(map[string][]string)}
+	report := newChartCoverageReport()
+	stacks, stackFindings, err := loadChartStacks(repoRoot, charts, workspace)
+	if err != nil {
+		return nil, err
+	}
+	report.add(stackFindings...)
 	tracked := make(map[string]bool)
 	indexed := make(map[string]bool)
 	for _, chart := range charts {
@@ -73,9 +79,14 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 	}
 	invalid := make(map[string]bool)
 	for _, chart := range sortedKeys(entries) {
-		if err := validateChartImageExclusion(repoRoot, chart, entries[chart], tracked, indexed[chart]); err != nil {
+		if err := validateChartImageExclusion(repoRoot, chart, entries[chart], tracked, indexed[chart], stacks); err != nil {
 			invalid[chart] = true
-			report.add(chartFinding{Category: findingInvalidEntry, Chart: chart, Problem: err.Error(),
+			// A stale entry names no tracked chart, so it has no class.
+			subject := chart
+			if tracked[chart] {
+				subject = chartSubject(chart, stacks.class(chart))
+			}
+			report.add(imageGateFinding{Category: findingInvalidEntry, Subject: subject, Problem: err.Error(),
 				Expected: "a valid " + chartImageExclusionsFile + " entry", Fix: "correct or remove the entry"})
 		}
 	}
@@ -83,12 +94,14 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 		if invalid[chart] {
 			continue
 		}
-		var entry *chartImageExclusion
+		var entry *imageExclusion
 		if value, ok := entries[chart]; ok {
 			entry = &value
 		}
 		action := classifyChart(indexed[chart], entry)
-		check := &chartCheck{chart: chart, source: filepath.Join(repoRoot, chart), scenarios: scenarios[chart]}
+		class := stacks.class(chart)
+		subject := chartSubject(chart, class)
+		check := &chartCheck{chart: chart, class: class, source: filepath.Join(repoRoot, chart), scenarios: scenarios[chart]}
 		if action != actionExpectedFailure && action != actionSkip {
 			check.workspace = workspace()
 		}
@@ -97,19 +110,19 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 			checkIndexedChart(check)
 			report.add(check.findings...)
 			if len(check.findings) == 0 {
-				report.Covered = append(report.Covered, chart)
+				report.Covered = append(report.Covered, subject)
 			}
 		case actionCheckExpectFailure:
 			checkIndexedChart(check)
-			findings, expected := pendingFixOutcome(check, *entry)
+			findings, expected := chartImageGate.pendingFixOutcome(subject, check.findings, *entry, findingCoverage)
 			report.add(findings...)
 			if expected != "" {
 				report.Expected = append(report.Expected, expected)
 			}
 		case actionExpectedFailure:
-			report.Expected = append(report.Expected, expectedFailureLabel(chart, *entry, "no image index"))
+			report.Expected = append(report.Expected, expectedFailureLabel(subject, *entry, "no image index"))
 		case actionSkip:
-			report.Skipped[entry.Reason] = append(report.Skipped[entry.Reason], chart)
+			report.Skipped[entry.Reason] = append(report.Skipped[entry.Reason], subject)
 		case actionConfirmNoImage:
 			confirmNoRuntimeImage(check)
 			report.add(check.findings...)
@@ -121,39 +134,9 @@ func evaluateChartImageCoverage(repoRoot, exclusionsPath string, workspace func(
 	return report, nil
 }
 
-// pendingFixOutcome applies expected-failure strictness to an indexed
-// pending-fix chart: only rule (coverage) findings are expected. It returns
-// the findings that fail the run, or the expected-failure label for the
-// summary. A render, dependency, index or exception-key error still fails,
-// and a clean pass means the entry is stale.
-func pendingFixOutcome(check *chartCheck, entry chartImageExclusion) ([]chartFinding, string) {
-	var hard []chartFinding
-	for _, finding := range check.findings {
-		if finding.Category != findingCoverage {
-			hard = append(hard, finding)
-		}
-	}
-	if len(hard) > 0 {
-		return hard, ""
-	}
-	if len(check.findings) == 0 {
-		return []chartFinding{{Category: findingPendingFixed, Chart: check.chart, Problem: "chart now passes image coverage",
-			Expected: "no " + reasonPendingFix + " entry for a covered chart", Fix: "remove the entry from " + chartImageExclusionsFile}}, ""
-	}
-	return nil, expectedFailureLabel(check.chart, entry, fmt.Sprintf("%d coverage findings", len(check.findings)))
-}
-
-func expectedFailureLabel(chart string, entry chartImageExclusion, detail string) string {
-	parts := []string{detail}
-	if entry.Issue != "" {
-		parts = append(parts, entry.Issue)
-	}
-	return chart + " (" + strings.Join(parts, ", ") + ")"
-}
-
 // TestChartImageFindingFormat pins the one-line failure format.
 func TestChartImageFindingFormat(t *testing.T) {
-	finding := chartFinding{Category: findingCoverage, Chart: "deploy/helm/x", Image: "server", ValuesPath: "x.server.image.registry",
+	finding := imageGateFinding{Category: findingCoverage, Subject: "deploy/helm/x", Image: "server", ValuesPath: "x.server.image.registry",
 		Problem: `prefilled image source "nvcr.io"`, Expected: `""`, Fix: "remove it"}
 	if got, want := finding.String(), `FAIL deploy/helm/x server x.server.image.registry: prefilled image source "nvcr.io"; expected ""; fix: remove it`; got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -167,10 +150,12 @@ func TestChartImageFindingFormat(t *testing.T) {
 // TestChartImageSummaryListsDowngrades requires skips and expected failures in
 // the summary, with counts by failure category.
 func TestChartImageSummaryListsDowngrades(t *testing.T) {
-	report := &chartCoverageReport{
-		Findings: []chartFinding{{Category: findingUncovered, Chart: "new"}, {Category: findingRenderError, Chart: "broken"}},
+	report := newChartCoverageReport()
+	*report = imageGateReport{
+		Name: report.Name, Categories: report.Categories,
+		Findings: []imageGateFinding{{Category: findingUncovered, Subject: "new"}, {Category: findingRenderError, Subject: "broken"}},
 		Skipped:  map[string][]string{reasonTestFixture: {"examples/a"}},
-		Expected: []string{expectedFailureLabel("deploy/helm/p", chartImageExclusion{Reason: reasonPendingFix, Issue: "https://github.com/dsx-ai-factory/nvcf/issues/7"}, "no image index")},
+		Expected: []string{expectedFailureLabel("deploy/helm/p", imageExclusion{Reason: reasonPendingFix, Issue: "https://github.com/dsx-ai-factory/nvcf/issues/7"}, "no image index")},
 		Covered:  []string{"deploy/helm/nats"},
 	}
 	summary := report.Summary()
@@ -187,21 +172,21 @@ func TestChartImageSummaryListsDowngrades(t *testing.T) {
 
 // TestPendingFixOutcome keeps render errors fatal and flags a stale entry.
 func TestPendingFixOutcome(t *testing.T) {
-	entry := chartImageExclusion{Reason: reasonPendingFix}
+	entry := imageExclusion{Reason: reasonPendingFix}
 	for _, test := range []struct {
 		name     string
-		findings []chartFinding
+		findings []imageGateFinding
 		want     string
 		expected bool
 	}{
-		{"coverage failure is expected", []chartFinding{{Category: findingCoverage}}, "", true},
-		{"render error fails", []chartFinding{{Category: findingCoverage}, {Category: findingRenderError}}, findingRenderError, false},
-		{"index or exception key error fails", []chartFinding{{Category: findingCoverage}, {Category: findingInvalidEntry}}, findingInvalidEntry, false},
-		{"incomplete scenario fails", []chartFinding{{Category: findingCoverage}, {Category: findingScenario}}, findingScenario, false},
+		{"coverage failure is expected", []imageGateFinding{{Category: findingCoverage}}, "", true},
+		{"render error fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingRenderError}}, findingRenderError, false},
+		{"index or exception key error fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingInvalidEntry}}, findingInvalidEntry, false},
+		{"incomplete scenario fails", []imageGateFinding{{Category: findingCoverage}, {Category: findingScenario}}, findingScenario, false},
 		{"passing chart is stale", nil, findingPendingFixed, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, label := pendingFixOutcome(&chartCheck{chart: "c", findings: test.findings}, entry)
+			got, label := chartImageGate.pendingFixOutcome("c", test.findings, entry, findingCoverage)
 			if test.want == "" && len(got) != 0 || test.want != "" && (len(got) != 1 || got[0].Category != test.want) {
 				t.Fatalf("findings %+v, want category %q", got, test.want)
 			}
@@ -266,6 +251,16 @@ func coverageFixtureChart(name, values string, images ...string) map[string]stri
 	}
 }
 
+// movedChart moves fixture chart files from one directory prefix to another,
+// such as a chart that lives in a stack's charts directory.
+func movedChart(chart map[string]string, from, to string) map[string]string {
+	moved := make(map[string]string, len(chart))
+	for name, content := range chart {
+		moved[to+strings.TrimPrefix(name, from)] = content
+	}
+	return moved
+}
+
 // Fixture image values and templates. The guarded template names the values
 // path in each required message, as every chart must.
 const (
@@ -280,7 +275,9 @@ const (
 // TestChartImageCoverageReportsEachFailure drives the whole evaluation on a
 // fixture repository, so each rule is pinned by a fixture built for it rather
 // than by the real charts, which are all pending-fix until their image
-// sources move to the stack.
+// sources move to the stack. A fixture released stack deploys the charts that
+// pin the stack-deployed rules; the standalone-* charts are deployed by no
+// released stack.
 func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	if os.Getenv("NVCF_IMAGE_CATALOG_E2E") != "1" {
 		t.Skip("set NVCF_IMAGE_CATALOG_E2E=1 to render fixture charts with Helm")
@@ -296,6 +293,10 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		"format-key":      "nats:\n  image: {registry: r.example, repository: nats}\n",
 		"pending-passing": fixtureScenario, "pending-failing": fixtureScenario,
 		"no-image": "sidecar: r.example/sidecar:v1\n", "pending-gap": "server:\n  image: {registry: r.example}\n",
+		"standalone-covered": fixtureScenario + "mode: server\n", "standalone-empty": fixtureScenario,
+		"standalone-repository-host": fixtureScenario, "standalone-template-default": fixtureScenario,
+		"standalone-template-host": fixtureScenario, "standalone-unguarded": fixtureScenario,
+		"standalone-hidden": fixtureScenario + "hidden: r.example/team/server:v1\n", "disabled-prefilled": fixtureScenario,
 	}
 	files := map[string]string{
 		chartImageExclusionsFile: "charts/no-image: {reason: no-runtime-image}\n" +
@@ -307,7 +308,53 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 			"charts/fixture: {reason: test-fixture}\n" +
 			"charts/wrapped/charts/sub: {reason: vendored-subchart}\n" +
 			"charts/no-image-ok: {reason: no-runtime-image}\n" +
-			"charts/gone: {reason: test-fixture}\n",
+			"charts/gone: {reason: test-fixture}\n" +
+			"deploy/stacks/dev/charts/dev-tool: {reason: dev-only}\n" +
+			"deploy/stacks/dev/charts/dev-shared: {reason: dev-only}\n" +
+			"deploy/stacks/devinv/charts/dev-tool: {reason: dev-only}\n",
+	}
+	// The released stack deploys every chart that pins a stack-deployed rule,
+	// one by relative path, and one as a release that is not installed: the
+	// stack still supplies its source once an operator installs it.
+	if len(untrackedStackCharts) == 0 {
+		t.Fatal("untrackedStackCharts is empty; replace the untracked release in the released fixture stack")
+	}
+	released := "releases:\n"
+	for _, chart := range []string{"covered", "wrapped", "prefilled-registry", "prefilled-repository", "repository-host",
+		"unguarded", "unnamed-guard", "unrelated-guard", "template-host", "template-default", "hidden", "undeclared",
+		"no-scenario", "scenario-gap", "format-key", "no-image", "unlisted", "no-image-ok", "pending-passing",
+		"pending-failing", "pending-gap", "pending-static"} {
+		released += "  - {name: " + chart + ", namespace: " + chart + ", chart: nvcf/" + chart + "}\n"
+	}
+	released += "  - {name: disabled-prefilled, namespace: disabled, chart: nvcf/disabled-prefilled, installed: false}\n" +
+		"  - {name: dev-shared, namespace: dev, chart: ../../dev/charts/dev-shared}\n" +
+		// A chart whose source is not tracked is not classified.
+		"  - {name: untracked, namespace: untracked, chart: nvcf/" + sortedKeys(untrackedStackCharts)[0] + "}\n"
+	devTool := coverageFixtureChart("dev-tool", fixturePrefilled, "{{ fail \"must not render\" }}")
+	devShared := coverageFixtureChart("dev-shared", "{}\n")
+	devInventoryTool := coverageFixtureChart("devinv-tool", "{}\n")
+	for _, stack := range []map[string]string{
+		fixtureStack("released", "{}\n", released),
+		// A stack with release-inventory.yaml that deploys its own dev-only
+		// chart: once a dev-only stack gains an inventory, its charts are no
+		// longer excluded.
+		fixtureStack("devinv", "{}\n", "releases:\n  - {name: tool, namespace: devinv, chart: ../charts/dev-tool}\n"),
+		// Its charts cannot be classified, so the run fails: the state does
+		// not build, a release names no tracked chart, or a local chart path
+		// is not a chart.
+		fixtureStack("broken", "{}\n", "{{ fail \"broken state\" }}\n"),
+		fixtureStack("unresolved", "{}\n", "releases:\n  - {name: missing, namespace: missing, chart: nvcf/missing}\n"),
+		fixtureStack("not-a-chart", "{}\n", "releases:\n  - {name: typo, namespace: typo, chart: ../../../../charts}\n"),
+		// An unreleased stack is not built, so the chart it deploys stays
+		// dev-only.
+		{"deploy/stacks/dev/helmfile.yaml.gotmpl": "releases:\n  - {name: tool, namespace: dev, chart: ./charts/dev-tool}\n"},
+		movedChart(devTool, "charts/dev-tool/", "deploy/stacks/dev/charts/dev-tool/"),
+		movedChart(devShared, "charts/dev-shared/", "deploy/stacks/dev/charts/dev-shared/"),
+		movedChart(devInventoryTool, "charts/devinv-tool/", "deploy/stacks/devinv/charts/dev-tool/"),
+	} {
+		for name, content := range stack {
+			files[name] = content
+		}
 	}
 	mapping := "scenarios:\n"
 	for _, chart := range sortedKeys(scenarios) {
@@ -330,6 +377,9 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	unrelatedGuard := coverageFixtureChart("unrelated-guard", fixtureIndexed+"mode: \"\"\n", fixtureGuarded)
 	unrelatedGuard["charts/unrelated-guard/templates/object.yaml"] = `{{- $_ := required "set mode" .Values.mode -}}` + "\n" +
 		unrelatedGuard["charts/unrelated-guard/templates/object.yaml"]
+	standaloneCovered := coverageFixtureChart("standalone-covered", fixturePrefilled+"mode: \"\"\n", fixtureGuarded)
+	standaloneCovered["charts/standalone-covered/templates/object.yaml"] = `{{- $_ := required "set mode" .Values.mode -}}` + "\n" +
+		standaloneCovered["charts/standalone-covered/templates/object.yaml"]
 	for _, chart := range []map[string]string{
 		coverageFixtureChart("covered", fixtureIndexed, fixtureGuarded),
 		wrapped,
@@ -366,6 +416,18 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 		// Never rendered: the template would fail.
 		coverageFixtureChart("pending-static", "{}\n", "{{ fail \"must not render\" }}"),
 		coverageFixtureChart("fixture", "{}\n", "{{ fail \"must not render\" }}"),
+		// Standalone: prefilled sources pass, and the defaults are not
+		// required to fail, even on an unrelated required value.
+		standaloneCovered,
+		coverageFixtureChart("standalone-empty", fixtureIndexed, fixtureGuarded),
+		coverageFixtureChart("standalone-repository-host", "ownedImages: {server: server.image}\nserver:\n  image: {registry: r.example, repository: docker.io/team/server, tag: v1}\n", fixtureGuarded),
+		coverageFixtureChart("standalone-template-default", fixturePrefilled,
+			`{{ .Values.server.image.registry | default "r.example" }}/{{ required "set server.image.repository" .Values.server.image.repository }}:{{ .Values.server.image.tag }}`),
+		coverageFixtureChart("standalone-template-host", fixturePrefilled, fixtureGuarded, "docker.io/library/busybox:1"),
+		coverageFixtureChart("standalone-unguarded", fixturePrefilled, fixtureUnguarded),
+		coverageFixtureChart("standalone-hidden", fixturePrefilled+"hidden: \"\"\n", fixtureGuarded, "{{ .Values.hidden }}"),
+		// Not installed by the released stack, yet stack-deployed.
+		coverageFixtureChart("disabled-prefilled", fixturePrefilled, fixtureGuarded),
 	} {
 		for name, content := range chart {
 			files[name] = content
@@ -384,33 +446,48 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	got := make(map[string]map[string]bool)
 	problems := make(map[string][]string)
 	for _, finding := range report.Findings {
-		if got[finding.Chart] == nil {
-			got[finding.Chart] = make(map[string]bool)
+		if got[finding.Subject] == nil {
+			got[finding.Subject] = make(map[string]bool)
 		}
-		got[finding.Chart][finding.Category] = true
-		problems[finding.Chart] = append(problems[finding.Chart], finding.ValuesPath+": "+finding.Problem)
+		got[finding.Subject][finding.Category] = true
+		problems[finding.Subject] = append(problems[finding.Subject], finding.ValuesPath+": "+finding.Problem)
 	}
 	// Each fixture names the check that must report it, so another check
 	// producing the same category cannot stand in for a broken one.
+	stack := func(chart string) string { return chartSubject(chart, classStackDeployed) }
+	standalone := func(chart string) string { return chartSubject(chart, classStandalone) }
 	want := map[string]struct{ category, problem string }{
-		"charts/prefilled-registry":   {findingCoverage, `server.image.registry: prefilled image source "r.example"`},
-		"charts/prefilled-repository": {findingCoverage, `server.image.repository: prefilled image source "team/server"`},
-		"charts/repository-host":      {findingCoverage, "server.image.repository: repository \"docker.io/team/server\" contains registry host docker.io"},
-		"charts/unguarded":            {findingCoverage, ": defaults render without an image source"},
-		"charts/unnamed-guard":        {findingCoverage, "server.image.registry: scenario unnamed-guard.yaml with an empty registry fails without naming it"},
-		"charts/unrelated-guard":      {findingCoverage, ": defaults render fails without naming an image source path"},
-		"charts/template-host":        {findingCoverage, "templates/object.yaml:10: image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
-		"charts/template-default":     {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
-		"charts/hidden":               {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},
-		"charts/undeclared":           {findingCoverage, "scenario undeclared.yaml renders undeclared image r.example/sidecar:v1"},
-		"charts/no-scenario":          {findingScenario, "indexed chart has no CI values scenario"},
-		"charts/pending-gap":          {findingScenario, "server.image.repository: scenario pending-gap.yaml does not supply repository"},
-		"charts/scenario-gap":         {findingScenario, "server.image.repository: scenario scenario-gap.yaml does not supply repository"},
-		"charts/format-key":           {findingInvalidEntry, "declared nats dependency"},
-		"charts/no-image":             {findingInvalidEntry, "listed as no-runtime-image but scenario no-image.yaml renders"},
-		"charts/unlisted":             {findingUncovered, "defaults render no image"},
-		"charts/pending-passing":      {findingPendingFixed, "now passes image coverage"},
-		"charts/gone":                 {findingInvalidEntry, "no tracked Chart.yaml"},
+		stack("charts/prefilled-registry"):    {findingCoverage, `server.image.registry: prefilled image source "r.example"`},
+		stack("charts/prefilled-repository"):  {findingCoverage, `server.image.repository: prefilled image source "team/server"`},
+		stack("charts/repository-host"):       {findingCoverage, "server.image.repository: repository \"docker.io/team/server\" contains registry host docker.io"},
+		stack("charts/unguarded"):             {findingCoverage, ": defaults render without an image source"},
+		stack("charts/unnamed-guard"):         {findingCoverage, "server.image.registry: scenario unnamed-guard.yaml with an empty registry fails without naming it"},
+		stack("charts/unrelated-guard"):       {findingCoverage, ": defaults render fails without naming an image source path"},
+		stack("charts/template-host"):         {findingCoverage, "templates/object.yaml:10: image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
+		stack("charts/template-default"):      {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
+		stack("charts/hidden"):                {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},
+		stack("charts/undeclared"):            {findingCoverage, "scenario undeclared.yaml renders undeclared image r.example/sidecar:v1"},
+		stack("charts/no-scenario"):           {findingScenario, "indexed chart has no CI values scenario"},
+		stack("charts/pending-gap"):           {findingScenario, "server.image.repository: scenario pending-gap.yaml does not supply repository"},
+		stack("charts/scenario-gap"):          {findingScenario, "server.image.repository: scenario scenario-gap.yaml does not supply repository"},
+		stack("charts/format-key"):            {findingInvalidEntry, "declared nats dependency"},
+		stack("charts/no-image"):              {findingInvalidEntry, "listed as no-runtime-image but scenario no-image.yaml renders"},
+		stack("charts/unlisted"):              {findingUncovered, "defaults render no image"},
+		stack("charts/pending-passing"):       {findingPendingFixed, "now passes image coverage"},
+		stack("charts/disabled-prefilled"):    {findingCoverage, `server.image.registry: prefilled image source "r.example"`},
+		"charts/gone":                         {findingInvalidEntry, "no tracked Chart.yaml"},
+		standalone("charts/standalone-empty"): {findingCoverage, "server.image.registry: standalone chart leaves image source empty"},
+		standalone("charts/standalone-repository-host"): {findingCoverage,
+			"server.image.repository: repository \"docker.io/team/server\" contains registry host docker.io"},
+		standalone("charts/standalone-template-default"): {findingCoverage, `templates/object.yaml:8: default "r.example" supplies an image source`},
+		standalone("charts/standalone-template-host"):    {findingCoverage, "image reference docker.io/library/busybox:1 starts with literal registry host docker.io"},
+		standalone("charts/standalone-unguarded"):        {findingCoverage, "server.image.registry: scenario standalone-unguarded.yaml renders with an empty registry"},
+		standalone("charts/standalone-hidden"):           {findingCoverage, "mirror override renders undeclared image r.example/team/server:v1"},
+		stack("deploy/stacks/dev/charts/dev-shared"):     {findingInvalidEntry, "chart is deployed by released stacks deploy/stacks/released"},
+		stack("deploy/stacks/devinv/charts/dev-tool"):    {findingInvalidEntry, "chart is deployed by released stacks deploy/stacks/devinv"},
+		"deploy/stacks/broken":                           {findingStackConfig, "deploy/stacks/broken/helmfile.d/01.yaml.gotmpl: build"},
+		"deploy/stacks/unresolved":                       {findingStackConfig, "release missing/missing: chart nvcf/missing matches no tracked Chart.yaml name"},
+		"deploy/stacks/not-a-chart":                      {findingStackConfig, "release typo/typo: chart ../../../../charts is not a tracked chart directory"},
 	}
 	for chart, expectation := range want {
 		if !got[chart][expectation.category] || len(got[chart]) != 1 {
@@ -423,16 +500,17 @@ func TestChartImageCoverageReportsEachFailure(t *testing.T) {
 	if len(got) != len(want) {
 		t.Errorf("unexpected findings:\n%s", report.Summary())
 	}
-	if strings.Join(report.Covered, ",") != "charts/covered,charts/wrapped" {
-		t.Errorf("covered %v", report.Covered)
+	if got, want := strings.Join(report.Covered, ","), stack("charts/covered")+","+standalone("charts/standalone-covered")+","+stack("charts/wrapped"); got != want {
+		t.Errorf("covered %s, want %s", got, want)
 	}
 	expected := strings.Join(report.Expected, "\n")
-	for _, chart := range []string{"charts/pending-failing", "issues/3532", "charts/pending-static (no image index)"} {
+	for _, chart := range []string{stack("charts/pending-failing"), "issues/3532", stack("charts/pending-static") + " (no image index)"} {
 		if !strings.Contains(expected, chart) {
 			t.Errorf("expected failures missing %s: %v", chart, report.Expected)
 		}
 	}
-	if strings.Join(report.Skipped[reasonTestFixture], ",") != "charts/fixture" {
+	if strings.Join(report.Skipped[reasonTestFixture], ",") != standalone("charts/fixture") ||
+		strings.Join(report.Skipped[reasonDevOnly], ",") != standalone("deploy/stacks/dev/charts/dev-tool") {
 		t.Errorf("skipped %v", report.Skipped)
 	}
 }
