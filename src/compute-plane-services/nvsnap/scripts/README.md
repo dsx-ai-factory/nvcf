@@ -5,16 +5,82 @@ SPDX-License-Identifier: Apache-2.0
 
 # scripts/
 
-Shell scripts run by hand or by CI: building images
-(`build-agent.sh`, `versions.sh`), installing and removing nvsnap
-(`install-nvsnap.sh`, `uninstall-nvsnap.sh`), checking the chart and gpushare
-build in CI (`test-helm-chart.sh`, `check-gpushare-build.sh`), and the
-cluster test suite described below.
+Scripts for building, installing, testing and diagnosing nvsnap, run by hand
+or by CI. A dagger (†) marks a file that no other file in the repository
+names.
+
+## What is here
+
+Cluster tests (the [test suite](#nvsnap-test-suite) below):
+
+- `test-e2e.sh`, `test-bench.sh`: the two entry points.
+- `run-e2e-suite.sh`†: runs `test-e2e.sh` over several workloads and wipes
+  checkpoint state on every agent between them.
+- `test-agent-driven-e2e.sh`†: `test-e2e.sh` for the agent-driven restore
+  (placeholder pod plus the agent's `/v1/restore` API).
+- `test-election-e2e.sh`: the one-downloader election against
+  [`deploy/k8s/charts/vllm-workers`](../deploy/k8s/charts/vllm-workers/).
+- `checkpoint.sh`: asks the agent for a capture; both entry points call it.
+  `config.sh` holds the paths it and the older scripts source.
+
+Build and release:
+
+- `versions.sh`: image versions, sourced by the build scripts.
+- `sync-versions.sh`: rewrites nvsnap image references under `deploy/` and
+  the chart's `values.yaml` to those versions.
+- `build-agent.sh`: the agent base and app images. `roll-agent.sh`† builds
+  one and rolls it onto a cluster.
+- `build-nvsnap-images.sh`: the `nvsnap-server` image.
+- `build-and-test.sh`†: build, push, deploy and test, checking each step.
+- `restore-bundle-init.sh`: copied into the agent image; stages the CRIU
+  bundle into a node or pod directory.
+- `retag-and-push-to-ncp-dev.sh`†: a one-time registry migration.
+
+Install and clusters:
+
+- `install-nvsnap.sh`, `uninstall-nvsnap.sh`: install and fully remove
+  nvsnap; `tests/uninstall-nvsnap_test.sh`† tests the uninstall against fake
+  `kubectl` and `helm`.
+- `bringup-cluster.sh`: prepares a fresh GKE cluster for nvsnap.
+- `cleanup-nodes.sh`†: frees checkpoint and containerd disk space on every
+  node.
+
+CI and docs:
+
+- `test-helm-chart.sh`: chart smoke tests (the `nvsnap chart` workflow).
+- `check-gpushare-build.sh`: compiles gpushare with warnings as errors (the
+  `nvsnap gpushare` workflow) and runs `check-gpushare-entry.sh` on the
+  library.
+- `check-mermaid.sh`: renders the Mermaid blocks of given Markdown files.
+- `grafana-dashboard-history.py`: generates the chart's history dashboard
+  JSON.
+
+Diagnostics:
+
+- `extract-restore-diag.sh`†: CRIU restore diagnostics from a restored pod.
+- `nccl-diagnose.sh`† with `nccl-ioctl-trace.bt`, and `nccl-trace-quick.sh`†:
+  trace `nvidia_ioctl` calls on a GPU node during a checkpoint.
+
+Benchmarks: `bench-cross-node-restore.sh` (cross-node fetch), and
+`bench-70b-full.sh`†, `bench-gpd-vs-cascade.sh`†, `bench-rootfs-cascade.sh`†,
+`bench-rootfs-real.sh`†, `bench-sweep-concurrency.sh`†.
+
+Earlier experiments and tools: `validate-milestone-{1,2,3}.sh`†,
+`test-checkpoint.sh`†, `test-gpu-checkpoint.sh`† (with `install-node.sh`,
+which it names), `test-vanilla-criu.sh`†, `test-lazy-pages.sh`†,
+`test-inference-containers.sh`†, `demo-checkpoint.sh`†,
+`checkpoint-helper.sh`†, `deploy-and-test.sh`†, `deploy-k8s.sh`†,
+`cluster-up.sh`† (a kind cluster), `uninstall.sh`†, `build-agent-base.sh`†
+and `build-container.sh` (both use `docker/phase2/`; see
+[`docker/README.md`](../docker/README.md)), `build-criu-bundle.sh`†,
+`build-criu-portable.sh`† (with `_deps.sh`, which it and
+`build-container.sh` source), `spike-rootfs-only.sh`†,
+`spike-static-pv-rox-rebind.sh`†, `create-issue.sh`† and
+`Dockerfile.intercept-build`†.
 
 Subdirectories: [`lib/`](lib/) (helpers the test scripts source),
 [`docs/`](docs/) (documentation checks), [`repro/nvmesh-shared-ro/`](repro/nvmesh-shared-ro/)
-(a standalone storage reproduction). `tests/` holds a test of
-`uninstall-nvsnap.sh` that nothing runs. `splice-microbench/` and
+(a standalone storage reproduction). `splice-microbench/` and
 `splice-parallel/` hold standalone Go programs that `make test` compiles
 (through `go list ./...`) and nothing runs.
 

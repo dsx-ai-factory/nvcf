@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 
 Pairs of pod manifests, `<id>.yaml` (the source pod to capture) and
 `<id>-restore.yaml` (the pod that restores it), one pair per test workload.
+`e5-mistral-replay.yaml` is a standalone replay pod with no pair; the
+server's catalog skips it with a warning and nothing else names it.
 Source pods carry `nvsnap.io/*` annotations. The readers use different ones:
 
 - nvsnap-server's demo catalog reads the display name, model, port, GPU count
@@ -33,7 +35,9 @@ Source pods carry `nvsnap.io/*` annotations. The readers use different ones:
 - `vllm-small.yaml` / `vllm-small-restore.yaml`: the single-GPU CRIU case.
 - `vllm-small-gpushare.yaml`, `vllm-tp4-gpushare.yaml`: sources annotated
   `nvsnap.io/gpushare: "true"`, with their restore manifests.
-- `vllm-small-rootfs-restore.yaml`: a rootfs restore of `vllm-small`.
+- `vllm-small-rootfs-restore.yaml`: a rootfs restore of `vllm-small`;
+  `test-e2e.sh` uses `<id>-rootfs-restore.yaml` in place of
+  `<id>-restore.yaml` when the capture path is `rootfs` and the file exists.
 - `BUILD.bazel`: the `workload_manifests` filegroup.
 
 Adding a workload is described in [`scripts/README.md`](../../../scripts/README.md).

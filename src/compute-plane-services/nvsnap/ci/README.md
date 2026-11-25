@@ -17,6 +17,10 @@ Image build helpers.
   only when `PUSH` is `1` (the default). The Dockerfiles are in [`docker/`](../docker/).
 - `Dockerfile.bazel`: a Bazel CI toolchain image on Ubuntu 22.04.
 
+`build-image.sh` is the Dockerfile path. The Bazel images in
+[`BUILD.bazel`](../BUILD.bazel) are built and pushed separately, by the
+`image-push-manual` GitHub workflow; see [`docker/README.md`](../docker/README.md).
+
 ## Used by
 
 - `build-image.sh`: run by hand, as
