@@ -1138,17 +1138,23 @@ int main(int argc, char **argv)
         nvsnap_ibv_map(f);
         uint32_t parent = map_token;
         int pfd[2];
-        if (pipe(pfd)) return 1;
+        if (pipe(pfd)) return printf("pipe: %s\n", strerror(errno)), 1;
         pid_t ch = fork();
+        if (ch < 0) return printf("fork: %s\n", strerror(errno)), 1;
         if (!ch) {
+            close(pfd[0]);
             nvsnap_ibv_map(f);
             uint32_t t = map_token;
-            ssize_t __attribute__((unused)) w = write(pfd[1], &t, sizeof(t));
-            _exit(0);
+            _exit(write(pfd[1], &t, sizeof(t)) == (ssize_t)sizeof(t) ? 0 : 1);
         }
+        close(pfd[1]);  /* the read below sees EOF if the child dies first */
         uint32_t child = 0;
-        ssize_t __attribute__((unused)) got = read(pfd[0], &child, sizeof(child));
-        waitpid(ch, NULL, 0);
+        ssize_t got = read(pfd[0], &child, sizeof(child));
+        close(pfd[0]);
+        int st = 0;
+        waitpid(ch, &st, 0);
+        if (got != (ssize_t)sizeof(child) || !WIFEXITED(st) || WEXITSTATUS(st))
+            return printf("child: read %zd byte(s), status %d\n", got, st), 1;
         nvsnap_ibv_map(f);
         printf("child_token_set=%d distinct=%d parent_kept=%d\n", child != 0, child != parent, map_token == parent);
         return 0;
