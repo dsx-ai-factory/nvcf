@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -326,7 +327,7 @@ func TestRootfsDiffChecksTheCheckpointRoom(t *testing.T) {
 		stubDisk(t, 0, func() (uint64, uint64) { return tc.avail, 100 << 20 })
 		ckpt := t.TempDir()
 		a := &Agent{log: logrus.New(), config: Config{CheckpointDir: ckpt, CaptureDiskKeepPercent: 20}}
-		err := a.mirrorRootfsDiff(context.Background(), ckpt, upper, nil, logrus.NewEntry(logrus.New()))
+		err := a.mirrorRootfsDiff(context.Background(), "p/main", ckpt, upper, nil, logrus.NewEntry(logrus.New()))
 		if (err == nil) != tc.fits {
 			t.Errorf("avail %d MiB: err = %v, want fits=%v", tc.avail>>20, err, tc.fits)
 		}
@@ -365,5 +366,88 @@ func TestCatalogDeleteIsRetriedFromItsTombstone(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 2 {
 		t.Fatalf("catalog deletes = %d, want 2", calls)
+	}
+}
+
+// Another member's dump that the preflight passed and that is not yet on
+// disk takes its room from the write-time check; the writer's own does not.
+func TestArchiveRoomCountsOtherMembersPendingDumps(t *testing.T) {
+	upper := t.TempDir()
+	if err := os.WriteFile(filepath.Join(upper, "f"), make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubDisk(t, 0, func() (uint64, uint64) { return 20<<20 + 16<<20, 100 << 20 })
+	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
+	write := func() error { return nil }
+	reserveDisk("p/main", 15<<20, time.Now()) // own: does not count
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); err != nil {
+		t.Fatalf("own reservation counted: %v", err)
+	}
+	reserveDisk("q/main", 15<<20, time.Now()) // another member's pending dump
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); !errors.Is(err, errNoCheckpointRoom) {
+		t.Fatalf("err = %v, want errNoCheckpointRoom with another member's dump pending", err)
+	}
+	releaseDisk("q/main") // its dump is on disk
+	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), write); err != nil {
+		t.Fatalf("after release: %v", err)
+	}
+}
+
+// Tar headers and padding count: many small files are far larger as an
+// archive than their payload.
+func TestTarBytesCountHeadersAndPadding(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 2000; i++ {
+		if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)), []byte{1}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	over, n, err := tarBytesOver(os.DirFS(dir), 1<<20)
+	if err != nil || !over {
+		t.Fatalf("2000 one-byte files: over=%v n=%d err=%v, want over 1 MiB", over, n, err)
+	}
+	if _, payload, _ := treeBytesOver(os.DirFS(dir), 1<<20); payload != 2000 {
+		t.Fatalf("payload = %d, want 2000", payload)
+	}
+}
+
+// An unreachable nvsnap-server does not hold up local reclamation: the
+// sweep retires local checkpoints first and bounds its catalog retries.
+func TestCatalogRetriesDoNotDelayReclamation(t *testing.T) {
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-stop:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(stop)
+	b, rt := catalogRetryBudget, catalogRequestTimeout
+	catalogRetryBudget, catalogRequestTimeout = 300*time.Millisecond, 200*time.Millisecond
+	defer func() { catalogRetryBudget, catalogRequestTimeout = b, rt }()
+	dir := t.TempDir()
+	now := time.Now()
+	if err := os.MkdirAll(filepath.Join(dir, catalogTombstoneDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(dir, catalogTombstoneDir, "old"+strconv.Itoa(i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour))
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
+	start := time.Now()
+	a.reapCheckpoints(context.Background(), nil, now)
+	if exists(dir, "orphan") {
+		t.Fatal("the local checkpoint was not retired")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("sweep took %v with an unreachable server, want it bounded", d)
+	}
+	ents, _ := os.ReadDir(filepath.Join(dir, catalogTombstoneDir))
+	if len(ents) != 21 {
+		t.Fatalf("tombstones = %d, want all 21 kept for later sweeps", len(ents))
 	}
 }

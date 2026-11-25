@@ -184,6 +184,81 @@ func reserveDisk(key string, bytes int64, now time.Time) {
 	diskReservations[key] = diskReservation{bytes: bytes, at: now}
 }
 
+// releaseDisk drops key's reservation: its dump is on disk.
+func releaseDisk(key string) {
+	diskReserveMu.Lock()
+	defer diskReserveMu.Unlock()
+	delete(diskReservations, key)
+}
+
+// diskKey is the reservation key of a container: its pod's name and its
+// own, as the preflight names them.
+func diskKey(pod, container string) string { return pod + "/" + container }
+
+// checkpointWriteMu serialises this node's post-dump writes to the
+// checkpoint filesystem, each from its room check through its write.
+var checkpointWriteMu sync.Mutex
+
+// errNoCheckpointRoom: an archive does not fit above the kept free space.
+var errNoCheckpointRoom = errors.New("does not fit above the checkpoint filesystem's kept free space")
+
+// withCheckpointRoom runs write, an archive of fsys to the checkpoint
+// filesystem, when the archive fits in the room above the kept free space
+// less the dumps the preflight passed on this node that are not yet on
+// disk (other than key's own); errNoCheckpointRoom when it does not. The node's
+// writes run one at a time, so two cannot both pass against the same room.
+func (a *Agent) withCheckpointRoom(key string, fsys fs.FS, write func() error) error {
+	checkpointWriteMu.Lock()
+	defer checkpointWriteMu.Unlock()
+	room, on, err := a.checkpointRoom()
+	if !on {
+		return write()
+	}
+	if err != nil {
+		return fmt.Errorf("cannot tell the checkpoint filesystem's free space: %w", err)
+	}
+	room -= reservedBytes(key, time.Now())
+	if room < 0 {
+		room = 0
+	}
+	over, n, err := tarBytesOver(fsys, room)
+	if err != nil {
+		return fmt.Errorf("cannot size the archive: %w", err)
+	}
+	if over {
+		return fmt.Errorf("an archive of over %d MiB %w (%d%%)", n>>20, errNoCheckpointRoom, a.config.CaptureDiskKeepPercent)
+	}
+	return write()
+}
+
+// tarBytesOver bounds the tar archive of fsys: per entry a header block
+// and one more for a long name or extended attributes, file data padded
+// to 512-byte blocks, and the two end blocks. It stops once over limit.
+func tarBytesOver(fsys fs.FS, limit int64) (over bool, total int64, err error) {
+	total = 1024
+	err = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == "." {
+			return nil
+		}
+		total += 1024
+		if d.Type().IsRegular() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			total += (info.Size() + 511) / 512 * 512
+		}
+		if total > limit {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	return total > limit, total, err
+}
+
 // checkpointRoom is how many bytes the checkpoint filesystem takes before
 // it has less than CaptureDiskKeepPercent free; on is false with the
 // check off. The capture's own writes after the dump (the rootfs diff, the
@@ -270,4 +345,18 @@ func (a *Agent) retireForSpace(ctx context.Context) {
 		return
 	}
 	a.reapCheckpointsOlderThan(ctx, pods.Items, time.Now(), pressureRetireAge)
+}
+
+// podNameLabel is the runtime's label for a container's pod name.
+const podNameLabel = "io.kubernetes.pod.name"
+
+// withWorkloadDirRoom is withCheckpointRoom for an archive of the
+// directory mp as process pid sees it (confined_fs.go).
+func (a *Agent) withWorkloadDirRoom(key string, pid int, mp string, write func() error) error {
+	d, err := openWorkloadDir("/proc", pid, mp)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	return a.withCheckpointRoom(key, d.root.FS(), write)
 }

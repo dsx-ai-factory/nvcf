@@ -188,13 +188,25 @@ func (a *Agent) retirableCachedirCaptures(ctx context.Context, pods []corev1.Pod
 
 // reapCheckpoints retires this node's dead checkpoints and their L2 copies.
 func (a *Agent) reapCheckpoints(ctx context.Context, pods []corev1.Pod, now time.Time) {
-	a.retryCatalogDrops(ctx, now)
 	age := checkpointRetireAge
 	if a.checkpointDiskLow() {
 		age = pressureRetireAge
 	}
+	// Local space first; the catalog retries after it, within a budget,
+	// so an unreachable nvsnap-server cannot hold up reclamation.
 	a.reapCheckpointsOlderThan(ctx, pods, now, age)
+	rctx, cancel := context.WithTimeout(ctx, catalogRetryBudget)
+	defer cancel()
+	a.retryCatalogDrops(rctx, now)
 }
+
+// catalogRetryBudget bounds one sweep's catalog retries, and
+// catalogRequestTimeout each request; what is left is tried on the next
+// sweep. Variables for tests.
+var (
+	catalogRetryBudget    = 2 * time.Minute
+	catalogRequestTimeout = 30 * time.Second
+)
 
 // reapCheckpointsOlderThan is reapCheckpoints with the age an unnamed
 // instance capture must have.
@@ -284,6 +296,9 @@ func (a *Agent) retryCatalogDrops(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, e := range ents {
+		if ctx.Err() != nil {
+			return // the sweep's budget is spent; the rest wait for the next
+		}
 		id := e.Name()
 		log := a.log.WithField("checkpoint", id)
 		if a.dropCatalogRow(ctx, id, log) {
@@ -308,7 +323,7 @@ func (a *Agent) dropCatalogRow(ctx context.Context, id string, log *logrus.Entry
 	ctx, span := tracing.Tracer().Start(ctx, "checkpoint.drop_catalog_row")
 	defer span.End()
 	span.SetAttributes(attribute.String("nvsnap.checkpoint_id", id))
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, catalogRequestTimeout)
 	defer cancel()
 	u := fmt.Sprintf("%s/api/v1/checkpoints/%s", a.config.CatalogURL, url.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
