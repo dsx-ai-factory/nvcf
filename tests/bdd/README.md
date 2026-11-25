@@ -57,10 +57,11 @@ upgrade. Run it alongside the live upgrade rehearsal.
 `TestAPIKeysUpgradeBefore` and `TestAPIKeysUpgradeAfter` check that an API key
 created with the legacy function service ID before an API Keys upgrade still
 works after it. They run against an existing installation and do not upgrade
-anything. Export `NVCF_CLI`, `UPGRADE_CLI_CONFIG`, `UPGRADE_KUBECONFIG`, and
-`UPGRADE_CONTEXT`. Use the same CLI config for both runs and do not run
-`nvcf-cli init` in between, because the config holds the key the first run
-creates.
+anything. Export `NVCF_CLI`, `UPGRADE_CLI_CONFIG`, `UPGRADE_KUBECONFIG`,
+`UPGRADE_CONTEXT`, and `UPGRADE_KEY_FILE`. The suite restores the CLI state
+file when a run ends, so the first run saves the generated key to
+`UPGRADE_KEY_FILE` (mode 0600) and the second run reads it from there and
+removes the file. Pick a path outside the repository.
 
 ```sh
 unset BDD_CLEANUP_MODE
@@ -72,7 +73,9 @@ go test -count=1 -run '^TestAPIKeysUpgradeAfter$' -timeout 10m -v
 
 The second run first checks the `keys_by_account_index_copy` completion marker
 in Cassandra, then uses the key and lists it. It reads the marker with `kubectl
-exec` into `cassandra-0` in `cassandra-system`.
+exec` into `cassandra-0` in `cassandra-system`, using the admin password from
+the `cassandra` Helm release values (`helm get values`), so `helm` and `jq`
+must be on the PATH.
 
 `TestAPIKeysUpgradeNewKey` runs after that. It creates a new key, uses it,
 checks that it is listed, and checks that `keys_by_owner_and_account_and_service`

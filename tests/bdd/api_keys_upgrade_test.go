@@ -19,6 +19,7 @@ package bdd_tmp
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,6 +64,7 @@ func TestAPIKeysUpgradeFeatureFileWiresToSteps(t *testing.T) {
 		"UPGRADE_CLI_CONFIG": "/site/cli.yaml",
 		"UPGRADE_KUBECONFIG": "/site/kubeconfig",
 		"UPGRADE_CONTEXT":    "upgrade-context",
+		"UPGRADE_KEY_FILE":   filepath.Join(t.TempDir(), "legacy-key.json"),
 	} {
 		t.Setenv(key, value)
 	}
