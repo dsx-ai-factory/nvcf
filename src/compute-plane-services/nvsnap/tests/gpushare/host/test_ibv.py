@@ -612,6 +612,7 @@ static int reconnect(void)
  * ("nocount"), with every row twice ("twice"),
  * with no file to read
  * ("unreadable"), or as it is. */
+static char drop_gid[33];  /* "nogid": leave out every row of this old GID (hex) */
 static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
 {
     char full[] = "/tmp/ibvmapXXXXXX", path[] = "/tmp/ibvmapXXXXXX", w1[160], w2[160], tail[16];
@@ -626,6 +627,7 @@ static int reconnect_edited(const char *how, uint32_t qpn, uint32_t alt)
         size_t n1 = strlen(w1);
         int row = !strncmp(w1, "ibvq:", 5) && n1 > nt && !strcmp(w1 + n1 - nt, tail);
         if ((row && !strcmp(how, "omit")) || (!strncmp(w1, "ibvp:", 5) && !strcmp(how, "noport"))) continue;
+        if (!strcmp(how, "nogid") && !strncmp(w1 + 5, drop_gid, 32)) continue;
         if (!strncmp(w1, "ibvk:", 5) && ((!strcmp(how, "nokey") && !keys++) || !strcmp(how, "nokeys"))) continue;
         if (!strncmp(w1, "ibvn:", 5) && !strcmp(how, "nocount")) continue;
         if (row && !strcmp(how, "bump")) snprintf(w2, sizeof(w2), "%lu", strtoul(w2, NULL, 10) + 1);
@@ -924,6 +926,85 @@ int main(int argc, char **argv)
         int ok = 0, n = cq->context->ops.poll_cq(cq, 8, wc);
         for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
         printf("connect=%d completed=%d\n", k, ok);
+        return 0;
+    }
+    if (!strcmp(c, "partialkeys")) {
+        /* Two devices, each with two queue pairs connected to each other.
+         * The first connect brings three to RTS and fails the last one's
+         * RTS. The retry's exchange has only the second device's rows: it
+         * must fail, not finish the last queue pair and let NCCL run with
+         * the first device's peer keys gone. A retry with every row then
+         * finishes it without moving the others again, and a write on the
+         * first device lands. */
+        int nd;
+        struct ibv_device **l = ibv_get_device_list(&nd);
+        static char b2[2][64];
+        struct ibv_context *cx[2];
+        struct ibv_mr *m2[2];
+        struct ibv_qp *q2[2][2];
+        struct ibv_cq *c2[2];
+        for (int d = 0; d < 2; d++) {
+            cx[d] = ibv_open_device(l[d]);
+            if (!d) fakes();
+            struct ibv_pd *p2 = ibv_alloc_pd(cx[d]);
+            m2[d] = ibv_reg_mr(p2, b2[d], sizeof(b2[d]), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+            c2[d] = ibv_create_cq(cx[d], 64, NULL, NULL, 0);
+            struct ibv_qp_init_attr ia = { .send_cq = c2[d], .recv_cq = c2[d], .qp_type = IBV_QPT_RC,
+                                           .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+            q2[d][0] = ibv_create_qp(p2, &ia), q2[d][1] = ibv_create_qp(p2, &ia);
+            union ibv_gid gid;
+            ibv_query_gid(cx[d], 1, 3, &gid);
+            struct ibv_port_attr pa;
+            (ibv_query_port)(cx[d], 1, (struct _compat_ibv_port_attr *)&pa);
+            for (int i = 0; i < 2; i++) {
+                struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+                ibv_modify_qp(q2[d][i], &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+                struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = q2[d][!i]->qp_num,
+                                         .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                                      .grh = { .dgid = gid, .sgid_index = 3 } } };
+                ibv_modify_qp(q2[d][i], &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+                struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+                ibv_modify_qp(q2[d][i], &z, IBV_QP_STATE);
+            }
+            if (!d) hex16(&gid, drop_gid);
+        }
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return printf("suspend: %s\n", rep), 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return printf("restore: %s\n", rep), 1;
+        struct vqp *last = (struct vqp *)q2[1][1];
+        last->attr[2].qp_state = IBV_QPS_RTR;  /* its RTS fails: RTR from RTR */
+        int first = reconnect();
+        last->attr[2].qp_state = IBV_QPS_RTS;
+        int partial = reconnect_edited("nogid", 0, 0);
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int full = reconnect();
+        nvsnap_ibv_open();
+        struct ibv_sge sg = { (uintptr_t)b2[0], 4, m2[0]->lkey };
+        struct ibv_send_wr w = { .wr_id = 11, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)b2[0] + 32, m2[0]->rkey } } }, *b;
+        q2[0][0]->context->ops.post_send(q2[0][0], &w, &b);
+        struct ibv_wc wc[8];
+        int ok = 0, n = c2[0]->context->ops.poll_cq(c2[0], 8, wc);
+        for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
+        printf("first=%d partial=%d held_after_partial=%d full=%d completed=%d\n", first, partial, held, full, ok);
+        return 0;
+    }
+    if (!strcmp(c, "rtschanged")) {
+        /* qa reaches RTS and qb's RTS fails; the retry's exchange gives qa's
+         * peer (qb) another number. qa is connected to the old one: the
+         * retry must fail. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        struct vqp *b = (struct vqp *)qb;
+        b->attr[2].qp_state = IBV_QPS_RTR;
+        int r1 = reconnect();
+        b->attr[2].qp_state = IBV_QPS_RTS;
+        int qa_rts = fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_RTS;
+        int r2 = reconnect_edited("bump", qb->qp_num, 0);
+        printf("first=%d qa_rts=%d retry=%d\n", r1, qa_rts, r2);
         return 0;
     }
     if (!strcmp(c, "lateqp")) {
@@ -1615,6 +1696,19 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_retry_checks_queue_pairs_already_at_rts(self):
+        out = self.probe("partialkeys")
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["partial"], "0", "a retry without the first device's rows finished: %s" % out)
+        self.assertEqual(out["held_after_partial"], "1", out)
+        self.assertEqual((out["full"], out["completed"]), ("0", "1"), out)
+
+    def test_retry_with_another_peer_for_a_queue_pair_at_rts_fails(self):
+        out = self.probe("rtschanged")
+        self.assertEqual((out["qa_rts"]), "1", out)
+        self.assertNotEqual(out["first"], "0", out)
+        self.assertNotEqual(out["retry"], "0", "qa at RTS kept its old peer while the retry gave another: %s" % out)
 
     def test_queue_pair_nccl_connects_after_the_restore_is_not_pending(self):
         out = self.probe("lateqp")

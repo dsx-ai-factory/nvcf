@@ -173,8 +173,9 @@ struct vqp {
     int failed;      /* a completion failed: which receives finished is unknown */
     int slot;
     int fresh;  /* re-created by a restore: 1 needs RTR and RTS, 2 RTS */
-    /* The peer "connect" moved it to RTR with, until it reaches RTS: a
-     * retried connect must find the same one in its exchange. */
+    /* The peer "connect" moved it to RTR with in this restore, kept at RTS
+     * too, until nvsnap_ibv_open lets NCCL's calls run: every connect
+     * until then must find the same one in its exchange, and keep its keys. */
     struct { int set; uint32_t qpn; uint16_t lid; union ibv_gid gid; } rtr;
 };
 
@@ -1612,9 +1613,12 @@ static int put_once(struct u32map *m, uint32_t k, uint32_t v, const char *row, c
     return -1;
 }
 
-/* A queue pair "connect" must bring to its peer: re-created by a restore
- * (or at RTR after an earlier try), and NCCL connected it. */
-static int wants_peer(const struct vqp *q) { return q->fresh && q->mask[1] & IBV_QP_STATE; }
+/* A queue pair whose peer "connect" checks and maps: NCCL connected it,
+ * and a restore re-created it (fresh), or a connect of this restore already
+ * brought it to RTR or RTS (rtr.set). */
+static int wants_peer(const struct vqp *q) { return (q->fresh || q->rtr.set) && q->mask[1] & IBV_QP_STATE; }
+/* One of those still to be moved to RTR or RTS: NCCL's calls stay held. */
+static int needs_connect(const struct vqp *q) { return q->fresh && q->mask[1] & IBV_QP_STATE; }
 
 /* NCCL's RTR attributes for q, with its peer's new GID, LID and queue pair
  * number from the current exchange (rports). -1 and reply when the
@@ -1654,7 +1658,7 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
     a->ah_attr.dlid = rports[i].cur_lid;
     if (q->rtr.set && (q->rtr.qpn != a->dest_qp_num || q->rtr.lid != a->ah_attr.dlid ||
                        (a->ah_attr.is_global && memcmp(q->rtr.gid.raw, a->ah_attr.grh.dgid.raw, 16)))) {
-        snprintf(reply, n, "err queue pair %u is at RTR with peer qpn %u, and this exchange gives %u: it cannot be retried",
+        snprintf(reply, n, "err queue pair %u was connected to peer qpn %u in this restore, and this exchange gives %u",
                  q->v.qp_num, q->rtr.qpn, a->dest_qp_num);
         return -1;
     }
@@ -1732,7 +1736,8 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
         struct vqp *q = qps[i];
         if (!wants_peer(q)) continue;  /* not re-created, or never connected */
         (void)peer_attr(q, &a, &ri, path, ferr, reply, n);  /* checked above */
-        /* A retry after a failure past RTR goes on from RTR (same peer). */
+        /* A retry after a failure past RTR goes on from RTR (same peer); one
+         * already at RTS only maps its peer again. */
         int e = 0;
         if (q->fresh == 1) {
             if (q->has_ece && R.set_ece) R.set_ece(q->real, &q->ece);
@@ -1749,7 +1754,7 @@ EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
             break;
         }
         q->remote = ri;
-        q->fresh = 0, q->rtr.set = 0;
+        q->fresh = 0;
         nq++;
     }
     pthread_mutex_unlock(&omu);
@@ -1773,8 +1778,11 @@ EXPORT void nvsnap_ibv_open(void)
     NVSNAP_IBV_OPEN_HOOK();
     pthread_mutex_lock(&omu);
     int gone = __atomic_load_n(&released, __ATOMIC_SEQ_CST), pending = 0;
-    for (int i = 0; i < n_qps; i++) pending += wants_peer(qps[i]);  /* re-created, not reconnected yet */
-    if (!gone && !pending) __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < n_qps; i++) pending += needs_connect(qps[i]);  /* re-created, not reconnected yet */
+    if (!gone && !pending) {
+        __atomic_store_n(&fenced, 0, __ATOMIC_SEQ_CST);
+        for (int i = 0; i < n_qps; i++) qps[i]->rtr.set = 0;  /* NCCL runs on them: this restore's connect is done */
+    }
     pthread_mutex_unlock(&omu);
     if (gone) { logf_("open: NCCL's verbs objects are not re-created: its calls stay held"); return; }
     if (pending) { logf_("open: %d queue pair(s) not reconnected yet: NCCL's calls stay held", pending); return; }
