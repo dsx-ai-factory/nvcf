@@ -231,36 +231,58 @@ func notServingWithRelease(ns, name string, uid types.UID, released chan<- struc
 	return e
 }
 
-// When the /v1/restore placeholder cannot be read, its restore marker is
-// kept: releasing it would leave a pod that serves nothing with nothing
-// to replace it on the agent's next run.
+// When the /v1/restore placeholder cannot be read, or cannot be deleted
+// once the delete's retries are spent, its restore marker is kept:
+// releasing it would leave a pod that serves nothing with nothing to
+// replace it on the agent's next run.
 func TestRestoreHandler_KeepsTheMarkerWhenTheDisposalFails(t *testing.T) {
-	pod := placeholderPod(ownedBy("ReplicaSet", true))
-	kc := fake.NewSimpleClientset(pod)
-	failPods(kc, "get", nil)
-	a := &Agent{kubeClient: kc, log: logrus.New()}
-	released := make(chan struct{}, 1)
-	prev := restoreForRequest
-	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
-		return nil, notServingWithRelease(pod.Namespace, pod.Name, pod.UID, released)
-	}
-	t.Cleanup(func() { restoreForRequest = prev })
-	body, _ := json.Marshal(RestoreRequest{CheckpointID: "abc__20261008-101010", PlaceholderNamespace: pod.Namespace, PlaceholderPodName: pod.Name})
-	a.restoreHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/restore", strings.NewReader(string(body))))
-	select {
-	case <-released:
-		t.Error("the marker was released though the placeholder was not disposed of")
-	case <-time.After(500 * time.Millisecond):
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	for _, verb := range []string{"get", "delete"} {
+		t.Run(verb, func(t *testing.T) {
+			pod := placeholderPod(ownedBy("ReplicaSet", true))
+			kc := fake.NewSimpleClientset(pod)
+			failPods(kc, verb, nil)
+			deletes := make(chan struct{}, 100)
+			kc.PrependReactor("delete", "pods", func(k8stesting.Action) (bool, kruntime.Object, error) {
+				deletes <- struct{}{}
+				return false, nil, nil
+			})
+			a := &Agent{kubeClient: kc, log: logrus.New()}
+			released := make(chan struct{}, 1)
+			prev := restoreForRequest
+			restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+				return nil, notServingWithRelease(pod.Namespace, pod.Name, pod.UID, released)
+			}
+			t.Cleanup(func() { restoreForRequest = prev })
+			body, _ := json.Marshal(RestoreRequest{CheckpointID: "abc__20261008-101010", PlaceholderNamespace: pod.Namespace, PlaceholderPodName: pod.Name})
+			a.restoreHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/restore", strings.NewReader(string(body))))
+			select {
+			case <-released:
+				t.Error("the marker was released though the placeholder was not disposed of")
+			case <-time.After(500 * time.Millisecond):
+			}
+			if verb == "delete" && len(deletes) < 2 {
+				t.Errorf("%d delete attempts, want the delete retried before it gave up", len(deletes))
+			}
+		})
 	}
 }
 
 // The automatic single-pod restore keeps the marker the same way when the
-// placeholder cannot be read for its disposal.
+// placeholder cannot be read for its disposal, or cannot be deleted once
+// the delete's retries are spent.
 func TestCRIUAutoRestore_KeepsTheMarkerWhenTheDisposalFails(t *testing.T) {
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)
+	for _, verb := range []string{"get", "delete"} {
+		t.Run(verb, func(t *testing.T) { autoRestoreKeepsTheMarker(t, verb) })
+	}
+}
+
+func autoRestoreKeepsTheMarker(t *testing.T, verb string) {
 	pod := placeholderPod(ownedBy("ReplicaSet", true))
 	kc := fake.NewSimpleClientset(pod)
 	var restored atomic.Bool
-	failPods(kc, "get", &restored)
+	failPods(kc, verb, &restored)
 	a := &Agent{kubeClient: kc, log: logrus.New()}
 	released := make(chan struct{}, 1)
 	prev := restoreForRequest

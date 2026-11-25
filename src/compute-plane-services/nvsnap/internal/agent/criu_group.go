@@ -293,7 +293,7 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 // happened (the agent stopped between the record and the delete, or every
 // retry failed) leaves a pod listed; after the window it counts as running
 // again.
-func leavingWindow() time.Duration { return deleteRetry.total + time.Minute }
+func leavingWindow() time.Duration { return deleteRetryBounds().total + time.Minute }
 
 // leavingSkew is how far ahead of this agent's clock a listing may be
 // stamped, by the clock of the agent that wrote it, and still count.
