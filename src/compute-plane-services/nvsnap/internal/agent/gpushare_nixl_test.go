@@ -37,7 +37,16 @@ func fakeNIXL(t *testing.T, out map[string]string, fail map[string]bool) *[]stri
 		calls = append(calls, c)
 		o, ok := out[verb]
 		if !ok {
-			o = "pid=7 nixl pause: ok engine paused, NIXL connector released on 1 worker(s), UCX 1.22.0\n"
+			// One engine that released, or brought back, its connector.
+			var b strings.Builder
+			for _, p := range pids {
+				if verb == "nixl-pause" {
+					fmt.Fprintf(&b, "pid=%d nixl pause: ok engine paused, NIXL connector released on 1 worker(s), UCX 1.22.0\n", p)
+				} else {
+					fmt.Fprintf(&b, "pid=%d nixl resume: ok resumed as engine e2, side channel 10.0.0.9:5600, 0 request(s) prefilled here\n", p)
+				}
+			}
+			o = b.String()
 		}
 		if fail[verb] {
 			o = "pid=7 nixl pause: err 2 RDMA device file(s) still open or mapped\nnixl-pause failed: resuming every pid\n"
@@ -80,24 +89,24 @@ func TestEnvOptsIntoNIXLPause(t *testing.T) {
 }
 
 // A connector was released when any process answered ok with something
-// other than "ok no ...".
-func TestNIXLConnectorFound(t *testing.T) {
+// The pause released nothing only when every pid says so ("ok no ...").
+func TestNIXLNothingPaused(t *testing.T) {
 	for out, want := range map[string]bool{
-		"pid=7 nixl pause: ok engine paused, NIXL connector released on 2 worker(s), UCX 1.22.0\npid=8 nixl pause: ok TP worker: NIXL connector released, UCX 1.22.0\n": true,
-		"pid=7 nixl pause: err UCX 1.19.0 is not 1.22: restored into another pod, it would keep the old pod's routes, and NIXL would reach no peer\n":                   false,
-		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no Python\n":                                                                                   false,
-		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok TP worker: NIXL connector released":                                                            true,
-		"":                        false,
-		"warning: ok something\n": false, // not a reply line
+		"pid=7 nixl pause: ok engine paused, NIXL connector released on 2 worker(s), UCX 1.22.0\npid=8 nixl pause: ok TP worker: NIXL connector released, UCX 1.22.0\n": false,
+		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no Python\n":                                                                                   true,
+		"pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok TP worker: NIXL connector released":                                                            false,
+		"pid=7 nixl pause: ok no NIXL KV connector\n":                                                                                                                   false, // pid 8 did not answer
+		"": false,
+		"warning: ok no thing\npid=8 nixl pause: ok no Python\n": false, // not a reply line for pid 7
 	} {
-		if got := nixlConnectorFound(out); got != want {
-			t.Errorf("nixlConnectorFound(%q) = %v, want %v", out, got, want)
+		if got := nixlNothingPaused(out, []int{7, 8}); got != want {
+			t.Errorf("nixlNothingPaused(%q) = %v, want %v", out, got, want)
 		}
 	}
 }
 
 func TestPauseNIXL(t *testing.T) {
-	noConn := "pid=7 nixl pause: ok no NIXL KV connector\n"
+	noConn := "pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no NIXL KV connector\n"
 	for _, tc := range []struct {
 		name       string
 		optedIn    bool
@@ -511,6 +520,56 @@ func TestPodPreflight_NIXLPauseRefusesAnEngineSpanningNodes(t *testing.T) {
 			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: tc.on}}}
 			if got := preflightBlocked(a.podPreflight(pod(tc.ann), "engine", true), "nixl-pause"); got != tc.want {
 				t.Errorf("nixl-pause block = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The pause's outcome fails closed: a pod is taken as paused unless every
+// pid answered "ok no ..." (no connector, no Python). Output the agent
+// cannot read, or a pid that did not answer (the tool prints nothing for
+// a pid without a control socket), counts as paused, so the source is
+// resumed when it runs on and the checkpoint records the pause.
+func TestPauseNIXL_UnclearOutputCountsAsPaused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"every pid without a connector", "pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok no Python\n", false},
+		{"one pid paused", "pid=7 nixl pause: ok no NIXL KV connector\npid=8 nixl pause: ok TP worker: NIXL connector released\n", true},
+		{"no output", "", true},
+		{"a pid did not answer", "pid=7 nixl pause: ok no NIXL KV connector\n", true},
+		{"another format", "7: paused\n8: paused\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeNIXL(t, map[string]string{"nixl-pause": tc.out}, nil)
+			paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8}, testLog())
+			if err != nil || paused != tc.want {
+				t.Errorf("pauseNIXL = %v, %v; want %v, nil", paused, err, tc.want)
+			}
+		})
+	}
+}
+
+// A resume succeeds only when every pid answered ok: a pid with no answer
+// was not resumed, and an engine that is not resumed serves nothing.
+func TestResumeNIXL_EveryPidAnswersOK(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		out     string
+		wantErr bool
+	}{
+		{"every pid resumed", "pid=7 nixl resume: ok resumed as engine e2\npid=8 nixl resume: ok TP worker: NIXL connector up\n", false},
+		{"not paused", "pid=7 nixl resume: ok not paused\npid=8 nixl resume 10.0.0.9: ok TP worker: NIXL connector up\n", false},
+		{"a pid did not answer", "pid=7 nixl resume: ok resumed as engine e2\n", true},
+		{"no output", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeNIXL(t, map[string]string{"nixl-resume": tc.out}, nil)
+			err := resumeNIXL(context.Background(), 42, "", []int{7, 8}, testLog())
+			if (err != nil) != tc.wantErr {
+				t.Errorf("resumeNIXL = %v, want err %v", err, tc.wantErr)
 			}
 		})
 	}

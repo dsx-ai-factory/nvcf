@@ -103,21 +103,54 @@ var gpushareNIXL = func(ctx context.Context, hostPID int, verb, host string, pid
 	return gpushareTool(ctx, hostPID, gpushareNIXLTimeout, args...)
 }
 
-// nixlConnectorFound reports whether the tool's output (one
-// "pid=N nixl pause: <reply>" line per process) shows a process that
-// released a NIXL KV connector: an "ok" reply other than "ok no ..."
-// ("ok no NIXL KV connector", "ok no Python").
-func nixlConnectorFound(out string) bool {
+// nixlReplies are the replies in the tool's output, by pid: one
+// "pid=N nixl <verb>[ HOST]: <reply>" line per process it reached. A pid
+// without a control socket gets no line.
+func nixlReplies(out string) map[int]string {
+	reps := map[int]string{}
 	for _, line := range strings.Split(out, "\n") {
-		_, rep, ok := strings.Cut(line, ": ")
-		if !ok || !strings.HasPrefix(line, "pid=") {
+		head, rep, ok := strings.Cut(line, ": ")
+		if !ok || !strings.HasPrefix(head, "pid=") {
 			continue
 		}
-		if strings.HasPrefix(rep, "ok ") && !strings.HasPrefix(rep, "ok no ") {
-			return true
+		f := strings.Fields(strings.TrimPrefix(head, "pid="))
+		if len(f) < 2 || f[1] != "nixl" {
+			continue
+		}
+		if pid, err := strconv.Atoi(f[0]); err == nil {
+			reps[pid] = rep
 		}
 	}
-	return false
+	return reps
+}
+
+// nixlNothingPaused reports whether the pause's output shows that no
+// process of pids released a connector: every pid answered "ok no ..."
+// ("ok no NIXL KV connector", "ok no Python"). Anything else (a pid
+// without an answer, output the agent cannot read) counts as paused: the
+// source is then resumed whenever it runs on, and the checkpoint records
+// the pause, which a resume of an engine not paused answers "not paused".
+func nixlNothingPaused(out string, pids []int) bool {
+	reps := nixlReplies(out)
+	for _, pid := range pids {
+		if !strings.HasPrefix(reps[pid], "ok no ") {
+			return false
+		}
+	}
+	return true
+}
+
+// nixlAllOK reports whether every pid answered the tool's verb with ok.
+// The tool exits 0 for a pid without a control socket, which it did not
+// reach.
+func nixlAllOK(out string, pids []int) bool {
+	reps := nixlReplies(out)
+	for _, pid := range pids {
+		if !strings.HasPrefix(reps[pid], "ok") {
+			return false
+		}
+	}
+	return true
 }
 
 // pauseNIXL has the NIXL KV connector in pids release its RDMA state
@@ -147,7 +180,7 @@ func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, 
 		return false, resumeNIXLSource(ctx, hostPID, pids, fmt.Errorf("%w: %w", errNIXLPauseRefused, err), log)
 	}
 	l := log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()})
-	if !nixlConnectorFound(out) {
+	if nixlNothingPaused(out, pids) {
 		l.Info("gpushare: the pod opted in to nixl-pause, but no process has a NIXL KV connector")
 		return false, nil
 	}
@@ -162,6 +195,9 @@ func resumeNIXL(ctx context.Context, hostPID int, host string, pids []int, log *
 	t0 := time.Now()
 	out, err := gpushareNIXL(context.WithoutCancel(ctx), hostPID, "nixl-resume", host, pids)
 	l := log.WithFields(logrus.Fields{"pids": pids, "host": host, "duration": time.Since(t0).Round(time.Millisecond).String()})
+	if err == nil && !nixlAllOK(out, pids) {
+		err = fmt.Errorf("not every process answered ok: %s", lastLines(out, 4))
+	}
 	if err != nil {
 		l.WithError(err).Warn("gpushare: the NIXL KV connector did not resume; the engine takes no requests")
 		return fmt.Errorf("nixl-resume: %w", err)
