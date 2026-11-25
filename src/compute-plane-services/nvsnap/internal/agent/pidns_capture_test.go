@@ -397,6 +397,25 @@ func TestPIDNSFDs(t *testing.T) {
 // nixl-resume, which reads only the plain name, finds none and refuses the
 // restore before CRIU (its pod starts cold), while an agent that resumes
 // NIXL reads it. Any other checkpoint keeps the plain name.
+// dumpV2's steps: the dump runs fenced exactly when the pause was
+// reported before it.
+func TestFencedDumpSteps(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		var got dumpV2Opts
+		nixlPaused, dump := fencedDumpSteps(dumpV2Opts{LeaveRunning: true}, func(o dumpV2Opts) (bool, bool, func(), error) {
+			got = o
+			return true, true, func() {}, nil
+		})
+		if paused {
+			nixlPaused()
+		}
+		_, _, _, _ = dump()
+		if got.nixlFence != paused || !got.LeaveRunning {
+			t.Errorf("paused %v: the dump ran with %+v", paused, got)
+		}
+	}
+}
+
 func TestDumpHooksFor_CarriesTheNIXLFence(t *testing.T) {
 	for _, fence := range []bool{false, true} {
 		if got := dumpHooksFor(dumpV2Opts{nixlFence: fence}, nil).NIXLFence; got != fence {

@@ -368,18 +368,25 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
+	nixlPaused, dump := fencedDumpSteps(o, func(o dumpV2Opts) (ran, done bool, cleanup func(), err error) {
+		ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
+		dumped = done
+		return ran, done, cleanup, err
+	})
 	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
 		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
-		closeFabric: closeFabric,
-		// The dump below reads o when it runs, after the pause.
-		nixlPaused: func() { o.nixlFence = true },
-		dump: func() (ran, done bool, cleanup func(), err error) {
-			ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
-			dumped = done
-			return ran, done, cleanup, err
-		},
+		closeFabric: closeFabric, nixlPaused: nixlPaused, dump: dump,
 	}, log), log)
+}
+
+// fencedDumpSteps returns a capture's sourceDump.nixlPaused and
+// sourceDump.dump for options o and the dump itself (dump, given the
+// options it runs with): once nixlPaused is called (the NIXL KV connector
+// paused), the dump runs with o.nixlFence set, so its marker fences the
+// checkpoint (pidNSMarkerName).
+func fencedDumpSteps(o dumpV2Opts, dump func(dumpV2Opts) (ran, done bool, cleanup func(), err error)) (nixlPaused func(), run func() (ran, done bool, cleanup func(), err error)) {
+	return func() { o.nixlFence = true }, func() (bool, bool, func(), error) { return dump(o) }
 }
 
 // sourceDumpFor completes d, the dump of containerInfo's container, with
