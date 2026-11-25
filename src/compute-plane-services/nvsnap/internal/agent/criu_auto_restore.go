@@ -345,8 +345,9 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	default:
 		log.WithError(err).Error("CRIU auto-restore failed; its capture was verified, so it is kept and the replacement restores from it again")
 	}
-	a.disposeFailedPlaceholderIn(context.WithoutCancel(ctx), ns, pod, uid, container, inPlace, log)
-	releaseNotServing(err)
+	if a.disposeFailedPlaceholderIn(context.WithoutCancel(ctx), ns, pod, uid, container, inPlace, log) {
+		releaseNotServing(err)
+	}
 }
 
 func (a *Agent) criuFailedNamespace() string {

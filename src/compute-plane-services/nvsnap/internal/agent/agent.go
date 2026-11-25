@@ -960,9 +960,10 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 			// The restore's marker stays until then: an agent that stops
 			// before the disposal replaces the pod on its next run.
 			go func(ctx context.Context) {
-				a.disposeFailedPlaceholder(ctx, ns.Namespace, ns.Pod, ns.UID, ns.Container,
-					a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod}))
-				releaseNotServing(err)
+				if a.disposeFailedPlaceholder(ctx, ns.Namespace, ns.Pod, ns.UID, ns.Container,
+					a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod})) {
+					releaseNotServing(err)
+				}
 			}(context.WithoutCancel(r.Context()))
 		}
 		writeRestoreFailure(w, err)

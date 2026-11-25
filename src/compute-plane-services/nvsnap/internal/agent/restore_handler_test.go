@@ -173,3 +173,109 @@ func TestRestoreHandler_ReleasesTheMarkerAfterTheDisposal(t *testing.T) {
 		t.Fatal("the marker was never released")
 	}
 }
+
+// shortDeleteRetry makes a failing delete give up quickly.
+func shortDeleteRetry(t *testing.T) {
+	t.Helper()
+	prev := deleteRetry
+	deleteRetry.first, deleteRetry.max, deleteRetry.total = time.Millisecond, 5*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { deleteRetry = prev })
+}
+
+// failPods makes every verb call on pods fail.
+func failPods(kc *fake.Clientset, verb string) {
+	kc.PrependReactor(verb, "pods", func(k8stesting.Action) (bool, kruntime.Object, error) {
+		return true, nil, errors.New("the API server is unavailable")
+	})
+}
+
+// A placeholder that could not be read or deleted is not settled: the
+// disposal says so, and the restore marker kept for it is kept, so an
+// agent that restarts replaces the pod. A pod gone or deleted is settled.
+func TestDisposeFailedPlaceholder_ReportsWhetherSettled(t *testing.T) {
+	shortDeleteRetry(t)
+	for _, tc := range []struct {
+		name string
+		fail string
+		want bool
+	}{
+		{"deleted", "", true},
+		{"pod cannot be read", "get", false},
+		{"pod cannot be deleted", "delete", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := placeholderPod(ownedBy("ReplicaSet", true))
+			kc := fake.NewSimpleClientset(pod)
+			if tc.fail != "" {
+				failPods(kc, tc.fail)
+			}
+			a := &Agent{kubeClient: kc, log: logrus.New()}
+			if got := a.disposeFailedPlaceholder(context.Background(), pod.Namespace, pod.Name, pod.UID, "inference", logrus.NewEntry(a.log)); got != tc.want {
+				t.Errorf("settled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New()}
+	if !a.disposeFailedPlaceholder(context.Background(), "sr-1", "gone", "u1", "inference", logrus.NewEntry(a.log)) {
+		t.Error("a pod already gone is not settled")
+	}
+}
+
+// When the /v1/restore placeholder cannot be read or deleted, its restore
+// marker is kept: releasing it would leave a pod that serves nothing with
+// nothing to replace it on the agent's next run.
+func TestRestoreHandler_KeepsTheMarkerWhenTheDisposalFails(t *testing.T) {
+	shortDeleteRetry(t)
+	for _, verb := range []string{"get", "delete"} {
+		t.Run(verb, func(t *testing.T) {
+			pod := placeholderPod(ownedBy("ReplicaSet", true))
+			kc := fake.NewSimpleClientset(pod)
+			failPods(kc, verb)
+			a := &Agent{kubeClient: kc, log: logrus.New()}
+			released := make(chan struct{}, 1)
+			prev := restoreForRequest
+			restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+				e := restoredNotServing(&containerd.ContainerInfo{Labels: map[string]string{
+					"io.kubernetes.pod.namespace": "sr-1", "io.kubernetes.pod.name": "fn-0", "io.kubernetes.pod.uid": string(pod.UID),
+					"io.kubernetes.container.name": "inference"}}, errors.New("nixl-resume: exit status 1")).(*restoredNotServingError)
+				e.release = func() { released <- struct{}{} }
+				return nil, e
+			}
+			t.Cleanup(func() { restoreForRequest = prev })
+			body, _ := json.Marshal(RestoreRequest{CheckpointID: "abc__20261008-101010", PlaceholderNamespace: pod.Namespace, PlaceholderPodName: pod.Name})
+			a.restoreHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/restore", strings.NewReader(string(body))))
+			select {
+			case <-released:
+				t.Error("the marker was released though the placeholder was not disposed of")
+			case <-time.After(500 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// The automatic single-pod restore keeps the marker the same way when the
+// placeholder cannot be deleted.
+func TestCRIUAutoRestore_KeepsTheMarkerWhenTheDeleteFails(t *testing.T) {
+	shortDeleteRetry(t)
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	kc := fake.NewSimpleClientset(pod)
+	failPods(kc, "delete")
+	a := &Agent{kubeClient: kc, log: logrus.New()}
+	released := false
+	prev := restoreForRequest
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		e := restoredNotServing(&containerd.ContainerInfo{Labels: map[string]string{
+			"io.kubernetes.pod.namespace": pod.Namespace, "io.kubernetes.pod.name": pod.Name, "io.kubernetes.pod.uid": string(pod.UID),
+			"io.kubernetes.container.name": "inference"}}, errors.New("nixl-resume: exit status 1")).(*restoredNotServingError)
+		e.release = func() { released = true }
+		return nil, e
+	}
+	t.Cleanup(func() { restoreForRequest = prev })
+	a.criuRestorer().restore(context.Background(), pod.Namespace, pod.Name, pod.UID, "abc__20261008-101010", "inference", "")
+	if _, err := kc.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("pod: %v", err)
+	}
+	if released {
+		t.Error("the marker was released though the placeholder could not be deleted")
+	}
+}
