@@ -564,6 +564,16 @@ the outcome is known:
 
 With the streamed limit unset, both limits are equal and requests are handled
 as before.
+
+The gateway accepts cleartext HTTP/2 with prior knowledge and through an
+HTTP/1.1 `Upgrade: h2c` request. An HTTP/1.1 request on any route that asks
+for `Upgrade: h2c` and has a body, a `Content-Length` above 0 or a chunked
+body, is served over HTTP/1.1 instead. The gateway removes `h2c` from
+`Upgrade`, the `HTTP2-Settings` header and the `Connection` tokens that name
+them before routing, so the body is read under the limits above, can take the
+streamed path, and the upgrade headers are not forwarded. A request without a
+body still upgrades to HTTP/2.
+
 For `functionType: LLM`, the LLM Gateway also buffers the rewritten body, so
 those requests are not expected to use less memory.
 

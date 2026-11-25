@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -159,10 +160,66 @@ func buildChiMux(mappings *config.GatewayConfig, serverConfig Config) (*chi.Mux,
 func createHttp2Server(addr string, swappableRouter *router.SwappableRouter) *http.Server {
 	return &http.Server{
 		Addr: addr,
-		Handler: h2c.NewHandler(swappableRouter, &http2.Server{
+		Handler: ignoreH2CUpgradeWithBody(h2c.NewHandler(swappableRouter, &http2.Server{
 			MaxConcurrentStreams: math.MaxInt32,
-		}),
+		})),
 	}
+}
+
+// ignoreH2CUpgradeWithBody serves an HTTP/1 request that has a body and asks
+// for an h2c upgrade over HTTP/1.1, as a server may when it ignores Upgrade.
+// The h2c handler reads such a body in full before the router runs, so model
+// routes could neither bound nor stream it. Requests without a body still
+// upgrade, and HTTP/2 with prior knowledge is unchanged.
+func ignoreH2CUpgradeWithBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength != 0 && headerHasToken(r.Header, "Upgrade", "h2c") {
+			removeH2CUpgrade(r.Header)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// removeH2CUpgrade removes the h2c upgrade request from h: the h2c Upgrade
+// token, the HTTP2-Settings header and the Connection tokens that name them.
+// Other Upgrade tokens are kept.
+func removeH2CUpgrade(h http.Header) {
+	h.Del("HTTP2-Settings")
+	removeHeaderToken(h, "Connection", "HTTP2-Settings")
+	if removeHeaderToken(h, "Upgrade", "h2c") == 0 {
+		removeHeaderToken(h, "Connection", "Upgrade")
+	}
+}
+
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, t := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeHeaderToken drops token, ignoring case, from the comma-separated
+// values of name, deletes name when no token remains, and returns the number
+// of tokens left.
+func removeHeaderToken(h http.Header, name, token string) int {
+	var kept []string
+	for _, value := range h.Values(name) {
+		for _, t := range strings.Split(value, ",") {
+			if t = strings.TrimSpace(t); t != "" && !strings.EqualFold(t, token) {
+				kept = append(kept, t)
+			}
+		}
+	}
+	if len(kept) == 0 {
+		h.Del(name)
+		return 0
+	}
+	h.Set(name, strings.Join(kept, ", "))
+	return len(kept)
 }
 
 // general pass-through vanity domains
