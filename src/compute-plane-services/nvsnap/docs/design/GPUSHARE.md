@@ -477,6 +477,10 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
       sent queue pair rows for that port, or any of the keys counted;
     - it has two rows with different values for one port, queue pair or
       key (identical rows are fine).
+
+    The exchange is built into a new peer table, which replaces the last
+    validated one only once every check passes. A refused `remap` leaves
+    the last one in place.
   - A retried `remap` goes on from RTR only with the same peer numbers.
     A queue pair that reached RTR or RTS with other peer numbers in this
     restore fails it.
@@ -484,7 +488,9 @@ library (`docker/agent/gpushare/nvsnap_ibv.c`), and:
     held, with none in progress after a wait of up to 2 s.
   - `nvsnap_ibv_open` leaves NCCL's calls held while a re-created queue
     pair that NCCL had connected still needs RTR or RTS. This applies to
-    any open: `resume`, a `hold`, a gate opening.
+    any open: `resume`, a `hold`, a gate opening. The library's other
+    release, `reopen` (after a failed fence, a `stop_calls` timeout, or a
+    release refused without a fence), follows the same rule.
   - A queue pair NCCL had not connected at the capture is NCCL's to
     connect after the restore. Once NCCL has connected it, nothing waits
     for it. If its peer was already connected to it (a capture
