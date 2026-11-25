@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -33,6 +34,8 @@ type groupRestoreHarness struct {
 	srv      *httptest.Server
 	ckpts    map[string]*CheckpointMetadata
 	failCkpt string
+	// failText is failCkpt's restore error (default: CRIU's).
+	failText string
 	// spans are the checkpoints' restore-span-ms on their nodes.
 	spans map[string]string
 
@@ -90,7 +93,11 @@ func (h *groupRestoreHarness) restore(w http.ResponseWriter, r *http.Request) {
 	h.requests = append(h.requests, req)
 	h.mu.Unlock()
 	if req.CheckpointID == h.failCkpt {
-		http.Error(w, "restore failed: criu-v2 restore: exit status 1", http.StatusInternalServerError)
+		text := h.failText
+		if text == "" {
+			text = "criu-v2 restore: exit status 1"
+		}
+		http.Error(w, "restore failed: "+text, http.StatusInternalServerError)
 		return
 	}
 	// The placeholder's work volume.
@@ -417,5 +424,25 @@ func learnedSpanForANewRank(t *testing.T, c0Span string, want int64, learned boo
 		if r.GroupRestoreSpanMS != w || r.GroupRestoreSpanLearned != wl {
 			t.Errorf("%s: span %d learned %v, want %d learned %v", r.CheckpointID, r.GroupRestoreSpanMS, r.GroupRestoreSpanLearned, w, wl)
 		}
+	}
+}
+
+// A member whose node cannot bring a paused NIXL KV connector back refuses
+// before CRIU runs; the group's restore then did not run, as far as the
+// checkpoint goes: it is not counted against it (not a
+// groupRestoreFailure), and the target pods still go.
+func TestGroupRestore_NIXLResumeUnavailableIsNotRun(t *testing.T) {
+	h := newGroupRestoreHarness(t, groupCkpts())
+	h.failCkpt = "c1"
+	h.failText = fmt.Errorf("%w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable).Error()
+	kc := groupRestoreCluster(t, h, map[string]string{"new-0": "10.1.0.10", "new-1": "10.1.0.11"})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := h.a.groupRestore(ctx, groupRestoreReq(), quietFabricLog())
+	if err == nil || errors.As(err, new(*groupRestoreFailure)) || !errors.Is(err, errCheckpointUnavailable) {
+		t.Fatalf("err = %v (%T), want a restore that did not run", err, err)
+	}
+	if pods, _ := kc.CoreV1().Pods("llm").List(ctx, metav1.ListOptions{}); len(pods.Items) != 0 {
+		t.Errorf("%d target pods left; they go as after any failure", len(pods.Items))
 	}
 }

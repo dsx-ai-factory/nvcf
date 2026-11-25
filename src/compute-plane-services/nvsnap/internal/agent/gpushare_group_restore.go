@@ -384,6 +384,12 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			res.DeletedPods = append(res.DeletedPods, name)
 		}
 	}
+	if nixlResumeUnavailable(res.Members) {
+		// A member's node cannot bring its paused NIXL KV connector back:
+		// it refused before CRIU ran, and the others failed with it. The
+		// checkpoint is not at fault.
+		return res, fmt.Errorf("%w: %w", errCheckpointUnavailable, membersFailed("group restore", res.Session, len(res.Members), failed))
+	}
 	failure := &groupRestoreFailure{err: membersFailed("group restore", res.Session, len(res.Members), failed)}
 	var faults []gpuFault
 	for _, m := range res.Members {
@@ -426,6 +432,18 @@ func (e *groupRestoreFailure) Unwrap() []error {
 		return []error{e.err, e.fault}
 	}
 	return []error{e.err}
+}
+
+// nixlResumeUnavailable reports whether a member refused its restore
+// because its node cannot resume the NIXL KV connector
+// (errNIXLResumeUnavailable, as text from its agent).
+func nixlResumeUnavailable(members []GroupRestoreMemberResult) bool {
+	for _, m := range members {
+		if strings.Contains(m.Error, errNIXLResumeUnavailable.Error()) {
+			return true
+		}
+	}
+	return false
 }
 
 // allRefusedAsRestored reports whether every member refused the restore

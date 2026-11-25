@@ -236,22 +236,36 @@ func TestRestoredNIXLHost(t *testing.T) {
 
 // Without the capture's pause there is nothing to resume, address or not;
 // with it, an unknown address fails the restore before any resume.
-func TestResumeRestoredNIXLFor(t *testing.T) {
+// Before CRIU runs, a restore whose capture paused the connector checks
+// it can bring it back: a GPU tool with nixl-resume, and the restored pod's
+// address. Either missing is a restore that did not run here
+// (errCheckpointUnavailable), which says nothing about the checkpoint.
+func TestNIXLRestorePrecheck(t *testing.T) {
 	a := &Agent{}
-	calls := fakeNIXL(t, nil, nil)
-	if err := a.resumeRestoredNIXLFor(context.Background(), &GPUShareInfo{PIDs: []int{7}}, nixlToolText, 99, "10.1.245.116", restoreV2Group{}, testLog()); err != nil {
-		t.Errorf("not paused: err = %v", err)
-	}
 	gs := &GPUShareInfo{PIDs: []int{7}, NIXL: true}
-	if err := a.resumeRestoredNIXLFor(context.Background(), gs, nixlToolText, 99, "10.1.245.116", restoreV2Group{}, testLog()); err == nil {
-		t.Error("paused, pod address unknown: err = nil, want the restore failed")
-	}
-	g := restoreV2Group{InetAddrMap: "10.1.245.116=10.1.253.45"}
-	if err := a.resumeRestoredNIXLFor(context.Background(), gs, nixlToolText, 99, "10.1.245.116", g, testLog()); err != nil {
-		t.Errorf("paused, moved: err = %v", err)
-	}
-	if !slices.Equal(*calls, []string{"--host 10.1.253.45 nixl-resume@99 [7]"}) {
-		t.Errorf("calls = %v, want one resume at the new address", *calls)
+	moved := restoreV2Group{InetAddrMap: "10.1.245.116=10.1.253.45"}
+	for _, tc := range []struct {
+		name     string
+		gs       *GPUShareInfo
+		tool     string
+		group    restoreV2Group
+		wantHost string
+		notRun   bool
+	}{
+		{"not paused", &GPUShareInfo{PIDs: []int{7}}, mxToolText, restoreV2Group{}, "", false},
+		{"paused, moved", gs, nixlToolText, moved, "10.1.253.45", false},
+		{"paused, tool without nixl-resume", gs, mxToolText, moved, "", true},
+		{"paused, pod address unknown", gs, nixlToolText, restoreV2Group{}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host, err := a.nixlRestorePrecheck(context.Background(), tc.gs, tc.tool, "10.1.245.116", tc.group)
+			if host != tc.wantHost || (err != nil) != tc.notRun {
+				t.Errorf("precheck = %q, %v; want %q, err %v", host, err, tc.wantHost, tc.notRun)
+			}
+			if tc.notRun && (!errors.Is(err, errCheckpointUnavailable) || !errors.Is(err, errNIXLResumeUnavailable)) {
+				t.Errorf("err = %v, want a restore that did not run (errCheckpointUnavailable, errNIXLResumeUnavailable)", err)
+			}
+		})
 	}
 }
 

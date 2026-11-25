@@ -208,6 +208,12 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 			return nil, fmt.Errorf("gpushare: %s is not in the placeholder's node bundle (version %s predates gpushare)", gpushareToolName, tools.version)
 		}
 	}
+	// A restore that could not bring a paused NIXL KV connector back is
+	// refused before CRIU runs, as a restore that did not run here.
+	nixlHost, nerr := a.nixlRestorePrecheck(ctx, gs, tools.gpuToolText(), metadata.SourcePodIP, group)
+	if nerr != nil {
+		return nil, nerr
+	}
 	// A group restore's session: the driver learns from it that this pod
 	// is restored, and answers with the unlock (and, for gpushare, the
 	// handle exchange of the resume).
@@ -482,7 +488,7 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		},
 		unlockNet: func() error { return netUnlock(ctx, hostPID, checkpointDir, log) },
 		resumeNIXL: func() error {
-			return a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log)
+			return resumeRestoredNIXL(ctx, gs, tools.gpuToolText(), toolPID, nixlHost, log)
 		},
 		resumeMX: func() {
 			goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)

@@ -258,17 +258,32 @@ func (a *Agent) restoredNIXLHostFor(ctx context.Context, gs *GPUShareInfo, captu
 	return restoredNIXLHost(a.placeholderPodIP(ctx, group.Namespace, group.Pod, group.InetAddrMap, capturedIP), capturedIP)
 }
 
-// resumeRestoredNIXLFor resumes the connector of a restore of group at
-// the restored pod's address (resumeRestoredNIXL, restoredNIXLHostFor).
-func (a *Agent) resumeRestoredNIXLFor(ctx context.Context, gs *GPUShareInfo, toolText string, toolPID int, capturedIP string, group restoreV2Group, log *logrus.Entry) error {
+// errNIXLResumeUnavailable marks a restore refused before CRIU ran
+// because its node cannot bring the paused NIXL KV connector back: its GPU
+// tool has no nixl-resume, or the restored pod's address is unknown. It
+// says nothing about the checkpoint (errCheckpointUnavailable).
+var errNIXLResumeUnavailable = errors.New("this node cannot resume the NIXL KV connector")
+
+// nixlRestorePrecheck runs before CRIU, for a restore whose capture paused
+// the connector (gs.NIXL): the node's GPU tool must have nixl-resume, and
+// the address to resume at (restoredNIXLHostFor) must be known. It returns
+// that address. Without either, the restore would run in full and then
+// fail with the engine paused; it is refused here instead, as a restore
+// that did not run: on another node, or after the bundle's rollout, the
+// checkpoint restores.
+func (a *Agent) nixlRestorePrecheck(ctx context.Context, gs *GPUShareInfo, toolText, capturedIP string, group restoreV2Group) (string, error) {
 	if gs == nil || !gs.NIXL {
-		return nil
+		return "", nil
+	}
+	if !gpushareNIXLSupported(toolText) {
+		return "", fmt.Errorf("%w: %w: the capture paused the connector, but this node's GPU tool has no nixl-resume",
+			errCheckpointUnavailable, errNIXLResumeUnavailable)
 	}
 	host, err := a.restoredNIXLHostFor(ctx, gs, capturedIP, group)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("%w: %w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable, err)
 	}
-	return resumeRestoredNIXL(ctx, gs, toolText, toolPID, host, log)
+	return host, nil
 }
 
 // nixlPausableByEnv are the processes of the container whose init is
