@@ -649,6 +649,11 @@ EXPORT int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *a, int mask)
     int r = R.modify_qp(q->real, a, mask);
     if (!r && k >= 0) q->attr[k] = *a, q->mask[k] = mask;
     if (!r && (mask & IBV_QP_STATE)) q->v.state = a->qp_state;
+    if (!r && k >= 1) {  /* NCCL connected it itself (it was not connected at the capture): not for "connect" */
+        pthread_mutex_lock(&omu);
+        q->fresh = 0, q->rtr.set = 0;
+        pthread_mutex_unlock(&omu);
+    }
     leave();
     if (!r && k == 1) {  /* the port's GID identifies this queue pair to its peer's exchange */
         struct vctx *c = q->pd->c;

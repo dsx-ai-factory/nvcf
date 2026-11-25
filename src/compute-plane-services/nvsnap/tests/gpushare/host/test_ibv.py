@@ -871,6 +871,35 @@ int main(int argc, char **argv)
         printf("connect=%d completed=%d\n", k, ok);
         return 0;
     }
+    if (!strcmp(c, "lateqp")) {
+        /* qc is created and at INIT when the process is captured; NCCL
+         * connects it itself after the restore. It is then connected: an
+         * open without a release (a refused fence, a catch-up hold) lets
+         * NCCL's calls go, and a remap with nothing re-created is a no-op. */
+        up(1);
+        struct ibv_qp_init_attr ia = { .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+                                       .cap = { .max_send_wr = 16, .max_recv_wr = 16, .max_send_sge = 1, .max_recv_sge = 8 } };
+        struct ibv_qp *qc = ibv_create_qp(pd, &ia);
+        struct ibv_qp_attr x = { .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
+        ibv_modify_qp(qc, &x, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        if (cycle()) return 1;
+        union ibv_gid gid;
+        ibv_query_gid(ctx, 1, 3, &gid);
+        struct ibv_port_attr pa;
+        (ibv_query_port)(ctx, 1, (struct _compat_ibv_port_attr *)&pa);
+        struct ibv_qp_attr y = { .qp_state = IBV_QPS_RTR, .dest_qp_num = qa->qp_num,
+                                 .ah_attr = { .is_global = 1, .dlid = pa.lid, .port_num = 1,
+                                              .grh = { .dgid = gid, .sgid_index = 3 } } };
+        int r1 = ibv_modify_qp(qc, &y, IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN);
+        struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
+        int r2 = ibv_modify_qp(qc, &z, IBV_QP_STATE);
+        if (stop_calls(rep, sizeof(rep))) return printf("stop: %s\n", rep), 1;
+        nvsnap_ibv_open();
+        int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
+        int k = reconnect();
+        printf("nccl_connect=%d held_after_open=%d remap=%d\n", r1 || r2, held, k);
+        return 0;
+    }
     if (!strcmp(c, "openfresh")) {
         /* An open after the restore and before "connect": NCCL's calls
          * stay held while its queue pairs are not connected. */
@@ -1409,6 +1438,12 @@ class Ibv(unittest.TestCase):
                 self.assertNotEqual(out["first"], "0", out)
                 self.assertNotEqual(out["retry"], "0", "a queue pair at RTR with the old peer number was finished: %s" % out)
                 self.assertEqual((out["still_rtr"], out["held"]), ("1", "1"), out)
+
+    def test_queue_pair_nccl_connects_after_the_restore_is_not_pending(self):
+        out = self.probe("lateqp")
+        self.assertEqual(out["nccl_connect"], "0", out)
+        self.assertEqual(out["held_after_open"], "0", "NCCL's calls stayed held for a queue pair NCCL connected: %s" % out)
+        self.assertEqual(out["remap"], "0", out)
 
     def test_open_before_connect_keeps_nccl_held(self):
         out = self.probe("openfresh")
