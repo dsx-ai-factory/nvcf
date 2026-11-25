@@ -200,6 +200,33 @@ func TestDumpAroundSuspend_ResumesThePausedPIDs(t *testing.T) {
 	}
 }
 
+// The dump of a capture that paused the NIXL KV connector runs fenced:
+// dumpAroundSuspend reports the pause (sourceDump.nixlPaused, which dumpV2
+// turns into the fenced marker name) before the dump runs; a capture that
+// paused nothing does not.
+func TestDumpAroundSuspend_FencesAPausedDump(t *testing.T) {
+	for _, optedIn := range []bool{true, false} {
+		base, pids := fakeDumpSource(t)
+		s := &dumpSteps{}
+		s.install(t)
+		d := s.source(base, pids, false, true)
+		d.nixlOptIn = optedIn
+		fenced, fencedAtDump := false, false
+		d.nixlPaused = func() { fenced = true }
+		dump := d.dump
+		d.dump = func() (bool, bool, func(), error) {
+			fencedAtDump = fenced
+			return dump()
+		}
+		if _, err := (&Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}).dumpAroundSuspend(context.Background(), d, testLog()); err != nil {
+			t.Fatal(err)
+		}
+		if fencedAtDump != optedIn {
+			t.Errorf("opted in %v: the dump ran fenced %v", optedIn, fencedAtDump)
+		}
+	}
+}
+
 // A pod that did not opt in (nixlOptIn) gets no nixl-pause, and the
 // checkpoint records no paused connector, whatever its processes' marker.
 func TestDumpAroundSuspend_NotOptedInPausesNoConnector(t *testing.T) {

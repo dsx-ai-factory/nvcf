@@ -245,6 +245,11 @@ type dumpV2Opts struct {
 	// snapshot was not taken fails. criuSaves names the mountpoints the
 	// dump saves itself, contents included (nil when it saves none).
 	Snapshot func(criuSaves map[string]bool) error
+	// nixlFence: the capture paused the NIXL KV connector, so its marker
+	// fences the checkpoint from agents that cannot resume it
+	// (pidNSMarkerName). dumpAroundSuspend sets it, through
+	// sourceDump.nixlPaused, before the dump.
+	nixlFence bool
 }
 
 func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerInfo, checkpointDir string, o dumpV2Opts, log *logrus.Entry) (_ *GPUShareInfo, retErr error) {
@@ -363,24 +368,18 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
-	gs, err := a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
 		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
 		closeFabric: closeFabric,
+		// The dump below reads o when it runs, after the pause.
+		nixlPaused: func() { o.nixlFence = true },
 		dump: func() (ran, done bool, cleanup func(), err error) {
 			ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
 			dumped = done
 			return ran, done, cleanup, err
 		},
 	}, log), log)
-	if err != nil {
-		return nil, err
-	}
-	// Only an agent that can resume a paused connector may restore it.
-	if err := fenceNIXLCheckpoint(checkpointDir, gs); err != nil {
-		return nil, err
-	}
-	return gs, nil
 }
 
 // sourceDumpFor completes d, the dump of containerInfo's container, with
@@ -415,6 +414,10 @@ type sourceDump struct {
 	// nixlRefusal: why the capture is refused before nixl-pause, from
 	// the pod (nixlCaptureRefusal); "" when it is not.
 	nixlRefusal string
+	// nixlPaused, when set, is called once the NIXL KV connector is
+	// paused, before the suspend and the dump: the dump then fences the
+	// checkpoint (dumpV2Opts.nixlFence).
+	nixlPaused func()
 	// syncOpenAsked: the session's driver runs the open phase
 	// (dumpV2Opts.SyncOpen).
 	syncOpenAsked bool
@@ -498,6 +501,9 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}
 		if len(nixlPaused) > 0 {
+			if d.nixlPaused != nil {
+				d.nixlPaused()
+			}
 			defer func() {
 				if !nixlResumed && sourceRunsOn(dumped, d.leaveRunning) && !errors.Is(retErr, errSourceLeftSuspended) {
 					retErr = resumeNIXLSource(ctx, d.hostPID, d.pids, nixlPaused, retErr, log)
@@ -591,7 +597,7 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 		}
 		return o.Freeze(ctx)
 	}
-	hooks := pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup}
+	hooks := dumpHooksFor(o, freeze)
 	// criu runs from the agent here: its action script sees the
 	// agent's paths.
 	var snapDir string
@@ -650,6 +656,12 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 		markPostDumpFailed(o.PostDumpDir, log)
 	}
 	return true, done, cleanup, err
+}
+
+// dumpHooksFor is the pid-namespace dump's hooks for a capture's options
+// o, with freeze run before CRIU starts.
+func dumpHooksFor(o dumpV2Opts, freeze func() error) pidnsDumpHooks {
+	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence}
 }
 
 // settleSource brings back a source whose GPU state a dump suspended,

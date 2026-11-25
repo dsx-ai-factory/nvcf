@@ -42,7 +42,7 @@ import (
 const pidNSMarkerFile = "pidns-restore.json"
 
 // pidNSNIXLMarkerFile is pidNSMarkerFile under the name a checkpoint whose
-// capture paused the NIXL KV connector carries instead (fenceNIXLCheckpoint).
+// capture paused the NIXL KV connector carries instead (pidNSMarkerName).
 // An agent from before nixl-resume reads only pidNSMarkerFile: it finds
 // none, and refuses the restore before CRIU as a checkpoint it does not
 // restore, so its pod starts cold rather than run an engine whose
@@ -625,25 +625,27 @@ func pidNSRestoreArgs(imgsDir, workDir, root string, mounts []string, listeners 
 }
 
 func writePIDNSMarker(checkpointDir string, c pidNSCapture) error {
+	return writePIDNSMarkerAs(checkpointDir, pidNSMarkerFile, c)
+}
+
+// writePIDNSMarkerAs writes the marker c under name (pidNSMarkerName).
+func writePIDNSMarkerAs(checkpointDir, name string, c pidNSCapture) error {
 	b, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(checkpointDir, pidNSMarkerFile), b, 0o644)
+	return os.WriteFile(filepath.Join(checkpointDir, name), b, 0o644)
 }
 
-// fenceNIXLCheckpoint renames the pid-namespace marker of a checkpoint
-// whose capture paused the NIXL KV connector (gs.NIXL) to
-// pidNSNIXLMarkerFile, so that only an agent that can resume the connector
-// restores it. Any other checkpoint keeps its marker.
-func fenceNIXLCheckpoint(checkpointDir string, gs *GPUShareInfo) error {
-	if gs == nil || !gs.NIXL {
-		return nil
+// pidNSMarkerName is the name of a pid-namespace dump's marker: for a
+// capture that paused the NIXL KV connector (nixlFence),
+// pidNSNIXLMarkerFile, so that only an agent that can resume the
+// connector restores it; for any other, pidNSMarkerFile.
+func pidNSMarkerName(nixlFence bool) string {
+	if nixlFence {
+		return pidNSNIXLMarkerFile
 	}
-	if err := os.Rename(filepath.Join(checkpointDir, pidNSMarkerFile), filepath.Join(checkpointDir, pidNSNIXLMarkerFile)); err != nil {
-		return fmt.Errorf("fence the NIXL checkpoint from agents that cannot resume it: %w", err)
-	}
-	return nil
+	return pidNSMarkerFile
 }
 
 // readPIDNSMarker returns the marker of a checkpoint that carries its pid
@@ -747,6 +749,9 @@ type pidnsDumpHooks struct {
 	// container to dump, "" for none: criu seizes its tasks frozen
 	// (--freeze-cgroup) and they never run before the dump.
 	FreezeCgroup func() string
+	// NIXLFence: the capture paused the NIXL KV connector; the marker is
+	// written as pidNSNIXLMarkerFile (pidNSMarkerName).
+	NIXLFence bool
 }
 
 func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID int, checkpointDir string, deviceExternals []string, final dumpFinal, gpushare bool, hooks pidnsDumpHooks, log *logrus.Entry) (bool, error) {
@@ -855,16 +860,16 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 		return false, fmt.Errorf("criu-v2 pid-namespace dump: %w (output: %s; dump.log tail: %s)", err,
 			strings.TrimSpace(string(out)), tailOfFile(filepath.Join(checkpointDir, "dump.log"), 6))
 	}
-	return pidNSDumpDone(checkpointDir, pidNSCapture{Mounts: mounts, GPUMounts: gpuMounts, UnixListeners: listeners,
+	return pidNSDumpDone(checkpointDir, pidNSMarkerName(hooks.NIXLFence), pidNSCapture{Mounts: mounts, GPUMounts: gpuMounts, UnixListeners: listeners,
 		StdoutPipe: stdout, StderrPipe: stderr, Subtree: subtree, RootNSPID: rootNSPIDOf(subtree, nsPID)})
 }
 
-// pidNSDumpDone records the marker of a pid-namespace dump CRIU completed.
-// dumped is true whatever the write's outcome: CRIU stopped the container,
-// so a marker that cannot be written is the agent's failure, never the
-// workload's (dumpFailure).
-func pidNSDumpDone(checkpointDir string, c pidNSCapture) (dumped bool, err error) {
-	return true, writePIDNSMarker(checkpointDir, c)
+// pidNSDumpDone records the marker of a pid-namespace dump CRIU completed,
+// as name (pidNSMarkerName). dumped is true whatever the write's outcome:
+// CRIU stopped the container, so a marker that cannot be written is the
+// agent's failure, never the workload's (dumpFailure).
+func pidNSDumpDone(checkpointDir, name string, c pidNSCapture) (dumped bool, err error) {
+	return true, writePIDNSMarkerAs(checkpointDir, name, c)
 }
 
 // pidNSDumpDeadline bounds a pid-namespace dump; CRIU's own --timeout
