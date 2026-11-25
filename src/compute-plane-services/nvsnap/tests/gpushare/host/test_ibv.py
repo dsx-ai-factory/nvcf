@@ -1043,6 +1043,7 @@ int main(int argc, char **argv)
         hex16(&gid, hex);
         snprintf(add_row, sizeof(add_row), "ibvq:%s:%u:%u %u", hex, qc->qp_num, map_token, ((struct vqp *)qc)->real->qp_num);
         int alt = reconnect_edited("addrow", 0, 0);
+        if (alt) return printf("refused=%d alt_connect=%d\n", refused, alt), 0;  /* held: no verbs call */
         nvsnap_ibv_open();
         /* NCCL connects qc as it would have: to qd's number and GID as qd
          * sent them before the capture. */
@@ -1111,6 +1112,8 @@ int main(int argc, char **argv)
         nvsnap_ibv_open();
         int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         int full = reconnect();
+        /* A failed remap leaves NCCL held: a send would wait for good. */
+        if (full) return printf("first=%d partial=%d held_after_partial=%d full=%d\n", first, partial, held, full), 0;
         nvsnap_ibv_open();
         struct ibv_sge sg = { (uintptr_t)b2[0], 4, m2[0]->lkey };
         struct ibv_send_wr w = { .wr_id = 11, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
@@ -1255,6 +1258,7 @@ int main(int argc, char **argv)
         nvsnap_ibv_open();
         int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         int k = reconnect();
+        if (k) return printf("held_after_open=%d connect=%d\n", held, k), 0;  /* held: no verbs call */
         nvsnap_ibv_open();
         int held_after = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         send_t(NULL);
@@ -1868,14 +1872,16 @@ class Ibv(unittest.TestCase):
                                             r"of queue pair \d+ \(peer qpn \d+\)$")
         # Why refuse: with a row for the INIT side, the remap succeeds, and
         # the connection NCCL then makes itself does not work.
-        self.assertEqual((out["alt_connect"], out["nccl_connect"], out["alt_completed"]), ("0", "0", "0"), out)
+        self.assertEqual(out["alt_connect"], "0", self.probe_stdout)
+        self.assertEqual((out["nccl_connect"], out["alt_completed"]), ("0", "0"), out)
 
     def test_retry_checks_queue_pairs_already_at_rts(self):
         out = self.probe("partialkeys")
         self.assertNotEqual(out["first"], "0", out)
         self.assertNotEqual(out["partial"], "0", "a retry without the first device's rows finished: %s" % out)
         self.assertEqual(out["held_after_partial"], "1", out)
-        self.assertEqual((out["full"], out["completed"]), ("0", "1"), out)
+        self.assertEqual(out["full"], "0", self.probe_stdout)
+        self.assertEqual(out["completed"], "1", out)
 
     def test_retry_with_another_peer_for_a_queue_pair_at_rts_fails(self):
         # The peer's queue pair number, LID or GID changes; the reply names
@@ -1913,7 +1919,8 @@ class Ibv(unittest.TestCase):
     def test_open_before_connect_keeps_nccl_held(self):
         out = self.probe("openfresh")
         self.assertEqual(out["held_after_open"], "1", "NCCL's calls ran on queue pairs not yet connected: %s" % out)
-        self.assertEqual((out["connect"], out["held_after_connect_open"], out["completed"]), ("0", "0", "1"), out)
+        self.assertEqual(out["connect"], "0", self.probe_stdout)
+        self.assertEqual((out["held_after_connect_open"], out["completed"]), ("0", "1"), out)
 
     def test_connect_refuses_while_nccl_can_run(self):
         out = self.probe("connectunheld")
