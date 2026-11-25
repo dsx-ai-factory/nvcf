@@ -856,6 +856,25 @@ func TestCapturePreflight_NIXLRankNodes(t *testing.T) {
 // when the node cannot resume it; otherwise a resume, run later, through
 // the restored tree's tool pid (set after the build, by the GPU resume),
 // at the address read up front.
+// A refused step builder still hands back a step, which fails with the
+// refusal: a restore that ignored the builder's error and ran would fail
+// its tail closed (marked not serving, for disposal), not call a nil
+// step, which would crash the agent from the auto-restore goroutine.
+func TestNIXLResumeFor_RefusedStepFailsClosed(t *testing.T) {
+	toolPID := 0
+	resume, err := (&Agent{}).nixlResumeFor(context.Background(), &GPUShareInfo{PIDs: []int{7}, NIXL: true}, mxToolText, "10.1.245.116",
+		restoreV2Group{InetAddrMap: "10.1.245.116=10.1.253.45"}, &toolPID, testLog())
+	if !errors.Is(err, errNIXLResumeUnavailable) {
+		t.Fatalf("err = %v, want refused before CRIU", err)
+	}
+	tail, _ := recordingTail(false, true, false, nil)
+	tail.resumeNIXL = resume
+	err = tail.run()
+	if !errors.Is(err, errNIXLResumeUnavailable) || !errors.As(err, new(*restoredNotServingError)) {
+		t.Errorf("tail = %v, want the refusal, marked not serving", err)
+	}
+}
+
 func TestNIXLResumeFor_BuildsTheTailsStep(t *testing.T) {
 	a := &Agent{}
 	gs := &GPUShareInfo{PIDs: []int{7}, NIXL: true}
