@@ -31,11 +31,13 @@ CUDA_INC names the one with cuda.h; default /usr/local/cuda/include.)
 """
 
 import os
+import re
 import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +46,7 @@ IBV_INC = os.environ.get("IBV_INC", "/usr/include")
 CUDA_INC = os.environ.get("CUDA_INC", "/usr/local/cuda/include")
 sys.path.insert(0, HERE)
 from test_rdma_nccl import STUB as CUDA_STUB  # noqa: E402  (libcuda for gpushare's quiesce)
+from test_sync_open import STUB as TOOL_CUDA_STUB  # noqa: E402  (libcuda for the tool: checkpoint states)
 
 FAKE = r"""
 #include <errno.h>
@@ -851,8 +854,7 @@ int main(int argc, char **argv)
             int n = cq->context->ops.poll_cq(cq, 8, wc);
             for (int i = 0; i < n; i++) ok += wc[i].wr_id == 11 && wc[i].status == IBV_WC_SUCCESS;
         }
-        printf("connect=%d untouched=%d completed=%d names_peer=%d dup=%d keyrows=%d\n", k, untouched, ok,
-               !!strstr(rep, "peer"), !!strstr(rep, "two different"), !!strstr(rep, "key"));
+        printf("connect=%d untouched=%d completed=%d\n", k, untouched, ok);
         return 0;
     }
     if (!strcmp(c, "remapnorelease")) {
@@ -898,11 +900,9 @@ int main(int argc, char **argv)
         __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
         int k_inflight = reconnect();
         __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
-        int why_inflight = !!strstr(rep, "not held");
         reopen();
         int k_open = reconnect();
-        int why_open = !!strstr(rep, "not held");
-        printf("connect_inflight=%d connect_open=%d why=%d untouched=%d\n", k_inflight, k_open, why_inflight && why_open,
+        printf("connect_inflight=%d connect_open=%d untouched=%d\n", k_inflight, k_open,
                fake_qp_state(((struct vqp *)qa)->real) == IBV_QPS_INIT && fake_qp_state(((struct vqp *)qb)->real) == IBV_QPS_INIT);
         return 0;
     }
@@ -1118,12 +1118,17 @@ ROLLBACK = r"""
 #include <infiniband/verbs.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 
 #define S(f) __typeof__(&f) p_##f = dlvsym(h, #f, "IBVERBS_1.1")
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* "clean": every destroy succeeds (no failure set up), and the tool
+     * may freeze this process (ptrace; Yama scope 1 honours this). */
+    int clean = argc > 1 && !strcmp(argv[1], "clean");
+    if (clean) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
     /* A driver lookup starts the library's control thread
      * (NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1): a process with NCCL's verbs and
      * no GPU memory of its own still takes part in the suspend. */
@@ -1165,22 +1170,27 @@ int main(void)
         struct ibv_qp_attr z = { .qp_state = IBV_QPS_RTS };
         p_ibv_modify_qp(pair[i][0], &z, IBV_QP_STATE);
     }
-    fail_destroy(1);  /* a's */
+    if (!clean) fail_destroy(1);  /* a's */
     printf("ready\n");
     fflush(stdout);
     char line[16];
-    if (!fgets(line, sizeof(line), stdin)) return 3;
-    /* NCCL writes from a to b with the numbers and keys it had. */
-    snprintf(src, sizeof(src), "rolled");
-    struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
-    struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
-                             .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
-    int posted = !a->context->ops.post_send(a, &w, &wb), ok = 0;
-    struct ibv_wc wc[8];
-    int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
-    for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
-    printf("written=%d data=%s\n", ok, strncmp(dst, "rolled", 6) ? "wrong" : "ok");
-    return 0;
+    int rounds = 0;
+    /* Each line: NCCL writes from a to b with the numbers and keys it had. */
+    while (fgets(line, sizeof(line), stdin)) {
+        rounds++;
+        memset(dst, 0, sizeof(dst));
+        snprintf(src, sizeof(src), "rolled");
+        struct ibv_sge sg = { (uintptr_t)src, 6, ms->lkey };
+        struct ibv_send_wr w = { .wr_id = 5, .sg_list = &sg, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                                 .send_flags = IBV_SEND_SIGNALED, .wr = { .rdma = { (uintptr_t)dst, md->rkey } } }, *wb;
+        int posted = !a->context->ops.post_send(a, &w, &wb), ok = 0;
+        struct ibv_wc wc[8];
+        int got = posted ? cq->context->ops.poll_cq(cq, 8, wc) : 0;
+        for (int i = 0; i < got; i++) ok += wc[i].wr_id == 5 && wc[i].status == IBV_WC_SUCCESS;
+        printf("written=%d data=%s\n", ok, strncmp(dst, "rolled", 6) ? "wrong" : "ok");
+        fflush(stdout);
+    }
+    return rounds ? 0 : 3;
 }
 """
 
@@ -1213,6 +1223,12 @@ class Ibv(unittest.TestCase):
             f.write(ROLLBACK)
         subprocess.run(["gcc", "-shared", "-fPIC", "-I", CUDA_INC, "-o", os.path.join(t, "libcuda.so.1"),
                         os.path.join(t, "cuda.c")], check=True)
+        cls.tool_lib = os.path.join(t, "toolcuda")
+        os.mkdir(cls.tool_lib)
+        with open(os.path.join(t, "toolcuda.c"), "w") as f:
+            f.write(TOOL_CUDA_STUB)
+        subprocess.run(["gcc", "-shared", "-fPIC", "-o", os.path.join(cls.tool_lib, "libcuda.so.1"),
+                        os.path.join(t, "toolcuda.c")], check=True)
         subprocess.run(["gcc", "-O2", "-Wall", "-Werror", *inc, "-o", os.path.join(t, "rollback"),
                         os.path.join(t, "rollback.c"), "-ldl"],
                        check=True)
@@ -1261,7 +1277,26 @@ class Ibv(unittest.TestCase):
                            text=True, timeout=60,
                            env=dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, **env))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.probe_stdout = p.stdout  # with the "connect: <reply>" lines
         return dict(kv.split("=", 1) for line in p.stdout.splitlines() for kv in line.split() if "=" in kv)
+
+    # The connect replies the probe prints ("connect: <reply>"), exactly.
+    GID = r"[0-9a-f]{32}"
+    REFUSAL = {
+        "omit": r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ \(peer qpn \d+\)",
+        "noport": r"err the verbs exchange has no port row for the peer of queue pair \d+ \(peer qpn \d+\)",
+        "unreadable": r"err cannot read the verbs exchange /tmp/ibvmap\w{6} \(No such file or directory\): "
+                      r"no new number for the peer of queue pair \d+",
+        "dupq": r"err the verbs exchange has two different rows for ibvq:%s:\d+ \(\d+ and \d+\)" % GID,
+        "dupp": r"err the verbs exchange has two different rows for ibvp:%s:\d+" % GID,
+        "dupk": r"err the verbs exchange has two different rows for ibvk:%s:\d+ \(\d+ and \d+\)" % GID,
+        "nokey": r"err the verbs exchange has 0 of the 1 key rows for the peer of queue pair \d+",
+        "nokeys": r"err the verbs exchange has 0 of the 1 key rows for the peer of queue pair \d+",
+        "nocount": r"err the verbs exchange has no key count row for the peer of queue pair \d+",
+    }
+
+    def assertRefused(self, how, out):
+        self.assertRegex(self.probe_stdout, r"(?m)^connect: %s$" % self.REFUSAL[how])
 
     def test_lookup_sees_one_table_while_it_grows(self):
         out = self.probe("maprace")
@@ -1331,7 +1366,8 @@ class Ibv(unittest.TestCase):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0",
                                     "connected with the previous restore's mapping (%s): %s" % (how, out))
-                self.assertEqual((out["untouched"], out["names_peer"]), ("1", "1"), out)
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
 
     def test_missing_key_rows_fail_the_connect(self):
         # A peer's key rows, or their count, missing from the exchange: a
@@ -1340,7 +1376,8 @@ class Ibv(unittest.TestCase):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0", "connected without the peer's keys (%s): %s" % (how, out))
-                self.assertEqual((out["untouched"], out["keyrows"]), ("1", "1"), out)
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
 
     def test_conflicting_duplicate_rows_fail_the_connect(self):
         # Two rows for one queue pair (or one port) with different values:
@@ -1349,7 +1386,8 @@ class Ibv(unittest.TestCase):
             with self.subTest(how=how):
                 out = self.probe("stalemap", how=how)
                 self.assertNotEqual(out["connect"], "0", "a conflicting duplicate row was used (%s): %s" % (how, out))
-                self.assertEqual((out["untouched"], out["dup"]), ("1", "1"), out)
+                self.assertEqual(out["untouched"], "1", out)
+                self.assertRefused(how, out)
 
     def test_second_restore_with_a_complete_exchange_connects(self):
         # As it is, and with every row twice (two processes on one port
@@ -1381,7 +1419,9 @@ class Ibv(unittest.TestCase):
         out = self.probe("connectunheld")
         self.assertNotEqual(out["connect_inflight"], "0", out)
         self.assertNotEqual(out["connect_open"], "0", out)
-        self.assertEqual((out["why"], out["untouched"]), ("1", "1"), out)
+        self.assertEqual(out["untouched"], "1", out)
+        held = r"(?m)^connect: err NCCL's verbs calls are not held \(or one is in progress\): cannot reconnect 2 queue pair\(s\)$"
+        self.assertEqual(len(re.findall(held, self.probe_stdout)), 2, self.probe_stdout)
 
     def test_sends_after_the_fence_wait_for_the_restore(self):
         out = self.probe("fenceheld")
@@ -1449,6 +1489,84 @@ class Ibv(unittest.TestCase):
         res, _ = w.communicate("go\n", timeout=60)
         self.assertIn("written=1 data=ok", res,
                       "after the tool's rollback, the queue pair whose destroy failed does not reach its peer:\n" + out + res)
+
+    def test_tool_remap_with_an_incomplete_exchange_fails(self):
+        # The GPU tool's own path (resume --fabric-map: fabmap, then
+        # gpushare "remap <file>"), this test as the driver that merges the
+        # nodes' lists. The first restore gets the whole list; the second
+        # one's lacks a queue pair row and must fail, not connect with the
+        # first restore's numbers.
+        env = dict(os.environ, LD_LIBRARY_PATH=self.tmp, NVSNAP_IBV_REAL_LIB=self.fake, NVSNAP_GPUSHARE_CTL_ON_CUDA_USE="1",
+                   LD_PRELOAD=os.path.join(self.tmp, "libnvsnap_gpushare.so"))
+        w = subprocess.Popen([os.path.join(self.tmp, "rollback"), "clean"], env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+        self.addCleanup(w.stdout.close)
+        self.addCleanup(w.stdin.close)
+        self.addCleanup(w.wait)
+        self.addCleanup(w.kill)
+        sel = selectors.DefaultSelector()
+        sel.register(w.stdout, selectors.EVENT_READ)
+        self.addCleanup(sel.close)
+
+        def worker_line():
+            return w.stdout.readline().strip() if sel.select(30) else "<nothing in 30 s>"
+
+        self.assertEqual(worker_line(), "ready")
+        try:
+            with open("/proc/sys/kernel/yama/ptrace_scope") as f:
+                if int(f.read()) > 1:
+                    self.skipTest("Yama ptrace_scope above 1: the tool cannot freeze the worker")
+        except FileNotFoundError:
+            pass
+        d = tempfile.mkdtemp(dir=self.tmp)
+        tenv = dict(os.environ, LD_LIBRARY_PATH=self.tool_lib)
+
+        def cycle(edit):
+            s = subprocess.run([self.tool, "suspend", str(w.pid)], capture_output=True, text=True, timeout=120, env=tenv)
+            self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+            # As the agent before a dump: the holder leaves the pid stopped
+            # and exits, and "resume" then restores it itself.
+            st = subprocess.run([self.tool, "stop", str(w.pid)], capture_output=True, text=True, timeout=60, env=tenv)
+            self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
+            for name in ("in", "out"):  # the previous cycle's lists
+                if os.path.exists(os.path.join(d, name)):
+                    os.unlink(os.path.join(d, name))
+            r = subprocess.Popen([self.tool, "--fabric-map", d, "resume", str(w.pid)], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, env=tenv)
+            self.addCleanup(r.kill)
+            out = os.path.join(d, "out")
+            for _ in range(600):
+                if os.path.exists(out) or r.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if not os.path.exists(out):
+                r.kill()
+                self.fail("no %s: %s" % (out, r.communicate()[0]))
+            with open(out) as f:
+                lines = f.read().splitlines()
+            with open(os.path.join(d, "in.tmp"), "w") as f:
+                f.write("".join(x + "\n" for x in edit(lines)))
+            os.rename(os.path.join(d, "in.tmp"), os.path.join(d, "in"))
+            return r.wait(timeout=120), r.communicate()[0], lines
+
+        rc, res, lines = cycle(lambda l: l)
+        self.assertEqual(rc, 0, res)
+        self.assertEqual(sum(x.startswith("ibvq:") for x in lines), 2, lines)
+        w.stdin.write("go\n")
+        w.stdin.flush()
+        self.assertEqual(worker_line(), "written=1 data=ok", res)
+        first_q = None
+
+        def drop_first_queue_pair(l):
+            nonlocal first_q
+            first_q = next(x for x in l if x.startswith("ibvq:"))
+            return [x for x in l if x != first_q]
+
+        rc, res, _ = cycle(drop_first_queue_pair)
+        self.assertNotEqual(rc, 0, "the second remap connected without a queue pair row:\n" + res)
+        self.assertIn("remap failed; pids left SIGSTOPped", res)
+        self.assertRegex(res, r"err the verbs exchange has no queue pair row for the peer of queue pair \d+ "
+                              r"\(peer qpn %s\)" % first_q.split()[0].rsplit(":", 1)[1])
 
     def test_queue_pair_left_by_a_failed_destroy_reaches_its_new_peer(self):
         out = self.probe("destroyfail")

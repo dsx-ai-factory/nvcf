@@ -1570,9 +1570,13 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
     }
     const struct u32tab *kt = rports[i].keys.t;
     uint32_t nk = kt ? (uint32_t)kt->used : 0;
-    if (!rports[i].counted || nk != rports[i].nkeys) {
-        snprintf(reply, n, "err the verbs exchange has %u of the %u key rows for the peer of queue pair %u%s", nk,
-                 rports[i].nkeys, q->v.qp_num, rports[i].counted ? "" : " (no key count row)");
+    if (!rports[i].counted) {
+        snprintf(reply, n, "err the verbs exchange has no key count row for the peer of queue pair %u", q->v.qp_num);
+        return -1;
+    }
+    if (nk != rports[i].nkeys) {
+        snprintf(reply, n, "err the verbs exchange has %u of the %u key rows for the peer of queue pair %u", nk,
+                 rports[i].nkeys, q->v.qp_num);
         return -1;
     }
     struct vgid *g = qp_gid(q);
