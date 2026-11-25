@@ -455,6 +455,7 @@ PROBE = r"""
 #include <poll.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 /* asyncgen: the first poll of an async event wait runs a whole suspend,
  * restore and resume before it returns that the old descriptor is ready. */
 static int probe_poll(struct pollfd *p, nfds_t n, int t);
@@ -650,6 +651,7 @@ static void *send_t(void *a)
     __atomic_store_n(&sent, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
+static void *leave_later(void *a) { (void)a; usleep(100000); __atomic_sub_fetch(&inflight, 1, __ATOMIC_SEQ_CST); return NULL; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 /* maprace: a reader looks up a key that is always there while the table grows. */
@@ -898,6 +900,43 @@ int main(int argc, char **argv)
         int held = !!__atomic_load_n(&suspended, __ATOMIC_SEQ_CST);
         int k = reconnect();
         printf("nccl_connect=%d held_after_open=%d remap=%d\n", r1 || r2, held, k);
+        return 0;
+    }
+    if (!strcmp(c, "forktoken")) {
+        /* A process that forks after its first exchange: the child sends
+         * its key counts under a token of its own. */
+        up(1);
+        FILE *f = fopen("/dev/null", "w");
+        nvsnap_ibv_map(f);
+        uint32_t parent = map_token;
+        int pfd[2];
+        if (pipe(pfd)) return 1;
+        pid_t ch = fork();
+        if (!ch) {
+            nvsnap_ibv_map(f);
+            uint32_t t = map_token;
+            ssize_t __attribute__((unused)) w = write(pfd[1], &t, sizeof(t));
+            _exit(0);
+        }
+        uint32_t child = 0;
+        ssize_t __attribute__((unused)) got = read(pfd[0], &child, sizeof(child));
+        waitpid(ch, NULL, 0);
+        nvsnap_ibv_map(f);
+        printf("child_token_set=%d distinct=%d parent_kept=%d\n", child != 0, child != parent, map_token == parent);
+        return 0;
+    }
+    if (!strcmp(c, "connectpass")) {
+        /* A call passes through the gate (enter) while "connect" starts: it
+         * waits for that call instead of refusing. */
+        up(1);
+        if (nvsnap_ibv_suspend(rep, sizeof(rep))) return 1;
+        fake_move();
+        if (nvsnap_ibv_restore(rep, sizeof(rep))) return 1;
+        __atomic_add_fetch(&inflight, 1, __ATOMIC_SEQ_CST);
+        pthread_create(&t, NULL, leave_later, NULL);
+        int k = reconnect();
+        pthread_join(t, NULL);
+        printf("connect=%d\n", k);
         return 0;
     }
     if (!strcmp(c, "openfresh")) {
@@ -1444,6 +1483,13 @@ class Ibv(unittest.TestCase):
         self.assertEqual(out["nccl_connect"], "0", out)
         self.assertEqual(out["held_after_open"], "0", "NCCL's calls stayed held for a queue pair NCCL connected: %s" % out)
         self.assertEqual(out["remap"], "0", out)
+
+    def test_forked_process_sends_its_own_key_count_token(self):
+        out = self.probe("forktoken")
+        self.assertEqual((out["child_token_set"], out["distinct"], out["parent_kept"]), ("1", "1", "1"), out)
+
+    def test_connect_waits_for_a_call_passing_the_gate(self):
+        self.assertEqual(self.probe("connectpass")["connect"], "0", self.probe_stdout)
 
     def test_open_before_connect_keeps_nccl_held(self):
         out = self.probe("openfresh")

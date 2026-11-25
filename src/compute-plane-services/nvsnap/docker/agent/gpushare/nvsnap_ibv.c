@@ -1492,16 +1492,17 @@ static struct vport *qp_port(struct vqp *q)
  *                                                   random, one per process)
  *   ibvq:<old GID>:<old qpn> <new qpn>              a queue pair on it
  *   ibvk:<old GID>:<old rkey> <new rkey>            a registration on its device */
+static uint32_t map_token; static pid_t map_token_pid;  /* this process's token in ibvn lines */
 EXPORT int nvsnap_ibv_map(FILE *fp)
 {
     char a[33], b[33];
     int lines = 0;
-    static uint32_t token;
     pthread_mutex_lock(&omu);
-    if (!token) {
+    if (!map_token || map_token_pid != getpid()) {  /* a forked child gets its own */
         struct timespec t;
         clock_gettime(CLOCK_MONOTONIC, &t);
-        token = hash32((uint32_t)getpid() ^ hash32((uint32_t)t.tv_nsec) ^ (uint32_t)t.tv_sec) | 1;
+        map_token_pid = getpid();
+        map_token = hash32((uint32_t)map_token_pid ^ hash32((uint32_t)t.tv_nsec) ^ (uint32_t)t.tv_sec) | 1;
     }
     for (int i = 0; i < n_qps; i++) {
         struct vqp *q = qps[i];
@@ -1517,7 +1518,7 @@ EXPORT int nvsnap_ibv_map(FILE *fp)
             lines++;
             int nk = 0;
             for (int k = 0; k < n_mrs; k++) nk += mrs[k]->pd->c == q->pd->c && mrs[k]->real;
-            fprintf(fp, "ibvn:%s:%u %d\n", a, token, nk);
+            fprintf(fp, "ibvn:%s:%u %d\n", a, map_token, nk);
             lines++;
             for (int k = 0; k < n_mrs; k++)
                 if (mrs[k]->pd->c == q->pd->c && mrs[k]->real)
@@ -1608,6 +1609,11 @@ static int peer_attr(struct vqp *q, struct ibv_qp_attr *a, int *ri, const char *
 EXPORT int nvsnap_ibv_connect(const char *path, char *reply, size_t n)
 {
     char w1[160], w2[160];
+    /* A call that reaches the gate while NCCL's calls are held counts in
+     * inflight for a moment before it waits: let it pass (as stop_calls). */
+    for (double t0 = now_s(); __atomic_load_n(&suspended, __ATOMIC_SEQ_CST) &&
+                              __atomic_load_n(&inflight, __ATOMIC_SEQ_CST) && now_s() - t0 < 2;)
+        usleep(1000);
     pthread_mutex_lock(&omu);
     int want = 0;
     for (int i = 0; i < n_qps; i++) want += wants_peer(qps[i]);
