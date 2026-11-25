@@ -19,6 +19,8 @@ package cmd
 
 import (
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,8 @@ import (
 
 	"nvcf-cli/internal/client"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -476,4 +480,51 @@ func TestRegistryCredentialAddHelp(t *testing.T) {
 		"registry add command help should provide file example")
 	assert.Contains(t, registryAddCmd.Long, "--secret-file -",
 		"registry add command help should provide stdin example")
+}
+
+func TestRunUpdateRegistryCredentialValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "request rejected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NVCF_API_KEY", "test-api-key")
+	t.Setenv("NVCF_BASE_HTTP_URL", server.URL)
+	t.Setenv("NVCF_BASE_GRPC_URL", "127.0.0.1:50051")
+	previousCfgFile := cfgFile
+	t.Cleanup(func() {
+		cfgFile = previousCfgFile
+		viper.Reset()
+	})
+	cfgFile = ""
+	viper.Reset()
+	viper.SetEnvPrefix("NVCF")
+	viper.AutomaticEnv()
+
+	tests := []struct {
+		name    string
+		flags   []string
+		wantErr string
+	}{
+		{name: "no update flags", wantErr: "no updates specified. Use --username/--password or --artifact-type flags"},
+		{name: "only username", flags: []string{"--username", "alice"}, wantErr: "both username and password must be provided together"},
+		{name: "only password", flags: []string{"--password", "secret"}, wantErr: "both username and password must be provided together"},
+		{name: "invalid artifact type", flags: []string{"--artifact-type", "UNKNOWN"}, wantErr: "invalid artifact type 'UNKNOWN'"},
+		{name: "valid updates reach API", flags: []string{"--username", "alice", "--password", "secret", "--artifact-type", "CONTAINER", "--artifact-type", "MODEL"}, wantErr: "failed to update registry credential:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("username", "", "")
+			cmd.Flags().String("password", "", "")
+			cmd.Flags().StringSlice("artifact-type", nil, "")
+			require.NoError(t, cmd.Flags().Parse(tt.flags))
+
+			err := runUpdateRegistryCredential(cmd, []string{"credential-id"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }

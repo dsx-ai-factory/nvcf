@@ -1710,3 +1710,42 @@ func TestEnsureNamespaceWaitsForTerminatingNamespaceBeforeRecreate(t *testing.T)
 	require.NoError(t, err)
 	assert.NotEqual(t, corev1.NamespaceTerminating, ns.Status.Phase)
 }
+
+func TestEnsureDockerConfigSecret(t *testing.T) {
+	const namespace = "nvcf-system"
+	const name = "registry-pull-secret"
+	payload := []byte(`{"auths":{"registry.example":{"auth":"token"}}}`)
+
+	tests := []struct {
+		name       string
+		seedSecret *corev1.Secret
+	}{
+		{name: "create"},
+		{
+			name: "update existing secret",
+			seedSecret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       nil,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var kube *fake.Clientset
+			if tt.seedSecret == nil {
+				kube = fake.NewSimpleClientset()
+			} else {
+				kube = fake.NewSimpleClientset(tt.seedSecret.DeepCopy())
+			}
+
+			require.NoError(t, ensureDockerConfigSecret(context.Background(), kube, namespace, name, payload))
+
+			secret, err := kube.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, corev1.SecretTypeDockerConfigJson, secret.Type)
+			assert.Equal(t, payload, secret.Data[corev1.DockerConfigJsonKey])
+		})
+	}
+}

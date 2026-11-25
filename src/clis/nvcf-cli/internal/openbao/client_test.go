@@ -369,3 +369,62 @@ printf '%s\n' '__NVCF_HTTP_CONTENT_TYPE__:application/json'
 	assert.Contains(t, commands, "/v1/services/all/pki/root/cert/ca")
 	assert.Contains(t, commands, "--write-out")
 }
+
+func TestGenerateJWTTokenHandlesSigningResponses(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		wantToken   string
+		wantErrText string
+	}{
+		{
+			name:      "valid token",
+			output:    `{"data":{"token":"signed-jwt"}}`,
+			wantToken: "signed-jwt",
+		},
+		{
+			name:        "empty response",
+			output:      " \n\t",
+			wantErrText: "empty response from JWT signing",
+		},
+		{
+			name:        "malformed JSON",
+			output:      "not-json",
+			wantErrText: "failed to unmarshal JWT response",
+		},
+		{
+			name:        "missing token",
+			output:      `{"data":{}}`,
+			wantErrText: "no token in JWT signing response",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testDir := t.TempDir()
+			kubectlPath := filepath.Join(testDir, "kubectl")
+			kubectlScript := "#!/bin/sh\nprintf '%s' '" + tt.output + "'\n"
+			require.NoError(t, os.WriteFile(kubectlPath, []byte(kubectlScript), 0o755))
+			t.Setenv("PATH", testDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			client := NewClient(&Config{
+				OpenBaoURL:            "http://openbao.nvcf.svc.cluster.local:8200",
+				OpenBaoJWTSigningRole: "nvcf-admin",
+				OpenBaoNamespace:      "openbao",
+				UtilityImage:          "curlimages/curl:latest",
+				Debug:                 true,
+			}, nil)
+
+			token, err := client.generateJWTToken(context.Background(), "vault-token")
+			if tt.wantErrText == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantToken, token)
+				return
+			}
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErrText)
+			assert.Empty(t, token)
+		})
+	}
+}

@@ -82,6 +82,37 @@ func TestResolveConfigFilePathHandlesCommonPathForms(t *testing.T) {
 	}
 }
 
+func TestParseSecretsListRejectsUnsupportedInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        interface{}
+		wantInError string
+	}{
+		{
+			name:        "unsupported entry",
+			raw:         []interface{}{42},
+			wantInError: "unsupported secret entry type: int",
+		},
+		{
+			name:        "unsupported payload",
+			raw:         "secret=value",
+			wantInError: "unsupported secrets payload type: string",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseSecretsList(tt.raw, nil)
+			if err == nil {
+				t.Fatal("parseSecretsList() error = nil, want unsupported input error")
+			}
+			if got := err.Error(); got != tt.wantInError {
+				t.Fatalf("parseSecretsList() error = %q, want %q", got, tt.wantInError)
+			}
+		})
+	}
+}
+
 func TestGetStateManagerForCurrentCommandReusesCacheForEquivalentPaths(t *testing.T) {
 	previousCfgFile := cfgFile
 	previousManager := configStateManager

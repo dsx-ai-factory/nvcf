@@ -476,6 +476,94 @@ func TestLoadCreateConfigAppendsLLMModelFlag(t *testing.T) {
 	assertStringSlice(t, model.LLMConfig.URIs, []string{"/v1/chat/completions", "/v1/embeddings"})
 }
 
+func TestApplyCreateFlagOverridesArtifactAndEnvironmentPaths(t *testing.T) {
+	originalFlags := createFlags
+	t.Cleanup(func() {
+		createFlags = originalFlags
+	})
+
+	tests := []struct {
+		name          string
+		containerEnv  []string
+		models        []string
+		llmModels     []string
+		resources     []string
+		wantErr       bool
+	}{
+		{
+			name:         "parses and combines overrides",
+			containerEnv: []string{"MODE=serve", "PORT=8080"},
+			models:       []string{"base:1.0:s3://models/base"},
+			llmModels:    []string{"name=chat,uris=/v1/chat/completions,routingMethod=round_robin"},
+			resources:    []string{"weights:2.0:s3://resources/weights"},
+		},
+		{
+			name:         "rejects invalid container environment",
+			containerEnv: []string{"MODE"},
+			wantErr:      true,
+		},
+		{
+			name:      "rejects invalid artifact",
+			models:    []string{"invalid-artifact"},
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			createFlags.containerEnvironment = tt.containerEnv
+			createFlags.models = tt.models
+			createFlags.llmModels = tt.llmModels
+			createFlags.resources = tt.resources
+
+			cmd := &cobra.Command{}
+			cmd.Flags().StringSlice("container-env", nil, "")
+			cmd.Flags().StringSlice("models", nil, "")
+			cmd.Flags().StringArray("llm-model", nil, "")
+			cmd.Flags().StringSlice("resources", nil, "")
+			flagValues := map[string]string{
+				"container-env": strings.Join(tt.containerEnv, ","),
+				"models":       strings.Join(tt.models, ","),
+				"resources":    strings.Join(tt.resources, ","),
+			}
+			if len(tt.llmModels) > 0 {
+				flagValues["llm-model"] = tt.llmModels[0]
+			} else {
+				flagValues["llm-model"] = ""
+			}
+			for _, name := range []string{"container-env", "models", "llm-model", "resources"} {
+				if err := cmd.Flags().Set(name, flagValues[name]); err != nil {
+					t.Fatalf("mark %s changed: %v", name, err)
+				}
+			}
+
+			config := CreateConfig{Models: []ArtifactConfig{{Name: "existing"}}}
+			err := applyCreateFlagOverrides(cmd, &config)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("applyCreateFlagOverrides() error = nil, want error")
+				}
+				if len(config.Models) != 1 || config.Models[0].Name != "existing" {
+					t.Fatalf("models after failed override = %#v, want original model", config.Models)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyCreateFlagOverrides(): %v", err)
+			}
+			if len(config.ContainerEnvironment) != 2 || config.ContainerEnvironment[0].Key != "MODE" || config.ContainerEnvironment[0].Value != "serve" || config.ContainerEnvironment[1].Key != "PORT" || config.ContainerEnvironment[1].Value != "8080" {
+				t.Fatalf("container environment = %#v, want MODE=serve and PORT=8080", config.ContainerEnvironment)
+			}
+			if len(config.Models) != 2 || config.Models[0].Name != "base" || config.Models[1].Name != "chat" {
+				t.Fatalf("models = %#v, want base artifact followed by chat LLM model", config.Models)
+			}
+			if len(config.Resources) != 1 || config.Resources[0].Name != "weights" {
+				t.Fatalf("resources = %#v, want weights artifact", config.Resources)
+			}
+		})
+	}
+}
+
 func TestUpdateConfigParsesLLMModelUpdatesFromJSON(t *testing.T) {
 	t.Parallel()
 

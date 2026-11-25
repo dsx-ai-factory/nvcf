@@ -223,6 +223,77 @@ func runTaskCreateWithResponse(t *testing.T, response string) (string, error) {
 	return output, runErr
 }
 
+func TestGenerateDemoFolderWritesOperationFiles(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	const functionID = "function-test-id"
+	const versionID = "version-test-id"
+	const functionName = "demo-function"
+	require.NoError(t, generateDemoFolder(functionID, versionID, &CreateConfig{Name: functionName}))
+
+	demoDir := versionID + "_demo"
+	readJSON := func(filename string) map[string]interface{} {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(demoDir, filename))
+		require.NoError(t, err)
+		var decoded map[string]interface{}
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		return decoded
+	}
+
+	deploy := readJSON("deploy.json")
+	assert.Equal(t, functionID, deploy["functionId"])
+	assert.Equal(t, versionID, deploy["versionId"])
+	specifications, ok := deploy["deploymentSpecifications"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, specifications, 1)
+	specification, ok := specifications[0].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "H100", specification["gpu"])
+	assert.Equal(t, float64(1), specification["maxInstances"])
+	assert.Equal(t, float64(1), specification["minInstances"])
+	assert.Equal(t, "NCP.GPU.H100_1x", specification["instanceType"])
+
+	invoke := readJSON("invoke.json")
+	assert.Equal(t, functionID, invoke["functionId"])
+	assert.Equal(t, versionID, invoke["versionId"])
+	assert.Equal(t, float64(120), invoke["timeout"])
+	assert.Equal(t, float64(10), invoke["pollDurationSeconds"])
+	requestBody, ok := invoke["requestBody"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "Hello, World! This is a test request.", requestBody["input"])
+	parameters, ok := requestBody["parameters"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, 0.7, parameters["temperature"])
+	assert.Equal(t, float64(100), parameters["max_tokens"])
+	assert.Equal(t, 0.9, parameters["top_p"])
+	modelConfig, ok := requestBody["model_config"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, float64(1), modelConfig["batch_size"])
+	assert.Equal(t, false, modelConfig["return_logprobs"])
+
+	for _, tc := range []struct {
+		filename            string
+		deleteDeploymentOnly bool
+	}{
+		{filename: "delete-function.json", deleteDeploymentOnly: false},
+		{filename: "delete-deployment.json", deleteDeploymentOnly: true},
+	} {
+		deletion := readJSON(tc.filename)
+		assert.Equal(t, functionID, deletion["functionId"])
+		assert.Equal(t, versionID, deletion["versionId"])
+		assert.Equal(t, true, deletion["graceful"])
+		assert.Equal(t, tc.deleteDeploymentOnly, deletion["deleteDeploymentOnly"])
+	}
+
+	readme, err := os.ReadFile(filepath.Join(demoDir, "README.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(readme), functionName)
+	for _, filename := range []string{"deploy.json", "invoke.json", "delete-deployment.json", "delete-function.json"} {
+		assert.Contains(t, string(readme), filename)
+	}
+}
+
 func TestFunctionCreateJSONOutputFromInputFile(t *testing.T) {
 	output, err, testDir := runFunctionCreateWithResponse(t, `{
 		"function": {
@@ -300,4 +371,35 @@ func TestTaskCreatePreservesWorkflowPayload(t *testing.T) {
 	var parsed client.TaskResponse
 	require.NoError(t, json.Unmarshal([]byte(output), &parsed))
 	assert.Equal(t, "task-test", parsed.Task.ID)
+}
+
+func TestParseContainerEnvironment(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantKey     string
+		wantValue   string
+		wantErrText string
+	}{
+		{name: "key and value", input: "MODE=production", wantKey: "MODE", wantValue: "production"},
+		{name: "value contains equals signs", input: "TOKEN=a=b=c", wantKey: "TOKEN", wantValue: "a=b=c"},
+		{name: "missing equals sign", input: "INVALID", wantErrText: "INVALID"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries, err := parseContainerEnvironment([]string{test.input})
+			if test.wantErrText != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), test.wantErrText)
+				assert.Empty(t, entries)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			assert.Equal(t, test.wantKey, entries[0].Key)
+			assert.Equal(t, test.wantValue, entries[0].Value)
+		})
+	}
 }

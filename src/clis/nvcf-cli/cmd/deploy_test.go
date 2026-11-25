@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"nvcf-cli/internal/client"
 	"nvcf-cli/internal/state"
 )
 
@@ -185,4 +186,162 @@ func TestLoadDeployConfig(t *testing.T) {
 			t.Fatal("loadDeployConfig succeeded with an empty deploymentSpecifications array")
 		}
 	})
+}
+
+func TestDeployUpdateValidationAndGPUSpecResolution(t *testing.T) {
+	min, max, negative, zero := 1, 3, -1, 0
+	validConfig := func() *UpdateDeploymentConfig {
+		return &UpdateDeploymentConfig{
+			FunctionID: "function-id", VersionID: "version-id", GPU: "H100", InstanceType: "NCP.GPU.H100_1x",
+			MinInstances: &min,
+		}
+	}
+	tests := []struct {
+		name    string
+		config  *UpdateDeploymentConfig
+		wantErr bool
+	}{
+		{name: "valid selector and settable field", config: validConfig()},
+		{name: "missing function ID", config: func() *UpdateDeploymentConfig { c := validConfig(); c.FunctionID = ""; return c }(), wantErr: true},
+		{name: "missing version ID", config: func() *UpdateDeploymentConfig { c := validConfig(); c.VersionID = ""; return c }(), wantErr: true},
+		{name: "missing GPU", config: func() *UpdateDeploymentConfig { c := validConfig(); c.GPU = ""; return c }(), wantErr: true},
+		{name: "missing instance type", config: func() *UpdateDeploymentConfig { c := validConfig(); c.InstanceType = ""; return c }(), wantErr: true},
+		{name: "no settable field", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = nil; return c }(), wantErr: true},
+		{name: "negative minimum", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = &negative; return c }(), wantErr: true},
+		{name: "nonpositive maximum", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = nil; c.MaxInstances = &zero; return c }(), wantErr: true},
+		{name: "minimum greater than maximum", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = &max; c.MaxInstances = &min; return c }(), wantErr: true},
+		{name: "custom policy", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = nil; c.AutoscalingConfigurationPolicy = client.AutoscalingPolicyCustom; return c }()},
+		{name: "platform policy", config: func() *UpdateDeploymentConfig { c := validConfig(); c.MinInstances = nil; c.AutoscalingConfigurationPolicy = client.AutoscalingPolicyPlatform; return c }()},
+		{name: "invalid policy", config: func() *UpdateDeploymentConfig { c := validConfig(); c.AutoscalingConfigurationPolicy = "invalid"; return c }(), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDeployUpdateConfig(tt.config)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateDeployUpdateConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	config := validConfig()
+	response := func(specs ...client.GPUSpecificationDto) *client.DeploymentResponse {
+		return &client.DeploymentResponse{Deployment: client.FunctionDeploymentDto{
+			DeploymentID: "deployment-id", DeploymentSpecifications: specs,
+		}}
+	}
+	gpuSpec := func(id, gpu, instanceType string) client.GPUSpecificationDto {
+		return client.GPUSpecificationDto{GpuSpecificationID: id, GPU: gpu, InstanceType: instanceType}
+	}
+	gpuTests := []struct {
+		name       string
+		deployment *client.DeploymentResponse
+		wantID     string
+		wantErr    bool
+	}{
+		{name: "unique match ignores nonmatching specs", deployment: response(gpuSpec("other-id", "A100", "other"), gpuSpec("gpu-spec-id", config.GPU, config.InstanceType)), wantID: "gpu-spec-id"},
+		{name: "missing deployment ID", deployment: &client.DeploymentResponse{Deployment: client.FunctionDeploymentDto{DeploymentSpecifications: []client.GPUSpecificationDto{gpuSpec("id", config.GPU, config.InstanceType)}}}, wantErr: true},
+		{name: "no match", deployment: response(gpuSpec("id", "A100", config.InstanceType)), wantErr: true},
+		{name: "duplicate matches", deployment: response(gpuSpec("first", config.GPU, config.InstanceType), gpuSpec("second", config.GPU, config.InstanceType)), wantErr: true},
+		{name: "matched spec without ID", deployment: response(gpuSpec("", config.GPU, config.InstanceType)), wantErr: true},
+	}
+	for _, tt := range gpuTests {
+		t.Run("GPU spec: "+tt.name, func(t *testing.T) {
+			gotID, err := findDeployUpdateGPUSpecID(tt.deployment, config)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("findDeployUpdateGPUSpecID() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if gotID != tt.wantID {
+				t.Fatalf("findDeployUpdateGPUSpecID() ID = %q, want %q", gotID, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestLoadDeployUpdateConfig(t *testing.T) {
+	previousFlags := deployUpdateFlags
+	t.Cleanup(func() {
+		deployUpdateFlags = previousFlags
+	})
+
+	inputFile := filepath.Join(t.TempDir(), "update.json")
+	data := `{"functionId":"file-function","versionId":"file-version","gpu":"H100","instanceType":"NCP.GPU.H100_1x","minInstances":1,"maxInstances":4}`
+	if err := os.WriteFile(inputFile, []byte(data), 0o600); err != nil {
+		t.Fatalf("write update config: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		inputFile  string
+		fileData   string
+		writeFile  bool
+		wantErr    bool
+	}{
+		{name: "merge file and changed flags", inputFile: inputFile},
+		{name: "malformed JSON", inputFile: "malformed.json", fileData: `{`, writeFile: true, wantErr: true},
+		{name: "missing input file", inputFile: filepath.Join(t.TempDir(), "missing.json"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.writeFile {
+				path := filepath.Join(t.TempDir(), tt.inputFile)
+				if err := os.WriteFile(path, []byte(tt.fileData), 0o600); err != nil {
+					t.Fatalf("write test input: %v", err)
+				}
+				tt.inputFile = path
+			}
+			deployUpdateFlags = struct {
+				inputFile         string
+				functionID        string
+				versionID         string
+				gpu               string
+				instanceType      string
+				minInstances      int
+				maxInstances      int
+				autoscalingPolicy string
+			}{
+				inputFile: tt.inputFile, functionID: "flag-function", minInstances: 2,
+				maxInstances: 3, autoscalingPolicy: string(client.AutoscalingPolicyCustom),
+			}
+
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("function-id", "", "")
+			cmd.Flags().String("version-id", "", "")
+			cmd.Flags().String("gpu", "", "")
+			cmd.Flags().String("instance-type", "", "")
+			cmd.Flags().Int("min-instances", 0, "")
+			cmd.Flags().Int("max-instances", 0, "")
+			cmd.Flags().String("autoscaling-policy", "", "")
+			for name, value := range map[string]string{
+				"function-id": "flag-function", "min-instances": "2", "max-instances": "3",
+				"autoscaling-policy": string(client.AutoscalingPolicyCustom),
+			} {
+				if err := cmd.Flags().Set(name, value); err != nil {
+					t.Fatalf("mark %s changed: %v", name, err)
+				}
+			}
+
+			got, err := loadDeployUpdateConfig(cmd)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("loadDeployUpdateConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if got.FunctionID != "flag-function" || got.VersionID != "file-version" {
+				t.Errorf("IDs = (%q, %q), want flag-function and file-version", got.FunctionID, got.VersionID)
+			}
+			if got.GPU != "H100" || got.InstanceType != "NCP.GPU.H100_1x" {
+				t.Errorf("GPU and instance type = (%q, %q), want file values", got.GPU, got.InstanceType)
+			}
+			if got.MinInstances == nil || *got.MinInstances != 2 {
+				t.Errorf("MinInstances = %v, want pointer to 2", got.MinInstances)
+			}
+			if got.MaxInstances == nil || *got.MaxInstances != 3 {
+				t.Errorf("MaxInstances = %v, want pointer to 3", got.MaxInstances)
+			}
+			if got.AutoscalingConfigurationPolicy != client.AutoscalingPolicyCustom {
+				t.Errorf("AutoscalingConfigurationPolicy = %q, want %q", got.AutoscalingConfigurationPolicy, client.AutoscalingPolicyCustom)
+			}
+		})
+	}
 }
