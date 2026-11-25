@@ -12,7 +12,7 @@ it is not. Words are defined in the [glossary](GLOSSARY.md).
 
 - [The problem](#the-problem)
 - [How nvsnap solves it](#how-nvsnap-solves-it)
-- [Three measured numbers](#three-measured-numbers)
+- [Measured numbers](#measured-numbers)
 - [What nvsnap is not](#what-nvsnap-is-not)
 - [Where next](#where-next)
 <!-- /toc -->
@@ -39,13 +39,10 @@ agents.
 
 ![nvsnap on one cluster: the webhook, the agent on every GPU node, the server and catalog, cluster storage and peer agents](figures/nvsnap-components.svg)
 
-## Three measured numbers
+## Measured numbers
 
-| What | Result | Hardware, date |
-|---|---|---|
-| Qwen2.5-72B-Instruct, TP=4, CRIU with gpushare, restored on another node | 66.7 s to first token from the node's copy, against 242 s cold without the download | 4x GB300, October 2026 ([GPUSHARE.md](design/GPUSHARE.md#validation)) |
-| DeepSeek-V4-Flash, SGLang TP=8, cachedir | 289 s to ready, against 1162 s cold | 8x H100, June 2026 ([RESULTS.md](RESULTS.md#cachedir)) |
-| Llama-3.1-8B, vLLM, single-GPU CRIU | 32.4 s agent restore time | H100, July 2026 ([RESULTS.md](RESULTS.md#criu-single-gpu)) |
+Every measured number, with its model, GPUs, nvsnap version, date and raw data, is in
+[BENCHMARKS.md](BENCHMARKS.md). What runs and what is refused is in [SUPPORT.md](SUPPORT.md).
 
 ## What nvsnap is not
 
@@ -54,13 +51,12 @@ agents.
 - Not a live migration system for serving traffic: a CRIU capture freezes
   the workload while it runs, so an instance is best captured before traffic
   reaches it.
-- Not proven end to end on hardware for multi-pod instances yet: group
-  capture and restore are covered by tests only
-  ([ARCHITECTURE.md §0](ARCHITECTURE.md#0-evidence-levels)).
+- Not every workload shape is checkpointed: [SUPPORT.md](SUPPORT.md) lists what
+  is supported, refused and not tested.
 
 ## Where next
 
 - Install it: [operate/INSTALL.md](operate/INSTALL.md)
 - How it works, with the code that enforces each rule: [ARCHITECTURE.md](ARCHITECTURE.md)
-- Every number: [RESULTS.md](RESULTS.md)
+- Every number: [BENCHMARKS.md](BENCHMARKS.md); what is supported: [SUPPORT.md](SUPPORT.md)
 - Every document: [README.md](README.md)

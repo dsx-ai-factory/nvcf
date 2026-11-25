@@ -38,7 +38,7 @@ import (
 //   - sweepStep reads the volume into the node's page cache with parallel
 //     byte-range readers before the engine starts, because the engine's own
 //     loader reads from one thread and a single stream over a network block
-//     device is latency-bound (docs/results/BENCHMARK.md, "Page-cache prewarm").
+//     device is latency-bound (docs/results/PREWARM-2026-09.md).
 //   - seedStep copies one directory of the volume into the pod's writable
 //     cache, because the engine must be able to write its cache and the
 //     volume is shared.

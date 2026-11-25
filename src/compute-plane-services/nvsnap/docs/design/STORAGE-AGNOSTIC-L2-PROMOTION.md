@@ -144,7 +144,7 @@ data:
 
 Two optional keys tune the cachedir restore's page-cache prewarm per class,
 because whether parallel read-ahead helps depends on the volume, not the
-model (the 70B A/B in `docs/results/BENCHMARK.md`):
+model (the 70B A/B in `docs/results/PREWARM-2026-09.md`):
 
 - `prewarm` (default `true`): add the `nvsnap-prewarm` init container that
   reads the whole rox tree before the engine starts. Set `false` where one
