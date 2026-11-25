@@ -281,6 +281,7 @@ go_test(
         "restore_prep_http_test.go",
         "restore_prep_test.go",
         "restore_span_learned_test.go",
+        "restore_tail_test.go",
         "restore_trust_test.go",
         "restore_v2_pidguard_test.go",
         "restore_v2_test.go",

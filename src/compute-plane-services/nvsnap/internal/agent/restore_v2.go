@@ -465,64 +465,31 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		return nil
 	}
 
-	if sess != nil {
-		// A GPU rank of a group reloads its GPU memory before it reports
-		// restored, its network still locked: the instance's members
-		// without GPU state are restored only once every rank has, so an
-		// etcd among them does not count the reload against its leases
-		// (gpushare_group_restore.go).
-		//
-		// Its GPU launches are held until every pod of the instance has
-		// resumed (gpushareOpen). The unlock below is that point: a pod
-		// reports restored only after its resume, and the unlock comes once
-		// every pod has. On any other outcome they stay held
-		// (openHeldGPUOnUnlock).
-		if gs != nil {
-			if err := resumeGPU(true); err != nil {
-				return nil, err
-			}
-			if err := continueTasks(); err != nil {
-				return nil, err
-			}
-		}
-		// Every pod of the instance must be restored before any of them
-		// sends: hold the lock until the driver says so, then release it in
-		// this pod's network namespace.
-		verdict, err := sess.awaitUnlock(ctx, log)
-		if err := openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
-			if gs == nil {
-				return nil
-			}
-			return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
-		}); err != nil {
-			return nil, err
-		}
-		if group.InetAddrMap != "" {
-			if err := netUnlock(ctx, hostPID, checkpointDir, log); err != nil {
-				return nil, err
-			}
-		}
-		// After the network unlock: the NIXL KV connector listens and
-		// ModelExpress republishes over it. The engine takes no requests
-		// until its connector is back: a failed resume fails the restore.
-		if err := a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log); err != nil {
-			return nil, err
-		}
-		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
-	} else if gs != nil {
-		if err := resumeGPU(false); err != nil {
-			return nil, err
-		}
-		if err := continueTasks(); err != nil {
-			return nil, err
-		}
-		if err := a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log); err != nil {
-			// The restored engine runs and takes no requests: its
-			// placeholder is disposed of (restoreHandler, or the automatic
-			// restore that ran it).
-			return nil, restoredNotServing(placeholderInfo, err)
-		}
-		goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
+	tail := restoreTail{
+		group: sess != nil, gpu: gs != nil, netUnlock: group.InetAddrMap != "", placeholder: placeholderInfo,
+		resumeGPU: resumeGPU, continueTasks: continueTasks,
+		awaitOpen: func() error {
+			// Every pod of the instance must be restored before any of them
+			// sends: hold the lock until the driver says so, then release it
+			// in this pod's network namespace.
+			verdict, err := sess.awaitUnlock(ctx, log)
+			return openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
+				if gs == nil {
+					return nil
+				}
+				return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
+			})
+		},
+		unlockNet: func() error { return netUnlock(ctx, hostPID, checkpointDir, log) },
+		resumeNIXL: func() error {
+			return a.resumeRestoredNIXLFor(ctx, gs, tools.gpuToolText(), toolPID, metadata.SourcePodIP, group, log)
+		},
+		resumeMX: func() {
+			goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
+		},
+	}
+	if err := tail.run(); err != nil {
+		return nil, err
 	}
 
 	duration := time.Since(startTime).Seconds()
@@ -773,4 +740,77 @@ func parsePstreeIDs(b []byte) (map[int]bool, error) {
 		}
 	}
 	return ids, nil
+}
+
+// restoreTail is the end of a restore once CRIU has restored the tree:
+// the GPU resume, the restored tasks let go, a group's open and network
+// unlock, then the NIXL KV connector (checked) and ModelExpress. Its
+// steps are functions, which tests replace.
+type restoreTail struct {
+	// group: a member of a group restore (a fabric session); gpu: the
+	// tree is under the gpushare library; netUnlock: the group's network
+	// is locked behind an address map.
+	group, gpu, netUnlock bool
+	placeholder           *containerd.ContainerInfo
+
+	resumeGPU     func(holdGate bool) error
+	continueTasks func() error
+	awaitOpen     func() error
+	unlockNet     func() error
+	resumeNIXL    func() error
+	resumeMX      func()
+}
+
+// run runs t's steps in order. A GPU rank of a group reloads its GPU memory
+// before it reports restored, its network still locked: the instance's
+// members without GPU state are restored only once every rank has, so an
+// etcd among them does not count the reload against its leases
+// (gpushare_group_restore.go). Its GPU launches are held until every pod
+// of the instance has resumed (gpushareOpen): the unlock is that point, as
+// a pod reports restored only after its resume and the unlock comes once
+// every pod has; on any other outcome they stay held
+// (openHeldGPUOnUnlock). After the network unlock, the NIXL KV connector
+// listens and ModelExpress republishes over it. The engine takes no
+// requests until its connector is back, so a failed resume fails the
+// restore; outside a group, it is marked restoredNotServing, for the
+// placeholder to be disposed of (a group's leader disposes of its
+// members).
+func (t restoreTail) run() error {
+	if t.group {
+		if t.gpu {
+			if err := t.resumeGPU(true); err != nil {
+				return err
+			}
+			if err := t.continueTasks(); err != nil {
+				return err
+			}
+		}
+		if err := t.awaitOpen(); err != nil {
+			return err
+		}
+		if t.netUnlock {
+			if err := t.unlockNet(); err != nil {
+				return err
+			}
+		}
+		if err := t.resumeNIXL(); err != nil {
+			return err
+		}
+		t.resumeMX()
+		return nil
+	}
+	if !t.gpu {
+		return nil
+	}
+	if err := t.resumeGPU(false); err != nil {
+		return err
+	}
+	if err := t.continueTasks(); err != nil {
+		return err
+	}
+	if err := t.resumeNIXL(); err != nil {
+		return restoredNotServing(t.placeholder, err)
+	}
+	t.resumeMX()
+	return nil
 }
