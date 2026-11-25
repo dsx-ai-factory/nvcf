@@ -15,8 +15,9 @@ in a cluster, run by hand. No workflow or other script calls them.
 - `vllm-criu.yaml`: a vLLM pod that can be CRIU-dumped and restored into a
   new pod.
 - `criu-build.yaml`: builds CRIU into the node-local checkpoint directory.
-- `vllm_criu_bench.sh`: a full CRIU checkpoint and restore of a vLLM model
-  on one node, with timings.
+- `vllm_criu_bench.sh`: a full CRIU checkpoint and restore of a vLLM model,
+  with timings, on one node by default. `RESTORE_NODE` restores on another
+  node, with `CKPT_PVC` putting `/ckpt` on a claim that node can read.
 - `vllm_ckpt_cycle.sh`: a checkpoint and restore cycle against a running
   vLLM pod.
 - `dump_evict.py`, `vllm_query.py`: evict a dump from the page cache;

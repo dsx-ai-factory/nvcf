@@ -22,9 +22,10 @@ Tests of the gpushare libraries and `nvsnap-gpu-suspend`
   `test_release_rollback.c` (a failed suspend leaves the workload running)
   or `test_checkpoint_nccl.c` (multi-rank checkpoint and restore). Each
   takes the path of `nvsnap-gpu-suspend`, some also a mode or scratch
-  directory. The `Run:` line in each file's header comment gives its full
+  directory. The `Run` line in each file's header comment gives its full
   invocation, including whether it runs under
-  `LD_PRELOAD=libnvsnap_gpushare.so`.
+  `LD_PRELOAD=libnvsnap_gpushare.so` (`test_checkpoint_nccl.c` needs it
+  only with its `suspend` argument).
 
 ## Subdirectories
 
