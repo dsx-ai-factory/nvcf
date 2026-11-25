@@ -250,6 +250,10 @@ type dumpV2Opts struct {
 	// of the dump's own outcome: such a source is not resumed.
 	ResetPeersOutside []string
 	peerReset         *peerResetOutcome
+	// IdentityCheck runs once the container is frozen, before CRIU, and
+	// before the peer reset lists its connections; an error fails the
+	// dump before it runs (frozenIdentityCheck). nil for none.
+	IdentityCheck func() error
 	// nixlFence: the capture paused the NIXL KV connector, so its marker
 	// fences the checkpoint from agents that cannot resume it
 	// (pidNSMarkerName). dumpAroundSuspend sets it, through
@@ -663,7 +667,7 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 	// the same tail as a failed dump (identity_peer_reset.go).
 	peerReset, err := a.beginPeerReset(o, targetHostPID, log)
 	if err == nil {
-		hooks.Frozen = peerReset.inventoryHook(procBase, targetHostPID)
+		hooks.Frozen = frozenHooks(hooks.Frozen, peerReset.inventoryHook(procBase, targetHostPID))
 		done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
 		o.peerReset.set(a.endPeerReset(ctx, peerReset, done, leaveRunning, checkpointDir))
 	}
@@ -682,7 +686,7 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 // dumpHooksFor is the pid-namespace dump's hooks for a capture's options
 // o, with freeze run before CRIU starts.
 func dumpHooksFor(o dumpV2Opts, freeze func() error) pidnsDumpHooks {
-	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence}
+	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence, Frozen: o.IdentityCheck}
 }
 
 // settleSource brings back a source whose GPU state a dump suspended,

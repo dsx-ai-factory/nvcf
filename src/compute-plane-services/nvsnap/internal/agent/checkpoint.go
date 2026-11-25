@@ -252,6 +252,14 @@ type CheckpointRequest struct {
 	// other peer are reset, so a registry or frontend outside the group
 	// drops the dead source at once (identity_peer_reset.go).
 	ResetPeersOutside []string `json:"resetPeersOutside,omitempty"`
+
+	// IdentityCheck, when set, is the etcd identity a capture read from
+	// this container's worker before the freeze (identity_etcd.go). Once
+	// the container is frozen, before CRIU runs, the worker's lease must
+	// still hold exactly those keys and values, else the dump fails
+	// before it runs (frozenIdentityCheck). CheckpointResult.IdentityChecked
+	// says it passed.
+	IdentityCheck *capturedIdentity `json:"identityCheck,omitempty"`
 }
 
 // CheckpointResult is the result of a checkpoint operation
@@ -297,6 +305,10 @@ type CheckpointResult struct {
 	// use (volume_uses.go), when the request asked (VolumeUse): nil when
 	// not known, empty for none.
 	UsedMounts *[]string `json:"usedMounts,omitempty"`
+	// IdentityChecked: the request's IdentityCheck passed under the
+	// freeze. An agent that predates it leaves it false, and the capture
+	// fails rather than record an identity nobody checked.
+	IdentityChecked bool `json:"identityChecked,omitempty"`
 	// LargeEmptyDirs are the mountpoints of the emptyDirs too large to
 	// copy into the checkpoint (captureReplayMounts), whose contents a
 	// restore does not bring back.
@@ -790,6 +802,8 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	criuSpan.SetAttributes(attribute.String("nvsnap.criu.mode", "v2-inns"))
 	dopts := dumpV2Opts{LeaveRunning: req.LeaveRunning, FabricSession: req.GPUShareFabricSession, RankNodes: req.GPUShareRankNodes,
 		SyncOpen: req.GPUShareSyncOpen, Snapshot: snapshot, ResetPeersOutside: req.ResetPeersOutside}
+	identityChecked := false
+	dopts.IdentityCheck = a.frozenIdentityCheck(ctx, req, &identityChecked)
 	var (
 		frozenAt, dumpAt clocks
 		held             bool
@@ -998,18 +1012,19 @@ func (a *Agent) Checkpoint(ctx context.Context, req CheckpointRequest) (_ *Check
 	}
 
 	result := &CheckpointResult{
-		CheckpointID:   checkpointID,
-		CheckpointPath: checkpointDir,
-		CheckpointRef:  "", // Direct CRIU checkpoint, no containerd image
-		CheckpointSize: checkpointSize,
-		ContainerID:    containerInfo.ID,
-		OriginalImage:  containerInfo.Image,
-		GPUPID:         gpuPID,
-		Duration:       duration,
-		Timestamp:      time.Now(),
-		Hash:           catalog.Hash,
-		CatalogInfo:    &catalog,
-		LargeEmptyDirs: largeEmptyDirs,
+		CheckpointID:    checkpointID,
+		CheckpointPath:  checkpointDir,
+		CheckpointRef:   "", // Direct CRIU checkpoint, no containerd image
+		CheckpointSize:  checkpointSize,
+		ContainerID:     containerInfo.ID,
+		OriginalImage:   containerInfo.Image,
+		GPUPID:          gpuPID,
+		Duration:        duration,
+		Timestamp:       time.Now(),
+		Hash:            catalog.Hash,
+		CatalogInfo:     &catalog,
+		LargeEmptyDirs:  largeEmptyDirs,
+		IdentityChecked: identityChecked,
 	}
 	if req.VolumeUse {
 		if used, uerr := dumpUsedMounts(checkpointDir); uerr != nil {

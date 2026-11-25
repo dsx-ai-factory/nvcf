@@ -642,6 +642,92 @@ func (c *criuAutoRestorer) captureIdentity(ctx context.Context, leader *corev1.P
 	return id, ""
 }
 
+// identityCheckKey carries, in a capture's context, the identity its
+// holder's dump checks under the freeze.
+type identityCheckKey struct{}
+
+// withIdentityCheck asks the capture of ctx to check id again once the
+// rank that holds it is frozen (frozenIdentityCheck).
+func withIdentityCheck(ctx context.Context, id *capturedIdentity) context.Context {
+	return context.WithValue(ctx, identityCheckKey{}, id)
+}
+
+// identityCheckFrom returns withIdentityCheck's identity, or nil.
+func identityCheckFrom(ctx context.Context) *capturedIdentity {
+	id, _ := ctx.Value(identityCheckKey{}).(*capturedIdentity)
+	return id
+}
+
+// identityUnchecked fails a capture whose identity id the holder's dump
+// did not confirm under the freeze (results by slot): an agent that
+// predates the check ignores it, and its identity may be stale. nil when
+// there is no identity.
+func identityUnchecked(id *capturedIdentity, results []*CheckpointResult) error {
+	if id == nil {
+		return nil
+	}
+	if id.Member >= len(results) || results[id.Member] == nil || !results[id.Member].IdentityChecked {
+		return errors.New("identity capture: the agent that dumped the lease holder did not confirm its etcd identity under the freeze")
+	}
+	return nil
+}
+
+// identityFreezeCheckTimeout bounds the check of an identity under the
+// freeze; the worker is stopped meanwhile.
+var identityFreezeCheckTimeout = 10 * time.Second
+
+// frozenIdentityCheck returns the dump's check, once req's container is
+// frozen and before CRIU runs, that the worker's lease holds exactly the
+// keys and values the capture read before the freeze (req.IdentityCheck;
+// identityStillHeld): a key added, removed or changed in between would be
+// missing from the record, and a restore would write a stale set. Frozen,
+// the worker changes nothing more before the dump ends it. A mismatch or
+// an unreadable registry fails the dump before it runs, and the source
+// resumes. checked is set once the check passed. nil when not asked.
+func (a *Agent) frozenIdentityCheck(ctx context.Context, req CheckpointRequest, checked *bool) func() error {
+	id := req.IdentityCheck
+	if id == nil {
+		return nil
+	}
+	return func() error {
+		cctx, cancel := context.WithTimeout(ctx, identityFreezeCheckTimeout)
+		defer cancel()
+		via := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: req.Namespace, Name: req.PodName}}
+		e, closeFn, err := newIdentityEtcd(cctx, a, id.Endpoints, req.Namespace, via, req.ContainerName)
+		if err != nil {
+			return fmt.Errorf("identity capture: reach the worker's etcd under the freeze: %w", err)
+		}
+		defer closeFn()
+		if err := identityStillHeld(cctx, e, id, id.PodIP); err != nil {
+			return fmt.Errorf("identity capture: under the freeze: %w", err)
+		}
+		*checked = true
+		return nil
+	}
+}
+
+// frozenHooks runs each of hooks that is set, in order, as one
+// pidnsDumpHooks.Frozen; nil when none is.
+func frozenHooks(hooks ...func() error) func() error {
+	var set []func() error
+	for _, h := range hooks {
+		if h != nil {
+			set = append(set, h)
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return func() error {
+		for _, h := range set {
+			if err := h(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // identityAlone decides whether leader's instance, which the group capture
 // would refuse (why), is captured alone with its etcd identity instead.
 // Only with the flag on, and only for an instance whose ranks pass
