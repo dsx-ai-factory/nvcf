@@ -76,6 +76,7 @@ go_library(
     },
     deps = [
         "//src/invocation-plane-services/vanity-gateway/gateway",
+        "//src/libraries/go/lib/pkg/nvkit/shutdown",
         "@com_github_go_logr_zapr//:zapr",
         "@com_github_nvidia_nvcf_go//pkg/nvkit/config",
         "@com_github_nvidia_nvcf_go//pkg/nvkit/logs",
@@ -106,6 +107,7 @@ go_test(
     deps = [
         "//src/invocation-plane-services/vanity-gateway/gateway",
         "//src/invocation-plane-services/vanity-gateway/gateway_config",
+        "//src/libraries/go/lib/pkg/nvkit/shutdown",
         "@com_github_go_logr_zapr//:zapr",
         "@com_github_goccy_go_json//:go-json",
         "@com_github_magiconair_properties//assert",

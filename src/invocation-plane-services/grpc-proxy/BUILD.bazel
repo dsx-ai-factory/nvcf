@@ -51,6 +51,7 @@ go_library(
         "//src/invocation-plane-services/grpc-proxy/proxy",
         "//src/libraries/go/lib/pkg/nvkit/config",
         "//src/libraries/go/lib/pkg/nvkit/logs",
+        "//src/libraries/go/lib/pkg/nvkit/shutdown",
         "//src/libraries/go/lib/pkg/nvkit/tracing",
         "@com_github_spf13_cobra//:cobra",
         "@com_github_spf13_pflag//:pflag",
@@ -69,6 +70,7 @@ go_test(
     srcs = ["main_test.go"],
     embed = [":nvcf-grpc-proxy_lib"],
     deps = [
+        "//src/libraries/go/lib/pkg/nvkit/shutdown",
         "@com_github_samber_lo//:lo",
         "@org_golang_x_sync//errgroup",
         "@org_uber_go_zap//:zap",

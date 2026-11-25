@@ -25,13 +25,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/servers"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	"github.com/google/uuid"
@@ -261,6 +261,12 @@ func (w *NVCTWorker) Setup(withHttpServer bool) error {
 
 // ------------------------------------------------------------------------
 
+// isFatalServerError reports whether a terminal error from the server is a
+// genuine failure rather than an expected shutdown signal.
+func (w *NVCTWorker) isFatalServerError(err error) bool {
+	return err != nil && !shutdown.IsSignalError(err)
+}
+
 // Run NVCT worker.
 // Http server is disabled in unit tests.
 func (w *NVCTWorker) Run(ctx context.Context, withHttpServer bool) error {
@@ -274,10 +280,9 @@ func (w *NVCTWorker) Run(ctx context.Context, withHttpServer bool) error {
 	)
 
 	if withHttpServer {
-		serverCloseErrPattern := regexp.MustCompile(`^received signal (interrupt|terminated)`)
 		go func() {
 			err := w.server.Run()
-			if err != nil && !serverCloseErrPattern.MatchString(strings.ToLower(err.Error())) {
+			if w.isFatalServerError(err) {
 				err = sharedTypes.NewInternalError(err)
 				utils.ExitReason(err)
 				zap.S().Panic(err)

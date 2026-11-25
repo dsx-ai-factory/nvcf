@@ -23,8 +23,6 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/go-viper/mapstructure/v2"
@@ -35,6 +33,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/config"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/logs"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/tracing"
 	sharedTypes "github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/types"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/utils"
@@ -60,6 +59,12 @@ var workerEnvAliases = map[string][]string{
 
 // ------------------------------------------------------------------------
 
+// isFatalRunError reports whether a terminal error from the root command is a
+// genuine failure rather than the expected response to a shutdown signal.
+func isFatalRunError(err error) bool {
+	return err != nil && !shutdown.IsSignalError(err)
+}
+
 // Run is the entrypoint for the NVCT worker service.
 func Run() {
 	startupTime := time.Now().UTC()
@@ -69,8 +74,7 @@ func Run() {
 
 	rootCmd := NewRootCommand(context.Background(), logger, startupTime)
 	err := rootCmd.Execute()
-	// err is returned as a string by nv-kit. type assertion is not possible.
-	if err != nil && strings.ToLower(err.Error()) != "received signal interrupt" {
+	if isFatalRunError(err) {
 		utils.ExitReason(err)
 		zap.S().Panic(err)
 	}
@@ -125,9 +129,9 @@ func NewRootCommand(ctx context.Context, logger *logs.ZapLogger, startupTime tim
 				}
 			}()
 
-			// Wait for SIGTERM and terminate the worker gracefully
+			// Wait for shutdown signals and terminate the worker gracefully
 			signalChan := make(chan os.Signal, 1)
-			signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+			signal.Notify(signalChan, shutdown.Signals()...)
 			go func() {
 				<-signalChan
 				if err := w.PreStopCheck(ctx); err == nil {

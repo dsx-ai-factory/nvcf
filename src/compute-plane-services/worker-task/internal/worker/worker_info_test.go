@@ -19,8 +19,11 @@ package worker
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"syscall"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +33,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/health"
 	taskmetrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/worker-task/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/nvkit/shutdown"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/version"
 	pb "github.com/dsx-ai-factory/nvcf/src/libraries/go/worker/proto/nvct"
 )
@@ -144,4 +148,67 @@ func infoTestMux(ready http.Handler) *http.ServeMux {
 		mux.Handle(path, handler)
 	}
 	return mux
+}
+
+func TestIsFatalServerError(t *testing.T) {
+	w := &NVCTWorker{}
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error is not fatal",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "typed SIGTERM is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGTERM),
+			want: false,
+		},
+		{
+			name: "typed SIGINT is not fatal",
+			err:  shutdown.NewSignalError(syscall.SIGINT),
+			want: false,
+		},
+		{
+			name: "wrapped typed SIGTERM is not fatal",
+			err:  fmt.Errorf("server error: %w", shutdown.NewSignalError(syscall.SIGTERM)),
+			want: false,
+		},
+		{
+			name: "untyped SIGTERM string fallback is not fatal",
+			err:  errors.New("received signal terminated"),
+			want: false,
+		},
+		{
+			name: "untyped SIGINT string fallback is not fatal",
+			err:  errors.New("received signal interrupt"),
+			want: false,
+		},
+		{
+			name: "wrapped untyped SIGTERM is not fatal",
+			err:  fmt.Errorf("server error: %w", errors.New("received signal terminated")),
+			want: false,
+		},
+		{
+			name: "unrelated error is fatal",
+			err:  errors.New("listen tcp :8080: bind: address already in use"),
+			want: true,
+		},
+		{
+			name: "generic error is fatal",
+			err:  errors.New("unexpected failure"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := w.isFatalServerError(tt.err); got != tt.want {
+				t.Errorf("isFatalServerError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
 }
