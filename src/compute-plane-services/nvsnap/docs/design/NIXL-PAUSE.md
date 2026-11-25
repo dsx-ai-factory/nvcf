@@ -75,7 +75,7 @@ When the capture paused the connector:
 
    Two things are checked before CRIU runs, as the hold gate is: that the node's GPU tool has `nixl-resume`, and that the restored pod's address can be read. If either fails, the restore is refused before anything is restored. It counts as a restore that did not run (as when the checkpoint cannot be fetched), not against the checkpoint, so a node whose bundle lags, or a passing API error, does not block a good checkpoint. In a group, a member refused this way makes the group's restore one that did not run.
 
-   The agent disposes of the placeholder, whose engine runs and takes no requests, on every path: a group's leader for its members, the automatic restore for its pod, and the agent itself for a single-pod restore requested through `POST /v1/restore` (the pod is deleted when its controller replaces it, else started cold in place).
+   The agent disposes of the placeholder, whose engine runs and takes no requests, on every path: a group's leader for its members, the automatic restore for its pod, and the agent itself, in the background after it answers, for a single-pod restore requested through `POST /v1/restore` (the pod is deleted when its controller replaces it, else started cold in place).
 
 A restore into another pod also needs the library's UCX route refresh. UCX reads the routing table once per process, and a restored process would otherwise keep the old pod's routes. The library handles UCX 1.22; with another version it logs that UCX keeps the old routes, and `nixl-resume` fails as above.
 

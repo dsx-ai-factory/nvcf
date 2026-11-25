@@ -953,10 +953,11 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 		a.log.WithError(err).Error("Restore failed")
 		// A restored engine left taking no requests is disposed of, as the
 		// automatic restores do, rather than left to the caller. A group's
-		// member is its leader's to dispose of.
+		// member is its leader's to dispose of. In the background: the
+		// disposal may retry for minutes, and the caller has its answer now.
 		var ns *restoredNotServingError
 		if req.GPUShareFabricSession == "" && errors.As(err, &ns) && ns.Pod != "" {
-			a.disposeFailedPlaceholder(context.WithoutCancel(r.Context()), ns.Namespace, ns.Pod, ns.UID, ns.Container,
+			go a.disposeFailedPlaceholder(context.WithoutCancel(r.Context()), ns.Namespace, ns.Pod, ns.UID, ns.Container,
 				a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod}))
 		}
 		writeRestoreFailure(w, err)

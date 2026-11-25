@@ -11,10 +11,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
 )
@@ -61,8 +64,20 @@ func TestRestoreHandler_DisposesAPlaceholderLeftNotServing(t *testing.T) {
 			if w.Code != http.StatusInternalServerError {
 				t.Errorf("status %d, want 500", w.Code)
 			}
-			_, gerr := kc.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
-			if disposed := gerr != nil; disposed != tc.disposed {
+			// The disposal runs after the answer: wait for it, or long
+			// enough to see that it does not come.
+			disposed := false
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+				if _, gerr := kc.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{}); gerr != nil {
+					disposed = true
+					break
+				}
+				if !tc.disposed {
+					time.Sleep(200 * time.Millisecond)
+					break
+				}
+			}
+			if disposed != tc.disposed {
 				t.Errorf("placeholder disposed = %v, want %v", disposed, tc.disposed)
 			}
 		})
@@ -88,5 +103,42 @@ func TestRestoredNotServing_NamesThePlaceholder(t *testing.T) {
 	}
 	if !errors.Is(err, cause) || e.Error() != cause.Error() {
 		t.Errorf("cause lost: %v", err)
+	}
+}
+
+// The answer does not wait for the disposal, which may retry for minutes
+// (a cold start in place, a delete): the caller has its error at once.
+func TestRestoreHandler_AnswersBeforeTheDisposal(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	kc := fake.NewSimpleClientset(pod)
+	release := make(chan struct{})
+	kc.PrependReactor("get", "pods", func(k8stesting.Action) (bool, kruntime.Object, error) {
+		<-release // the API server is slow
+		return false, nil, nil
+	})
+	t.Cleanup(func() { close(release) })
+	a := &Agent{kubeClient: kc, log: logrus.New()}
+	prev := restoreForRequest
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		return nil, restoredNotServing(&containerd.ContainerInfo{Labels: map[string]string{
+			"io.kubernetes.pod.namespace": "sr-1", "io.kubernetes.pod.name": "fn-0", "io.kubernetes.pod.uid": "u1",
+			"io.kubernetes.container.name": "inference"}}, errors.New("nixl-resume: exit status 1"))
+	}
+	t.Cleanup(func() { restoreForRequest = prev })
+
+	body, _ := json.Marshal(RestoreRequest{CheckpointID: "abc__20261008-101010", PlaceholderNamespace: pod.Namespace, PlaceholderPodName: pod.Name})
+	done := make(chan int)
+	go func() {
+		w := httptest.NewRecorder()
+		a.restoreHandler(w, httptest.NewRequest(http.MethodPost, "/v1/restore", strings.NewReader(string(body))))
+		done <- w.Code
+	}()
+	select {
+	case code := <-done:
+		if code != http.StatusInternalServerError {
+			t.Errorf("status %d, want 500", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the answer waits for the placeholder's disposal")
 	}
 }
