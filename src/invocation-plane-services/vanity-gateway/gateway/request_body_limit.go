@@ -22,6 +22,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
+
+	"go.uber.org/zap"
 )
 
 // Model API request bodies are read behind the buffered limit. Only a request
@@ -127,12 +130,17 @@ func (b *promotedRequestBody) Read(p []byte) (int, error) {
 // after the prefix, without reading more of it. On HTTP/1, closing the body
 // reads up to 256 KiB of the remaining upload, and so does writing the reply
 // on a connection that stays open, so a client that pauses would hold the
-// error. There the reply instead closes the connection, and the server
-// closes the body after the reply is sent. Other bodies are closed now.
+// error. There the reply instead closes the connection, and the read deadline
+// expires now, so the server's own close of the body after the reply fails at
+// once instead of waiting for the rest of the upload. Other bodies are closed
+// now.
 func abandonRequestBody(request *http.Request) {
 	limited, ok := request.Context().Value(limitedRequestBodyKey{}).(*limitedRequestBody)
 	if ok && request.ProtoMajor == 1 {
 		limited.writer.Header().Set("Connection", "close")
+		if err := http.NewResponseController(limited.writer).SetReadDeadline(time.Now()); err != nil {
+			zap.L().Debug("could not end the read of a rejected request body", zap.Error(err))
+		}
 		return
 	}
 	_ = request.Body.Close()

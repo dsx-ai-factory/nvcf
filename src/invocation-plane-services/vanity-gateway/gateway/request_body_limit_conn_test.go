@@ -297,13 +297,20 @@ func TestRejectionDoesNotWaitForPausedUpload(t *testing.T) {
 			// The client sends nothing more. The deadline only bounds a
 			// gateway that waits for the rest of the upload.
 			require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
-			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
 			require.NoError(t, err, "the gateway must answer while the client is paused")
 			payload, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			requireBodyLimitError(t, "/v1/chat/completions", resp.StatusCode, string(payload), tc.limit)
 			assert.True(t, resp.Close, "the connection must close after the reply, since the body was not read")
 			assert.Zero(t, upstreamCalls.Load())
+
+			// The client still sends nothing and keeps its side open. The
+			// gateway must close the connection rather than wait for the rest
+			// of the upload.
+			_, err = br.ReadByte()
+			require.ErrorIs(t, err, io.EOF, "the gateway must close the connection without the rest of the upload")
 		})
 	}
 }
