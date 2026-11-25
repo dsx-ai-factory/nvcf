@@ -389,7 +389,7 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 		// The NIXL KV connector of a pod that opted in, likewise. Its
 		// resume is checked: a paused engine takes no requests, so a
 		// source that runs on and does not resume is replaced.
-		nixlPaused, nixlErr := pauseNIXL(ctx, optedIntoNIXLPause(procBase, sessionPIDs(procBase, targetHostPID)), tools.gpuToolText(), hostPID, gsPIDs, log)
+		nixlPaused, nixlErr := a.pauseNIXLFor(ctx, procBase, targetHostPID, tools.gpuToolText(), hostPID, gsPIDs, log)
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}

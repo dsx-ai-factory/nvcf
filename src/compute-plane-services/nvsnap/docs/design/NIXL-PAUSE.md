@@ -36,13 +36,15 @@ The agent calls them at the same points as ModelExpress's `mx-pause` / `mx-resum
 
 | Switch | Set by | Default | Effect |
 |---|---|---|---|
-| chart `webhook.nixlPause.enabled` (agent flag `--webhook-nixl-pause`) | the cluster operator | `false` | Off: the annotation below is ignored (logged), and such pods are refused as before. |
+| chart `webhook.nixlPause.enabled` (agent flag `--webhook-nixl-pause`) | the cluster operator | `false` | Off: the annotation below is ignored (logged), and such pods are refused as before. The webhook and the agent both check it (below). |
 | pod annotation `nvsnap.io/nixl-pause: "true"` | the workload owner | absent | Opts the workload in; removing it opts out. |
 
 With both on, the webhook adds two variables to each GPU container of a pod under the gpushare library, including a pod that already carries the gpushare placement. A value the pod sets itself is kept.
 
 - `NVSNAP_NIXL_PAUSE=1`: the marker the agent reads from the process's environment at capture.
 - `NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1`: the library opens its control socket on a process's first CUDA entry-point lookup. vLLM's engine-core process at TP > 1 allocates no GPU memory, and `nixl-pause` reaches the engine through it.
+
+The pod cannot opt itself in by setting `NVSNAP_NIXL_PAUSE=1`: with the switch off, the webhook replaces a value a GPU container of a pod under the library sets itself with `0`, and the agent pauses only when its own `--webhook-nixl-pause` is on, whatever the process's environment says (a value from `envFrom` is not visible at admission). Such a pod is refused by the preflight as before, and the agent logs the marker it ignored. With the switch on, the annotation is the opt-in; a pod that sets the variable itself is treated as opted in.
 
 The variables are added after the process configuration is stamped from the pod as submitted (`process_config.go`), so they don't change which checkpoint a pod restores. A change to the switch applies to pods admitted after it.
 

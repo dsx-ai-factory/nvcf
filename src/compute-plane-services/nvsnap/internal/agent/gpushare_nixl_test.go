@@ -57,7 +57,7 @@ func TestGPUShareNIXLSupported(t *testing.T) {
 
 // Only NVSNAP_NIXL_PAUSE=1 opts in; another value, its absence or a
 // process that cannot be read does not.
-func TestOptedIntoNIXLPause(t *testing.T) {
+func TestEnvOptsIntoNIXLPause(t *testing.T) {
 	base := t.TempDir()
 	fakeMXProc(t, base, 10, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=1"}, []string{"python3"})
 	fakeMXProc(t, base, 11, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=0"}, []string{"python3"})
@@ -66,8 +66,8 @@ func TestOptedIntoNIXLPause(t *testing.T) {
 		pids []int
 		want bool
 	}{{[]int{10}, true}, {[]int{11}, false}, {[]int{12}, false}, {[]int{99}, false}, {[]int{12, 10}, true}} {
-		if got := optedIntoNIXLPause(base, tc.pids); got != tc.want {
-			t.Errorf("optedIntoNIXLPause(%v) = %v, want %v", tc.pids, got, tc.want)
+		if got := envOptsIntoNIXLPause(base, tc.pids); got != tc.want {
+			t.Errorf("envOptsIntoNIXLPause(%v) = %v, want %v", tc.pids, got, tc.want)
 		}
 	}
 }
@@ -296,7 +296,7 @@ func TestNIXLPausable(t *testing.T) {
 		fakeMXProc(t, base, pid, optIn, []string{"python3"})
 	}
 	fakeMXProc(t, base, 5300, nil, []string{"python3"})
-	got := nixlPausable(base, 5000)
+	got := nixlPausableByEnv(base, 5000)
 	if len(got) != 1 || !got[5100] {
 		t.Fatalf("nixlPausable = %v, want only 5100", got)
 	}
@@ -319,5 +319,46 @@ func TestGPUShareInfo_NIXLRoundTrip(t *testing.T) {
 		if b.NIXL != gs.NIXL {
 			t.Errorf("NIXL %v came back %v", gs.NIXL, b.NIXL)
 		}
+	}
+}
+
+// The agent pauses only with its own switch on (--webhook-nixl-pause): a
+// pod may set NVSNAP_NIXL_PAUSE=1 itself, and with the switch off that
+// neither turns its RDMA findings into information (the capture is
+// refused as before) nor runs nixl-pause. With the switch on, the same
+// process is paused.
+func TestNIXLPause_NeedsTheAgentSwitch(t *testing.T) {
+	base := t.TempDir()
+	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil)
+	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia0"}, nil)
+	fakeMXProc(t, base, 5000, nil, []string{"python3"})
+	fakeMXProc(t, base, 5100, []string{"NVSNAP_NIXL_PAUSE=1"}, []string{"python3"})
+	rdma := []PreflightFinding{{Pod: "w", Check: "rdma", Severity: preflightBlock, PID: 5100, Detail: "process 5100 holds RDMA devices /dev/infiniband/uverbs0"}}
+
+	for _, tc := range []struct {
+		name       string
+		on         bool
+		wantSev    string
+		wantPaused bool
+		wantCalls  []string
+	}{
+		{"switch off, pod sets the env", false, preflightBlock, false, nil},
+		{"switch on, opted in", true, preflightInfo, true, []string{"nixl-pause@42 [2]"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: tc.on}}}
+			fs := nixlPauseFindings(rdma, a.nixlPausable(base, 5000), base, "w", "engine")
+			if fs[0].Severity != tc.wantSev {
+				t.Errorf("rdma finding severity %q, want %q", fs[0].Severity, tc.wantSev)
+			}
+			calls := fakeNIXL(t, nil, nil)
+			paused, err := a.pauseNIXLFor(context.Background(), base, 5000, nixlToolText, 42, []int{2}, testLog())
+			if err != nil || paused != tc.wantPaused {
+				t.Errorf("pauseNIXLFor = %v, %v; want %v, nil", paused, err, tc.wantPaused)
+			}
+			if !slices.Equal(*calls, tc.wantCalls) {
+				t.Errorf("calls = %v, want %v", *calls, tc.wantCalls)
+			}
+		})
 	}
 }

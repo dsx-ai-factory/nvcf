@@ -12,7 +12,8 @@ package agent
 // over RDMA, say). nixl-resume creates the connectors again on the same KV
 // memory under a new engine id and, with --host, at the restored pod's
 // address. Only pods that opt in (nvsnap.io/nixl-pause, which the webhook
-// turns into NVSNAP_NIXL_PAUSE=1 in the process) are paused: anything else
+// turns into NVSNAP_NIXL_PAUSE=1 in the process) are paused, and only by
+// an agent whose own switch is on (--webhook-nixl-pause): anything else
 // with RDMA is refused by the preflight as before.
 //
 // Unlike ModelExpress, a paused engine serves nothing. So every resume is
@@ -76,9 +77,10 @@ func procEnvSet(procBase string, pids []int, key, value string) bool {
 	return false
 }
 
-// optedIntoNIXLPause reports whether the processes pids belong to a pod
-// that opted in to nixl-pause.
-func optedIntoNIXLPause(procBase string, pids []int) bool {
+// envOptsIntoNIXLPause reports whether the processes pids carry the
+// nixl-pause marker in their environment. The marker alone does not opt a
+// pod in: the agent's switch must be on too (Agent.nixlPauseOn).
+func envOptsIntoNIXLPause(procBase string, pids []int) bool {
 	return procEnvSet(procBase, pids, nixlPauseEnv, "1")
 }
 
@@ -227,12 +229,12 @@ func (a *Agent) resumeRestoredNIXLFor(ctx context.Context, gs *GPUShareInfo, too
 	return resumeRestoredNIXL(ctx, gs, toolText, toolPID, host, log)
 }
 
-// nixlPausable are the processes of the container whose init is
+// nixlPausableByEnv are the processes of the container whose init is
 // sessionHostPID (host numbering) that a capture's nixl-pause addresses
 // and whose pod opted in: the GPU processes under the library, the ones
 // the capture suspends (gpushareTargets). nixl-pause checks the RDMA of
 // these only.
-func nixlPausable(procBase string, sessionHostPID int) map[int]bool {
+func nixlPausableByEnv(procBase string, sessionHostPID int) map[int]bool {
 	out := map[int]bool{}
 	for _, pid := range sessionPIDs(procBase, sessionHostPID) {
 		dir := filepath.Join(procBase, strconv.Itoa(pid))
@@ -240,7 +242,7 @@ func nixlPausable(procBase string, sessionHostPID int) map[int]bool {
 		if !gpu {
 			gpu = holdsNvidiaFD(filepath.Join(dir, "fd"))
 		}
-		if shim && gpu && optedIntoNIXLPause(procBase, []int{pid}) {
+		if shim && gpu && envOptsIntoNIXLPause(procBase, []int{pid}) {
 			out[pid] = true
 		}
 	}
@@ -312,4 +314,34 @@ func restoredNotServing(info *containerd.ContainerInfo, err error) error {
 		e.UID = types.UID(info.Labels["io.kubernetes.pod.uid"])
 	}
 	return e
+}
+
+// nixlPauseOn reports whether this agent pauses NIXL KV connectors: its
+// own switch, the cluster's (--webhook-nixl-pause, chart
+// webhook.nixlPause.enabled). The process environment alone does not
+// decide: a pod may set NVSNAP_NIXL_PAUSE=1 itself, which the webhook
+// cannot always see (envFrom). Off, such a pod is captured as if it had
+// not opted in, so its RDMA refuses the capture as before.
+func (a *Agent) nixlPauseOn() bool { return a.config.Webhook.NIXLPause }
+
+// nixlPausable is nixlPausableByEnv with the agent's switch on, and none
+// with it off.
+func (a *Agent) nixlPausable(procBase string, sessionHostPID int) map[int]bool {
+	if !a.nixlPauseOn() {
+		return map[int]bool{}
+	}
+	return nixlPausableByEnv(procBase, sessionHostPID)
+}
+
+// pauseNIXLFor is pauseNIXL for the capture of the container whose init is
+// sessionHostPID, opted in when its processes carry the marker and the
+// agent's switch is on. A marker with the switch off is logged and
+// ignored.
+func (a *Agent) pauseNIXLFor(ctx context.Context, procBase string, sessionHostPID int, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
+	optedIn := envOptsIntoNIXLPause(procBase, sessionPIDs(procBase, sessionHostPID))
+	if optedIn && !a.nixlPauseOn() {
+		log.Warn("gpushare: the workload sets " + nixlPauseEnv + "=1, but this cluster does not enable nixl-pause (webhook.nixlPause.enabled); not pausing it")
+		optedIn = false
+	}
+	return pauseNIXL(ctx, optedIn, toolText, hostPID, pids, log)
 }

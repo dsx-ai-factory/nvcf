@@ -186,7 +186,7 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 			fs = releasedByMXPause(fs, mxPausable(procBase, int(info.PID)))
 		}
 		if gpushareNIXLSupported(tools.gpuToolText()) {
-			fs = nixlPauseFindings(fs, nixlPausable(procBase, int(info.PID)), procBase, pod, container)
+			fs = nixlPauseFindings(fs, a.nixlPausable(procBase, int(info.PID)), procBase, pod, container)
 		}
 	}
 	return fs, nil

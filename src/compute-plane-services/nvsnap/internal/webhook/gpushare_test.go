@@ -462,6 +462,48 @@ func TestGPUSharePatches_NIXLPause(t *testing.T) {
 	}
 }
 
+// With the cluster's switch off, a pod that sets NVSNAP_NIXL_PAUSE=1
+// itself does not keep it: the GPU container's value is replaced with "0",
+// annotated or not, placed or not, so the agent does not see an opt-in the
+// cluster did not grant. With the switch on and the annotation, the pod's
+// own value stands, as before.
+func TestGPUSharePatches_NIXLPauseEnvWithTheSwitchOff(t *testing.T) {
+	own := func(v string) []corev1.EnvVar { return []corev1.EnvVar{{Name: nixlPauseEnv, Value: v}} }
+	annotate := func(p *corev1.Pod) *corev1.Pod { p.Annotations[NIXLPauseAnnotation] = "true"; return p }
+	for _, tc := range []struct {
+		name string
+		on   bool
+		pod  *corev1.Pod
+		want string
+	}{
+		{"off, not annotated", false, gpushareTestPod(true, own("1")), "0"},
+		{"off, annotated", false, annotate(gpushareTestPod(true, own("1"))), "0"},
+		{"off, from a reference", false, gpushareTestPod(true, []corev1.EnvVar{{Name: nixlPauseEnv,
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}}), "0"},
+		{"on, annotated", true, annotate(gpushareTestPod(true, own("1"))), "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Mutator{NIXLPause: tc.on}
+			got := applyPatches(t, tc.pod, m.gpusharePatches(context.Background(), tc.pod))
+			if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != tc.want || e.ValueFrom != nil {
+				t.Errorf("%s = %+v, want %q", nixlPauseEnv, e, tc.want)
+			}
+			// Admitted again (a manifest written from the admitted pod): unchanged.
+			if ops := m.gpusharePatches(context.Background(), got); len(ops) != 0 {
+				t.Errorf("admitted again: patched: %+v", ops)
+			}
+		})
+	}
+
+	// A pod that already carries the placement is corrected too.
+	placed := applyPatches(t, gpushareTestPod(true, nil), (&Mutator{}).gpusharePatches(context.Background(), gpushareTestPod(true, nil)))
+	placed.Spec.Containers[1].Env = append(placed.Spec.Containers[1].Env, own("1")...)
+	got := applyPatches(t, placed, (&Mutator{}).gpusharePatches(context.Background(), placed))
+	if e := envOf(got.Spec.Containers[1], nixlPauseEnv); e == nil || e.Value != "0" {
+		t.Errorf("placed pod: %s = %+v, want 0", nixlPauseEnv, e)
+	}
+}
+
 // A pod annotated nvsnap.io/gpushare-ibv gets NCCL pointed at the bundled
 // verbs library, unless it names one itself; without the annotation, NCCL
 // keeps its own.

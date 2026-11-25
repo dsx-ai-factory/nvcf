@@ -100,6 +100,23 @@ func nixlPauseEnvVars(c *corev1.Container) []corev1.EnvVar {
 	return vars
 }
 
+// nixlPauseEnvOff replaces a NVSNAP_NIXL_PAUSE that container c (index
+// i) sets itself with "0", in place, when the cluster's switch is off: the
+// pod did not get the opt-in, so it does not keep the marker. The agent
+// also checks its own switch, which covers a value that comes through
+// envFrom, where admission cannot see it.
+func (m *Mutator) nixlPauseEnvOff(i int, c *corev1.Container) []PatchOp {
+	if m.NIXLPause {
+		return nil
+	}
+	for j, e := range c.Env {
+		if e.Name == nixlPauseEnv && (e.Value != "0" || e.ValueFrom != nil) {
+			return []PatchOp{{Op: "replace", Path: fmt.Sprintf("/spec/containers/%d/env/%d", i, j), Value: corev1.EnvVar{Name: nixlPauseEnv, Value: "0"}}}
+		}
+	}
+	return nil
+}
+
 // nixlPauseWanted reports whether a gpushare pod gets the nixl-pause env:
 // annotated nvsnap.io/nixl-pause "true" with the cluster's switch on. The
 // annotation with the switch off is logged and ignored.
@@ -273,14 +290,15 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 	nixlPause := m.nixlPauseWanted(pod)
 	if placed {
 		// Already placed (re-admission, or written into the manifest):
-		// only the nixl-pause env, if the opt-in came after the placement.
-		if !nixlPause {
-			return nil
-		}
+		// only the nixl-pause env, if the opt-in came after the placement,
+		// or the pod's own marker turned off without the switch.
 		var patches []PatchOp
 		for _, i := range gpuContainers {
 			c := &pod.Spec.Containers[i]
-			patches = append(patches, setContainerEnv(i, c, nixlPauseEnvVars(c))...)
+			patches = append(patches, m.nixlPauseEnvOff(i, c)...)
+			if nixlPause {
+				patches = append(patches, setContainerEnv(i, c, nixlPauseEnvVars(c))...)
+			}
 		}
 		return patches
 	}
@@ -360,6 +378,7 @@ func (m *Mutator) gpusharePatches(ctx context.Context, pod *corev1.Pod) []PatchO
 		if nixlPause {
 			vars = append(vars, nixlPauseEnvVars(c)...)
 		}
+		patches = append(patches, m.nixlPauseEnvOff(i, c)...)
 		patches = append(patches, setContainerEnv(i, c, vars)...)
 	}
 	return patches
