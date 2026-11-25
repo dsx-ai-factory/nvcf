@@ -18,11 +18,13 @@ function or with plain Helm. `cases/` holds one values file per matrix case.
   shapes need.
 - `cases/*.yaml`: one case each, for example `sts-tp2.yaml` or
   `vllm-llama-8b.yaml`.
-- `create-functions.sh`: for each selected case, pushes the chart with the
-  case's values as its defaults and creates an NVCF Helm function, plus a
-  container function for single-pod Deployment cases. `MODE=helm` skips the
-  container functions and `MODE=container` the chart push and Helm
-  functions (default `both`). Its header lists the
+- `create-functions.sh`: creates the chart repository if it is missing,
+  then for each selected case pushes the chart with the case's values as
+  its defaults and creates an NVCF Helm function, plus a container function
+  for single-pod Deployment cases that set no `runAsUser` and no
+  `function.container: false`. `MODE=helm` skips the container functions
+  and `MODE=container` the per-case chart push and Helm functions (default
+  `both`). Its header lists the
   environment it reads (`ORG`, `NGC_CLI_API_KEY`, `CASES`, `ARCH`,
   `DRY_RUN`, ...).
 

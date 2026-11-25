@@ -8,7 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 One React component per route of the web UI, wired in
 [`../App.tsx`](../App.tsx). The pages read their data through
 [`../api/`](../api/): the hooks, and in `Demo.tsx` also `client.ts`
-functions directly.
+functions directly. Two requests bypass `../api/` and call the server with
+Axios: `CheckpointDetail.tsx` (`/api/v1/checkpoints/:id/files`) and
+`Demo.tsx` (`/api/v1/demo/pods`).
 
 ## Key files
 
