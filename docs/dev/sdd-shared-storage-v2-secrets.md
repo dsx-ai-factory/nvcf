@@ -145,8 +145,20 @@ lifecycle:
 - a ConfigMap with the per-function ESS HCL that names the Secret references;
 - an optional NetworkPolicy.
 
-Names are proposed as `<storagerequest>-runtime` and `<storagerequest>-metadata`. This is a
-decision to confirm.
+Names follow the existing shared-storage objects. NVCA creates the `StorageRequest` named
+`shared-storage` and the SMB claims `nvcf-secrets-data-rw/ro`, `nvcf-kns-data-rw/ro` and
+`nvcf-task-data-rw` in the MiniService namespace, so the namespace already scopes them and
+no per-request suffix is needed. The Secrets use the same stem and name what they hold:
+
+| Secret | Keys | Replaces |
+|---|---|---|
+| `nvcf-secrets-data` | `secrets.json`, `accounts-secrets.json` | `nvcf-secrets-data-rw/ro` |
+| `nvcf-metadata-credentials` | `self` | `nvcf-kns-data-rw/ro` |
+
+`nvcf-metadata-credentials` replaces the stem `kns` because the name should say what the data
+is. A Secret and a claim never share a name, so both can exist in one namespace during
+migration. Read-write and read-only variants are not needed: access is controlled by the Role
+for the writer and by the read-only projected mount for readers.
 
 Size budgets: 768 KiB decoded per key and 900 KiB decoded for all keys of one Secret, so the
 two runtime keys share the 900 KiB.
@@ -226,9 +238,10 @@ Secret size did not change the delay. File replacement is atomic: the kubelet sw
 1. The design budget for Secret-to-file propagation is **120 seconds**.
 2. **Consumers must re-read the file on each use.** A process must not cache the content
    for its lifetime.
-3. **Initial population.** The Secret key must exist before the workload starts. NVCA
-   creates the Secret with the first value, or the workload waits for it. A missing key
-   would otherwise leave the file absent until the first sync.
+3. **Initial population.** The `StorageRequest` is ready only after every key of both Secrets
+   has been written. NVCA applies the instance workloads after that, which matches the mount plan
+   (built from `StorageRequest.Status.SharedStorage` once storage is ready). A workload
+   therefore never starts with a missing file.
 4. **Metadata credentials.** The worker refreshes at 80% of the reported lifetime plus up to
    60 seconds of jitter, retrying every minute after a failure
    (`src/libraries/go/worker/token/token.go`). The new value reaches the workload about
@@ -269,14 +282,17 @@ Secret size did not change the delay. File replacement is atomic: the kubelet sw
   new requests.
 - `secretBackend` and `sharedDataBackend` are independent, so `k8s-native` secrets can run
   with SMB-backed task data and model cache.
-- Rollback returns `secretBackend` to `smb` for new requests. An existing `k8s-native` request
-  keeps its backend, so to return a function to SMB, redeploy it: the new deployment creates a
+- Rollback returns `secretBackend` to `smb` for new requests. NVCA builds the `StorageRequest`
+  from the current configuration when it creates it, in the MiniService namespace of the
+  deployment (`NewSharedStorageRequest`), so an existing `k8s-native` request keeps its backend.
+  To return a function to SMB, redeploy it: the new deployment creates a
   new `StorageRequest` under the restored setting, the utility pod writes the files to the SMB
   volumes as it does today, and the old request and its Secrets are removed with it. Migrating
   a live request in place is not designed here. The rollout guide describes the steps for both
   SMB backends.
-- Mixed versions need a defined behavior, for example a new ESS agent with an older NVCA. The
-  ESS agent keeps supporting `destination`, so an older NVCA is unaffected.
+- Mixed versions: native mode needs matching ESS agent, worker and NVCA versions. The stack pins
+  them together and must refuse `secretBackend=k8s-native` when the configured images do not
+  support it. The ESS agent keeps supporting `destination`, so an older NVCA is unaffected.
 
 ## Known limitation and workaround
 
@@ -293,19 +309,31 @@ tuning and verify it on your own cluster.
 - Tests for projected-file latency, Secret updates, metadata updates and RBAC.
 - A fully SMB-free configuration also needs the RWX backend and the SMB CSI changes.
 
+## Decisions
+
+These are settled in this document, subject to review:
+
+- Secret names and keys, as in the table under Secret objects.
+- The `StorageRequest` is ready only after every key has been written (rule 3).
+- Native mode needs matching component versions, enforced by the stack (Coexistence).
+- A function returns to SMB by redeploying it (Coexistence).
+
+## Validation gates
+
+These cannot be settled by design. They must pass before native mode is enabled:
+
+- Verify the real `exp` of the signed metadata token on a running function worker. The
+  signing service is not in this repository.
+- Collect encryption-at-rest evidence for a non-local cluster.
+- Run the BYOO collector against a projected `accounts-secrets.json`.
+- Tell workload authors to re-read `/var/run/nvcf/info/self` on each use. No component in this
+  repository reads the file, so workload code cannot be audited here.
+
 ## Open items
 
-- Verify the real `exp` of the signed metadata token on a running function worker.
-- Check that the workloads' own code does not cache `/var/run/nvcf/info/self` for the process
-  lifetime. The only writer in this repository is the worker (`metadata.go`), and no component
-  in the repository reads the file, so the readers are the workload's own code and cannot be
-  audited here. Document the re-read rule for workload authors.
-- Confirm the Secret naming scheme.
-- Decide how a workload waits for initial population.
-- Collect encryption-at-rest evidence for a non-local cluster.
-- Define mixed-version behavior across ESS agent, worker and NVCA.
-- Confirm against NVCA's reconcile behavior that redeploying a function is enough to return it
-  to SMB, and write the rollout guide.
+- Confirm with a test that NVCA never rewrites the backend of an existing `StorageRequest`
+  when the configuration changes. The spec is written at creation, and no code that rewrites it
+  was found, but the search was not exhaustive.
 
 ## Source references
 
