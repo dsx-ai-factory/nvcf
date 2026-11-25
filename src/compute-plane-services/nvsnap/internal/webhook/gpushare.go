@@ -286,13 +286,18 @@ func EngineSpansPods(pod *corev1.Pod) string {
 // in a shell line) is one only an engine on more than one node is started
 // with, or "": --headless (a node without the API server), a node count
 // above one (--nnodes, --num-nodes), a node rank above zero (--node-rank),
-// or --dist-init-addr. An address alone (--data-parallel-address,
-// --master-addr) does not say: single-node engines set them too.
+// --dist-init-addr, a vLLM data-parallel engine's start rank above zero
+// (--data-parallel-start-rank, a node after the first), or fewer local
+// data-parallel ranks than in all (--data-parallel-size-local below
+// --data-parallel-size: the leader of an engine spanning nodes). An
+// address alone (--data-parallel-address, --master-addr) does not say:
+// single-node engines set them too.
 func EngineSpansArg(args []string) string {
 	var words []string
 	for _, a := range args {
 		words = append(words, strings.Fields(a)...)
 	}
+	dpSize, dpLocal := -1, -1
 	for i, w := range words {
 		name, val, hasVal := strings.Cut(w, "=")
 		if !hasVal && i+1 < len(words) {
@@ -306,11 +311,22 @@ func EngineSpansArg(args []string) string {
 			if nerr != nil || n > 1 {
 				return fmt.Sprintf("its engine is started with %s %s", name, val)
 			}
-		case "--node-rank", "--node_rank":
+		case "--node-rank", "--node_rank", "--data-parallel-start-rank":
 			if nerr != nil || n > 0 {
 				return fmt.Sprintf("its engine is started with %s %s", name, val)
 			}
+		case "--data-parallel-size":
+			if nerr == nil {
+				dpSize = n
+			}
+		case "--data-parallel-size-local":
+			if nerr == nil {
+				dpLocal = n
+			}
 		}
+	}
+	if dpLocal >= 0 && dpSize > dpLocal {
+		return fmt.Sprintf("its engine is started with --data-parallel-size %d and --data-parallel-size-local %d", dpSize, dpLocal)
 	}
 	return ""
 }

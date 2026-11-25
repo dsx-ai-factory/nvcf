@@ -341,6 +341,8 @@ func TestNIXLSpansNodes(t *testing.T) {
 		{"flag in a shell line", nil, []string{"/bin/sh", "-c", "vllm serve m --nnodes=2"}, "", 0, true},
 		{"single node with a data-parallel address", nil, []string{"vllm", "serve", "m", "--data-parallel-address", "127.0.0.1"}, "", 0, false},
 		{"--num-nodes 2", nil, []string{"vllm", "serve", "m", "--num-nodes", "2"}, "", 0, true},
+		{"data-parallel leader of an engine spanning nodes", nil, []string{"vllm", "serve", "m", "--data-parallel-size=4", "--data-parallel-size-local", "2"}, "", 0, true},
+		{"single node data-parallel engine", nil, []string{"vllm", "serve", "m", "--data-parallel-size", "2"}, "", 0, false},
 		{"session, ranks on two nodes", nil, nil, "s1", 2, true},
 		{"session, ranks on one node (with companions)", nil, nil, "s1", 1, false},
 		{"session, driver does not say", nil, nil, "s1", 0, true},

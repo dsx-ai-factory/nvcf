@@ -786,6 +786,15 @@ func TestEngineSpansPods(t *testing.T) {
 		{"--num-nodes 2", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--num-nodes", "2"} }, true},
 		{"--nnodes=1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--nnodes=1"} }, false},
 		{"--node-rank 1", func(p *corev1.Pod) { p.Spec.Containers[1].Args = []string{"serve", "m", "--node-rank", "1"} }, true},
+		{"data-parallel leader of an engine spanning nodes", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-size", "4", "--data-parallel-size-local=2", "--data-parallel-address", "10.0.0.1"}
+		}, true},
+		{"data-parallel node after the first", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-start-rank", "2"}
+		}, true},
+		{"single node data-parallel engine", func(p *corev1.Pod) {
+			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-size", "2", "--data-parallel-size-local", "2", "--data-parallel-start-rank=0"}
+		}, false},
 		{"single node, data-parallel address", func(p *corev1.Pod) {
 			p.Spec.Containers[1].Args = []string{"serve", "m", "--data-parallel-address", "127.0.0.1"}
 		}, false},
