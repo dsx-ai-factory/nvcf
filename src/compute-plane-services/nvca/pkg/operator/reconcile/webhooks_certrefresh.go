@@ -126,106 +126,193 @@ func (bc *BackendK8sCache) rotateTLSCert(ctx context.Context, nb *nvidiaiov1.NVC
 	return nil
 }
 
-// webhookCARepairAttempts bounds how often repairWebhookCAMismatch re-checks after
-// the serving cert changed underneath it.
-const webhookCARepairAttempts = 3
-
 // repairWebhookCAMismatch republishes the webhook CA when the stored serving cert
 // does not verify against the caBundle of an NVCA webhook, or when the CA Secret no
 // longer holds the CA that issued it. Setup publishes them together, but only runs
 // when the configuration changes, so a mismatch left by an earlier operator, a
 // partially failed write, or a manual edit otherwise persists. A stored cert that is
 // still usable is kept and only the CA copies are rewritten; an unusable one is
-// replaced through ensureWebhookCert. It reports whether anything was repaired.
-//
-// Rotation, or another operator replica, can replace the serving cert after this
-// reads it and before its CA is published, which would leave the older CA in the
-// caBundles. Nothing serializes those writers, so after publishing, the serving cert
-// is read again and the check repeated if it changed.
+// replaced through ensureWebhookCert. It reports whether anything was repaired. A
+// failed write returns before the caBundles are updated, so the mismatch stays
+// detectable for the next sync.
 func (bc *BackendK8sCache) repairWebhookCAMismatch(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) (bool, error) {
-	secretClient := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb))
-	repaired := false
-	for attempt := 0; attempt < webhookCARepairAttempts; attempt++ {
-		publishedFor, err := bc.repairWebhookCAMismatchOnce(ctx, nb, now)
-		if err != nil {
-			return repaired, err
-		}
-		if publishedFor == nil {
-			return repaired, nil
-		}
-		repaired = true
-
-		current, err := secretClient.Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
-		if err != nil {
-			return repaired, fmt.Errorf("get %s: %w", NVCAWebhookTLSCertSecretName, err)
-		}
-		if bytes.Equal(current.Data[TLSCertName], publishedFor) {
-			return repaired, nil
-		}
-		core.GetLogger(ctx).Info("Webhook serving cert changed while its CA was being republished, checking again")
-	}
-	return repaired, fmt.Errorf("webhook serving cert kept changing while its CA was being republished")
-}
-
-// repairWebhookCAMismatchOnce makes one repair pass and returns the serving cert
-// whose CA it published, or nil if nothing needed repair. A failed write returns
-// before the caBundles are updated, so the mismatch stays detectable for the next sync.
-func (bc *BackendK8sCache) repairWebhookCAMismatchOnce(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) ([]byte, error) {
 	log := core.GetLogger(ctx)
 
 	bundles, err := bc.webhookCABundles(ctx)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 	if len(bundles) == 0 {
-		return nil, nil
+		return false, nil
 	}
 
 	stored, _, ok, err := bc.reusableWebhookCert(ctx, nb, now)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	if ok {
-		servingCert, err := parseCertPEM(stored.TLSCert)
-		if err != nil {
-			return nil, fmt.Errorf("decode stored webhook serving cert: %w", err)
+	if !ok {
+		log.Warn("Stored webhook TLS certs are unusable while webhooks are published, replacing them")
+		if _, err := bc.ensureWebhookCert(ctx, nb, now); err != nil {
+			return false, err
 		}
-		mismatched := mismatchedWebhookCABundles(servingCert, bundles, nb, now)
-		caSecretStale, err := bc.webhookCASecretStale(ctx, nb, stored.CACertBytes)
-		if err != nil {
-			return nil, err
+		if err := bc.publishStoredCAToSecret(ctx, nb, now); err != nil {
+			return false, err
 		}
-		if len(mismatched) == 0 && !caSecretStale {
-			return nil, nil
+		if err := bc.publishStoredCAToWebhooks(ctx, nb, now); err != nil {
+			return false, err
 		}
-		if caSecretStale {
-			log.Warnf("%s does not hold the CA of the webhook serving cert, rewriting it", NVCAWebhookTLSCASecretName)
-			if err := bc.setupTLSCASecret(ctx, nb, stored); err != nil {
-				return nil, fmt.Errorf("update %s: %w", NVCAWebhookTLSCASecretName, err)
-			}
-		}
-		if len(mismatched) > 0 {
-			log.Warnf("Webhook serving cert does not verify against the caBundle of %v, republishing the stored CA",
-				strings.Join(mismatched, ", "))
-			if err := bc.updateWebhookCABundles(ctx, stored.CACertBytes); err != nil {
-				return nil, fmt.Errorf("republish webhook CA: %w", err)
-			}
-		}
-		return stored.TLSCert, nil
+		return true, nil
 	}
 
-	log.Warn("Stored webhook TLS certs are unusable while webhooks are published, replacing them")
-	webhookCert, err := bc.ensureWebhookCert(ctx, nb, now)
+	servingCert, err := parseCertPEM(stored.TLSCert)
+	if err != nil {
+		return false, fmt.Errorf("decode stored webhook serving cert: %w", err)
+	}
+	mismatched := mismatchedWebhookCABundles(servingCert, bundles, nb, now)
+	caSecretStale, err := bc.webhookCASecretStale(ctx, nb, stored.CACertBytes)
+	if err != nil {
+		return false, err
+	}
+	if len(mismatched) == 0 && !caSecretStale {
+		return false, nil
+	}
+	if caSecretStale {
+		log.Warnf("%s does not hold the CA of the webhook serving cert, rewriting it", NVCAWebhookTLSCASecretName)
+		if err := bc.publishStoredCAToSecret(ctx, nb, now); err != nil {
+			return false, err
+		}
+	}
+	if len(mismatched) > 0 {
+		log.Warnf("Webhook serving cert does not verify against the caBundle of %v, republishing the stored CA",
+			strings.Join(mismatched, ", "))
+		if err := bc.publishStoredCAToWebhooks(ctx, nb, now); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// The publishStoredCATo* functions copy the CA of the stored serving cert to the
+// objects that carry it. Rotation, setup, or another operator replica can replace
+// the serving cert at any time, and the operator has no leader election to serialize
+// them. Each of those writers stores the serving cert before it publishes the CA, so
+// each target is read first, the stored cert second, and the target written at the
+// resourceVersion it was read at. A writer that published before the target was read
+// stored its cert before the stored cert was read, so its CA is the one copied. A
+// writer that publishes after the target was read conflicts the write, which is then
+// retried. An older CA therefore never overwrites a newer one.
+
+// publishStoredCAToSecret writes the CA of the stored serving cert to the CA Secret.
+func (bc *BackendK8sCache) publishStoredCAToSecret(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) error {
+	secrets := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb))
+	err := retry.OnError(retry.DefaultRetry, isCreateOrUpdateRace, func() error {
+		caSecret, err := secrets.Get(ctx, NVCAWebhookTLSCASecretName, metav1.GetOptions{})
+		notFound := k8serrors.IsNotFound(err)
+		if err != nil && !notFound {
+			return err
+		}
+		ca, err := bc.storedWebhookCA(ctx, nb, now)
+		if err != nil {
+			return err
+		}
+		if notFound {
+			_, err = secrets.Create(ctx, newTLSCASecret(nb, ca), metav1.CreateOptions{})
+			return err
+		}
+		if bytes.Equal(caSecret.Data[TLSCAName], ca) {
+			return nil
+		}
+		if caSecret.Data == nil {
+			caSecret.Data = map[string][]byte{}
+		}
+		caSecret.Data[TLSCAName] = ca
+		_, err = secrets.Update(ctx, caSecret, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("update %s: %w", NVCAWebhookTLSCASecretName, err)
+	}
+	return nil
+}
+
+// publishStoredCAToWebhooks sets the CA of the stored serving cert as the caBundle of
+// every webhook in the NVCA validating and mutating webhook configurations. A
+// configuration that does not exist yet is skipped; setup creates it.
+func (bc *BackendK8sCache) publishStoredCAToWebhooks(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) error {
+	admission := bc.clients.K8s.AdmissionregistrationV1()
+	name := nvcaoptypes.NVCAModuleName
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		vwc, err := admission.ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		ca, err := bc.storedWebhookCA(ctx, nb, now)
+		if err != nil {
+			return err
+		}
+		changed := false
+		for i := range vwc.Webhooks {
+			if !bytes.Equal(vwc.Webhooks[i].ClientConfig.CABundle, ca) {
+				vwc.Webhooks[i].ClientConfig.CABundle = ca
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		_, err = admission.ValidatingWebhookConfigurations().Update(ctx, vwc, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("update %v ValidatingWebhookConfiguration: %w", name, err)
+	}
+
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		mwc, err := admission.MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		ca, err := bc.storedWebhookCA(ctx, nb, now)
+		if err != nil {
+			return err
+		}
+		changed := false
+		for i := range mwc.Webhooks {
+			if !bytes.Equal(mwc.Webhooks[i].ClientConfig.CABundle, ca) {
+				mwc.Webhooks[i].ClientConfig.CABundle = ca
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		_, err = admission.MutatingWebhookConfigurations().Update(ctx, mwc, metav1.UpdateOptions{})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("update %v MutatingWebhookConfiguration: %w", name, err)
+	}
+	return nil
+}
+
+// storedWebhookCA returns the CA of the stored serving cert, or an error if the
+// stored cert is not usable.
+func (bc *BackendK8sCache) storedWebhookCA(ctx context.Context, nb *nvidiaiov1.NVCFBackend, now time.Time) ([]byte, error) {
+	stored, _, ok, err := bc.reusableWebhookCert(ctx, nb, now)
 	if err != nil {
 		return nil, err
 	}
-	if err := bc.setupWebhookSecrets(ctx, nb, webhookCert); err != nil {
-		return nil, fmt.Errorf("update webhook secrets: %w", err)
+	if !ok {
+		return nil, fmt.Errorf("%s holds unusable cert material", NVCAWebhookTLSCertSecretName)
 	}
-	if err := bc.updateWebhookCABundles(ctx, webhookCert.CACertBytes); err != nil {
-		return nil, fmt.Errorf("update webhook caBundles: %w", err)
-	}
-	return webhookCert.TLSCert, nil
+	return stored.CACertBytes, nil
 }
 
 // webhookCASecretStale reports whether the CA Secret is missing or holds a CA other

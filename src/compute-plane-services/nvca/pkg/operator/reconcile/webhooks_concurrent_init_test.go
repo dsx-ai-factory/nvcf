@@ -18,6 +18,7 @@ limitations under the License.
 package operator
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -517,13 +519,79 @@ func TestRepairWebhookCAMismatch_SkipsBeforeWebhooksArePublished(t *testing.T) {
 	assert.True(t, k8serrors.IsNotFound(err))
 }
 
-// A rotation that stores a new serving cert while the repair is republishing the
-// previous cert's CA must not leave the caBundles on the previous CA.
-func TestRepairWebhookCAMismatch_RechecksAfterConcurrentRotation(t *testing.T) {
+// rotateDuringFirstUpdate simulates a rotation that stores a new serving cert and
+// publishes its CA right after the repair read resource, so the repair's first
+// update of it conflicts. It returns whether the rotation ran and whether any update
+// that landed afterwards still carried staleCA.
+func rotateDuringFirstUpdate(t *testing.T, cs *fake.Clientset, nb *nvidiaiov1.NVCFBackend, rotated WebhookCert,
+	resource string, staleCA []byte) (rotatedDuringRepair, staleAfterRotation *atomic.Bool) {
+	rotatedDuringRepair, staleAfterRotation = &atomic.Bool{}, &atomic.Bool{}
+	cs.PrependReactor("update", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if !rotatedDuringRepair.Load() {
+			return false, nil, nil
+		}
+		switch obj := a.(k8stesting.UpdateAction).GetObject().(type) {
+		case *v1.Secret:
+			if obj.Name == NVCAWebhookTLSCASecretName && bytes.Equal(obj.Data[TLSCAName], staleCA) {
+				staleAfterRotation.Store(true)
+			}
+		case *admissionregistrationv1.ValidatingWebhookConfiguration:
+			for _, w := range obj.Webhooks {
+				if bytes.Equal(w.ClientConfig.CABundle, staleCA) {
+					staleAfterRotation.Store(true)
+				}
+			}
+		case *admissionregistrationv1.MutatingWebhookConfiguration:
+			for _, w := range obj.Webhooks {
+				if bytes.Equal(w.ClientConfig.CABundle, staleCA) {
+					staleAfterRotation.Store(true)
+				}
+			}
+		}
+		return false, nil, nil
+	})
+	cs.PrependReactor("update", resource, func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if rotatedDuringRepair.Swap(true) {
+			return false, nil, nil
+		}
+		ns := getSystemNamespace(nb)
+		secrets := v1.SchemeGroupVersion.WithResource("secrets")
+		require.NoError(t, cs.Tracker().Update(secrets, newTLSCertSecret(nb, rotated), ns))
+		require.NoError(t, cs.Tracker().Update(secrets, newTLSCASecret(nb, rotated.CACertBytes), ns))
+		vwcRes := admissionregistrationv1.SchemeGroupVersion.WithResource("validatingwebhookconfigurations")
+		vwcObj, err := cs.Tracker().Get(vwcRes, "", nvcaoptypes.NVCAModuleName)
+		require.NoError(t, err)
+		vwc := vwcObj.(*admissionregistrationv1.ValidatingWebhookConfiguration).DeepCopy()
+		for i := range vwc.Webhooks {
+			vwc.Webhooks[i].ClientConfig.CABundle = rotated.CACertBytes
+		}
+		require.NoError(t, cs.Tracker().Update(vwcRes, vwc, ""))
+		mwcRes := admissionregistrationv1.SchemeGroupVersion.WithResource("mutatingwebhookconfigurations")
+		mwcObj, err := cs.Tracker().Get(mwcRes, "", nvcaoptypes.NVCAModuleName)
+		require.NoError(t, err)
+		mwc := mwcObj.(*admissionregistrationv1.MutatingWebhookConfiguration).DeepCopy()
+		for i := range mwc.Webhooks {
+			mwc.Webhooks[i].ClientConfig.CABundle = rotated.CACertBytes
+		}
+		require.NoError(t, cs.Tracker().Update(mwcRes, mwc, ""))
+		name := a.(k8stesting.UpdateAction).GetObject().(metav1.Object).GetName()
+		return true, nil, k8serrors.NewConflict(schema.GroupResource{Resource: resource}, name,
+			fmt.Errorf("the object has been modified"))
+	})
+	return rotatedDuringRepair, staleAfterRotation
+}
+
+// A rotation that publishes a new CA while the repair is republishing the previous
+// one must never be overwritten by the previous CA, so the caBundles are correct as
+// soon as the repair returns, with no later pass needed.
+func TestRepairWebhookCAMismatch_NeverOverwritesConcurrentRotation(t *testing.T) {
 	ctx := newTestContext()
 	bc, nb := newWebhookCertTestCache()
 	now := time.Now().UTC()
 	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	stored, err := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb)).
+		Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
 	other, err := generateWebhookCerts(nb, now)
 	require.NoError(t, err)
 	require.NoError(t, bc.updateWebhookCABundles(ctx, other.CACertBytes))
@@ -531,27 +599,44 @@ func TestRepairWebhookCAMismatch_RechecksAfterConcurrentRotation(t *testing.T) {
 	require.NoError(t, err)
 
 	cs := bc.clients.K8s.(*fake.Clientset)
-	var rotatedDuringRepair atomic.Bool
-	cs.PrependReactor("update", "validatingwebhookconfigurations", func(a k8stesting.Action) (bool, runtime.Object, error) {
-		if rotatedDuringRepair.Swap(true) {
-			return false, nil, nil
-		}
-		ns := getSystemNamespace(nb)
-		secrets := v1.SchemeGroupVersion.WithResource("secrets")
-		require.NoError(t, cs.Tracker().Update(secrets, newTLSCertSecret(nb, rotated), ns))
-		require.NoError(t, cs.Tracker().Update(secrets, &v1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: NVCAWebhookTLSCASecretName, Namespace: ns},
-			Data:       map[string][]byte{TLSCAName: rotated.CACertBytes},
-		}, ns))
-		return false, nil, nil
-	})
+	rotatedDuringRepair, staleAfterRotation := rotateDuringFirstUpdate(t, cs, nb, rotated,
+		"validatingwebhookconfigurations", stored.Data[TLSCAName])
 
 	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
 	require.NoError(t, err)
 	assert.True(t, repaired)
 	assert.True(t, rotatedDuringRepair.Load())
+	assert.False(t, staleAfterRotation.Load(), "the previous CA was published after the rotation")
 	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
 	assertWebhookCABundles(ctx, t, bc, rotated.CACertBytes)
+}
+
+// The same holds for the CA Secret: a rotation that stores a new CA while the repair
+// is rewriting a stale CA Secret must not be overwritten by the previous CA.
+func TestRepairWebhookCAMismatch_NeverOverwritesConcurrentRotationOfCASecret(t *testing.T) {
+	ctx := newTestContext()
+	bc, nb := newWebhookCertTestCache()
+	now := time.Now().UTC()
+	require.NoError(t, publishWebhookCert(ctx, bc, nb, now))
+	stored, err := bc.clients.K8s.CoreV1().Secrets(getSystemNamespace(nb)).
+		Get(ctx, NVCAWebhookTLSCertSecretName, metav1.GetOptions{})
+	require.NoError(t, err)
+	other, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+	require.NoError(t, bc.setupTLSCASecret(ctx, nb, other))
+	rotated, err := generateWebhookCerts(nb, now)
+	require.NoError(t, err)
+
+	cs := bc.clients.K8s.(*fake.Clientset)
+	rotatedDuringRepair, staleAfterRotation := rotateDuringFirstUpdate(t, cs, nb, rotated,
+		"secrets", stored.Data[TLSCAName])
+
+	repaired, err := bc.repairWebhookCAMismatch(ctx, nb, now)
+	require.NoError(t, err)
+	assert.True(t, repaired)
+	assert.True(t, rotatedDuringRepair.Load())
+	assert.False(t, staleAfterRotation.Load(), "the previous CA was published after the rotation")
+	require.NoError(t, webhookCAConsistency(ctx, bc, nb, now))
 }
 
 // A CA Secret that no longer holds the CA of a usable serving cert must be rewritten
