@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,30 +23,229 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/criu/mountinfo"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
-const tib = uint64(1) << 40
+const tib = int64(1) << 40
 
-// stubDisk makes diskSpace report avail/total from next, called once per
-// statfs, and gpuUsedBytes report gpu; both restored after the test.
-func stubDisk(t *testing.T, gpu int64, next func() (avail, total uint64)) {
-	t.Helper()
-	ds, gu := diskSpace, gpuUsedBytes
-	resetReservations := func() {
-		diskReserveMu.Lock()
-		diskReservations = map[string]diskReservation{}
-		diskReserveMu.Unlock()
-	}
-	resetReservations()
-	t.Cleanup(func() { diskSpace, gpuUsedBytes = ds, gu; resetReservations() })
-	diskSpace = func(string) (uint64, uint64, error) { a, tot := next(); return a, tot, nil }
-	gpuUsedBytes = func([]int) (int64, error) { return gpu, nil }
+// diskHost is a fake node for dumpBytes: free space, GPU memory, mounts
+// and archive sizes. install swaps it in for the test.
+type diskHost struct {
+	avail, total  uint64
+	gpu           int64
+	gpuErr        error
+	mounts        []mountinfo.MountInfo
+	mountsErr     error
+	tmpfs         map[string]int64
+	replay        map[string]int64
+	upperdir      string
+	upperdirBytes int64
 }
 
-func writeCheckpoint(t *testing.T, dir, id string, created time.Time) {
+func (h *diskHost) install(t *testing.T) {
 	t.Helper()
-	b, _ := json.Marshal(CheckpointMetadata{ID: id, CreatedAt: created, CatalogInfo: &CatalogInfo{InstanceCapture: true}})
+	ds, gu, cm, cu, tu, rb, ub := diskSpace, gpuUsedBytes, containerMounts, containerUpperdir, tmpfsUsed, replayArchiveBytes, upperdirArchiveBytes
+	t.Cleanup(func() {
+		diskSpace, gpuUsedBytes, containerMounts, containerUpperdir, tmpfsUsed, replayArchiveBytes, upperdirArchiveBytes = ds, gu, cm, cu, tu, rb, ub
+	})
+	diskSpace = func(string) (uint64, uint64, error) { return h.avail, h.total, nil }
+	gpuUsedBytes = func([]int) (int64, error) { return h.gpu, h.gpuErr }
+	containerMounts = func(int) ([]mountinfo.MountInfo, error) { return h.mounts, h.mountsErr }
+	containerUpperdir = func(int) string { return h.upperdir }
+	tmpfsUsed = func(_ int, mp string) (int64, error) {
+		if n, ok := h.tmpfs[mp]; ok {
+			return n, nil
+		}
+		return 0, errors.New("statfs failed")
+	}
+	replayArchiveBytes = func(_ int, mp string, _ []string, _ int64) (int64, error) { return h.replay[mp], nil }
+	upperdirArchiveBytes = func(string, []string, int64) (int64, error) { return h.upperdirBytes, nil }
+}
+
+// diskProc is a /proc with one process pid of anon bytes, holding a GPU
+// device open when gpu.
+func diskProc(t *testing.T, pid int, anon int64, gpu bool) string {
+	t.Helper()
+	proc := t.TempDir()
+	dir := filepath.Join(proc, strconv.Itoa(pid))
+	if err := os.MkdirAll(filepath.Join(dir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "smaps_rollup"), []byte("Rss: 1 kB\nAnonymous: "+strconv.FormatInt(anon>>10, 10)+" kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if gpu {
+		if err := os.Symlink("/dev/nvidia0", filepath.Join(dir, "fd", "5")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return proc
+}
+
+func diskAgent(t *testing.T, keep int) *Agent {
+	return &Agent{log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: keep}}
+}
+
+func TestSumGPUUsed(t *testing.T) {
+	if got, err := sumGPUUsed("112, 140000\n519, 139000\n777, 5000\n", []int{112, 519}); err != nil || got != int64(279000)<<20 {
+		t.Fatalf("sumGPUUsed = %d %v, want %d", got, err, int64(279000)<<20)
+	}
+	// "[N/A]" (MIG) for a wanted pid is an error, not zero; another pid's
+	// line doesn't matter.
+	if _, err := sumGPUUsed("112, [N/A]\n", []int{112}); err == nil {
+		t.Fatal("an unparsable used_memory for a wanted pid: want an error")
+	}
+	if _, err := sumGPUUsed("112, [N/A]\n519, 10\n", []int{519}); err != nil {
+		t.Fatalf("an unparsable line of another pid: %v", err)
+	}
+}
+
+// Everything the capture writes is counted: anonymous memory, GPU memory,
+// tmpfs contents, replay-mount archives and the rootfs diff.
+func TestDumpBytesCountsEverythingTheCaptureWrites(t *testing.T) {
+	h := &diskHost{avail: uint64(3 * tib), total: uint64(4 * tib), gpu: 500 << 30,
+		mounts: []mountinfo.MountInfo{
+			{MountPoint: "/", FsType: "overlay"},
+			{MountPoint: "/dev/shm", FsType: "tmpfs"},
+			{MountPoint: "/opt/nvsnap", Root: "/var/lib/kubelet/pods/u/volumes/kubernetes.io~empty-dir/c", FsType: "ext4", Opts: "rw"},
+		},
+		tmpfs: map[string]int64{"/dev/shm": 64 << 30}, replay: map[string]int64{"/opt/nvsnap": 3 << 30},
+		upperdir: "/var/lib/up", upperdirBytes: 2 << 30}
+	h.install(t)
+	t.Setenv("NVSNAP_REPLAY_MOUNTS", "/opt/nvsnap")
+	a := diskAgent(t, 20)
+	got, err := a.dumpBytes(diskProc(t, 7, 10<<30, true), 7, []int{7}, 2*tib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := int64(10<<30 + 500<<30 + 64<<30 + 3<<30 + 2<<30)
+	if got != want {
+		t.Fatalf("dumpBytes = %d GiB, want %d GiB", got>>30, want>>30)
+	}
+}
+
+// Every part that cannot be measured fails the estimate: the capture is
+// then blocked, not let through.
+func TestDumpBytesFailsClosed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		host    diskHost
+		gpuOpen bool
+		noAnon  bool
+	}{
+		"GPU open, nvidia-smi fails":            {host: diskHost{gpuErr: errors.New("driver not loaded")}, gpuOpen: true},
+		"GPU open, no nvidia-smi":               {host: diskHost{gpuErr: errNoNvidiaSMI}, gpuOpen: true},
+		"mounts unreadable":                     {host: diskHost{mountsErr: errors.New("no mountinfo")}},
+		"tmpfs not measurable":                  {host: diskHost{mounts: []mountinfo.MountInfo{{MountPoint: "/dev/shm", FsType: "tmpfs"}}}},
+		"memory unreadable (no Anonymous line)": {noAnon: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := tc.host
+			h.avail, h.total = uint64(3*tib), uint64(4*tib)
+			h.install(t)
+			proc := diskProc(t, 7, 1<<30, tc.gpuOpen)
+			if tc.noAnon {
+				if err := os.WriteFile(filepath.Join(proc, "7", "smaps_rollup"), []byte("Rss: 1 kB\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := diskAgent(t, 20).dumpBytes(proc, 7, []int{7}, 2*tib); err == nil {
+				t.Fatal("want an error")
+			}
+			fs := diskAgent(t, 20).diskFindings(proc, 7, []int{7}, "rank-0", "main")
+			if len(fs) != 1 || fs[0].Severity != preflightBlock {
+				t.Fatalf("findings = %+v, want one block", fs)
+			}
+		})
+	}
+}
+
+// A process with no GPU open never asks nvidia-smi: a companion on a node
+// whose nvidia-smi fails is not blocked.
+func TestDumpBytesSkipsTheGPUQueryWithoutAGPUOpen(t *testing.T) {
+	h := &diskHost{avail: uint64(3 * tib), total: uint64(4 * tib), gpuErr: errors.New("driver not loaded")}
+	h.install(t)
+	got, err := diskAgent(t, 20).dumpBytes(diskProc(t, 7, 1<<30, false), 7, []int{7}, 2*tib)
+	if err != nil || got != 1<<30 {
+		t.Fatalf("dumpBytes = %d %v, want 1 GiB and no error", got, err)
+	}
+}
+
+// The incident: a ~570 GB rank on a node with 584 GB of 4 TB free.
+func TestDiskFindingsBlockACaptureThatDoesNotFit(t *testing.T) {
+	h := &diskHost{avail: 584 << 30, total: uint64(4 * tib), gpu: 560 << 30}
+	h.install(t)
+	fs := diskAgent(t, 20).diskFindings(diskProc(t, 7, 10<<30, true), 7, []int{7}, "rank-0", "main")
+	if len(fs) != 1 || fs[0].Severity != preflightBlock || fs[0].Check != diskCheck {
+		t.Fatalf("findings = %+v, want one disk block", fs)
+	}
+}
+
+func TestDiskFindingsReportTheEstimateWhenItFits(t *testing.T) {
+	h := &diskHost{avail: uint64(3 * tib), total: uint64(4 * tib), gpu: 560 << 30}
+	h.install(t)
+	fs := diskAgent(t, 20).diskFindings(diskProc(t, 7, 10<<30, true), 7, []int{7}, "rank-0", "main")
+	room := 3*tib - 4*tib/100*20
+	if len(fs) != 1 || fs[0].Severity != preflightInfo || fs[0].DiskBytes != 570<<30 || fs[0].DiskRoom != room || fs[0].Node != "n1" {
+		t.Fatalf("findings = %+v, want one info with 570 GiB, the room and the node", fs)
+	}
+}
+
+func TestDiskFindingsOffAtZero(t *testing.T) {
+	h := &diskHost{avail: 1 << 30, total: uint64(4 * tib), gpu: 560 << 30}
+	h.install(t)
+	if fs := diskAgent(t, 0).diskFindings(diskProc(t, 7, 10<<30, true), 7, []int{7}, "rank-0", "main"); len(fs) != 0 {
+		t.Fatalf("findings = %+v, want none with the check off", fs)
+	}
+}
+
+// Members of one node that fit alone but not together block; members on
+// different nodes are counted apart.
+func TestNodeDiskFindingsAddUpANodesMembers(t *testing.T) {
+	member := func(pod, node string, bytes int64) PreflightFinding {
+		return PreflightFinding{Pod: pod, Check: diskCheck, Severity: preflightInfo, Node: node, DiskBytes: bytes, DiskRoom: 1000 << 30}
+	}
+	if got := nodeDiskFindings([]PreflightFinding{member("a", "n1", 600<<30), member("b", "n2", 600<<30)}); len(got) != 0 {
+		t.Fatalf("different nodes: %+v, want none", got)
+	}
+	got := nodeDiskFindings([]PreflightFinding{member("a", "n1", 600<<30), member("b", "n1", 600<<30)})
+	if len(got) != 1 || got[0].Severity != preflightBlock || got[0].Node != "n1" {
+		t.Fatalf("one node: %+v, want one block for n1", got)
+	}
+}
+
+// A member whose host checks did not run blocks the capture: its node's
+// disk was not checked.
+func TestCapturePreflightBlocksWhenAMembersDiskWasNotChecked(t *testing.T) {
+	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{CaptureDiskKeepPercent: 20}}
+	rank := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w0", Namespace: "ns"}, Spec: corev1.PodSpec{NodeName: "n-gone",
+		Containers: []corev1.Container{{Name: "main"}}}}
+	fs := a.capturePreflight(context.Background(), []*corev1.Pod{rank}, nil, nil, logrus.NewEntry(logrus.New()))
+	for _, f := range fs {
+		if f.Check == diskCheck && f.Severity == preflightBlock {
+			return
+		}
+	}
+	t.Fatalf("findings = %+v, want a disk block", fs)
+}
+
+// The disk finding's estimate reaches the capture's driver intact.
+func TestDiskFindingSurvivesTheWire(t *testing.T) {
+	in := PreflightFinding{Pod: "p", Check: diskCheck, Severity: preflightInfo, Node: "n1", DiskBytes: 570 << 30, DiskRoom: 2 << 40}
+	b, _ := json.Marshal([]PreflightFinding{in})
+	var out []PreflightFinding
+	if err := json.Unmarshal(b, &out); err != nil || len(out) != 1 || out[0] != in {
+		t.Fatalf("round trip = %+v %v, want %+v", out, err, in)
+	}
+}
+
+func writeCheckpoint(t *testing.T, dir, id string, created time.Time, instance bool) {
+	t.Helper()
+	md := CheckpointMetadata{ID: id, CreatedAt: created}
+	if instance {
+		md.CatalogInfo = &CatalogInfo{InstanceCapture: true}
+	}
+	b, _ := json.Marshal(md)
 	if err := os.MkdirAll(filepath.Join(dir, id), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -64,81 +264,18 @@ func exists(dir, id string) bool {
 	return err == nil
 }
 
-func TestSumGPUUsed(t *testing.T) {
-	out := "112, 140000\n519, 139000\n777, 5000\nbad line\n521, x\n"
-	if got, want := sumGPUUsed(out, []int{112, 519, 521}), int64(279000)<<20; got != want {
-		t.Fatalf("sumGPUUsed = %d, want %d", got, want)
-	}
-}
-
-// The failure this fixes: a capture of a Kimi rank (about 570 GB) on a
-// node whose checkpoint filesystem had 584 GB of 4 TB free filled it past
-// the kubelet's eviction threshold; the kubelet evicted a rank mid-capture
-// and the agent with it. The preflight now blocks such a capture before
-// any member suspends.
-func TestDiskFindingsBlockADumpThatDoesNotFit(t *testing.T) {
-	stubDisk(t, 560<<30, func() (uint64, uint64) { return 584 << 30, 4 * tib })
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main")
-	if len(fs) != 1 || fs[0].Severity != preflightBlock || fs[0].Check != "disk" {
-		t.Fatalf("findings = %+v, want one disk block", fs)
-	}
-}
-
-func TestDiskFindingsPassWhenItFits(t *testing.T) {
-	stubDisk(t, 560<<30, func() (uint64, uint64) { return 3 * tib, 4 * tib })
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
-		t.Fatalf("findings = %+v, want none", fs)
-	}
-}
-
-func TestDiskFindingsOffAtZero(t *testing.T) {
-	stubDisk(t, 560<<30, func() (uint64, uint64) { return 1 << 30, 4 * tib })
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir()}}
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
-		t.Fatalf("findings = %+v, want none with the check off", fs)
-	}
-}
-
-// A node short of room retires the checkpoints no record names, without
-// waiting checkpointRetireAge, before it blocks; a named one stays.
-func TestDiskFindingsRetireUnnamedCheckpointsFirst(t *testing.T) {
-	dir := t.TempDir()
-	now := time.Now()
-	writeCheckpoint(t, dir, "orphan", now.Add(-time.Hour))
-	writeCheckpoint(t, dir, "recorded", now.Add(-time.Hour))
-	writeCheckpoint(t, dir, "writing", now.Add(-time.Minute))
-	kc := fake.NewSimpleClientset(diskTestRecord("k", map[string]string{"state": "complete", "size": "1", "checkpoint.0": "recorded"}))
-	stubDisk(t, 560<<30, func() (uint64, uint64) {
-		if exists(dir, "orphan") {
-			return 584 << 30, 4 * tib
-		}
-		return 2 * tib, 4 * tib
-	})
-	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CaptureDiskKeepPercent: 20}}
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
-		t.Fatalf("findings = %+v, want none once the orphan is retired", fs)
-	}
-	if exists(dir, "orphan") || !exists(dir, "recorded") || !exists(dir, "writing") {
-		t.Fatalf("orphan %v recorded %v writing %v; want only the orphan gone",
-			exists(dir, "orphan"), exists(dir, "recorded"), exists(dir, "writing"))
-	}
-}
-
 // A low filesystem makes the reaper retire unnamed checkpoints at
 // pressureRetireAge; with room it waits checkpointRetireAge.
 func TestReaperRetiresEarlyWhileTheDiskIsLow(t *testing.T) {
 	for _, low := range []bool{false, true} {
 		dir := t.TempDir()
 		now := time.Now()
-		writeCheckpoint(t, dir, "orphan", now.Add(-time.Hour))
-		stubDisk(t, 0, func() (uint64, uint64) {
-			if low {
-				return 600 << 30, 4 * tib
-			}
-			return 3 * tib, 4 * tib
-		})
+		writeCheckpoint(t, dir, "orphan", now.Add(-time.Hour), true)
+		h := &diskHost{avail: uint64(3 * tib), total: uint64(4 * tib)}
+		if low {
+			h.avail = 600 << 30
+		}
+		h.install(t)
 		a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CaptureDiskKeepPercent: 20}}
 		a.reapCheckpoints(context.Background(), nil, now)
 		if exists(dir, "orphan") == low {
@@ -147,20 +284,22 @@ func TestReaperRetiresEarlyWhileTheDiskIsLow(t *testing.T) {
 	}
 }
 
-// The prd21 failure: records left "verifying" after their namespaces
-// went, marked abandoned, kept 2.5 TB of checkpoints per node for 11
-// days. An abandoned record names nothing; one still being verified does.
-func TestAbandonedVerifyKeepsNoCheckpoint(t *testing.T) {
+// Records left "verifying" after their namespaces went, marked abandoned,
+// kept 2.5 TB of checkpoints per node for 11 days. An abandoned record
+// names nothing; one still being verified, or still capturing, does.
+func TestRetirableCheckpointsByRecordState(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
-	writeCheckpoint(t, dir, "abandoned", now.Add(-5*time.Hour))
-	writeCheckpoint(t, dir, "verifying", now.Add(-5*time.Hour))
+	for _, id := range []string{"abandoned", "verifying", "capturing"} {
+		writeCheckpoint(t, dir, id, now.Add(-5*time.Hour), true)
+	}
 	kc := fake.NewSimpleClientset(
 		diskTestRecord("a", map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "gone", groupAbandonedKey: now.Format(time.RFC3339), "size": "1", "checkpoint.0": "abandoned"}),
 		diskTestRecord("v", map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "live", "size": "1", "checkpoint.0": "verifying"}),
+		diskTestRecord("c", map[string]string{"state": criuGroupStateCapturing, "size": "1", "checkpoint.0": "capturing"}),
 	)
 	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir}}
-	dead, err := a.retirableCheckpoints(context.Background(), nil, now, checkpointRetireAge)
+	dead, err := a.retirableCheckpoints(context.Background(), nil, now, pressureRetireAge)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,250 +308,70 @@ func TestAbandonedVerifyKeepsNoCheckpoint(t *testing.T) {
 	}
 }
 
-// A retired checkpoint's catalog row is deleted through nvsnap-server.
-func TestReaperDropsTheCatalogRow(t *testing.T) {
+// catalogServer answers each DELETE with status() and records the paths.
+func catalogServer(t *testing.T, status func() int) (*httptest.Server, func() []string) {
 	var mu sync.Mutex
-	var deleted []string
+	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		defer mu.Unlock()
-		if r.Method == http.MethodDelete {
-			deleted = append(deleted, r.URL.Path)
-		}
-		w.WriteHeader(http.StatusNoContent)
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.WriteHeader(status())
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), paths...) }
+}
+
+// A retired instance capture's catalog row is deleted; a lone capture's
+// is not: nvsnap-server deletes by hash, and a lone capture's hash is its
+// configuration's, which a newer capture may share.
+func TestReaperDropsOnlyInstanceCapturesCatalogRows(t *testing.T) {
+	srv, paths := catalogServer(t, func() int { return http.StatusNoContent })
 	dir := t.TempDir()
 	now := time.Now()
-	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour))
-	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
-	a.reapCheckpointsOlderThan(context.Background(), nil, now, checkpointRetireAge)
-	mu.Lock()
-	defer mu.Unlock()
-	if len(deleted) != 1 || deleted[0] != "/api/v1/checkpoints/orphan" {
-		t.Fatalf("catalog deletes = %v, want /api/v1/checkpoints/orphan", deleted)
+	writeCheckpoint(t, dir, "instance", now.Add(-5*time.Hour), true)
+	writeCheckpoint(t, dir, "lone", now.Add(-5*time.Hour), false)
+	kc := fake.NewSimpleClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuRestoreFailedConfigMap, Namespace: "nvsnap-system"},
+		Data: map[string]string{"lone": "x"}})
+	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
+	a.reapCheckpoints(context.Background(), nil, now)
+	if exists(dir, "instance") || exists(dir, "lone") {
+		t.Fatal("want both retired locally")
+	}
+	if got := paths(); len(got) != 1 || got[0] != "/api/v1/checkpoints/instance" {
+		t.Fatalf("catalog deletes = %v, want only the instance capture's", got)
 	}
 }
 
-// GPU memory that cannot be read on a node with GPUs blocks: the dump
-// could be far larger than its host memory.
-func TestDiskFindingsBlockWhenGPUMemoryIsUnknown(t *testing.T) {
-	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
-	gpuUsedBytes = func([]int) (int64, error) { return 0, errors.New("nvidia-smi: driver not loaded") }
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main")
-	if len(fs) != 1 || fs[0].Severity != preflightBlock {
-		t.Fatalf("findings = %+v, want one disk block", fs)
-	}
-	// A node with no nvidia-smi has no GPU memory to save.
-	gpuUsedBytes = func([]int) (int64, error) { return 0, errNoNvidiaSMI }
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "etcd-0", "etcd"); len(fs) != 0 {
-		t.Fatalf("findings = %+v, want none on a node without GPUs", fs)
-	}
-}
-
-// Two members on one node: each fits alone, not together. The second is
-// blocked.
-func TestDiskFindingsCountTheOtherMembersOnTheNode(t *testing.T) {
-	stubDisk(t, 400<<30, func() (uint64, uint64) { return 1000 << 30, 2000 << 30 })
-	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
-		t.Fatalf("first member: %+v, want none", fs)
-	}
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-1", "main"); len(fs) != 1 || fs[0].Severity != preflightBlock {
-		t.Fatalf("second member: %+v, want one disk block", fs)
-	}
-	// The first member checked again does not count against itself.
-	if fs := a.diskFindings(context.Background(), t.TempDir(), nil, "rank-0", "main"); len(fs) != 0 {
-		t.Fatalf("first member again: %+v, want none", fs)
-	}
-}
-
-// A deleted file the dump saves whole counts in the estimate.
-func TestCaptureBytesCountDeletedFiles(t *testing.T) {
-	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
-	a := &Agent{log: logrus.New()}
-	before, err := a.captureBytes("/proc", []int{os.Getpid()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Create(filepath.Join(t.TempDir(), "held"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.Write(make([]byte, 64<<20)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(f.Name()); err != nil {
-		t.Fatal(err)
-	}
-	after, err := a.captureBytes("/proc", []int{os.Getpid()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after-before < 48<<20 {
-		t.Fatalf("estimate grew by %d bytes with a 64 MiB deleted file held, want about 64 MiB", after-before)
-	}
-}
-
-// A delete cascaded from another node's reaper keeps a copy a pod on this
-// node restores from.
-func TestDeleteKeepsACheckpointAPodRestoresFrom(t *testing.T) {
-	dir := t.TempDir()
-	writeCheckpoint(t, dir, "busy", time.Now())
-	writeCheckpoint(t, dir, "idle", time.Now())
-	kc := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns",
-		Annotations: map[string]string{webhook.CRIURestoreAnnotation: "busy"}}, Spec: corev1.PodSpec{NodeName: "n1"}})
-	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir}}
-	for id, want := range map[string]int{"busy": http.StatusConflict, "idle": http.StatusNoContent} {
-		req := mux.SetURLVars(httptest.NewRequest(http.MethodDelete, "/v1/checkpoints/"+id, nil), map[string]string{"id": id})
-		rec := httptest.NewRecorder()
-		a.deleteCheckpointHandler(rec, req)
-		if rec.Code != want || exists(dir, id) != (want == http.StatusConflict) {
-			t.Errorf("%s: status %d (want %d), still there %v", id, rec.Code, want, exists(dir, id))
-		}
-	}
-}
-
-// An unreadable memory measure blocks; a process gone since it was listed
-// counts 0.
-func TestCaptureBytesFailClosedOnUnreadableMemory(t *testing.T) {
-	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
-	proc := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(proc, "41"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(proc, "41", "smaps_rollup"), []byte("Rss: 10 kB\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	if _, err := a.captureBytes(proc, []int{41}); err == nil {
-		t.Fatal("no Anonymous line: want an error")
-	}
-	if fs := a.diskFindings(context.Background(), proc, []int{41}, "rank-0", "main"); len(fs) != 1 || fs[0].Severity != preflightBlock {
-		t.Fatalf("findings = %+v, want one disk block", fs)
-	}
-	if n, err := a.captureBytes(proc, []int{42}); err != nil || n != 0 {
-		t.Fatalf("gone process: %d %v, want 0 and no error", n, err)
-	}
-}
-
-// A re-check of the same container (the on-demand preflight report) does
-// not lower the reservation of a dump still being written.
-func TestReserveDiskNeverLowersALiveReservation(t *testing.T) {
-	stubDisk(t, 0, func() (uint64, uint64) { return 3 * tib, 4 * tib })
-	now := time.Now()
-	reserveDisk("p/main", 500<<30, now)
-	reserveDisk("p/main", 100<<30, now.Add(time.Minute))
-	if got := reservedBytes("other/main", now.Add(2*time.Minute)); got != 500<<30 {
-		t.Fatalf("reserved = %d GiB, want 500", got>>30)
-	}
-	if got := reservedBytes("other/main", now.Add(diskReserveTTL+time.Minute)); got != 0 {
-		t.Fatalf("reserved after the TTL = %d, want 0", got)
-	}
-}
-
-// The rootfs diff is not archived when it would take the room the kept
-// free space needs.
-func TestRootfsDiffChecksTheCheckpointRoom(t *testing.T) {
-	upper := t.TempDir()
-	if err := os.WriteFile(filepath.Join(upper, "db"), make([]byte, 2<<20), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		avail uint64
-		fits  bool
-	}{{avail: 20<<20 + 1<<20, fits: false}, {avail: 20<<20 + 64<<20, fits: true}} {
-		stubDisk(t, 0, func() (uint64, uint64) { return tc.avail, 100 << 20 })
-		ckpt := t.TempDir()
-		a := &Agent{log: logrus.New(), config: Config{CheckpointDir: ckpt, CaptureDiskKeepPercent: 20}}
-		err := a.mirrorRootfsDiff(context.Background(), "p/main", ckpt, upper, nil, logrus.NewEntry(logrus.New()))
-		if (err == nil) != tc.fits {
-			t.Errorf("avail %d MiB: err = %v, want fits=%v", tc.avail>>20, err, tc.fits)
-		}
-	}
-}
-
-// A catalog delete that fails is retried from its tombstone until it
+// A catalog delete that fails is retried on later sweeps until it
 // succeeds.
 func TestCatalogDeleteIsRetriedFromItsTombstone(t *testing.T) {
 	var mu sync.Mutex
-	status, calls := http.StatusInternalServerError, 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		calls++
-		w.WriteHeader(status)
-	}))
-	defer srv.Close()
+	status := http.StatusInternalServerError
+	srv, paths := catalogServer(t, func() int { mu.Lock(); defer mu.Unlock(); return status })
 	dir := t.TempDir()
 	now := time.Now()
-	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour))
+	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour), true)
 	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
-	a.reapCheckpointsOlderThan(context.Background(), nil, now, checkpointRetireAge)
-	tomb := filepath.Join(dir, catalogTombstoneDir, "orphan")
-	if exists(dir, "orphan") || !exists(filepath.Dir(tomb), "orphan") {
+	a.reapCheckpoints(context.Background(), nil, now)
+	tombs := filepath.Join(dir, catalogTombstoneDir)
+	if exists(dir, "orphan") || !exists(tombs, "orphan") {
 		t.Fatal("want the checkpoint gone and its tombstone kept after a failed catalog delete")
 	}
 	mu.Lock()
 	status = http.StatusNoContent
 	mu.Unlock()
-	a.reapCheckpoints(context.Background(), nil, now) // each sweep retries first
-	if exists(filepath.Dir(tomb), "orphan") {
+	a.reapCheckpoints(context.Background(), nil, now)
+	if exists(tombs, "orphan") {
 		t.Fatal("tombstone kept after the catalog delete succeeded")
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("catalog deletes = %d, want 2", calls)
-	}
-}
-
-// Another member's dump that the preflight passed and that is not yet on
-// disk takes its room from the write-time check; the writer's own does not.
-func TestArchiveRoomCountsOtherMembersPendingDumps(t *testing.T) {
-	upper := t.TempDir()
-	if err := os.WriteFile(filepath.Join(upper, "f"), make([]byte, 2<<20), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	stubDisk(t, 0, func() (uint64, uint64) { return 20<<20 + 16<<20, 100 << 20 })
-	a := &Agent{log: logrus.New(), config: Config{CheckpointDir: t.TempDir(), CaptureDiskKeepPercent: 20}}
-	write := func() error { return nil }
-	reserveDisk("p/main", 15<<20, time.Now()) // own: does not count
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); err != nil {
-		t.Fatalf("own reservation counted: %v", err)
-	}
-	reserveDisk("q/main", 15<<20, time.Now()) // another member's pending dump
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); !errors.Is(err, errNoCheckpointRoom) {
-		t.Fatalf("err = %v, want errNoCheckpointRoom with another member's dump pending", err)
-	}
-	releaseDisk("q/main") // its dump is on disk
-	if err := a.withCheckpointRoom("p/main", os.DirFS(upper), nil, write); err != nil {
-		t.Fatalf("after release: %v", err)
-	}
-}
-
-// Tar headers and padding count: many small files are far larger as an
-// archive than their payload.
-func TestTarBytesCountHeadersAndPadding(t *testing.T) {
-	dir := t.TempDir()
-	for i := 0; i < 2000; i++ {
-		if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)), []byte{1}, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	over, n, err := tarBytesOver(os.DirFS(dir), 1<<20, nil)
-	if err != nil || !over {
-		t.Fatalf("2000 one-byte files: over=%v n=%d err=%v, want over 1 MiB", over, n, err)
-	}
-	if _, payload, _ := treeBytesOver(os.DirFS(dir), 1<<20); payload != 2000 {
-		t.Fatalf("payload = %d, want 2000", payload)
+	if got := paths(); len(got) != 2 {
+		t.Fatalf("catalog deletes = %v, want 2", got)
 	}
 }
 
 // An unreachable nvsnap-server does not hold up local reclamation: the
-// sweep retires local checkpoints first and bounds its catalog retries.
+// sweep retires every local checkpoint and bounds its catalog retries.
 func TestCatalogRetriesDoNotDelayReclamation(t *testing.T) {
 	stop := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -428,32 +387,59 @@ func TestCatalogRetriesDoNotDelayReclamation(t *testing.T) {
 	defer func() { catalogRetryBudget, catalogRequestTimeout = b, rt }()
 	dir := t.TempDir()
 	now := time.Now()
-	if err := os.MkdirAll(filepath.Join(dir, catalogTombstoneDir), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	for i := 0; i < 20; i++ {
-		if err := os.WriteFile(filepath.Join(dir, catalogTombstoneDir, "old"+strconv.Itoa(i)), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeCheckpoint(t, dir, "orphan"+strconv.Itoa(i), now.Add(-5*time.Hour), true)
 	}
-	writeCheckpoint(t, dir, "orphan", now.Add(-5*time.Hour))
 	a := &Agent{kubeClient: fake.NewSimpleClientset(), log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir, CatalogURL: srv.URL}}
 	start := time.Now()
 	a.reapCheckpoints(context.Background(), nil, now)
-	if exists(dir, "orphan") {
-		t.Fatal("the local checkpoint was not retired")
+	for i := 0; i < 20; i++ {
+		if exists(dir, "orphan"+strconv.Itoa(i)) {
+			t.Fatalf("orphan%d not retired", i)
+		}
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("sweep took %v with an unreachable server, want it bounded", d)
 	}
-	ents, _ := os.ReadDir(filepath.Join(dir, catalogTombstoneDir))
-	if len(ents) != 21 {
-		t.Fatalf("tombstones = %d, want all 21 kept for later sweeps", len(ents))
+	if ents, _ := os.ReadDir(filepath.Join(dir, catalogTombstoneDir)); len(ents) != 20 {
+		t.Fatalf("tombstones = %d, want all 20 kept for later sweeps", len(ents))
 	}
 }
 
-// Sizing leaves out what the archive leaves out: a model cache the rootfs
-// diff excludes must not block an archive whose included files fit.
+// A delete cascaded from another node's reaper keeps a copy a pod on this
+// node restores from.
+func TestDeleteKeepsACheckpointAPodRestoresFrom(t *testing.T) {
+	dir := t.TempDir()
+	writeCheckpoint(t, dir, "busy", time.Now(), true)
+	writeCheckpoint(t, dir, "idle", time.Now(), true)
+	kc := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns",
+		Annotations: map[string]string{webhook.CRIURestoreAnnotation: "busy"}}, Spec: corev1.PodSpec{NodeName: "n1"}})
+	a := &Agent{kubeClient: kc, log: logrus.New(), config: Config{NodeName: "n1", CheckpointDir: dir}}
+	for id, want := range map[string]int{"busy": http.StatusConflict, "idle": http.StatusNoContent} {
+		req := mux.SetURLVars(httptest.NewRequest(http.MethodDelete, "/v1/checkpoints/"+id, nil), map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		a.deleteCheckpointHandler(rec, req)
+		if rec.Code != want || exists(dir, id) != (want == http.StatusConflict) {
+			t.Errorf("%s: status %d (want %d), still there %v", id, rec.Code, want, exists(dir, id))
+		}
+	}
+}
+
+// Tar headers and padding count: many small files are far larger as an
+// archive than their payload.
+func TestTarBytesCountHeadersAndPadding(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 2000; i++ {
+		if err := os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)), []byte{1}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if over, n, err := tarBytesOver(os.DirFS(dir), 1<<20, nil); err != nil || !over {
+		t.Fatalf("2000 one-byte files: over=%v n=%d err=%v, want over 1 MiB", over, n, err)
+	}
+}
+
+// Sizing leaves out what the archive leaves out.
 func TestTarBytesLeaveOutTheWritersExclusions(t *testing.T) {
 	dir := t.TempDir()
 	hub := filepath.Join(dir, "root", ".cache", "huggingface", "hub")
@@ -467,9 +453,6 @@ func TestTarBytesLeaveOutTheWritersExclusions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "proc-mount", "x"), make([]byte, 4<<20), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "app.log"), make([]byte, 64<<10), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	exclude := append(tarPatternsForMountpoints([]string{"/proc-mount"}), rootfsDiffExcludeGlobs()...)
@@ -492,11 +475,41 @@ func TestTarExcluded(t *testing.T) {
 		{"./root/.cache/huggingface", []string{"*/huggingface/hub"}, false},
 		{"./usr/bin/nvidia-smi", tarPatternsForMountpoints([]string{"/usr/bin/nvidia-smi"}), true},
 		{"./usr/bin/nvidia-smi-x", tarPatternsForMountpoints([]string{"/usr/bin/nvidia-smi"}), false},
-		{"./sub/mnt/f", tarMountPatterns([]string{"sub/mnt"}), false},
 		{"./sub/mnt", tarMountPatterns([]string{"sub/mnt"}), true},
+		{"./data/a.bin", []string{"*.[ab]in"}, true},
+		{"./data/a.cin", []string{"*.[!c]in"}, false},
+		{"./data/a.bin", []string{"*.[!c]in"}, true},
+		{"./data/x*y", []string{`*x\*y`}, true},
+		{"./data/xzy", []string{`*x\*y`}, false},
 	} {
 		if got := tarExcluded(tc.name, tc.pats); got != tc.want {
 			t.Errorf("tarExcluded(%q, %q) = %v, want %v", tc.name, tc.pats, got, tc.want)
 		}
 	}
+}
+
+// The capture's driver adds up the disk findings its members' nodes send
+// back: two ranks on one node that fit alone but not together block.
+func TestCapturePreflightAddsUpEachNodesMembers(t *testing.T) {
+	// Each member's node answers its host checks: 600 GiB to write, 1000
+	// GiB of room.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]PreflightFinding{{Pod: filepath.Base(r.URL.Path), Check: diskCheck, Severity: preflightInfo, Node: "n1", DiskBytes: 600 << 30, DiskRoom: 1000 << 30}})
+	}))
+	defer srv.Close()
+	port := srv.URL[strings.LastIndexByte(srv.URL, ':'):]
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "n1"}, Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: "127.0.0.1"}}}}
+	a := &Agent{kubeClient: fake.NewSimpleClientset(node), log: logrus.New(), config: Config{ListenAddr: port, CaptureDiskKeepPercent: 20}}
+	var ranks []*corev1.Pod
+	for _, name := range []string{"w0", "w1"} {
+		ranks = append(ranks, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}, Spec: corev1.PodSpec{NodeName: "n1",
+			Containers: []corev1.Container{{Name: "main"}}}})
+	}
+	fs := a.capturePreflight(context.Background(), ranks, nil, nil, logrus.NewEntry(logrus.New()))
+	for _, f := range fs {
+		if f.Check == diskCheck && f.Severity == preflightBlock && f.Node == "n1" {
+			return
+		}
+	}
+	t.Fatalf("findings = %+v, want a disk block for node n1", fs)
 }

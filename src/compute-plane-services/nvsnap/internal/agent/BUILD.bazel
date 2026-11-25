@@ -328,6 +328,7 @@ go_test(
         "//src/compute-plane-services/nvsnap/internal/capturehold",
         "//src/compute-plane-services/nvsnap/internal/checkpointstore",
         "//src/compute-plane-services/nvsnap/internal/containerd",
+        "//src/compute-plane-services/nvsnap/internal/criu/mountinfo",
         "//src/compute-plane-services/nvsnap/internal/fnstatus",
         "//src/compute-plane-services/nvsnap/internal/metrics",
         "//src/compute-plane-services/nvsnap/internal/modelcache",

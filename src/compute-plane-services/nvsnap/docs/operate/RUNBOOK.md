@@ -398,15 +398,33 @@ A capture writes its pods' memory to the node's checkpoint directory, about 570 
 
 What the agent does:
 
-- **Before a capture:** on each member's node, the preflight checks that the dump leaves `agent.captureDiskKeepPercent` (default 20) of the filesystem free. The dump counts anonymous memory, GPU memory in use and the deleted files it saves, plus the dumps of other members on the same node from the last 30 minutes. If the memory or GPU memory can't be read, the capture is skipped. After the dump, the node's archive writes run one at a time. The rootfs diff is not archived (the capture fails) and a replay mount is not copied when its archive, headers included, would cut into that kept free space, less the other members' dumps not yet written. If not, it first retires checkpoints no record names that are over 15 minutes old. If there is still not enough room, the capture is skipped before any member suspends, with the finding `disk`, and the instance keeps serving.
-- **While the filesystem has less than the setting plus 10 points free:** the reaper retires unnamed checkpoints after 15 minutes instead of 3 hours.
+- **Before a capture, before any member suspends:** on each member's node, the preflight estimates everything the capture writes there:
+  - anonymous memory, memfds and the deleted files the dump saves
+  - tmpfs contents
+  - the GPU memory the processes use
+  - the rootfs diff archive and replay-mount archives
+
+  The capture is skipped (finding `disk`) when:
+  - a member's dump would leave less than `agent.captureDiskKeepPercent` (default 20) of the filesystem free;
+  - the members on one node would do so together;
+  - any part can't be measured (GPU memory unreadable, for example);
+  - a member's host checks did not run.
+
+  The check keeps no state, and the on-demand preflight report changes nothing.
+- **While the filesystem has less than the setting plus 10 points free:** the reaper retires checkpoints no record names after 15 minutes instead of 3 hours. Checkpoints of a capture still running are kept.
 - **Records abandoned during verification** (their namespace is gone) no longer keep their checkpoints.
-- **A retired checkpoint's catalog row** is deleted through nvsnap-server. An agent refuses (409) to delete a copy that a pod on its node restores from; that node retires its copy once no pod holds it. A failed catalog delete is retried after each sweep's local cleanup, within 2 minutes per sweep, for up to 7 days, from a tombstone in `<checkpoint dir>/.catalog-pending/`.
+- **A retired instance capture's catalog row** is deleted through nvsnap-server, from a tombstone in `<checkpoint dir>/.catalog-pending/`:
+  - It is retried after each sweep's local cleanup, within 2 minutes per sweep, for up to 7 days.
+  - A lone capture's row is left alone: nvsnap-server deletes by hash, and a lone capture shares its hash with later captures of its configuration.
+  - An agent refuses (409) to delete a copy that a pod on its node restores from.
+
+Not covered: two instances captured on one node at the same time, and other writers (peer fetches, L2 pulls) between the preflight and the dump.
 
 Checks:
 
 - How full the filesystem is, from the agent: `kubectl -n nvsnap-system exec <agent> -c agent -- nsenter -t 1 -m -- df -h /var/lib/containers`.
-- Checkpoints still named by a `complete` record stay until that record is deleted. For a function that no longer exists, delete its record, then delete its checkpoints through nvsnap-server's `DELETE /api/v1/checkpoints/{id}`, which also removes the agents' and peers' copies and the catalog row.
+- What a capture would write, without capturing: the `disk` findings of `GET /v1/capture-preflight/<namespace>/<rank 0 pod>` on any agent.
+- Checkpoints still named by a `complete` record stay until that record is deleted. For a function that no longer exists, delete its record, then delete its checkpoints through nvsnap-server's `DELETE /api/v1/checkpoints/{id}`. That also removes the agents' and peers' copies and the catalog row.
 
 ## Node model cache
 

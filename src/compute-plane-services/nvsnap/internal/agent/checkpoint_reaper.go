@@ -12,11 +12,14 @@ package agent
 //     checkpointRetireAge first, past any capture and L2 promote still
 //     running.
 // A checkpoint a pod on this node is restoring from or restored from is
-// kept either way. A record abandoned before its verification
+// kept either way, and so are the checkpoints of a capture still running
+// (its record capturing). A record abandoned before its verification
 // (verify_abandoned.go) names nothing: its namespace is gone, and it is
 // restored only there. While the checkpoint filesystem is low
-// (capture_disk.go) the age is pressureRetireAge. A retired checkpoint's
-// catalog row goes with it.
+// (capture_disk.go) the age is pressureRetireAge. A retired instance
+// capture's catalog row goes with it, through a tombstone retried within
+// a budget after the sweep (a lone capture's row is its configuration's,
+// which a later capture may share: nvsnap-server deletes by hash).
 
 import (
 	"context"
@@ -75,7 +78,11 @@ func (a *Agent) retirableCheckpoints(ctx context.Context, pods []corev1.Pod, now
 		}
 	}
 	for _, r := range records.Items {
-		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) || !recordUsable(r.Data) || r.Data[groupAbandonedKey] != "" {
+		if !strings.HasPrefix(r.Name, criuGroupConfigMapPrefix) {
+			continue
+		}
+		capturing := r.Data["state"] == criuGroupStateCapturing
+		if !capturing && (!recordUsable(r.Data) || r.Data[groupAbandonedKey] != "") {
 			continue
 		}
 		for k, v := range r.Data {
@@ -244,18 +251,17 @@ func (a *Agent) reapCheckpointsOlderThan(ctx context.Context, pods []corev1.Pod,
 				continue
 			}
 		}
-		// The catalog row and the other nodes' copies go through
-		// nvsnap-server after the directory is gone; a tombstone keeps the
-		// request to retry it until it succeeds.
-		a.writeCatalogTombstone(id, log)
+		// An instance capture's catalog row and its other nodes' copies go
+		// through nvsnap-server after the directory is gone: a tombstone
+		// keeps the request, sent after the sweep (retryCatalogDrops).
+		if instance {
+			a.writeCatalogTombstone(id, log)
+		}
 		if err := os.RemoveAll(filepath.Join(a.config.CheckpointDir, id)); err != nil {
 			log.WithError(err).Warn("checkpoint reaper: cannot remove the checkpoint")
 			continue
 		}
 		log.Info("checkpoint reaper: retired a checkpoint that is never restored again")
-		if a.dropCatalogRow(ctx, id, log) {
-			a.clearCatalogTombstone(id)
-		}
 	}
 }
 

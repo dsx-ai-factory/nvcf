@@ -104,9 +104,9 @@ agent:
   # Share of the checkpoint filesystem, in percent, a capture must leave
   # free. A capture writes its pods' memory there (about 570 GB per rank of
   # a large model); below the kubelet's eviction threshold (15% by default)
-  # the kubelet evicts every pod on the node. A node short of room first
-  # retires the checkpoints no capture restores again; if it is still short,
-  # the capture is skipped before any member suspends. 0 turns the check off.
+  # the kubelet evicts every pod on the node. A capture that would not leave
+  # this much free is skipped before any member suspends. 0 turns the check
+  # off; empty is the default, 20.
   captureDiskKeepPercent: 20
 
   # Oldest NVIDIA driver major CRIU captures and restores on. Each agent

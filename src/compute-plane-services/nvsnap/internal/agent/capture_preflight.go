@@ -66,6 +66,12 @@ type PreflightFinding struct {
 	Detail    string `json:"detail"`
 	// PID is the process an RDMA finding is about (host numbering).
 	PID int `json:"pid,omitempty"`
+	// Node, DiskBytes and DiskRoom are a disk finding's node, the bytes the
+	// member's capture writes there and the room the node has
+	// (capture_disk.go).
+	Node      string `json:"node,omitempty"`
+	DiskBytes int64  `json:"diskBytes,omitempty"`
+	DiskRoom  int64  `json:"diskRoom,omitempty"`
 }
 
 // PreflightReport is the preflight of one instance.
@@ -188,7 +194,7 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 // (releaseFindings).
 func (a *Agent) containerFindings(ctx context.Context, procBase string, initPID int, pids []int, ns, pod, container string) []PreflightFinding {
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
-	fs = append(fs, a.diskFindings(ctx, procBase, pids, pod, container)...)
+	fs = append(fs, a.diskFindings(procBase, initPID, pids, pod, container)...)
 	// The capture runs its tools from the node bundle mounted in the
 	// container, and only there (bundle_tools.go). A companion that started
 	// before its version was mounted here has it mounted into it, when the
@@ -573,13 +579,19 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 				log.WithError(err).WithField("pod", m.pod.Name).Warn("capture preflight: cannot run the host checks of a member")
 				fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightWarn, Check: "host",
 					Detail: "host checks did not run: " + err.Error()})
+				// The disk check is one of them, and does not fail open
+				// (capture_disk.go).
+				if a.config.CaptureDiskKeepPercent > 0 {
+					fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightBlock, Check: diskCheck,
+						Detail: "the checkpoint disk of the member's node was not checked: " + err.Error()})
+				}
 				return
 			}
 			fs = append(fs, host...)
 		}(m)
 	}
 	wg.Wait()
-	return fs
+	return append(fs, nodeDiskFindings(fs)...)
 }
 
 // fetchHostPreflight runs the host checks of a member on its node's agent.
