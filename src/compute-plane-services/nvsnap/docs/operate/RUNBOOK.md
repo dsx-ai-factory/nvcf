@@ -25,6 +25,7 @@ records are in `nvsnap-system`.
 - [NvsnapInventoryStale](#nvsnapinventorystale)
 - [NvsnapCaptureStuckVerifying](#nvsnapcapturestuckverifying)
 - [Workloads whose NCCL uses RDMA (`webhook.gpushareIBV`)](#workloads-whose-nccl-uses-rdma-webhookgpushareibv)
+- [Checkpoint disk (`agent.captureDiskKeepPercent`)](#checkpoint-disk-agentcapturediskkeeppercent)
 - [Node model cache](#node-model-cache)
 <!-- /toc -->
 
@@ -396,12 +397,14 @@ state"), and the configuration starts cold every time.
 A capture writes its pods' memory to the node's checkpoint directory, about 570 GB per rank of a large model. When that directory shares the kubelet's image filesystem, filling it past the kubelet's eviction threshold makes the kubelet evict every pod on the node, nvsnap's agent included. Evicting pods frees nothing, so the node stays in that state.
 
 What the agent does:
+
 - **Before a capture:** on each member's node, the preflight checks that the dump leaves `agent.captureDiskKeepPercent` (default 20) of the filesystem free. If not, it first retires checkpoints no record names that are over 15 minutes old. If there is still not enough room, the capture is skipped before any member suspends, with the finding `disk`, and the instance keeps serving.
 - **While the filesystem has less than the setting plus 10 points free:** the reaper retires unnamed checkpoints after 15 minutes instead of 3 hours.
 - **Records abandoned during verification** (their namespace is gone) no longer keep their checkpoints.
 - **A retired checkpoint's catalog row** is deleted through nvsnap-server.
 
 Checks:
+
 - How full the filesystem is, from the agent: `kubectl -n nvsnap-system exec <agent> -c agent -- nsenter -t 1 -m -- df -h /var/lib/containers`.
 - Checkpoints still named by a `complete` record stay until that record is deleted. For a function that no longer exists, delete its record, then delete its checkpoints through nvsnap-server's `DELETE /api/v1/checkpoints/{id}`, which also removes the agents' and peers' copies and the catalog row.
 
