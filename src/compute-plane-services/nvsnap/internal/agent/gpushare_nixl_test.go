@@ -14,8 +14,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
@@ -68,23 +70,6 @@ func TestGPUShareNIXLSupported(t *testing.T) {
 	} {
 		if got := gpushareNIXLSupported(text); got != want {
 			t.Errorf("gpushareNIXLSupported(%q) = %v, want %v", text, got, want)
-		}
-	}
-}
-
-// Only NVSNAP_NIXL_PAUSE=1 opts in; another value, its absence or a
-// process that cannot be read does not.
-func TestEnvOptsIntoNIXLPause(t *testing.T) {
-	base := t.TempDir()
-	fakeMXProc(t, base, 10, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=1"}, []string{"python3"})
-	fakeMXProc(t, base, 11, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=0"}, []string{"python3"})
-	fakeMXProc(t, base, 12, []string{"PATH=/bin"}, []string{"python3"})
-	for _, tc := range []struct {
-		pids []int
-		want bool
-	}{{[]int{10}, true}, {[]int{11}, false}, {[]int{12}, false}, {[]int{99}, false}, {[]int{12, 10}, true}} {
-		if got := envOptsIntoNIXLPause(base, tc.pids); got != tc.want {
-			t.Errorf("envOptsIntoNIXLPause(%v) = %v, want %v", tc.pids, got, tc.want)
 		}
 	}
 }
@@ -313,36 +298,6 @@ func TestNIXLPauseFindings(t *testing.T) {
 	}
 }
 
-// nixl-pause addresses the session's GPU processes under the library, when
-// any process of the container carries the opt-in: the container opted in,
-// whatever a process's own environ shows now.
-func TestNIXLPausable(t *testing.T) {
-	base := t.TempDir()
-	optIn := []string{"NVSNAP_NIXL_PAUSE=1"}
-	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil)                 // API server: no GPU state
-	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia0"}, nil) // engine, opted in
-	fakeGPUProc(t, base, 5200, 3, 5000, []string{"/dev/nvidia1"}, nil)           // GPU helper outside the library
-	fakeGPUProc(t, base, 5300, 4, 5000, []string{testShim, "/dev/nvidia2"}, nil) // worker whose environ shows no marker
-	fakeGPUProc(t, base, 7100, 2, 7000, []string{testShim, "/dev/nvidia3"}, nil) // another session
-	fakeGPUProc(t, base, 7200, 3, 7000, []string{testShim, "/dev/nvidia4"}, nil) // in a session that did not opt in
-	for _, pid := range []int{5000, 5100, 5200, 7100} {
-		fakeMXProc(t, base, pid, optIn, []string{"python3"})
-	}
-	fakeMXProc(t, base, 5300, nil, []string{"python3"})
-	fakeMXProc(t, base, 7200, nil, []string{"python3"})
-	if got := nixlPausableByEnv(base, 5000); len(got) != 2 || !got[5100] || !got[5300] {
-		t.Errorf("nixlPausableByEnv(5000) = %v, want 5100 and 5300", got)
-	}
-	base2 := t.TempDir()
-	fakeGPUProc(t, base2, 7000, 1, 7000, []string{testShim}, nil)
-	fakeGPUProc(t, base2, 7200, 3, 7000, []string{testShim, "/dev/nvidia4"}, nil)
-	fakeMXProc(t, base2, 7000, nil, []string{"python3"})
-	fakeMXProc(t, base2, 7200, nil, []string{"python3"})
-	if got := nixlPausableByEnv(base2, 7000); len(got) != 0 {
-		t.Errorf("a container without the marker: %v, want none", got)
-	}
-}
-
 // The capture records that it paused the connector, for its restore.
 func TestGPUShareInfo_NIXLRoundTrip(t *testing.T) {
 	for _, gs := range []GPUShareInfo{{PIDs: []int{7}}, {PIDs: []int{7}, NIXL: true}} {
@@ -361,117 +316,6 @@ func TestGPUShareInfo_NIXLRoundTrip(t *testing.T) {
 			t.Errorf("NIXL %v came back %v", gs.NIXL, b.NIXL)
 		}
 	}
-}
-
-// The agent pauses only with its own switch on (--webhook-nixl-pause): a
-// pod may set NVSNAP_NIXL_PAUSE=1 itself, and with the switch off that
-// neither turns its RDMA findings into information (the capture is
-// refused as before) nor runs nixl-pause. With the switch on, the same
-// process is paused.
-func TestNIXLPause_NeedsTheAgentSwitch(t *testing.T) {
-	base := t.TempDir()
-	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil)
-	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia0"}, nil)
-	fakeMXProc(t, base, 5000, nil, []string{"python3"})
-	fakeMXProc(t, base, 5100, []string{"NVSNAP_NIXL_PAUSE=1"}, []string{"python3"})
-	rdma := []PreflightFinding{{Pod: "w", Check: "rdma", Severity: preflightBlock, PID: 5100, Detail: "process 5100 holds RDMA devices /dev/infiniband/uverbs0"}}
-
-	for _, tc := range []struct {
-		name       string
-		on         bool
-		wantSev    string
-		wantPaused bool
-		wantCalls  []string
-	}{
-		{"switch off, pod sets the env", false, preflightBlock, false, nil},
-		{"switch on, opted in", true, preflightInfo, true, []string{"nixl-pause@42 [2]"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: tc.on}}}
-			fs := nixlPauseFindings(rdma, a.nixlPausable(base, 5000), "", "w", "engine")
-			if fs[0].Severity != tc.wantSev {
-				t.Errorf("rdma finding severity %q, want %q", fs[0].Severity, tc.wantSev)
-			}
-			calls := fakeNIXL(t, nil, nil)
-			paused, err := a.pauseNIXLFor(context.Background(), base, 5000, "", nixlToolText, 42, []int{2}, testLog())
-			if err != nil || paused != tc.wantPaused {
-				t.Errorf("pauseNIXLFor = %v, %v; want %v, nil", paused, err, tc.wantPaused)
-			}
-			if !slices.Equal(*calls, tc.wantCalls) {
-				t.Errorf("calls = %v, want %v", *calls, tc.wantCalls)
-			}
-		})
-	}
-}
-
-// fakeRetitledProc gives process pid of base the environ a process has
-// after setproctitle (vLLM names its engine and workers that way): the
-// area is overwritten in place, mostly NULs with what is left of a few
-// variables, and the webhook's markers are gone. Its cmdline is the title.
-func fakeRetitledProc(t *testing.T, base string, pid int, title string) {
-	t.Helper()
-	dir := filepath.Join(base, fmt.Sprint(pid))
-	environ := strings.Repeat("\x00", 4755) + "PATH=/usr/bin\x00UCX_TLS=rc\x00LD_LIBRARY_PATH=/usr/lib\x00"
-	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte(environ), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(title+strings.Repeat(" ", 100)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// retitledSession is a container (init 5000, the API server, environ
-// intact, no GPU state) whose engine (5100, under the library, holding RDMA) was renamed
-// with setproctitle, which wiped its environ. env is the container's
-// environment, as the init keeps it.
-func retitledSession(t *testing.T, env []string) (base string, rdma []PreflightFinding) {
-	t.Helper()
-	base = t.TempDir()
-	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil) // the API server: no GPU state
-	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia1"}, nil)
-	fakeMXProc(t, base, 5000, env, []string{"/usr/bin/python3", "/usr/local/bin/vllm", "serve", "m"})
-	fakeMXProc(t, base, 5100, nil, nil)
-	fakeRetitledProc(t, base, 5100, "VLLM::EngineCore")
-	return base, []PreflightFinding{{Pod: "w", Check: "rdma", Severity: preflightBlock, PID: 5100,
-		Detail: "process 5100 (VLLM::EngineCor) holds RDMA devices /dev/infiniband/uverbs4"}}
-}
-
-// The opt-in and the limits are the container's, not each process's: a
-// vLLM engine renamed with setproctitle has lost the webhook's markers
-// from its environ, while its container's other processes keep them. Its
-// RDMA is released by nixl-pause when the container opted in, and an
-// engine that spans nodes is refused even when only the init still shows
-// the fabric marker.
-func TestReleaseFindings_RetitledEngine(t *testing.T) {
-	a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}
-
-	base, rdma := retitledSession(t, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=1"})
-	fs := a.releaseFindings(rdma, nixlToolText, base, 5000, "w", "engine")
-	if len(fs) != 1 || fs[0].Severity != preflightInfo {
-		t.Errorf("opted-in container, renamed engine: findings %+v, want its RDMA released (info)", fs)
-	}
-
-	base, rdma = retitledSession(t, []string{"PATH=/bin", "NVSNAP_NIXL_PAUSE=1", "NVSNAP_GPUSHARE_FABRIC=1"})
-	fs = a.releaseFindings(rdma, nixlToolText, base, 5000, "w", "engine")
-	if !preflightBlocked(fs, "nixl-pause") || fs[0].Severity != preflightBlock {
-		t.Errorf("engine spanning nodes, renamed: findings %+v, want the RDMA blocked and a nixl-pause block", fs)
-	}
-
-	base, rdma = retitledSession(t, []string{"PATH=/bin"})
-	fs = a.releaseFindings(rdma, nixlToolText, base, 5000, "w", "engine")
-	if len(fs) != 1 || fs[0].Severity != preflightBlock {
-		t.Errorf("container that did not opt in: findings %+v, want the RDMA blocked", fs)
-	}
-}
-
-// preflightBlocked reports whether fs has a blocking finding of check.
-func preflightBlocked(fs []PreflightFinding, check string) bool {
-	for _, f := range fs {
-		if f.Check == check && f.Severity == preflightBlock {
-			return true
-		}
-	}
-	return false
 }
 
 // Any process of the container says the engine spans nodes: the fabric
@@ -714,5 +558,219 @@ func TestNIXL_ResumeWithAnAPIServerWithoutASocket(t *testing.T) {
 	}
 	if len(*given) != 1 || !slices.Equal((*given)[0], []int{460}) {
 		t.Errorf("the tool was given %v, want [[460]]", *given)
+	}
+}
+
+// nixlPod is pod ns/w whose GPU container "engine" carries the
+// annotation (annotated) and the webhook's marker in its spec (marked).
+func nixlPod(annotated, marked bool) *corev1.Pod {
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "w", Namespace: "ns", Annotations: map[string]string{}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sidecar"}, {Name: "engine"}}}}
+	if annotated {
+		p.Annotations[webhook.NIXLPauseAnnotation] = "true"
+	}
+	if marked {
+		p.Spec.Containers[1].Env = []corev1.EnvVar{{Name: nixlPauseEnv, Value: "1"}}
+	}
+	return p
+}
+
+// The opt-in is what the cluster decided at admission: the switch, the
+// annotation and the marker the webhook set in the container's spec. Not
+// a process's environment: an image's own ENV does not opt in, and a
+// process renamed with setproctitle does not opt out.
+func TestNIXLOptInFromPod(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		on, ann, mark bool
+		container     string
+		want          bool
+		whyHas        string
+	}{
+		{"opted in", true, true, true, "engine", true, ""},
+		{"did not ask", true, false, false, "engine", false, ""},
+		{"switch off", false, true, true, "engine", false, "does not enable"},
+		{"admitted without the env", true, true, false, "engine", false, "admitted without"},
+		{"env in the spec, no annotation", true, false, true, "engine", false, "not annotated"},
+		{"another container", true, true, true, "sidecar", false, "admitted without"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := nixlOptInFromPod(tc.on, nixlPod(tc.ann, tc.mark), tc.container)
+			if got != tc.want || (tc.whyHas == "") != (why == "") || !strings.Contains(why, tc.whyHas) {
+				t.Errorf("nixlOptInFromPod = %v, %q; want %v, %q", got, why, tc.want, tc.whyHas)
+			}
+		})
+	}
+	a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}, kubeClient: fake.NewSimpleClientset()}
+	if got, why := a.nixlOptIn(context.Background(), "ns", "w", "engine"); got || !strings.Contains(why, "cannot read") {
+		t.Errorf("pod not found: %v, %q; want not opted in, saying why", got, why)
+	}
+}
+
+// Not opted in, the capture runs no nixl-pause, whatever the processes'
+// environment says.
+func TestPauseNIXLFor_NotOptedInPausesNothing(t *testing.T) {
+	base, _ := retitledSession(t, []string{"NVSNAP_NIXL_PAUSE=1"})
+	calls := fakeNIXL(t, nil, nil)
+	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, base, 5000, "", nixlToolText, 42, []int{2}, testLog())
+	if err != nil || paused || len(*calls) != 0 {
+		t.Errorf("pauseNIXLFor = %v, %v, calls %v; want nothing paused", paused, err, *calls)
+	}
+}
+
+// nixl-pause addresses the session's GPU processes under the library.
+func TestNIXLGPUProcesses(t *testing.T) {
+	base := t.TempDir()
+	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil)                 // API server: no GPU state
+	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia0"}, nil) // engine
+	fakeGPUProc(t, base, 5200, 3, 5000, []string{"/dev/nvidia1"}, nil)           // GPU helper outside the library
+	fakeGPUProc(t, base, 7100, 2, 7000, []string{testShim, "/dev/nvidia3"}, nil) // another session
+	if got := nixlGPUProcesses(base, 5000); len(got) != 1 || !got[5100] {
+		t.Errorf("nixlGPUProcesses = %v, want only 5100", got)
+	}
+}
+
+// fakeRetitledProc gives process pid of base the environ a process has
+// after setproctitle (vLLM names its engine and workers that way): the
+// area is overwritten in place, mostly NULs with what is left of a few
+// variables, and the webhook's markers are gone. Its cmdline is the title.
+func fakeRetitledProc(t *testing.T, base string, pid int, title string) {
+	t.Helper()
+	dir := filepath.Join(base, fmt.Sprint(pid))
+	environ := strings.Repeat("\x00", 4755) + "PATH=/usr/bin\x00UCX_TLS=rc\x00LD_LIBRARY_PATH=/usr/lib\x00"
+	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte(environ), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(title+strings.Repeat(" ", 100)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// retitledSession is a container (init 5000, the API server, no GPU state,
+// its environment env) whose engine (5100, under the library, holding
+// RDMA) was renamed with setproctitle, which wiped its environ.
+func retitledSession(t *testing.T, env []string) (base string, rdma []PreflightFinding) {
+	t.Helper()
+	base = t.TempDir()
+	fakeGPUProc(t, base, 5000, 1, 5000, []string{testShim}, nil) // the API server: no GPU state
+	fakeGPUProc(t, base, 5100, 2, 5000, []string{testShim, "/dev/nvidia1"}, nil)
+	fakeMXProc(t, base, 5000, env, []string{"/usr/bin/python3", "/usr/local/bin/vllm", "serve", "m"})
+	fakeMXProc(t, base, 5100, nil, nil)
+	fakeRetitledProc(t, base, 5100, "VLLM::EngineCore")
+	return base, []PreflightFinding{{Pod: "w", Check: "rdma", Severity: preflightBlock, PID: 5100,
+		Detail: "process 5100 (VLLM::EngineCor) holds RDMA devices /dev/infiniband/uverbs4"}}
+}
+
+// The preflight takes the opt-in from the pod, and the limits from the
+// container: a renamed engine (no marker left in any process) is released
+// when its pod opted in; an image's own ENV marker without the annotation
+// is not an opt-in; a pod that asked but is not opted in is told why; an
+// engine spanning nodes is refused even when only the init shows it.
+func TestReleaseFindings_OptInFromThePod(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		on      bool
+		pod     *corev1.Pod
+		env     []string // the init's environment
+		wantSev string
+		nixlWhy string // a nixl-pause block naming this; "" none
+	}{
+		{"opted in, renamed engine", true, nixlPod(true, true), []string{"PATH=/bin"}, preflightInfo, ""},
+		{"image ENV only", true, nixlPod(false, false), []string{"NVSNAP_NIXL_PAUSE=1"}, preflightBlock, ""},
+		{"admitted without the env", true, nixlPod(true, false), nil, preflightBlock, "admitted without"},
+		{"switch off", false, nixlPod(true, true), nil, preflightBlock, "does not enable"},
+		{"spans nodes", true, nixlPod(true, true), []string{"NVSNAP_GPUSHARE_FABRIC=1"}, preflightBlock, "spans nodes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, rdma := retitledSession(t, tc.env)
+			a := &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: tc.on}}, kubeClient: fake.NewSimpleClientset(tc.pod)}
+			fs := a.releaseFindings(context.Background(), rdma, nixlToolText, base, 5000, "ns", "w", "engine")
+			if fs[0].Severity != tc.wantSev {
+				t.Errorf("rdma finding %+v, want %s", fs[0], tc.wantSev)
+			}
+			got := ""
+			for _, f := range fs {
+				if f.Check == "nixl-pause" && f.Severity == preflightBlock {
+					got = f.Detail
+				}
+			}
+			if (tc.nixlWhy == "") != (got == "") || !strings.Contains(got, tc.nixlWhy) {
+				t.Errorf("nixl-pause finding %q, want one naming %q", got, tc.nixlWhy)
+			}
+		})
+	}
+}
+
+// preflightBlocked reports whether fs has a blocking finding of check.
+func preflightBlocked(fs []PreflightFinding, check string) bool {
+	for _, f := range fs {
+		if f.Check == check && f.Severity == preflightBlock {
+			return true
+		}
+	}
+	return false
+}
+
+// bundledSession is retitledSession whose init (5000) also has the node
+// bundle mounted, read-only, from the node's version "criu-bundle", whose
+// GPU tool has nixl-pause; its engine (5100) holds an RDMA device.
+func bundledSession(t *testing.T, env []string) (a *Agent, base string) {
+	t.Helper()
+	base, _ = retitledSession(t, env)
+	root := t.TempDir()
+	version := filepath.Join(root, webhook.BundleVersionsDir, "criu-bundle")
+	if err := os.MkdirAll(version, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(version, gpushareToolName), []byte(nixlToolText), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gpuToolTextCache.Delete("criu-bundle")
+	t.Cleanup(func() { gpuToolTextCache.Delete("criu-bundle") })
+	init := filepath.Join(base, "5000")
+	if err := os.Symlink(filepath.Join(root, webhook.BundleVersionsDir), filepath.Join(init, "root")); err != nil {
+		t.Fatal(err)
+	}
+	status := "Name:\tpython3\nNSpid:\t5000\t1\nCapEff:\t" + capsWorker + "\n"
+	for f, c := range map[string]string{"status": status, "mountinfo": bundleRO} {
+		if err := os.WriteFile(filepath.Join(init, f), []byte(c), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/dev/infiniband/uverbs4", filepath.Join(base, "5100", "fd", "40")); err != nil {
+		t.Fatal(err)
+	}
+	return &Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true, HostBundleRoot: root}}, log: logrus.New()}, base
+}
+
+// The host preflight's container checks apply the release: an opted-in
+// pod's engine RDMA is information, a pod that did not opt in is blocked.
+// Drives containerFindings, which hostPreflight returns.
+func TestContainerFindings_ReleasesAnOptedInEngine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pod     *corev1.Pod
+		wantSev string
+	}{
+		{"opted in", nixlPod(true, true), preflightInfo},
+		{"not opted in", nixlPod(false, false), preflightBlock},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, base := bundledSession(t, nil)
+			a.kubeClient = fake.NewSimpleClientset(tc.pod)
+			fs := a.containerFindings(context.Background(), base, 5000, []int{5000, 5100}, "ns", "w", "engine")
+			sev := ""
+			for _, f := range fs {
+				if f.Check == "rdma" && f.PID == 5100 {
+					sev = f.Severity
+				}
+				if f.Check == "bundle" {
+					t.Fatalf("bundle finding: %+v", f)
+				}
+			}
+			if sev != tc.wantSev {
+				t.Errorf("engine RDMA finding %q, want %q (findings %+v)", sev, tc.wantSev, fs)
+			}
+		})
 	}
 }

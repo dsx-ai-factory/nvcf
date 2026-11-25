@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -178,41 +179,52 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	if err != nil {
 		return nil, err
 	}
+	return a.containerFindings(ctx, procBase, int(info.PID), pids, ns, pod, container), nil
+}
+
+// containerFindings is the host checks of the container whose init is
+// initPID and whose processes are pids: what its processes hold, its node
+// bundle, and what the capture releases before its suspend
+// (releaseFindings).
+func (a *Agent) containerFindings(ctx context.Context, procBase string, initPID int, pids []int, ns, pod, container string) []PreflightFinding {
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
 	// The capture runs its tools from the node bundle mounted in the
 	// container, and only there (bundle_tools.go). A companion that started
 	// before its version was mounted here has it mounted into it, when the
 	// version is staged on this node (companion_tools.go).
-	if err := a.ensureCompanionToolsIn(procBase, int(info.PID)); err != nil {
+	if err := a.ensureCompanionToolsIn(procBase, initPID); err != nil {
 		a.log.WithError(err).WithField("pod", ns+"/"+pod).Warn("node bundle: cannot mount the tools into a pod without GPUs yet; its capture waits for them")
 	}
-	tools, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir())
+	tools, err := bundleToolsOf(procBase, initPID, a.bundleVersionsDir())
 	if err != nil {
-		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
-	} else {
-		fs = a.releaseFindings(fs, tools.gpuToolText(), procBase, int(info.PID), pod, container)
+		return append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
 	}
-	return fs, nil
+	return a.releaseFindings(ctx, fs, tools.gpuToolText(), procBase, initPID, ns, pod, container)
 }
 
 // releaseFindings applies to a container's findings fs what the capture
 // releases before its suspend, with a GPU tool (its text, toolText) that
-// can: ModelExpress's RDMA (mx-pause) and, for a pod that opted in, the
-// NIXL KV connector's (nixl-pause). sessionHostPID is the container's
-// init.
-func (a *Agent) releaseFindings(fs []PreflightFinding, toolText, procBase string, sessionHostPID int, pod, container string) []PreflightFinding {
+// can: ModelExpress's RDMA (mx-pause) and, for a pod that opted in
+// (nixlOptIn), the NIXL KV connector's (nixl-pause). sessionHostPID is the
+// container's init. A pod that asked for nixl-pause but is not opted in
+// gets a finding saying why, when RDMA blocks its capture.
+func (a *Agent) releaseFindings(ctx context.Context, fs []PreflightFinding, toolText, procBase string, sessionHostPID int, ns, pod, container string) []PreflightFinding {
 	if gpushareMXSupported(toolText) {
 		fs = releasedByMXPause(fs, mxPausable(procBase, sessionHostPID))
 	}
-	if gpushareNIXLSupported(toolText) {
-		pausable := a.nixlPausable(procBase, sessionHostPID)
-		limit := ""
-		if len(pausable) > 0 {
-			limit = nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), "")
-		}
-		fs = nixlPauseFindings(fs, pausable, limit, pod, container)
+	if !gpushareNIXLSupported(toolText) {
+		return fs
 	}
-	return fs
+	optedIn, why := a.nixlOptIn(ctx, ns, pod, container)
+	if !optedIn {
+		if why != "" && slices.ContainsFunc(fs, func(f PreflightFinding) bool { return f.Check == "rdma" && f.Severity == preflightBlock }) {
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "nixl-pause",
+				Detail: "the pod's RDMA is not released for the capture: " + why})
+		}
+		return fs
+	}
+	return nixlPauseFindings(fs, nixlGPUProcesses(procBase, sessionHostPID),
+		nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), ""), pod, container)
 }
 
 // processFindings is the host checks of a container's processes pids.

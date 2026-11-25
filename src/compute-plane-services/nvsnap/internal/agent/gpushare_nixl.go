@@ -34,6 +34,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/containerd"
@@ -81,13 +83,6 @@ func procEnvSet(procBase string, pids []int, key, value string) bool {
 		}
 	}
 	return false
-}
-
-// envOptsIntoNIXLPause reports whether the processes pids carry the
-// nixl-pause marker in their environment. The marker alone does not opt a
-// pod in: the agent's switch must be on too (Agent.nixlPauseOn).
-func envOptsIntoNIXLPause(procBase string, pids []int) bool {
-	return procEnvSet(procBase, pids, nixlPauseEnv, "1")
 }
 
 // gpushareNIXL runs nixl-pause or nixl-resume on pids (namespace pids)
@@ -293,22 +288,14 @@ func (a *Agent) nixlRestorePrecheck(ctx context.Context, gs *GPUShareInfo, toolT
 	return host, nil
 }
 
-// nixlPausableByEnv are the processes of the container whose init is
-// sessionHostPID (host numbering) that a capture's nixl-pause addresses,
-// when the container opted in: the GPU processes under the library, the
-// ones the capture suspends (gpushareTargets). nixl-pause checks the RDMA
-// of these only. The opt-in is the container's: any of its processes
-// carrying the marker. A process's own environ does not decide: vLLM
-// renames its engine and workers with setproctitle, which overwrites the
-// environ in place, so the engine that holds the RDMA no longer shows the
-// marker the webhook set for its container.
-func nixlPausableByEnv(procBase string, sessionHostPID int) map[int]bool {
+// nixlGPUProcesses are the processes of the container whose init is
+// sessionHostPID (host numbering) that a capture's nixl-pause addresses
+// once the pod opted in (nixlOptIn): the GPU processes under the library,
+// the ones the capture suspends (gpushareTargets). nixl-pause checks the
+// RDMA of these only.
+func nixlGPUProcesses(procBase string, sessionHostPID int) map[int]bool {
 	out := map[int]bool{}
-	pids := sessionPIDs(procBase, sessionHostPID)
-	if !envOptsIntoNIXLPause(procBase, pids) {
-		return out
-	}
-	for _, pid := range pids {
+	for _, pid := range sessionPIDs(procBase, sessionHostPID) {
 		dir := filepath.Join(procBase, strconv.Itoa(pid))
 		shim, gpu, _ := scanMaps(filepath.Join(dir, "maps"))
 		if !gpu {
@@ -435,31 +422,63 @@ func restoredNotServing(info *containerd.ContainerInfo, err error) error {
 // not opted in, so its RDMA refuses the capture as before.
 func (a *Agent) nixlPauseOn() bool { return a.config.Webhook.NIXLPause }
 
-// nixlPausable is nixlPausableByEnv with the agent's switch on, and none
-// with it off.
-func (a *Agent) nixlPausable(procBase string, sessionHostPID int) map[int]bool {
-	if !a.nixlPauseOn() {
-		return map[int]bool{}
+// nixlOptInFromPod reports whether container of pod opted in to
+// nixl-pause, from what the cluster decided at admission, not from what a
+// process's environment shows now (vLLM renames its processes with
+// setproctitle, which overwrites their environ; an image's own ENV is not
+// an opt-in): the agent's switch (on), the pod's annotation, and the
+// marker the webhook set in the container's spec. why says what is
+// missing when the pod asked for nixl-pause (the annotation, or the marker
+// in its spec) but is not opted in; "" when it did not ask.
+func nixlOptInFromPod(on bool, pod *corev1.Pod, container string) (optedIn bool, why string) {
+	annotated := pod.Annotations[webhook.NIXLPauseAnnotation] == "true"
+	marked := false
+	for _, c := range pod.Spec.Containers {
+		if c.Name != container {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == nixlPauseEnv && e.Value == "1" && e.ValueFrom == nil {
+				marked = true
+			}
+		}
 	}
-	return nixlPausableByEnv(procBase, sessionHostPID)
+	switch {
+	case !annotated && !marked:
+		return false, ""
+	case !on:
+		return false, "this cluster does not enable nixl-pause (webhook.nixlPause.enabled)"
+	case !annotated:
+		return false, "the container sets " + nixlPauseEnv + " but the pod is not annotated " + webhook.NIXLPauseAnnotation + `: "true"`
+	case !marked:
+		return false, "the pod is annotated " + webhook.NIXLPauseAnnotation + " but was admitted without the nixl-pause environment " +
+			"(admitted before the switch was on, or not under the gpushare library); recreate it"
+	}
+	return true, ""
+}
+
+// nixlOptIn is nixlOptInFromPod for the pod ns/name, read from the API
+// server. A pod that cannot be read is not opted in, and why says so.
+func (a *Agent) nixlOptIn(ctx context.Context, ns, name, container string) (bool, string) {
+	if a.kubeClient == nil {
+		return false, "the agent has no API client to read the pod's opt-in"
+	}
+	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return false, "cannot read the pod's opt-in: " + err.Error()
+	}
+	return nixlOptInFromPod(a.nixlPauseOn(), pod, container)
 }
 
 // pauseNIXLFor is pauseNIXL for the capture of the container whose init is
-// sessionHostPID, opted in when any of its processes carries the marker
-// and the agent's switch is on. A marker with the switch off is logged and
-// ignored. An engine that spans nodes (nixlSpansNodes: the capture joins
-// fabricSession, or a process of the container says so) is refused here,
-// before anything is paused, whether or not a preflight ran: a capture
-// requested through POST /v1/checkpoints runs none.
-func (a *Agent) pauseNIXLFor(ctx context.Context, procBase string, sessionHostPID int, fabricSession, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
-	session := sessionPIDs(procBase, sessionHostPID)
-	optedIn := envOptsIntoNIXLPause(procBase, session)
-	if optedIn && !a.nixlPauseOn() {
-		log.Warn("gpushare: the workload sets " + nixlPauseEnv + "=1, but this cluster does not enable nixl-pause (webhook.nixlPause.enabled); not pausing it")
-		optedIn = false
-	}
+// sessionHostPID, when its pod opted in (nixlOptIn). An engine that spans
+// nodes (nixlSpansNodes: the capture joins fabricSession, or a process of
+// the container says so) is refused here, before anything is paused,
+// whether or not a preflight ran: a capture requested through
+// POST /v1/checkpoints runs none.
+func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession, toolText string, hostPID int, pids []int, log *logrus.Entry) (bool, error) {
 	if optedIn && gpushareNIXLSupported(toolText) {
-		if why := nixlSpansNodes(procBase, session, fabricSession); why != "" {
+		if why := nixlSpansNodes(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession); why != "" {
 			return false, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
 				errNIXLPauseUnsupported, why)
 		}

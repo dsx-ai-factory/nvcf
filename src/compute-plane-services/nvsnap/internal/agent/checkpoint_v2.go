@@ -360,8 +360,17 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
+	// The pod's nixl-pause opt-in, as admitted (nixlOptIn).
+	nixlOptIn, why := false, ""
+	if gsOn {
+		nixlOptIn, why = a.nixlOptIn(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
+			containerInfo.Labels["io.kubernetes.pod.name"], containerInfo.Labels["io.kubernetes.container.name"])
+		if why != "" {
+			log.Warn("gpushare: not pausing the NIXL KV connector: " + why)
+		}
+	}
 	return a.dumpAroundSuspend(ctx, sourceDump{
-		on: gsOn, leaveRunning: leaveRunning, syncOpenAsked: o.SyncOpen, postDumpDir: o.PostDumpDir,
+		on: gsOn, nixlOptIn: nixlOptIn, leaveRunning: leaveRunning, syncOpenAsked: o.SyncOpen, postDumpDir: o.PostDumpDir,
 		procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version,
 		fabric: fabric, fabricDir: fabricDir, fabricSession: fabricSession, checkpointDir: checkpointDir,
@@ -386,6 +395,8 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 // on the workload, which tests replace.
 type sourceDump struct {
 	on, leaveRunning bool
+	// nixlOptIn: the pod opted in to nixl-pause (nixlOptIn).
+	nixlOptIn bool
 	// syncOpenAsked: the session's driver runs the open phase
 	// (dumpV2Opts.SyncOpen).
 	syncOpenAsked bool
@@ -460,7 +471,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		// resume is checked: a paused engine takes no requests, so a
 		// source that runs on and does not resume is replaced.
 		var nixlErr error
-		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.procBase, d.targetHostPID, d.fabricSession, d.toolText, d.hostPID, d.pids, log)
+		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.procBase, d.targetHostPID, d.fabricSession, d.toolText, d.hostPID, d.pids, log)
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}

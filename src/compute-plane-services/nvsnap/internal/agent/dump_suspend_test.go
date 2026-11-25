@@ -65,7 +65,7 @@ func (s *dumpSteps) install(t *testing.T) {
 
 func (s *dumpSteps) source(base string, pids []int, leaveRunning bool, dumpRuns bool) sourceDump {
 	return sourceDump{
-		on: true, leaveRunning: leaveRunning, procBase: base, hostPID: 5000, targetHostPID: 5000, pids: pids,
+		on: true, nixlOptIn: true, leaveRunning: leaveRunning, procBase: base, hostPID: 5000, targetHostPID: 5000, pids: pids,
 		toolText: nixlToolText, checkpointDir: base,
 		suspend: func(context.Context, int, []int, string, *logrus.Entry) (string, bool, error) {
 			if err := s.step("suspend"); err != nil {
@@ -141,14 +141,15 @@ func TestDumpAroundSuspend_StepsInOrder(t *testing.T) {
 	}
 }
 
-// With the agent's switch off, a pod's own marker pauses nothing, and the
-// checkpoint records no paused connector.
-func TestDumpAroundSuspend_SwitchOffPausesNoConnector(t *testing.T) {
+// A pod that did not opt in (nixlOptIn) gets no nixl-pause, and the
+// checkpoint records no paused connector, whatever its processes' marker.
+func TestDumpAroundSuspend_NotOptedInPausesNoConnector(t *testing.T) {
 	base, pids := fakeDumpSource(t)
 	s := &dumpSteps{}
 	s.install(t)
-	a := &Agent{}
-	info, err := a.dumpAroundSuspend(context.Background(), s.source(base, pids, false, true), testLog())
+	d := s.source(base, pids, false, true)
+	d.nixlOptIn = false
+	info, err := (&Agent{config: Config{Webhook: WebhookConfig{NIXLPause: true}}}).dumpAroundSuspend(context.Background(), d, testLog())
 	if err != nil {
 		t.Fatal(err)
 	}
