@@ -668,7 +668,7 @@ func TestNIXLOptInFromPod(t *testing.T) {
 func TestPauseNIXLFor_NotOptedInPausesNothing(t *testing.T) {
 	base, _ := retitledSession(t, []string{"NVSNAP_NIXL_PAUSE=1"})
 	calls := fakeNIXL(t, nil, nil)
-	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, base, 5000, "", 1, nixlToolText, 42, []int{2}, testLog())
+	paused, err := (&Agent{}).pauseNIXLFor(context.Background(), false, "", base, 5000, "", 1, nixlToolText, 42, []int{2}, testLog())
 	if err != nil || len(paused) > 0 || len(*calls) != 0 {
 		t.Errorf("pauseNIXLFor = %v, %v, calls %v; want nothing paused", paused, err, *calls)
 	}

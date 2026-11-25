@@ -384,10 +384,10 @@ func (a *Agent) sourceDumpFor(ctx context.Context, containerInfo *containerd.Con
 	d.leaveRunning, d.syncOpenAsked, d.postDumpDir = o.LeaveRunning, o.SyncOpen, o.PostDumpDir
 	d.fabricSession, d.rankNodes, d.checkpointDir = o.FabricSession, o.RankNodes, checkpointDir
 	if d.on {
-		var why string
-		d.nixlOptIn, why = a.nixlOptIn(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
+		opted, why, pod, err := a.nixlOptInPod(ctx, containerInfo.Labels["io.kubernetes.pod.namespace"],
 			containerInfo.Labels["io.kubernetes.pod.name"], containerInfo.Labels["io.kubernetes.container.name"])
-		if why != "" {
+		d.nixlOptIn, d.nixlRefusal = opted, nixlCaptureRefusal(a.nixlPauseOn(), opted, pod, err)
+		if why != "" && d.nixlRefusal == "" {
 			log.Warn("gpushare: not pausing the NIXL KV connector: " + why)
 		}
 	}
@@ -404,6 +404,9 @@ type sourceDump struct {
 	on, leaveRunning bool
 	// nixlOptIn: the pod opted in to nixl-pause (nixlOptIn).
 	nixlOptIn bool
+	// nixlRefusal: why the capture is refused before nixl-pause, from
+	// the pod (nixlCaptureRefusal); "" when it is not.
+	nixlRefusal string
 	// syncOpenAsked: the session's driver runs the open phase
 	// (dumpV2Opts.SyncOpen).
 	syncOpenAsked bool
@@ -482,7 +485,7 @@ func (a *Agent) dumpAroundSuspend(ctx context.Context, d sourceDump, log *logrus
 		// resume is checked: a paused engine takes no requests, so a
 		// source that runs on and does not resume is replaced.
 		var nixlErr error
-		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.procBase, d.targetHostPID, d.fabricSession, d.rankNodes, d.toolText, d.hostPID, d.pids, log)
+		nixlPaused, nixlErr = a.pauseNIXLFor(ctx, d.nixlOptIn, d.nixlRefusal, d.procBase, d.targetHostPID, d.fabricSession, d.rankNodes, d.toolText, d.hostPID, d.pids, log)
 		if nixlErr != nil {
 			return nil, fmt.Errorf("gpushare: %w", nixlErr)
 		}

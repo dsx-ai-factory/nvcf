@@ -521,27 +521,61 @@ func nixlOptInFromPod(on bool, pod *corev1.Pod, container string) (optedIn bool,
 // nixlOptIn is nixlOptInFromPod for the pod ns/name, read from the API
 // server. A pod that cannot be read is not opted in, and why says so.
 func (a *Agent) nixlOptIn(ctx context.Context, ns, name, container string) (bool, string) {
+	opted, why, _, _ := a.nixlOptInPod(ctx, ns, name, container)
+	return opted, why
+}
+
+// nixlOptInPod is nixlOptIn, also returning the pod it read, or the
+// error that kept it from reading one (nil pod).
+func (a *Agent) nixlOptInPod(ctx context.Context, ns, name, container string) (bool, string, *corev1.Pod, error) {
 	if a.kubeClient == nil {
-		return false, "the agent has no API client to read the pod's opt-in"
+		err := errors.New("the agent has no API client to read the pod's opt-in")
+		return false, err.Error(), nil, err
 	}
 	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return false, "cannot read the pod's opt-in: " + err.Error()
+		return false, "cannot read the pod's opt-in: " + err.Error(), nil, err
 	}
-	return nixlOptInFromPod(a.nixlPauseOn(), pod, container)
+	opted, why := nixlOptInFromPod(a.nixlPauseOn(), pod, container)
+	return opted, why, pod, nil
+}
+
+// nixlCaptureRefusal is why a capture by an agent whose nixl-pause switch
+// is on (on) refuses to run, before anything is paused, from what the pod
+// read for its opt-in says (nixlOptInPod: opted, pod, err), or "": a pod
+// that could not be read (its opt-in is unknown, so the capture fails
+// closed rather than suspend an engine whose connector may hold RDMA), or
+// an opted-in pod whose spec says its engine spans nodes
+// (webhook.EngineSpansPods, as the preflight checks; its processes may not
+// show it).
+func nixlCaptureRefusal(on, opted bool, pod *corev1.Pod, err error) string {
+	switch {
+	case !on:
+		return ""
+	case err != nil:
+		return "the pod's nixl-pause opt-in cannot be read, so the capture is refused: " + err.Error()
+	case opted:
+		if why := webhook.EngineSpansPods(pod); why != "" {
+			return "the pod opted in to nixl-pause, but its engine spans nodes (" + why + "); nixl-pause is not supported for an engine that spans nodes yet"
+		}
+	}
+	return ""
 }
 
 // pauseNIXLFor is pauseNIXL for the capture of the container whose init is
-// sessionHostPID, when its pod opted in (nixlOptIn). An engine that spans
-// nodes (nixlSpansNodes: the capture joins fabricSession, or a process of
-// the container says so) is refused here, before anything is paused,
-// whether or not a preflight ran: a capture requested through
-// POST /v1/checkpoints runs none.
-func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, procBase string, sessionHostPID int, fabricSession string, rankNodes int, toolText string, hostPID int, pids []int, log *logrus.Entry) ([]int, error) {
+// sessionHostPID, when its pod opted in (nixlOptIn). A refusal from the
+// pod (nixlCaptureRefusal), and a container nixl-pause does not handle
+// (nixlPauseLimit: ModelExpress in the pod, or an engine that spans nodes,
+// from the capture's session or the container's processes), are refused
+// here, before anything is paused, whether or not a preflight ran: a
+// capture requested through POST /v1/checkpoints runs none.
+func (a *Agent) pauseNIXLFor(ctx context.Context, optedIn bool, refusal, procBase string, sessionHostPID int, fabricSession string, rankNodes int, toolText string, hostPID int, pids []int, log *logrus.Entry) ([]int, error) {
+	if refusal != "" {
+		return nil, fmt.Errorf("%w: %s", errNIXLPauseUnsupported, refusal)
+	}
 	if optedIn && gpushareNIXLSupported(toolText) {
-		if why := nixlSpansNodes(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession, rankNodes); why != "" {
-			return nil, fmt.Errorf("%w: the pod opted in to nixl-pause, but its engine spans nodes (%s); nixl-pause is not supported for an engine that spans nodes yet",
-				errNIXLPauseUnsupported, why)
+		if why := nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), fabricSession, rankNodes); why != "" {
+			return nil, fmt.Errorf("%w: %s", errNIXLPauseUnsupported, why)
 		}
 	}
 	return pauseNIXL(ctx, optedIn, toolText, hostPID, pids, log)
