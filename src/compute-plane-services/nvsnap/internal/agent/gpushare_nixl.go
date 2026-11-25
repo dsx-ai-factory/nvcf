@@ -174,6 +174,10 @@ func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, 
 		log.Info("gpushare: the pod opted in to nixl-pause, but the GPU tool has no nixl-pause; capturing it as it is")
 		return false, nil
 	}
+	if pids = controlSocketPIDs(hostPID, pids); len(pids) == 0 {
+		log.Info("gpushare: the pod opted in to nixl-pause, but no process has a control socket, so none has a NIXL KV connector the tool could reach")
+		return false, nil
+	}
 	t0 := time.Now()
 	out, err := gpushareNIXL(ctx, hostPID, "nixl-pause", "", pids)
 	if err != nil {
@@ -192,6 +196,9 @@ func pauseNIXL(ctx context.Context, optedIn bool, toolText string, hostPID int, 
 // engine id, at host when set. It runs to its end under its own deadline.
 // An error means the engine takes no requests.
 func resumeNIXL(ctx context.Context, hostPID int, host string, pids []int, log *logrus.Entry) error {
+	if pids = controlSocketPIDs(hostPID, pids); len(pids) == 0 {
+		return errors.New("nixl-resume: no process has a control socket to resume")
+	}
 	t0 := time.Now()
 	out, err := gpushareNIXL(context.WithoutCancel(ctx), hostPID, "nixl-resume", host, pids)
 	l := log.WithFields(logrus.Fields{"pids": pids, "host": host, "duration": time.Since(t0).Round(time.Millisecond).String()})
@@ -458,4 +465,39 @@ func (a *Agent) pauseNIXLFor(ctx context.Context, procBase string, sessionHostPI
 		}
 	}
 	return pauseNIXL(ctx, optedIn, toolText, hostPID, pids, log)
+}
+
+// controlSocketPIDs are the pids among pids (namespace numbering) whose
+// gpushare library has its control socket open, in the network namespace
+// of the container whose init is hostPID. A variable for tests.
+var controlSocketPIDs = func(hostPID int, pids []int) []int {
+	return controlSocketPIDsIn(hostProcBase(), hostPID, pids)
+}
+
+// controlSocketPIDsIn is controlSocketPIDs under procBase. The library
+// listens on the abstract socket @nvsnap-gpushare.<pid> (gpushare.h), and
+// opens it only once its process uses the GPU, or looks up a CUDA entry
+// point with NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1. A process under the
+// library that never did (a resource tracker, a shell wrapper) has none:
+// the tool cannot reach it, prints nothing for it and exits 0. When the
+// namespace's sockets cannot be read, every pid is returned, so that a
+// missing answer fails closed.
+func controlSocketPIDsIn(procBase string, hostPID int, pids []int) []int {
+	b, err := os.ReadFile(filepath.Join(procBase, strconv.Itoa(hostPID), "net", "unix"))
+	if err != nil {
+		return pids
+	}
+	listening := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 8 && strings.HasPrefix(f[7], "@") {
+			listening[f[7]] = true
+		}
+	}
+	var out []int
+	for _, pid := range pids {
+		if listening[fmt.Sprintf("@nvsnap-gpushare.%d", pid)] {
+			out = append(out, pid)
+		}
+	}
+	return out
 }

@@ -27,6 +27,7 @@ const nixlToolText = mxToolText + "  nixl-pause   (before suspend: ...)\n  nixl-
 // in fail.
 func fakeNIXL(t *testing.T, out map[string]string, fail map[string]bool) *[]string {
 	t.Helper()
+	fakeControlSockets(t, nil) // every pid has a control socket
 	var calls []string
 	prev := gpushareNIXL
 	gpushareNIXL = func(_ context.Context, hostPID int, verb, host string, pids []int) (string, error) {
@@ -566,8 +567,10 @@ func TestPauseNIXL_UnclearOutputCountsAsPaused(t *testing.T) {
 	}
 }
 
-// A resume succeeds only when every pid answered ok: a pid with no answer
-// was not resumed, and an engine that is not resumed serves nothing.
+// A resume succeeds only when every pid with a control socket answered ok:
+// such a pid with no answer was not resumed, and an engine that is not
+// resumed serves nothing. (A pid without a socket is not asked:
+// TestNIXL_ProcessWithoutAControlSocket.)
 func TestResumeNIXL_EveryPidAnswersOK(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -576,7 +579,7 @@ func TestResumeNIXL_EveryPidAnswersOK(t *testing.T) {
 	}{
 		{"every pid resumed", "pid=7 nixl resume: ok resumed as engine e2\npid=8 nixl resume: ok TP worker: NIXL connector up\n", false},
 		{"not paused", "pid=7 nixl resume: ok not paused\npid=8 nixl resume 10.0.0.9: ok TP worker: NIXL connector up\n", false},
-		{"a pid did not answer", "pid=7 nixl resume: ok resumed as engine e2\n", true},
+		{"a pid with a control socket did not answer", "pid=7 nixl resume: ok resumed as engine e2\n", true},
 		{"no output", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -586,5 +589,102 @@ func TestResumeNIXL_EveryPidAnswersOK(t *testing.T) {
 				t.Errorf("resumeNIXL = %v, want err %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// fakeNIXLTool answers like the GPU tool: one line per pid it reached,
+// nothing (and exit 0) for a pid without a control socket (socketless).
+// It records the pids it was given.
+func fakeNIXLTool(t *testing.T, socketless map[int]bool) *[][]int {
+	t.Helper()
+	var given [][]int
+	prev := gpushareNIXL
+	gpushareNIXL = func(_ context.Context, _ int, verb, _ string, pids []int) (string, error) {
+		given = append(given, append([]int(nil), pids...))
+		var b strings.Builder
+		for _, p := range pids {
+			if socketless[p] {
+				continue
+			}
+			if verb == "nixl-pause" {
+				fmt.Fprintf(&b, "pid=%d nixl pause: ok engine paused, NIXL connector released on 1 worker(s)\n", p)
+			} else {
+				fmt.Fprintf(&b, "pid=%d nixl resume: ok resumed as engine e2\n", p)
+			}
+		}
+		return b.String(), nil
+	}
+	t.Cleanup(func() { gpushareNIXL = prev })
+	return &given
+}
+
+// fakeControlSockets makes pids in socketless have no control socket.
+func fakeControlSockets(t *testing.T, socketless map[int]bool) {
+	t.Helper()
+	prev := controlSocketPIDs
+	controlSocketPIDs = func(_ int, pids []int) []int {
+		var out []int
+		for _, p := range pids {
+			if !socketless[p] {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	t.Cleanup(func() { controlSocketPIDs = prev })
+}
+
+// A process under the library that never used CUDA (a resource tracker,
+// a shell wrapper, an API server) has no control socket, and the tool
+// prints nothing for it. The pause and the resume address only the
+// processes with one: such a process neither fails the resume nor makes a
+// pod without a connector count as paused.
+func TestNIXL_ProcessWithoutAControlSocket(t *testing.T) {
+	socketless := map[int]bool{9: true}
+	fakeControlSockets(t, socketless)
+	given := fakeNIXLTool(t, socketless)
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, testLog()); err != nil {
+		t.Errorf("resume with a socketless pid: %v", err)
+	}
+	paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog())
+	if err != nil || !paused {
+		t.Errorf("pause = %v, %v; want paused", paused, err)
+	}
+	for _, g := range *given {
+		if slices.Contains(g, 9) {
+			t.Errorf("the tool was given the socketless pid: %v", g)
+		}
+	}
+	// No process with a socket: nothing to pause; a restore that must
+	// resume one cannot.
+	fakeControlSockets(t, map[int]bool{7: true, 8: true, 9: true})
+	if paused, err := pauseNIXL(context.Background(), true, nixlToolText, 42, []int{7, 8, 9}, testLog()); err != nil || paused {
+		t.Errorf("pause with no control socket = %v, %v; want not paused", paused, err)
+	}
+	if err := resumeNIXL(context.Background(), 42, "", []int{7, 8, 9}, testLog()); err == nil {
+		t.Error("resume with no control socket succeeded")
+	}
+}
+
+// controlSocketPIDsIn reads the network namespace's unix sockets: a pid
+// has a control socket when its library listens on @nvsnap-gpushare.<pid>.
+func TestControlSocketPIDsIn(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "42", "net"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unix := "Num       RefCount Protocol Flags    Type St Inode Path\n" +
+		"0000000000000000: 00000002 00000000 00010000 0005 01 11111 @nvsnap-gpushare.7\n" +
+		"0000000000000000: 00000002 00000000 00010000 0005 01 11112 @nvsnap-gpushare.80\n" +
+		"0000000000000000: 00000002 00000000 00010000 0001 01 11113 /tmp/nvsnap-gpushare.8\n"
+	if err := os.WriteFile(filepath.Join(base, "42", "net", "unix"), []byte(unix), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := controlSocketPIDsIn(base, 42, []int{7, 8, 9}); !slices.Equal(got, []int{7}) {
+		t.Errorf("controlSocketPIDsIn = %v, want [7]", got)
+	}
+	// Unreadable: every pid, so a missing answer fails closed.
+	if got := controlSocketPIDsIn(base, 43, []int{7, 8}); !slices.Equal(got, []int{7, 8}) {
+		t.Errorf("unreadable namespace: %v, want every pid", got)
 	}
 }

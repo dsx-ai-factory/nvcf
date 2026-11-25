@@ -48,6 +48,7 @@ func fakeDumpSource(t *testing.T) (base string, pids []int) {
 
 func (s *dumpSteps) install(t *testing.T) {
 	t.Helper()
+	fakeControlSockets(t, nil)
 	prevMX, prevNIXL := gpushareMX, gpushareNIXL
 	gpushareMX = func(_ context.Context, _ int, verb, _ string, _ []int) (string, error) {
 		return "pid=2 mx: ok\n", s.step(verb)
