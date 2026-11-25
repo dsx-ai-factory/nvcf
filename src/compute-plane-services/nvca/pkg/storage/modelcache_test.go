@@ -2822,23 +2822,32 @@ func TestReconcileInitModelCacheNVMesh_PublishesPrimaryPVOnlyAfterWriterDetach(t
 			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(mgrScheme).WithObjects(initJob, rwPVC, pv, va).Build()
+	st := nvcav1new.StorageRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: nvcav1new.ModelCacheRequest.Name(), Namespace: "ns1"},
+		Spec: nvcav1new.StorageRequestSpec{
+			Type:            nvcav1new.ModelCacheRequest,
+			ICMSRequestName: "icms-" + handle,
+			ModelCache:      &nvcav1new.ModelCacheSpec{CacheHandle: handle},
+		},
+		Status: nvcav1new.StorageRequestStatus{Phase: nvcav1new.StorageInitRunning},
+	}
+	stCopy := st.DeepCopy()
+	// The init lease already exists and is held by this request, as it is in
+	// production by the time the writer Job succeeds.
+	lease := newInitLease(stCopy)
+	acquired := metav1.NewMicroTime(time.Now())
+	lease.Spec.AcquireTime = &acquired
+	lease.Spec.RenewTime = &acquired
+
+	c := fake.NewClientBuilder().WithScheme(mgrScheme).WithObjects(initJob, rwPVC, pv, va, lease).Build()
 	r := &Reconciler{
 		Client:        c,
 		metrics:       newTestMetrics(),
 		fff:           &featureflagmock.Fetcher{},
 		nowFunc:       time.Now,
 		k8sTimeConfig: (&k8sutil.TimeConfig{}).Complete(),
+		initStatuses:  newInitStatusCache(c),
 	}
-	st := nvcav1new.StorageRequest{
-		ObjectMeta: metav1.ObjectMeta{Name: nvcav1new.ModelCacheRequest.Name(), Namespace: "ns1"},
-		Spec: nvcav1new.StorageRequestSpec{
-			Type:       nvcav1new.ModelCacheRequest,
-			ModelCache: &nvcav1new.ModelCacheSpec{CacheHandle: handle},
-		},
-		Status: nvcav1new.StorageRequestStatus{Phase: nvcav1new.StorageInitRunning},
-	}
-	stCopy := st.DeepCopy()
 
 	// Writer still attached read-write: requeue, no primary label, phase unchanged.
 	res, err := r.reconcileInitModelCacheNVMesh(ctx, st, stCopy, rwPVC.DeepCopy(), initJob.DeepCopy(), nil, HelmCacheBackendNVMesh)
@@ -2848,6 +2857,14 @@ func TestReconcileInitModelCacheNVMesh_PublishesPrimaryPVOnlyAfterWriterDetach(t
 	got := &corev1.PersistentVolume{}
 	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: pvName}, got))
 	assert.NotContains(t, got.Labels, primaryPVLabelKey, "primary PV must not be published while the writer is attached")
+
+	// Through the lease wrapper the holder's renewal deadline (half the lease
+	// duration) must not stretch the detach poll interval.
+	res, err = r.doInitModelCacheNVMesh(ctx, st, stCopy, rwPVC.DeepCopy(), initJob.DeepCopy(), nil, HelmCacheBackendNVMesh)
+	require.NoError(t, err)
+	assert.Equal(t, volumeDetachRequeueInterval, res.RequeueAfter, "lease renewal deadline must not override the detach poll interval")
+	require.NoError(t, c.Get(ctx, client.ObjectKey{Name: pvName}, got))
+	assert.NotContains(t, got.Labels, primaryPVLabelKey)
 
 	// Detached: publish the primary PV and advance.
 	require.NoError(t, c.Delete(ctx, va))

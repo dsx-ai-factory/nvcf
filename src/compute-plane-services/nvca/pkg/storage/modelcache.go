@@ -1301,9 +1301,12 @@ func (r *Reconciler) doInitModelCacheNVMesh(ctx context.Context,
 		r.initStatuses.put(cacheHandle, stCopy.Status)
 	}
 
-	// Consolidate result.
+	// Consolidate result. The lease result's RequeueAfter is the renewal
+	// deadline, an upper bound on how long the holder may wait; a shorter
+	// explicit requeue from the init path (such as the writer detach poll)
+	// must win, or it would be stretched to half the lease duration.
 	res.Requeue = res.Requeue || lres.Requeue //nolint:staticcheck
-	if lres.RequeueAfter > res.RequeueAfter {
+	if lres.RequeueAfter > 0 && (res.RequeueAfter == 0 || lres.RequeueAfter < res.RequeueAfter) {
 		res.RequeueAfter = lres.RequeueAfter
 	}
 	return res, err
@@ -1415,6 +1418,10 @@ func (r *Reconciler) reconcileInitModelCacheNVMesh(ctx context.Context,
 				// never blocking the reconcile worker, and publish afterwards.
 				detached, err := r.isVolumeDetached(ctx, rwPVC.Spec.VolumeName)
 				if err != nil {
+					if k8sutil.IsTransientK8sError(err) {
+						log.V(1).Info("Transient error checking writer volume attachment, requeuing", "error", err)
+						return reconcile.Result{Requeue: true}, nil
+					}
 					return reconcile.Result{}, err
 				}
 				if !detached {
