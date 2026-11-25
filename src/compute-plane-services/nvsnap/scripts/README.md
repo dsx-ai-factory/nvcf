@@ -3,7 +3,22 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# nvsnap test suite
+# scripts/
+
+Shell scripts run by hand or by CI: building images
+(`build-agent.sh`, `versions.sh`), installing and removing nvsnap
+(`install-nvsnap.sh`, `uninstall-nvsnap.sh`), checking the chart and gpushare
+build in CI (`test-helm-chart.sh`, `check-gpushare-build.sh`), and the
+cluster test suite described below.
+
+Subdirectories: [`lib/`](lib/) (helpers the test scripts source),
+[`docs/`](docs/) (documentation checks), [`repro/nvmesh-shared-ro/`](repro/nvmesh-shared-ro/)
+(a standalone storage reproduction). `tests/` holds a test of
+`uninstall-nvsnap.sh` that nothing runs. `splice-microbench/` and
+`splice-parallel/` hold standalone Go programs that `make test` compiles
+(through `go list ./...`) and nothing runs.
+
+## nvsnap test suite
 
 Two entry points:
 
@@ -18,11 +33,11 @@ Use `test-e2e.sh` to check correctness, `test-bench.sh` to produce numbers.
 
 ```sh
 export KUBECONFIG=<your cluster kubeconfig>
-kubectl get nodes                     # must work; expired credentials are the #1 cause of confusing failures
+kubectl get nodes                     # must work
 ./scripts/test-e2e.sh                 # no args: prints the workload list
 ```
 
-The suite refuses to start unless the deployed agent matches
+`test-e2e.sh` refuses to start unless the deployed agent matches
 `scripts/versions.sh`. That is deliberate: a run against a different build
 produces numbers attributed to the wrong version. To test a build that is
 already deployed, override rather than editing the file:
@@ -34,13 +49,14 @@ NVSNAP_APP_VERSION=v0.2.46 ./scripts/test-e2e.sh vllm-small
 ## Running
 
 ```sh
-./scripts/test-e2e.sh vllm-small      # single GPU, CRIU path, ~5 min
-./scripts/test-e2e.sh vllm-70b        # 4 GPUs, cachedir path, ~30 min
+./scripts/test-e2e.sh vllm-small      # single GPU, CRIU path
+./scripts/test-e2e.sh vllm-70b        # 4 GPUs, cachedir path
 ./scripts/test-bench.sh gpt-oss-120b  # benchmark row instead of pass/fail
 ```
 
-Both leave the source and restored pods in place on failure so you can inspect
-them. On success they clean up.
+`test-e2e.sh` deletes the source pod before it restores. At the end it
+prints the command that deletes the restored pod and leaves that pod
+running.
 
 ## Capture paths
 
@@ -60,21 +76,21 @@ capture method; it refuses a workload CRIU cannot capture (a Riva or Triton
 NIM), and the script stops with a hint (`internal/agent/nim_backend.go`
 `resolveCheckpointRedirect`).
 
-The `nvsnap.io/path` annotation in a workload manifest documents the intent; it
-does not select the path. The agent's `--pod-cache-dir` flag is what decides
+`test-e2e.sh` does not read the `nvsnap.io/path` annotation of a workload
+manifest (nvsnap-server's demo page and `internal/manifests` do).
+`test-bench.sh` uses `CAPTURE_PATH=rootfs` unless the environment sets it. The agent's `--pod-cache-dir` flag is what decides
 whether a `rootfs`-family capture is really cachedir. If those two disagree,
 believe the flag.
 
 ## Guards, and why a run may refuse to start
 
-These exist because each one has silently produced a wrong result before.
 If a guard fires, it is telling you the run would have measured something other
 than what you asked for.
 
 | Guard | Refuses when | Why |
 |---|---|---|
-| agent version | deployed image != `versions.sh` | numbers would be attributed to the wrong build |
-| image exists | tag missing from the registry | catches a failed push before a 30 min run |
+| agent version (`test-e2e.sh` only) | deployed image != `versions.sh` | numbers would be attributed to the wrong build |
+| image exists (`test-e2e.sh` only) | tag missing from the registry | catches a failed push before a long run |
 | placeholder | any `__NAME__` token survived substitution, not just `__CAPTURE_HASH__` | the webhook ignores the pod and it cold-starts |
 | restore admitted | the agent has no `--pod-cache-dir`, the named container is absent, the cache dir is not mounted, neither `HF_HOME` nor `NIM_CACHE_PATH` is set, or one of them points outside the cache dir | the pod cold-starts while looking like a restore |
 
@@ -140,20 +156,23 @@ To force a fresh capture, remove what claims the hash:
 
 ```sh
 kubectl delete cm -n nvsnap-system nvsnap-capture-<hash-prefix>   # manifest tier
-kubectl delete pvc -n nvsnap-system rox-<hash>                    # L2 tier
+kubectl delete pvc -n nvsnap-system rox-<short-hash>              # L2 tier
 ```
 
-Deleting only one tier is not enough: the agent skips the capture if any tier
-claims the hash. A schema change bumps `CaptureFormatVersion`, which changes the
+The capture is skipped when the first tier that claims the hash returns a
+usable manifest (`internal/rootfsonly/orchestrator.go`), so remove both. A schema change bumps `CaptureFormatVersion`, which changes the
 hash and re-captures everything automatically.
 
 ## Adding a workload
 
-1. `deploy/k8s/workloads/<id>.yaml` plus `<id>-restore.yaml`.
-2. Restore manifest carries `nvsnap.io/restore-from: "__CAPTURE_HASH__"`; the
-   scripts substitute it.
+1. `deploy/k8s/workloads/<id>.yaml` plus `<id>-restore.yaml` for
+   `test-e2e.sh`; `deploy/k8s/benchmarks/` for `test-bench.sh`.
+2. A rootfs restore manifest carries
+   `nvsnap.io/restore-from: "__CAPTURE_HASH__"`; a criu-v2 restore manifest
+   is generated by `go run ./internal/manifests/gen` and carries
+   `__NODE_NAME__` and `__CHECKPOINT_ID__`. The scripts substitute them.
 3. Add a `case` arm in both scripts with the pod names, port, model, and
    inference payloads.
 4. Set the first container's `nvidia.com/gpu` request accurately, and annotate
-   `nvsnap.io/gpushare: "true"` for a multi-GPU CRIU case: the scripts pick
-   the capture path from them.
+   `nvsnap.io/gpushare: "true"` for a multi-GPU CRIU case: `test-e2e.sh`
+   picks the capture path from them.

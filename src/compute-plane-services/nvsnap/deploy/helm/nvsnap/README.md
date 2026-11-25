@@ -13,15 +13,33 @@ documented in [values.yaml](values.yaml); what the components do is in
 
 ## Templates
 
-| Template | Renders |
-|---|---|
-| `agent-daemonset.yaml`, `agent-rbac.yaml`, `agent-token-secret.yaml` | The agent and its two Services, its RBAC and its API token |
-| `server.yaml` | The server Deployment, Service, RBAC and catalog PVC |
-| `webhook.yaml` | The webhook Service, the MutatingWebhookConfiguration and its certificate |
-| `cachedir-env-configmap.yaml` | The cachedir environment template the webhook reads at capture (when `agent.podCacheDir` is set) |
-| `network-policy-restore-pods.yaml` | Lets restore pods in the namespaces listed in `agent.l2.restoreNamespaces` reach the server, and, with `webhook.restorePrepStrategy: init-container`, the agent |
-| `post-install-smoke.yaml` | The post-install health probe Job |
-| `grafana-dashboard.yaml` | The nvsnap Grafana dashboard |
+| Template | Renders | When |
+|---|---|---|
+| `agent-daemonset.yaml`, `agent-rbac.yaml` | The agent DaemonSet, its Services (the node-local one only without `agent.hostNetwork`) and its RBAC | `agent.enabled` |
+| `agent-token-secret.yaml` | The agent API token | `agent.auth.enabled` |
+| `agent-servicemonitor.yaml`, `prometheus-rules.yaml` | Agent scrape config and alert rules | `agent.metrics.*.enabled` (`auto`: when the CRD exists) |
+| `server.yaml` | The server Deployment, Service, RBAC and catalog PVC | `server.enabled` |
+| `nvsnapfunction-crd.yaml` | The `NvsnapFunction` CRD and a ClusterRole for it | `server.enabled` |
+| `webhook.yaml` | The webhook Service, certificate and, with `webhook.inject`, the MutatingWebhookConfiguration | `webhook.enabled` |
+| `ephemeral-container-policy.yaml` | A ValidatingAdmissionPolicy that keeps ephemeral containers off nvsnap volumes | `webhook.ephemeralContainerPolicy.enabled` |
+| `cachedir-env-configmap.yaml` | The cachedir environment template the webhook reads | `agent.podCacheDir` set |
+| `network-policy-restore-pods.yaml` | Lets restore pods in `agent.l2.restoreNamespaces` reach the server (and the agent with `webhook.restorePrepStrategy: init-container`) | `webhook.enabled` and that list set |
+| `rails.yaml` | The RDMA claim template and shared secret of the rails fetch tier | `agent.rails.enabled` |
+| `grafana-dashboard.yaml` | Overview dashboard ConfigMap from `files/` | `grafana.enabled` |
+| `grafana-dashboard-history.yaml` | History dashboard ConfigMap from `files/` | `agent.metrics.dashboard.enabled` |
+| `post-install-smoke.yaml` | The post-install health probe Job | `postInstallSmoke.enabled` |
+
+`_helpers.tpl` holds shared template helpers and `NOTES.txt` the install
+notes.
+
+## Other directories
+
+- `crds/`: the `GPUCheckpoint` and `GPURestore` CRDs; must match
+  [`deploy/crds/nvsnap.io_gpucheckpoints.yaml`](../../crds/)
+  (checked by `scripts/test-helm-chart.sh`).
+- `files/`: the Grafana dashboards and the alert rules read by the
+  templates above, the rules' promtool tests, and `test-rules.sh`, which runs
+  them.
 
 ## Development
 
