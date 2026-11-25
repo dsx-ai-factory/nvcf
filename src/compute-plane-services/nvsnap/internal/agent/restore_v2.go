@@ -209,8 +209,10 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		}
 	}
 	// A restore that could not bring a paused NIXL KV connector back is
-	// refused before CRIU runs, as a restore that did not run here.
-	nixlHost, nerr := a.nixlRestorePrecheck(ctx, gs, tools.gpuToolText(), metadata.SourcePodIP, group)
+	// refused before CRIU runs, as a restore that did not run here. The
+	// tool's pid is the restored tree's, known after its GPU resume.
+	toolPID := 0
+	resumeNIXL, nerr := a.nixlResumeFor(ctx, gs, tools.gpuToolText(), metadata.SourcePodIP, group, &toolPID, log)
 	if nerr != nil {
 		return nil, nerr
 	}
@@ -375,7 +377,6 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// resumeGPU reloads the restored processes' GPU memory (gpushare);
 	// holdGate keeps their GPU launches waiting until gpushareOpen. toolPID
 	// is the pid the resume tool entered, once it ran, for gpushareOpen.
-	toolPID := 0
 	var clockAt int64
 	// clockWait is how long the GPU resume waited for the dumped clock:
 	// not part of the restore's work, so not of the next one's budget.
@@ -486,10 +487,8 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 				return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
 			})
 		},
-		unlockNet: func() error { return netUnlock(ctx, hostPID, checkpointDir, log) },
-		resumeNIXL: func() error {
-			return resumeRestoredNIXL(ctx, gs, tools.gpuToolText(), toolPID, nixlHost, log)
-		},
+		unlockNet:  func() error { return netUnlock(ctx, hostPID, checkpointDir, log) },
+		resumeNIXL: resumeNIXL,
 		resumeMX: func() {
 			goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
 		},

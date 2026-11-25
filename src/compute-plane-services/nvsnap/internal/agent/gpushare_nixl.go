@@ -266,6 +266,18 @@ func (a *Agent) restoredNIXLHostFor(ctx context.Context, gs *GPUShareInfo, captu
 // says nothing about the checkpoint (errCheckpointUnavailable).
 var errNIXLResumeUnavailable = errors.New("this node cannot resume the NIXL KV connector")
 
+// nixlResumeFor is the NIXL step of a restore's tail (restoreTail): it
+// runs nixlRestorePrecheck now, before CRIU, and returns the resume to
+// run once the restored processes run, through the tool in the restored
+// tree (*toolPID, set by the GPU resume), at the address the precheck read.
+func (a *Agent) nixlResumeFor(ctx context.Context, gs *GPUShareInfo, toolText, capturedIP string, group restoreV2Group, toolPID *int, log *logrus.Entry) (func() error, error) {
+	host, err := a.nixlRestorePrecheck(ctx, gs, toolText, capturedIP, group)
+	if err != nil {
+		return nil, err
+	}
+	return func() error { return resumeRestoredNIXL(ctx, gs, toolText, *toolPID, host, log) }, nil
+}
+
 // nixlRestorePrecheck runs before CRIU, for a restore whose capture paused
 // the connector (gs.NIXL): the node's GPU tool must have nixl-resume, and
 // the address to resume at (restoredNIXLHostFor) must be known. It returns

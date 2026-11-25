@@ -801,3 +801,32 @@ func TestCapturePreflight_NIXLRankNodes(t *testing.T) {
 		t.Errorf("ranks on two nodes: %+v, want a nixl-pause block", two)
 	}
 }
+
+// restoreV2's NIXL step, as nixlResumeFor builds it: refused before CRIU
+// when the node cannot resume it; otherwise a resume, run later, through
+// the restored tree's tool pid (set after the build, by the GPU resume),
+// at the address read up front.
+func TestNIXLResumeFor_BuildsTheTailsStep(t *testing.T) {
+	a := &Agent{}
+	gs := &GPUShareInfo{PIDs: []int{7}, NIXL: true}
+	moved := restoreV2Group{InetAddrMap: "10.1.245.116=10.1.253.45"}
+	toolPID := 0
+	if _, err := a.nixlResumeFor(context.Background(), gs, mxToolText, "10.1.245.116", moved, &toolPID, testLog()); !errors.Is(err, errNIXLResumeUnavailable) {
+		t.Errorf("tool without nixl-resume: err = %v, want refused before CRIU", err)
+	}
+	calls := fakeNIXL(t, nil, nil)
+	resume, err := a.nixlResumeFor(context.Background(), gs, nixlToolText, "10.1.245.116", moved, &toolPID, testLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("resumed at build time: %v", *calls)
+	}
+	toolPID = 99
+	if err := resume(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(*calls, []string{"--host 10.1.253.45 nixl-resume@99 [7]"}) {
+		t.Errorf("calls = %v, want the restored tree's resume at the new address", *calls)
+	}
+}
