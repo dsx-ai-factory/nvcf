@@ -64,15 +64,15 @@ worker's own network namespace (`podNetnsDialer`):
 
 - every key under `v1/`; the worker's lease is the one lease that holds an
   instance registration named by its own ID in hex and a value naming the
-  worker's pod address as a URL host. None, or more than one, refuses the
-  capture.
+  worker's pod address in a form a restore rewrites (section 4). None, or
+  more than one, refuses the capture.
 - the lease's granted TTL and every key attached to it, with their values,
   read twice: the second read must find the same key set under the lease,
   each value unchanged, with an instance registration named by the lease
   and a key naming the address. A registration that changes between the
   reads is read again once, then refuses the capture.
-  A key whose name, or whose value outside a URL host, names a rank's address
-  refuses the capture: a restore could not rewrite it.
+  A key whose name, or whose value outside those forms, names a rank's
+  address refuses the capture: a restore could not rewrite it.
 
 The identity (lease ID, TTL, pod address, the slot that holds the lease, the
 etcd endpoints and the keys) is written into the group record with the
@@ -127,12 +127,52 @@ confirmed, is assumed, not shown. A connection the kernel completes into a
 listening socket's backlog after the inventory (the container is frozen, so
 nothing accepts it) is not listed and not reset.
 
-Only Dynamo's NATS request plane (`DYN_REQUEST_PLANE=nats`) is supported. On
-the TCP request plane, Dynamo's default, an endpoint registers its address
-as `{"transport":{"tcp":"<ip>:<port>/<path>"}}`; a restore does not rewrite
-that form (`identity_etcd.go` `urlHostForms`), so the capture refuses the
-identity (`readIdentity`, `strayAddress`) and the worker is not captured
-with one.
+Both of Dynamo's request planes are supported: TCP, its default, and NATS
+(`DYN_REQUEST_PLANE=nats`). A restore rewrites the worker's address in these
+forms, and only these (`identity_etcd.go` `hostForms`, `rewriteHost`), as
+Dynamo writes them under the lease (`lib/runtime/src` of Dynamo):
+
+- an endpoint registration on the TCP request plane (`v1/instances/`):
+  `{"transport":{"tcp":"<ip>:<port>/<path>"}}`, the address the
+  request-plane server advertises (`component/endpoint.rs`
+  `tcp_transport_type`; `[<ip>]` for IPv6). On the NATS plane the
+  registration names a subject and no address;
+- a ZMQ event channel (`v1/event_channels/`):
+  `{"kind":"Zmq","config":{"endpoint":"tcp://<ip>:<port>"}}`
+  (`transports/event_plane/mod.rs` `direct_zmq_public_endpoint`);
+- any URL host, `//<ip>:` or `//<ip>/` (a model card's URL under
+  `v1/mdc/`).
+
+Any other form of a rank's address under the lease refuses the capture
+(`readIdentity`, `strayAddress`): a bare address, such as a prefill
+worker's `"bootstrap_host":"<ip>"` in its model card's runtime config, or
+an engine's own `runtime_data`; and a form with spaces, which serde_json
+does not write.
+
+The frontend reaches a worker on the TCP plane at the address its
+registration names. The captured lease expires before it is granted again
+(section 5), which deletes the dead source's keys: the frontend's watch
+removes the instance, then adds it from the rewritten keys
+(`discovery/kv_store.rs` `discovery_events_from_watch_event`), and its
+client resolves an instance's address per request (`component/client.rs`
+`instance_by_id`, `pipeline/network/egress/push_router.rs`
+`resolve_transport`). So the rewritten keys lead it to the new address. The worker's server is
+restored as it was dumped, so the new address reaches it only when the
+restore moved its socket there or leads the new address to the captured
+one (RESTORE-POD-ADDRESS.md): Dynamo binds the server to the pod address
+it advertises, unless `DYN_TCP_RPC_HOST` names the wildcard
+(`pipeline/network/manager.rs` `create_tcp_server`), and a lone restore
+without `agent.restoreCapturedAddress` only aliases the captured address
+on the loopback. So, before the keys are written, the agent connects to
+each request-plane address the keys name, at the new address, from its own
+network (the node's) and closes the connection (`writeIdentityKeys`,
+`awaitRequestPlane`, within the smaller of 5 s and a quarter of the
+lease's TTL). One that does not accept a connection fails the key write:
+the lease is revoked and the pod ended (`keys_write_failed`, section 5).
+A ZMQ publisher binds the wildcard and needs no such check. The
+frontend's and other peers' connections to the dead source are reset
+above, accepted and opened ones alike: nothing more is needed for the TCP
+plane.
 
 ## 5. Restore
 
@@ -300,8 +340,13 @@ Against the invariants in `AGENTS.md`:
 - The dead source stays registered until its lease expires (its TTL) after
   the dump; the verification restore waits that long.
 - Dual-stack pods: only the primary pod address is matched and rewritten.
-- Dynamo's TCP request plane (its default): its registrations are not
-  rewritten, so such workers are not captured with an identity (section 4).
+- A restored worker that writes its registrations again (an endpoint it
+  unregisters and registers anew) writes the captured address, which it
+  still holds; nothing rewrites that.
+- A worker on the TCP request plane whose server the restore leaves on
+  the captured address only (a lone restore without
+  `agent.restoreCapturedAddress`) is ended after its restore, not started
+  cold before it (section 4).
 - The identity is read before the freeze, not under it: a key the worker
   changes between the read and the freeze is not recorded (the read is
   repeated and compared, `identityStillHeld`, but not under the freeze).

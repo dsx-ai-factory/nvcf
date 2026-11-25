@@ -47,6 +47,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -326,31 +327,50 @@ func ipToken(ip string) *regexp.Regexp {
 	return regexp.MustCompile(`(^|[^0-9.])` + q + `($|[^0-9.]|\.[^0-9]|\.$)`)
 }
 
-// urlHostForms are the forms in which a value names ip as a URL host, the
-// only ones a restore rewrites.
-func urlHostForms(ip string) []string {
-	if strings.Contains(ip, ":") {
-		return []string{"//[" + ip + "]:", "//[" + ip + "]/"}
-	}
-	return []string{"//" + ip + ":", "//" + ip + "/"}
+// requestPlaneTCP opens the address of an endpoint registration on
+// Dynamo's TCP request plane, its default: the value of an instance
+// registration is {"transport":{"tcp":"<ip>:<port>/<path>"}}, the address
+// a SocketAddr ("[ip]" for IPv6), serialized by serde_json without spaces.
+const requestPlaneTCP = `"tcp":"`
+
+// hostForms are the forms in which a value names ip as a host, the only
+// ones a restore rewrites: a URL host ("//ip:", "//ip/"; a model card's
+// URL, a ZMQ event channel's "tcp://ip:port"), and the address of a TCP
+// request-plane registration (`"tcp":"ip:`). An address in any other form
+// (a bare "ip" or "ip:port" string) is not rewritten.
+func hostForms(ip string) []string {
+	h := bracketed(ip)
+	return []string{"//" + h + ":", "//" + h + "/", requestPlaneForm(ip)}
 }
 
-// rewriteHost replaces every URL-host form of old in v with new.
+// requestPlaneForm is the form in which a TCP request-plane registration
+// names ip: `"tcp":"ip:` (`"tcp":"[ip]:` for IPv6).
+func requestPlaneForm(ip string) string { return requestPlaneTCP + bracketed(ip) + ":" }
+
+// bracketed is ip as the host of an address: in brackets for IPv6.
+func bracketed(ip string) string {
+	if strings.Contains(ip, ":") {
+		return "[" + ip + "]"
+	}
+	return ip
+}
+
+// rewriteHost replaces every host form of old in v with new.
 func rewriteHost(v []byte, old, nw string) []byte {
 	s := string(v)
-	for i, f := range urlHostForms(old) {
-		s = strings.ReplaceAll(s, f, urlHostForms(nw)[i])
+	for i, f := range hostForms(old) {
+		s = strings.ReplaceAll(s, f, hostForms(nw)[i])
 	}
 	return []byte(s)
 }
 
-// strayAddress reports whether v names any of ips other than as the
-// holder's URL host, which a restore could not rewrite.
+// strayAddress reports whether v names any of ips other than in a host
+// form of the holder's, which a restore could not rewrite.
 func strayAddress(v []byte, holder string, ips []string) bool {
 	s := string(v)
 	if holder != "" {
-		for _, f := range urlHostForms(holder) {
-			s = strings.ReplaceAll(s, f, "//")
+		for i, f := range hostForms(holder) {
+			s = strings.ReplaceAll(s, f, hostForms("")[i])
 		}
 	}
 	for _, ip := range ips {
@@ -361,14 +381,89 @@ func strayAddress(v []byte, holder string, ips []string) bool {
 	return false
 }
 
-// mentions reports whether v names ip as a URL host.
+// mentions reports whether v names ip in a host form.
 func mentions(v []byte, ip string) bool {
-	for _, f := range urlHostForms(ip) {
+	for _, f := range hostForms(ip) {
 		if strings.Contains(string(v), f) {
 			return true
 		}
 	}
 	return false
+}
+
+// requestPlaneAddrs returns the TCP request-plane addresses ("ip:port")
+// at which v registers an endpoint at ip.
+func requestPlaneAddrs(v []byte, ip string) []string {
+	f := requestPlaneForm(ip)
+	var out []string
+	for s := string(v); ; {
+		i := strings.Index(s, f)
+		if i < 0 {
+			return out
+		}
+		s = s[i+len(f):]
+		n := 0
+		for n < len(s) && s[n] >= '0' && s[n] <= '9' {
+			n++
+		}
+		if n > 0 {
+			out = append(out, net.JoinHostPort(ip, s[:n]))
+		}
+	}
+}
+
+// Reaching a restored worker's TCP request plane; tests replace them.
+var (
+	// requestPlaneWait bounds the wait for a restored worker's request
+	// plane to accept a connection at its new address; a quarter of the
+	// lease's TTL bounds it too, since the keeper does not renew the
+	// lease meanwhile.
+	requestPlaneWait = 5 * time.Second
+	// dialRequestPlane connects to addr from the agent's network (the
+	// node's by default: a pod on the host network reaches every pod)
+	// and closes the connection.
+	dialRequestPlane = func(ctx context.Context, addr string) error {
+		c, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return err
+		}
+		return c.Close()
+	}
+)
+
+// awaitRequestPlane waits for every address of addrs to accept a
+// connection, at most min(requestPlaneWait, ttl/4) in all. A restored
+// worker registered at an address that does not reach it takes requests
+// it never answers: a listener restored on the captured address with
+// nothing that leads the new one to it (restore_address.go
+// restoreSourceAddress: the loopback alias alone).
+func awaitRequestPlane(ctx context.Context, addrs []string, ttl int64) error {
+	deadline := time.Now().Add(min(requestPlaneWait, time.Duration(ttl)*time.Second/4))
+	for _, addr := range addrs {
+		for {
+			err := dialRequestPlane(ctx, addr)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if time.Now().After(deadline) {
+				// The dial's error names the address: not logged.
+				why := "no answer"
+				if errors.Is(err, syscall.ECONNREFUSED) {
+					why = "refused"
+				}
+				return fmt.Errorf("the restored worker's TCP request plane does not accept connections at its new address (%s)", why)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	return nil
 }
 
 // identityLeaseOf finds, among the Dynamo keys kvs, the one lease that a
@@ -798,6 +893,8 @@ func grantLease(ctx context.Context, e identityEtcd, id *capturedIdentity) error
 // captured address replaced by newIP. A key another lease holds now is
 // left as it is and fails the write: another worker owns it.
 func writeIdentityKeys(ctx context.Context, e identityEtcd, id *capturedIdentity, newIP string) error {
+	var writes []identityKey
+	var addrs []string
 	for _, k := range id.Keys {
 		// A key already under the lease is the process's own, maybe
 		// newer than the capture's (an agent that adopts after a
@@ -809,7 +906,17 @@ func writeIdentityKeys(ctx context.Context, e identityEtcd, id *capturedIdentity
 		if cur != nil && cur.Lease == id.Lease {
 			continue
 		}
-		owned, err := e.PutOwned(ctx, k.Key, rewriteHost(k.Value, id.PodIP, newIP), id.Lease)
+		v := rewriteHost(k.Value, id.PodIP, newIP)
+		writes = append(writes, identityKey{Key: k.Key, Value: v})
+		addrs = append(addrs, requestPlaneAddrs(v, newIP)...)
+	}
+	// Registered on the TCP request plane, the worker is routed to at the
+	// address its keys name: only once it answers there.
+	if err := awaitRequestPlane(ctx, slices.Compact(slices.Sorted(slices.Values(addrs))), id.TTL); err != nil {
+		return fmt.Errorf("write the identity's keys: %w", err)
+	}
+	for _, k := range writes {
+		owned, err := e.PutOwned(ctx, k.Key, k.Value, id.Lease)
 		if err != nil {
 			return fmt.Errorf("write the identity's keys: %w", err)
 		}

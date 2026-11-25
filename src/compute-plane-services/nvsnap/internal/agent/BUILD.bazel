@@ -240,6 +240,7 @@ go_test(
         "identity_etcd_fake_test.go",
         "identity_etcd_test.go",
         "identity_peer_reset_test.go",
+        "identity_tcp_plane_test.go",
         "instance_clients_test.go",
         "instance_nat_test.go",
         "kmsg_test.go",
