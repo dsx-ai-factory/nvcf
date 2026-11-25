@@ -235,9 +235,11 @@ fails on any of these:
 
 A refused `remap` keeps the last validated peer table. `nvsnap_ibv_open`,
 and any other release of NCCL's calls, keeps them held until those queue
-pairs are connected. A `remap` that reconnects queue pairs fails when the restore's
-processes mix this library with an older one, which sends no key counts or sender
-tokens (`nvsnap_ibv_connect`); a `remap` with nothing to reconnect reads no exchange. RDMA anything else holds (UCX, NIXL) cannot
+pairs are connected. A `remap` that reconnects queue pairs fails when any process in
+the restore that holds queue pairs runs an older library: its `ibvq` rows carry no
+sender token, so `nvsnap_ibv_connect` rejects them as malformed. An older process with
+no queue pairs writes no such rows and does not trigger it; a `remap` with nothing to
+reconnect reads no exchange. RDMA anything else holds (UCX, NIXL) cannot
 be told apart from the host, so the process's own `quiesce` refuses its
 open RDMA files (device files and verbs event files) and its mappings of
 other devices before anything stops, and the workload runs on
