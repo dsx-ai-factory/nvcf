@@ -21,10 +21,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -375,4 +377,56 @@ func TestResolveTaskIDFromState(t *testing.T) {
 	got, err := resolveTaskID(nil)
 	require.NoError(t, err)
 	assert.Equal(t, "state-task", got)
+}
+
+func TestLoadTaskCreateConfigCLIOverrides(t *testing.T) {
+	originalFlags := taskCreateFlags
+	t.Cleanup(func() { taskCreateFlags = originalFlags })
+
+	newCommand := func() *cobra.Command {
+		cmd := &cobra.Command{}
+		cmd.Flags().StringVar(&taskCreateFlags.inputFile, "input-file", "", "")
+		cmd.Flags().StringVar(&taskCreateFlags.gpu, "gpu", "", "")
+		cmd.Flags().StringVar(&taskCreateFlags.logsTelemetryId, "logs-telemetry-id", "", "")
+		cmd.Flags().StringSliceVar(&taskCreateFlags.containerEnvironment, "container-env", nil, "")
+		t.Cleanup(func() {
+			for _, name := range []string{"input-file", "gpu", "logs-telemetry-id", "container-env"} {
+				cmd.Flags().Lookup(name).Changed = false
+			}
+		})
+		return cmd
+	}
+
+	t.Run("CLI overrides file values and initializes telemetries", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "task.json")
+		err := os.WriteFile(configPath, []byte(`{"gpuSpecification":{"gpu":"file-gpu","instanceType":"GPU.H100_1x"},"telemetries":{"metricsTelemetryId":"file-metrics"}}`), 0o600)
+		require.NoError(t, err)
+
+		cmd := newCommand()
+		taskCreateFlags.inputFile = configPath
+		taskCreateFlags.gpu = "cli-gpu"
+		taskCreateFlags.logsTelemetryId = "cli-logs"
+		for _, name := range []string{"input-file", "gpu", "logs-telemetry-id"} {
+			cmd.Flags().Lookup(name).Changed = true
+		}
+
+		cfg, err := loadTaskCreateConfig(cmd)
+		require.NoError(t, err)
+		require.NotNil(t, cfg.GpuSpecification)
+		assert.Equal(t, "cli-gpu", cfg.GpuSpecification.GPU)
+		assert.Equal(t, "GPU.H100_1x", cfg.GpuSpecification.InstanceType)
+		require.NotNil(t, cfg.Telemetries)
+		assert.Equal(t, "cli-logs", cfg.Telemetries.LogsTelemetryId)
+		assert.Equal(t, "file-metrics", cfg.Telemetries.MetricsTelemetryId)
+	})
+
+	t.Run("rejects malformed container environment", func(t *testing.T) {
+		cmd := newCommand()
+		taskCreateFlags.containerEnvironment = []string{"MALFORMED"}
+		cmd.Flags().Lookup("container-env").Changed = true
+
+		_, err := loadTaskCreateConfig(cmd)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected key=value")
+	})
 }

@@ -972,6 +972,65 @@ func TestLLMInvocationHostPreservesPort(t *testing.T) {
 	}
 }
 
+func TestDirectInvocationURLValidationAndPathHandling(t *testing.T) {
+	tests := []struct {
+		name          string
+		baseInvokeURL string
+		functionID    string
+		inferenceURL  string
+		want          string
+		wantErr       string
+	}{
+		{
+			name:          "malformed URL",
+			baseInvokeURL: "http://%",
+			functionID:    "fn",
+			wantErr:       "failed to parse invoke URL \"http://%\": parse \"http://%\": invalid URL escape \"%\"",
+		},
+		{
+			name:          "URL without scheme and host",
+			baseInvokeURL: "invocation.example.com",
+			functionID:    "fn",
+			wantErr:       "invoke URL must include scheme and host: \"invocation.example.com\"",
+		},
+		{
+			name:          "fallback function-specific invocation domain",
+			baseInvokeURL: "https://custom.example.com",
+			functionID:    "fn",
+			inferenceURL:  "/predict",
+			want:          "https://fn.invocation.custom.example.com/predict",
+		},
+		{
+			name:          "preserve trailing inference slash",
+			baseInvokeURL: "https://invocation.example.com",
+			functionID:    "fn",
+			inferenceURL:  "/v1/",
+			want:          "https://fn.invocation.example.com/v1/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := directInvocationURL(tt.baseInvokeURL, tt.functionID, tt.inferenceURL)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("directInvocationURL returned no error")
+				}
+				if err.Error() != tt.wantErr {
+					t.Fatalf("directInvocationURL error = %q, want %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("directInvocationURL returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("directInvocationURL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func assertInvocationBodyField(t *testing.T, body []byte, key, want string) {
 	t.Helper()
 

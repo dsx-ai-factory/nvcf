@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"nvcf-cli/internal/state"
 )
 
@@ -111,4 +112,77 @@ func TestSaveStateForCurrentCommandPersistsFunctionContextForConfig(t *testing.T
 	if saved.Token != "admin-token" {
 		t.Fatalf("Token = %q, want admin-token", saved.Token)
 	}
+}
+
+func TestLoadDeployConfig(t *testing.T) {
+	previousInputFile := deployFlags.inputFile
+	previousGPU := deployFlags.gpu
+	previousBackend := deployFlags.backend
+	previousClusterName := deployFlags.clusterName
+	t.Cleanup(func() {
+		deployFlags.inputFile = previousInputFile
+		deployFlags.gpu = previousGPU
+		deployFlags.backend = previousBackend
+		deployFlags.clusterName = previousClusterName
+	})
+
+	writeJSON := func(t *testing.T, contents string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "deploy.json")
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write JSON: %v", err)
+		}
+		return path
+	}
+
+	t.Run("nested configuration and CLI overrides", func(t *testing.T) {
+		deployFlags.inputFile = writeJSON(t, `{"functionId":"file-function","versionId":"file-version","deploymentSpecifications":[{"gpu":"L40S","instanceType":"NCP.GPU.L40S_1x","minInstances":2,"maxInstances":4,"clusters":["cluster-a"],"regions":["region-a"],"cpuArch":"x86_64","configuration":{"key":"value"}}]}`)
+		deployFlags.gpu = "B200"
+		deployFlags.backend = ""
+		deployFlags.clusterName = "legacy-cluster"
+
+		cmd := &cobra.Command{}
+		cmd.Flags().String("gpu", "", "")
+		cmd.Flags().String("backend", "", "")
+		cmd.Flags().String("cluster-name", "", "")
+		for name, value := range map[string]string{"gpu": "B200", "backend": "", "cluster-name": "legacy-cluster"} {
+			if err := cmd.Flags().Set(name, value); err != nil {
+				t.Fatalf("set %s flag: %v", name, err)
+			}
+		}
+
+		config, err := loadDeployConfig(cmd)
+		if err != nil {
+			t.Fatalf("load deploy config: %v", err)
+		}
+		if config.FunctionID != "file-function" || config.VersionID != "file-version" {
+			t.Fatalf("IDs = (%q, %q), want file-function and file-version", config.FunctionID, config.VersionID)
+		}
+		if config.GPU != "B200" || config.InstanceType != "NCP.GPU.L40S_1x" {
+			t.Fatalf("GPU and instance type = (%q, %q), want B200 and NCP.GPU.L40S_1x", config.GPU, config.InstanceType)
+		}
+		if config.MinInstances != 2 || config.MaxInstances != 4 || config.Timeout != 900 {
+			t.Fatalf("instance counts and timeout = (%d, %d, %d), want (2, 4, 900)", config.MinInstances, config.MaxInstances, config.Timeout)
+		}
+		if config.Backend != "legacy-cluster" || len(config.Clusters) != 1 || config.Clusters[0] != "cluster-a" || len(config.Regions) != 1 || config.Regions[0] != "region-a" {
+			t.Fatalf("backend, clusters, regions = (%q, %v, %v), want legacy-cluster, [cluster-a], [region-a]", config.Backend, config.Clusters, config.Regions)
+		}
+		if config.CPUArch != "x86_64" || config.Configuration["key"] != "value" {
+			t.Fatalf("hardware/configuration = (%q, %v), want x86_64 and key=value", config.CPUArch, config.Configuration)
+		}
+	})
+
+	t.Run("malformed JSON", func(t *testing.T) {
+		deployFlags.inputFile = writeJSON(t, `{`)
+		if _, err := loadDeployConfig(&cobra.Command{}); err == nil {
+			t.Fatal("loadDeployConfig succeeded for malformed JSON")
+		}
+	})
+
+	t.Run("empty deployment specifications", func(t *testing.T) {
+		deployFlags.inputFile = writeJSON(t, `{"deploymentSpecifications":[]}`)
+		if _, err := loadDeployConfig(&cobra.Command{}); err == nil {
+			t.Fatal("loadDeployConfig succeeded with an empty deploymentSpecifications array")
+		}
+	})
 }

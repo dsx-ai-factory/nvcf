@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -154,6 +155,105 @@ func TestParseLLMModelString(t *testing.T) {
 	assertStringSlice(t, model.LLMConfig.URIs, []string{"/v1/chat/completions", "/v1/responses", "/v1/embeddings"})
 	if got := stringValue(model.LLMConfig.RoutingMethod); got != "power_of_two" {
 		t.Fatalf("routingMethod = %q, want power_of_two", got)
+	}
+}
+
+func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		parse       func() error
+		wantErrPart string
+	}{
+		{
+			name: "model malformed key value",
+			parse: func() error {
+				_, err := parseLLMModelString("name")
+				return err
+			},
+			wantErrPart: `invalid field "name"`,
+		},
+		{
+			name: "model unknown field",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,unknown=value")
+				return err
+			},
+			wantErrPart: `unknown llm model field "unknown"`,
+		},
+		{
+			name: "model missing name",
+			parse: func() error {
+				_, err := parseLLMModelString("uris=/v1/chat/completions")
+				return err
+			},
+			wantErrPart: "name is required",
+		},
+		{
+			name: "model empty uri element",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,uris=/v1/chat/completions|")
+				return err
+			},
+			wantErrPart: "uris cannot contain empty values",
+		},
+		{
+			name: "update malformed key value",
+			parse: func() error {
+				_, err := parseLLMModelUpdateString("name")
+				return err
+			},
+			wantErrPart: `invalid field "name"`,
+		},
+		{
+			name: "update unknown field",
+			parse: func() error {
+				_, err := parseLLMModelUpdateString("name=model,unknown=value")
+				return err
+			},
+			wantErrPart: `unknown llm model update field "unknown"`,
+		},
+		{
+			name: "update requires a change",
+			parse: func() error {
+				_, err := parseLLMModelUpdateString("name=model")
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+		{
+			name: "update list wraps invalid item and discards partial results",
+			parse: func() error {
+				invalid := "name=model"
+				updates, err := parseLLMModelUpdateStrings([]string{"name=valid,routingMethod=round_robin", invalid})
+				if err == nil {
+					return fmt.Errorf("expected an error")
+				}
+				if updates != nil {
+					return fmt.Errorf("updates = %#v, want nil", updates)
+				}
+				if !strings.Contains(err.Error(), invalid) {
+					return fmt.Errorf("error %q does not include invalid specification %q", err, invalid)
+				}
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.parse()
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %q, want it to contain %q", err, tt.wantErrPart)
+			}
+		})
 	}
 }
 
