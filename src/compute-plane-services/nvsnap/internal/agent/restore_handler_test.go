@@ -142,3 +142,34 @@ func TestRestoreHandler_AnswersBeforeTheDisposal(t *testing.T) {
 		t.Fatal("the answer waits for the placeholder's disposal")
 	}
 }
+
+// The /v1/restore placeholder's restore marker is removed only once the
+// background disposal is done.
+func TestRestoreHandler_ReleasesTheMarkerAfterTheDisposal(t *testing.T) {
+	pod := placeholderPod(ownedBy("ReplicaSet", true))
+	kc := fake.NewSimpleClientset(pod)
+	a := &Agent{kubeClient: kc, log: logrus.New()}
+	released := make(chan bool, 1)
+	prev := restoreForRequest
+	restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+		e := restoredNotServing(&containerd.ContainerInfo{Labels: map[string]string{
+			"io.kubernetes.pod.namespace": "sr-1", "io.kubernetes.pod.name": "fn-0", "io.kubernetes.pod.uid": "u1",
+			"io.kubernetes.container.name": "inference"}}, errors.New("nixl-resume: exit status 1")).(*restoredNotServingError)
+		e.release = func() {
+			_, gerr := kc.CoreV1().Pods("sr-1").Get(context.Background(), "fn-0", metav1.GetOptions{})
+			released <- gerr != nil // the pod is gone by then
+		}
+		return nil, e
+	}
+	t.Cleanup(func() { restoreForRequest = prev })
+	body, _ := json.Marshal(RestoreRequest{CheckpointID: "abc__20261008-101010", PlaceholderNamespace: pod.Namespace, PlaceholderPodName: pod.Name})
+	a.restoreHandler(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/restore", strings.NewReader(string(body))))
+	select {
+	case afterDisposal := <-released:
+		if !afterDisposal {
+			t.Error("the marker was released before the placeholder was disposed of")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the marker was never released")
+	}
+}

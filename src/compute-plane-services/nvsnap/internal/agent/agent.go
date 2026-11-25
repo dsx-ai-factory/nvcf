@@ -957,8 +957,13 @@ func (a *Agent) restoreHandler(w http.ResponseWriter, r *http.Request) {
 		// disposal may retry for minutes, and the caller has its answer now.
 		var ns *restoredNotServingError
 		if req.GPUShareFabricSession == "" && errors.As(err, &ns) && ns.Pod != "" {
-			go a.disposeFailedPlaceholder(context.WithoutCancel(r.Context()), ns.Namespace, ns.Pod, ns.UID, ns.Container,
-				a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod}))
+			// The restore's marker stays until then: an agent that stops
+			// before the disposal replaces the pod on its next run.
+			go func(ctx context.Context) {
+				a.disposeFailedPlaceholder(ctx, ns.Namespace, ns.Pod, ns.UID, ns.Container,
+					a.log.WithFields(logrus.Fields{"checkpointId": req.CheckpointID, "pod": ns.Namespace + "/" + ns.Pod}))
+				releaseNotServing(err)
+			}(context.WithoutCancel(r.Context()))
 		}
 		writeRestoreFailure(w, err)
 		return

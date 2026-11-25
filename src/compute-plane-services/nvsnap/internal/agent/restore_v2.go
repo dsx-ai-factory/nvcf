@@ -112,14 +112,23 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// From here the restore changes the placeholder; a marker names it until
 	// the restore ends, so the next run of an agent that stops mid-restore
 	// replaces it rather than leave a tree half restored (capture_marker.go).
+	// A restore whose engine runs and takes no requests hands the marker
+	// to whoever disposes of the placeholder (restoreTail.run): an agent
+	// that stops before the disposal replaces it on its next run.
+	clearMarker, markerKept := func() {}, false
 	if uid := placeholderInfo.Labels["io.kubernetes.pod.uid"]; uid != "" {
-		clearMarker, merr := a.markCapturing(captureMarker{Namespace: placeholderInfo.Labels["io.kubernetes.pod.namespace"],
+		c, merr := a.markCapturing(captureMarker{Namespace: placeholderInfo.Labels["io.kubernetes.pod.namespace"],
 			Pod: placeholderInfo.Labels["io.kubernetes.pod.name"], UID: uid})
 		if merr != nil {
 			return nil, merr
 		}
-		defer clearMarker()
+		clearMarker = c
 	}
+	defer func() {
+		if !markerKept {
+			clearMarker()
+		}
+	}()
 
 	// Refuse to restore into a placeholder that never pushed its own pid
 	// allocations clear of the dumped range. CRIU recreates the dumped tree at
@@ -493,7 +502,10 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 			goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
 		},
 	}
-	if err := tail.run(); err != nil {
+	tail.releaseMarker = clearMarker
+	err = tail.run()
+	markerKept = tail.markerKept
+	if err != nil {
 		return nil, err
 	}
 
@@ -764,6 +776,13 @@ type restoreTail struct {
 	unlockNet     func() error
 	resumeNIXL    func() error
 	resumeMX      func()
+	// releaseMarker removes the placeholder's restore marker
+	// (capture_marker.go). run hands it to a restoredNotServing failure,
+	// and sets markerKept: the marker stays until the placeholder is
+	// disposed of, so an agent that stops first replaces it on its next
+	// run.
+	releaseMarker func()
+	markerKept    bool
 }
 
 // run runs t's steps in order. A GPU rank of a group reloads its GPU memory
@@ -780,7 +799,7 @@ type restoreTail struct {
 // restore; outside a group, it is marked restoredNotServing, for the
 // placeholder to be disposed of (a group's leader disposes of its
 // members).
-func (t restoreTail) run() error {
+func (t *restoreTail) run() error {
 	if t.group {
 		if t.gpu {
 			if err := t.resumeGPU(true); err != nil {
@@ -814,7 +833,9 @@ func (t restoreTail) run() error {
 		return err
 	}
 	if err := t.resumeNIXL(); err != nil {
-		return restoredNotServing(t.placeholder, err)
+		e := restoredNotServing(t.placeholder, err).(*restoredNotServingError)
+		e.release, t.markerKept = t.releaseMarker, t.releaseMarker != nil
+		return e
 	}
 	t.resumeMX()
 	return nil

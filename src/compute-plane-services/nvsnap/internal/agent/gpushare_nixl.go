@@ -415,6 +415,19 @@ type restoredNotServingError struct {
 	Namespace, Pod, Container string
 	UID                       types.UID
 	err                       error
+	// release removes the placeholder's restore marker, once it is
+	// disposed of (nil: none was kept).
+	release func()
+}
+
+// releaseNotServing removes the restore marker a restoredNotServing
+// failure err kept for its placeholder, once the placeholder is disposed
+// of.
+func releaseNotServing(err error) {
+	var ns *restoredNotServingError
+	if errors.As(err, &ns) && ns.release != nil {
+		ns.release()
+	}
 }
 
 func (e *restoredNotServingError) Error() string { return e.err.Error() }

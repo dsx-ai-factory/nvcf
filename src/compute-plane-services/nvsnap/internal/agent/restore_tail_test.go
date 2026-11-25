@@ -87,3 +87,34 @@ func TestRestoreTail_Order(t *testing.T) {
 		})
 	}
 }
+
+// A single-pod restore whose connector does not resume keeps its
+// placeholder's restore marker, and hands its removal to whoever disposes
+// of the placeholder: an agent that stops first replaces the pod on its
+// next run (capture_marker.go). Any other outcome leaves the marker to
+// the restore.
+func TestRestoreTail_KeepsTheMarkerUntilTheDisposal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail string
+		kept bool
+	}{
+		{"connector does not resume", "nixl-resume", true},
+		{"restored", "", false},
+		{"GPU resume fails", "gpu-resume", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tail, _ := recordingTail(false, true, false, map[string]bool{tc.fail: true})
+			released := false
+			tail.releaseMarker = func() { released = true }
+			err := tail.run()
+			if tail.markerKept != tc.kept {
+				t.Errorf("marker kept = %v, want %v", tail.markerKept, tc.kept)
+			}
+			releaseNotServing(err)
+			if released != tc.kept {
+				t.Errorf("released by the disposer = %v, want %v", released, tc.kept)
+			}
+		})
+	}
+}
