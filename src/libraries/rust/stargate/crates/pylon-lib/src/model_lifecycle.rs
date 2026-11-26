@@ -198,8 +198,22 @@ pub async fn start_model_lifecycle(
     }
 
     let task = OwnedTask::spawn("model lifecycle supervisor", move |stop| async move {
-        if let Err(error) = supervisor.run(stop).await {
-            tracing::error!(error = %error, "model lifecycle supervisor failed");
+        let result = supervisor.run(stop.clone()).await;
+        let stats_stopped = matches!(&result, Err(ModelLifecycleError::StatsCollectorStopped));
+        let ended_by_shutdown = stats_stopped && supervisor.stats.ended_by_shutdown().await;
+        match &result {
+            Err(_) if ended_by_shutdown => {
+                tracing::debug!(
+                    "model lifecycle supervisor stopped after stats collector shutdown"
+                );
+            }
+            Err(error) => tracing::error!(error = %error, "model lifecycle supervisor failed"),
+            Ok(()) => {}
+        }
+        if stats_stopped {
+            // Pylon stops the supervisor after its registration drain. Keep
+            // admitted generations routable until that stop arrives.
+            stop.cancelled().await;
         }
         supervisor.shutdown().await;
     });
@@ -261,6 +275,17 @@ impl ModelLifecycleSupervisor {
                 self.start_canary(&generation, stop)?;
             }
             InitializationAttemptOutcome::Failed(error) => {
+                if matches!(
+                    &error,
+                    ModelLifecycleError::Bringup(BringupError::StatsCollectorStopped)
+                ) {
+                    tracing::warn!(
+                        model_id = generation.model_id(),
+                        error = %error,
+                        "model calibration failed; stats collector stopped"
+                    );
+                    return Err(ModelLifecycleError::StatsCollectorStopped);
+                }
                 if let Some(input_tps) = self.fallback_input_tps(&error) {
                     let generation = self
                         .admit_at_input_tps(&generation, &error, input_tps)
@@ -484,7 +509,17 @@ impl ModelLifecycleSupervisor {
                 result = &mut attempt => {
                     let outcome = match result {
                         Ok(()) => InitializationAttemptOutcome::Ready,
-                        Err(error) => InitializationAttemptOutcome::Failed(error),
+                        Err(error) => {
+                            let ended_by_shutdown = matches!(
+                                &error,
+                                ModelLifecycleError::Bringup(BringupError::StatsCollectorStopped)
+                            ) && self.stats.ended_by_shutdown().await;
+                            if ended_by_shutdown && stop.is_some() {
+                                InitializationAttemptOutcome::Cancelled
+                            } else {
+                                InitializationAttemptOutcome::Failed(error)
+                            }
+                        }
                     };
                     for desired in deferred_desired {
                         self.reconcile(desired).await?;
@@ -686,7 +721,13 @@ async fn initialization_attempt(
             &runtime_state,
         )
         .await;
-        timer.finish(&result);
+        let ended_by_shutdown = matches!(&result, Err(BringupError::StatsCollectorStopped))
+            && stats.ended_by_shutdown().await;
+        if ended_by_shutdown {
+            timer.record(CalibrationOutcome::Cancelled);
+        } else {
+            timer.finish(&result);
+        }
         result?;
     }
     Ok(())
@@ -861,6 +902,9 @@ mod tests {
         discovery_polled: Arc<Notify>,
         discovery_failing: Arc<AtomicBool>,
         discovery_blocked: Arc<AtomicBool>,
+        health_blocked: Arc<AtomicBool>,
+        health_blocked_polls: Arc<AtomicUsize>,
+        health_released: Arc<Notify>,
         calibrations: mpsc::UnboundedSender<ModelGeneration>,
         completed_requests: Arc<StdMutex<HashMap<ModelGeneration, usize>>>,
         completion_behavior: CompletionBehavior,
@@ -873,6 +917,9 @@ mod tests {
         discovery_polled: Arc<Notify>,
         discovery_failing: Arc<AtomicBool>,
         discovery_blocked: Arc<AtomicBool>,
+        health_blocked: Arc<AtomicBool>,
+        health_blocked_polls: Arc<AtomicUsize>,
+        health_released: Arc<Notify>,
         calibrations: mpsc::UnboundedReceiver<ModelGeneration>,
         server: TestHttpServer,
     }
@@ -889,6 +936,9 @@ mod tests {
             let discovery_polled = Arc::new(Notify::new());
             let discovery_failing = Arc::new(AtomicBool::new(false));
             let discovery_blocked = Arc::new(AtomicBool::new(false));
+            let health_blocked = Arc::new(AtomicBool::new(false));
+            let health_blocked_polls = Arc::new(AtomicUsize::new(0));
+            let health_released = Arc::new(Notify::new());
             let (calibrations, calibration_rx) = mpsc::unbounded_channel();
             let state = TestUpstreamState {
                 models: models.clone(),
@@ -896,6 +946,9 @@ mod tests {
                 discovery_polled: discovery_polled.clone(),
                 discovery_failing: discovery_failing.clone(),
                 discovery_blocked: discovery_blocked.clone(),
+                health_blocked: health_blocked.clone(),
+                health_blocked_polls: health_blocked_polls.clone(),
+                health_released: health_released.clone(),
                 calibrations,
                 completed_requests: Arc::new(StdMutex::new(HashMap::new())),
                 completion_behavior,
@@ -903,7 +956,7 @@ mod tests {
             let server = TestHttpServer::spawn(
                 Router::new()
                     .route("/v1/models", get(test_models))
-                    .route("/health", get(|| async { "ok" }))
+                    .route("/health", get(test_health))
                     .route("/v1/chat/completions", post(test_completion))
                     .with_state(state),
             )
@@ -915,6 +968,9 @@ mod tests {
                 discovery_polled,
                 discovery_failing,
                 discovery_blocked,
+                health_blocked,
+                health_blocked_polls,
+                health_released,
                 calibrations: calibration_rx,
                 server,
             }
@@ -933,6 +989,24 @@ mod tests {
 
         fn set_discovery_blocked(&self, blocked: bool) {
             self.discovery_blocked.store(blocked, Ordering::SeqCst);
+        }
+
+        fn hold_health(&self) -> usize {
+            let polls = self.health_blocked_polls.load(Ordering::SeqCst);
+            self.health_blocked.store(true, Ordering::SeqCst);
+            polls
+        }
+
+        async fn wait_for_held_health_probe_after(&self, count: usize) {
+            wait_for("upstream health probe should block", || {
+                self.health_blocked_polls.load(Ordering::SeqCst) > count
+            })
+            .await;
+        }
+
+        fn release_health(&self) {
+            self.health_blocked.store(false, Ordering::SeqCst);
+            self.health_released.notify_waiters();
         }
 
         async fn next_calibration(&mut self) -> ModelGeneration {
@@ -1012,6 +1086,20 @@ mod tests {
         async fn shutdown(self) {
             self.server.shutdown().await;
         }
+    }
+
+    async fn test_health(State(state): State<TestUpstreamState>) -> Response {
+        if state.health_blocked.load(Ordering::SeqCst) {
+            state.health_blocked_polls.fetch_add(1, Ordering::SeqCst);
+            loop {
+                let released = state.health_released.notified();
+                if !state.health_blocked.load(Ordering::SeqCst) {
+                    break;
+                }
+                released.await;
+            }
+        }
+        StatusCode::OK.into_response()
     }
 
     async fn test_models(State(state): State<TestUpstreamState>) -> Response {
@@ -1627,6 +1715,21 @@ mod tests {
         (runtime_state, stats)
     }
 
+    async fn wait_for_stats_collector_stop(
+        control: &crate::stats::StatsCollectorControl,
+        generation: &ModelGeneration,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if control.flush_and_snapshot(generation).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("stats collector should stop");
+    }
+
     fn published_input_tps(runtime_state: &PylonRuntimeState) -> BTreeMap<String, f64> {
         runtime_state
             .advertised_models()
@@ -1640,6 +1743,11 @@ mod tests {
 
     const FALLBACK_WARNING: &str =
         "model calibration failed; starting the model at the fallback input TPS";
+    const PENDING_WARNING: &str = "model initialization failed; keeping generation pending";
+    const COLLECTOR_STOPPED_WARNING: &str = "model calibration failed; stats collector stopped";
+    const SUPERVISOR_FAILED: &str = "model lifecycle supervisor failed";
+    const SUPERVISOR_STOPPED: &str =
+        "model lifecycle supervisor stopped after stats collector shutdown";
 
     /// Asserts each seeded model publishes the fallback rate with one warning and
     /// every other model publishes a measured rate.
@@ -2803,6 +2911,297 @@ mod tests {
 
         lifecycle.shutdown().await;
         stats.shutdown().await;
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_keeps_admitted_models_until_supervisor_stops() {
+        #[derive(Clone, Copy)]
+        enum CollectorEnding {
+            Shutdown,
+            Abort,
+        }
+
+        for ending in [CollectorEnding::Shutdown, CollectorEnding::Abort] {
+            let upstream = TestUpstream::spawn(&["model-a"], CompletionBehavior::Pending).await;
+            let (runtime_state, stats) = start_test_stats();
+            let mut lifecycle = start_model_lifecycle(
+                discovery_config(&upstream.base_url),
+                runtime_state.clone(),
+                &stats,
+                None,
+            )
+            .await
+            .expect("model-a should initialize");
+            let subscriber = RecordingTracingSubscriber::default();
+            let dispatch = tracing::Dispatch::new(subscriber.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+            let control = stats.control();
+
+            match ending {
+                CollectorEnding::Shutdown => stats.shutdown().await,
+                CollectorEnding::Abort => {
+                    drop(stats);
+                    wait_for_stats_collector_stop(
+                        &control,
+                        &ModelGeneration::new("collector-probe", 0),
+                    )
+                    .await;
+                }
+            }
+            upstream.set_models(&["model-a", "model-b"]).await;
+            wait_for("supervisor should observe the collector stop", || {
+                subscriber.event_count(SUPERVISOR_FAILED)
+                    + subscriber.event_count(SUPERVISOR_STOPPED)
+                    > 0
+            })
+            .await;
+
+            let exited_early =
+                tokio::time::timeout(Duration::from_millis(100), lifecycle.wait_for_exit())
+                    .await
+                    .is_ok();
+            assert!(
+                !exited_early,
+                "the supervisor must wait for its own stop before retiring admitted models"
+            );
+            assert_eq!(runtime_state.advertised_model_ids(), ["model-a"]);
+            let events = subscriber.events();
+            match ending {
+                CollectorEnding::Shutdown => {
+                    assert!(
+                        events
+                            .iter()
+                            .all(|event| event.level != tracing::Level::ERROR)
+                    );
+                    let stopped = events
+                        .iter()
+                        .filter(|event| {
+                            event.fields.get("message").map(String::as_str)
+                                == Some(SUPERVISOR_STOPPED)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(stopped.len(), 1);
+                    assert_eq!(stopped[0].level, tracing::Level::DEBUG);
+                }
+                CollectorEnding::Abort => {
+                    let failed = events
+                        .iter()
+                        .filter(|event| {
+                            event.fields.get("message").map(String::as_str)
+                                == Some(SUPERVISOR_FAILED)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(failed.len(), 1);
+                    assert_eq!(failed[0].level, tracing::Level::ERROR);
+                }
+            }
+
+            lifecycle.shutdown().await;
+            assert!(runtime_state.advertised_model_ids().is_empty());
+            drop(default_guard);
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_shutdown_cancels_calibration_without_warning() {
+        let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let (runtime_state, stats) = start_test_stats();
+        let lifecycle = start_model_lifecycle(
+            calibration_discovery_config(&upstream.base_url, Duration::from_millis(10)),
+            runtime_state,
+            &stats,
+            Some(metrics.clone()),
+        )
+        .await
+        .expect("empty initial discovery should start");
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+        let health_polls = upstream.hold_health();
+        upstream.set_models(&["model-a"]).await;
+        upstream
+            .wait_for_held_health_probe_after(health_polls)
+            .await;
+
+        stats.shutdown().await;
+        upstream.release_health();
+        upstream.next_calibration().await;
+        wait_for_calibration_count(&metrics, "model-a", "cancelled", 1).await;
+
+        lifecycle.shutdown().await;
+        drop(default_guard);
+        let events = subscriber.events();
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.fields.get("message").map(String::as_str),
+                Some(
+                    PENDING_WARNING
+                        | FALLBACK_WARNING
+                        | COLLECTOR_STOPPED_WARNING
+                        | SUPERVISOR_FAILED
+                )
+            )
+        }));
+        let body = metrics.gather_text().expect("metrics should encode");
+        assert!(!body.contains(
+            r#"pylon_model_calibration_duration_ms_count{model="model-a",outcome="error"}"#
+        ));
+        upstream.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_outside_shutdown_is_terminal_for_calibration() {
+        for fallback_input_tps in [None, Some(FALLBACK_INPUT_TPS)] {
+            let mut upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+            let metrics = PylonMetrics::new().expect("metrics should initialize");
+            let (runtime_state, stats) = start_test_stats();
+            let mut config =
+                calibration_discovery_config(&upstream.base_url, Duration::from_millis(10));
+            let ModelInitialization::Calibration(calibration) = &mut config.initialization else {
+                unreachable!("the test config calibrates")
+            };
+            calibration.fallback_input_tps = fallback_input_tps;
+            let lifecycle =
+                start_model_lifecycle(config, runtime_state, &stats, Some(metrics.clone()))
+                    .await
+                    .expect("empty initial discovery should start");
+            let subscriber = RecordingTracingSubscriber::default();
+            let dispatch = tracing::Dispatch::new(subscriber.clone());
+            let default_guard = tracing::dispatcher::set_default(&dispatch);
+            let health_polls = upstream.hold_health();
+            upstream.set_models(&["model-a"]).await;
+            upstream
+                .wait_for_held_health_probe_after(health_polls)
+                .await;
+            let control = stats.control();
+
+            drop(stats);
+            wait_for_stats_collector_stop(&control, &ModelGeneration::new("collector-probe", 0))
+                .await;
+            upstream.release_health();
+            upstream.next_calibration().await;
+            wait_for("calibration should stop the supervisor", || {
+                subscriber.event_count(SUPERVISOR_FAILED) > 0
+            })
+            .await;
+
+            lifecycle.shutdown().await;
+            drop(default_guard);
+            let events = subscriber.events();
+            let warnings = events
+                .iter()
+                .filter(|event| {
+                    event.fields.get("message").map(String::as_str)
+                        == Some(COLLECTOR_STOPPED_WARNING)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 1, "fallback: {fallback_input_tps:?}");
+            assert_eq!(warnings[0].level, tracing::Level::WARN);
+            assert!(events.iter().all(|event| {
+                !matches!(
+                    event.fields.get("message").map(String::as_str),
+                    Some(PENDING_WARNING | FALLBACK_WARNING)
+                )
+            }));
+            let body = metrics.gather_text().expect("metrics should encode");
+            assert!(body.contains(
+                r#"pylon_model_calibration_duration_ms_count{model="model-a",outcome="error"} 1"#
+            ));
+            assert!(!body.contains(
+                r#"pylon_model_calibration_duration_ms_count{model="model-a",outcome="cancelled"}"#
+            ));
+            upstream.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_collector_stop_abnormal_panic_after_shutdown_start_fails_calibration() {
+        let upstream = TestUpstream::spawn(&[], CompletionBehavior::Pending).await;
+        let metrics = PylonMetrics::new().expect("metrics should initialize");
+        let stats_config = StatsCollectorConfig {
+            kv_cache_poll_interval: Duration::ZERO,
+            ..StatsCollectorConfig::default()
+        };
+        let (runtime_state, observations) = PylonRuntimeState::observed(
+            InferenceServerStatus::Active,
+            &[],
+            stats_config.observation_channel_capacity,
+            None,
+        );
+        let stats = start_stats_collector(stats_config, observations, runtime_state.clone());
+        let control = stats.control();
+        stats
+            .shutdown_reporting_panic()
+            .await
+            .expect_err("the collector should panic after shutdown starts");
+        let generation = ModelGeneration::new("model-a", 1);
+        assert!(runtime_state.begin_generation(generation.clone()));
+        let mut supervisor = ModelLifecycleSupervisor {
+            config: calibration_discovery_config(&upstream.base_url, Duration::from_millis(10)),
+            runtime_state,
+            stats: control,
+            metrics: Some(metrics.clone()),
+            http_client: reqwest::Client::new(),
+            live: HashMap::from([(
+                generation.model_id().to_string(),
+                LiveModelGeneration {
+                    generation: generation.clone(),
+                    canary: None,
+                },
+            )]),
+            pending: Vec::new(),
+            next_generation: 2,
+            next_poll_at: None,
+        };
+        let subscriber = RecordingTracingSubscriber::default();
+        let dispatch = tracing::Dispatch::new(subscriber.clone());
+        let default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        let result = supervisor
+            .run_pending(
+                super::PendingInitialization {
+                    generation,
+                    retry_at: tokio::time::Instant::now(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ModelLifecycleError::StatsCollectorStopped)
+        ));
+        assert!(
+            supervisor.pending.is_empty(),
+            "calibration must not requeue"
+        );
+        let events = subscriber.events();
+        let warnings = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str) == Some(COLLECTOR_STOPPED_WARNING)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].level, tracing::Level::WARN);
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.fields.get("message").map(String::as_str),
+                Some(PENDING_WARNING | FALLBACK_WARNING)
+            )
+        }));
+        let body = metrics.gather_text().expect("metrics should encode");
+        assert!(body.contains(
+            r#"pylon_model_calibration_duration_ms_count{model="model-a",outcome="error"} 1"#
+        ));
+        assert!(!body.contains(
+            r#"pylon_model_calibration_duration_ms_count{model="model-a",outcome="cancelled"}"#
+        ));
+        drop(default_guard);
+        supervisor.shutdown().await;
         upstream.shutdown().await;
     }
 }

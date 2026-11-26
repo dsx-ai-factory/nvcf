@@ -475,13 +475,20 @@ impl RunningPylon {
     {
         tokio::pin!(signal);
         loop {
+            let mut collector_was_critical = false;
             let error = tokio::select! {
                 result = signal.as_mut() => {
                     let result = result.context("failed to receive pylon termination signal");
                     if let Ok(signal) = &result {
                         info!(signal, "received shutdown signal");
                     }
-                    self.shutdown(ShutdownCause::Signal).await;
+                    if let Some(error) = self
+                        .shutdown_reporting_collector_panic(ShutdownCause::Signal)
+                        .await
+                    {
+                        error!(error = %error, "critical pylon task exited");
+                        return Err(error);
+                    }
                     return result.map(|_| ());
                 }
                 result = self.registration_client.wait_for_exit() => critical_task_exit_error("registration session", result),
@@ -501,7 +508,10 @@ impl RunningPylon {
                     }
                     critical_task_exit_error("engine stats stream", result)
                 }
-                result = self.stats_collector.wait_for_exit() => critical_task_exit_error("stats collector", result),
+                result = self.stats_collector.wait_for_exit() => {
+                    collector_was_critical = true;
+                    critical_task_exit_error("stats collector", result)
+                }
                 result = async {
                     self.model_lifecycle.wait_for_exit().await
                 } => critical_task_exit_error("model lifecycle supervisor", result),
@@ -516,12 +526,27 @@ impl RunningPylon {
                 }
             };
             error!(error = %error, "critical pylon task exited");
-            self.shutdown(ShutdownCause::CriticalTaskExit).await;
-            return Err(error);
+            let collector_error = self
+                .shutdown_reporting_collector_panic(ShutdownCause::CriticalTaskExit)
+                .await;
+            return Err(finish_critical_task_shutdown(
+                error,
+                collector_error,
+                collector_was_critical,
+            ));
         }
     }
 
+    #[cfg(test)]
     async fn shutdown(self, cause: ShutdownCause) {
+        let _ = self.shutdown_reporting_collector_panic(cause).await;
+    }
+
+    /// Stops every task and returns a collector panic that was not already reported.
+    async fn shutdown_reporting_collector_panic(
+        self,
+        cause: ShutdownCause,
+    ) -> Option<anyhow::Error> {
         let Self {
             inference_server_id,
             mut registration_client,
@@ -537,13 +562,13 @@ impl RunningPylon {
         if let Some(summary) = registration_client.shutdown().await {
             log_drain_summary(&inference_server_id, cause, &summary);
         }
-        tokio::join!(
+        let (_, stats_collector, ..) = tokio::join!(
             async move {
                 if let Some(stream) = engine_stats_stream {
                     stream.handle.shutdown().await;
                 }
             },
-            stats_collector.shutdown(),
+            stats_collector.shutdown_reporting_panic(),
             model_lifecycle.shutdown(),
             metrics_server.shutdown(),
             async move {
@@ -552,7 +577,19 @@ impl RunningPylon {
                 }
             },
         );
+        stats_collector.err()
     }
+}
+
+fn finish_critical_task_shutdown(
+    error: anyhow::Error,
+    collector_error: Option<anyhow::Error>,
+    collector_was_critical: bool,
+) -> anyhow::Error {
+    if !collector_was_critical && let Some(collector_error) = collector_error {
+        error!(error = %collector_error, "critical pylon task exited during shutdown");
+    }
+    error
 }
 
 /// What started Pylon's shutdown, for the drain summary.
@@ -2813,5 +2850,203 @@ mod tests {
             plan.auth_token_provider.as_deref(),
             Some(AuthTokenProvider::File(path)) if path == std::path::Path::new("/tmp/pylon-token")
         ));
+    }
+
+    #[derive(Clone, Default)]
+    struct CriticalErrorRecorder(Arc<StdMutex<Vec<String>>>);
+
+    impl CriticalErrorRecorder {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(
+                &mut *self
+                    .0
+                    .lock()
+                    .expect("recorded errors should not be poisoned"),
+            )
+        }
+    }
+
+    impl tracing::Subscriber for CriticalErrorRecorder {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.level() == &tracing::Level::ERROR
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(
+            &self,
+            _span: &tracing::span::Id,
+            _follows_from: &tracing::span::Id,
+        ) {
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct ErrorField(Option<String>);
+
+            impl tracing::field::Visit for ErrorField {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "error" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+
+            let mut error = ErrorField::default();
+            event.record(&mut error);
+            self.0
+                .lock()
+                .expect("recorded errors should not be poisoned")
+                .push(error.0.unwrap_or_default());
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn critical_shutdown_logs_only_unreported_collector_error() {
+        let recorder = CriticalErrorRecorder::default();
+        let dispatch = tracing::Dispatch::new(recorder.clone());
+        let _default_guard = tracing::dispatcher::set_default(&dispatch);
+
+        let original = finish_critical_task_shutdown(
+            anyhow::anyhow!("metrics server exited unexpectedly"),
+            Some(anyhow::anyhow!("collector cleanup failed")),
+            false,
+        );
+        assert_eq!(original.to_string(), "metrics server exited unexpectedly");
+        assert_eq!(recorder.take(), ["collector cleanup failed"]);
+
+        let original = finish_critical_task_shutdown(
+            anyhow::anyhow!("stats collector failed"),
+            Some(anyhow::anyhow!("stats collector failed")),
+            true,
+        );
+        assert_eq!(original.to_string(), "stats collector failed");
+        assert!(recorder.take().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_panic_is_the_critical_exit() {
+        let (_observation_tx, observation_rx) = flume::bounded(1);
+        let stats_collector = start_stats_collector_with_engine_stats(
+            StatsCollectorConfig {
+                kv_cache_poll_interval: Duration::ZERO,
+                ..StatsCollectorConfig::default()
+            },
+            observation_rx,
+            None,
+            PylonRuntimeState::default(),
+        );
+        let runtime = test_running_pylon(stats_collector).await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(
+                runtime.run_until_shutdown(std::future::pending::<std::io::Result<&'static str>>()),
+            ),
+        )
+        .await
+        .expect("collector panic shutdown should finish")
+        .expect("collector panic should not be re-raised during shutdown");
+        let error = outcome.expect_err("collector panic should fail the runtime");
+        let message = error.to_string();
+        assert!(message.contains("stats collector failed"), "{message}");
+        assert!(message.contains("panicked"), "{message}");
+        assert!(message.contains("period"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_shutdown_does_not_rethrow_panic() {
+        let (_observation_tx, observation_rx) = flume::bounded(1);
+        let stats_collector = start_stats_collector_with_engine_stats(
+            StatsCollectorConfig {
+                kv_cache_poll_interval: Duration::ZERO,
+                ..StatsCollectorConfig::default()
+            },
+            observation_rx,
+            None,
+            PylonRuntimeState::default(),
+        );
+        let runtime = test_running_pylon(stats_collector).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(runtime.shutdown(ShutdownCause::Signal)),
+        )
+        .await
+        .expect("collector panic shutdown should finish")
+        .expect("collector panic should not be re-raised during shutdown");
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_abnormal_clean_exit_is_an_error() {
+        let observation_rx = {
+            let (_observation_tx, observation_rx) =
+                flume::bounded::<pylon_lib::RequestObservationEvent>(1);
+            observation_rx
+        };
+        let mut stats_collector = start_stats_collector_with_engine_stats(
+            StatsCollectorConfig::default(),
+            observation_rx,
+            None,
+            PylonRuntimeState::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), stats_collector.wait_for_exit())
+            .await
+            .expect("collector should finish after its observation input disconnects")
+            .expect("disconnected observation input should end the collector cleanly");
+        let runtime = test_running_pylon(stats_collector).await;
+
+        let reported = runtime
+            .shutdown_reporting_collector_panic(ShutdownCause::Signal)
+            .await;
+        let error = reported.expect("an abnormal clean collector exit should fail shutdown");
+        assert_eq!(error.to_string(), "stats collector exited unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn stats_collector_stop_signal_shutdown_returns_panic_message() {
+        let (_observation_tx, observation_rx) = flume::bounded(1);
+        let stats_collector = start_stats_collector_with_engine_stats(
+            StatsCollectorConfig {
+                kv_cache_poll_interval: Duration::ZERO,
+                ..StatsCollectorConfig::default()
+            },
+            observation_rx,
+            None,
+            PylonRuntimeState::default(),
+        );
+        let runtime = test_running_pylon(stats_collector).await;
+
+        let reported = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(runtime.shutdown_reporting_collector_panic(ShutdownCause::Signal)),
+        )
+        .await
+        .expect("collector panic shutdown should finish")
+        .expect("collector panic should not be re-raised during shutdown");
+        let error = reported.expect("signal-started shutdown should report the collector panic");
+        let message = error.to_string();
+        assert!(message.contains("stats collector"), "{message}");
+        assert!(message.contains("panicked"), "{message}");
+        assert!(message.contains("period"), "{message}");
     }
 }
