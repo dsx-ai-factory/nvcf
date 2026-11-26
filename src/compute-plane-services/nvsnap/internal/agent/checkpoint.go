@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -167,16 +168,16 @@ func nvidiaSMICommand(roots []struct{ root, bin string }, args []string) (string
 	return "", nil, errNoNvidiaSMI
 }
 
-// rootLoader returns the dynamic loader of the filesystem at root, or "".
+// rootLoader returns the dynamic loader of the filesystem at root for the
+// agent's own architecture (the node's), or "": a root may also hold
+// another architecture's loader, which cannot run here.
 func rootLoader(root string) string {
-	for _, l := range []string{
-		"lib/ld-linux-aarch64.so.1",
-		"lib64/ld-linux-x86-64.so.2",
-		"lib/ld-linux-x86-64.so.2",
-		"usr/lib/" + hostlibs.Triplet() + "/ld-linux-aarch64.so.1",
-		"usr/lib/" + hostlibs.Triplet() + "/ld-linux-x86-64.so.2",
-	} {
-		if p := resolveInRoot(root, l); p != "" {
+	name := "ld-linux-x86-64.so.2"
+	if runtime.GOARCH == "arm64" {
+		name = "ld-linux-aarch64.so.1"
+	}
+	for _, dir := range []string{"lib", "lib64", "usr/lib/" + hostlibs.Triplet(), "lib/" + hostlibs.Triplet()} {
+		if p := resolveInRoot(root, dir+"/"+name); p != "" {
 			if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
 				return p
 			}
@@ -228,7 +229,7 @@ func resolveInRoot(root, rel string) string {
 		todo = append(strings.Split(t, "/"), todo...)
 	}
 	if fi, err := os.Lstat(root + cur); err == nil && (fi.Mode().IsRegular() || fi.IsDir()) && cur != "" {
-		return root + cur
+		return filepath.Join(root, cur)
 	}
 	return ""
 }
