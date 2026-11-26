@@ -1788,8 +1788,8 @@ func TestEnsureDockerConfigSecret(t *testing.T) {
 			name: "update existing secret",
 			seedSecret: &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-				Type:       corev1.SecretTypeOpaque,
-				Data:       nil,
+				Type:       corev1.SecretTypeDockerConfigJson,
+				Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{}}`)},
 			},
 		},
 	}

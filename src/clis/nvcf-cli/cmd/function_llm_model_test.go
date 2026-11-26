@@ -163,12 +163,12 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		parse       func() error
+		parse       func(*testing.T) error
 		wantErrPart string
 	}{
 		{
 			name: "model malformed key value",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelString("name")
 				return err
 			},
@@ -176,7 +176,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "model unknown field",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelString("name=model,unknown=value")
 				return err
 			},
@@ -184,7 +184,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "model missing name",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelString("uris=/v1/chat/completions")
 				return err
 			},
@@ -192,7 +192,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "model empty uri element",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelString("name=model,uris=/v1/chat/completions|")
 				return err
 			},
@@ -200,7 +200,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "update malformed key value",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelUpdateString("name")
 				return err
 			},
@@ -208,7 +208,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "update unknown field",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelUpdateString("name=model,unknown=value")
 				return err
 			},
@@ -216,7 +216,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "update requires a change",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				_, err := parseLLMModelUpdateString("name=model")
 				return err
 			},
@@ -224,17 +224,17 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		},
 		{
 			name: "update list wraps invalid item and discards partial results",
-			parse: func() error {
+			parse: func(t *testing.T) error {
 				invalid := "name=model"
 				updates, err := parseLLMModelUpdateStrings([]string{"name=valid,routingMethod=round_robin", invalid})
 				if err == nil {
-					return fmt.Errorf("expected an error")
+					t.Fatal("expected an error")
 				}
 				if updates != nil {
-					return fmt.Errorf("updates = %#v, want nil", updates)
+					t.Fatalf("updates = %#v, want nil", updates)
 				}
 				if !strings.Contains(err.Error(), invalid) {
-					return fmt.Errorf("error %q does not include invalid specification %q", err, invalid)
+					t.Fatalf("error %q does not include invalid specification %q", err, invalid)
 				}
 				return err
 			},
@@ -246,7 +246,7 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := tt.parse()
+			err := tt.parse(t)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -551,12 +551,12 @@ func TestApplyCreateFlagOverridesArtifactAndEnvironmentPaths(t *testing.T) {
 	})
 
 	tests := []struct {
-		name          string
-		containerEnv  []string
-		models        []string
-		llmModels     []string
-		resources     []string
-		wantErr       bool
+		name         string
+		containerEnv []string
+		models       []string
+		llmModels    []string
+		resources    []string
+		wantErr      bool
 	}{
 		{
 			name:         "parses and combines overrides",
@@ -571,9 +571,9 @@ func TestApplyCreateFlagOverridesArtifactAndEnvironmentPaths(t *testing.T) {
 			wantErr:      true,
 		},
 		{
-			name:      "rejects invalid artifact",
-			models:    []string{"invalid-artifact"},
-			wantErr:   true,
+			name:    "rejects invalid artifact",
+			models:  []string{"invalid-artifact"},
+			wantErr: true,
 		},
 	}
 
@@ -591,8 +591,8 @@ func TestApplyCreateFlagOverridesArtifactAndEnvironmentPaths(t *testing.T) {
 			cmd.Flags().StringSlice("resources", nil, "")
 			flagValues := map[string]string{
 				"container-env": strings.Join(tt.containerEnv, ","),
-				"models":       strings.Join(tt.models, ","),
-				"resources":    strings.Join(tt.resources, ","),
+				"models":        strings.Join(tt.models, ","),
+				"resources":     strings.Join(tt.resources, ","),
 			}
 			if len(tt.llmModels) > 0 {
 				flagValues["llm-model"] = tt.llmModels[0]

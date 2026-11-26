@@ -188,12 +188,12 @@ esac
 
 func TestDiscoverSpireOIDC(t *testing.T) {
 	tests := []struct {
-		name          string
-		labelOutput   string
-		labelFailure  bool
-		fallbackOutput string
+		name            string
+		labelOutput     string
+		labelFailure    bool
+		fallbackOutput  string
 		fallbackFailure bool
-		want          string
+		want            string
 	}{
 		{name: "label query success", labelOutput: "10.43.0.10:8080", fallbackOutput: "ignored svc 10.43.0.11:8080", want: "10.43.0.10:8080"},
 		{name: "empty label result falls back to oidc discovery", labelOutput: ":", fallbackOutput: "oidc-discovery-provider 10.43.0.12:8080", want: "10.43.0.12:8080"},
@@ -267,15 +267,17 @@ func TestFetchClusterJWKS(t *testing.T) {
 			script := `#!/bin/sh
 case "$*" in
   *nvcf-oidc-probe*)
+    printf 'oidc\n' >> "$FAKE_SPIRE_PROBES"
     [ "$FAKE_SPIRE_FETCH_FAIL" != 1 ] || exit 1
     printf '%s' "$FAKE_SPIRE_DISCOVERY"
     ;;
   *nvcf-jwks-probe*)
+    printf 'jwks\n' >> "$FAKE_SPIRE_PROBES"
     [ "$FAKE_SPIRE_FETCH_FAIL" != 1 ] || exit 1
     printf '%s' "$FAKE_SPIRE_JWKS"
     ;;
-  *"get svc -A"*) printf '%s' "$FAKE_SERVICE_OUTPUT" ;;
   *"app.kubernetes.io/name=spiffe-oidc-discovery-provider"*) printf ':' ;;
+  *"get svc -A"*) printf '%s' "$FAKE_SERVICE_OUTPUT" ;;
   *"get --raw /.well-known/openid-configuration"*) printf '%s' "$FAKE_K8S_DISCOVERY" ;;
   *"get --raw /openid/v1/jwks"*)
     [ "$FAKE_K8S_JWKS_FAIL" != 1 ] || exit 1
@@ -286,6 +288,8 @@ esac
 `
 			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			probeLog := filepath.Join(binDir, "spire-probes")
+			t.Setenv("FAKE_SPIRE_PROBES", probeLog)
 			t.Setenv("FAKE_SERVICE_OUTPUT", tt.serviceOutput)
 			t.Setenv("FAKE_SPIRE_DISCOVERY", tt.spireDiscovery)
 			t.Setenv("FAKE_SPIRE_JWKS", tt.spireJWKS)
@@ -301,6 +305,17 @@ esac
 			}
 
 			issuer, jwks, identity, err := fetchClusterJWKS(&client.Config{}, tt.manualIssuer)
+			if tt.manualIssuer == "" && strings.HasPrefix(tt.serviceOutput, "other-service ") {
+				_, probeErr := os.Stat(probeLog)
+				require.ErrorIs(t, probeErr, os.ErrNotExist, "absent SPIRE must not launch probe pods")
+			} else {
+				probeCalls, probeErr := os.ReadFile(probeLog)
+				require.NoError(t, probeErr)
+				assert.Contains(t, string(probeCalls), "oidc\n")
+				if !tt.spireFetchFails {
+					assert.Contains(t, string(probeCalls), "jwks\n")
+				}
+			}
 			if tt.wantError != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantError)
@@ -546,12 +561,12 @@ esac
 
 func TestFetchK8sOIDCJWKSErrors(t *testing.T) {
 	tests := []struct {
-		name            string
-		discovery       string
-		jwks            string
-		failDiscovery   bool
-		failJWKS        bool
-		wantError       string
+		name          string
+		discovery     string
+		jwks          string
+		failDiscovery bool
+		failJWKS      bool
+		wantError     string
 	}{
 		{name: "discovery command failure", failDiscovery: true, wantError: "failed to fetch OIDC configuration"},
 		{name: "malformed discovery JSON", discovery: "not json", wantError: "failed to parse OIDC configuration"},
@@ -1171,9 +1186,15 @@ func TestGetHTTPString(t *testing.T) {
 	}{
 		{name: "invalid request URL", rawURL: "://bad", client: http.DefaultClient, wantError: "missing protocol scheme"},
 		{name: "transport failure", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return nil, transportErr })}, wantError: "transport failed"},
-		{name: "trims successful response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("  body text\n"))}, nil })}, want: "body text"},
-		{name: "non-200 response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(" upstream unavailable \n"))}, nil })}, wantError: "502 from https://example.test: upstream unavailable"},
-		{name: "response body read failure", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusOK, Body: getHTTPStringFailingBody{}}, nil })}, wantError: "body read failed"},
+		{name: "trims successful response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("  body text\n"))}, nil
+		})}, want: "body text"},
+		{name: "non-200 response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(" upstream unavailable \n"))}, nil
+		})}, wantError: "502 from https://example.test: upstream unavailable"},
+		{name: "response body read failure", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: getHTTPStringFailingBody{}}, nil
+		})}, wantError: "body read failed"},
 	}
 
 	for _, tt := range tests {
