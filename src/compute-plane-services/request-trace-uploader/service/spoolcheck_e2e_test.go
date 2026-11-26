@@ -95,6 +95,11 @@ func waitStarted(t *testing.T, slow slowPrepare) {
 
 func TestASlowPrepareDoesNotDelayTheSpoolCheck(t *testing.T) {
 	spool, _ := spoolWith(t, []string{uploadertest.RequestEnd("a", 1)})
+	active := filepath.Join(spool.Dir, config.DefaultSegmentPrefix+".000001.jsonl.gz")
+	stamp := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(active, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
 	slow := newSlowPrepare()
 	metrics, err := telemetry.NewMemory("fake")
 	if err != nil {
@@ -124,6 +129,10 @@ func TestASlowPrepareDoesNotDelayTheSpoolCheck(t *testing.T) {
 	waitFor(t, "the spool gauges while the prepare runs", func() bool {
 		free, ok := metrics.Value(telemetry.SpoolFreeBytes, nil)
 		return ok && free > 0
+	})
+	waitFor(t, "the active file age while the prepare runs", func() bool {
+		age, ok := metrics.Value("open_file_age", nil)
+		return ok && age >= 3600
 	})
 	waitFor(t, "the stale quarantine entry to be removed and counted while the prepare runs", func() bool {
 		got, _ := metrics.Value(telemetry.QuarantineEvicted, nil)

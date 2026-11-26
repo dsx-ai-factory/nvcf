@@ -192,6 +192,31 @@ Rate, errors and duration of the export path:
   Dynamo v1.4.0 event type, or `unknown` for an unparseable line, an older
   release's record, or an event type this build does not know.
 
+- `open_file_age`, seconds: estimated oldest wait across nonempty active
+  files, including each configured prefix and tied highest indices. The
+  first observed modification time is retained across appends. Empty,
+  removed, replaced, truncated, or rolled files reset their observation;
+  no qualifying files reports zero. Only file metadata is inspected.
+  The gauge starts at zero and refreshes with the spool gauges, including
+  the independent 10-second spool check. Failed metadata scans preserve
+  the last value and log a warning. The existing `oldest_pending_age`
+  continues to cover closed segments only.
+
+  This is an estimate: on restart, an existing file's last-write time can
+  understate the age of its oldest record. Nonzero size can include gzip
+  headers or a partial record. Truncation followed by regrowth between
+  checks can be missed. No record timestamp is read.
+
+  Add an `Oldest open-file age (estimate)` seconds panel beside closed
+  pending age. With conventional Prometheus translation, use
+  `max by (backend, pod) (dynamo_request_trace_open_file_age_seconds)`
+  with the dashboard's workload filters. Use max across pods, never sum.
+  An example alert threshold is greater than 900 seconds for 5 minutes;
+  tune it to the delivery objective. OTLP names the gauge
+  `dynamo.request_trace.open_file_age` with unit `s`; collector naming can
+  vary. Missing telemetry needs a separate alert. This signal observes
+  waiting data and does not upload the active file.
+
 - `uptime`, seconds: time since the uploader became ready, refreshed on the
   spool check interval. It is absent while startup has not succeeded.
 - `startup_failures` (`reason`): startup attempts that failed and will be

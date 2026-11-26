@@ -162,6 +162,9 @@ type Uploader struct {
 	submitMu  sync.Mutex
 	pollMu    sync.Mutex
 	cleanupMu sync.Mutex
+	// openFilesMu serializes metadata scans and their gauge observations.
+	openFilesMu sync.Mutex
+	openFiles   map[string]openFileObservation
 	// fingerprints is used by intake only.
 	fingerprints map[fileIdentity]string
 	// backlog runs full-batch submits beside intake. Intake sets it before
