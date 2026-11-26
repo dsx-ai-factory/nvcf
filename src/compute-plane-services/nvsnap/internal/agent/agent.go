@@ -79,6 +79,10 @@ type Config struct {
 	// on its loopback, translated at its edge, when no other pod uses it
 	// (restore_address.go).
 	RestoreCapturedAddress bool
+	// IdentityRestore captures a Dynamo worker that registers in a shared
+	// etcd alone, with its etcd identity, and restores it as that identity
+	// (identity_etcd.go; --identity-restore).
+	IdentityRestore bool
 	// CheckpointHostDir is the host filesystem path that backs CheckpointDir
 	// inside the agent container. The capture-write writer Job consumes
 	// CaptureSource.SrcPath as a host path (joined with /host), so the
@@ -326,6 +330,10 @@ const DefaultWriterPullSecret = "nvsnap-agent-pull" //nolint:gosec // secret nam
 
 // Agent is the NVSNAP node agent
 type Agent struct {
+	// identityDisabledSeen holds the identity records admission found
+	// with identity restore off, each counted once (identityRecordVisible).
+	identityDisabledSeen sync.Map
+
 	// drivers is the cluster's GPU drivers as the agents report them
 	// (driver_gate.go).
 	drivers driverView

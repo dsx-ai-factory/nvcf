@@ -313,3 +313,38 @@ func TestCRIUGroupRestore_PlaceholderGetsTheLandingsEnvironment(t *testing.T) {
 		t.Errorf("HF_MODULES_CACHE = %q, want %q off the read-only landing", modules, criuHFModulesCache)
 	}
 }
+
+// A rank that names its own namespace in its configuration (its etcd's
+// address) is admitted only from a capture that holds its etcd identity,
+// taken in that namespace: the agent's identity restore restores it as
+// itself. With identity restore off the agent does not look such a
+// record up, so IdentityNamespace is empty and the pod starts cold; a
+// capture from another namespace of the tenant is refused too.
+func TestCRIUGroupRestore_OwnInstanceAdmittedForItsIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, identityNS string
+		admitted         bool
+	}{
+		{"identity restore off (no identity namespace)", "", false},
+		{"identity captured in the pod's namespace", "fn", true},
+		{"identity captured in another namespace", "fn-other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := CRIUGroup{Checkpoints: []string{"r0__1", "r1__1"}, Nodes: []string{"n0", "n1"}, IdentityNamespace: tc.identityNS}
+			m, _ := groupMutator(t, g, "")
+			pod := lwsRank("0")
+			pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "DYN_NAMESPACE", Value: "pool"}, {Name: "ETCD_ENDPOINTS", Value: "http://etcd.fn.svc.cluster.local:2379"}}
+			if NamesOwnInstance(pod) == "" {
+				t.Fatal("the test pod does not name its own instance")
+			}
+			patches, err := m.Mutate(context.Background(), pod)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := applyPatches(t, pod, patches)
+			if admitted := got.Annotations[CRIURestoreAnnotation] != ""; admitted != tc.admitted {
+				t.Fatalf("admitted %v; want %v", admitted, tc.admitted)
+			}
+		})
+	}
+}

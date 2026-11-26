@@ -20,6 +20,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -177,6 +178,28 @@ type RestoreRequest struct {
 	// before the restore. Needed for a placeholder the webhook made from
 	// the workload's own pod: it is not privileged, so it cannot do it.
 	ReservePIDs bool `json:"reservePids,omitempty"`
+	// PlaceholderPodUID, when set, binds the restore to that pod: a
+	// placeholder container of another pod under the same name (replaced
+	// since) is refused (errPlaceholderReplaced).
+	PlaceholderPodUID string `json:"placeholderPodUid,omitempty"`
+}
+
+// errPlaceholderReplaced marks a restore refused before anything ran: the
+// container found under the placeholder's name is not the pod the request
+// names.
+var errPlaceholderReplaced = errors.New("the placeholder container is not the pod's the restore was asked for")
+
+// placeholderOfPod refuses a placeholder container that is not pod uid's
+// (by its runtime label); without uid any is taken. A container without
+// the label is refused: it cannot be told.
+func placeholderOfPod(info *containerd.ContainerInfo, uid string) error {
+	if uid == "" {
+		return nil
+	}
+	if got := info.Labels["io.kubernetes.pod.uid"]; got != uid {
+		return fmt.Errorf("%w: it is of pod uid %q, not %q", errPlaceholderReplaced, got, uid)
+	}
+	return nil
 }
 
 // RestoreResult is the result of a restore operation
@@ -385,6 +408,9 @@ func (a *Agent) Restore(ctx context.Context, req RestoreRequest) (*RestoreResult
 		placeholderInfo, findErr = a.runtime.FindContainerByPod(ctx, req.PlaceholderNamespace, req.PlaceholderPodName, req.PlaceholderContainerName)
 		if findErr != nil {
 			return nil, fmt.Errorf("failed to find placeholder container: %w", findErr)
+		}
+		if err := placeholderOfPod(placeholderInfo, req.PlaceholderPodUID); err != nil {
+			return nil, err
 		}
 		log = log.WithFields(logrus.Fields{
 			"placeholderId":  placeholderInfo.ID[:12],

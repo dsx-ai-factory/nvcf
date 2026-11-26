@@ -171,6 +171,10 @@ func RegisterAgent() {
 			AgentAuthTotal,
 		)
 		prometheus.MustRegister(lifecycleCollectors...)
+		prometheus.MustRegister(IdentityRestoreDecisions)
+		for _, d := range IdentityDecisions {
+			IdentityRestoreDecisions.WithLabelValues(d)
+		}
 		// The agent serves an HTTP API too, so it needs the same RED metrics
 		// the server has. See InstrumentRoute.
 		registerAPIMetrics()

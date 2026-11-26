@@ -752,6 +752,9 @@ type pidnsDumpHooks struct {
 	// NIXLFence: the capture paused the NIXL KV connector; the marker is
 	// written as pidNSNIXLMarkerFile (pidNSMarkerName).
 	NIXLFence bool
+	// Frozen, when set, runs once the container is frozen, right before
+	// CRIU starts; an error fails the dump before it runs.
+	Frozen func() error
 }
 
 func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID int, checkpointDir string, deviceExternals []string, final dumpFinal, gpushare bool, hooks pidnsDumpHooks, log *logrus.Entry) (bool, error) {
@@ -842,6 +845,11 @@ func (a *Agent) dumpPIDNamespace(ctx context.Context, procBase string, hostPID i
 	}
 	if len(ended) > 0 {
 		log.WithField("pids", ended).Info("criu-v2: ended the runtime's exec sessions in the container (a probe's or a kubectl exec's); they cannot be dumped")
+	}
+	if hooks.Frozen != nil {
+		if ferr := hooks.Frozen(); ferr != nil {
+			return false, fmt.Errorf("pid-namespace dump: %w", ferr)
+		}
 	}
 	args = append(args, "--freeze-cgroup", cg)
 	log.WithField("cgroup", cg).Info("criu-v2: dumping the container from its frozen cgroup")

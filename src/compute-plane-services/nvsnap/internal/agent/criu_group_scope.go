@@ -166,10 +166,16 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod, g webhook.
 	}
 	// Admission is decided once, so an unreadable count fails closed: the
 	// pod starts cold (grove_replicas.go).
-	if why, err := a.sharedCompanionsReason(ctx, pod, pods.Items); err != nil {
+	// A worker captured alone with its identity shares nothing it
+	// restores (identity_etcd.go); the pod carries no record yet.
+	if alone, err := a.identityRecordAlone(ctx, g.Key); err != nil {
 		return false, err.Error()
-	} else if why != "" {
-		return false, why
+	} else if !alone {
+		if why, err := a.sharedCompanionsReason(ctx, pod, pods.Items); err != nil {
+			return false, err.Error()
+		} else if why != "" {
+			return false, why
+		}
 	}
 	now := time.Now()
 	for i := range pods.Items {

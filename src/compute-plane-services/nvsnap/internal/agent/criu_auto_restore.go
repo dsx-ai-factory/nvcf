@@ -183,9 +183,13 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	c.considerRestored(ctx, pod)
 	c.considerRestoredCondition(ctx, pod)
 	c.considerColdStart(ctx, pod)
+	c.considerRestoredIdentity(ctx, pod)
 	c.considerRestoredStacks(ctx, pod)
 	c.considerTeardown(ctx, pod)
 	c.observePodReady(ctx, pod)
+	if c.considerRefusing(ctx, pod) {
+		return
+	}
 	if !c.admitted(ctx, pod) {
 		return
 	}
@@ -269,19 +273,44 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	defer cancel()
 	t0 := time.Now()
 	ref := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid}}
+	var refusedPod *corev1.Pod
 	err := func() error {
 		if why := c.driverMismatch(rctx, groupKey); why != "" {
 			// Not run, and not held against the capture: the replacement is
 			// admitted under the cluster's drivers as they are now.
 			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
 		}
-		_, err := restoreForRequest(a, rctx, RestoreRequest{
+		keeper, target, ierr := c.loneIdentityBeforeRestore(rctx, ctx, groupKey, ns, pod, uid, id, log)
+		if ierr != nil {
+			refusedPod = target
+			return ierr
+		}
+		req := RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
 			PlaceholderPodName:       pod,
 			PlaceholderContainerName: container,
 			ReservePIDs:              true,
-		})
+		}
+		if keeper != nil {
+			// The identity is set up for pod uid, which the wait for the
+			// captured lease may have outlived: the pod is read again, and
+			// the restore takes only that pod's container.
+			if _, serr := c.samePlaceholder(rctx, ns, pod, uid, id); serr != nil {
+				keeper.restored(serr)
+				refusedPod = target
+				return serr
+			}
+			req.PlaceholderPodUID = string(uid)
+		}
+		_, err := restoreForRequest(a, rctx, req)
+		keeper.restored(err)
+		if errors.Is(err, errPlaceholderReplaced) {
+			// Nothing restored: refused, so the replacement is left to its
+			// own restore and nothing is counted.
+			refusedPod = target
+			return refuseIdentity(identityRefusedError, err)
+		}
 		return err
 	}()
 	record := func(change func(map[string]string) bool) {
@@ -305,6 +334,15 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 	}
 	if ctx.Err() != nil {
 		return // the agent stops; the next one restores the pod
+	}
+	if errors.Is(err, errIdentityRefused) {
+		// Nothing restored, nothing held against the capture.
+		if refusedPod == nil || refusedPod.UID == "" {
+			refusedPod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: pod, UID: uid,
+				Annotations: map[string]string{webhook.CRIURestoreAnnotation: id, webhook.CRIURestoreContainerAnnotation: container}}}
+		}
+		c.identityRefused(context.WithoutCancel(ctx), groupKey, id, []*corev1.Pod{refusedPod}, err, func() { c.attempted.Delete(uid) }, log)
+		return
 	}
 	if errors.Is(err, errNotPlaceholder) {
 		// Restored already (by this agent before a restart, which kept its

@@ -262,7 +262,7 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 	if err != nil || size < 1 {
 		return webhook.CRIUGroup{}, false
 	}
-	g := webhook.CRIUGroup{Key: key, GPUShare: data["gpushare"] == "true", VerifyNamespace: verifyNamespace(data),
+	g := webhook.CRIUGroup{Key: key, GPUShare: data["gpushare"] == "true", VerifyNamespace: verifyNamespace(data), IdentityNamespace: data[identityNamespaceKey],
 		Checkpoints: make([]string, size), Nodes: make([]string, size), Companion: make([]bool, size), Containers: make([]string, size), Bundles: make([]string, size), ColdEntrypoints: make([]string, size),
 		ProcessConfigs: make([]string, size)}
 	for i := range size {
@@ -373,12 +373,18 @@ func (a *Agent) lookupCRIUGroup(ctx context.Context, key string) (webhook.CRIUGr
 		}
 		return webhook.CRIUGroup{}, false
 	}
+	if !a.identityRecordVisible(key, cm.Data) {
+		return webhook.CRIUGroup{}, false
+	}
 	if cm.Data["state"] == criuGroupStateAlias {
 		// A rank of an instance whose ranks differ in configuration finds
 		// the instance's record through the alias of its own.
 		// A companion's alias also names its slots.
 		target, slots := cm.Data["alias"], parseSlots(cm.Data)
 		if cm, err = a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(target), metav1.GetOptions{}); err != nil {
+			return webhook.CRIUGroup{}, false
+		}
+		if !a.identityRecordVisible(target, cm.Data) {
 			return webhook.CRIUGroup{}, false
 		}
 		g, ok := parseCRIUGroup(target, cm.Data)
@@ -689,7 +695,8 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		log.WithError(err).Warn("CRIU group capture: cannot list the instance's pods")
 		return true
 	}
-	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, pods.Items, log); skip {
+	again, skip, alone := c.sharedBlocksCapture(ctx, leader, pods.Items, log)
+	if skip {
 		return again
 	}
 	// A rank the webhook never mutated is never one of the instance's ranks
@@ -721,7 +728,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			return false
 		}
 	}
-	companions, companionContainers, err := a.discoverCompanions(ctx, ranks, log)
+	var companions []*corev1.Pod
+	var companionContainers map[string]string
+	if !alone {
+		// Captured alone with its identity, the instance takes none of
+		// what its namespace shares (identity_etcd.go).
+		companions, companionContainers, err = a.discoverCompanions(ctx, ranks, log)
+	}
 	if errors.Is(err, errAgentNotYet) {
 		// As agentsSettled below: an agent rollout ends. Bounded: an agent
 		// that does not come (a node it cannot run on for a reason the
@@ -750,9 +763,32 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
-		if webhook.DynamoComponent(r) && len(companions) == 0 {
+		if webhook.DynamoComponent(r) && len(companions) == 0 && !alone {
+			if alone = c.identityAlone(ranks, "a Dynamo rank is connected to no etcd or NATS of its namespace", log); alone {
+				break
+			}
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
 			return false
+		}
+	}
+	var identity *capturedIdentity
+	if alone {
+		// Read before the freeze, while the worker holds its lease.
+		var why string
+		if identity, why = c.captureIdentity(ctx, leader, ranks); identity == nil {
+			observeIdentity(identityCaptureRefused)
+			log.WithField("reason", why).Warn("CRIU group capture: skipped; the worker's etcd identity cannot be read")
+			return false
+		}
+	} else {
+		// A rank that names its own instance was let through only for an
+		// identity capture (identityBlocksCapture); without one it is
+		// refused as before.
+		for _, r := range ranks {
+			if name := a.ownInstanceBlocks(r); name != "" {
+				log.WithFields(logrus.Fields{"rank": r.Name, "env": name}).Info("CRIU group capture: skipped; a rank names its own instance in its configuration, and is not captured with its etcd identity")
+				return false
+			}
 		}
 	}
 	uris := make([]string, 0, len(ranks)+len(companions))
@@ -844,7 +880,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	// Again just before the instance is held: the namespace's scaling
 	// groups may have grown while the instance warmed up.
-	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
+	if again, skip := c.sharedRecheck(ctx, leader, alone, log); skip {
 		return again
 	}
 	// Held for the capture before it is claimed: a member already
@@ -898,6 +934,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	aliases := c.a.instanceServiceAliases(ctx, members)
 	cctx, cancel := context.WithTimeout(ctx, criuGroupCaptureTimeout)
 	defer cancel()
+	if identity != nil {
+		cctx = withPeerReset(withIdentityCheck(cctx, identity), memberAddresses(members))
+	}
 	t0 := time.Now()
 	// Read while the ranks run: a capture stops them.
 	entrypoints := make([]string, len(ranks))
@@ -939,6 +978,14 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
+		}
+		if identity != nil {
+			if ierr := identity.write(data); ierr != nil {
+				log.WithError(ierr).Error("CRIU group capture: cannot record the worker's etcd identity")
+			} else {
+				data[identityNamespaceKey] = leader.Namespace
+				observeIdentity(identityCaptured)
+			}
 		}
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
@@ -1487,8 +1534,17 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	// Only an instance of several members restores as a group, whose
 	// placeholders may skip setup.
 	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
-	for _, p := range ranks {
-		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use})
+	// The identity read before the freeze is checked again under it, by
+	// the agent that dumps the rank holding the lease (maybe on another
+	// node).
+	idc := identityCheckFrom(ctx)
+	for i, p := range ranks {
+		req := CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use,
+			ResetPeersOutside: peerResetFrom(ctx)}
+		if idc != nil && i == idc.Member {
+			req.IdentityCheck = idc
+		}
+		reqs = append(reqs, req)
 	}
 	for _, p := range companions {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: companionContainers[p.Name],
@@ -1496,11 +1552,18 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	}
 	if len(reqs) == 1 {
 		// A failed dump puts the pod back as it was.
-		r, cerr := c.a.Checkpoint(ctx, reqs[0])
+		r, cerr := checkpointMember(c.a, ctx, reqs[0])
 		if cerr != nil {
 			return nil, false, cerr
 		}
-		return []*CheckpointResult{r}, true, nil
+		out := []*CheckpointResult{r}
+		if err := peersResetDone(reqs, out); err != nil {
+			return nil, true, err
+		}
+		if ierr := identityUnchecked(idc, out); ierr != nil {
+			return nil, true, ierr // dumped: the source is gone
+		}
+		return out, true, nil
 	}
 	res, err := c.a.groupCheckpoint(ctx, GroupCheckpointRequest{Members: reqs}, log)
 	stopped = res != nil && res.Fabric.Went
@@ -1514,7 +1577,27 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 		}
 		out[i] = m.Result
 	}
+	if err := peersResetDone(reqs, out); err != nil {
+		return nil, true, err
+	}
+	if ierr := identityUnchecked(idc, out); ierr != nil {
+		return nil, true, ierr // every member was dumped: the instance is gone
+	}
 	return out, stopped, nil
+}
+
+// peersResetDone fails a capture one of whose members was asked to reset
+// its source's outside connections and did not say it did (an agent of a
+// version that ignores the request): its dead source's sessions may stay
+// open beside a restore. The dump stopped the source, so the capture's
+// pods are replaced.
+func peersResetDone(reqs []CheckpointRequest, results []*CheckpointResult) error {
+	for i, r := range results {
+		if i < len(reqs) && len(reqs[i].ResetPeersOutside) > 0 && (r == nil || !r.PeersReset) {
+			return fmt.Errorf("identity capture: member %s/%s did not reset its source's connections to peers outside the group (an agent without identity restore?)", reqs[i].Namespace, reqs[i].PodName)
+		}
+	}
+	return nil
 }
 
 // identityBlocksCapture returns the env variable through which a GPU pod
@@ -1522,7 +1605,34 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 // consistent: a Dynamo component that runs under the fixed Dynamo
 // namespace and registers in its instance's etcd (webhook.DynamoRestorable),
 // whose etcd is captured with it as a companion.
+//
+// With identity restore on, a Dynamo worker the identity restore can take
+// (identityRestoreCandidate: its etcd named literally, as its namespace
+// may be) is not refused here: its capture goes on, and is kept only when
+// it records the worker's identity (ownInstanceBlocks, after the identity
+// is read). Such a capture restores only into the namespace it was taken
+// in: the configuration hash leaves the Dynamo wiring env out
+// (rootfsonly cacheRelevantEnv), and a tenant's namespaces share
+// captures, so the record names the namespace (identityNamespaceKey),
+// admission admits only a placeholder in it (CRIUGroup.IdentityNamespace)
+// and the restore refuses any other (identityBeforeRestore).
 func (a *Agent) identityBlocksCapture(pod *corev1.Pod) string {
+	name := a.ownInstanceBlocks(pod)
+	if name == "" {
+		return ""
+	}
+	if a.identityEnabled() {
+		if b, _ := identityRestoreCandidate(pod); b != "" {
+			return ""
+		}
+	}
+	return name
+}
+
+// ownInstanceBlocks is identityBlocksCapture without the identity
+// restore: the env variable through which pod names its own instance,
+// unless the fixed Dynamo namespace keeps it consistent.
+func (a *Agent) ownInstanceBlocks(pod *corev1.Pod) string {
 	name := webhook.NamesOwnInstance(pod)
 	if name == "" {
 		return ""
@@ -1709,7 +1819,18 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")
 	rctx, cancel := context.WithTimeout(ctx, criuAutoRestoreTimeout)
 	defer cancel()
-	_, err := a.groupRestore(rctx, req, log)
+	keeper, ierr := c.identityBeforeRestore(rctx, ctx, key, ranks, leader, log)
+	if ierr != nil {
+		if ctx.Err() != nil {
+			return // the agent stops; the next one drives the restore
+		}
+		// Nothing restored, nothing counted against the capture.
+		c.identityRefused(context.WithoutCancel(ctx), key, leader.Annotations[webhook.CRIURestoreAnnotation], ranks, ierr,
+			func() { c.attempted.Delete("restore/" + string(leader.UID)) }, log)
+		return
+	}
+	_, err := restoreInstance(a, rctx, req, log)
+	keeper.restored(err)
 	if ac := new(addressCollision); errors.As(err, &ac) {
 		c.replaceColliding(ctx, leader, key, ac, log)
 		return

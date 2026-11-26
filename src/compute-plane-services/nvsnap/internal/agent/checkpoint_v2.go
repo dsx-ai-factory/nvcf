@@ -245,6 +245,15 @@ type dumpV2Opts struct {
 	// snapshot was not taken fails. criuSaves names the mountpoints the
 	// dump saves itself, contents included (nil when it saves none).
 	Snapshot func(criuSaves map[string]bool) error
+	// ResetPeersOutside: CheckpointRequest.ResetPeersOutside. peerReset
+	// carries a reset's failure after a dump that killed its source out
+	// of the dump's own outcome: such a source is not resumed.
+	ResetPeersOutside []string
+	peerReset         *peerResetOutcome
+	// IdentityCheck runs once the container is frozen, before CRIU, and
+	// before the peer reset lists its connections; an error fails the
+	// dump before it runs (frozenIdentityCheck). nil for none.
+	IdentityCheck func() error
 	// nixlFence: the capture paused the NIXL KV connector, so its marker
 	// fences the checkpoint from agents that cannot resume it
 	// (pidNSMarkerName). dumpAroundSuspend sets it, through
@@ -368,16 +377,18 @@ func (a *Agent) dumpV2(ctx context.Context, containerInfo *containerd.ContainerI
 			return nil, fmt.Errorf("gpushare: give the workload its chunk store: %w", oerr)
 		}
 	}
+	o.peerReset = &peerResetOutcome{}
 	nixlPaused, dump := fencedDumpSteps(o, func(o dumpV2Opts) (ran, done bool, cleanup func(), err error) {
 		ran, done, cleanup, err = a.dumpPrepared(ctx, procBase, targetHostPID, checkpointDir, externals, leaveRunning, gsOn, o, log)
 		dumped = done
 		return ran, done, cleanup, err
 	})
-	return a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
+	gs, err := a.dumpAroundSuspend(ctx, a.sourceDumpFor(ctx, containerInfo, checkpointDir, o, sourceDump{
 		on: gsOn, procBase: procBase, hostPID: hostPID, targetHostPID: targetHostPID, pids: gsPIDs, lib: gsLib,
 		toolText: tools.gpuToolText(), bundle: tools.version, fabric: fabric, fabricDir: fabricDir,
 		closeFabric: closeFabric, nixlPaused: nixlPaused, dump: dump,
 	}, log), log)
+	return gs, o.peerReset.fail(err)
 }
 
 // fencedDumpSteps returns a capture's sourceDump.nixlPaused and
@@ -652,7 +663,14 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 	// with the agent's own CRIU (pidns_capture.go).
 	// done is CRIU's completion, not the error: a marker that cannot be
 	// written after CRIU dumped the container is nvsnap's failure.
-	done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+	// A reset that cannot begin fails the dump before it runs, through
+	// the same tail as a failed dump (identity_peer_reset.go).
+	peerReset, err := a.beginPeerReset(o, targetHostPID, log)
+	if err == nil {
+		hooks.Frozen = frozenHooks(hooks.Frozen, peerReset.inventoryHook(procBase, targetHostPID))
+		done, err = a.dumpPIDNamespace(ctx, procBase, targetHostPID, checkpointDir, externals, final, gsOn, hooks, log)
+		o.peerReset.set(a.endPeerReset(ctx, peerReset, done, leaveRunning, checkpointDir))
+	}
 	if taken, serr := stopSnapshot(); err == nil && !taken {
 		err = snapshotNotTaken(serr)
 	}
@@ -668,7 +686,7 @@ func (a *Agent) dumpPrepared(ctx context.Context, procBase string, targetHostPID
 // dumpHooksFor is the pid-namespace dump's hooks for a capture's options
 // o, with freeze run before CRIU starts.
 func dumpHooksFor(o dumpV2Opts, freeze func() error) pidnsDumpHooks {
-	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence}
+	return pidnsDumpHooks{Before: freeze, FreezeCgroup: o.HeldCgroup, NIXLFence: o.nixlFence, Frozen: o.IdentityCheck}
 }
 
 // settleSource brings back a source whose GPU state a dump suspended,

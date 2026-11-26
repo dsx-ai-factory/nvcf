@@ -19,7 +19,9 @@ package agent
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -263,8 +265,26 @@ func allTCP(log *logrus.Entry) []*netlink.Socket {
 }
 
 // containerSocketInodes returns the inodes of the sockets open in the
-// processes that share host pid pid's cgroup.
+// processes that share host pid pid's cgroup. A process that cannot be
+// inspected is skipped.
 func containerSocketInodes(procBase string, pid int) (map[uint32]bool, error) {
+	return socketInodes(procBase, pid, false)
+}
+
+// containerSocketInodesStrict is containerSocketInodes failing when a
+// process that is still there cannot be inspected: a socket it missed
+// would go unreset. A process that went away meanwhile is skipped.
+func containerSocketInodesStrict(procBase string, pid int) (map[uint32]bool, error) {
+	return socketInodes(procBase, pid, true)
+}
+
+// procGone reports an error of reading a process's /proc entry that
+// means the process (or its fd) went away.
+func procGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
+func socketInodes(procBase string, pid int, strict bool) (map[uint32]bool, error) {
 	cg, err := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "cgroup"))
 	if err != nil {
 		return nil, fmt.Errorf("cgroup of pid %d: %w", pid, err)
@@ -278,16 +298,32 @@ func containerSocketInodes(procBase string, pid int) (map[uint32]bool, error) {
 		if _, err := strconv.Atoi(e.Name()); err != nil {
 			continue
 		}
-		if c, err := os.ReadFile(filepath.Join(procBase, e.Name(), "cgroup")); err != nil || !bytes.Equal(c, cg) {
+		c, err := os.ReadFile(filepath.Join(procBase, e.Name(), "cgroup"))
+		if err != nil {
+			if strict && !procGone(err) {
+				return nil, fmt.Errorf("cgroup of pid %s: %w", e.Name(), err)
+			}
+			continue
+		}
+		if !bytes.Equal(c, cg) {
 			continue
 		}
 		fds, err := os.ReadDir(filepath.Join(procBase, e.Name(), "fd"))
 		if err != nil {
+			if strict && !procGone(err) {
+				return nil, fmt.Errorf("open files of pid %s: %w", e.Name(), err)
+			}
 			continue
 		}
 		for _, fd := range fds {
 			l, err := os.Readlink(filepath.Join(procBase, e.Name(), "fd", fd.Name()))
-			if err != nil || !strings.HasPrefix(l, "socket:[") {
+			if err != nil {
+				if strict && !procGone(err) {
+					return nil, fmt.Errorf("open file %s of pid %s: %w", fd.Name(), e.Name(), err)
+				}
+				continue
+			}
+			if !strings.HasPrefix(l, "socket:[") {
 				continue
 			}
 			if n, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(l, "socket:["), "]"), 10, 32); err == nil {

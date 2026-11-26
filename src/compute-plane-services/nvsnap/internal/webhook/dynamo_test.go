@@ -153,3 +153,44 @@ func TestLocalHost(t *testing.T) {
 		}
 	}
 }
+
+// A worker whose capture keeps its own registry identity (the agent's
+// identity restore) keeps its Dynamo namespace, prefix and lease TTL: in a
+// namespace whose frontend and peers share one Dynamo namespace, the fixed
+// one would move it out of their sight. Without it (identity restore off)
+// the fixed namespace is set, as before.
+func TestDynamoNamespaceKeptForIdentityRestore(t *testing.T) {
+	ctx := context.Background()
+	env := []corev1.EnvVar{
+		{Name: "DYN_NAMESPACE", Value: "identity"},
+		{Name: "DYN_NAMESPACE_PREFIX", Value: "identity"},
+		{Name: "ETCD_ENDPOINTS", Value: "http://etcd:2379"},
+		{Name: "NATS_SERVER", Value: "nats://nats:4222"},
+	}
+	keeps := func(*corev1.Pod) bool { return true }
+	for _, tc := range []struct {
+		name  string
+		keeps func(*corev1.Pod) bool
+		want  string
+	}{
+		{"identity restore keeps it", keeps, "identity"},
+		{"identity restore off", nil, "nvcf-nvsnap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &Mutator{DynamoNamespace: "nvcf-nvsnap", DynamoLeaseTTL: 60, CaptureCandidate: criuCandidates, KeepsDynamoIdentity: tc.keeps}
+			pod := dynamoPod(env...)
+			pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+			got := applyPatches(t, pod, m.dynamoNamespacePatches(ctx, pod))
+			vals := map[string]string{}
+			for _, e := range got.Spec.Containers[0].Env {
+				vals[e.Name] = e.Value
+			}
+			if vals["DYN_NAMESPACE"] != tc.want || vals["DYN_NAMESPACE_PREFIX"] != tc.want {
+				t.Fatalf("env %v; want the Dynamo namespace %q", vals, tc.want)
+			}
+			if _, ttl := vals["ETCD_LEASE_TTL"]; ttl != (tc.keeps == nil) {
+				t.Fatalf("lease TTL set %v; want %v", ttl, tc.keeps == nil)
+			}
+		})
+	}
+}

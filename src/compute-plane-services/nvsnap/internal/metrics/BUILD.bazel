@@ -4,6 +4,7 @@ go_library(
     name = "metrics",
     srcs = [
         "first_sight.go",
+        "identity.go",
         "lifecycle.go",
         "metrics.go",
     ],

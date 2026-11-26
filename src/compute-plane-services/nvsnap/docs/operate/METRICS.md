@@ -52,6 +52,7 @@ function or checkpoint label: those are in the summary lines.
 | `nvsnap_model_cache_inits_total` | counter | `result` |
 | `nvsnap_model_cache_operations_total` | counter | `op`, `result` |
 | `nvsnap_model_cache_bytes_total` | counter | `op` |
+| `nvsnap_identity_restore_decisions_total` | counter | `decision` |
 
 Labels:
 
@@ -61,6 +62,11 @@ Labels:
   - `nvsnap_model_cache_operations_total{op,result}`: `op` is `harvest`, `fetch` or `evict`; `result` is `ok`,
     `error` or `skipped` (no room).
   - `nvsnap_model_cache_bytes_total{op}`: bytes written by `harvest` and `fetch`.
+- For the identity restore ([IDENTITY-RESTORE.md](../design/IDENTITY-RESTORE.md), off by default):
+  `nvsnap_identity_restore_decisions_total{decision}` counts `captured`, `capture_refused`, `peers_reset`,
+  `peers_reset_failed`, `refused_live_lease`, `refused_held`, `refused_error`, `refused_disabled`, `regranted`,
+  `keepalive_handoff`, `keepalive_handoff_timeout`, `keepalive_lease_lost`, `keys_write_failed`,
+  `restore_aborted` and `keeper_agent_stopped`.
 - `method`: `criu` (restored from a CRIU capture), `cachedir` (seeded from a
   cachedir capture, the fallback), `cold`.
 - `gpu`: the node's GPU product (`nvidia.com/gpu.product`).

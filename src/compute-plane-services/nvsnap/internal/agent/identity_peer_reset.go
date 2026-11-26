@@ -1,0 +1,527 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package agent
+
+// Resetting a dumped source's connections to peers outside the captured
+// group (identity restore, docs/design/IDENTITY-RESTORE.md).
+//
+// CRIU dumps established TCP connections in repair mode and, on a dump
+// that kills the tree, closes them silently: no FIN, no RST. It also
+// leaves its network lock in the pod's network namespace (an nftables
+// table that drops every packet of the dumped connections), so the
+// kernel cannot answer a peer's next packet with a reset either. A peer
+// outside the captured group (a shared NATS, etcd, a frontend) keeps the
+// dead source's connection until its own keepalive gives up: minutes, in
+// which a shared NATS hands the source's subscription half the requests
+// meant for the restored worker.
+//
+// After such a dump, while the pod's network namespace still exists:
+//
+//  1. `criu net-unlock -D <images>` in that namespace removes the dump's
+//     lock (its table is named by the dump's run id in the images).
+//  2. For each connection the source had to a peer outside the group, a
+//     socket bound to the connection's own local address and port
+//     connects to the peer. The peer, which still holds the connection,
+//     answers the SYN with an ACK of its own sequence (RFC 5961 challenge
+//     ACK); the probe, in SYN-SENT, answers that ACK with a reset whose
+//     sequence number is the ACK's, exactly what the peer expects
+//     (RFC 793), and the peer drops the connection at once. The probe is
+//     then closed.
+//
+// This needs no sequence numbers from the images, no raw sockets and no
+// change to the dump: only the agent's privileges in the pod's network
+// namespace (CAP_NET_ADMIN for the unlock, a plain bind and connect for
+// the probe). A connection the peer already closed answers the SYN with a
+// SYN-ACK; the probe then closes it, which the peer sees as a client that
+// left.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
+)
+
+// peerProbeWait bounds each probe: the peer's challenge ACK and the reset
+// that answers it come within a round trip, and the probe's own SYN
+// retransmits (at about 1 s and 3 s) must find the peer's side gone, which
+// it answers by accepting the connection.
+var peerProbeWait = 3500 * time.Millisecond
+
+// peerResetKey carries, in a capture's context, the addresses of the
+// captured group's members: the connections between them are kept.
+type peerResetKey struct{}
+
+// withPeerReset asks the capture of ctx to reset its sources' connections
+// to peers outside members (by address) after the dump.
+func withPeerReset(ctx context.Context, members []string) context.Context {
+	return context.WithValue(ctx, peerResetKey{}, members)
+}
+
+// peerResetFrom returns withPeerReset's addresses, or nil.
+func peerResetFrom(ctx context.Context) []string {
+	v, _ := ctx.Value(peerResetKey{}).([]string)
+	return v
+}
+
+// memberAddresses returns every pod address of members (both families of
+// a dual-stack pod).
+func memberAddresses(members []*corev1.Pod) []string {
+	out := make([]string, 0, len(members))
+	for _, p := range members {
+		seen := map[string]bool{}
+		for _, ip := range append([]string{p.Status.PodIP}, podIPs(p)...) {
+			if ip != "" && !seen[ip] {
+				seen[ip] = true
+				out = append(out, ip)
+			}
+		}
+	}
+	return out
+}
+
+// tcpTuple is one established connection, from the namespace's side.
+type tcpTuple struct {
+	Local, Remote netip.AddrPort
+}
+
+// outsidePeers selects, among sockets, the established connections of
+// the inodes own whose peer is neither loopback nor one of keep.
+func outsidePeers(sockets []*netlink.Socket, own func(uint32) bool, keep []string) []tcpTuple {
+	kept := map[string]bool{}
+	for _, k := range keep {
+		if ip := net.ParseIP(k); ip != nil {
+			kept[ip.String()] = true
+		}
+	}
+	var out []tcpTuple
+	for _, s := range sockets {
+		if s.State != tcpStateEstablished || !own(s.INode) || s.ID.Destination.IsLoopback() || s.ID.Source.IsLoopback() || kept[s.ID.Destination.String()] {
+			continue
+		}
+		l, ok1 := netip.AddrFromSlice(s.ID.Source)
+		r, ok2 := netip.AddrFromSlice(s.ID.Destination)
+		if !ok1 || !ok2 {
+			continue
+		}
+		out = append(out, tcpTuple{
+			Local:  netip.AddrPortFrom(l.Unmap(), s.ID.SourcePort),
+			Remote: netip.AddrPortFrom(r.Unmap(), s.ID.DestinationPort),
+		})
+	}
+	return out
+}
+
+// sourcePeerReset is the reset of one dumped container's outside
+// connections: listed once the container is frozen, reset after the dump.
+type sourcePeerReset struct {
+	ns    netns.NsHandle
+	keep  []string
+	conns []tcpTuple
+	log   *logrus.Entry
+}
+
+// beginSourcePeerReset holds the pod's network namespace of the
+// container (host pid hostPID) for after the dump.
+func beginSourcePeerReset(hostPID int, keep []string, log *logrus.Entry) (*sourcePeerReset, error) {
+	h, err := netns.GetFromPid(hostPID)
+	if err != nil {
+		return nil, fmt.Errorf("open the pod's network namespace: %w", err)
+	}
+	return &sourcePeerReset{ns: h, keep: keep, log: log}, nil
+}
+
+// inventoryHook lists, once the container is frozen and before CRIU runs,
+// the container's connections to peers outside the group: the sockets the
+// dump takes. Nil for no reset.
+func (r *sourcePeerReset) inventoryHook(procBase string, hostPID int) func() error {
+	if r == nil {
+		return nil
+	}
+	return func() error {
+		inodes, err := containerSocketInodesStrict(procBase, hostPID)
+		if err != nil {
+			return fmt.Errorf("identity capture: list the container's sockets: %w", err)
+		}
+		return inNetNSHandle(r.ns, func() error {
+			sockets, err := allTCPStrict()
+			if err != nil {
+				return fmt.Errorf("identity capture: list the pod's connections: %w", err)
+			}
+			r.conns = outsidePeers(sockets, func(i uint32) bool { return inodes[i] }, r.keep)
+			return nil
+		})
+	}
+}
+
+// allTCPStrict is allTCP, failing when a family cannot be listed: a reset
+// that missed a connection would report success.
+func allTCPStrict() ([]*netlink.Socket, error) {
+	var out []*netlink.Socket
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		sockets, err := netlink.SocketDiagTCP(family)
+		if err != nil {
+			if family == unix.AF_INET6 && errors.Is(err, unix.EAFNOSUPPORT) {
+				continue // no IPv6 in the namespace: nothing to list
+			}
+			return nil, err
+		}
+		out = append(out, sockets...)
+	}
+	return out, nil
+}
+
+// close releases the namespace. Nil-safe.
+func (r *sourcePeerReset) close() {
+	if r != nil {
+		_ = r.ns.Close()
+	}
+}
+
+// netUnlockCmd builds `criu net-unlock` for a dump's images, run in the
+// namespace passed as the command's fd 3.
+func netUnlockCmd(ctx context.Context, criu, imagesDir string) *exec.Cmd {
+	return exec.CommandContext(ctx, "nsenter", "--net=/proc/self/fd/3", "--", //nolint:gosec // the agent's own CRIU, a path it built
+		criu, "net-unlock", "-D", imagesDir, "-o", "net-unlock-source.log")
+}
+
+// runNetUnlock is how afterDump removes the dump's lock; tests stub it.
+var runNetUnlock = func(ctx context.Context, ns netns.NsHandle, criu, imagesDir string) error {
+	// A duplicate: the command's file is closed with it, never the
+	// namespace handle the probes still use.
+	fd, err := unix.Dup(int(ns))
+	if err != nil {
+		return fmt.Errorf("criu net-unlock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "netns")
+	defer func() { _ = f.Close() }()
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := netUnlockCmd(cctx, criu, imagesDir)
+	cmd.ExtraFiles = []*os.File{f}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("criu net-unlock: %w (output: %s; log: %s)", err, strings.TrimSpace(string(out)),
+			tailOfFile(filepath.Join(imagesDir, "net-unlock-source.log"), 6))
+	}
+	return nil
+}
+
+// peerResetBudget bounds a dumped source's whole reset; peerResetParallel
+// bounds the probes in flight. Probes of one local address and port run
+// one after another: two sockets cannot both be bound to it.
+var (
+	peerResetBudget   = 30 * time.Second
+	peerResetParallel = 16
+)
+
+// probeInNS runs probe in network namespace ns; tests replace it.
+var probeInNS = func(ctx context.Context, ns netns.NsHandle, c tcpTuple) error {
+	return inNetNSHandle(ns, func() error {
+		// One more try: a lost packet leaves the exchange unconfirmed.
+		perr := probeReset(ctx, c)
+		if errors.Is(perr, errProbeUnconfirmed) && ctx.Err() == nil {
+			perr = probeReset(ctx, c)
+		}
+		return perr
+	})
+}
+
+// afterDump resets the listed connections once the dump has killed the
+// source: removes the dump's network lock, then probes each connection,
+// all within peerResetBudget. The rule: every connection must be
+// confirmed reset (probeReset) within the budget, else the capture fails
+// and its source, dead, is replaced cold. A peer that drops the probe (a
+// node gone, a firewall, a network policy) therefore fails the capture:
+// a session that cannot be shown closed may still hold the source's
+// subscription beside its restore.
+func (r *sourcePeerReset) afterDump(ctx context.Context, criu, imagesDir string) error {
+	defer r.close()
+	if len(r.conns) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, peerResetBudget)
+	defer cancel()
+	if err := runNetUnlock(ctx, r.ns, criu, imagesDir); err != nil {
+		return err
+	}
+	byLocal := map[netip.AddrPort][]tcpTuple{}
+	var order []netip.AddrPort
+	for _, c := range r.conns {
+		if _, ok := byLocal[c.Local]; !ok {
+			order = append(order, c.Local)
+		}
+		byLocal[c.Local] = append(byLocal[c.Local], c)
+	}
+	var mu sync.Mutex
+	var errs []error
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, peerResetParallel)
+	for _, l := range order {
+		wg.Add(1)
+		go func(conns []tcpTuple) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			for _, c := range conns {
+				err := ctx.Err()
+				if err == nil {
+					err = probeInNS(ctx, r.ns, c)
+				} else {
+					err = fmt.Errorf("the reset's time ran out first: %w", err)
+				}
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("%s -> %s: %w", c.Local, c.Remote, err))
+					mu.Unlock()
+				}
+			}
+		}(byLocal[l])
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("reset the source's connections to peers outside the group (%d of %d unconfirmed): %w", len(errs), len(r.conns), err)
+	}
+	r.log.WithField("connections", len(r.conns)).Info("identity capture: the dumped source's connections to peers outside the group were reset")
+	return nil
+}
+
+// errProbeUnconfirmed is a probe whose peer was not seen to drop the old
+// connection.
+var errProbeUnconfirmed = errors.New("the peer was not seen to drop the old connection")
+
+// probeReset sends, from the calling thread's network namespace, a SYN on
+// connection c's own address pair (see the file comment) and waits, at
+// most peerProbeWait and never past ctx's deadline, for proof that the
+// peer no longer holds the old connection: a SYN of the probe (its first,
+// or a retransmit after the challenge ACK was answered with the reset) is
+// accepted, or refused. A challenge ACK alone proves only that the reset
+// was sent, not that it arrived, so it is not enough. The probe is closed.
+func probeReset(ctx context.Context, c tcpTuple) error {
+	family := unix.AF_INET
+	if c.Local.Addr().Is6() {
+		family = unix.AF_INET6
+	}
+	fd, err := unix.Socket(family, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("socket: %w", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if serr := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); serr != nil {
+		return fmt.Errorf("reuseaddr: %w", serr)
+	}
+	if berr := unix.Bind(fd, sockaddrOf(c.Local)); berr != nil {
+		return fmt.Errorf("bind the connection's local address: %w", berr)
+	}
+	err = unix.Connect(fd, sockaddrOf(c.Remote))
+	if err != nil && !errors.Is(err, unix.EINPROGRESS) {
+		if errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.ECONNRESET) {
+			return nil // the peer answered with a reset: its side is gone
+		}
+		return fmt.Errorf("connect: %w", err)
+	}
+	deadline := time.Now().Add(peerProbeWait)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("probe: %w", cerr)
+		}
+		left := time.Until(deadline)
+		if left <= 0 {
+			return errProbeUnconfirmed
+		}
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}} //nolint:gosec // a file descriptor fits in 32 bits
+		_, perr := unix.Poll(pfd, int(min(left, 100*time.Millisecond)/time.Millisecond)+1)
+		if perr != nil && !errors.Is(perr, unix.EINTR) {
+			return fmt.Errorf("poll: %w", perr)
+		}
+		soErr, gerr := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
+		if gerr != nil {
+			return fmt.Errorf("probe outcome: %w", gerr)
+		}
+		if soErr != 0 {
+			e := unix.Errno(soErr)
+			if errors.Is(e, unix.ECONNREFUSED) || errors.Is(e, unix.ECONNRESET) {
+				return nil
+			}
+			return fmt.Errorf("probe: %w", e)
+		}
+		info, ierr := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+		if ierr != nil {
+			return fmt.Errorf("probe outcome: %w", ierr)
+		}
+		if info.State == tcpStateEstablished {
+			return nil // accepted: the peer holds no old connection
+		}
+	}
+}
+
+func sockaddrOf(ap netip.AddrPort) unix.Sockaddr {
+	if ap.Addr().Is4() {
+		return &unix.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()}
+	}
+	return &unix.SockaddrInet6{Port: int(ap.Port()), Addr: ap.Addr().As16()}
+}
+
+// inNetNSHandle runs f on a thread in network namespace h. A thread that
+// cannot be put back in the agent's namespace is never reused: it stays
+// locked and exits with the goroutine.
+func inNetNSHandle(h netns.NsHandle, f func() error) error {
+	errc := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		orig, err := netns.Get()
+		if err != nil {
+			runtime.UnlockOSThread()
+			errc <- fmt.Errorf("get current netns: %w", err)
+			return
+		}
+		defer func() { _ = orig.Close() }()
+		if err := netns.Set(h); err != nil {
+			runtime.UnlockOSThread()
+			errc <- fmt.Errorf("enter the pod's network namespace: %w", err)
+			return
+		}
+		ferr := f()
+		if err := netns.Set(orig); err != nil {
+			errc <- errors.Join(ferr, fmt.Errorf("return to the agent's network namespace: %w", err))
+			return // the thread stays locked and is discarded
+		}
+		runtime.UnlockOSThread()
+		errc <- ferr
+	}()
+	return <-errc
+}
+
+// podNetnsDialer returns a dialer whose connections are opened in the
+// network namespace of pod's container (on this node), and a func that
+// releases the namespace. Names are resolved by the agent first.
+func (a *Agent) podNetnsDialer(ctx context.Context, pod *corev1.Pod, container string) (dial func(context.Context, string, string) (net.Conn, error), release func(), err error) {
+	if a.runtime == nil {
+		return nil, nil, errors.New("no container runtime client")
+	}
+	if container == "" {
+		container = gpuContainer(pod)
+	}
+	info, err := a.runtime.FindContainerByPod(ctx, pod.Namespace, pod.Name, container)
+	if err != nil {
+		return nil, nil, fmt.Errorf("find the pod's container: %w", err)
+	}
+	if info == nil || info.PID == 0 {
+		return nil, nil, errors.New("the pod's container has no running process")
+	}
+	h, err := netns.GetFromPid(int(info.PID))
+	if err != nil {
+		return nil, nil, fmt.Errorf("open the pod's network namespace: %w", err)
+	}
+	dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, serr := net.SplitHostPort(addr)
+		if serr != nil {
+			return nil, serr
+		}
+		ips := []string{host}
+		if net.ParseIP(host) == nil {
+			addrs, rerr := net.DefaultResolver.LookupHost(ctx, host)
+			if rerr != nil {
+				return nil, rerr
+			}
+			ips = addrs
+		}
+		var errs []error
+		for _, ip := range ips {
+			var conn net.Conn
+			derr := inNetNSHandle(h, func() error {
+				var e error
+				conn, e = (&net.Dialer{Timeout: etcdCallTimeout}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+				return e
+			})
+			if derr == nil {
+				return conn, nil
+			}
+			errs = append(errs, derr)
+		}
+		return nil, errors.Join(errs...)
+	}
+	return dial, func() { _ = h.Close() }, nil
+}
+
+// beginPeerReset starts, for a dump asked to (o.ResetPeersOutside), the
+// reset of its source's outside connections; nil when not asked. Only with
+// identity restore on: a direct checkpoint request that asks for it with
+// the flag off is not obeyed.
+func (a *Agent) beginPeerReset(o dumpV2Opts, hostPID int, log *logrus.Entry) (*sourcePeerReset, error) {
+	if len(o.ResetPeersOutside) == 0 || o.LeaveRunning {
+		return nil, nil
+	}
+	if !a.identityEnabled() {
+		log.Warn("identity capture: a reset of the source's outside connections was asked with identity restore off; not resetting")
+		return nil, nil
+	}
+	r, err := beginSourcePeerReset(hostPID, o.ResetPeersOutside, log)
+	if err != nil {
+		observeIdentity(identityPeersResetFailed)
+		return nil, fmt.Errorf("identity capture: %w", err)
+	}
+	return r, nil
+}
+
+// endPeerReset finishes r after the dump: a dump CRIU completed (dumped)
+// that killed its source has the source's outside connections reset,
+// whatever failed after CRIU (its marker, say); any other outcome only
+// releases r. It returns the reset's own failure, which fails the capture
+// without resuming the dead source (peerResetOutcome).
+func (a *Agent) endPeerReset(ctx context.Context, r *sourcePeerReset, dumped, leaveRunning bool, imagesDir string) error {
+	if r == nil {
+		return nil
+	}
+	if !dumped || leaveRunning {
+		r.close()
+		return nil
+	}
+	if err := r.afterDump(ctx, a.config.CRIUPath, imagesDir); err != nil {
+		observeIdentity(identityPeersResetFailed)
+		return fmt.Errorf("identity capture: %w", err)
+	}
+	observeIdentity(identityPeersReset)
+	return nil
+}
+
+// peerResetOutcome carries a peer reset's failure from the dump, which
+// killed the source, to the end of the capture: it fails the capture as
+// one whose source must be replaced, never as a dump to roll back (the
+// source is dead). Nil-safe.
+type peerResetOutcome struct{ err error }
+
+func (o *peerResetOutcome) set(err error) {
+	if o != nil && err != nil {
+		o.err = err
+	}
+}
+
+// fail returns err, or the reset's failure when the capture otherwise
+// succeeded.
+func (o *peerResetOutcome) fail(err error) error {
+	if o == nil || o.err == nil {
+		return err
+	}
+	// Kept with any later failure (a store that cannot be collected): the
+	// source is dead either way and must be replaced.
+	return errors.Join(err, fmt.Errorf("%w: %w", errSourceLeftSuspended, o.err))
+}
