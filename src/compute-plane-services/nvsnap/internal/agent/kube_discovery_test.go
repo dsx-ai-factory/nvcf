@@ -240,3 +240,39 @@ func TestWriteRegistrationsFailsClosed(t *testing.T) {
 		t.Error("wrote a registration without the placeholder's address")
 	}
 }
+
+func TestWriteRegistrationsRefusesASecondReplica(t *testing.T) {
+	ctx := context.Background()
+	src := &Agent{dynClient: fakeDyn(workerCR("a", "w-old", "w-old", "u-old", true, workerSpec("10.0.0.1")))}
+	record, err := src.recordRegistrations(ctx, []*corev1.Pod{kubeRank("a", "w-old", "u-old", "10.0.0.1", "kubernetes")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dyn := fakeDyn()
+	a := &Agent{dynClient: dyn}
+	first := kubeRank("b", "w-1", "u-1", "10.0.0.2", "kubernetes")
+	if err := a.writeRegistrations(ctx, record, []*corev1.Pod{first}); err != nil {
+		t.Fatal(err)
+	}
+	// Its own again: fine.
+	if err := a.writeRegistrations(ctx, record, []*corev1.Pod{first}); err != nil {
+		t.Errorf("rewrite of its own: %v", err)
+	}
+	// Another replica of the same capture in the namespace: refused.
+	second := kubeRank("b", "w-2", "u-2", "10.0.0.3", "kubernetes")
+	if err := a.writeRegistrations(ctx, record, []*corev1.Pod{second}); err == nil || !strings.Contains(err.Error(), "7965170713353809") {
+		t.Errorf("err = %v, want the shared instance ID refused", err)
+	}
+	// In another namespace the IDs are free: a frontend lists its own.
+	other := kubeRank("c", "w-3", "u-3", "10.0.0.4", "kubernetes")
+	if err := a.writeRegistrations(ctx, record, []*corev1.Pod{other}); err != nil {
+		t.Errorf("another namespace: %v", err)
+	}
+}
+
+func TestInstanceIDs(t *testing.T) {
+	raw, _ := json.Marshal(workerSpec("10.0.0.1"))
+	if got := instanceIDs(raw); len(got) != 1 || got[0] != "7965170713353809" {
+		t.Errorf("got %v", got)
+	}
+}

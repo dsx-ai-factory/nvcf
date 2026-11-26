@@ -176,6 +176,9 @@ func (a *Agent) writeRegistrations(ctx context.Context, record map[string]string
 		if err := json.Unmarshal([]byte(v), &regs); err != nil {
 			return fmt.Errorf("rank %d: registrations: %w", i, err)
 		}
+		if err := a.instanceIDsFree(ctx, p, regs); err != nil {
+			return fmt.Errorf("rank %d: %w", i, err)
+		}
 		ip := p.Status.PodIP
 		if net.ParseIP(ip).To4() == nil {
 			return fmt.Errorf("placeholder %s has no IPv4 address (%q)", p.Name, ip)
@@ -354,4 +357,75 @@ func (c *criuAutoRestorer) writeGroupRegistrations(ctx context.Context, key stri
 		return fmt.Errorf("group record: %w", err)
 	}
 	return c.a.writeRegistrations(ctx, cm.Data, ranks)
+}
+
+// instanceIDsFree fails when another pod of p's namespace registers an
+// instance ID that regs does. The restored process answers to the IDs it
+// was captured with: two replicas restored from one capture would both
+// claim them, and a frontend routes an ID to one of them. The first
+// restore keeps them; a later one starts cold.
+func (a *Agent) instanceIDsFree(ctx context.Context, p *corev1.Pod, regs rankRegistrations) error {
+	mine := map[string]bool{}
+	for _, o := range regs.Objects {
+		for _, id := range instanceIDs(o.Spec) {
+			mine[id] = true
+		}
+	}
+	if len(mine) == 0 {
+		return fmt.Errorf("the captured registration names no instance ID")
+	}
+	list, err := a.dynClient.Resource(dynamoWorkerMetadata).Namespace(p.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list DynamoWorkerMetadata in %s: %w", p.Namespace, err)
+	}
+	for i := range list.Items {
+		o := &list.Items[i]
+		owned := false
+		for _, r := range o.GetOwnerReferences() {
+			owned = owned || r.UID == p.UID
+		}
+		if owned {
+			continue // the placeholder's own, from an earlier attempt
+		}
+		raw, err := json.Marshal(o.Object["spec"])
+		if err != nil {
+			continue
+		}
+		for _, id := range instanceIDs(raw) {
+			if mine[id] {
+				return fmt.Errorf("instance %s of the capture is registered by DynamoWorkerMetadata %s already (another replica restored from the same capture)", id, o.GetName())
+			}
+		}
+	}
+	return nil
+}
+
+// instanceIDs returns the values of every "instance_id" key in spec.
+func instanceIDs(spec json.RawMessage) []string {
+	d := json.NewDecoder(bytes.NewReader(spec))
+	d.UseNumber()
+	var v any
+	if d.Decode(&v) != nil {
+		return nil
+	}
+	var out []string
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, e := range t {
+				if k == "instance_id" {
+					out = append(out, fmt.Sprint(e))
+					continue
+				}
+				walk(e)
+			}
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		}
+	}
+	walk(v)
+	return out
 }
