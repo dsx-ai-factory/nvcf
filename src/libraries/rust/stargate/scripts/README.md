@@ -170,3 +170,20 @@ scripts/e2e-last-cluster.sh
 
 Run `scripts/e2e-last-cluster.sh --help` for the scenario, options, and
 environment variables.
+
+## Reverse Tunnel Liveness End-to-End Check
+
+`scripts/e2e-reverse-tunnel-liveness.sh` runs Stargate with reverse tunnels,
+two Pylons, and two mock-dynamo backends on loopback for each tunnel protocol.
+It checks that streaming requests succeed through both tunnels, that quiet
+tunnels stay open, that Stargate closes the tunnel of a Pylon frozen with
+`SIGSTOP` within `--reverse-tunnel-max-idle-timeout-ms`, and that the Pylon
+reconnects after `SIGCONT`.
+
+```bash
+scripts/e2e-reverse-tunnel-liveness.sh
+E2E_KEEP_ALIVE_MS=5000 E2E_IDLE_TIMEOUT_MS=15000 scripts/e2e-reverse-tunnel-liveness.sh --no-build
+```
+
+Run `scripts/e2e-reverse-tunnel-liveness.sh --help` for the scenario, options,
+and environment variables.
