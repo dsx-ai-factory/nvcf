@@ -1056,7 +1056,7 @@ func TestBackendK8sSyncAllFeatures(t *testing.T) {
 			},
 		}).
 		WithK8sClusterNetworkCIDRs([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/12"}).
-		WithNVCFWorkerConfig(true, types.DefaultCacheCSIMountOptions, 90*time.Minute, 0)
+		WithNVCFWorkerConfig(true, types.DefaultCacheCSIMountOptions, 90*time.Minute, 0, 0)
 
 	bc, _, err := b.Start(ctx)
 	require.NoError(t, err)
@@ -1298,7 +1298,7 @@ func TestBackendK8sSyncAllFeaturesCSIOptionOverride(t *testing.T) {
 		WithClients(clients).
 		WithGXCache(clustermgmt.DefaultGXCacheNamespace, true).
 		WithK8sClusterNetworkCIDRs([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/12"}).
-		WithNVCFWorkerConfig(true, "remount,rw", 90*time.Minute, 0)
+		WithNVCFWorkerConfig(true, "remount,rw", 90*time.Minute, 0, 0)
 
 	bc, _, err := b.Start(ctx)
 	require.NoError(t, err)
@@ -3448,6 +3448,41 @@ func TestSyncNVCFBackend_AgentWithoutValidatorSettingStaysWhileDisabled(t *testi
 	c.clusterValidatorEnabled = true
 	require.NoError(t, c.syncNVCFBackend(ctx, nb, false))
 	assert.Equal(t, before+1, agentUpdates(), "enabling it rolls the agent once")
+}
+
+// A webhook caBundle that no longer matches the stored serving cert must be
+// repaired by the next sync even when nothing else changed, without rolling the
+// agent.
+func TestSyncNVCFBackend_RepairsWebhookCAMismatchWithoutRollout(t *testing.T) {
+	recorder := record.NewFakeRecorder(200)
+	c := &BackendK8sCache{
+		clients:              mockKubeClients(),
+		operatorNamespace:    NVCAOperatorNamespace,
+		eventRecorder:        recorder,
+		ngcServiceKeyFetcher: &mockTokenFetcher{token: "randomkey"},
+		now:                  time.Now,
+	}
+	ctx := newTestContext()
+	nb := getTestNVCFBackendAllFeatures()
+	nb.Spec.Overrides = nil
+	require.NoError(t, c.CreateOrUpdateNVCFBackend(ctx, nb))
+	require.NoError(t, c.syncNVCFBackend(ctx, nb, false))
+
+	stale, err := generateWebhookCerts(nb, time.Now().UTC())
+	require.NoError(t, err)
+	require.NoError(t, c.updateWebhookCABundles(ctx, stale.CACertBytes))
+	require.Error(t, webhookCAConsistency(ctx, c, nb, time.Now().UTC()))
+	k8s := c.clients.K8s.(*fakek8sclient.Clientset)
+	k8s.ClearActions()
+
+	require.NoError(t, c.syncNVCFBackend(ctx, nb, false))
+	require.NoError(t, webhookCAConsistency(ctx, c, nb, time.Now().UTC()))
+	for _, a := range k8s.Actions() {
+		if a.GetResource().Resource == "deployments" {
+			assert.Equal(t, "get", a.GetVerb(), "the repair must not roll the agent")
+		}
+	}
+	assert.True(t, hasEventContaining(recorder, "webhook CA that did not match"))
 }
 
 func TestCreateOrUpdateNVCFBackend_PropagatesNVCAOTELConfig(t *testing.T) {
