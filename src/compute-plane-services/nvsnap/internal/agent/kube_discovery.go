@@ -28,6 +28,7 @@ package agent
 // its pods start cold, rather than run ready with no route to them.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -234,8 +235,11 @@ func (a *Agent) applyRegistration(ctx context.Context, pod *corev1.Pod, name str
 // replaced by new in every string under a "transport" key, as a whole
 // address only (10.0.0.1 is not part of 10.0.0.12).
 func replaceTransportIP(spec json.RawMessage, old, new string) (map[string]any, error) {
+	// Numbers decoded exactly: instance IDs are integers of up to 53 bits.
+	d := json.NewDecoder(bytes.NewReader(spec))
+	d.UseNumber()
 	var v map[string]any
-	if err := json.Unmarshal(spec, &v); err != nil {
+	if err := d.Decode(&v); err != nil {
 		return nil, fmt.Errorf("registration spec: %w", err)
 	}
 	walkTransports(v, false, func(s string) string { return replaceIPv4(s, old, new) })
@@ -280,6 +284,13 @@ func walkTransports(v any, in bool, f func(string) string) any {
 			return f(t)
 		}
 		return t
+	case json.Number:
+		// As an unstructured object holds numbers.
+		if i, err := t.Int64(); err == nil {
+			return i
+		}
+		f, _ := t.Float64()
+		return f
 	default:
 		return v
 	}

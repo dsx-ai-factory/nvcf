@@ -239,6 +239,7 @@ go_test(
         "instance_clients_test.go",
         "instance_nat_test.go",
         "kmsg_test.go",
+        "kube_discovery_test.go",
         "l2_fetch_test.go",
         "l2_integration_test.go",
         "l2_integration_unqualified_test.go",
