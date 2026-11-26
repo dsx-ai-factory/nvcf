@@ -17,13 +17,16 @@ package agent
 // another name, UID and IP. So a capture keeps each rank's registration
 // objects and the rank's address (registrationsOf); the restore writes
 // them again for the placeholder pod it restores into, named after it,
-// owned by it, with the captured address replaced by the placeholder's in
-// the endpoints' transports (writeRegistrations). The worker's instance
+// owned by it, with the captured address replaced by the placeholder's
+// wherever the objects name it (writeRegistrations): the endpoints'
+// transports, and the URLs of the model card's files on the worker's
+// system port, from which a frontend that has not loaded the model yet
+// fetches its tokenizer. The worker's instance
 // IDs in the objects stay those it was captured with: the restored
 // process answers to them.
 //
 // Both ends fail closed. A rank whose registration cannot be read, or
-// whose transports name an address other than its pod's, is not
+// whose transports or URLs name an address other than its pod's, is not
 // captured. A restore whose registrations cannot be written does not run:
 // its pods start cold, rather than run ready with no route to them.
 
@@ -117,7 +120,7 @@ func (a *Agent) registrationsOf(ctx context.Context, pod *corev1.Pod) (rankRegis
 		if err != nil {
 			return out, fmt.Errorf("DynamoWorkerMetadata %s: %w", o.GetName(), err)
 		}
-		if other := foreignTransportIP(raw, ip); other != "" {
+		if other := foreignAddress(raw, ip); other != "" {
 			// An address the restore would not know to replace.
 			return out, fmt.Errorf("DynamoWorkerMetadata %s serves at %s, not at its pod's address %s", o.GetName(), other, ip)
 		}
@@ -178,7 +181,7 @@ func (a *Agent) writeRegistrations(ctx context.Context, record map[string]string
 			return fmt.Errorf("placeholder %s has no IPv4 address (%q)", p.Name, ip)
 		}
 		for _, o := range regs.Objects {
-			spec, err := replaceTransportIP(o.Spec, regs.PodIP, ip)
+			spec, err := replacePodIP(o.Spec, regs.PodIP, ip)
 			if err != nil {
 				return fmt.Errorf("rank %d: %w", i, err)
 			}
@@ -231,10 +234,10 @@ func (a *Agent) applyRegistration(ctx context.Context, pod *corev1.Pod, name str
 	return nil
 }
 
-// replaceTransportIP returns spec (JSON) with the IPv4 address old
-// replaced by new in every string under a "transport" key, as a whole
-// address only (10.0.0.1 is not part of 10.0.0.12).
-func replaceTransportIP(spec json.RawMessage, old, new string) (map[string]any, error) {
+// replacePodIP returns spec (JSON) with the IPv4 address old replaced by
+// new in every string, as a whole address only (10.0.0.1 is not part of
+// 10.0.0.12).
+func replacePodIP(spec json.RawMessage, old, new string) (map[string]any, error) {
 	// Numbers decoded exactly: instance IDs are integers of up to 53 bits.
 	d := json.NewDecoder(bytes.NewReader(spec))
 	d.UseNumber()
@@ -242,19 +245,23 @@ func replaceTransportIP(spec json.RawMessage, old, new string) (map[string]any, 
 	if err := d.Decode(&v); err != nil {
 		return nil, fmt.Errorf("registration spec: %w", err)
 	}
-	walkTransports(v, false, func(s string) string { return replaceIPv4(s, old, new) })
+	walkStrings(v, false, func(s string, _ bool) string { return replaceIPv4(s, old, new) })
 	return v, nil
 }
 
-// foreignTransportIP returns an IPv4 address other than ip that a string
-// under a "transport" key of spec names, or "".
-func foreignTransportIP(spec json.RawMessage, ip string) string {
+// foreignAddress returns an IPv4 address other than ip that spec names
+// where a peer would connect to it: in a string under a "transport" key,
+// or in a URL. "" when there is none.
+func foreignAddress(spec json.RawMessage, ip string) string {
 	var v any
 	if err := json.Unmarshal(spec, &v); err != nil {
 		return "unparseable spec"
 	}
 	other := ""
-	walkTransports(v, false, func(s string) string {
+	walkStrings(v, false, func(s string, transport bool) string {
+		if !transport && !strings.Contains(s, "://") {
+			return s
+		}
 		for _, a := range ipv4Tokens(s) {
 			if a != ip && other == "" {
 				other = a
@@ -265,25 +272,22 @@ func foreignTransportIP(spec json.RawMessage, ip string) string {
 	return other
 }
 
-// walkTransports replaces, in place, every string under a "transport"
-// key of v with f's result.
-func walkTransports(v any, in bool, f func(string) string) any {
+// walkStrings replaces, in place, every string of v with f's result; f
+// learns whether the string is under a "transport" key.
+func walkStrings(v any, in bool, f func(s string, transport bool) string) any {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, e := range t {
-			t[k] = walkTransports(e, in || k == "transport", f)
+			t[k] = walkStrings(e, in || k == "transport", f)
 		}
 		return t
 	case []any:
 		for i, e := range t {
-			t[i] = walkTransports(e, in, f)
+			t[i] = walkStrings(e, in, f)
 		}
 		return t
 	case string:
-		if in {
-			return f(t)
-		}
-		return t
+		return f(t, in)
 	case json.Number:
 		// As an unstructured object holds numbers.
 		if i, err := t.Int64(); err == nil {

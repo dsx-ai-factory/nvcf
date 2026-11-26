@@ -42,7 +42,10 @@ func workerSpec(ip string) map[string]any {
 			"transport": map[string]any{"kind": "Zmq", "config": map[string]any{"endpoint": "tcp://" + ip + ":34203"}},
 		}},
 		"model_cards": map[string]any{"qwen/backend/generate/1c4c": map[string]any{
-			"card_json": map[string]any{"display_name": "served at " + ip},
+			"card_json": map[string]any{
+				"display_name": "Qwen 1.2.3.4",
+				"extra_files":  []any{map[string]any{"path": "http://" + ip + ":9090/v1/metadata/qwen/tokenizer.json"}},
+			},
 		}},
 	}}
 }
@@ -86,15 +89,18 @@ func TestIPv4Tokens(t *testing.T) {
 	}
 }
 
-func TestReplaceTransportIPTouchesTransportsOnly(t *testing.T) {
+func TestReplacePodIP(t *testing.T) {
 	raw, _ := json.Marshal(workerSpec("10.0.0.1"))
-	got, err := replaceTransportIP(raw, "10.0.0.1", "10.9.9.9")
+	got, err := replacePodIP(raw, "10.0.0.1", "10.9.9.9")
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(got)
 	s := string(b)
-	for _, want := range []string{`"tcp":"10.9.9.9:44325/1c4c47d2f1de51/generate"`, `"endpoint":"tcp://10.9.9.9:34203"`, `"display_name":"served at 10.0.0.1"`} {
+	// The model card's files are fetched from the worker's system port by
+	// a frontend that has not loaded the model.
+	for _, want := range []string{`"tcp":"10.9.9.9:44325/1c4c47d2f1de51/generate"`, `"endpoint":"tcp://10.9.9.9:34203"`,
+		`"path":"http://10.9.9.9:9090/v1/metadata/qwen/tokenizer.json"`, `"display_name":"Qwen 1.2.3.4"`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("spec lacks %s: %s", want, s)
 		}
@@ -145,6 +151,12 @@ func TestRegistrationsOfFailsClosed(t *testing.T) {
 		{"no address", &Agent{dynClient: fakeDyn()}, kubeRank("a", "w", "u1", "", "kubernetes"), "no IPv4"},
 		{"another address", &Agent{dynClient: fakeDyn(workerCR("a", "w", "w", "u1", true, workerSpec("10.0.0.7")))},
 			kubeRank("a", "w", "u1", "10.0.0.1", "kubernetes"), "serves at 10.0.0.7"},
+		{"a URL at another address", &Agent{dynClient: fakeDyn(workerCR("a", "w", "w", "u1", true, func() map[string]any {
+			s := workerSpec("10.0.0.1")
+			card := s["data"].(map[string]any)["model_cards"].(map[string]any)["qwen/backend/generate/1c4c"].(map[string]any)["card_json"].(map[string]any)
+			card["extra_files"] = []any{map[string]any{"path": "http://10.0.0.8:9090/x"}}
+			return s
+		}()))}, kubeRank("a", "w", "u1", "10.0.0.1", "kubernetes"), "serves at 10.0.0.8"},
 		{"misnamed", &Agent{dynClient: fakeDyn(workerCR("a", "other", "w", "u1", true, workerSpec("10.0.0.1")))},
 			kubeRank("a", "w", "u1", "10.0.0.1", "kubernetes"), "not named after it"},
 	} {
@@ -192,7 +204,7 @@ func TestWriteRegistrations(t *testing.T) {
 		t.Errorf("owner %+v, want the placeholder as controller", refs)
 	}
 	b, _ := json.Marshal(got.Object["spec"])
-	if !strings.Contains(string(b), "10.0.0.2:44325/1c4c47d2f1de51/generate") || strings.Contains(string(b), "10.0.0.1:") {
+	if !strings.Contains(string(b), "10.0.0.2:44325/1c4c47d2f1de51/generate") || !strings.Contains(string(b), "http://10.0.0.2:9090/") || strings.Contains(string(b), "10.0.0.1") {
 		t.Errorf("transports not moved to the placeholder's address: %s", b)
 	}
 	// Driven again: the placeholder's own object is overwritten.

@@ -275,6 +275,21 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 			// admitted under the cluster's drivers as they are now.
 			return fmt.Errorf("%w: %s", errCheckpointUnavailable, why)
 		}
+		// Before the restore, as a group's (kube_discovery.go): a worker
+		// that registers through Kubernetes is routed to only once its
+		// registration names this pod.
+		if groupKey != "" {
+			p, gerr := a.kubeClient.CoreV1().Pods(ns).Get(rctx, pod, metav1.GetOptions{})
+			if gerr == nil && p.UID != uid {
+				gerr = fmt.Errorf("pod %s/%s was replaced", ns, pod)
+			}
+			if gerr != nil {
+				return fmt.Errorf("%w: placeholder: %w", errCheckpointUnavailable, gerr)
+			}
+			if werr := c.writeGroupRegistrations(rctx, groupKey, []*corev1.Pod{p}); werr != nil {
+				return fmt.Errorf("%w: registrations: %w", errCheckpointUnavailable, werr)
+			}
+		}
 		_, err := restoreForRequest(a, rctx, RestoreRequest{
 			CheckpointID:             id,
 			PlaceholderNamespace:     ns,
