@@ -137,6 +137,13 @@ The worker and DCGM PodMonitors set the `job` label to `nvcf-worker` and
 selects series by these names, so keep them aligned with the collector
 templates.
 
+The default monitors reference no Secrets, so discovery RBAC grants the
+Target Allocator Secret access through a Role in the collector namespace only.
+With the default values, this chart does not configure Target Allocator mTLS.
+Without it, the Target Allocator does not pass Secret values to the collector.
+So with the default values, monitors that authenticate with a Secret, for
+example `basicAuth` or a `tlsConfig` client certificate, do not work.
+
 The default observability namespace is `monitoring`. A different namespace
 also requires NetworkPolicy reachability to the collector.
 
