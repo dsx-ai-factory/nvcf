@@ -115,9 +115,11 @@ event name for a context, ordered by event timestamp. It is not an immutable log
 of every repeated occurrence.
 
 The v3 read endpoints do not paginate results. A read returns all stored event
-names for the selected context. The v3 API does not expose a retention
-duration. Plan Cassandra capacity and backups according to the event rate of
-the registered compute planes.
+names for the selected context. New events from `grpc-proxy` expire three hours
+after their last write, and their stats rows expire after 72 hours. The service
+can configure these durations. Other sources do not receive a retention TTL.
+Plan Cassandra capacity and backups according to the event rate of the
+registered compute planes.
 
 ## Prerequisites
 

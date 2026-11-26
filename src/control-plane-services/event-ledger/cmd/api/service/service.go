@@ -47,6 +47,9 @@ func InitConns(cfg config.Config, logger *otelzap.Logger) (Connections, error) {
 		// Note: Fatal will exit, so error return might not be reached, but keep for consistency
 		return Connections{}, fmt.Errorf("%s", errMsg)
 	}
+	if handler, ok := db.(interface{ ConfigureV3Retention(config.V3Config) }); ok {
+		handler.ConfigureV3Retention(cfg.V3)
+	}
 
 	// Attempt to get the V2 handler via type assertion.
 	// This assumes the underlying implementation (e.g., CassandraHandler)

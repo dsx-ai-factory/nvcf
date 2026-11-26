@@ -34,6 +34,7 @@ go_test(
         "auth_config_test.go",
         "cloudevents_test.go",
         "config_test.go",
+        "v3_retention_test.go",
     ],
     embed = [":config"],
     deps = [
