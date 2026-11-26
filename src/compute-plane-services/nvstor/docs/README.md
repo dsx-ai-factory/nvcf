@@ -14,6 +14,7 @@ Start with [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - [`../crates/nvstor-nfs/README.md`](../crates/nvstor-nfs/README.md): `nvstor-nfs-export` flags, behaviour, systemd unit, troubleshooting.
 - [`../deploy/nfs-rdma/README.md`](../deploy/nfs-rdma/README.md): deploying NFS over RDMA and `nvstor-peer` fan-out on a multi-rail RoCE fabric.
 - [`peer-copy.md`](peer-copy.md): `nvstor-peer`, copying a directory node to node over RDMA.
+- [`peer-copy-internals.md`](peer-copy-internals.md): how `nvstor-peer` works: protocol, fan-out, attributes, the GPU path.
 - [`model-hydration.md`](model-hydration.md): `s3_hydrate`, copying model shards node to node over TCP or RDMA.
 - [`../crates/nvstor-fuse/README.md`](../crates/nvstor-fuse/README.md): the FUSE filesystem.
 

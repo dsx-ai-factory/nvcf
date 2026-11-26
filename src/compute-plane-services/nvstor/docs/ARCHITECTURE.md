@@ -632,7 +632,8 @@ write and info through PmStore, for `nvstor-client`. No authentication.
 **Stable.** `nvstor-peer` copies a directory tree (a checkpoint, model
 weights) from the node that has it to the node that needs it, with no
 storage tier in between. Usage, flags and how to measure it:
-[peer-copy.md](peer-copy.md).
+[peer-copy.md](peer-copy.md); how it works:
+[peer-copy-internals.md](peer-copy-internals.md).
 
 - **serve** exports a directory read-only through
   `S3RdmaServer::read_only`, one transport per rail, bootstrap on port
