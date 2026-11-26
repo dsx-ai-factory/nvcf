@@ -848,6 +848,15 @@ nvcf-cli function invoke --grpc --request-body '{"input": "test"}'
 
 # Or invoke with JSON configuration
 ./nvcf-cli function invoke --input-file invoke.json
+
+# LLM function: --inference-url and --model-name are required.
+# The CLI sets the body's "model" field to <function-id>/<model-name>.
+./nvcf-cli function invoke \
+  --function-id "func-12345678-1234-1234-1234-123456789abc" \
+  --version-id "ver-12345678-1234-1234-1234-123456789abc" \
+  --inference-url "/v1/chat/completions" \
+  --model-name "dummy-model" \
+  --request-body '{"messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 Direct HTTP invocation routes through the function-specific invocation host, not function routing headers:
