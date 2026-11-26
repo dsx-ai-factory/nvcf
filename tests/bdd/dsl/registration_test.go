@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWatchStargatesCommandKeepsObservationInputsExplicit(t *testing.T) {
@@ -59,6 +60,79 @@ func TestWatchStargatesCommandRejectsMissingOrInvalidInputs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := WatchStargatesCommand(test.endpoint, test.authority, "tls", "nvcf", "context", test.duration); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestPlaintextWatchStargatesRejectionCommandKeepsInputsExplicit(t *testing.T) {
+	t.Setenv("BDD_WATCH_ENDPOINT", "127.0.0.1:50071")
+	got, err := PlaintextWatchStargatesRejectionCommand("${BDD_WATCH_ENDPOINT}", "5")
+	if err != nil {
+		t.Fatalf("build plaintext WatchStargates command: %v", err)
+	}
+	want := "bash tests/bdd/scripts/observe-plaintext-watch-rejection.sh 127.0.0.1:50071 5"
+	if got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestPlaintextWatchStargatesRejectionCommandRejectsMissingOrInvalidInputs(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		duration string
+	}{
+		{name: "empty endpoint", endpoint: " ", duration: "5"},
+		{name: "invalid duration", endpoint: "127.0.0.1:50071", duration: "5s"},
+		{name: "zero duration", endpoint: "127.0.0.1:50071", duration: "0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := PlaintextWatchStargatesRejectionCommand(test.endpoint, test.duration); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestTLSListenerProbeCommandKeepsProbeInputsExplicit(t *testing.T) {
+	t.Setenv("BDD_PROBE_CONTEXT", "k3d-ncp-local-cp")
+	got, err := TLSListenerProbeCommand(
+		"127.0.0.1:50071",
+		"llm-request-router.nvcf.svc.cluster.local",
+		"h2",
+		"stargate-quic-tls",
+		"nvcf",
+		"${BDD_PROBE_CONTEXT}",
+		"10",
+	)
+	if err != nil {
+		t.Fatalf("build TLS listener probe command: %v", err)
+	}
+	want := "bash tests/bdd/scripts/probe-tls-listener.sh 127.0.0.1:50071 llm-request-router.nvcf.svc.cluster.local h2 stargate-quic-tls nvcf k3d-ncp-local-cp 10"
+	if got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestTLSListenerProbeCommandRejectsMissingOrInvalidInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		endpoint   string
+		serverName string
+		alpn       string
+		timeout    string
+	}{
+		{name: "empty endpoint", endpoint: "", serverName: "router.nvcf.svc", alpn: "h2", timeout: "10"},
+		{name: "empty server name", endpoint: "127.0.0.1:50071", serverName: "", alpn: "h2", timeout: "10"},
+		{name: "empty ALPN", endpoint: "127.0.0.1:50071", serverName: "router.nvcf.svc", alpn: " ", timeout: "10"},
+		{name: "invalid timeout", endpoint: "127.0.0.1:50071", serverName: "router.nvcf.svc", alpn: "h2", timeout: "10s"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := TLSListenerProbeCommand(test.endpoint, test.serverName, test.alpn, "tls", "nvcf", "context", test.timeout); err == nil {
 				t.Fatal("expected validation error")
 			}
 		})
@@ -176,6 +250,136 @@ func TestObserveWatchStargatesScriptRejectsDeadlineWithoutSnapshot(t *testing.T)
 	}
 	if !strings.Contains(output, "did not return a streamed snapshot") {
 		t.Fatalf("output = %q, want missing snapshot diagnostic", output)
+	}
+}
+
+func TestObservePlaintextWatchRejectionScriptAcceptsTLSListenerDialTimeout(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "grpcurl"), `#!/bin/sh
+printf '%s\n' "$*" >"$(dirname "$0")/grpcurl-args"
+printf 'Failed to dial target host "127.0.0.1:50071": context deadline exceeded\n' >&2
+exit 1
+`)
+
+	output, err := runRegistrationScript(t, fakeBin, "observe-plaintext-watch-rejection.sh", "127.0.0.1:50071", "5")
+	if err != nil {
+		t.Fatalf("observe plaintext WatchStargates rejection: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		`Failed to dial target host "127.0.0.1:50071": context deadline exceeded`,
+		"plaintext-watch-rejected=tls-listener-timeout",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+	args, err := os.ReadFile(filepath.Join(fakeBin, "grpcurl-args"))
+	if err != nil {
+		t.Fatalf("read grpcurl args: %v", err)
+	}
+	for _, want := range []string{
+		"-plaintext -max-time 5 -import-path ",
+		"/src/libraries/rust/stargate/crates/proto/proto -proto stargate.proto 127.0.0.1:50071 stargate.StargateControlPlane/WatchStargates",
+	} {
+		if !strings.Contains(string(args), want) {
+			t.Fatalf("grpcurl args = %q, want %q", args, want)
+		}
+	}
+}
+
+func TestObservePlaintextWatchRejectionScriptRejectsSuccessfulPlaintextWatch(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "grpcurl"), "#!/bin/sh\nprintf '{\\n  \"stargates\": []\\n}\\n'\n")
+
+	output, err := runRegistrationScript(t, fakeBin, "observe-plaintext-watch-rejection.sh", "127.0.0.1:50071", "5")
+	if err == nil {
+		t.Fatalf("successful plaintext Watch was accepted: %s", output)
+	}
+	if !strings.Contains(output, "plaintext Watch unexpectedly succeeded") || strings.Contains(output, "plaintext-watch-rejected=") {
+		t.Fatalf("output = %q, want unexpected-success diagnostic without the rejection marker", output)
+	}
+}
+
+func TestObservePlaintextWatchRejectionScriptRejectsUnrelatedFailure(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "grpcurl"), `#!/bin/sh
+printf 'Failed to dial target host "127.0.0.1:50071": connection refused\n' >&2
+exit 1
+`)
+
+	output, err := runRegistrationScript(t, fakeBin, "observe-plaintext-watch-rejection.sh", "127.0.0.1:50071", "5")
+	if err == nil {
+		t.Fatalf("unrelated plaintext failure was accepted: %s", output)
+	}
+	if !strings.Contains(output, "connection refused") || strings.Contains(output, "plaintext-watch-rejected=") {
+		t.Fatalf("output = %q, want preserved failure without the rejection marker", output)
+	}
+}
+
+func TestProbeTLSListenerScriptPassesVisibleInputsAndCAToOpenSSL(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "kubectl"), "#!/bin/sh\nprintf 'kubectl %s\\n' \"$*\" >&2\nprintf 'dGVzdC1jYQ=='\n")
+	writeExecutable(t, filepath.Join(fakeBin, "openssl"), `#!/bin/sh
+printf 'openssl %s\n' "$*"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-CAfile" ]; then
+    printf 'CA file contents: %s\n' "$(cat "$2")"
+  fi
+  shift
+done
+printf 'ALPN protocol: h2\nVerify return code: 0 (ok)\n'
+`)
+
+	output, err := runRegistrationScript(t, fakeBin, "probe-tls-listener.sh", "127.0.0.1:50071", "router.nvcf.svc", "h2", "tls", "nvcf", "context", "5")
+	if err != nil {
+		t.Fatalf("probe TLS listener: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"kubectl --context context get secret tls -n nvcf",
+		"openssl s_client -connect 127.0.0.1:50071 -servername router.nvcf.svc -alpn h2 -verify_return_error -CAfile ",
+		"CA file contents: test-ca",
+		"ALPN protocol: h2",
+		"Verify return code: 0 (ok)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output = %q, want %q", output, want)
+		}
+	}
+}
+
+func TestProbeTLSListenerScriptPreservesVerificationFailure(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "kubectl"), "#!/bin/sh\nprintf 'dGVzdC1jYQ=='\n")
+	writeExecutable(t, filepath.Join(fakeBin, "openssl"), `#!/bin/sh
+printf 'verify error:num=19:self-signed certificate in certificate chain\n' >&2
+printf 'Verify return code: 19 (self-signed certificate in certificate chain)\n'
+exit 1
+`)
+
+	output, err := runRegistrationScript(t, fakeBin, "probe-tls-listener.sh", "127.0.0.1:50071", "router.nvcf.svc", "h2", "tls", "nvcf", "context", "5")
+	if err == nil {
+		t.Fatalf("failed handshake was accepted: %s", output)
+	}
+	if !strings.Contains(output, "Verify return code: 19") {
+		t.Fatalf("output = %q, want preserved openssl verification result", output)
+	}
+}
+
+func TestProbeTLSListenerScriptStopsHungHandshakeAtTimeout(t *testing.T) {
+	fakeBin := t.TempDir()
+	writeExecutable(t, filepath.Join(fakeBin, "kubectl"), "#!/bin/sh\nprintf 'dGVzdC1jYQ=='\n")
+	writeExecutable(t, filepath.Join(fakeBin, "openssl"), "#!/bin/sh\nexec sleep 30\n")
+
+	started := time.Now()
+	output, err := runRegistrationScript(t, fakeBin, "probe-tls-listener.sh", "127.0.0.1:50071", "router.nvcf.svc", "h2", "tls", "nvcf", "context", "1")
+	if err == nil {
+		t.Fatalf("hung handshake was accepted: %s", output)
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("probe ran for %s, want it stopped near the 1s timeout", elapsed)
+	}
+	if !strings.Contains(output, "did not finish within 1s") {
+		t.Fatalf("output = %q, want timeout diagnostic", output)
 	}
 }
 

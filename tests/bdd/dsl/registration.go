@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	observeWatchStargatesScript = "tests/bdd/scripts/observe-watch-stargates.sh"
-	waitPylonMetricsScript      = "tests/bdd/scripts/wait-pylon-metrics.sh"
+	observePlaintextWatchRejectionScript = "tests/bdd/scripts/observe-plaintext-watch-rejection.sh"
+	observeWatchStargatesScript          = "tests/bdd/scripts/observe-watch-stargates.sh"
+	probeTLSListenerScript               = "tests/bdd/scripts/probe-tls-listener.sh"
+	waitPylonMetricsScript               = "tests/bdd/scripts/wait-pylon-metrics.sh"
 )
 
 var prometheusMetricNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
@@ -42,17 +44,14 @@ type PylonMetricExpectation struct {
 // WatchStargatesCommand builds a TLS WatchStargates observation with an
 // explicit endpoint, authority, CA source, Kubernetes context, and duration.
 func WatchStargatesCommand(endpoint, authority, caSecret, namespace, kubeContext, durationSeconds string) (string, error) {
-	values := []*string{&endpoint, &authority, &caSecret, &namespace, &kubeContext, &durationSeconds}
-	labels := []string{"endpoint", "TLS authority", "CA secret", "namespace", "kube context", "duration seconds"}
-	for index := range values {
-		*values[index] = strings.TrimSpace(Interpolate(*values[index]))
-		if *values[index] == "" {
-			return "", fmt.Errorf("%s is empty", labels[index])
-		}
+	if err := resolveRequiredInputs(
+		[]string{"endpoint", "TLS authority", "CA secret", "namespace", "kube context", "duration seconds"},
+		&endpoint, &authority, &caSecret, &namespace, &kubeContext, &durationSeconds,
+	); err != nil {
+		return "", err
 	}
-	duration, err := strconv.Atoi(durationSeconds)
-	if err != nil || duration <= 0 {
-		return "", fmt.Errorf("duration seconds must be a positive integer")
+	if err := requirePositiveSeconds("duration seconds", durationSeconds); err != nil {
+		return "", err
 	}
 
 	return BuildCommand(
@@ -65,6 +64,62 @@ func WatchStargatesCommand(endpoint, authority, caSecret, namespace, kubeContext
 		kubeContext,
 		durationSeconds,
 	), nil
+}
+
+// PlaintextWatchStargatesRejectionCommand builds a plaintext WatchStargates
+// call that a TLS listener at an explicit endpoint must reject within an
+// explicit duration.
+func PlaintextWatchStargatesRejectionCommand(endpoint, durationSeconds string) (string, error) {
+	if err := resolveRequiredInputs([]string{"endpoint", "duration seconds"}, &endpoint, &durationSeconds); err != nil {
+		return "", err
+	}
+	if err := requirePositiveSeconds("duration seconds", durationSeconds); err != nil {
+		return "", err
+	}
+	return BuildCommand("bash", observePlaintextWatchRejectionScript, endpoint, durationSeconds), nil
+}
+
+// TLSListenerProbeCommand builds one TLS handshake probe with an explicit
+// endpoint, SNI server name, offered ALPN protocol, CA source, Kubernetes
+// context, and timeout.
+func TLSListenerProbeCommand(endpoint, serverName, alpn, caSecret, namespace, kubeContext, timeoutSeconds string) (string, error) {
+	if err := resolveRequiredInputs(
+		[]string{"endpoint", "TLS server name", "ALPN protocol", "CA secret", "namespace", "kube context", "timeout seconds"},
+		&endpoint, &serverName, &alpn, &caSecret, &namespace, &kubeContext, &timeoutSeconds,
+	); err != nil {
+		return "", err
+	}
+	if err := requirePositiveSeconds("timeout seconds", timeoutSeconds); err != nil {
+		return "", err
+	}
+	return BuildCommand(
+		"bash",
+		probeTLSListenerScript,
+		endpoint,
+		serverName,
+		alpn,
+		caSecret,
+		namespace,
+		kubeContext,
+		timeoutSeconds,
+	), nil
+}
+
+func resolveRequiredInputs(labels []string, values ...*string) error {
+	for index, value := range values {
+		*value = strings.TrimSpace(Interpolate(*value))
+		if *value == "" {
+			return fmt.Errorf("%s is empty", labels[index])
+		}
+	}
+	return nil
+}
+
+func requirePositiveSeconds(label, value string) error {
+	if seconds, err := strconv.Atoi(value); err != nil || seconds <= 0 {
+		return fmt.Errorf("%s must be a positive integer", label)
+	}
+	return nil
 }
 
 // PylonMetricsCommand builds a Pylon metrics observation for every running

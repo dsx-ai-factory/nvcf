@@ -30,6 +30,8 @@ import (
 
 func registerRegistrationSteps(ctx *godog.ScenarioContext, sc *ScenarioContext) {
 	ctx.Step(`^I successfully observe WatchStargates at "([^"]*)" with TLS authority "([^"]*)" using CA secret "([^"]*)" in namespace "([^"]*)" and context "([^"]*)" for "([^"]*)" seconds$`, sc.iSuccessfullyObserveWatchStargates)
+	ctx.Step(`^I successfully observe plaintext WatchStargates rejection at "([^"]*)" for "([^"]*)" seconds$`, sc.iSuccessfullyObservePlaintextWatchStargatesRejection)
+	ctx.Step(`^I successfully probe the TLS listener at "([^"]*)" with TLS server name "([^"]*)" and ALPN "([^"]*)" using CA secret "([^"]*)" in namespace "([^"]*)" and context "([^"]*)" within "([^"]*)" seconds$`, sc.iSuccessfullyProbeTLSListener)
 	ctx.Step(`^every Pylon for function "([^"]*)" using container "([^"]*)" and context "([^"]*)" should report metrics within "([^"]*)":$`, sc.everyPylonForFunctionShouldReportMetrics)
 }
 
@@ -48,6 +50,37 @@ func (sc *ScenarioContext) iSuccessfullyObserveWatchStargates(
 	}
 	if err := sc.runResolvedSuccessfully(ctx, command); err != nil {
 		return fmt.Errorf("WatchStargates at %q with TLS authority %q failed: %w", dsl.Interpolate(endpoint), dsl.Interpolate(authority), err)
+	}
+	return nil
+}
+
+func (sc *ScenarioContext) iSuccessfullyObservePlaintextWatchStargatesRejection(ctx context.Context, endpoint, durationSeconds string) error {
+	command, err := dsl.PlaintextWatchStargatesRejectionCommand(endpoint, durationSeconds)
+	if err != nil {
+		return err
+	}
+	if err := sc.runResolvedSuccessfully(ctx, command); err != nil {
+		return fmt.Errorf("plaintext WatchStargates rejection at %q was not observed: %w", dsl.Interpolate(endpoint), err)
+	}
+	return nil
+}
+
+func (sc *ScenarioContext) iSuccessfullyProbeTLSListener(
+	ctx context.Context,
+	endpoint,
+	serverName,
+	alpn,
+	caSecret,
+	namespace,
+	kubeContext,
+	timeoutSeconds string,
+) error {
+	command, err := dsl.TLSListenerProbeCommand(endpoint, serverName, alpn, caSecret, namespace, kubeContext, timeoutSeconds)
+	if err != nil {
+		return err
+	}
+	if err := sc.runResolvedSuccessfully(ctx, command); err != nil {
+		return fmt.Errorf("TLS listener probe at %q with TLS server name %q failed: %w", dsl.Interpolate(endpoint), dsl.Interpolate(serverName), err)
 	}
 	return nil
 }

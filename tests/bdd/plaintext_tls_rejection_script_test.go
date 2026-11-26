@@ -24,22 +24,24 @@ import (
 )
 
 func TestPlaintextTLSRejectionAcceptsObservedGrpcurlDeadline(t *testing.T) {
-	cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh")
-	cmd.Stdin = strings.NewReader(
-		`Failed to dial target host "127.0.0.1:50071": context deadline exceeded`,
-	)
+	for _, endpoint := range []string{"127.0.0.1:50071", "127.0.0.1:50443"} {
+		t.Run(endpoint, func(t *testing.T) {
+			cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh", endpoint)
+			cmd.Stdin = strings.NewReader(`Failed to dial target host "` + endpoint + `": context deadline exceeded`)
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("classify grpcurl deadline: %v\n%s", err, output)
-	}
-	if got, want := strings.TrimSpace(string(output)), "plaintext-watch-rejected=tls-listener-timeout"; got != want {
-		t.Fatalf("normalized output = %q, want %q", got, want)
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("classify grpcurl deadline: %v\n%s", err, output)
+			}
+			if got, want := strings.TrimSpace(string(output)), "plaintext-watch-rejected=tls-listener-timeout"; got != want {
+				t.Fatalf("normalized output = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
 func TestPlaintextTLSRejectionRejectsSnapshotThenRPCDeadline(t *testing.T) {
-	cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh")
+	cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh", "127.0.0.1:50071")
 	cmd.Stdin = strings.NewReader(`{
   "stargates": []
 }
@@ -66,7 +68,7 @@ func TestPlaintextTLSRejectionRejectsUnrelatedGrpcurlFailures(t *testing.T) {
 		"wrong target dial timeout": "Failed to dial target host \"127.0.0.1:50443\": context deadline exceeded",
 	} {
 		t.Run(name, func(t *testing.T) {
-			cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh")
+			cmd := exec.Command("bash", "scripts/assert-grpcurl-plaintext-tls-rejection.sh", "127.0.0.1:50071")
 			cmd.Stdin = strings.NewReader(diagnostic)
 
 			output, err := cmd.CombinedOutput()
