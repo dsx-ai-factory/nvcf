@@ -387,6 +387,11 @@ type Mutator struct {
 	// DynamoLeaseTTL, in seconds, is the etcd lease TTL (ETCD_LEASE_TTL)
 	// those components get unless they set one; 0 leaves Dynamo's default.
 	DynamoLeaseTTL int
+	// KeepsDynamoIdentity reports a Dynamo component whose capture keeps
+	// its own registry identity (the agent's identity restore: on, and a
+	// worker it can take). Such a pod keeps its Dynamo namespace, its
+	// prefix and its lease TTL (dynamoNamespacePatches). Nil: none does.
+	KeepsDynamoIdentity func(pod *corev1.Pod) bool
 	// CaptureLivenessBudget, in seconds, is the silence the liveness
 	// probes of a pod a capture may freeze are widened to tolerate, so the
 	// freeze does not get the pod restarted (liveness.go); 0 leaves probes

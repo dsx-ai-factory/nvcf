@@ -70,6 +70,9 @@ const (
 	identityMemberKey    = "identity.member"    // slot of the rank that holds the lease
 	identityEndpointsKey = "identity.endpoints" // the rank's ETCD_ENDPOINTS
 	identityKeysKey      = "identity.keys"      // JSON: every key under the lease, with its value
+	// identityNamespaceKey is the namespace the identity was captured in,
+	// the only one it restores into (identityBlocksCapture).
+	identityNamespaceKey = "identity.namespace"
 	// identityHolderKey names the restore that holds the identity
 	// ("namespace/pod/uid"): one live restore per identity.
 	identityHolderKey = "identity.holder"
@@ -241,6 +244,18 @@ func dynamoEtcdEndpoints(pod *corev1.Pod) string {
 const (
 	identityBackendEtcd = "etcd"
 )
+
+// keepsDynamoIdentity reports a pod the identity restore keeps as itself:
+// the flag on, and a worker it can take (identityRestoreCandidate). Its
+// Dynamo namespace is left as the pod sets it (webhook
+// dynamoNamespacePatches).
+func (a *Agent) keepsDynamoIdentity(pod *corev1.Pod) bool {
+	if !a.identityEnabled() {
+		return false
+	}
+	b, _ := identityRestoreCandidate(pod)
+	return b != ""
+}
 
 // identityRestoreCandidate decides whether rank pod may be captured alone
 // with its registry identity, its companions excluded, and with which
@@ -1263,6 +1278,18 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 	id, err := identityFromRecord(d)
 	if err != nil {
 		return nil, refuseIdentity(identityRefusedError, err)
+	}
+	// An identity restores only into the namespace it was captured in
+	// when its worker names that namespace in its configuration
+	// (identityBlocksCapture): restored elsewhere, it would join the
+	// source namespace's registry.
+	for _, s := range slots {
+		if s == nil {
+			continue
+		}
+		if webhook.NamesOwnInstance(s) != "" && s.Namespace != d[identityNamespaceKey] {
+			return nil, refuseIdentity(identityRefusedError, errors.New("the identity was captured in another namespace, which the worker names in its configuration"))
+		}
 	}
 	if id.Member >= len(slots) || slots[id.Member] == nil {
 		return nil, refuseIdentity(identityRefusedError, fmt.Errorf("no placeholder for the lease holder's slot %d", id.Member))

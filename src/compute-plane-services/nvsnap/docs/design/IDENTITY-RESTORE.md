@@ -93,7 +93,31 @@ the dump ends it.
 
 The identity (lease ID, TTL, pod address, the slot that holds the lease, the
 etcd endpoints and the keys) is written into the group record with the
-capture's outcome (`identity.*` keys). None of it is logged.
+capture's outcome (`identity.*` keys), with the namespace it was captured in
+(`identity.namespace`). None of it is logged.
+
+A worker that names its own namespace in its configuration (its etcd's
+address in that namespace, say) is otherwise never captured, since a
+restore elsewhere would run as the wrong instance (`webhook`
+`NamesOwnInstance`). With the flag on, such a worker that the identity
+restore can take (`identityRestoreCandidate`) is captured, but only with
+its identity (`criu_group.go` `identityBlocksCapture`, `ownInstanceBlocks`).
+It restores only in the namespace it was captured in: the configuration
+hash leaves the Dynamo wiring env out (`rootfsonly` `cacheRelevantEnv`) and
+a tenant's namespaces share captures, so admission admits its placeholder
+only there (`CRIUGroup.IdentityNamespace`; with the flag off such a record
+is not looked up at all), and the restore refuses any other namespace
+(`identityBeforeRestore`).
+
+Admission sets a fixed Dynamo namespace (`DYN_NAMESPACE`,
+`DYN_NAMESPACE_PREFIX`) and a longer lease TTL on Dynamo pods a CRIU capture
+may take, so a restored graph and a fresh one agree (`webhook`
+`dynamoNamespacePatches`). With the flag on, a worker the identity restore
+can take keeps its own (`Mutator.KeepsDynamoIdentity`, the agent's
+`keepsDynamoIdentity`): it is restored as itself, and in a namespace whose
+frontend and peers share one Dynamo namespace the fixed one would move it
+where the frontend never routes. Its lease TTL stays its own too: a longer
+one only lengthens the restore's wait for the dead source's lease.
 
 ## 4. Resetting the source's outside connections
 

@@ -2921,3 +2921,152 @@ func TestMarkRefusing_FullListRefuses(t *testing.T) {
 		t.Fatalf("the list changed: %d entries", got)
 	}
 }
+
+// A worker that names its own namespace in its configuration (its etcd's
+// address in that namespace) is captured with its identity when identity
+// restore is on, and the record names the namespace, the only one it
+// restores into; with the flag off it is skipped, as before.
+func TestCaptureGroup_WorkerNamingItsNamespace(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		t.Run(fmt.Sprintf("identity restore %v", on), func(t *testing.T) {
+			saved, savedCk, savedDel := groupWarmupWait, checkpointMember, deleteMember
+			groupWarmupWait = 0
+			t.Cleanup(func() { groupWarmupWait, checkpointMember, deleteMember = saved, savedCk, savedDel })
+			ctx := context.Background()
+			f := newFakeEtcd(t)
+			f.grant(idLease, 30)
+			f.dynamoWorkerKeys(idLease, idOldIP)
+			f.grant(idLease+1, 30)
+			f.dynamoWorkerKeys(idLease+1, "10.0.0.9")
+			useFakeEtcd(t, f)
+			const ownEtcd = "http://etcd.shared.svc.cluster.local:2379"
+			leader := idWorker("w-a", idOldIP)
+			other := idWorker("w-b", "10.0.0.9")
+			other.OwnerReferences[0].UID = "rs2"
+			for _, p := range []*corev1.Pod{leader, other} {
+				for i := range p.Spec.Containers[0].Env {
+					if p.Spec.Containers[0].Env[i].Name == "ETCD_ENDPOINTS" {
+						p.Spec.Containers[0].Env[i].Value = ownEtcd
+					}
+				}
+			}
+			if webhook.NamesOwnInstance(leader) == "" {
+				t.Fatal("the test worker does not name its own namespace")
+			}
+			agentPod := ready(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "nvsnap-agent-x", Namespace: "nvsnap-system",
+				Labels: map[string]string{"app": "nvsnap-agent"}}, Spec: corev1.PodSpec{NodeName: "n0"}})
+			kc := fake.NewSimpleClientset(leader, other, agentPod)
+			a := idAgent(kc, on)
+			a.seedDrivers()
+			var reqs []CheckpointRequest
+			checkpointMember = func(_ *Agent, _ context.Context, req CheckpointRequest) (*CheckpointResult, error) {
+				reqs = append(reqs, req)
+				return &CheckpointResult{CheckpointID: "ck-a", PeersReset: len(req.ResetPeersOutside) > 0, IdentityChecked: req.IdentityCheck != nil}, nil
+			}
+			deleteMember = func(*Agent, context.Context, string, string, types.UID) error { return nil }
+			a.criuRestorer().captureGroup(ctx, leader, "", 1)
+			if !on {
+				if len(reqs) != 0 {
+					t.Fatalf("captured with identity restore off: %+v", reqs)
+				}
+				return
+			}
+			if len(reqs) != 1 {
+				t.Fatalf("checkpoint requests %+v; want the worker captured with its identity", reqs)
+			}
+			cms, _ := kc.CoreV1().ConfigMaps("nvsnap-system").List(ctx, metav1.ListOptions{})
+			var rec map[string]string
+			for _, cm := range cms.Items {
+				if cm.Data["checkpoint.0"] == "ck-a" {
+					rec = cm.Data
+				}
+			}
+			if rec == nil || rec[identityNamespaceKey] != "shared" || !hasIdentity(rec) {
+				t.Fatalf("record %v; want the identity and its namespace", rec)
+			}
+			if g, _ := parseCRIUGroup("k", map[string]string{"state": criuGroupStateComplete, "size": "1", "checkpoint.0": "ck-a", identityNamespaceKey: "shared"}); g.IdentityNamespace != "shared" {
+				t.Fatalf("admission's view %+v; want the identity's namespace", g)
+			}
+		})
+	}
+}
+
+// Restored elsewhere, a worker naming its namespace would join that
+// namespace's registry: the restore refuses any namespace but the one the
+// identity was captured in.
+func TestLoneRestore_OwnNamespaceIdentityOnlyThere(t *testing.T) {
+	fastIdentity(t)
+	ctx := context.Background()
+	f := newFakeEtcd(t)
+	base := idRecord(t, f.dynamoWorkerKeys(idLease, idOldIP), f)
+	useFakeEtcd(t, f)
+	for _, tc := range []struct {
+		capturedIn string
+		restored   bool
+	}{{"shared", true}, {"elsewhere", false}} {
+		t.Run("captured in "+tc.capturedIn, func(t *testing.T) {
+			rec := base.DeepCopy()
+			rec.Data[identityNamespaceKey] = tc.capturedIn
+			f.mu.Lock()
+			f.kvs, f.leases = map[string]etcdKV{}, map[int64]*fakeLease{}
+			f.mu.Unlock()
+			pod := idPlaceholder("w-new", idNewIP)
+			for i := range pod.Spec.Containers[0].Env {
+				if pod.Spec.Containers[0].Env[i].Name == "ETCD_ENDPOINTS" {
+					pod.Spec.Containers[0].Env[i].Value = "http://etcd.shared.svc.cluster.local:2379"
+				}
+			}
+			kc := fake.NewSimpleClientset(rec, pod)
+			c := idAgent(kc, true).criuRestorer()
+			saved := restoreForRequest
+			t.Cleanup(func() { restoreForRequest = saved })
+			restored := false
+			restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+				restored = true
+				return nil, errors.New("stop here")
+			}
+			c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
+			if restored != tc.restored {
+				t.Fatalf("restored %v; want %v", restored, tc.restored)
+			}
+		})
+	}
+}
+
+// The capture's first gate: a worker naming its namespace passes it only
+// with identity restore on, and only as an identity candidate.
+func TestIdentityBlocksCapture_IdentityCandidate(t *testing.T) {
+	w := idWorker("w", idOldIP)
+	for i := range w.Spec.Containers[0].Env {
+		if w.Spec.Containers[0].Env[i].Name == "ETCD_ENDPOINTS" {
+			w.Spec.Containers[0].Env[i].Value = "http://etcd.shared.svc.cluster.local:2379"
+		}
+	}
+	if got := idAgent(fake.NewSimpleClientset(), false).identityBlocksCapture(w); got != "ETCD_ENDPOINTS" {
+		t.Fatalf("flag off: %q; want the pod refused", got)
+	}
+	if got := idAgent(fake.NewSimpleClientset(), true).identityBlocksCapture(w); got != "" {
+		t.Fatalf("flag on: %q; want the identity candidate let through", got)
+	}
+	w.Spec.HostNetwork = true // not a candidate
+	if got := idAgent(fake.NewSimpleClientset(), true).identityBlocksCapture(w); got == "" {
+		t.Fatal("flag on: a pod the identity restore cannot take was let through")
+	}
+}
+
+// Admission keeps a worker's own Dynamo namespace only when identity
+// restore is on and the worker is one it can take; the agent hands
+// admission that decision.
+func TestKeepsDynamoIdentity(t *testing.T) {
+	w := idWorker("w", idOldIP)
+	if !idAgent(fake.NewSimpleClientset(), true).keepsDynamoIdentity(w) {
+		t.Fatal("flag on: an identity candidate's Dynamo namespace is rewritten")
+	}
+	if idAgent(fake.NewSimpleClientset(), false).keepsDynamoIdentity(w) {
+		t.Fatal("flag off: the Dynamo namespace is no longer fixed")
+	}
+	w.Spec.HostNetwork = true
+	if idAgent(fake.NewSimpleClientset(), true).keepsDynamoIdentity(w) {
+		t.Fatal("flag on: a worker the identity restore cannot take keeps its own namespace")
+	}
+}

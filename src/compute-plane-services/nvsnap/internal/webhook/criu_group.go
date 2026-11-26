@@ -79,6 +79,12 @@ type CRIUGroup struct {
 	// from the capture: the instance stopped for it, whose restore
 	// verifies it. Empty once a restore has succeeded.
 	VerifyNamespace string
+	// IdentityNamespace is the namespace a capture holding an etcd
+	// identity was taken in (the agent's identity restore, on: a record
+	// with an identity is not looked up with it off). A placeholder that
+	// names its own instance in its configuration may restore from it
+	// only in that namespace.
+	IdentityNamespace string
 	// Slots are the members a companion's own configuration names, when
 	// the record was found through a companion's alias: one, or several
 	// for identical companions (replicas of one template), any of which a
@@ -188,7 +194,12 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 			return nil
 		}
 	} else {
-		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) {
+		// A capture holding the worker's etcd identity, taken in this very
+		// namespace, restores the worker as itself (the agent's identity
+		// restore): the namespace in its configuration is its own. The
+		// configuration hash leaves that wiring out and a tenant's
+		// namespaces share captures, so any other namespace is refused.
+		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) && g.IdentityNamespace != pod.Namespace {
 			log.WithField("env", name).Info("CRIU group restore: the pod names its own instance in its configuration; it starts from the caches")
 			admit(metrics.AdmitCold, "own-instance")
 			return nil

@@ -110,6 +110,15 @@ func (m *Mutator) dynamoNamespacePatches(ctx context.Context, pod *corev1.Pod) [
 	if gpuRequest(pod) == 0 && !m.CaptureCandidate(ctx, pod) {
 		return nil
 	}
+	// A worker the identity restore takes is restored as itself, under
+	// its own Dynamo namespace: one shared with other instances (its
+	// frontend and peers) that the fixed one would move it out of, so the
+	// frontend would never route to it. Its lease TTL is its own too: a
+	// longer one only lengthens the wait for its dead source's lease
+	// before its restore.
+	if m.KeepsDynamoIdentity != nil && m.KeepsDynamoIdentity(pod) {
+		return nil
+	}
 	var patches []PatchOp
 	for i := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[i]

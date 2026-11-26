@@ -262,7 +262,7 @@ func parseCRIUGroup(key string, data map[string]string) (webhook.CRIUGroup, bool
 	if err != nil || size < 1 {
 		return webhook.CRIUGroup{}, false
 	}
-	g := webhook.CRIUGroup{Key: key, GPUShare: data["gpushare"] == "true", VerifyNamespace: verifyNamespace(data),
+	g := webhook.CRIUGroup{Key: key, GPUShare: data["gpushare"] == "true", VerifyNamespace: verifyNamespace(data), IdentityNamespace: data[identityNamespaceKey],
 		Checkpoints: make([]string, size), Nodes: make([]string, size), Companion: make([]bool, size), Containers: make([]string, size), Bundles: make([]string, size), ColdEntrypoints: make([]string, size),
 		ProcessConfigs: make([]string, size)}
 	for i := range size {
@@ -780,6 +780,16 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			log.WithField("reason", why).Warn("CRIU group capture: skipped; the worker's etcd identity cannot be read")
 			return false
 		}
+	} else {
+		// A rank that names its own instance was let through only for an
+		// identity capture (identityBlocksCapture); without one it is
+		// refused as before.
+		for _, r := range ranks {
+			if name := a.ownInstanceBlocks(r); name != "" {
+				log.WithFields(logrus.Fields{"rank": r.Name, "env": name}).Info("CRIU group capture: skipped; a rank names its own instance in its configuration, and is not captured with its etcd identity")
+				return false
+			}
+		}
 	}
 	uris := make([]string, 0, len(ranks)+len(companions))
 	for _, r := range ranks {
@@ -973,6 +983,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			if ierr := identity.write(data); ierr != nil {
 				log.WithError(ierr).Error("CRIU group capture: cannot record the worker's etcd identity")
 			} else {
+				data[identityNamespaceKey] = leader.Namespace
 				observeIdentity(identityCaptured)
 			}
 		}
@@ -1594,7 +1605,34 @@ func peersResetDone(reqs []CheckpointRequest, results []*CheckpointResult) error
 // consistent: a Dynamo component that runs under the fixed Dynamo
 // namespace and registers in its instance's etcd (webhook.DynamoRestorable),
 // whose etcd is captured with it as a companion.
+//
+// With identity restore on, a Dynamo worker the identity restore can take
+// (identityRestoreCandidate: its etcd named literally, as its namespace
+// may be) is not refused here: its capture goes on, and is kept only when
+// it records the worker's identity (ownInstanceBlocks, after the identity
+// is read). Such a capture restores only into the namespace it was taken
+// in: the configuration hash leaves the Dynamo wiring env out
+// (rootfsonly cacheRelevantEnv), and a tenant's namespaces share
+// captures, so the record names the namespace (identityNamespaceKey),
+// admission admits only a placeholder in it (CRIUGroup.IdentityNamespace)
+// and the restore refuses any other (identityBeforeRestore).
 func (a *Agent) identityBlocksCapture(pod *corev1.Pod) string {
+	name := a.ownInstanceBlocks(pod)
+	if name == "" {
+		return ""
+	}
+	if a.identityEnabled() {
+		if b, _ := identityRestoreCandidate(pod); b != "" {
+			return ""
+		}
+	}
+	return name
+}
+
+// ownInstanceBlocks is identityBlocksCapture without the identity
+// restore: the env variable through which pod names its own instance,
+// unless the fixed Dynamo namespace keeps it consistent.
+func (a *Agent) ownInstanceBlocks(pod *corev1.Pod) string {
 	name := webhook.NamesOwnInstance(pod)
 	if name == "" {
 		return ""
