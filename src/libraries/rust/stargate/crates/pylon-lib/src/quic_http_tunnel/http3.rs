@@ -206,6 +206,7 @@ mod tests {
         HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     };
 
+    use super::super::UpstreamBackend;
     use super::super::core::{PylonRetryConfig, build_response_headers};
 
     fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
@@ -232,29 +233,32 @@ mod tests {
     fn h3_success_response_omits_content_length_and_keeps_retry_metadata() {
         let retry = PylonRetryConfig::default();
         let mut upstream_headers = HeaderMap::new();
-        upstream_headers.insert(
-            retry.upstream_retry_header.clone(),
-            HeaderValue::from_static("true"),
-        );
         upstream_headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
         upstream_headers.insert(
             reqwest::header::CONTENT_LENGTH,
             HeaderValue::from_static("99"),
         );
 
-        let status = reqwest::StatusCode::TOO_MANY_REQUESTS;
-        let headers = build_response_headers(status, &upstream_headers, &retry, None, "inst-a")
-            .expect("h3 success headers should build");
+        let status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let headers = build_response_headers(
+            status,
+            &upstream_headers,
+            &retry,
+            UpstreamBackend::default(),
+            None,
+            "inst-a",
+        )
+        .expect("h3 success headers should build");
         let response = h3_response(status, headers).expect("h3 success response should build");
 
-        assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             header_value(response.headers(), HEADER_STARGATE_RETRYABLE),
             "true"
         );
         assert_eq!(
             header_value(response.headers(), HEADER_STARGATE_RETRY_REASON),
-            "upstream_admission_rejected"
+            "upstream_unavailable"
         );
         assert_eq!(
             header_value(response.headers(), "x-stargate-retry-after-ms"),

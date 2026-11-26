@@ -61,6 +61,9 @@ type WebhookConfig struct {
 	// DynamoNamespace is the fixed Dynamo namespace for Dynamo components
 	// (webhook.Mutator.DynamoNamespace).
 	DynamoNamespace string
+	// SkipUnusedInits is webhook.Mutator.SkipUnusedInits; it also makes a
+	// group capture record the volumes its restores may skip filling.
+	SkipUnusedInits bool
 	// DynamoLeaseTTL is webhook.Mutator.DynamoLeaseTTL.
 	DynamoLeaseTTL int
 	// CaptureLivenessBudget is webhook.Mutator.CaptureLivenessBudget.
@@ -69,6 +72,11 @@ type WebhookConfig struct {
 	// freeze is held out of service until its capture is settled
 	// (capture_hold.go).
 	CaptureHold bool
+	// GPUShareIBV is webhook.Mutator.GPUShareIBVByDefault.
+	GPUShareIBV bool
+	// NIXLPause is webhook.Mutator.NIXLPause: the cluster honors the
+	// nvsnap.io/nixl-pause annotation (gpushare_nixl.go).
+	NIXLPause bool
 
 	// CacheSalt is folded into every cache identity the webhook composes
 	// (rootfsonly.HashInputComposer.Salt). Bump it to start fresh captures
@@ -153,6 +161,7 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		Backend:               backend,
 		AgentPlacement:        placement,
 		DynamoNamespace:       cfg.DynamoNamespace,
+		SkipUnusedInits:       cfg.SkipUnusedInits,
 		DynamoLeaseTTL:        cfg.DynamoLeaseTTL,
 		CaptureLivenessBudget: cfg.CaptureLivenessBudget,
 		// nvsnap#194 + #88: per-pod OverlayFS unions over every captured
@@ -181,10 +190,12 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// reads its prewarm policy (on/off, reader count). nil = defaults.
 		StorageProfile: a.l2Profile,
 		// One-downloader election for chart pods; nil when off or L2 is
-		// off (docs/design/helm-chart-cache-election.md).
+		// off (docs/ARCHITECTURE.md, section 7).
 		Elector: a.elector,
 		// Write-once model volume for Helm functions; nil when off.
-		ModelVolume:       a.modelVolume,
+		ModelVolume: a.modelVolume,
+		// Node-local model cache; nil when off (node_model_cache.go).
+		NodeModelCache:    a.webhookNodeModelCache(),
 		CacheVolume:       a.cacheVolume,
 		ModelWaitDeadline: a.config.ModelVolume.WaitDeadline,
 		ModelHostRoot:     a.modelHostRoot(),
@@ -224,6 +235,12 @@ func (a *Agent) startWebhook(ctx context.Context, cfg WebhookConfig, backend che
 		// On a CRIU cluster every GPU pod runs under the gpushare library,
 		// which keeps GPU memory out of the CRIU image.
 		GPUShareByDefault: criuIsDefault(),
+		// NCCL in pods under the library takes its verbs from the bundled
+		// library, which releases its RDMA state around a capture.
+		GPUShareIBVByDefault: cfg.GPUShareIBV,
+		// Pods annotated nvsnap.io/nixl-pause get the env nixl-pause
+		// needs, where the cluster enables it.
+		NIXLPause: cfg.NIXLPause,
 		// nvsnap#202: restore-prep strategy. When "init-container",
 		// the webhook emits a nvsnap-mount-prep init container instead
 		// of doing the OverlayFS mount syscalls during admission.

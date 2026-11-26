@@ -307,10 +307,10 @@ func TestExtractOpenAIMultipartBody(t *testing.T) {
 	})
 }
 
-func TestRewriteShadowRequestModel(t *testing.T) {
+func TestReplaceTopLevelModelKeepsOriginalBody(t *testing.T) {
 	original := []byte(`{"model":"facebook/opt-125m","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 
-	rewritten, err := rewriteShadowRequestModel(bytes.Clone(original), "private/facebook/opt-125m-shadow")
+	rewritten, err := replaceTopLevelModel(bytes.Clone(original), "private/facebook/opt-125m-shadow")
 	require.NoError(t, err)
 
 	var body map[string]any
@@ -692,7 +692,7 @@ func TestDispatchShadowIfNeededIsolatesRewriteFailure(t *testing.T) {
 			if modelName == failingTarget {
 				return nil, errors.New("injected rewrite failure")
 			}
-			return rewriteShadowRequestModel(body, modelName)
+			return replaceTopLevelModel(body, modelName)
 		},
 	}
 	primaryBody := `{"model":"facebook/opt-125m","stream":true}`

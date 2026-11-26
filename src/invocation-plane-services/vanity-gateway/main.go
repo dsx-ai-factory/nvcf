@@ -18,7 +18,10 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
+	"os"
 	"reflect"
+	"strconv"
 
 	"ai-api-gateway-service/gateway"
 
@@ -60,15 +63,7 @@ func NewRootCommand(zapLogger *logs.ZapLogger) *cobra.Command {
 		Version:      gateway.GetVersion(),
 		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			v, err := config.InitConfig(cmd, cfgFile, "", "")
-			if err != nil {
-				return err
-			}
-			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
-				v.MustBindEnv(flag.Name)
-			})
-			c := gateway.Config{}
-			err = v.Unmarshal(&c)
+			c, err := loadConfig(cmd, cfgFile)
 			if err != nil {
 				return err
 			}
@@ -87,6 +82,35 @@ func NewRootCommand(zapLogger *logs.ZapLogger) *cobra.Command {
 	registerConfigFlags(rootCmd)
 
 	return rootCmd
+}
+
+// loadConfig reads gateway.Config from the config file, flags and environment.
+func loadConfig(cmd *cobra.Command, cfgFile string) (gateway.Config, error) {
+	v, err := config.InitConfig(cmd, cfgFile, "", "")
+	if err != nil {
+		return gateway.Config{}, err
+	}
+	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		v.MustBindEnv(flag.Name)
+	})
+	for _, name := range []string{"MAX_REQUEST_SIZE_BYTES", "MAX_STREAMED_REQUEST_SIZE_BYTES"} {
+		if value, set := os.LookupEnv(name); set && value == "" {
+			return gateway.Config{}, fmt.Errorf("%s must be a positive integer in bytes", name)
+		}
+		if v.IsSet(name) {
+			limit, err := strconv.ParseInt(v.GetString(name), 10, 64)
+			if err != nil {
+				return gateway.Config{}, fmt.Errorf("%s must be a positive integer in bytes: %w", name, err)
+			}
+			// The config decoder reads a string with a leading zero as octal.
+			v.Set(name, limit)
+		}
+	}
+	c := gateway.Config{}
+	if err := v.Unmarshal(&c); err != nil {
+		return gateway.Config{}, err
+	}
+	return c, nil
 }
 
 // registerConfigFlags declares one flag per gateway.Config field so that

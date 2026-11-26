@@ -53,11 +53,64 @@ Configuration is passed through environment variables.
 | `PRIVATE_MODEL_NAME_REGEX_PATTERN` | No | See below | Regex used to hide private model names from `/v1/models`. |
 | `POD_IP` | No | Empty | Added to trace attributes as `host.ip`. |
 | `AWS_REGION` | No | Empty | Added to trace attributes as `host.dc`. |
+| `MAX_REQUEST_SIZE_BYTES` | No | `26214400` (25 MiB) | Maximum model API request body size in bytes. Explicit values must be positive integers. Invalid values stop startup. |
+| `MAX_STREAMED_REQUEST_SIZE_BYTES` | No | `MAX_REQUEST_SIZE_BYTES` | Maximum body size in bytes for model API requests on the streamed path. Explicit values must be positive integers, at least `MAX_REQUEST_SIZE_BYTES`, and above it only when `MAX_REQUEST_SIZE_BYTES` is at least 65536. Invalid values stop startup. |
 | `SHADOW_MAX_CONCURRENT` | No | `256` | Maximum concurrent shadow requests. Non-positive values use the default. |
 
 `PRIVATE_MODEL_NAME_REGEX_PATTERN` defaults to the value compiled into the
 service. Override it when your deployment uses different private model naming
 conventions.
+
+Set `MAX_REQUEST_SIZE_BYTES=67108864` for a 64 MiB limit. The native chart
+exposes the same setting as `vanityGateway.config.maxRequestSizeBytes`:
+
+```yaml
+vanityGateway:
+  config:
+    maxRequestSizeBytes: 67108864
+```
+
+The gateway holds a model API request body in memory while it routes the
+request, unless the body is larger than 64 KiB, its first 64 KiB contain
+`model` and `stream` (decision routes: `model`), and the model's route
+forwards the body unchanged. Then it holds only that prefix and forwards the
+rest as it arrives; see [Request Body Handling](#request-body-handling).
+LLM Gateway routes and shadow models always hold the full body and add more
+copies. In one in-process test, a single 64 MiB request held in full raised
+gateway heap use by about
+224 MiB on a direct route, 600 to 700 MiB on an LLM Gateway route, and about
+900 MiB with one shadow model. Treat these numbers as examples, not limits.
+When raising this limit, also raise `vanityGateway.resources.limits.memory`.
+Size it from a load test at your expected concurrency, with headroom. The
+chart's default memory limit is `512Mi`.
+
+Requests for models with `functionType: LLM` are also limited by the LLM
+Gateway, which rejects request bodies over 50 MiB (52428800 bytes) by default.
+
+The limit applies to all model API POST routes, including JSON and multipart
+image requests. Bodies exactly at the limit are accepted. Generic vanity
+pass-through routes and private-model lookup response limits are unchanged.
+Existing logs, spans, and request metrics still record rejected requests.
+Changing the environment setting requires a process restart; mapping reloads
+retain the configured limit.
+
+`MAX_STREAMED_REQUEST_SIZE_BYTES` raises the limit only for requests on the
+streamed path, which holds a 64 KiB prefix whatever the body size. Unset, it
+equals `MAX_REQUEST_SIZE_BYTES` and nothing changes. Every request the gateway
+reads in full, including multipart, LLM Gateway, shadowed and late-field
+requests, keeps `MAX_REQUEST_SIZE_BYTES`. For example, keep the buffered limit
+at 25 MiB and allow 64 MiB streamed:
+
+```yaml
+vanityGateway:
+  config:
+    maxStreamedRequestSizeBytes: 67108864
+```
+
+The chart leaves this key unset. Set it only with a chart version that has
+it, and remove it before rolling the chart back to an older version. A larger
+streamed limit does not raise gateway memory per request, but it lets clients
+hold an upstream connection and backend for longer uploads.
 
 ## Configuration Sources
 
@@ -343,7 +396,9 @@ When a target's `cancelOnClientDisconnect` is `true`, the gateway cancels only
 that target if the client disconnects or cancels the primary request before the
 primary response completes. Other targets continue under their own policies.
 Sampling does not change primary validation, forwarded request bytes, or
-headers. Raw bearer credentials, prompt cache keys, and message content are not
+headers. A model with shadow targets reads each request body in full before
+dispatch, because sampling and replay read the body. See
+[Request Body Handling](#request-body-handling). Raw bearer credentials, prompt cache keys, and message content are not
 added to logs, traces, or metric labels.
 
 ### Vanity Mapping Fields
@@ -417,6 +472,156 @@ model may shadow a model served by the invocation service, or the reverse.
 `LLM_GATEWAY_ENDPOINT` is required whenever a model sets `functionType: LLM`. It
 is the outbound address of the LLM Gateway, so it is a full URL with a scheme
 and must not carry a path.
+
+The `model` rewrite needs the complete body, so requests for these models are
+read in full before they are forwarded. See
+[Request Body Handling](#request-body-handling).
+
+## Request Body Handling
+
+Model API routes need `model`, and outside `/v1/decisions` and
+`/v1/systemone` also `stream`, before they can choose a backend. The gateway
+reads at most 64 KiB of a JSON body before it decides how to read the rest.
+
+```mermaid
+flowchart TD
+  request[Model API request] --> multipart{Multipart?}
+  multipart -- yes --> mplimit{Content-Length over the buffered limit?}
+  mplimit -- yes --> rejected[Reject before reading the body]
+  mplimit -- no --> buffered[Buffered path: read the whole body within the buffered limit, validate, route, forward]
+  multipart -- no --> limit{Content-Length over the streamed limit?}
+  limit -- yes --> rejected
+  limit -- no --> prefix[Read up to 64 KiB]
+  prefix --> ended{Body ended?}
+  ended -- yes --> buffered
+  ended -- no --> fields{Routing fields in the prefix, and the route forwards the body unchanged?}
+  fields -- no --> between{Content-Length over the buffered limit?}
+  between -- yes --> rejectedprefix[Reject after the prefix]
+  between -- no --> buffered
+  fields -- yes --> streamed[Streamed path: route, forward the prefix, then the rest of the upload as it arrives, within the streamed limit]
+```
+
+- Buffered path: the gateway reads the complete body, decodes and validates it,
+  and then forwards it. Every body shorter than 64 KiB uses this path, so
+  small requests are validated exactly as before.
+- Streamed path: the gateway retains only the 64 KiB prefix, releases it once
+  forwarded, and applies backpressure from the upstream to the client upload.
+  The upstream request starts before the upload ends, so a slow upload holds
+  the upstream connection for as long as the client takes to send the body.
+  An upload that sends no bytes for 60 seconds ends the request. The backend
+  reads the body as the client sends it, so a backend whose body read timeout
+  is shorter than a slow upload fails the request; the buffered path delivers
+  the whole body at once.
+
+A body longer than the prefix streams when its top-level JSON object has
+`model`, and outside the decision routes `stream`, within the prefix. Other
+members may come first if they are complete, valid JSON within the prefix. The routing fields follow the buffered decoder:
+
+- Keys match without regard to ASCII case. The first `model` and the first
+  `stream` member win. Later duplicates are forwarded unchanged and not read.
+- `model` must be a non-empty string of printable ASCII without escapes.
+  `stream` must be `true` or `false`.
+- An escaped or non-ASCII key that may name a routing field, a `null` or
+  non-string `model`, an escaped `model` value, or a non-boolean `stream`
+  uses the buffered path, so the request is accepted or rejected as before.
+
+Field order is not a protocol guarantee. Some clients serialize `model` and
+`stream` first, such as Codex CLI 0.167.0 and OpenAI Python SDK 3.49.0. Others
+send the input first, such as OpenAI Python SDK 2.26.0, or keep the caller's
+property order, such as OpenAI Node SDK 7.55.0. Those requests use the buffered
+path.
+
+The buffered path is also used when:
+
+| Case | `reason` |
+| --- | --- |
+| The body ends within the prefix | `complete` |
+| `model` or `stream` is missing from the prefix. An omitted `stream` is not known to be absent until the body ends. | `late_fields` |
+| The object ends, or more data follows it, before the routing fields | `fields_absent` |
+| A routing field uses a form listed above | `nonstandard_fields` |
+| The prefix is not a JSON object, has a syntax error, or nests deeper than the JSON decoders accept | `invalid_prefix` |
+| `multipart/form-data` image requests | `multipart` |
+| The model is not routed by the endpoint | `model_not_found` |
+| The model is offline or past `eol` | `function_status` |
+| `functionType: LLM`, which rewrites `model` in the body | `llm_gateway` |
+| The model has shadow targets | `shadow` |
+
+The buffered cases keep their existing error responses and error precedence.
+
+Two limits apply. The buffered limit, `MAX_REQUEST_SIZE_BYTES`, bounds every
+read until the gateway chooses the streamed path. Only then is the rest of the
+upload allowed up to the streamed limit, `MAX_STREAMED_REQUEST_SIZE_BYTES`,
+with the prefix counted once. Any other read keeps the buffered limit. The
+too-large error names the limit that applied: `400` with `Please make sure
+your payload is below <limit> bytes in size.` on OpenAI routes, and `413` with
+`request body is too large (limit <limit> bytes)` on native routes. When the
+streamed limit is above the buffered limit and the request used the buffered
+path because of `late_fields` or `fields_absent`, the message ends with a hint,
+for example `Bodies up to 134217728 bytes can be accepted when the model and
+stream fields are in the first 65536 bytes of the JSON body.` On
+`/v1/decisions` and `/v1/systemone` it names only the model field. Other
+reasons, and equal limits, get no hint. The gateway rejects as early as the
+outcome is known:
+
+- A `Content-Length` over the streamed limit, or a multipart `Content-Length`
+  over the buffered limit, is rejected without reading the body.
+- A `Content-Length` between the two limits on a request that falls back to
+  the buffered path is rejected right after the prefix, with the buffered
+  limit, and nothing is forwarded.
+- These two rejections answer without reading the rest of the upload. On
+  HTTP/1.1 the response carries `Connection: close` and the gateway closes the
+  connection after it, so the client gets the error even if it waits for a
+  response before sending more.
+- A body of unknown length on the buffered path stops at the buffered limit.
+
+With the streamed limit unset, both limits are equal and requests are handled
+as before.
+
+The gateway accepts cleartext HTTP/2 with prior knowledge and through an
+HTTP/1.1 `Upgrade: h2c` request. An HTTP/1.1 request on any route that asks
+for `Upgrade: h2c` and has a body, a `Content-Length` above 0 or a chunked
+body, is served over HTTP/1.1 instead. The gateway removes `h2c` from
+`Upgrade`, the `HTTP2-Settings` header and the `Connection` tokens that name
+them before routing, so the body is read under the limits above, can take the
+streamed path, and the upgrade headers are not forwarded. A request without a
+body still upgrades to HTTP/2.
+
+For `functionType: LLM`, the LLM Gateway also buffers the rewritten body, so
+those requests are not expected to use less memory.
+
+On the streamed path the gateway validates only the prefix up to the routing
+fields. Later bytes, including malformed JSON, trailing data, and duplicate
+routing keys, are forwarded unchanged and the backend accepts or rejects them.
+The buffered path rejects malformed JSON with `400` before dispatch.
+
+Failures after a streamed request is dispatched:
+
+- If an upload of unknown length passes the streamed limit before the
+  upstream responds, the gateway stops the upstream body and returns the same
+  error as a limit reached before dispatch: `400` on OpenAI routes and `413` on
+  native routes. The upstream receives an incomplete body, never a complete
+  truncated one.
+- If the client disconnects, the upload fails, or the client sends no body
+  bytes for 60 seconds, the upstream request is aborted with an incomplete body
+  and the gateway records `client_canceled` (`499`), not an upstream error. An
+  upload that fails before dispatch still returns `500`.
+- If the upstream has already started its response, the failure ends that
+  response.
+- If the upstream answers before reading the whole body, the client receives
+  that response. The rest of the upload is not forwarded. A client that has
+  stopped sending receives it when the 60-second limit ends its upload.
+
+Each primary request rejected for its body size is counted in
+`nvcf_ai_api_gateway_request_body_large_total` (see [Health and
+Metrics](#health-and-metrics)) and logged once at info level with the message
+`request body over the size limit rejected`. The log line has the request ID,
+the trace and span IDs when traced, the outcome, the size range, the limit, the
+declared `Content-Length` when the client sent one, the buffered reason when
+known, the model and function ID when the prefix named a routed model, and the
+client's User-Agent cut to its product and version, at most 64 characters. It
+has no body bytes and no other headers. The gateway reads no body bytes for
+this telemetry: it uses the declared length and what routing already knows at
+the rejection point, and the client's response is unchanged.
 
 ## Invoking OpenAI-compatible Endpoints
 
@@ -550,14 +755,30 @@ curl -s -H "Host: api.example.com" \
   http://localhost:10081/v1/models
 ```
 
-The gateway does not validate the key. It sends the key to
-`GET /v2/nvcf/functions?visibility=authorized,private` on
-`NVCF_CONTROL_PLANE_ENDPOINT`, and the NVCF API applies the same account and
-API key resource checks as invocation, version by version. A model whose name
-matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when the NVCF API returns
-the function version it routes to. An entry without `functionVersionID` is
-listed when any version of its function is returned. Expiry,
-`supported_endpoints`, and metadata follow the public-model rules, and
+The gateway does not validate the key. It sends the key to List Invocable
+Functions, `GET /v2/nvcf/invocable/functions/versions/ids?visibility=authorized,private`,
+on `NVCF_CONTROL_PLANE_ENDPOINT`. That listing has one entry per invocable
+function version, in `ACTIVE` or `DEGRADING` status, and needs the
+`list_functions` scope. The NVCF API applies the same account and API key
+resource checks as invocation, version by version. After a `404` for that
+listing, the lookup uses `GET /v2/nvcf/functions?visibility=authorized,private`
+instead and keeps only its `ACTIVE` and `DEGRADING` versions. When the function
+listing answers for the same key, the NVCF API predates List Invocable
+Functions, so every lookup in the pod uses the function listing for 10 minutes
+and then tries List Invocable Functions again. A `404` from both listings, as
+for a JWT whose client has no account, leaves the pod on List Invocable
+Functions.
+
+The function listing accepts the `list_functions_details` scope as well as
+`list_functions`. Against an NVCF API without List Invocable Functions, a key
+with only `list_functions_details` can therefore discover private models. After
+the NVCF API is upgraded, List Invocable Functions answers such a key with
+`403`, and the key needs `list_functions` for discovery.
+
+A model whose name matches `PRIVATE_MODEL_NAME_REGEX_PATTERN` is listed when
+the NVCF API returns the function version it routes to. An entry without
+`functionVersionID` is listed when any version of its function is returned.
+Expiry, `supported_endpoints`, and metadata follow the public-model rules, and
 Anthropic clients get the same models in the Anthropic shape. An alias can
 route to different functions per section. A key sees it only for the sections
 whose route it may use: `supported_endpoints` lists only those, and Anthropic
@@ -574,9 +795,9 @@ The lookup never fails a request:
 | --- | --- |
 | No bearer key | Public list, no NVCF API call |
 | Key accepted | Public list plus the private models the key may access |
-| NVCF API rejects the key (`401`) | Public list |
-| Key has no `list_functions` or `list_functions_details` scope (`403`) | Public list |
-| NVCF API error, timeout, or redirect | The key's last successful result if it is under 15 minutes old, otherwise the public list. The key is not looked up again for 10 seconds. |
+| NVCF API rejects the key (`401`) | Public list. The key is looked up again after 10 seconds. |
+| Key lacks the `list_functions` scope (`403`) | Public list. The key is looked up again after 10 seconds. |
+| NVCF API error, timeout, or redirect | The key's last authorized result if it is under 15 minutes old, otherwise the public list. A `401` or `403` is never served stale. The key is not looked up again for 10 seconds. |
 | `NVCF_CONTROL_PLANE_ENDPOINT` not set | Public list, no NVCF API call |
 
 Keyed responses carry `Cache-Control: private, no-store` and
@@ -585,8 +806,12 @@ Keyed responses carry `Cache-Control: private, no-store` and
 `403` for an unrecognized `nvapi-` key, so that key reports `forbidden`. Model
 list responses carry `Vary: Authorization`.
 
-Results are cached per key for one minute, for up to 4096 keys, and survive
-mapping reloads. A reload that changes the set of private functions refreshes
+Authorized results are cached per key for five minutes, for up to 4096 keys,
+and survive mapping reloads. Invocation checks access on every call, so a list
+that lags access changes by a few minutes is acceptable. A `401` or `403` is
+kept for 10 seconds only, so a key that gains the `list_functions` scope shows
+its private models within seconds. The gateway does not store or replay NVCF
+API responses. A reload that changes the set of private functions refreshes
 each key on its next request. Concurrent requests with the same key share one
 lookup. Each pod runs at most 16 lookups at once, each with a 5 second
 timeout, and a request never waits for a free slot. Keys without an
@@ -594,7 +819,7 @@ authorized result share a per-pod budget of 50 lookups per second, so random
 tokens cannot drive NVCF API calls. Without a private alias in the mapping,
 there is no lookup. The lookup never follows a redirect, so the key goes only
 to `NVCF_CONTROL_PLANE_ENDPOINT`. A request that the gateway skips under these
-limits gets the key's last successful result or the public list.
+limits gets the key's last authorized result or the public list.
 
 ## Invoking the Anthropic Messages Endpoint
 
@@ -716,7 +941,8 @@ Requests must use `Content-Type: application/json`. A request without
 a `Content-Type` header is read as JSON, as on `/v1/chat/completions`; any
 other media type returns `415`. Vendor headers such as
 `TypeSafe-Danger-Zone-Images: true` reach the backend unchanged. Request bodies
-may be up to 25 MB.
+may be up to `MAX_REQUEST_SIZE_BYTES` (25 MiB by default), or up to
+`MAX_STREAMED_REQUEST_SIZE_BYTES` when they take the streamed path.
 
 ```shell
 source .env
@@ -875,6 +1101,28 @@ combinations are emitted at zero on startup. The primary request span records
 the deciding methods in the `shadow.sampling_methods` attribute. Neither
 records cache keys, credentials, or message content.
 
+`nvcf_ai_api_gateway_request_body_reads_total` counts primary model API
+request bodies read without error. The `mode` label is `streamed` or
+`buffered`, and the `reason` label is `early_fields` for streamed requests or
+one of the buffered reasons in [Request Body Handling](#request-body-handling).
+All label combinations are emitted at zero on startup. The request span records
+`request.body.mode` and `request.body.reason`. Shadow replays are not counted.
+
+`nvcf_ai_api_gateway_request_body_large_total` counts primary model API
+requests rejected because the body is over its limit, and streamed requests
+whose body ended above the buffered limit. The `outcome` label is
+`rejected_unread` when the declared `Content-Length` is over the limit and no
+body byte is read, `rejected_buffered` when the body passes the buffered limit
+while the gateway reads it in full or a declared length between the limits
+falls back to the buffered path, `rejected_streamed` when it passes the
+streamed limit after a streamed request was dispatched, and
+`streamed_complete` when a streamed request body reached its end above the
+buffered limit, counted once per request. The `size` label is the declared
+`Content-Length` range: `le_32MiB`, `le_64MiB`, `le_128MiB`, `gt_128MiB`, or
+`unknown` when the client sent no `Content-Length`. Ranges do not overlap, so a
+40 MiB body counts only as `le_64MiB`. All label combinations are emitted at
+zero on startup. Shadow replays are not counted.
+
 `nvcf_ai_api_gateway_private_model_lookups_total` counts private model access
 lookups. The `result` label is `authorized`, `unauthenticated`, `forbidden`,
 `unavailable`, or `limited`. The `cached` label is `true` for cache hits. A
@@ -887,8 +1135,9 @@ combinations are emitted at zero on startup. The request span records
 `private_models.cached` and `private_models.result`.
 
 Every response on the model API host (`openai.host`) carries one
-`X-Request-Id`. The gateway keeps the caller's value or creates a UUID and sends
-the same value upstream, so the LLM Gateway logs the request under the same ID.
+`X-Request-Id`. The gateway keeps a caller value only when it is at most 128
+characters and uses `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, or `-`. Otherwise it
+creates a UUID. The same ID is sent upstream and used in the LLM Gateway logs.
 An ID the upstream returns is replaced. Each shadow copy gets its own ID. The
 request log line includes the ID. Pass-through vanity hosts do not add or
 replace request IDs; the caller's and the function's headers pass through
@@ -956,7 +1205,8 @@ function, status, and error-origin attributes retain their meaning.
 request from server telemetry entry to entry into the outbound transport,
 before client instrumentation, connection setup, upstream headers, or body
 streaming. It covers routing, validation, request-body parsing and rewriting,
-and shadow scheduling before primary dispatch. It is elapsed pre-upstream
+and shadow scheduling before primary dispatch. For a streamed request body it
+covers only the 64 KiB prefix read. It is elapsed pre-upstream
 processing time, including scheduling and request-body reads, not gateway CPU
 time or total gateway work. Post-dispatch processing is excluded.
 

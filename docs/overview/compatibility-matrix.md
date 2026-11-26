@@ -10,8 +10,8 @@ stacks. Stack, chart and image versions do not need matching version numbers.
 
 | Stack | Selected version | Source tag |
 | --- | --- | --- |
-| [Self-managed (control plane)](../self-managed/installation.md) | `1.1.5` | `deploy/stacks/self-managed/v1.1.5` |
-| [Compute plane](../compute-plane/cluster-management/index.md) | `1.1.0` | `deploy/stacks/nvcf-compute-plane/v1.1.0` |
+| [Self-managed (control plane)](../self-managed/installation.md) | `1.1.9` | `deploy/stacks/self-managed/v1.1.9` |
+| [Compute plane](../compute-plane/cluster-management/index.md) | `1.1.1` | `deploy/stacks/nvcf-compute-plane/v1.1.1` |
 | [Observability](../observability/observability.md) | `1.1.0` | `deploy/stacks/observability/v1.1.0` |
 
 {/*docs-version-sync:END compatibility-matrix*/}
@@ -40,6 +40,10 @@ for the docs edition 1.0.2 baseline and required upgrade order. Use
 [Consume an NVCF release](umbrella-releases.md) for package downloads.
 
 For the separate 1.1 upgrade path, see its
-[cross-stack upgrade order](release-notes/1.0.x-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
+[cross-stack upgrade order](release-notes/1.0.1-to-1.1.0-upgrade.md#cross-stack-upgrade-order).
 That contract applies to its listed starting releases; it does not change
 the exact 1.0.4 selection above.
+
+To reach NVCF 1.1.1, follow the [1.0.4 to 1.1.1 upgrade](release-notes/1.0.4-to-1.1.1-upgrade.md)
+from NVCF 1.0.4 or the [1.1.0 to 1.1.1 upgrade](release-notes/1.1.0-to-1.1.1-upgrade.md)
+from NVCF 1.1.0. Earlier 1.0.x releases upgrade to 1.0.4 first.

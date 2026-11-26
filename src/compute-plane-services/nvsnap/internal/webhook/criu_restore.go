@@ -43,7 +43,10 @@ const (
 	// (/checkpoints/<id>), the same path the agent's placeholder uses.
 	criuCheckpointsMount = "/checkpoints"
 
-	restoreWorkVolume = "nvsnap-restore-work"
+	restoreWorkVolume = RestoreWorkVolume
+	// RestoreWorkVolume names the placeholder's work volume, an emptyDir the
+	// node's agent also reaches through the kubelet's pod directory.
+	RestoreWorkVolume = "nvsnap-restore-work"
 	// RestoreWorkMountPath is the placeholder's own writable directory for
 	// what a restore writes: CRIU's log and stats (criu -W) and a group
 	// restore's session. The checkpoint itself is mounted read-only: later
@@ -63,6 +66,20 @@ const (
 	// ColdStartedAnnotation marks a placeholder whose restore failed and
 	// that the agent started cold in place, with the time it did.
 	ColdStartedAnnotation = "nvsnap.io/criu-cold-started"
+
+	// TeardownHoldFile is the agent's hold on a restored group rank's
+	// placeholder, on its work volume: once its workload has gone, the
+	// placeholder stays until the agent removes it, once every rank of the
+	// group has exited, so no node leaves the group's fabric while a peer
+	// still holds memory imported from it (docs/design/GROUP-TEARDOWN.md).
+	// cmd/nvsnap-idle names it too.
+	TeardownHoldFile = "teardown-hold"
+	// TeardownExitedFile is the placeholder's report, on its work volume,
+	// that its workload has gone. cmd/nvsnap-idle names it too.
+	TeardownExitedFile = "teardown-exited"
+	// TeardownExitedAnnotation marks a terminating restored rank whose
+	// workload has exited, for the other ranks' agents.
+	TeardownExitedAnnotation = "nvsnap.io/criu-teardown-exited"
 )
 
 // criuCheckpointID returns the CRIU checkpoint a capture record points to,
@@ -110,6 +127,11 @@ func (m *Mutator) criuRestoreFor(ctx context.Context, pod *corev1.Pod, hash stri
 	}
 	if m.CRIURestoreBlocked != nil && m.CRIURestoreBlocked(ctx, id) {
 		log.WithField("checkpoint", id).Warn("CRIU restore: this checkpoint failed to restore before; cold start")
+		return "", man
+	}
+	if changed := ProcessConfigChanges(man.SourcePodMeta[ProcessConfigMeta], ProcessConfig(pod)); len(changed) > 0 {
+		log.WithFields(logrus.Fields{"checkpoint": id, "changed": strings.Join(changed, ", ")}).
+			Info("CRIU restore: the pod's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
 		return "", man
 	}
 	return id, man
@@ -214,7 +236,7 @@ func (m *Mutator) criuPlaceholderPatches(pod *corev1.Pod, checkpointID string, m
 	} else if c.Args != nil {
 		patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
 	}
-	patches = append(patches, placeholderInitPatches(pod, group)...)
+	patches = append(patches, placeholderInitPatches(pod, group, c.Name, m.unusedForPlaceholder(pod, group, man))...)
 	if c.LivenessProbe != nil {
 		patches = append(patches, PatchOp{Op: "remove", Path: base + "/livenessProbe"})
 	}
@@ -426,12 +448,20 @@ func jsonPointerEscape(s string) string {
 // startup step: it serves beside the main container for the pod's life,
 // like any other sidecar, and runs unchanged. Skipped, it would exit, be
 // restarted, and hold back every init container after it.
-func placeholderInitPatches(pod *corev1.Pod, group bool) []PatchOp {
+//
+// unused names the emptyDir volumes the group's capture found no restored
+// process using (UnusedVolumes), when the group skips the setup that fills
+// them; nil keeps every init that writes what the checkpointed container
+// mounts. The restored processes keep the files they had open, so a volume
+// none of them used needs none of its contents.
+func placeholderInitPatches(pod *corev1.Pod, group bool, container string, unused map[string]bool) []PatchOp {
 	if !group {
 		return nil
 	}
-	keep := initsToKeep(pod)
+	keep := initsToKeep(pod, container, unused)
+	base0 := initsToKeep(pod, container, nil)
 	var patches []PatchOp
+	var skippedForUnused []string
 	for i := range pod.Spec.InitContainers {
 		init := &pod.Spec.InitContainers[i]
 		if keep[i] {
@@ -442,8 +472,13 @@ func placeholderInitPatches(pod *corev1.Pod, group bool) []PatchOp {
 		if init.Command != nil {
 			op = "replace"
 		}
+		reason := init.Name + " leaves nothing the pod's running containers read"
+		if base0[i] {
+			reason = init.Name + " fills only volumes no restored process uses"
+			skippedForUnused = append(skippedForUnused, init.Name)
+		}
 		patches = append(patches, PatchOp{Op: op, Path: base + "/command",
-			Value: []string{HelperBin, "skip", "--reason", "restore placeholder: " + init.Name + " leaves nothing the pod's running containers read"}})
+			Value: []string{HelperBin, "skip", "--reason", "restore placeholder: " + reason}})
 		if init.Args != nil {
 			patches = append(patches, PatchOp{Op: "remove", Path: base + "/args"})
 		}
@@ -453,6 +488,9 @@ func placeholderInitPatches(pod *corev1.Pod, group bool) []PatchOp {
 			patches = append(patches, PatchOp{Op: "add", Path: base + "/volumeMounts/-", Value: helperMount()})
 		}
 	}
+	if len(skippedForUnused) > 0 {
+		patches = append(patches, newMetaPatcher(pod).annotation(SkippedInitsAnnotation, strings.Join(skippedForUnused, ","))...)
+	}
 	return patches
 }
 
@@ -460,7 +498,11 @@ func placeholderInitPatches(pod *corev1.Pod, group bool) []PatchOp {
 // runs: native sidecars, and every init that writes a data volume read by a
 // container that runs in the placeholder (every regular container, every
 // native sidecar, every init kept), until no more are kept.
-func initsToKeep(pod *corev1.Pod) map[int]bool {
+//
+// The checkpointed container's mounts of emptyDir volumes in unused do not
+// count as reads: its processes are restored, not started, and the capture
+// found none of them using those volumes. Every other container's do.
+func initsToKeep(pod *corev1.Pod, container string, unused map[string]bool) map[int]bool {
 	volumes := map[string]corev1.Volume{}
 	for i := range pod.Spec.Volumes {
 		volumes[pod.Spec.Volumes[i].Name] = pod.Spec.Volumes[i]
@@ -472,7 +514,19 @@ func initsToKeep(pod *corev1.Pod) map[int]bool {
 		}
 	}
 	for i := range pod.Spec.Containers {
-		mount(&pod.Spec.Containers[i])
+		c := &pod.Spec.Containers[i]
+		if c.Name != container || len(unused) == 0 {
+			mount(c)
+			continue
+		}
+		for _, vm := range c.VolumeMounts {
+			// A subPath mount reads a file the setup put there; without it
+			// kubelet would make a directory in its place.
+			if v, ok := volumes[vm.Name]; ok && v.EmptyDir != nil && unused[vm.Name] && vm.SubPath == "" && vm.SubPathExpr == "" {
+				continue
+			}
+			read[vm.Name] = true
+		}
 	}
 	keep := map[int]bool{}
 	for i := range pod.Spec.InitContainers {

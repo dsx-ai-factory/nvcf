@@ -19,6 +19,8 @@ use axum::http::{HeaderMap, HeaderName, StatusCode};
 use stargate_protocol::tunnel_contract::{
     HEADER_STARGATE_RETRY_REASON, HEADER_STARGATE_RETRYABLE,
     RETRY_REASON_CHAT_USAGE_REWRITE_SATURATED, RETRY_REASON_QUEUE_ESTIMATE_MISMATCH,
+    RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED, RETRY_REASON_UPSTREAM_OVERLOADED,
+    RETRY_REASON_UPSTREAM_UNAVAILABLE,
 };
 
 mod replay;
@@ -175,14 +177,26 @@ fn should_retry_upstream_response(
     headers: &HeaderMap,
     retry: &ProxyRetryConfig,
 ) -> bool {
-    retry.retryable_status_codes.contains(&status)
-        && match header_str(headers, HEADER_STARGATE_RETRYABLE) {
-            Some(retryable) => retryable.eq_ignore_ascii_case("true"),
-            None => {
-                !headers.contains_key(HEADER_STARGATE_RETRYABLE)
-                    && !retry.require_pylon_retry_signal
-            }
+    match header_str(headers, HEADER_STARGATE_RETRYABLE) {
+        // Pylon decides which model server errors are safe to retry.
+        Some(retryable) => !status.is_success() && retryable.eq_ignore_ascii_case("true"),
+        None => {
+            !headers.contains_key(HEADER_STARGATE_RETRYABLE)
+                && !retry.require_pylon_retry_signal
+                && retry.retryable_status_codes.contains(&status)
         }
+    }
+}
+
+/// Whether Pylon marked a model server error, rather than its own rejection.
+/// The client gets the model server's answer when no other instance is left.
+pub(super) fn is_model_server_error_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        RETRY_REASON_UPSTREAM_OVERLOADED
+            | RETRY_REASON_UPSTREAM_UNAVAILABLE
+            | RETRY_REASON_UPSTREAM_MODEL_UNREGISTERED
+    )
 }
 
 pub(super) fn is_internal_capacity_rejection(status: StatusCode, headers: &HeaderMap) -> bool {
@@ -396,12 +410,22 @@ mod tests {
     }
 
     #[test]
-    fn retry_signal_is_ignored_for_non_retryable_status() {
+    fn pylon_retry_signal_decides_for_error_statuses() {
         let retry = ProxyRetryConfig::default();
         let headers = retry_headers("true", None);
 
+        for status in [529, 503, 404] {
+            assert!(
+                should_retry_upstream_response(
+                    StatusCode::from_u16(status).unwrap(),
+                    &headers,
+                    &retry
+                ),
+                "{status}"
+            );
+        }
         assert!(!should_retry_upstream_response(
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             &headers,
             &retry
         ));

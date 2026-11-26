@@ -1,6 +1,18 @@
 # The agent's ClusterRole, read by internal/agent's
-# TestAgentRBACCoversItsClientCalls.
+# TestAgentRBACCoversItsClientCalls; the alert rules and their promtool
+# tests, read by its TestAlertRulesAreTestedAndDocumented.
 exports_files(
-    ["helm/nvsnap/templates/agent-rbac.yaml"],
+    [
+        "helm/nvsnap/files/prometheus-rules.test.yaml",
+        "helm/nvsnap/files/prometheus-rules.yaml",
+        "helm/nvsnap/templates/agent-rbac.yaml",
+    ],
     visibility = ["//src/compute-plane-services/nvsnap/internal/agent:__pkg__"],
+)
+
+# The ServiceMonitor, whose scrape-interval guard internal/metrics's
+# TestFirstSightHoldCoversSeveralScrapes reads.
+exports_files(
+    ["helm/nvsnap/templates/agent-servicemonitor.yaml"],
+    visibility = ["//src/compute-plane-services/nvsnap/internal/metrics:__pkg__"],
 )

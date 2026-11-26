@@ -12,7 +12,15 @@ this docs edition's [artifact manifest](manifest.md). Use one selected
 combination. Mixing the latest versions of each stack can select a different
 combination from the one documented here.
 
-For the 1.0.4 selection and changes from docs edition 1.0.2, read the
+For NVCF 1.1.1, read the [release notes](../../fern/changelog/2026-11-25.mdx).
+To reach NVCF 1.1.1, use the
+[1.0.4 to 1.1.1 upgrade](release-notes/1.0.4-to-1.1.1-upgrade.md) or, from NVCF
+1.1.0, the [1.1.0 to 1.1.1 upgrade](release-notes/1.1.0-to-1.1.1-upgrade.md).
+
+For NVCF 1.1.0, read the [release notes](../../fern/changelog/2026-11-10.mdx)
+and the [1.0.1 to 1.1.0 upgrade procedure](release-notes/1.0.1-to-1.1.0-upgrade.md).
+
+For the earlier 1.0.4 selection and changes from docs edition 1.0.2, read its
 [release notes](../../fern/changelog/2026-10-26.mdx) and
 [upgrade procedure](release-notes/1.0.2-to-1.0.4-upgrade.md).
 The [compatibility policy](compatibility-matrix.md#compatibility-and-maintenance-policy)
@@ -88,14 +96,20 @@ download command in this catalog.
 {/*docs-version-sync:BEGIN stack-package-downloads*/}
 
 ```bash
-# Self-Managed 1.1.5
-# Publication pending: nvcf-self-managed-stack 1.1.5 is not yet available for download.
+# Self-Managed 1.1.9
+ngc registry resource download-version "nvidia/nvcf/nvcf-self-managed-stack:1.1.9"
+tar -xzf "nvcf-self-managed-stack_v1.1.9/nvcf-self-managed-stack-1.1.9.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/self-managed"
 
-# Compute Plane 1.1.0
-# Publication pending: nvcf-compute-plane-stack 1.1.0 is not yet available for download.
+# Compute Plane 1.1.1
+ngc registry resource download-version "nvidia/nvcf/nvcf-compute-plane-stack:1.1.1"
+tar -xzf "nvcf-compute-plane-stack_v1.1.1/nvcf-compute-plane-stack-1.1.1.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/nvcf-compute-plane"
 
 # Observability 1.1.0
-# Publication pending: nvcf-observability-stack 1.1.0 is not yet available for download.
+ngc registry resource download-version "nvidia/nvcf/nvcf-observability-stack:1.1.0"
+tar -xzf "nvcf-observability-stack_v1.1.0/nvcf-observability-stack-1.1.0.tar.gz" \
+  -C "$BUNDLE_DIR/deploy/stacks/observability"
 
 ```
 

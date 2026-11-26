@@ -51,6 +51,42 @@ type Config struct {
 	PodIP                        string        `mapstructure:"POD_IP"`
 	AWSRegion                    string        `mapstructure:"AWS_REGION"`
 	ShadowMaxConcurrent          int           `mapstructure:"SHADOW_MAX_CONCURRENT"`
+	MaxRequestSizeBytes          *int64        `mapstructure:"MAX_REQUEST_SIZE_BYTES"`
+	MaxStreamedRequestSizeBytes  *int64        `mapstructure:"MAX_STREAMED_REQUEST_SIZE_BYTES"`
+}
+
+// streamedRequestSizeLimit returns the body limit for model requests on the
+// streamed path. Unset, it equals the buffered limit. It may exceed the
+// buffered limit only when the buffered limit covers the routing prefix, so
+// the prefix read before the path is chosen stays within the buffered limit.
+func (c Config) streamedRequestSizeLimit() (int64, error) {
+	buffered, err := c.requestSizeLimit()
+	if err != nil {
+		return 0, err
+	}
+	if c.MaxStreamedRequestSizeBytes == nil {
+		return buffered, nil
+	}
+	streamed := *c.MaxStreamedRequestSizeBytes
+	switch {
+	case streamed <= 0:
+		return 0, fmt.Errorf("MAX_STREAMED_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+	case streamed < buffered:
+		return 0, fmt.Errorf("MAX_STREAMED_REQUEST_SIZE_BYTES must not be below MAX_REQUEST_SIZE_BYTES (%d bytes)", buffered)
+	case streamed > buffered && buffered < requestPrefixLimit:
+		return 0, fmt.Errorf("MAX_STREAMED_REQUEST_SIZE_BYTES can exceed MAX_REQUEST_SIZE_BYTES only when MAX_REQUEST_SIZE_BYTES is at least %d bytes", requestPrefixLimit)
+	}
+	return streamed, nil
+}
+
+func (c Config) requestSizeLimit() (int64, error) {
+	if c.MaxRequestSizeBytes == nil {
+		return defaultMaxRequestSize, nil
+	}
+	if *c.MaxRequestSizeBytes <= 0 {
+		return 0, fmt.Errorf("MAX_REQUEST_SIZE_BYTES must be a positive integer in bytes")
+	}
+	return *c.MaxRequestSizeBytes, nil
 }
 
 type NVCFGateway struct {
@@ -80,6 +116,9 @@ func swapRouterWhenNotified(ctx context.Context, mappings reloadableconfig.Reloa
 }
 
 func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error) {
+	if _, err := config.streamedRequestSizeLimit(); err != nil {
+		return nil, err
+	}
 	if config.SecretsPath == "" {
 		config.SecretsPath = "vault/secrets.json"
 	}
@@ -115,6 +154,9 @@ func NewNVCFGateway(logger *logs.ZapLogger, config Config) (*NVCFGateway, error)
 	}
 	if err := setupShadowMetrics(); err != nil {
 		return nil, fmt.Errorf("failed to setup shadow metrics: %w", err)
+	}
+	if err := setupRequestBodyMetrics(); err != nil {
+		return nil, fmt.Errorf("failed to setup request body metrics: %w", err)
 	}
 	if err := setupPrivateModelMetrics(); err != nil {
 		return nil, fmt.Errorf("failed to setup private model metrics: %w", err)

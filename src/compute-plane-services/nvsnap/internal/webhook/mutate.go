@@ -340,6 +340,10 @@ type Mutator struct {
 	// group members that name no model (LWS workers); may be nil.
 	// ModelWaitDeadline bounds a reader's wait before it downloads itself.
 	ModelVolume *modelvolume.Provisioner
+	// NodeModelCache, when set, seeds a cold pod's model download from
+	// the node's local copy (docs/design/node-model-cache.md). Never
+	// together with ModelVolume.
+	NodeModelCache *NodeModelCache
 	// CacheVolume shares compile caches between Helm pods on block storage
 	// (KindCache provisioner); nil disables.
 	CacheVolume       *modelvolume.Provisioner
@@ -372,6 +376,10 @@ type Mutator struct {
 	// Job runs within it.
 	AgentPlacement AgentPlacement
 
+	// SkipUnusedInits lets a group restore's placeholders skip the init
+	// containers that fill only volumes no restored process uses, as the
+	// group's capture recorded them (unused_volumes.go).
+	SkipUnusedInits bool
 	// DynamoNamespace is the fixed Dynamo namespace the webhook gives
 	// every Dynamo component whose etcd and NATS are its instance's own
 	// (dynamo.go). Empty leaves the operator's.
@@ -399,9 +407,9 @@ type Mutator struct {
 	CaptureHoldAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
 
 	// CRIUCompanionAdmits reports whether a pod without GPUs may be admitted
-	// as a companion of a group restore: not while a GPU rank of its
-	// namespace already runs. Nil admits.
-	CRIUCompanionAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
+	// as a companion of group g's restore: not while a GPU rank of its
+	// namespace already runs (one g lists as leaving does not). Nil admits.
+	CRIUCompanionAdmits func(ctx context.Context, pod *corev1.Pod, g CRIUGroup) (bool, string)
 	// CRIUCompanionSlot claims for pod one of slots, the slots of identical
 	// companions of group g, that no other placeholder of its instance
 	// holds; two pods admitted together never get the same one. Nil
@@ -461,6 +469,15 @@ type Mutator struct {
 	// GPUShareByDefault puts every GPU pod under the gpushare library
 	// unless it is annotated nvsnap.io/gpushare: "false" (CRIU clusters).
 	GPUShareByDefault bool
+	// GPUShareIBVByDefault treats every pod under the gpushare library as
+	// annotated nvsnap.io/gpushare-ibv: "true" unless it is annotated
+	// "false", so that a workload whose NCCL uses RDMA can be captured
+	// without a change to its pods (chart webhook.gpushareIBV).
+	GPUShareIBVByDefault bool
+	// NIXLPause honors NIXLPauseAnnotation (the cluster's switch, chart
+	// webhook.nixlPause.enabled, off by default): an opted-in gpushare pod
+	// gets the env nixl-pause needs. Off, the annotation is ignored.
+	NIXLPause bool
 	// CRIUCapture is set when the cluster captures with CRIU (agent
 	// captureMethod criu): a restore brings the whole process back, so the
 	// cachedir capture and its compile-cache set do not run, and GPU pods
@@ -476,7 +493,7 @@ type Mutator struct {
 	// CRIUFallback returns why a configuration CRIU cannot serve falls
 	// back to the caches, and the cachedir capture of the pod's rank
 	// (criu_fallback.go). Nil: none does.
-	CRIUFallback func(ctx context.Context, namespace, cacheURI string, ordinal int) (CRIUFallback, bool)
+	CRIUFallback func(ctx context.Context, namespace, cacheURI string, ordinal int, processConfig string) (CRIUFallback, bool)
 	// CRIUScope returns the tenant scope of a namespace, the value a CRIU
 	// capture records under checkpointstore.CRIUScopeMetaKey. Nil: the
 	// scope is the namespace itself.
@@ -484,9 +501,9 @@ type Mutator struct {
 
 	// CRIUGroupAdmits reports whether pod's instance of several ranks can
 	// restore as a group, and why not: a group restore needs every rank to
-	// arrive as a placeholder together. Not asked for a single pod. nil
-	// admits.
-	CRIUGroupAdmits func(ctx context.Context, pod *corev1.Pod) (bool, string)
+	// arrive as a placeholder together (a pod g lists as leaving is not
+	// running). Not asked for a single pod. nil admits.
+	CRIUGroupAdmits func(ctx context.Context, pod *corev1.Pod, g CRIUGroup) (bool, string)
 	// DebugEnv sets debug variables on the GPU containers of matching
 	// pods (debug_env.go).
 	DebugEnv []DebugEnv
@@ -627,6 +644,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	var injectPatches []PatchOp
 	// The identity of the spec as received, before any patch below.
 	injectPatches = append(injectPatches, m.admittedConfigPatches(pod)...)
+	injectPatches = append(injectPatches, m.processConfigPatches(pod)...)
 	// A configuration CRIU cannot serve falls back to the caches; one that
 	// does not start under the gpushare library goes without it.
 	fallback, isFallback := m.criuFallback(ctx, pod)
@@ -638,8 +656,14 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	// gpushare placement is independent of every other decision below and
 	// rides along with whichever patches they return.
-	if !isFallback || fallback.Reason != FallbackGPUShareFailed {
+	// Whether the pod already runs from the node's nvsnap bundle (the
+	// gpushare library): only then may the model cache add the helper,
+	// which comes from the same bundle.
+	bundled := false
+	if !isFallback || (fallback.Reason != FallbackGPUShareFailed && fallback.Reason != FallbackDriver) {
 		gp := m.gpusharePatches(ctx, pod)
+		_, helperBundle := m.bundleHelperVolume(pod)
+		bundled = len(gp) > 0 || podHasVolume(pod, gpushareLibVolume) || helperBundle
 		injectPatches = append(injectPatches, gp...)
 		injectPatches = append(injectPatches, m.captureHoldPatches(ctx, pod, len(gp) > 0)...)
 	}
@@ -673,6 +697,11 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		} else if ep != nil {
 			return mergePatchPlan(append(injectPatches, ep...)), nil
 		}
+		// A cold pod's model download seeds from the node's copy
+		// (node_model_cache.go); it changes only the download init. Here,
+		// after the restore and election branches returned: a pod those
+		// admit keeps its spec.
+		injectPatches = append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
 		// No restore-from — this is a CAPTURE/cold pod. In cachedir mode,
 		// inject the cache/model env vars + the /opt/nvsnap emptyDir so the
 		// engine funnels its caches there and the agent captures that dir.
@@ -708,6 +737,17 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	span.SetAttributes(attribute.String("nvsnap.hash", hash))
 
+	// coldStart admits a stamped pod that restores nothing: it keeps the
+	// placement every cold pod gets, its model download seeding from the
+	// node's copy among it.
+	coldStart := func() ([]PatchOp, error) {
+		patches := append(injectPatches, m.nodeModelCachePatches(ctx, pod, bundled)...)
+		if len(patches) == 0 {
+			return nil, nil
+		}
+		return mergePatchPlan(patches), nil
+	}
+
 	// A CRIU capture: the pod becomes the placeholder the agent restores
 	// the captured process into.
 	plog := m.logger().WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "hash": checkpointstore.ShortHash(hash)})
@@ -715,12 +755,24 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		cp, err := m.criuRestorePatches(pod, id, cman)
 		if err != nil {
 			plog.WithError(err).Warn("CRIU restore: cannot prepare the pod; cold start")
+			return coldStart()
+		}
+		// The restored process keeps the mounts it was dumped with, so the
+		// placeholder gets the model landing the captured pod had, as a
+		// group rank's does (criuGroupRestorePatches); without it CRIU
+		// cannot recreate the landing's mount and the restore fails. The
+		// model gone: start cold rather than fail the restore.
+		vp, err := m.placeholderModelPatches(ctx, pod)
+		if err != nil {
+			plog.WithError(err).Warn("CRIU restore: the captured pod's model landing is not available; cold start")
 			return mergePatchPlan(injectPatches), nil
 		}
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
+		cp = append(cp, m.processConfigPatches(pod)...)
+		cp = append(cp, m.placeholderModelCachePatches(ctx, pod, cp)...)
 		// Not injectPatches: a gpushare restore mounts the checkpoint's
 		// chunk store, not the pod's own empty one.
-		return mergePatchPlan(withPIDReserve(pod, cp)), nil
+		return mergePatchPlan(withPIDReserve(pod, append(cp, vp...))), nil
 	}
 
 	// Resolve the manifest so the L2 dispatch can branch on the capture
@@ -747,10 +799,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	// node never schedules (the platform kills it as "no capacity").
 	if haveManifest && criuCheckpointID(manifest) != "" {
 		plog.Info("CRIU capture not restored; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 	// Dispatch on the AUTHORITATIVE capture method stamped at capture
 	// time (v0.0.56). Fall back to the shape heuristic only for
@@ -821,10 +870,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		// be taken from it.
 		m.logger().WithField("hash", checkpointstore.ShortHash(hash)).
 			Info("no capture for hash; cold start")
-		if len(injectPatches) == 0 {
-			return nil, nil
-		}
-		return mergePatchPlan(injectPatches), nil
+		return coldStart()
 	}
 
 	// Note: we do NOT peer-fetch the capture bytes here. The webhook

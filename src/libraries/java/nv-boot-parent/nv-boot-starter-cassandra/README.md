@@ -223,9 +223,9 @@ This requires:
 
 `CassandraAutoConfiguration` imports the following `@Configuration` classes (this order):
 
-`CassandraConverterConfiguration` → `CassandraAdvancedConfiguration` →
-`CassandraHealthConfiguration` → `CassandraMetricsConfiguration` →
-`CassandraSslBundleConfiguration`.
+`CassandraConverterConfiguration` -> `CassandraAdvancedConfiguration` ->
+`CassandraHealthConfiguration` -> `CassandraMetricsConfiguration` ->
+`CassandraSessionLivenessConfiguration` -> `CassandraSslBundleConfiguration`.
 
 ### CassandraConverterConfiguration
 
@@ -264,6 +264,65 @@ the loss of a replica.
 | Bean | Type | Description |
 |------|------|-------------|
 | `configLoaderBuilderCustomizer` | `DriverConfigLoaderBuilderCustomizer` | Registers Micrometer as the driver metrics factory, `TaggingMetricIdGenerator`, and the enabled session/node metric lists from `spring.cassandra.session-metrics` and `spring.cassandra.node-metrics`. **Only created when at least one of those lists is non-empty** (see [Driver metrics](#driver-metrics)). |
+
+### CassandraSessionLivenessConfiguration
+
+| Bean | Type | Description |
+|------|------|-------------|
+| `cassandraSessionHealthIndicator` | `CassandraSessionLivenessIndicator` | Registers the `cassandraSession` health contributor, a liveness check for a session that stays broken after Cassandra recovers. |
+
+The `cassandra` contributor fails whenever Cassandra is unavailable. Every
+replica shares Cassandra, so listing it in liveness restarts all replicas
+during an outage. Keep `cassandra` in readiness and use `cassandraSession` for
+liveness.
+
+A background thread runs `SELECT release_version FROM system.local` on the
+application session every `check-interval`. When that query fails, the check
+reads the session's connection pools, and if none of them has a connection,
+opens a new session with the application's driver settings and runs the same
+query:
+
+| Application query | Application pools | New session | Result |
+|-------------------|-------------------|-------------|--------|
+| Succeeds | Not read | Not run | UP |
+| Fails | A pool has a connection | Not run | UP. The session is congested or slow, not stuck. |
+| Fails | Cannot be read | Not run | UP. Unknown never counts toward a restart. |
+| Fails | No pool has a connection | Fails | UP. Cassandra is unavailable, so a restart cannot help. |
+| Fails | No pool has a connection | Succeeds | UP until this has lasted `grace-period`, then DOWN. |
+
+Only the last row continues the grace period; every other result resets it.
+The pool count excludes the driver's control connection. The check detects the
+known stuck mode, a session with no pool connections, and not every way a
+session can fail. A session whose pool connections keep opening and failing
+resets the grace period each time one opens, so the check does not restart
+it. The health endpoint reads the last result and does not wait on Cassandra. The new session turns off schema metadata and driver
+metrics, so the check adds little load and leaves the application's driver
+metrics unchanged. If the application has no unique `CqlSession`, the check
+always reports UP.
+
+The check runs in every service that uses this starter. It affects restarts
+only when the service lists it in the liveness group:
+
+```yaml
+management:
+  endpoint:
+    health:
+      group:
+        liveness:
+          include:
+            - livenessState
+            - cassandraSession
+```
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `app.cassandra.session-liveness.enabled` | `true` | `false` stops the checks. `cassandraSession` stays registered and always reports UP, so health groups that list it stay valid. |
+| `app.cassandra.session-liveness.grace-period` | `3m` | How long the application session must keep failing while a new session succeeds before the check reports DOWN. |
+| `app.cassandra.session-liveness.check-interval` | `30s` | Time between checks. |
+
+Setting `enabled=false` removes Cassandra from liveness decisions. It does not
+restore the earlier behavior of listing `cassandra` in liveness. Other
+contributors in the liveness group still apply.
 
 ### CassandraSslBundleConfiguration
 

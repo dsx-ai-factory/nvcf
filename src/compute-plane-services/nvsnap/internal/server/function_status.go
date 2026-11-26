@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -44,6 +46,18 @@ type FunctionStatus struct {
 	Namespace  string        // where the records live
 	Interval   time.Duration // default 30s
 	Log        logrus.FieldLogger
+	// Restores follows the restores' pods for each version's history
+	// (restore_history.go); nil keeps none.
+	Restores *restoreTracker
+	// Now is the clock the restores are aged by; nil is time.Now.
+	Now func() time.Time
+}
+
+func (f *FunctionStatus) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
 }
 
 // Run keeps the objects every Interval until ctx is cancelled.
@@ -53,6 +67,9 @@ func (f *FunctionStatus) Run(ctx context.Context) {
 	}
 	if f.Log == nil {
 		f.Log = logrus.NewEntry(logrus.New()).WithField("subsys", "server.function-status")
+	}
+	if f.Restores != nil {
+		f.Restores.watch(ctx, f.KubeClient)
 	}
 	missing := false
 	t := time.NewTicker(f.Interval)
@@ -81,13 +98,27 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 	records, err := f.KubeClient.CoreV1().ConfigMaps(f.Namespace).List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=nvsnap"})
 	if err != nil {
 		// Never delete on a list that failed: an empty view is a claim
-		// that nothing is cached.
+		// that nothing is cached. The restores followed still age out.
+		if f.Restores != nil {
+			f.Restores.forget(nil, f.now())
+		}
 		return err
 	}
 	want := fnstatus.Project(records.Items)
+	restores, over := f.restoresByObject(records.Items)
+	// written: the objects whose status now holds what was merged into it
+	// (written, or already equal); only their finished restores are
+	// forgotten.
+	written := map[string]bool{}
 	objs := f.DynClient.Resource(functionGVR)
 	have, err := objs.List(ctx, metav1.ListOptions{LabelSelector: "app.kubernetes.io/managed-by=" + functionManagedBy})
 	if err != nil {
+		// No object is written (the CRD may not be installed, a steady
+		// state): the restores followed are still aged out, or they would
+		// grow with every labelled pod until the server restarts.
+		if f.Restores != nil {
+			f.Restores.forget(nil, f.now())
+		}
 		return err
 	}
 	existing := make(map[string]*unstructured.Unstructured, len(have.Items))
@@ -102,6 +133,12 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 	}
 	for name := range want {
 		s := want[name]
+		// The history is the server's own: carried from the object, with
+		// the restores followed since merged in.
+		if obj, ok := existing[name]; ok {
+			s.History = historyOf(obj)
+		}
+		s.History = s.History.Merge(restores[name])
 		status, err := toMap(s)
 		if err != nil {
 			keep(err)
@@ -110,6 +147,7 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 		obj, ok := existing[name]
 		if !ok {
 			_, err = objs.Create(ctx, functionObject(name, s, status), metav1.CreateOptions{})
+			written[name] = err == nil
 			if apierrors.IsAlreadyExists(err) {
 				err = nil // not ours, or made since the list; the next pass sees it
 			}
@@ -119,11 +157,13 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 		delete(existing, name)
 		cur, _, _ := unstructured.NestedMap(obj.Object, "status")
 		if sameJSON(cur, status) && maps.Equal(obj.GetLabels(), functionLabels(s)) {
+			written[name] = true
 			continue
 		}
 		next := functionObject(name, s, status)
 		next.SetResourceVersion(obj.GetResourceVersion())
 		_, err = objs.Update(ctx, next, metav1.UpdateOptions{})
+		written[name] = err == nil
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			err = nil // the next pass sees it
 		}
@@ -136,7 +176,77 @@ func (f *FunctionStatus) reconcileOnce(ctx context.Context) error {
 		}
 		keep(err)
 	}
+	if f.Restores != nil {
+		// The restores whose final entries are written: the objects keep
+		// them now. One whose object was not written is merged again next
+		// pass.
+		var done []string
+		for name, ids := range over {
+			if written[name] {
+				done = append(done, ids...)
+			}
+		}
+		f.Restores.forget(done, f.now())
+	}
 	return firstErr
+}
+
+// restoreTimeTolerance bounds how far a record's stamp that names no
+// restore may be from the restore's last rank's restore: the agent stamps
+// it when the restore ends.
+const restoreTimeTolerance = 2 * time.Minute
+
+// restoresByObject is the restores followed, by the object of their
+// configuration, with the record's time and capture bundle; and, by
+// object, the ids of those whose pods are all gone. Nothing before the
+// watch has listed the pods.
+func (f *FunctionStatus) restoresByObject(records []corev1.ConfigMap) (map[string][]fnstatus.Restore, map[string][]string) {
+	if f.Restores == nil || !f.Restores.ready() {
+		return nil, nil
+	}
+	type rec struct {
+		object string
+		data   map[string]string
+	}
+	byKey := map[string]rec{}
+	for i := range records {
+		r := &records[i]
+		key, ok := strings.CutPrefix(r.Name, fnstatus.GroupRecordPrefix)
+		if !ok || r.Data["state"] == fnstatus.StateAlias {
+			continue
+		}
+		if name := fnstatus.ObjectName(r.Labels); name != "" {
+			byKey[key] = rec{name, r.Data}
+		}
+	}
+	byKeyEntries, overByKey := f.Restores.restores(func(key string) int { return fnstatus.GPURanks(byKey[key].data) })
+	out, over := map[string][]fnstatus.Restore{}, map[string][]string{}
+	for key, rs := range byKeyEntries {
+		r, ok := byKey[key]
+		if !ok {
+			continue // its record is gone, and its object with it
+		}
+		for _, e := range rs {
+			if at, err := time.Parse(time.RFC3339, e.RestoredAt); err == nil {
+				e.RestoreSeconds = fnstatus.RecordRestoreSeconds(r.data, e.Leader, at, restoreTimeTolerance)
+			}
+			e.CapturedBy = r.data["agentBundle"]
+			out[r.object] = append(out[r.object], e)
+		}
+		over[r.object] = append(over[r.object], overByKey[key]...)
+	}
+	return out, over
+}
+
+// historyOf is the history an object's status holds.
+func historyOf(obj *unstructured.Unstructured) fnstatus.History {
+	var h fnstatus.History
+	if st, ok, _ := unstructured.NestedMap(obj.Object, "status"); ok {
+		if b, err := json.Marshal(st); err == nil {
+			_ = json.Unmarshal(b, &h)
+		}
+	}
+	return h
 }
 
 // functionLabels select a function's versions: kubectl get nvsnapfunctions

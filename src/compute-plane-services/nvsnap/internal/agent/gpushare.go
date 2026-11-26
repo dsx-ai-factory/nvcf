@@ -82,6 +82,18 @@ type GPUShareInfo struct {
 	// LibPath is where the processes mapped the shim from; a placeholder
 	// must provide the same file at the same path.
 	LibPath string `json:"libPath"`
+	// ModelExpress: the capture paused ModelExpress in PIDs (mx-pause); a
+	// restore resumes it once their GPU launches run (gpushare_mx.go).
+	ModelExpress bool `json:"modelExpress,omitempty"`
+	// NIXL: the capture paused the NIXL KV connector in PIDs (nixl-pause);
+	// a restore resumes it, and fails if it cannot (gpushare_nixl.go).
+	NIXL bool `json:"nixl,omitempty"`
+	// NIXLPIDs are the pids among PIDs whose connector the pause released
+	// (every pid but those that answered "ok no ..."). A resume addresses
+	// each of them, with or without a control socket then, and fails
+	// unless each answers ok. Empty in a checkpoint from before it was
+	// recorded: the resume then addresses the pids with a socket.
+	NIXLPIDs []int `json:"nixlPIDs,omitempty"`
 }
 
 // gpushareProc is what the dump needs to know about one process.
@@ -238,10 +250,103 @@ func gpushareToolEnv(ctx context.Context, hostPID int, env []string, timeout tim
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	if err := cmd.Run(); err != nil {
-		return out.String(), fmt.Errorf("%s %s: %w (output: %s)", gpushareToolName, strings.Join(args, " "), err,
-			lastLines(out.String()+errOut.String(), 8))
+		return out.String(), &toolError{args: args, err: err, out: boundOutput(out.String() + errOut.String())}
 	}
 	return out.String(), nil
+}
+
+// toolError is a failed run of nvsnap-gpu-suspend. Its message leads with
+// what failed, every distinct failure line with how often it was printed,
+// so the cause survives the cuts a group record makes (memberFailure keeps
+// a member's first third and its end); then the command and the output's
+// last lines. out, the whole output, is kept with a failed capture's logs
+// (writeToolOutput).
+type toolError struct {
+	args []string
+	err  error
+	out  string
+}
+
+func (e *toolError) Error() string {
+	head := gpushareToolName + " " + toolVerb(e.args) + ": " + e.err.Error()
+	if f := toolFailures(e.out); f != "" {
+		head += ": " + f
+	}
+	return fmt.Sprintf("%s (command: %s %s; output: %s)", head, gpushareToolName, strings.Join(e.args, " "), lastLines(e.out, 8))
+}
+
+func (e *toolError) Unwrap() error { return e.err }
+
+// toolOutputMax bounds the output a toolError keeps.
+const toolOutputMax = 4 << 20
+
+// boundOutput keeps the end of s when it is longer than toolOutputMax.
+func boundOutput(s string) string {
+	if len(s) <= toolOutputMax {
+		return s
+	}
+	return "… " + s[len(s)-toolOutputMax:]
+}
+
+// toolVerb is the tool's command among args: the first that is not a flag
+// or a flag's value.
+func toolVerb(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "--") {
+			if !strings.Contains(a, "=") && !toolBoolFlags[a] {
+				i++ // its value
+			}
+			continue
+		}
+		return a
+	}
+	return ""
+}
+
+// toolBoolFlags are the tool's flags that take no value.
+var toolBoolFlags = map[string]bool{"--hold-gate": true}
+
+// toolFailureLine is a line of the tool's output that reports a failure:
+// a process's error reply ("pid=1152 quiesce: err busy (…)") or the tool's
+// own account of one.
+var toolFailureLine = regexp.MustCompile(`^pid=\d+ [^:]+: err |failed|cannot |rolling back`)
+
+// toolFailureMax bounds the distinct failure lines toolFailures reports.
+const toolFailureMax = 8
+
+// toolFailures is every distinct failure line of out, in the order first
+// printed, each with how many times it was (a quiesce retried every 250 ms
+// prints the same busy reply hundreds of times); "" when there is none.
+func toolFailures(out string) string {
+	var order []string
+	count := map[string]int{}
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || !toolFailureLine.MatchString(l) {
+			continue
+		}
+		if count[l] == 0 {
+			order = append(order, l)
+		}
+		count[l]++
+	}
+	more := 0
+	if len(order) > toolFailureMax {
+		more = len(order) - toolFailureMax
+		order = order[:toolFailureMax]
+	}
+	parts := make([]string, 0, len(order)+1)
+	for _, l := range order {
+		if n := count[l]; n > 1 {
+			l += fmt.Sprintf(" (%d times)", n)
+		}
+		parts = append(parts, l)
+	}
+	if more > 0 {
+		parts = append(parts, fmt.Sprintf("%d more", more))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // killGroupOnCancel makes the cancel of cmd's context (a deadline, a
@@ -322,9 +427,12 @@ func suspendFailure(err error) error {
 
 // gpushareResume restores the driver state of pids, loads their saved GPU
 // memory, re-creates the shared mappings and lets them run. gpuMap, when
-// set, maps the capture's GPUs onto the ones visible here.
-func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabricDir string, log *logrus.Entry) error {
-	_, err := gpushareResumeWithGPUsOf(ctx, hostPID, hostPID, pids, gpuMap, fabricDir, false, 0, log)
+// set, maps the capture's GPUs onto the ones visible here. syncOpen, with
+// fabricDir, holds their GPU launches until every node of the instance has
+// resumed, waiting at most syncOpen for the driver's verdict (--sync-open;
+// fabricOpener). Zero: they go through at once, as before.
+func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabricDir string, syncOpen time.Duration, log *logrus.Entry) error {
+	_, err := gpushareResumeWithGPUsOf(ctx, hostPID, hostPID, pids, gpuMap, fabricDir, false, syncOpen, 0, log)
 	return err
 }
 
@@ -337,7 +445,7 @@ func gpushareResume(ctx context.Context, hostPID int, pids []int, gpuMap, fabric
 // when set, is the CLOCK_MONOTONIC their dump recorded: the tool thaws them
 // only once their clocks have reached it (restore_clock_gpu.go); it
 // returns how long the tool waited for that.
-func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []int, gpuMap, fabricDir string, holdGate bool, clockAt int64, log *logrus.Entry) (time.Duration, error) {
+func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []int, gpuMap, fabricDir string, holdGate bool, syncOpen time.Duration, clockAt int64, log *logrus.Entry) (time.Duration, error) {
 	env := podGPUEnv(gpusPID)
 	if env == nil && gpusPID != hostPID {
 		// No UUIDs in NVIDIA_VISIBLE_DEVICES (GPUs given as device nodes,
@@ -351,14 +459,17 @@ func gpushareResumeWithGPUsOf(ctx context.Context, hostPID, gpusPID int, pids []
 		env = cudaVisibleEnv(gpus)
 	}
 	env = append(env, resumeDiagEnv()...)
-	args := gpushareResumeArgs(gpuMap, fabricDir, holdGate, clockAt, pids)
+	args := gpushareResumeArgs(gpuMap, fabricDir, holdGate, syncOpen, clockAt, pids)
 	t0 := time.Now()
-	out, err := gpushareToolEnv(ctx, hostPID, env, gpushareResumeDeadline, args...)
+	out, err := gpushareToolRun(ctx, hostPID, env, gpushareResumeDeadline, args...)
 	if err != nil {
 		return 0, err
 	}
 	log.WithFields(logrus.Fields{"pids": pids, "duration": time.Since(t0).Round(time.Millisecond).String()}).
 		Info("gpushare: resumed " + lastLines(out, 1))
+	if err := resumeOutputErr(out); err != nil {
+		return 0, err
+	}
 	// Each pid's remap reply: what it remapped, and where the time went
 	// (host register, imports, map, multicast).
 	for _, l := range remapReplies(out) {
@@ -411,18 +522,59 @@ func clockWaited(out string) time.Duration {
 	return w
 }
 
+// gpushareQuiesceTimeout is how long a suspend tries to quiesce the GPU
+// work of every pid (and, in a group, of every node) before it gives up
+// and rolls back. The tool measures it in wall-clock time; across nodes the
+// vote driver ends the session at it (driveFabric VoteDeadline). An
+// attempt that finds a pid busy takes about 2 to 4 s (the library waits
+// 2 s for the work to drain, then the nodes vote), so this is 30 to 60
+// attempts.
+const gpushareQuiesceTimeout = 2 * time.Minute
+
 // gpushareSuspendArgs builds the suspend command line. fabricDir, when set,
 // joins a multi-node session (--fabric-map, see gpushare_fabric.go).
 func gpushareSuspendArgs(store, fabricDir string, pids []int) []string {
-	args := []string{"--timeout-ms", "120000", "--store", store, "--ckpt-dir", store}
+	args := []string{"--timeout-ms", strconv.FormatInt(gpushareQuiesceTimeout.Milliseconds(), 10), "--store", store, "--ckpt-dir", store}
 	if fabricDir != "" {
 		args = append(args, "--fabric-map", fabricDir)
 	}
 	return append(append(args, "suspend"), intsToStrings(pids)...)
 }
 
-// gpushareResumeArgs builds the resume command line.
-func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, pids []int) []string {
+// gpushareSyncOpenWait is how long a node's tool waits, resumed in place
+// with its GPU launches held, for the driver's open verdict: the driver's
+// deadline (fabricOpenDeadline) and a minute, so that the driver, not the
+// tool, ends the wait unless the driver is gone. Then it opens anyway.
+const gpushareSyncOpenWait = fabricOpenDeadline + time.Minute
+
+// gpushareSyncOpenSupported reports whether the GPU tool (its binary's
+// text) has --sync-open; a tool from before it would take the option for
+// its command. "" (the text could not be read) is false.
+func gpushareSyncOpenSupported(toolText string) bool {
+	return strings.Contains(toolText, "--sync-open")
+}
+
+// openUnsyncedText is what the tool prints when it let a node's GPU
+// launches through before every node reported resumed: the driver answered
+// "abort", or did not answer in time (nvsnap-gpu-suspend.c, open_synced).
+const openUnsyncedText = "GPU launches let through before every node resumed"
+
+// resumeOutputErr fails a resume whose tool let the GPU launches through
+// before every node had resumed. The workload runs, its gates open: a
+// stalled resume (it may hang on memory another node had not bound yet),
+// not a source left suspended.
+func resumeOutputErr(out string) error {
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); strings.Contains(l, openUnsyncedText) {
+			return fmt.Errorf("%w: %s", errResumeStalled, l)
+		}
+	}
+	return nil
+}
+
+// gpushareResumeArgs builds the resume command line. syncOpen goes with
+// fabricDir only (see gpushareResume).
+func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, syncOpen time.Duration, clockAt int64, pids []int) []string {
 	var args []string
 	if holdGate {
 		args = append(args, "--hold-gate")
@@ -435,6 +587,9 @@ func gpushareResumeArgs(gpuMap, fabricDir string, holdGate bool, clockAt int64, 
 	}
 	if fabricDir != "" {
 		args = append(args, "--fabric-map", fabricDir)
+		if syncOpen > 0 {
+			args = append(args, "--sync-open", strconv.FormatInt(syncOpen.Milliseconds(), 10))
+		}
 	}
 	return append(append(args, "resume"), intsToStrings(pids)...)
 }

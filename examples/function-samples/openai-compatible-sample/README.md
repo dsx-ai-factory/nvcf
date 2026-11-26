@@ -55,6 +55,8 @@ to all POST routes.
 | Stream truncate | `X-Load-Tester-Stream-Truncate-After-Chunks` | `x_load_tester_stream_truncate_after_chunks` | unset | Close a stream without its completion event after this many chunks. |
 | Concurrency limit | `X-Load-Tester-Max-Concurrency` | `x_load_tester_max_concurrency` | `0` | Return 429 when the global in-flight request count exceeds this value. |
 | Echo | `X-Load-Tester-Echo` | `x_load_tester_echo` | `false` | Return the raw request body as the output text. |
+| SSE line ending | `X-Load-Tester-SSE-Line-Ending` | `x_load_tester_sse_line_ending` | `lf` | `/v1/messages` streams only: write the stream with `lf`, `crlf` or `cr` line endings. |
+| SSE split bytes | `X-Load-Tester-SSE-Split-Bytes` | `x_load_tester_sse_split_bytes` | `0` | `/v1/messages` streams only: write the stream in pieces of this many bytes and flush after each, so a multi-byte UTF-8 character can be split across two writes. |
 
 Timing values are non-negative integer milliseconds and are capped at five
 minutes. Output is capped at 1 MiB and the startup chunk limit. The
@@ -86,6 +88,104 @@ each version's container environment. The request router picks the version,
 so only a container default can make one version slower. A distinct default
 chunk for each version, such as `fast` and `slow`, shows in every response
 which version answered.
+
+## Server limits
+
+Two environment variables raise the request limits for slow or large uploads.
+No request can change them.
+
+| Environment variable | Default | Accepted values | Behavior |
+|----------------------|---------|-----------------|----------|
+| `LOAD_TESTER_MAX_REQUEST_BYTES` | 10 MiB, and 16 MiB on the decision routes | Integer bytes from 1 through 1073741824 | Largest request body on every POST route. |
+| `LOAD_TESTER_READ_TIMEOUT_MS` | `30000` | Integer milliseconds from 1 through 3600000 | Time allowed to read one request, headers and body. |
+
+A body over the limit gets the route's usual error: 400 on the OpenAI routes,
+413 on Messages and the decision routes. A read that passes the timeout fails
+like a closed connection. The routes hold the whole body in memory, except
+with the body digest, so size the container for the largest body. The second
+startup log line shows the limits.
+
+## Request body controls
+
+These header-only controls act on the raw request body before a route parses
+it. They apply to every POST route, including Messages and the decision
+routes, and never change the body. Like every `X-Load-Tester-` header, they
+turn off body controls.
+
+| Control | Header | Behavior |
+|---------|--------|----------|
+| Body digest | `X-Load-Tester-Body-Digest: true` | Read the whole body without parsing it and answer with a receipt instead of the route response. |
+| Read delay | `X-Load-Tester-Read-Delay-Ms` | Wait this long before each body read of at most 16 KiB. |
+| Read pause | `X-Load-Tester-Read-Pause-After-Bytes` and `X-Load-Tester-Read-Pause-Ms` | After this many body bytes, stop reading once for this long. Set both. |
+| Early status | `X-Load-Tester-Early-Status-Code` | Answer with this error status, from 400 through 599, before reading any body byte. |
+
+The digest receipt for the example below:
+
+```json
+{
+  "object": "load_tester.body_digest",
+  "bytes": 70052,
+  "sha256": "78428f6e0cdef39f0e754223e208faaafe1f369aa25c0b4237540eff4c54a8e5",
+  "content_length": 70052,
+  "accept": "*/*",
+  "first_byte_at": "2026-11-12T03:16:40.167Z",
+  "last_byte_at": "2026-11-12T03:16:42.167Z",
+  "eof_at": "2026-11-12T03:16:42.167Z",
+  "complete": true
+}
+```
+
+`sha256` covers the bytes exactly as received, so duplicate keys, key order
+and whitespace count. `content_length` is -1 for a chunked upload. Times are
+UTC with milliseconds. A body over the limit returns 413 and any other read
+failure returns 400, both with `complete: false` and `read_error`.
+
+Early status cannot be combined with the digest. Its body uses the route's
+error shape. On the OpenAI routes the error code is `injected_early_response`.
+The server sends it at once, even while the client is still uploading. Some
+clients, such as `curl` reading the body from standard input, show it only
+after their upload ends.
+
+Read delay and read pause slow the server's reads, so the client or a proxy
+in front sees backpressure. Delay and pause values are integer milliseconds up
+to five minutes. Without the digest, the route still answers normally after
+the slow read.
+
+The read timeout keeps running during a delay or pause, but it is only checked
+when the server next reads from the connection. If the timeout passes during a
+pause, the read after the pause fails, unless the server already holds the
+rest of the body in its buffer. Set `LOAD_TESTER_READ_TIMEOUT_MS` above the
+whole upload, pauses included.
+
+The body digest, an early status answer and a rejected control header all
+answer without running the route's handler, so `LOG_REQUESTS` logs only the
+JSON line below for them, not the route's own request log line.
+
+```bash
+python3 -c 'import sys; sys.stdout.write("{\"model\":\"test-model\",\"messages\":[]," + " " * 70000 + "\"model\":\"other\"}")' > body.json
+shasum -a 256 body.json
+curl -sS http://localhost:8000/v1/chat/completions \
+  --header 'Expect:' \
+  --header 'X-Load-Tester-Body-Digest: true' \
+  --header 'X-Load-Tester-Read-Pause-After-Bytes: 65536' \
+  --header 'X-Load-Tester-Read-Pause-Ms: 2000' \
+  --data-binary @body.json
+```
+
+With `LOG_REQUESTS=true`, every POST request to these routes also logs one
+JSON line to standard error when the handler returns. Messages, Decisions and
+System One requests keep their request log line as well. For a client that closed after
+1 MiB of a declared 8 MiB body:
+
+```json
+{"time":"2026-11-11T19:20:25.958753-08:00","level":"INFO","msg":"request body","method":"POST","path":"/v1/chat/completions","request_id":"abort-8m","content_length":8388608,"bytes":1048576,"complete":false,"first_byte_at":"2026-11-12T03:20:25.450Z","last_byte_at":"2026-11-12T03:20:25.454Z","read_error":"unexpected EOF"}
+```
+
+`request_id` and `function_id` come from the `NVCF-REQID` and
+`NVCF-FUNCTION-ID` request headers when present. `complete` is true only when
+the server read the body to its end without an error. The line also has
+`sha256` with the digest, `eof_at` for a complete body, and `early_status`
+for an early answer.
 
 ## Echo control
 
@@ -140,12 +240,237 @@ A request needs `model`, a non-negative integer `max_tokens`, and a non-empty
   `rate_limit_error`, 500 `api_error`, 504 `timeout_error`, and 529
   `overloaded_error`. Other 4xx codes use `invalid_request_error` and other 5xx
   codes use `api_error`.
+- The SSE line ending and split bytes controls change only how a stream is
+  written, not its events. Structural newlines are replaced; newlines inside
+  text deltas are JSON-escaped and stay untouched. With `x_load_tester_chunk`
+  set to a multi-byte string and `x_load_tester_sse_split_bytes` set to `1`,
+  every byte is its own write, so characters are split between writes. Both are
+  off by default.
 - The stream error control sends an `error` event with type `api_error`. Stream
   error and truncate controls end the stream without `message_stop`.
 
 Tool use, thinking blocks, images, documents, citations, stop sequences,
 prompt caching, token counting, and Message Batches are not implemented.
 `GET /v1/models` keeps the OpenAI shape.
+
+## Backend diagnostics
+
+The Messages route can report which replica served a request and which headers
+the replica received. Use it to check replica affinity across requests, to see
+which caller headers a gateway or proxy forwarded, and to tell which function
+version answered. It is off by default and has no effect on other routes.
+
+Set the top-level body field `x_load_tester_echo_diagnostics` to `true` to turn
+it on. It is a body field only, with no header form. Unlike the benchmark
+controls, it still applies when the request carries an `X-Load-Tester-*` header.
+
+When it is on, the response carries:
+
+- Response headers `x-backend-replica` and, when the version id is known,
+  `x-backend-function-version`. They are set before the body, so they are
+  readable on streamed responses too.
+- An `x_backend` object in the message body. For a stream, the object is in the
+  `message` of the `message_start` event.
+
+| `x_backend` field | Source |
+|-------------------|--------|
+| `replica` | `NVCF_INSTANCE_ID` (the pod name on NVCF), else the hostname, else `unknown` |
+| `function_id` | `NVCF_FUNCTION_ID`, omitted when unset |
+| `function_version_id` | `NVCF_FUNCTION_VERSION_ID`, omitted when unset |
+| `method` | HTTP method the replica saw |
+| `path` | Request path the replica saw |
+| `query` | Raw query string, omitted when empty |
+| `host` | `Host` the replica saw, omitted when empty |
+| `remote_addr` | Peer address of the connection, omitted when empty |
+| `content_length` | Request `Content-Length`, `-1` when unknown |
+| `received_headers` | Every request header. Names are lower-cased and each value is a list |
+
+Diagnostics are added only to successful responses. Error responses, such as
+status injection, a concurrency 429, or a validation 400, carry no `x_backend`
+and no diagnostic headers.
+
+The values of `Authorization`, `Proxy-Authorization`, `X-Api-Key` and
+`Cookie` are replaced with `<redacted>`. The names stay, so you can still see
+whether a gateway forwarded them. Other header values are echoed as received.
+
+### Non-streaming request
+
+```bash
+curl -sS http://localhost:18000/v1/messages \
+  --include \
+  --header 'Content-Type: application/json' \
+  --header 'X-Test-Header: hello' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+The response headers include `x-backend-replica: <pod name>`. The body looks
+like this, trimmed:
+
+```json
+{
+  "id": "msg_2",
+  "type": "message",
+  "content": [{"type": "text", "text": "xxxx"}],
+  "stop_reason": "end_turn",
+  "x_backend": {
+    "replica": "0-sr-1a2b3c",
+    "function_id": "<function id>",
+    "function_version_id": "<version id>",
+    "method": "POST",
+    "path": "/v1/messages",
+    "host": "localhost:18000",
+    "remote_addr": "172.17.0.1:53012",
+    "content_length": 143,
+    "received_headers": {
+      "content-type": ["application/json"],
+      "x-test-header": ["hello"]
+    }
+  }
+}
+```
+
+### Streaming request
+
+Add `"stream": true`. The headers are on the HTTP response and `x_backend` is in
+the first event.
+
+```bash
+curl -sSN http://localhost:18000/v1/messages \
+  --include \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "stream": true,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+### Read only the replica or the headers
+
+```bash
+BODY='{"model":"test-model","max_tokens":1,"messages":[{"role":"user","content":"hi"}],"x_load_tester_echo_diagnostics":true}'
+
+# Which replica answered
+curl -sS -o /dev/null -D - http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' --data "$BODY" | grep -i '^x-backend-'
+
+# Which headers a gateway forwarded
+curl -sS http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' --data "$BODY" \
+  | jq '.x_backend.received_headers'
+```
+
+### Check replica spread
+
+Send the same request repeatedly and count replicas. One replica means all
+requests landed on it. Several means the router spread them.
+
+```bash
+for _ in $(seq 1 50); do
+  curl -sS -o /dev/null -D - http://localhost:18000/v1/messages \
+    --header 'Content-Type: application/json' --data "$BODY" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="x-backend-replica"{print $2}'
+done | sort | uniq -c
+```
+
+For affinity, repeat the loop with the header or session value your gateway
+uses for sticky routing and confirm the count stays at one replica.
+
+### Combine with benchmark controls
+
+Diagnostics combine with every Messages control. A request can set latency,
+chunk count, and diagnostics together:
+
+```bash
+curl -sS http://localhost:18000/v1/messages \
+  --header 'Content-Type: application/json' \
+  --header 'X-Load-Tester-TTFT-Ms: 200' \
+  --header 'X-Load-Tester-Output-Chunks: 3' \
+  --data '{
+    "model": "test-model",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hello"}],
+    "x_load_tester_echo_diagnostics": true
+  }'
+```
+
+### Anthropic Python client
+
+The Anthropic client passes unknown body fields through `extra_body`. Read the
+response headers with `with_raw_response`. `x_backend` is not a modeled field,
+so it is in `model_extra`.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="not-needed",
+    base_url="http://localhost:18000",
+)
+
+raw = client.messages.with_raw_response.create(
+    model="test-model",
+    max_tokens=16,
+    messages=[{"role": "user", "content": "hello"}],
+    extra_body={"x_load_tester_echo_diagnostics": True},
+)
+print(raw.headers["x-backend-replica"])
+message = raw.parse()
+print(message.model_extra["x_backend"]["received_headers"])
+```
+
+### Request log
+
+Set `LOG_REQUESTS=true` in the container environment to log one line at handler
+entry for each Messages, Decisions, or System One request, including requests
+that later return errors. The server reads the variable once at startup.
+Logs go to stderr and are available through `kubectl logs`.
+
+Messages logs are unchanged and do not require the diagnostics control:
+
+```text
+messages request id=req_7 replica=0-sr-1a2b3c method=POST path=/v1/messages headers=content-length,content-type,x-test-header
+```
+
+The Messages log has the generated request id, replica, method, path, and sorted
+header names. Its id matches the `request-id` response header.
+
+Decisions and System One log the received `X-Request-Id`, method, path, replica,
+and function and version ids from the environment (empty when unavailable):
+
+```text
+decision request id="caller-request-id" replica="sample-pod" method="POST" path="/v1/decisions" function_id="function-id" function_version_id="version-id"
+```
+
+Fields are quoted and escaped to keep each request on one line. These access
+logs exclude credentials, cookies, request bodies, image data, query parameters,
+and other header values. Responses and echo behavior are unchanged.
+
+To check gateway rejection, send distinct `X-Request-Id` values for an owner
+request and a request from an account without access to a private function.
+Confirm the owner receives 200 and its id appears in the backend logs. Confirm
+the other account receives 404 and its id is absent across all backend replicas
+in the same time window. A missing id alone is insufficient evidence; keep the
+owner log as a positive control and allow for log collection delay.
+
+```bash
+kubectl logs -l '<backend-selector>' --all-containers=true --prefix=true \
+  --since=10m --tail=-1 | grep -F 'id="caller-request-id"'
+```
+
+| Environment variable | Accepted values | Default |
+|----------------------|-----------------|---------|
+| `LOG_REQUESTS` | `true` enables the log. Any other value disables it | unset (off) |
+| `NVCF_INSTANCE_ID` | Replica name reported in diagnostics. NVCF sets it | hostname |
+| `NVCF_FUNCTION_ID` | Function id reported in diagnostics. NVCF sets it | omitted |
+| `NVCF_FUNCTION_VERSION_ID` | Version id reported in diagnostics. NVCF sets it | omitted |
 
 ## Build and run
 

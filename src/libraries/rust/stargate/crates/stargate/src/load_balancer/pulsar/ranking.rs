@@ -323,7 +323,13 @@ pub(super) fn pulsar_weight(
 ) -> Option<f64> {
     let value = match rendezvous_weight {
         PulsarRendezvousWeight::LastMeanInputTps => Some(candidate.stats.last_mean_input_tps),
-        PulsarRendezvousWeight::MaxInputTps => candidate.stats.max_input_tps,
+        // Older producers and relays omit the optional maximum.
+        PulsarRendezvousWeight::MaxInputTps => Some(
+            candidate
+                .stats
+                .max_input_tps
+                .unwrap_or(candidate.stats.last_mean_input_tps),
+        ),
     }?;
     (value > 0.0 && value.is_finite()).then_some(value)
 }

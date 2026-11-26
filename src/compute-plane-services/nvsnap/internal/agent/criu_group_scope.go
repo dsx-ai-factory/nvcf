@@ -117,7 +117,12 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 		a.log.WithError(err).WithField("namespace", ns).Warn("CRIU group restore: cannot read the namespace's scope; cold start")
 		return webhook.CRIUGroup{}, false
 	}
-	key := criuGroupKey(uri, scope)
+	if why := a.driverGate(ctx); why != "" {
+		// No restore under these drivers (driver_gate.go): GPU ranks fall
+		// back to the cachedir, companions start cold.
+		return webhook.CRIUGroup{}, false
+	}
+	key := criuGroupKeyDriver(uri, scope, a.keyDriver(ctx))
 	g, ok := a.lookupCRIUGroup(ctx, key)
 	if ok {
 		a.nameRecordLater(key, ns)
@@ -139,8 +144,12 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 //     Ready before it creates rank 1, and rank 0's placeholder is not
 //     Ready until the instance is restored.
 //
+// A pod of the instance that g, the record pod would restore from, lists
+// as leaving (deleteInstance) is not running, whether or not its delete is
+// visible yet: admission does not depend on the order of the deletes.
+//
 // A pod that cannot restore as a group starts cold.
-func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod) (bool, string) {
+func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod, g webhook.CRIUGroup) (bool, string) {
 	if c := metav1.GetControllerOf(pod); c != nil && c.Kind == "StatefulSet" && groveInstance(pod) == "" && pod.Labels[lwsGroupKeyLabel] == "" {
 		sts, err := a.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(ctx, c.Name, metav1.GetOptions{})
 		if err != nil {
@@ -155,9 +164,17 @@ func (a *Agent) criuGroupAdmits(ctx context.Context, pod *corev1.Pod) (bool, str
 	if err != nil {
 		return false, fmt.Sprintf("cannot list the instance's pods: %v", err)
 	}
+	// Admission is decided once, so an unreadable count fails closed: the
+	// pod starts cold (grove_replicas.go).
+	if why, err := a.sharedCompanionsReason(ctx, pod, pods.Items); err != nil {
+		return false, err.Error()
+	} else if why != "" {
+		return false, why
+	}
+	now := time.Now()
 	for i := range pods.Items {
 		p := &pods.Items[i]
-		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) {
+		if p.Name == pod.Name || p.DeletionTimestamp != nil || !sameInstance(pod, p) || a.leavingPod(g, p, now) {
 			continue
 		}
 		if p.Annotations[webhook.CRIUGroupAnnotation] != "" && p.Annotations[webhook.CRIURestoredAnnotation] == "" {

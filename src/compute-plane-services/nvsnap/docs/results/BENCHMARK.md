@@ -64,7 +64,7 @@ recompiling.
 The first three rows are from an EKS cluster with NVMesh storage
 (2026-09-25), not the June GKE run. The two Qwen rows are two-replica Helm
 chart deployments through the admission election
-(`docs/design/helm-chart-cache-election.md`): their first deploy pays one
+(`docs/results/HELM-CHART-CACHE-2026-09.md`): their first deploy pays one
 cold leader plus capture, and every later start of the chart is the restore
 number.
 Phase split for Qwen3-235B, cold to warm: model download and load 641 s to

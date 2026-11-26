@@ -46,6 +46,14 @@ global:
     registry: nvcr.io
     repository: YOUR_ORG/YOUR_TEAM
 
+  # nvcf-openbao-migrations image tag shared by OpenBao, LLS HMAC rotation and
+  # the NVCF UI. Set openbao.migrations.image.tag,
+  # addons.lls.hmacRotation.image.tag or addons.nvcfUi.openbaoMigrations.image.tag
+  # to pin one component.
+  openbaoMigrations:
+    image:
+      tag: "0.23.1"
+
   # =============================================================================
   # Worker Sidecar Registry Configuration
   # =============================================================================
@@ -163,7 +171,9 @@ global:
 
 # One profile installs and configures the shared observability stack for the
 # selected planes. Self-managed control-plane installs need no other
-# observability flags.
+# observability flags. The image defaults of the observability releases live in
+# deploy/stacks/observability/environments/base.yaml; override them here under
+# the forwarded keys (collector, opentelemetryOperator, victoriaMetrics).
 observability:
   profile: control
 
@@ -223,6 +233,13 @@ nvctApi:
 #       registry: <your-registry>
 #       repository: <your-repository>/alpine-k8s
 #       tag: "1.37.0"
+#
+# The account-bootstrap hook Job runs on install and upgrade and creates the
+# NVCF account if it does not exist. When the account is provisioned another
+# way, set api.accountBootstrap.enabled: false. Unset, the API chart default
+# (true) applies:
+#   accountBootstrap:
+#     enabled: false
 
 # The bundled upgrade receipt uses its chart's public upstream helper image.
 # Global NVCF image settings do not select this third-party image. To use a
@@ -573,6 +590,12 @@ addons:
       mappingPath: /etc/vanity-gateway/config/config.yaml
       nvcfApiEndpoint: http://invocation.nvcf.svc.cluster.local:8080
       llmGatewayEndpoint: http://llm-api-gateway.nvcf.svc.cluster.local:8080
+      # Model API request body limit in bytes (25 MiB). Must be positive.
+      maxRequestSizeBytes: 26214400
+      # Optional larger limit for model API requests forwarded as they arrive.
+      # Unset means equal to maxRequestSizeBytes. Set it only with a chart
+      # that has vanityGateway.config.maxStreamedRequestSizeBytes.
+      # maxStreamedRequestSizeBytes: 67108864
       # Empty by default because the Vanity Gateway chart does not create Vault
       # Agent injection. Set this only when another component mounts the secrets
       # file into the pod.
@@ -741,6 +764,10 @@ ingress:
         routeAnnotations: {}
       invocation:
         routeAnnotations: {}
+      # The LLM routes, llm.<domain> (llmApiGateway) and llm.invocation.<domain>
+      # (llmInvocation), follow addons.llm.enabled. Set enabled: false on either
+      # to keep it off while the add-on is on, for example when callers reach
+      # the gateway in-cluster.
       llmInvocation:
         routeAnnotations: {}
       vanityGateway:
@@ -842,6 +869,7 @@ grpcproxy:
 #       }
 #   - Give workers the CA that issued Envoy's frontend certificate through
 #     global.nvcaOperator.agent.workerCallbackCaPem in the compute-plane stack.
+#     HTTP callbacks trust that CA from worker-utils 1.4.0.
 #     Workers need no stack CA when Envoy's frontend certificate comes from a
 #     public CA (tls.frontend below).
 # Workers' TLS always ends at Envoy. Envoy then opens its own TLS session to

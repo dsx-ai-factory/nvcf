@@ -26,9 +26,14 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
+// restoredConditionReason is the reason of the condition of a pod the
+// agent restored into; a pod started cold in place after a failed restore
+// has "ColdStarted".
+const restoredConditionReason = "Restored"
+
 // setRestoredCondition sets pod's webhook.CRIURestoredCondition True.
 func (a *Agent) setRestoredCondition(ctx context.Context, ns, pod string) error {
-	return a.setRestoredConditionReason(ctx, ns, pod, "Restored", "the agent restored the checkpoint into the pod")
+	return a.setRestoredConditionReason(ctx, ns, pod, restoredConditionReason, "the agent restored the checkpoint into the pod")
 }
 
 // setRestoredConditionReason sets pod's webhook.CRIURestoredCondition True
@@ -49,6 +54,17 @@ func (a *Agent) setRestoredConditionReason(ctx context.Context, ns, pod, reason,
 		return nil
 	}
 	return err
+}
+
+// restoredByCondition reports whether pod's webhook.CRIURestoredCondition
+// says the agent restored into it.
+func restoredByCondition(pod *corev1.Pod) bool {
+	for i := range pod.Status.Conditions {
+		if c := &pod.Status.Conditions[i]; c.Type == webhook.CRIURestoredCondition {
+			return c.Status == corev1.ConditionTrue && c.Reason == restoredConditionReason
+		}
+	}
+	return false
 }
 
 // restoredConditionTrue reports whether pod's webhook.CRIURestoredCondition

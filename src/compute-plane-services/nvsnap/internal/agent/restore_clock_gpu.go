@@ -43,7 +43,8 @@ import (
 const (
 	// restoreSpanFile, in a checkpoint's directory, holds what its last
 	// restore with a GPU reload took on this node, from CRIU's start to the
-	// GPU resume, in milliseconds.
+	// GPU resume, in milliseconds. It is the node's own: a peer fetching
+	// the checkpoint does not copy it (nodeLocalCheckpointFile).
 	restoreSpanFile = "restore-span-ms"
 	// timensResumePIDsFile is CRIU's list, in its work directory, of the
 	// tasks that ran at the dump, which the agent resumes
@@ -67,23 +68,84 @@ const (
 func restoreSpanBudget(dir string) time.Duration {
 	if b, err := os.ReadFile(filepath.Join(dir, restoreSpanFile)); err == nil {
 		if ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && ms >= 0 {
-			return min(time.Duration(ms)*time.Millisecond*11/10+restoreClockSlack, restoreClockMax)
+			return spanBudget(ms)
 		}
 	}
+	return restoreSpanEstimate(dir)
+}
+
+// spanBudget is the budget for a restore whose last one took ms.
+func spanBudget(ms int64) time.Duration {
+	return min(time.Duration(ms)*time.Millisecond*11/10+restoreClockSlack, restoreClockMax)
+}
+
+// restoreSpanEstimate is the budget of a checkpoint not restored yet: from
+// its CRIU images and its GPU memory.
+func restoreSpanEstimate(dir string) time.Duration {
 	gpu := time.Duration(float64(gpuStoreBytes(dir)) / restoreGPULoadRate * float64(time.Second))
 	return min(restoreClockBudget(dir)+gpu+restoreGPUSlack, restoreClockMax)
+}
+
+// groupSpanUnknown is a group restore's span when a GPU rank's node has no
+// restore of its checkpoint: every rank then takes the estimate.
+const groupSpanUnknown int64 = -1
+
+// groupSpanBudget is a GPU rank's budget. The ranks of a group restore
+// resume when their clocks reach the dump, a budget after CRIU started, and
+// they start together; with budgets of their own (each from its node's last
+// restore of its checkpoint) they would resume apart, and the first would
+// wait, network locked, for the last (the unlock comes once every pod has
+// restored). A rank placed on a node without a restore of its checkpoint
+// took the estimate, 1m52s, while the others took their last 41 s span:
+// they waited 61 s, and the leader's workload exited before the unlock.
+// So the driver hands every rank one span: the slowest rank's last
+// (groupSpanMS > 0), or groupSpanUnknown when a rank has none, for the
+// estimate; 0 is a restore on its own, with this node's record.
+//
+// A learned span (restore_span_learned.go), another checkpoint's, only
+// shortens the wait: its budget is never more than this checkpoint's
+// estimate.
+func groupSpanBudget(dir string, groupSpanMS int64, learned bool) time.Duration {
+	switch {
+	case groupSpanMS > 0 && learned:
+		return min(spanBudget(groupSpanMS), restoreSpanEstimate(dir))
+	case groupSpanMS > 0:
+		return spanBudget(groupSpanMS)
+	case groupSpanMS < 0:
+		return restoreSpanEstimate(dir)
+	default:
+		return restoreSpanBudget(dir)
+	}
+}
+
+// groupRestoreSpan is the span a group restore hands its GPU ranks: the
+// largest of their last restores (spans[i], when known[i]), or
+// groupSpanUnknown when a rank has none.
+func groupRestoreSpan(spans []int64, known []bool) int64 {
+	if len(spans) == 0 {
+		return groupSpanUnknown
+	}
+	var span int64
+	for i, ms := range spans {
+		if !known[i] {
+			return groupSpanUnknown
+		}
+		span = max(span, ms)
+	}
+	return span
 }
 
 // restoreClockArgs is what CRIU is told about the restored clocks, and
 // the budget: nothing without --timens-budget; CRIU's own restore as the
 // budget, which CRIU waits out; or, through a GPU reload, the whole restore,
-// with every task left stopped for the GPU resume.
-func restoreClockArgs(dir string, budgetSupported, throughGPU bool) ([]string, time.Duration) {
+// with every task left stopped for the GPU resume (groupSpanMS, see
+// groupSpanBudget).
+func restoreClockArgs(dir string, budgetSupported, throughGPU bool, groupSpanMS int64, learned bool) ([]string, time.Duration) {
 	switch {
 	case !budgetSupported:
 		return nil, 0
 	case throughGPU:
-		b := restoreSpanBudget(dir)
+		b := groupSpanBudget(dir, groupSpanMS, learned)
 		return []string{"--timens-budget", strconv.FormatInt(b.Milliseconds(), 10), "--leave-stopped", "--timens-no-wait"}, b
 	default:
 		b := restoreClockBudget(dir)
@@ -249,4 +311,26 @@ func restoredTasksToResume(procBase string, nsRef, criuNSRef int, pids, skip []i
 func clockThroughGPUSupported(criuHelp, toolUsage string) bool {
 	return criuSupportsTimensBudget(criuHelp) && strings.Contains(criuHelp, "--timens-no-wait") &&
 		strings.Contains(toolUsage, "--clock-at")
+}
+
+// nodeLocalCheckpointFile is whether rel, a path in a checkpoint's
+// directory, is this node's own record rather than part of the checkpoint:
+// the checkpoint manifest leaves it out, a fetch from a peer skips it, and
+// a done fetch over any tier drops it (endLocalFetch).
+// A copy of another node's restoreSpanFile would make a node new to the
+// checkpoint look restored: it would budget with the other node's span and
+// record no sample of its own.
+func nodeLocalCheckpointFile(rel string) bool {
+	return filepath.ToSlash(filepath.Clean(rel)) == restoreSpanFile
+}
+
+// hasRestoreSpan is whether this node has a restore of the checkpoint in
+// dir on record (restoreSpanFile) that restoreSpanBudget can use.
+func hasRestoreSpan(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, restoreSpanFile)) //nolint:gosec // dir is the agent's own checkpoint directory
+	if err != nil {
+		return false
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	return err == nil && ms >= 0
 }

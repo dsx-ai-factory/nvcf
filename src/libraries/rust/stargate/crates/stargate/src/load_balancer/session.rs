@@ -907,7 +907,7 @@ mod tests {
         let last = hint("b");
         let request = request(&target, Some(KEY), 0, Some(&last));
         let mut unweighted = single_slot(1);
-        unweighted[0].stats.max_input_tps = None;
+        unweighted[0].stats.max_input_tps = Some(0.0);
 
         assert_eq!(lb(&request, &unweighted, Duration::ZERO), Unavailable);
         // B joins before the retry. The request stays stale, so it does not

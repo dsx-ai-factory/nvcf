@@ -10,9 +10,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/transform/suppress"
 )
 
 const (
@@ -23,9 +26,7 @@ const (
 	EnvStateDir             = "REQUEST_TRACE_UPLOADER_STATE_DIR"
 	EnvQuarantineDir        = "REQUEST_TRACE_UPLOADER_QUARANTINE_DIR"
 	EnvHealthAddr           = "HEALTH_ADDR"
-	EnvScanInterval         = "REQUEST_TRACE_UPLOADER_SCAN_INTERVAL_SECONDS"
-	EnvKratosStatusInterval = "REQUEST_TRACE_UPLOADER_KRATOS_STATUS_INTERVAL_SECONDS"
-	EnvKratosStatusTimeout  = "REQUEST_TRACE_UPLOADER_KRATOS_STATUS_TIMEOUT_SECONDS"
+	EnvScanInterval         = "REQUEST_TRACE_UPLOADER_SCAN_INTERVAL"
 	EnvAttemptTimeout       = "REQUEST_TRACE_UPLOADER_ATTEMPT_TIMEOUT"
 	EnvOperationTimeout     = "REQUEST_TRACE_UPLOADER_OPERATION_TIMEOUT"
 	EnvMaxRetries           = "REQUEST_TRACE_UPLOADER_MAX_RETRIES"
@@ -43,8 +44,6 @@ const (
 	DefaultHealthAddr       = ":8011"
 	DefaultSegmentPrefix    = "request-trace"
 	DefaultScanInterval     = 30 * time.Second
-	DefaultStatusInterval   = 5 * time.Second
-	DefaultStatusTimeout    = 30 * time.Minute
 	DefaultAttemptTimeout   = 30 * time.Second
 	DefaultOperationTimeout = 90 * time.Second
 	DefaultMaxRetries       = 2
@@ -54,12 +53,13 @@ const (
 )
 
 // Backend selects the export destination. Core behavior derives from the
-// backend's declared capabilities rather than from this value.
+// backend's declared capabilities rather than from this value. Load checks
+// only its shape; the backend registry decides which names exist, so a new
+// backend needs no change here.
 type Backend string
 
 const (
 	BackendObjectStore Backend = "objectstore"
-	BackendKratos      Backend = "kratos"
 	// BackendDebug reads and reports segments without exporting them. It
 	// exists so the read path can be exercised against a real Dynamo without
 	// credentials or a destination.
@@ -102,9 +102,46 @@ type Config struct {
 	HealthAddr     string
 	ScanInterval   time.Duration
 	RetryPolicy    RetryPolicy
-	Kratos         KratosPolicy
 	ObjectStore    ObjectStorePolicy
 	DebugVerbosity DebugVerbosity
+	// Suppression is the validated suppression rule list. No rules turns
+	// suppression off.
+	Suppression suppress.Config
+	// AuditPrefix names a second segment family to upload, or is empty.
+	AuditPrefix string
+	// SkipRedaction turns redaction of inline media off. The zero value
+	// redacts, so a Config built by hand never exports media by accident.
+	SkipRedaction bool
+	// DrainTimeout bounds the shutdown drain after SIGTERM.
+	DrainTimeout time.Duration
+	// MaxJobAge is how long a submitted job may stay unfinished before it
+	// is reported stranded.
+	MaxJobAge time.Duration
+	// StatusInterval is how often every open job is polled.
+	StatusInterval time.Duration
+	// QuarantineTrip is how many segments quarantined in a row stop intake.
+	// Zero, as in a Config built by hand, uses the fault handling default.
+	QuarantineTrip int
+	// QuarantineResume is how long intake stays stopped after a trip before
+	// it reads new segments again. Zero uses the fault handling default.
+	QuarantineResume time.Duration
+	// Batch bounds each upload batch.
+	Batch BatchPolicy
+	// Faults tunes fault handling.
+	Faults FaultPolicy
+	// Spool bounds spool use: when data is deleted to keep the spool from
+	// filling, and how much free space preparing leaves.
+	Spool SpoolPolicy
+	// SpoolBudgetBytes is the spool's own size, such as its emptyDir size
+	// limit. Zero, also the value when its setting is unset, measures
+	// fullness on the spool's filesystem only.
+	SpoolBudgetBytes int64
+	// RecordMaxBytes is the most bytes one source record may have. Zero, as
+	// in a Config built by hand, uses DefaultRecordMaxBytes.
+	RecordMaxBytes int64
+	// Prepare bounds preparing segments in parallel. The zero value, as in a
+	// Config built by hand, prepares one segment at a time.
+	Prepare PreparePolicy
 }
 
 // ObjectStorePolicy configures the generic S3-compatible backend. Bucket and
@@ -130,18 +167,17 @@ type ObjectStorePolicy struct {
 	// exists to exercise config, key computation, and hostname namespacing
 	// without a destination, the same role debug plays for the read path.
 	DryRun bool
+	// ResponseTimeout bounds the wait for a store's answer once a request,
+	// body included, is sent. Zero, as in a Config built by hand, uses
+	// DefaultObjectStoreResponseTimeout; it never means no bound.
+	ResponseTimeout time.Duration
 }
 
-// KratosPolicy bounds the asynchronous job polling that only the Kratos Bulk
-// Upload backend performs. Object-store submission is synchronous and has no
-// status poll.
-type KratosPolicy struct {
-	StatusInterval time.Duration
-	StatusTimeout  time.Duration
-}
-
-// RetryPolicy bounds each remote operation. The initial scaffold validates but
-// does not yet invoke a remote upload client.
+// RetryPolicy bounds each remote operation. AttemptTimeout bounds each backend
+// job status call. A submit has no core deadline; an upload deadline belongs
+// to the backend. OperationTimeout, MaxRetries and the backoff fields are
+// validated but not read by the pipeline, whose retries follow its fault
+// policy.
 type RetryPolicy struct {
 	AttemptTimeout   time.Duration
 	OperationTimeout time.Duration
@@ -191,13 +227,7 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		return Config{}, nil, fmt.Errorf("%s must not be empty", EnvHealthAddr)
 	}
 
-	scanInterval := durationSeconds(lookup, EnvScanInterval, DefaultScanInterval, time.Second, 24*time.Hour, &warnings)
-	statusInterval := durationSeconds(lookup, EnvKratosStatusInterval, DefaultStatusInterval, time.Second, time.Hour, &warnings)
-	statusTimeout := durationSeconds(lookup, EnvKratosStatusTimeout, DefaultStatusTimeout, time.Second, 24*time.Hour, &warnings)
-	if statusTimeout < statusInterval {
-		statusTimeout = statusInterval
-		warnings = append(warnings, EnvKratosStatusTimeout)
-	}
+	scanInterval := duration(lookup, EnvScanInterval, DefaultScanInterval, time.Second, 24*time.Hour, &warnings)
 	attemptTimeout := duration(lookup, EnvAttemptTimeout, DefaultAttemptTimeout, time.Second, 90*time.Second, &warnings)
 	operationTimeout := duration(lookup, EnvOperationTimeout, DefaultOperationTimeout, time.Second, 5*time.Minute, &warnings)
 	if operationTimeout < attemptTimeout {
@@ -225,7 +255,67 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		PathStyle: boolValue(lookup, EnvObjectStorePathStyle, false, &warnings),
 		DryRun:    boolValue(lookup, EnvObjectStoreDryRun, false, &warnings),
 	}
+	objectStore.ResponseTimeout, err = strictDuration(lookup, EnvObjectStoreResponseTimeout, DefaultObjectStoreResponseTimeout, 10*time.Second, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
 	debugVerbosity := debugVerbosityValue(lookup, EnvDebugVerbosity, &warnings)
+	suppression, err := suppressionValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	auditPrefix, err := auditPrefixValue(lookup, segmentPrefix)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	redactMultimodal, err := strictBool(lookup, EnvRedactMultimodal, true)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	drainTimeout, err := strictDuration(lookup, EnvDrainTimeout, DefaultDrainTimeout, 0, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	maxJobAge, err := strictDuration(lookup, EnvMaxJobAge, DefaultMaxJobAge, time.Minute, 7*24*time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	pollInterval, err := strictDuration(lookup, EnvStatusInterval, DefaultPollInterval, time.Second, time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	quarantineTrip, err := strictInt(lookup, EnvQuarantineTrip, DefaultQuarantineTrip, 1, maxQuarantineTrip)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	quarantineResume, err := strictDuration(lookup, EnvQuarantineResume, DefaultQuarantineResume, time.Minute, 24*time.Hour)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	batchPolicy, err := batchPolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	faultPolicy, err := faultPolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	spool, err := spoolPolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	spoolBudget, err := spoolBudgetValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	recordMaxBytes, err := strictBytes(lookup, EnvRecordMaxBytes, DefaultRecordMaxBytes, minRecordMaxBytes, maxRecordMaxBytes)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	prepare, err := preparePolicyValue(lookup)
+	if err != nil {
+		return Config{}, nil, err
+	}
 
 	return Config{
 		SourceDir:     sourceDir,
@@ -236,10 +326,6 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		QuarantineDir: quarantineDir,
 		HealthAddr:    strings.TrimSpace(healthAddr),
 		ScanInterval:  scanInterval,
-		Kratos: KratosPolicy{
-			StatusInterval: statusInterval,
-			StatusTimeout:  statusTimeout,
-		},
 		RetryPolicy: RetryPolicy{
 			AttemptTimeout:   attemptTimeout,
 			OperationTimeout: operationTimeout,
@@ -250,6 +336,21 @@ func Load(lookup LookupFunc) (Config, []string, error) {
 		},
 		ObjectStore:    objectStore,
 		DebugVerbosity: debugVerbosity,
+		Suppression:    suppression,
+		AuditPrefix:    auditPrefix,
+		SkipRedaction:  !redactMultimodal,
+		DrainTimeout:   drainTimeout,
+		MaxJobAge:      maxJobAge,
+		StatusInterval: pollInterval,
+
+		QuarantineTrip:   quarantineTrip,
+		QuarantineResume: quarantineResume,
+		Batch:            batchPolicy,
+		Faults:           faultPolicy,
+		Spool:            spool,
+		SpoolBudgetBytes: spoolBudget,
+		RecordMaxBytes:   recordMaxBytes,
+		Prepare:          prepare,
 	}, warnings, nil
 }
 
@@ -312,13 +413,15 @@ func backendValue(lookup LookupFunc, name string) (Backend, error) {
 	if !ok || value == "" {
 		return "", fmt.Errorf("%s is required", name)
 	}
-	switch Backend(value) {
-	case BackendObjectStore, BackendKratos, BackendDebug:
-		return Backend(value), nil
-	default:
-		return "", fmt.Errorf("%s must be one of %q, %q, or %q", name, BackendObjectStore, BackendKratos, BackendDebug)
+	if !backendNamePattern.MatchString(value) {
+		return "", fmt.Errorf("%s must be a lowercase backend name", name)
 	}
+	return Backend(value), nil
 }
+
+// backendNamePattern is the shape of a backend name, which is also a metrics
+// label value.
+var backendNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
 // debugVerbosityValue reads the debug backend's log verbosity. An unknown
 // value falls back to DebugVerbosityBasic with a warning rather than a hard
@@ -345,28 +448,6 @@ func valueOrDefault(lookup LookupFunc, name, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func durationSeconds(lookup LookupFunc, name string, fallback, minimum, maximum time.Duration, warnings *[]string) time.Duration {
-	value, ok := lookup(name)
-	if !ok || strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	seconds, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		*warnings = append(*warnings, name)
-		return fallback
-	}
-	if seconds < 0 || int64(seconds) > int64(maximum/time.Second) {
-		*warnings = append(*warnings, name)
-		return fallback
-	}
-	duration := time.Duration(seconds) * time.Second
-	if duration < minimum || duration > maximum {
-		*warnings = append(*warnings, name)
-		return fallback
-	}
-	return duration
 }
 
 func duration(lookup LookupFunc, name string, fallback, minimum, maximum time.Duration, warnings *[]string) time.Duration {
