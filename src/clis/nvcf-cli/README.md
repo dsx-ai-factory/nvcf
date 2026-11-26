@@ -1207,6 +1207,7 @@ export NVCF_CLI_DEBUG=true
   --inference-url "/echo" \
   --inference-port 8000 \
   --health-uri "/health" \
+  --health-timeout "PT30S" \
   --debug
 
 # 3. Deploy for testing

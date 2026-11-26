@@ -782,6 +782,7 @@ curl -X POST https://api.nvcf.nvidia.com/v2/nvcf/registry-credentials \
   --inference-url /predict \
   --health-port 8000 \
   --health-uri /health \
+  --health-timeout PT30S \
   --secrets API_KEY=sk-1234567890abcdef,DATABASE_PASSWORD=mypassword
 
 # Create function with multiple secrets
