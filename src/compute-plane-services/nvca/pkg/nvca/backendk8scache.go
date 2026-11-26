@@ -203,6 +203,8 @@ type BackendK8sCache struct {
 	// was ever told the instance is gone. Wired by Agent, which owns the
 	// ICMS HTTP client; nil in builds/tests that don't need it.
 	notFoundInstanceReporter func(ctx context.Context, reqID, instanceID string) error
+	// workerRestartScoreRecorder is nil when CountAllWorkerRestarts is on.
+	workerRestartScoreRecorder *workerRestartScoreRecorder
 
 	podLister                            listersv1.PodLister
 	podSpecLister                        listersv1.PodNamespaceLister
@@ -680,11 +682,12 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 				resyncPeriod,
 				k8sinformers.WithTransform(k8sutil.StripManagedFields),
 			)
+			podInf := podInfFactory.Core().V1().Pods()
 			podWatchers := []workloadWatcher{watchForPodCrashesRestarts, onNVCFPodUpdateFunc}
 			if c.k8sTimeConfig != nil && !c.k8sTimeConfig.CountAllWorkerRestarts {
-				podWatchers = append(podWatchers, recordWorkerRestartScore(k8sClient, c.k8sTimeConfig))
+				c.workerRestartScoreRecorder = newWorkerRestartScoreRecorder(k8sClient, podInf.Lister(), c.k8sTimeConfig)
+				podWatchers = append(podWatchers, c.workerRestartScoreRecorder.onPodUpdate)
 			}
-			podInf := podInfFactory.Core().V1().Pods()
 			_, err := podInf.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
 				UpdateFunc: func(oldObj, newObj any) {
 					oldPod, ok := oldObj.(*corev1.Pod)
@@ -954,6 +957,11 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 			for c.processNotFoundInstanceWork(ctx) {
 			}
 		}()
+	}
+
+	if c.workerRestartScoreRecorder != nil {
+		log.Info("Starting worker restart score recorder")
+		go c.workerRestartScoreRecorder.run(ctx)
 	}
 
 	return c, out, nil

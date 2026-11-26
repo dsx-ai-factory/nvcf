@@ -32,6 +32,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	listersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/util/workqueue"
 
 	nvcametrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/metrics"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
@@ -75,31 +77,89 @@ func watchForPodCrashesRestarts(ctx context.Context, oldPod, newPod *corev1.Pod)
 	reportPodCrashAndRestartMetrics(ctx, oldPod.Status.ContainerStatuses, newPod.Status.ContainerStatuses, podNamespacedName)
 }
 
-// recordWorkerRestartScore returns a workloadWatcher that records the NVCA worker container restart score on its
-// function Pod when the worker's RestartCount changes. A failed patch loses nothing: the score is computed from the
-// last recorded score plus the restarts since, and the next Pod update records it again.
-func recordWorkerRestartScore(client kubernetes.Interface, k8sTimeConfig *k8sutil.TimeConfig) workloadWatcher {
-	return func(ctx context.Context, _, newPod *corev1.Pod) {
-		if _, ok := newPod.Labels[nvcatypes.ICMSRequestIDKey]; !ok {
-			return
-		}
-		score, ok := k8sutil.WorkerRestartScoreToRecord(newPod, time.Now(), k8sTimeConfig)
-		if !ok {
-			return
-		}
-		patch, err := json.Marshal(map[string]any{
-			"metadata": map[string]any{"annotations": map[string]string{k8sutil.WorkerRestartScoreAnnotationKey: score}},
-		})
-		if err != nil {
-			return
-		}
-		_, err = client.CoreV1().Pods(newPod.Namespace).Patch(ctx, newPod.Name, apitypes.MergePatchType, patch,
-			metav1.PatchOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			core.GetLogger(ctx).WithError(err).Warnf("failed to record the worker restart score on pod %s/%s",
-				newPod.Namespace, newPod.Name)
-		}
+// workerRestartScoreRecorder records the NVCA worker container restart score on function Pods. Pod updates only queue
+// the Pod and a separate worker patches it, so a slow API server does not hold up the Pod informer. A late or failed
+// patch loses nothing: the score is computed from the last recorded score plus the restarts since.
+type workerRestartScoreRecorder struct {
+	client        kubernetes.Interface
+	podLister     listersv1.PodLister
+	k8sTimeConfig *k8sutil.TimeConfig
+	queue         workqueue.TypedRateLimitingInterface[apitypes.NamespacedName]
+}
+
+func newWorkerRestartScoreRecorder(
+	client kubernetes.Interface,
+	podLister listersv1.PodLister,
+	k8sTimeConfig *k8sutil.TimeConfig,
+) *workerRestartScoreRecorder {
+	return &workerRestartScoreRecorder{
+		client:        client,
+		podLister:     podLister,
+		k8sTimeConfig: k8sTimeConfig,
+		queue:         workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[apitypes.NamespacedName]()),
 	}
+}
+
+// onPodUpdate is a workloadWatcher that queues a function Pod whose worker restart score needs to be recorded.
+func (r *workerRestartScoreRecorder) onPodUpdate(_ context.Context, _, newPod *corev1.Pod) {
+	if _, ok := newPod.Labels[nvcatypes.ICMSRequestIDKey]; !ok {
+		return
+	}
+	if _, ok := k8sutil.WorkerRestartScoreToRecord(newPod, time.Now(), r.k8sTimeConfig); ok {
+		r.queue.Add(apitypes.NamespacedName{Namespace: newPod.Namespace, Name: newPod.Name})
+	}
+}
+
+// run records the queued worker restart scores until ctx is done.
+func (r *workerRestartScoreRecorder) run(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		r.queue.ShutDown()
+	}()
+	for r.processNext(ctx) {
+	}
+}
+
+func (r *workerRestartScoreRecorder) processNext(ctx context.Context) bool {
+	key, shutdown := r.queue.Get()
+	if shutdown {
+		return false
+	}
+	defer r.queue.Done(key)
+
+	if err := r.record(ctx, key); err != nil {
+		core.GetLogger(ctx).WithError(err).Warnf("failed to record the worker restart score on pod %s, requeuing", key)
+		r.queue.AddRateLimited(key)
+		return true
+	}
+	r.queue.Forget(key)
+	return true
+}
+
+// record patches the worker restart score annotation from the latest cached Pod. A deleted Pod is skipped.
+func (r *workerRestartScoreRecorder) record(ctx context.Context, key apitypes.NamespacedName) error {
+	pod, err := r.podLister.Pods(key.Namespace).Get(key.Name)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	annotationValue, ok := k8sutil.WorkerRestartScoreToRecord(pod, time.Now(), r.k8sTimeConfig)
+	if !ok {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]string{k8sutil.WorkerRestartScoreAnnotationKey: annotationValue}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = r.client.CoreV1().Pods(key.Namespace).Patch(ctx, key.Name, apitypes.MergePatchType, patch, metav1.PatchOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 func reportPodCrashAndRestartMetrics(ctx context.Context,

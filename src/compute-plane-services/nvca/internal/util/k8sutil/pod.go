@@ -319,14 +319,14 @@ type ContainerStuckInitializing struct {
 // the kubelet restarted it in place.
 func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfig *TimeConfig) bool {
 	threshold := RestartCountToFailInstance
-	restarts := float64(cs.RestartCount)
+	restartScore := float64(cs.RestartCount)
 	if isWorkerContainer(pod, cs.Name) {
 		threshold = k8sTimeConfig.workerRestartCountToFailInstance()
 		if !k8sTimeConfig.CountAllWorkerRestarts {
-			restarts = workerRestartScore(pod, cs.RestartCount, time.Now(), k8sTimeConfig.workerRestartScoreDecayPeriod())
+			restartScore = workerRestartScore(pod, cs.RestartCount, time.Now(), k8sTimeConfig.workerRestartScoreDecayPeriod())
 		}
 	}
-	if restarts < float64(threshold) ||
+	if restartScore < float64(threshold) ||
 		!IsTimeSincePodLaunchedLaterThan(pod, k8sTimeConfig.PodLaunchThresholdSecondsOnFailedRestarts) {
 		return false
 	}
