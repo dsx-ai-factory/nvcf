@@ -24,6 +24,7 @@ metadata:
     {{- include "nvcf-otel-collector.labels" . | nindent 4 }}
 spec:
   mode: statefulset
+  replicas: {{ .Values.replicas }}
   {{- with .Values.image }}
   image: {{ . | quote }}
   {{- end }}
