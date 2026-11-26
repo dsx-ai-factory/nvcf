@@ -137,3 +137,18 @@ func TestNvidiaSMICommandRunsARealBinary(t *testing.T) {
 		t.Fatalf("%s %v: %v: %s", name, argv, err, out)
 	}
 }
+
+// A root may also hold another architecture's loader (a cross toolchain):
+// only the agent's own can run it.
+func TestRootLoaderIsTheAgentsArchitecture(t *testing.T) {
+	root := t.TempDir()
+	mkfile(t, filepath.Join(root, "lib/ld-linux-aarch64.so.1"))
+	mkfile(t, filepath.Join(root, "lib64/ld-linux-x86-64.so.2"))
+	want := filepath.Join(root, "lib64/ld-linux-x86-64.so.2")
+	if runtime.GOARCH == "arm64" {
+		want = filepath.Join(root, "lib/ld-linux-aarch64.so.1")
+	}
+	if got := rootLoader(root); got != want {
+		t.Errorf("rootLoader = %q, want %q", got, want)
+	}
+}
