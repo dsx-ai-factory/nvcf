@@ -34,9 +34,10 @@ type umbrellaPublisher struct {
 	api, uploads, repository, token string
 }
 type umbrellaReleaseAsset struct {
-	ID    int64  `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	State              string `json:"state"`
+	BrowserDownloadURL string `json:"browser_download_url"`
 }
 type umbrellaRelease struct {
 	ID         int64  `json:"id"`

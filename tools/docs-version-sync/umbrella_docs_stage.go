@@ -108,7 +108,10 @@ func readPublishedDocsProduct(root string, release editionRelease, publisher umb
 		if !ok || asset.State != "uploaded" {
 			return nil, fmt.Errorf("docs product release is missing %s", name)
 		}
-		content, err := publisher.request("GET", fmt.Sprintf("%s/repos/%s/releases/assets/%d", publisher.api, publisher.repository, asset.ID), "download", nil)
+		if asset.BrowserDownloadURL == "" {
+			return nil, fmt.Errorf("docs product release is missing the public download URL for %s", name)
+		}
+		content, err := publisher.request("GET", asset.BrowserDownloadURL, "download", nil)
 		if err != nil {
 			return nil, err
 		}

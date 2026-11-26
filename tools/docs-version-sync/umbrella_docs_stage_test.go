@@ -215,6 +215,7 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 	sort.Strings(names)
 	remote := umbrellaRelease{ID: 1, Tag: umbrellaTag(manifest.Version)}
 	unavailable := false
+	missingDownloadURL := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/repos/dsx-ai-factory/nvcf")
 		if r.Method != "GET" || r.Header.Get("Authorization") != "" {
@@ -229,16 +230,22 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 			list := []umbrellaReleaseAsset{}
 			for i, name := range names {
 				if _, ok := assets[name]; ok {
-					list = append(list, umbrellaReleaseAsset{ID: int64(i + 10), Name: name, State: "uploaded"})
+					asset := umbrellaReleaseAsset{ID: int64(i + 10), Name: name, State: "uploaded", BrowserDownloadURL: "http://" + r.Host + "/downloads/" + strconv.Itoa(i+10)}
+					if missingDownloadURL {
+						asset.BrowserDownloadURL = ""
+					}
+					list = append(list, asset)
 				}
 			}
 			json.NewEncoder(w).Encode(list)
 		case strings.HasPrefix(path, "/releases/assets/"):
+			http.Error(w, "API asset download rate limit exceeded", http.StatusForbidden)
+		case strings.HasPrefix(path, "/downloads/"):
 			if unavailable {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-			id, _ := strconv.Atoi(strings.TrimPrefix(path, "/releases/assets/"))
+			id, _ := strconv.Atoi(strings.TrimPrefix(path, "/downloads/"))
 			if id < 10 || id >= 10+len(names) {
 				w.WriteHeader(404)
 				return
@@ -268,6 +275,11 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 		})
 	}
 	remote.Draft, remote.Prerelease = false, false
+	missingDownloadURL = true
+	if err := verifyPublishedDocsProduct(fixture.root, release, publisher); err == nil || !strings.Contains(err.Error(), "public download URL") {
+		t.Fatalf("accepted assets without public download URLs: %v", err)
+	}
+	missingDownloadURL = false
 	unavailable = true
 	if err := verifyPublishedDocsProduct(fixture.root, release, publisher); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("accepted unavailable product assets: %v", err)
