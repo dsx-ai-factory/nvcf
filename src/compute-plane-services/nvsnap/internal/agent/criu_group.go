@@ -750,7 +750,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	c.companionFailures.Delete(leader.UID)
 	for _, r := range ranks {
-		if webhook.DynamoComponent(r) && len(companions) == 0 {
+		// A rank that registers through Kubernetes has no etcd: its
+		// registration is kept with the capture (kube_discovery.go).
+		if webhook.DynamoComponent(r) && !kubeDiscoveryRank(r) && len(companions) == 0 {
 			log.WithField("rank", r.Name).Warn("CRIU group capture: skipped; a Dynamo rank is connected to no etcd or NATS of its namespace to capture with it")
 			return false
 		}
@@ -840,6 +842,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		if why := configurationRefusal(b); why != "" {
 			c.recordRefusal(ctx, key, scope, drv, uris, len(ranks), leader, why, log)
 		}
+		return false
+	}
+	// Read while the ranks serve: their restore writes them again
+	// (kube_discovery.go).
+	registrations, rerr := a.recordRegistrations(ctx, ranks)
+	if rerr != nil {
+		log.WithError(rerr).Warn("CRIU group capture: skipped; cannot keep a rank's Kubernetes registration for its restore")
 		return false
 	}
 	// Again just before the instance is held: the namespace's scaling
@@ -939,6 +948,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
+		}
+		for k, v := range registrations {
+			data[k] = v
 		}
 		log.WithField("duration", time.Since(t0).Round(time.Second).String()).Info("CRIU group capture: recorded; the instance restores from it to verify it")
 	}
@@ -1704,6 +1716,13 @@ func (c *criuAutoRestorer) restoreGroup(ctx context.Context, leader *corev1.Pod,
 		}
 		log.WithError(err).Warn("CRIU group restore: cannot claim the companions yet; trying again on the leader's next event")
 		c.attempted.Delete("restore/" + string(leader.UID))
+		return
+	}
+	// Before the restore: a rank that registers through Kubernetes is
+	// routed to only once its registration names its placeholder. Not
+	// written, the instance starts cold rather than restore unreachable.
+	if err := c.writeGroupRegistrations(ctx, key, ranks); err != nil {
+		c.failGroup(ctx, leader, key, false, fmt.Errorf("registrations: %w", err), log)
 		return
 	}
 	log.Info("CRIU group restore: every placeholder runs; restoring the instance")

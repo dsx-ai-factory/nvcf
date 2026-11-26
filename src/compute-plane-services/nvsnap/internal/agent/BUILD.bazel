@@ -55,6 +55,7 @@ go_library(
         "grove_replicas.go",
         "instance_nat.go",
         "kmsg.go",
+        "kube_discovery.go",
         "l2_catalog_writer.go",
         "l2_copy.go",
         "l2_fetch.go",
