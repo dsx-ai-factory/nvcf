@@ -20,8 +20,12 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,6 +121,202 @@ func TestOIDCConfigParsing(t *testing.T) {
 	})
 }
 
+func TestFetchJWKSFromURL(t *testing.T) {
+	tests := []struct {
+		name          string
+		discovery     string
+		jwks          string
+		failDiscovery bool
+		failJWKS      bool
+		wantIssuer    string
+		wantJWKS      string
+		wantError     string
+	}{
+		{name: "success", discovery: `{"issuer":"https://issuer.example.com","jwks_uri":"https://issuer.example.com/keys"}`, jwks: `{"keys":[{"kid":"test-key"}]}`, wantIssuer: "https://issuer.example.com", wantJWKS: `{"keys":[{"kid":"test-key"}]}`},
+		{name: "discovery command failure", failDiscovery: true, wantError: "failed to fetch OIDC config"},
+		{name: "invalid discovery JSON", discovery: "not json", wantError: "failed to parse OIDC config"},
+		{name: "missing issuer", discovery: `{"jwks_uri":"https://issuer.example.com/keys"}`, wantError: "missing issuer or jwks_uri"},
+		{name: "missing JWKS URI", discovery: `{"issuer":"https://issuer.example.com"}`, wantError: "missing issuer or jwks_uri"},
+		{name: "JWKS command failure", discovery: `{"issuer":"https://issuer.example.com","jwks_uri":"https://issuer.example.com/keys"}`, failJWKS: true, wantError: "failed to fetch JWKS"},
+		{name: "invalid JWKS JSON", discovery: `{"issuer":"https://issuer.example.com","jwks_uri":"https://issuer.example.com/keys"}`, jwks: "not json", wantError: "is not valid JSON"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			kubectl := filepath.Join(binDir, "kubectl")
+			script := `#!/bin/sh
+case "$*" in
+  *nvcf-oidc-probe*)
+    [ "$FAKE_DISCOVERY_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_DISCOVERY"
+    ;;
+  *nvcf-jwks-probe*)
+    [ "$FAKE_JWKS_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_JWKS"
+    ;;
+  *) exit 2 ;;
+esac
+`
+			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("FAKE_DISCOVERY", tt.discovery)
+			t.Setenv("FAKE_JWKS", tt.jwks)
+			t.Setenv("FAKE_DISCOVERY_FAIL", "")
+			t.Setenv("FAKE_JWKS_FAIL", "")
+			if tt.failDiscovery {
+				t.Setenv("FAKE_DISCOVERY_FAIL", "1")
+			}
+			if tt.failJWKS {
+				t.Setenv("FAKE_JWKS_FAIL", "1")
+			}
+
+			issuer, jwks, err := fetchJWKSFromURL(&client.Config{}, "http://spire-oidc:8080/")
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				assert.Empty(t, issuer)
+				assert.Empty(t, jwks)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIssuer, issuer)
+			assert.Equal(t, tt.wantJWKS, jwks)
+		})
+	}
+}
+
+func TestDiscoverSpireOIDC(t *testing.T) {
+	tests := []struct {
+		name          string
+		labelOutput   string
+		labelFailure  bool
+		fallbackOutput string
+		fallbackFailure bool
+		want          string
+	}{
+		{name: "label query success", labelOutput: "10.43.0.10:8080", fallbackOutput: "ignored svc 10.43.0.11:8080", want: "10.43.0.10:8080"},
+		{name: "empty label result falls back to oidc discovery", labelOutput: ":", fallbackOutput: "oidc-discovery-provider 10.43.0.12:8080", want: "10.43.0.12:8080"},
+		{name: "label failure scans for spire oidc", labelFailure: true, fallbackOutput: "malformed\nother-service 10.43.0.13:8080\nspire-oidc 10.43.0.14:8080", want: "10.43.0.14:8080"},
+		{name: "no matching service", labelOutput: ":", fallbackOutput: "malformed\nother-service 10.43.0.15:8080"},
+		{name: "fallback command failure", labelOutput: ":", fallbackFailure: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			kubectl := filepath.Join(binDir, "kubectl")
+			script := `#!/bin/sh
+case "$*" in
+  *app.kubernetes.io/name=spiffe-oidc-discovery-provider*)
+    [ "$FAKE_LABEL_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_LABEL_OUTPUT"
+    ;;
+  *)
+    [ "$FAKE_FALLBACK_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_FALLBACK_OUTPUT"
+    ;;
+esac
+`
+			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("FAKE_LABEL_OUTPUT", tt.labelOutput)
+			t.Setenv("FAKE_FALLBACK_OUTPUT", tt.fallbackOutput)
+			t.Setenv("FAKE_LABEL_FAIL", "")
+			t.Setenv("FAKE_FALLBACK_FAIL", "")
+			if tt.labelFailure {
+				t.Setenv("FAKE_LABEL_FAIL", "1")
+			}
+			if tt.fallbackFailure {
+				t.Setenv("FAKE_FALLBACK_FAIL", "1")
+			}
+
+			assert.Equal(t, tt.want, discoverSpireOIDC(&client.Config{}))
+		})
+	}
+}
+
+func TestFetchClusterJWKS(t *testing.T) {
+	tests := []struct {
+		name            string
+		manualIssuer    string
+		serviceOutput   string
+		spireDiscovery  string
+		spireJWKS       string
+		spireFetchFails bool
+		k8sDiscovery    string
+		k8sJWKS         string
+		k8sJWKSFailure  bool
+		wantIssuer      string
+		wantJWKS        string
+		wantIdentity    string
+		wantError       string
+	}{
+		{name: "manual custom issuer", manualIssuer: "https://issuer.example.com", spireDiscovery: `{"issuer":"https://issuer.example.com","jwks_uri":"https://issuer.example.com/keys"}`, spireJWKS: `{"keys":[{"kid":"custom-key"}]}`, wantIssuer: "https://issuer.example.com", wantJWKS: `{"keys":[{"kid":"custom-key"}]}`, wantIdentity: "custom"},
+		{name: "manual SPIRE issuer", manualIssuer: "http://spire-oidc:8080", spireDiscovery: `{"issuer":"spiffe://example.org","jwks_uri":"http://spire-oidc:8080/keys"}`, spireJWKS: `{"keys":[{"kid":"spire-key"}]}`, wantIssuer: "spiffe://example.org", wantJWKS: `{"keys":[{"kid":"spire-key"}]}`, wantIdentity: "spire"},
+		{name: "auto detected SPIRE", serviceOutput: "spire-oidc 10.43.0.10:8080", spireDiscovery: `{"issuer":"spiffe://example.org","jwks_uri":"http://spire-oidc/keys"}`, spireJWKS: `{"keys":[{"kid":"auto-spire-key"}]}`, wantIssuer: "spiffe://example.org", wantJWKS: `{"keys":[{"kid":"auto-spire-key"}]}`, wantIdentity: "spire"},
+		{name: "no SPIRE falls back to Kubernetes", serviceOutput: "other-service 10.43.0.11:8080", k8sDiscovery: `{"issuer":"https://kubernetes.default.svc.cluster.local"}`, k8sJWKS: `{"keys":[{"kid":"psat-key"}]}`, wantIssuer: "https://kubernetes.default.svc.cluster.local", wantJWKS: `{"keys":[{"kid":"psat-key"}]}`, wantIdentity: "psat"},
+		{name: "SPIRE fetch failure falls back to Kubernetes", serviceOutput: "spire-oidc 10.43.0.12:8080", spireFetchFails: true, k8sDiscovery: `{"issuer":"https://kubernetes.default.svc.cluster.local"}`, k8sJWKS: `{"keys":[{"kid":"fallback-key"}]}`, wantIssuer: "https://kubernetes.default.svc.cluster.local", wantJWKS: `{"keys":[{"kid":"fallback-key"}]}`, wantIdentity: "psat"},
+		{name: "Kubernetes fallback error propagates", serviceOutput: "other-service 10.43.0.13:8080", k8sDiscovery: `{"issuer":"https://kubernetes.default.svc.cluster.local"}`, k8sJWKSFailure: true, wantError: "failed to fetch JWKS"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			kubectl := filepath.Join(binDir, "kubectl")
+			script := `#!/bin/sh
+case "$*" in
+  *nvcf-oidc-probe*)
+    [ "$FAKE_SPIRE_FETCH_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_SPIRE_DISCOVERY"
+    ;;
+  *nvcf-jwks-probe*)
+    [ "$FAKE_SPIRE_FETCH_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_SPIRE_JWKS"
+    ;;
+  *"get svc -A"*) printf '%s' "$FAKE_SERVICE_OUTPUT" ;;
+  *"app.kubernetes.io/name=spiffe-oidc-discovery-provider"*) printf ':' ;;
+  *"get --raw /.well-known/openid-configuration"*) printf '%s' "$FAKE_K8S_DISCOVERY" ;;
+  *"get --raw /openid/v1/jwks"*)
+    [ "$FAKE_K8S_JWKS_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_K8S_JWKS"
+    ;;
+  *) exit 2 ;;
+esac
+`
+			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("FAKE_SERVICE_OUTPUT", tt.serviceOutput)
+			t.Setenv("FAKE_SPIRE_DISCOVERY", tt.spireDiscovery)
+			t.Setenv("FAKE_SPIRE_JWKS", tt.spireJWKS)
+			t.Setenv("FAKE_K8S_DISCOVERY", tt.k8sDiscovery)
+			t.Setenv("FAKE_K8S_JWKS", tt.k8sJWKS)
+			t.Setenv("FAKE_SPIRE_FETCH_FAIL", "")
+			t.Setenv("FAKE_K8S_JWKS_FAIL", "")
+			if tt.spireFetchFails {
+				t.Setenv("FAKE_SPIRE_FETCH_FAIL", "1")
+			}
+			if tt.k8sJWKSFailure {
+				t.Setenv("FAKE_K8S_JWKS_FAIL", "1")
+			}
+
+			issuer, jwks, identity, err := fetchClusterJWKS(&client.Config{}, tt.manualIssuer)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				assert.Empty(t, issuer)
+				assert.Empty(t, jwks)
+				assert.Empty(t, identity)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantIssuer, issuer)
+			assert.Equal(t, tt.wantJWKS, jwks)
+			assert.Equal(t, tt.wantIdentity, identity)
+		})
+	}
+}
+
 func TestOIDCIssuerDirectDiscovery(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -199,6 +399,149 @@ func TestFetchDirectOIDCJWKS(t *testing.T) {
 		assert.Empty(t, issuer)
 		assert.Empty(t, jwks)
 	})
+}
+
+func TestFetchDirectOIDCJWKSErrors(t *testing.T) {
+	tests := []struct {
+		name            string
+		discoveryStatus int
+		discoveryBody   string
+		jwksStatus      int
+		jwksBody        string
+		badJWKSURI      bool
+		nilClient       bool
+		wantError       string
+	}{
+		{name: "discovery HTTP error", discoveryStatus: http.StatusBadGateway, discoveryBody: "discovery unavailable", wantError: "502 from"},
+		{name: "malformed discovery JSON", discoveryBody: "not json", wantError: "failed to parse OIDC config"},
+		{name: "missing issuer", discoveryBody: `{"jwks_uri":"/keys"}`, wantError: "missing issuer or jwks_uri"},
+		{name: "missing JWKS URI", discoveryBody: `{"issuer":"placeholder"}`, wantError: "missing issuer or jwks_uri"},
+		{name: "invalid JWKS URI", badJWKSURI: true, wantError: "failed to resolve JWKS URI"},
+		{name: "JWKS HTTP error", jwksStatus: http.StatusBadGateway, jwksBody: "keys unavailable", wantError: "502 from"},
+		{name: "malformed JWKS JSON", jwksBody: "not json", wantError: "is not valid JSON"},
+		{name: "nil client uses default", jwksBody: `{"keys":[{"kid":"default-client-key"}]}`, nilClient: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+				status := tt.discoveryStatus
+				if status == 0 {
+					status = http.StatusOK
+				}
+				w.WriteHeader(status)
+				body := tt.discoveryBody
+				if body == "" {
+					jwksURI := server.URL + "/keys"
+					if tt.badJWKSURI {
+						jwksURI = "%zz"
+					}
+					body = `{"issuer":"` + server.URL + `","jwks_uri":"` + jwksURI + `"}`
+				} else if tt.name == "missing JWKS URI" {
+					body = `{"issuer":"` + server.URL + `"}`
+				} else if tt.name == "missing issuer" {
+					body = `{"jwks_uri":"` + server.URL + `/keys"}`
+				}
+				_, _ = w.Write([]byte(body))
+			})
+			mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+				status := tt.jwksStatus
+				if status == 0 {
+					status = http.StatusOK
+				}
+				w.WriteHeader(status)
+				body := tt.jwksBody
+				if body == "" {
+					body = `{"keys":[{"kid":"test-key"}]}`
+				}
+				_, _ = w.Write([]byte(body))
+			})
+
+			var httpClient *http.Client = server.Client()
+			if tt.nilClient {
+				httpClient = nil
+			}
+			issuer, jwks, err := fetchDirectOIDCJWKS(context.Background(), server.URL, httpClient)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				assert.Empty(t, issuer)
+				assert.Empty(t, jwks)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, server.URL, issuer)
+			assert.Contains(t, jwks, "default-client-key")
+		})
+	}
+}
+
+func TestFetchK8sOIDCJWKSDirectDiscovery(t *testing.T) {
+	tests := []struct {
+		name            string
+		discoveryStatus int
+		wantJWKS        string
+		wantK8sJWKS     bool
+	}{
+		{name: "direct discovery succeeds"},
+		{name: "direct discovery failure falls back", discoveryStatus: http.StatusBadGateway, wantJWKS: `{"keys":[{"kid":"kubernetes-fallback-key"}]}`, wantK8sJWKS: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				switch r.URL.Path {
+				case "/.well-known/openid-configuration":
+					if tt.discoveryStatus != 0 {
+						http.Error(w, "discovery unavailable", tt.discoveryStatus)
+						return
+					}
+					_, _ = w.Write([]byte(`{"issuer":"` + server.URL + `","jwks_uri":"` + server.URL + `/keys"}`))
+				case "/keys":
+					_, _ = w.Write([]byte(`{"keys":[{"kid":"direct-key"}]}`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			binDir := t.TempDir()
+			kubectl := filepath.Join(binDir, "kubectl")
+			calls := filepath.Join(binDir, "calls")
+			script := `#!/bin/sh
+case "$*" in
+  *"get --raw /.well-known/openid-configuration"*) printf '%s' "$FAKE_DISCOVERY" ;;
+  *"get --raw /openid/v1/jwks"*) printf '%s\n' k8s-jwks >> "$FAKE_CALLS"; printf '%s' "$FAKE_K8S_JWKS" ;;
+  *) exit 2 ;;
+esac
+`
+			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("FAKE_DISCOVERY", `{"issuer":"`+server.URL+`"}`)
+			t.Setenv("FAKE_K8S_JWKS", tt.wantJWKS)
+			t.Setenv("FAKE_CALLS", calls)
+
+			issuer, jwks, err := fetchK8sOIDCJWKS(&client.Config{})
+			require.NoError(t, err)
+			assert.Equal(t, server.URL, issuer)
+			if tt.wantK8sJWKS {
+				assert.Equal(t, tt.wantJWKS, jwks)
+				data, readErr := os.ReadFile(calls)
+				require.NoError(t, readErr)
+				assert.Contains(t, string(data), "k8s-jwks")
+			} else {
+				assert.Contains(t, jwks, "direct-key")
+				_, readErr := os.Stat(calls)
+				assert.True(t, os.IsNotExist(readErr), "Kubernetes JWKS command should not be called")
+			}
+		})
+	}
 }
 
 // --- JWKS Validation ---
@@ -696,4 +1039,99 @@ func TestParseJSONField(t *testing.T) {
 		_, err := parseJSONField(json, "missing")
 		assert.Error(t, err)
 	})
+}
+
+func TestRegisteredClusterIDs(t *testing.T) {
+	tests := []struct {
+		name             string
+		response         client.RegisterClusterResponse
+		wantClusterGroup string
+		wantCluster      string
+	}{
+		{
+			name: "nested IDs take precedence",
+			response: client.RegisterClusterResponse{
+				ClusterGroup: client.ClusterGroup{
+					ID:       "nested-group",
+					Clusters: []client.Cluster{{ID: "nested-cluster"}},
+				},
+				ClusterGroupID: "top-level-group",
+				ClusterID:      "top-level-cluster",
+			},
+			wantClusterGroup: "nested-group",
+			wantCluster:      "nested-cluster",
+		},
+		{
+			name: "top-level IDs provide fallback",
+			response: client.RegisterClusterResponse{
+				ClusterGroupID: "top-level-group",
+				ClusterID:      "top-level-cluster",
+			},
+			wantClusterGroup: "top-level-group",
+			wantCluster:      "top-level-cluster",
+		},
+		{
+			name: "empty cluster list uses top-level cluster ID",
+			response: client.RegisterClusterResponse{
+				ClusterGroup: client.ClusterGroup{ID: "nested-group"},
+				ClusterID:    "top-level-cluster",
+			},
+			wantClusterGroup: "nested-group",
+			wantCluster:      "top-level-cluster",
+		},
+		{
+			name:     "all IDs are empty",
+			response: client.RegisterClusterResponse{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groupID, clusterID := registeredClusterIDs(&tt.response)
+			assert.Equal(t, tt.wantClusterGroup, groupID)
+			assert.Equal(t, tt.wantCluster, clusterID)
+		})
+	}
+}
+
+type getHTTPStringRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f getHTTPStringRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type getHTTPStringFailingBody struct{}
+
+func (getHTTPStringFailingBody) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+func (getHTTPStringFailingBody) Close() error             { return nil }
+
+func TestGetHTTPString(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	tests := []struct {
+		name      string
+		rawURL    string
+		client    *http.Client
+		want      string
+		wantError string
+	}{
+		{name: "invalid request URL", rawURL: "://bad", client: http.DefaultClient, wantError: "missing protocol scheme"},
+		{name: "transport failure", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return nil, transportErr })}, wantError: "transport failed"},
+		{name: "trims successful response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("  body text\n"))}, nil })}, want: "body text"},
+		{name: "non-200 response", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusBadGateway, Body: io.NopCloser(strings.NewReader(" upstream unavailable \n"))}, nil })}, wantError: "502 from https://example.test: upstream unavailable"},
+		{name: "response body read failure", rawURL: "https://example.test", client: &http.Client{Transport: getHTTPStringRoundTripper(func(*http.Request) (*http.Response, error) { return &http.Response{StatusCode: http.StatusOK, Body: getHTTPStringFailingBody{}}, nil })}, wantError: "body read failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getHTTPString(context.Background(), tt.client, tt.rawURL)
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

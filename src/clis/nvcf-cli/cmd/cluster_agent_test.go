@@ -18,7 +18,10 @@ limitations under the License.
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -128,4 +131,93 @@ func TestBuildListOptions(t *testing.T) {
 			t.Errorf("PhaseFilter = %q, want FAILED", opts.PhaseFilter)
 		}
 	})
+}
+
+func TestClusterAgentHumanReadableOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func()
+		want []string
+	}{
+		{
+			name: "status with GPU and unavailable control plane",
+			run: func() {
+				printAgentStatus(&clusteragent.AgentStatus{
+					ClusterName: "edge", ClusterID: "c1", Namespace: "nvca-operator",
+					GPU: []clusteragent.GPUUsage{{Name: "A100", Capacity: 8, Available: 3, Allocated: 5}},
+					ControlPlane: &clusteragent.ICMSInfo{Note: "enrichment skipped"},
+				})
+			},
+			want: []string{"edge (c1)", "A100", "8", "3", "5", "enrichment skipped"},
+		},
+		{
+			name: "empty status defaults",
+			run:  func() { printAgentStatus(&clusteragent.AgentStatus{}) },
+			want: []string{"(none reported)", "unavailable", "NVCA Status"},
+		},
+		{
+			name: "empty scheduled function list",
+			run:  func() { printScheduledFunctions(nil) },
+			want: []string{"No functions scheduled on this cluster."},
+		},
+		{
+			name: "scheduled function row",
+			run: func() {
+				printScheduledFunctions([]clusteragent.ScheduledFunction{{
+					FunctionID: "f1", FunctionVersionID: "v1", Namespace: "functions",
+					Phase: clusteragent.PhaseActive, InstanceCount: 2, RequestStatus: "Ready",
+				}})
+			},
+			want: []string{"FUNCTION ID", "f1", "v1", "functions", "ACTIVE", "2", "Ready", "Total: 1 functions"},
+		},
+		{
+			name: "function detail without instances",
+			run:  func() { printFunctionDetail(&clusteragent.FunctionDetail{ScheduledFunction: clusteragent.ScheduledFunction{FunctionID: "f1"}}) },
+			want: []string{"Function ID:         f1", "Version ID:          -", "(none)"},
+		},
+		{
+			name: "function detail with reconcile error and instance",
+			run: func() {
+				printFunctionDetail(&clusteragent.FunctionDetail{
+					ScheduledFunction: clusteragent.ScheduledFunction{FunctionID: "f2", Action: "Update", Phase: clusteragent.PhaseFailed},
+					LastReconcileError: "failed", ReconcileErrors: 3,
+					Instances:          []clusteragent.Instance{{ID: "i1", Status: "Running"}},
+				})
+			},
+			want: []string{"Reconcile Errors:    3", "Last Reconcile Err:  failed", "INSTANCE ID", "i1", "Running"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := captureClusterAgentStdout(t, tt.run)
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+func captureClusterAgentStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b bytes.Buffer
+		_, _ = io.Copy(&b, r)
+		done <- b.String()
+	}()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	os.Stdout = old
+	return <-done
 }

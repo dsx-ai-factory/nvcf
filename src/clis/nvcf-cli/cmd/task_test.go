@@ -449,6 +449,80 @@ func TestRunTaskListFormatsTasksAndPagination(t *testing.T) {
 	assert.Contains(t, text, "Next cursor: next-page (limit=12)")
 }
 
+func TestRunTaskListEmptyAndJSONOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		jsonOutput bool
+		wantOutput string
+	}{
+		{name: "plain output", wantOutput: "No tasks found."},
+		{name: "JSON output", jsonOutput: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v1/nvct/tasks", r.URL.Path)
+				assert.Equal(t, "Bearer test-task-api-key", r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"tasks":[],"cursor":"","limit":0}`))
+			}))
+			t.Cleanup(server.Close)
+
+			oldCfgFile := cfgFile
+			oldStateManager := configStateManager
+			oldStateManagerKey := configStateManagerKey
+			oldTaskListFlags := taskListFlags
+			oldJSONOutput := jsonOutput
+			oldStdout := os.Stdout
+			t.Cleanup(func() {
+				cfgFile = oldCfgFile
+				configStateManager = oldStateManager
+				configStateManagerKey = oldStateManagerKey
+				taskListFlags = oldTaskListFlags
+				jsonOutput = oldJSONOutput
+				os.Stdout = oldStdout
+				viper.Reset()
+			})
+
+			viper.Reset()
+			viper.Set("base_nvct_url", server.URL)
+			viper.Set("base_grpc_url", "localhost:50051")
+			viper.Set("api_key", "test-function-api-key")
+			viper.Set("nvct_api_key", "test-task-api-key")
+			cfgFile = filepath.Join(t.TempDir(), "workflow.yaml")
+			configStateManager = nil
+			configStateManagerKey = ""
+			taskListFlags = struct {
+				limit  int
+				status string
+				cursor string
+			}{}
+			jsonOutput = tc.jsonOutput
+
+			readEnd, writeEnd, err := os.Pipe()
+			require.NoError(t, err)
+			os.Stdout = writeEnd
+			err = runTaskList(taskListCmd, nil)
+			closeErr := writeEnd.Close()
+			os.Stdout = oldStdout
+			output, readErr := io.ReadAll(readEnd)
+			readEnd.Close()
+			require.NoError(t, err)
+			require.NoError(t, closeErr)
+			require.NoError(t, readErr)
+
+			if tc.jsonOutput {
+				var result struct {
+					Tasks []json.RawMessage `json:"tasks"`
+				}
+				require.NoError(t, json.Unmarshal(bytes.TrimSpace(output), &result))
+				assert.Empty(t, result.Tasks)
+			} else {
+				assert.Contains(t, string(output), tc.wantOutput)
+			}
+		})
+	}
+}
+
 func TestRunTaskGetFormatsDetailedTask(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/v1/nvct/tasks/task-get-details", r.URL.Path)
@@ -816,6 +890,144 @@ func TestRunTaskBulkInputValidation(t *testing.T) {
 			err := runTaskBulk(taskBulkCmd, nil)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantError)
+		})
+	}
+}
+
+func TestRunTaskCreateRequiredFieldValidation(t *testing.T) {
+	oldFlags := taskCreateFlags
+	oldJSONOutput := jsonOutput
+	t.Cleanup(func() {
+		taskCreateFlags = oldFlags
+		jsonOutput = oldJSONOutput
+	})
+
+	jsonOutput = true
+	tests := []struct {
+		name      string
+		input     string
+		wantError string
+	}{
+		{name: "missing name", input: `{}`, wantError: "task name is required"},
+		{name: "missing GPU specification", input: `{"name":"job"}`, wantError: "gpuSpecification is required"},
+		{name: "missing GPU name", input: `{"name":"job","gpuSpecification":{"instanceType":"GPU.H100_1x"}}`, wantError: "gpuSpecification.gpu is required"},
+		{name: "missing instance type", input: `{"name":"job","gpuSpecification":{"gpu":"H100"}}`, wantError: "gpuSpecification.instanceType is required"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			inputPath := filepath.Join(t.TempDir(), "task.json")
+			require.NoError(t, os.WriteFile(inputPath, []byte(tc.input), 0o600))
+			taskCreateFlags = struct {
+				inputFile                      string
+				name                           string
+				gpu                            string
+				instanceType                   string
+				backend                        string
+				clusters                       []string
+				containerImage                 string
+				containerArgs                  string
+				containerEnvironment           []string
+				tags                           []string
+				description                    string
+				maxRuntimeDuration             string
+				maxQueuedDuration              string
+				terminationGracePeriodDuration string
+				resultHandlingStrategy         string
+				resultsLocation                string
+				helmChart                      string
+				logsTelemetryId                string
+				metricsTelemetryId             string
+				tracesTelemetryId              string
+				models                         []string
+				resources                      []string
+				secrets                        []string
+			}{inputFile: inputPath}
+
+			err := runTaskCreate(&cobra.Command{}, nil)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.wantError)
+		})
+	}
+}
+
+func TestTaskCommandOutputBranches(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/nvct/tasks":
+			_, _ = w.Write([]byte(`{"tasks":[{"id":"task-output","name":"output-job","status":"RUNNING","gpuSpecification":{"gpu":"H100","instanceType":"GPU.H100_1x"},"createdAt":"2026-01-02T03:04:05Z","percentComplete":65}],"cursor":"list-next","limit":10}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/nvct/tasks/bulk":
+			_, _ = w.Write([]byte(`{"ncaId":"account-output","tasks":[{"id":"task-output","name":"output-job","status":"RUNNING"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/nvct/tasks/task-output/cancel":
+			_, _ = w.Write([]byte(`{"task":{"id":"task-output","name":"output-job","status":"CANCELED"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/nvct/tasks/task-output/events":
+			_, _ = w.Write([]byte(`{"events":[{"eventId":"event-output","taskId":"task-output","message":"Task started","createdAt":"2026-01-02T03:04:05Z"}],"cursor":"events-next","limit":10}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/nvct/tasks/task-output/results":
+			_, _ = w.Write([]byte(`{"results":[{"resultId":"result-output","taskId":"task-output","name":"model.bin","createdAt":"2026-01-02T03:04:05Z","metadata":{"format":"binary"}}],"cursor":"results-next","limit":10}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	oldCfgFile, oldManager, oldManagerKey := cfgFile, configStateManager, configStateManagerKey
+	oldJSONOutput, oldStdout := jsonOutput, os.Stdout
+	oldListFlags, oldBulkFlags := taskListFlags, taskBulkFlags
+	oldPaginationFlags, oldResultsFlags := taskPaginationFlags, taskResultsPaginationFlags
+	t.Cleanup(func() {
+		cfgFile, configStateManager, configStateManagerKey = oldCfgFile, oldManager, oldManagerKey
+		jsonOutput, os.Stdout = oldJSONOutput, oldStdout
+		taskListFlags, taskBulkFlags = oldListFlags, oldBulkFlags
+		taskPaginationFlags, taskResultsPaginationFlags = oldPaginationFlags, oldResultsFlags
+		viper.Reset()
+	})
+	viper.Reset()
+	viper.Set("base_nvct_url", server.URL)
+	viper.Set("base_grpc_url", "localhost:50051")
+	viper.Set("api_key", "test-function-api-key")
+	viper.Set("nvct_api_key", "test-task-api-key")
+	cfgFile = filepath.Join(t.TempDir(), "workflow.yaml")
+	configStateManager, configStateManagerKey = nil, ""
+
+	cases := []struct {
+		name string
+		json bool
+		run  func() error
+		want []string
+	}{
+		{name: "list text", run: func() error { return runTaskList(taskListCmd, nil) }, want: []string{"output-job", "GPU: H100", "Progress: 65%", "list-next"}},
+		{name: "list JSON", json: true, run: func() error { return runTaskList(taskListCmd, nil) }, want: []string{`"id": "task-output"`, `"cursor": "list-next"`}},
+		{name: "bulk text", run: func() error { return runTaskBulk(taskBulkCmd, nil) }, want: []string{"Account: account-output", "task-output", "RUNNING", "output-job"}},
+		{name: "bulk JSON", json: true, run: func() error { return runTaskBulk(taskBulkCmd, nil) }, want: []string{`"ncaId": "account-output"`, `"task-output"`}},
+		{name: "cancel text", run: func() error { return runTaskCancel(taskCancelCmd, []string{"task-output"}) }, want: []string{"task-output", "CANCELED"}},
+		{name: "cancel JSON", json: true, run: func() error { return runTaskCancel(taskCancelCmd, []string{"task-output"}) }, want: []string{`"status": "CANCELED"`}},
+		{name: "events text", run: func() error { return runTaskEvents(taskEventsCmd, []string{"task-output"}) }, want: []string{"Task started", "events-next"}},
+		{name: "events JSON", json: true, run: func() error { return runTaskEvents(taskEventsCmd, []string{"task-output"}) }, want: []string{`"message": "Task started"`, `"cursor": "events-next"`}},
+		{name: "results text", run: func() error { return runTaskResults(taskResultsCmd, []string{"task-output"}) }, want: []string{"model.bin", "result-output", "format", "results-next"}},
+		{name: "results JSON", json: true, run: func() error { return runTaskResults(taskResultsCmd, []string{"task-output"}) }, want: []string{`"resultId": "result-output"`, `"format": "binary"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			taskListFlags = struct { limit int; status, cursor string }{limit: 10}
+			taskBulkFlags = struct { inputFile string; taskIDs []string }{taskIDs: []string{"task-output"}}
+			taskPaginationFlags = struct { limit int; cursor string; timeoutSeconds int }{limit: 10}
+			taskResultsPaginationFlags = struct { limit int; cursor string; timeoutSeconds int }{limit: 10}
+			jsonOutput = tc.json
+			readEnd, writeEnd, err := os.Pipe()
+			require.NoError(t, err)
+			os.Stdout = writeEnd
+			err = tc.run()
+			closeErr := writeEnd.Close()
+			os.Stdout = oldStdout
+			output, readErr := io.ReadAll(readEnd)
+			_ = readEnd.Close()
+			require.NoError(t, err)
+			require.NoError(t, closeErr)
+			require.NoError(t, readErr)
+			for _, expected := range tc.want {
+				assert.Contains(t, string(output), expected)
+			}
 		})
 	}
 }

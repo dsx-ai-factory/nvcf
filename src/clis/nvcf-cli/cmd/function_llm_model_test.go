@@ -732,6 +732,126 @@ func TestValidateUpdateConfigRejectsNoUpdates(t *testing.T) {
 	}
 }
 
+func TestLLMConfigConversionAndUpdateRequestValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		convert     func() error
+		wantErrPart string
+	}{
+		{
+			name: "nil llm input",
+			convert: func() error {
+				got, err := llmConfigInputToClient(nil)
+				if err == nil && got != nil {
+					return fmt.Errorf("result = %#v, want nil", got)
+				}
+				return err
+			},
+		},
+		{
+			name: "empty uri list",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{})
+				return err
+			},
+			wantErrPart: "uris is required",
+		},
+		{
+			name: "blank uri",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{URIs: []string{"  "}})
+				return err
+			},
+			wantErrPart: "uris cannot contain empty values",
+		},
+		{
+			name: "invalid token rate limit",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{
+					URIs:           []string{"/v1/chat/completions"},
+					TokenRateLimit: optionalString("100-A"),
+				})
+				return err
+			},
+			wantErrPart: "invalid tokenRateLimit unit",
+		},
+		{
+			name: "blank model name",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{
+					ModelName: " \t",
+					LLMConfig: &LLMConfigUpdateInput{RoutingMethod: optionalString("round_robin")},
+				})
+				return err
+			},
+			wantErrPart: "modelName is required",
+		},
+		{
+			name: "missing update llm config",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{ModelName: "model"})
+				return err
+			},
+			wantErrPart: "llmConfig is required",
+		},
+		{
+			name: "update with no changes",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{
+					ModelName: "model",
+					LLMConfig: &LLMConfigUpdateInput{},
+				})
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+		{
+			name: "invalid invocation priority",
+			convert: func() error {
+				_, err := updateConfigToClientRequest(&UpdateConfig{
+					LLMInvocationConfig: &LLMInvocationConfigInput{
+						Priority: &PriorityInput{PerAccountPriority: map[string]uint32{"nca-1": 1}},
+					},
+				})
+				return err
+			},
+			wantErrPart: "defaultPriority is required",
+		},
+		{
+			name: "model update error includes model name",
+			convert: func() error {
+				_, err := updateConfigToClientRequest(&UpdateConfig{
+					ModelUpdates: []ModelUpdateConfig{{ModelName: "broken-model"}},
+				})
+				return err
+			},
+			wantErrPart: `model update "broken-model": llmConfig is required`,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.convert()
+			if tt.wantErrPart == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q", tt.wantErrPart)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %q, want it to contain %q", err, tt.wantErrPart)
+			}
+		})
+	}
+}
+
 func TestLoadInvokeConfigAppliesInferenceURLFlag(t *testing.T) {
 	originalFlags := invokeFlags
 	t.Cleanup(func() {

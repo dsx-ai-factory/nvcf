@@ -188,6 +188,78 @@ func TestRunAccountsList_JSON(t *testing.T) {
 	assert.Equal(t, "Acme", first["name"])
 }
 
+func TestRunAccountsList_HumanOutputCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		response   string
+		want       []string
+		wantError  string
+	}{
+		{
+			name:       "empty results",
+			statusCode: http.StatusOK,
+			response:   `{"cloudAccounts":[]}`,
+			want:       []string{"Listing all NVIDIA Cloud Accounts...", "No accounts found."},
+		},
+		{
+			name:       "accounts with no client IDs",
+			statusCode: http.StatusOK,
+			response:   `{"cloudAccounts":[{"ncaId":"nca-none","name":"No Clients","maxFunctionsAllowed":1,"maxTasksAllowed":2,"maxTelemetriesAllowed":3,"maxRegistryCredentialsAllowed":4}]}`,
+			want:       []string{"nca-none", "No Clients", "1", "2", "3", "4", "None", "Total: 1 accounts"},
+		},
+		{
+			name:       "account with one client ID",
+			statusCode: http.StatusOK,
+			response:   `{"cloudAccounts":[{"ncaId":"nca-one","name":"One Client","maxFunctionsAllowed":5,"maxTasksAllowed":6,"maxTelemetriesAllowed":7,"maxRegistryCredentialsAllowed":8,"adminClientIds":["client-one"]}]}`,
+			want:       []string{"nca-one", "One Client", "5", "6", "7", "8", "client-one", "Total: 1 accounts"},
+		},
+		{
+			name:       "account with multiple client IDs",
+			statusCode: http.StatusOK,
+			response:   `{"cloudAccounts":[{"ncaId":"nca-many","name":"Many Clients","maxFunctionsAllowed":9,"maxTasksAllowed":10,"maxTelemetriesAllowed":11,"maxRegistryCredentialsAllowed":12,"adminClientIds":["client-first","client-second","client-third"]}]}`,
+			want:       []string{"nca-many", "Many Clients", "9", "10", "11", "12", "client-first (+2 more)", "Total: 1 accounts"},
+		},
+		{
+			name:       "backend error",
+			statusCode: http.StatusServiceUnavailable,
+			response:   `{"message":"unavailable"}`,
+			wantError:  "failed to list accounts",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(func() { jsonOutput = false })
+			jsonOutput = false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/v2/nvcf/accounts", r.URL.Path)
+				assert.Equal(t, "Bearer test-admin-token", r.Header.Get("Authorization"))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer srv.Close()
+			configureAdminTest(t, srv.URL)
+
+			var err error
+			output := captureStdout(t, func() {
+				err = runAccountsList(nil, nil)
+			})
+			if tt.wantError != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantError)
+				assert.Contains(t, output, "Listing all NVIDIA Cloud Accounts...")
+				return
+			}
+			require.NoError(t, err)
+			for _, want := range tt.want {
+				assert.Contains(t, output, want)
+			}
+		})
+	}
+}
+
 const wantAdminTokenRequiredError = "admin commands require NVCF_TOKEN with the appropriate admin scope; NVCF_API_KEY is not accepted"
 
 func TestRunAccountsList_NoToken_FailsFast(t *testing.T) {
@@ -297,6 +369,74 @@ func TestRunSecretsUpdateFunction_JSONEnvelope(t *testing.T) {
 	assert.Equal(t, "nca-1", parsed["ncaId"])
 	assert.Equal(t, "fn-1", parsed["functionId"])
 	assert.Equal(t, "ver-1", parsed["versionId"])
+}
+
+func TestLoadSecretPayload(t *testing.T) {
+	tests := []struct {
+		name        string
+		inputFile   func(*testing.T) string
+		secretsJSON string
+		want        map[string]interface{}
+		wantError   string
+		wantWarning bool
+	}{
+		{name: "neither input", wantError: "either --input-file or --secrets must be provided"},
+		{name: "both inputs", inputFile: func(t *testing.T) string { return "unused.json" }, secretsJSON: `{}`, wantError: "only one of --input-file or --secrets can be provided"},
+		{name: "unreadable input file", inputFile: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.json") }, wantError: "failed to read input file"},
+		{name: "malformed file JSON", inputFile: func(t *testing.T) string { path := filepath.Join(t.TempDir(), "invalid.json"); require.NoError(t, os.WriteFile(path, []byte("{"), 0600)); return path }, wantError: "failed to parse JSON from file"},
+		{name: "malformed inline JSON", secretsJSON: `{`, wantError: "failed to parse JSON from --secrets", wantWarning: true},
+		{name: "valid inline JSON", secretsJSON: `{"TOKEN":"abc"}`, want: map[string]interface{}{"TOKEN": "abc"}, wantWarning: true},
+		{name: "valid file JSON", inputFile: func(t *testing.T) string { path := filepath.Join(t.TempDir(), "secrets.json"); require.NoError(t, os.WriteFile(path, []byte(`{"TOKEN":"abc"}`), 0600)); return path }, want: map[string]interface{}{"TOKEN": "abc"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secretUpdateFlags = struct {
+				ncaId       string
+				functionId  string
+				versionId   string
+				telemetryId string
+				inputFile   string
+				secretsJSON string
+			}{}
+			t.Cleanup(func() {
+				secretUpdateFlags = struct {
+					ncaId       string
+					functionId  string
+					versionId   string
+					telemetryId string
+					inputFile   string
+					secretsJSON string
+				}{}
+			})
+			if tt.inputFile != nil {
+				secretUpdateFlags.inputFile = tt.inputFile(t)
+			}
+			secretUpdateFlags.secretsJSON = tt.secretsJSON
+
+			oldStderr := os.Stderr
+			r, w, err := os.Pipe()
+			require.NoError(t, err)
+			os.Stderr = w
+			payload, loadErr := loadSecretPayload()
+			_ = w.Close()
+			os.Stderr = oldStderr
+			stderr, readErr := io.ReadAll(r)
+			_ = r.Close()
+			require.NoError(t, readErr)
+
+			if tt.wantError != "" {
+				require.Error(t, loadErr)
+				assert.Contains(t, loadErr.Error(), tt.wantError)
+				if secretUpdateFlags.inputFile != "" && strings.Contains(tt.wantError, "input file") || strings.Contains(tt.wantError, "from file") {
+					assert.Contains(t, loadErr.Error(), secretUpdateFlags.inputFile)
+				}
+				return
+			}
+			require.NoError(t, loadErr)
+			assert.Equal(t, tt.want, payload)
+			assert.Equal(t, tt.wantWarning, strings.Contains(string(stderr), "WARNING"))
+		})
+	}
 }
 
 func TestRunAccountsList_HumanOutput(t *testing.T) {

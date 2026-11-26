@@ -250,3 +250,64 @@ func TestRenderDirectoryAndArchiveParity(t *testing.T) {
 	}))
 	assert.Equal(t, dirSet, archiveSet)
 }
+
+func TestRenderTextPlaneOptionalSections(t *testing.T) {
+	longEvent := "event starts here " + strings.Repeat("detail ", 20)
+	dump := Dump{
+		ControlPlane: &PlaneSnapshot{
+			Role:              RoleControlPlane,
+			Context:           "",
+			KubernetesVersion: "",
+			Nodes:             NodeSummary{Ready: 2, Total: 3, GPUCount: 4},
+			NodeDetails: []NodeRow{
+				{Name: "not-ready", Ready: false, Schedulable: true, Roles: "worker", Age: HumanDuration(time.Hour)},
+				{Name: "cordoned-pressure", Ready: true, Schedulable: false, Pressures: []string{"MemoryPressure"}, Age: HumanDuration(time.Hour)},
+				{Name: "gpu-node", Ready: true, Schedulable: true, GPU: 4, KubeletVersion: "v1.30.1"},
+				{Name: "cpu-node", Ready: true, Schedulable: true},
+			},
+			HelmReleases: []HelmRelease{
+				{Name: "healthy-release", Status: "deployed"},
+				{Name: "failed-release", Status: "failed"},
+			},
+			NVCFBackends: []NVCFBackendRow{{Name: "backend-a", AgentStatus: "Ready", NVCAVersion: "1.2.3", GPUCapacity: 4}},
+			GPU: &GPUReconciliation{
+				BackendCapacity: 4, BackendAllocated: 2, NodeAllocatedByPods: 1,
+				MiniServiceReserved: 1, BackendAvailable: 2, Match: false,
+				Cliques: []CliqueGPU{
+					{Clique: "clique-a", Capacity: 2, Allocated: 1, Available: 1, Nodes: 1},
+					{Clique: "clique-b", Capacity: 2, Allocated: 0, Available: 2, Nodes: 1},
+				},
+			},
+			ICMSRequests: []ICMSRequestSummary{
+				{Name: "request-ok", Type: "container", RequestStatus: "RequestSucceeded"},
+				{Name: "request-failed", Type: "helm", RequestStatus: "RequestFailed", Failed: true},
+			},
+			Pods: []PodRow{
+				{Namespace: "nvcf", Name: "healthy-pod", Ready: "1/1", Status: "Running"},
+				{Namespace: "nvcf", Name: "unhealthy-pod", Ready: "0/1", Status: "Running"},
+			},
+			Events:          []EventRow{{Namespace: "nvcf", Object: "pod/test", Reason: "Failed", Message: longEvent}},
+			StuckNamespaces: []StuckNamespace{{Name: "stuck-ns", RemainingObjects: []StuckObject{{Kind: "Pod", Name: "held"}}}},
+			Warnings:        []string{"probe warning"},
+		},
+	}
+
+	var out bytes.Buffer
+	require.NoError(t, RenderText(&out, dump))
+	text := out.String()
+	for _, want := range []string{
+		"(current context)", "Kubernetes   unknown", "2/3 ready  (4 GPU capacity)",
+		"NotReady", "cordoned,MemoryPressure", "gpu-node", "cpu-node",
+		"Helm Releases  (1 not deployed)", "failed-release", "backend-a",
+		"MISMATCH", "clique-a", "clique-b", "ICMSRequests  2 total, 1 failed",
+		"Pods  2 total, 1 unhealthy", "healthy-pod", "unhealthy-pod",
+		"event starts here", "Stuck Namespaces (Terminating)",
+		"stuck-ns: 1 object(s) holding finalizers", "probe warning",
+	} {
+		assert.Contains(t, text, want)
+	}
+	assert.NotContains(t, text, longEvent)
+	require.Contains(t, text, "event starts here")
+	eventLine := strings.Split(strings.Split(text, "event starts here")[1], "\n")[0]
+	assert.LessOrEqual(t, len(eventLine), 80)
+}

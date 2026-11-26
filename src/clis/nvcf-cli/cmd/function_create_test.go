@@ -28,6 +28,7 @@ import (
 	"nvcf-cli/internal/client"
 	"nvcf-cli/internal/logging"
 
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -91,6 +92,75 @@ func runFunctionCreateWithResponse(t *testing.T, response string, demo bool) (st
 		runErr = runCreate(createCmd, nil)
 	})
 	return output, runErr, testDir
+}
+
+func TestLoadDeleteConfig(t *testing.T) {
+	oldDeleteFlags := deleteFlags
+	t.Cleanup(func() { deleteFlags = oldDeleteFlags })
+
+	testDir := t.TempDir()
+	validPath := filepath.Join(testDir, "delete.json")
+	malformedPath := filepath.Join(testDir, "malformed.json")
+	require.NoError(t, os.WriteFile(validPath, []byte(`{"functionId":"json-function","versionId":"json-version","graceful":false,"deleteDeploymentOnly":true}`), 0600))
+	require.NoError(t, os.WriteFile(malformedPath, []byte(`{"functionId":`), 0600))
+
+	tests := []struct {
+		name      string
+		inputFile string
+		setFlags  map[string]string
+		want      *DeleteConfig
+		wantErr   bool
+	}{
+		{
+			name:      "JSON values are retained when flags are unchanged",
+			inputFile: validPath,
+			want:      &DeleteConfig{FunctionID: "json-function", VersionID: "json-version", DeleteDeploymentOnly: true},
+		},
+		{
+			name:      "changed CLI flags override corresponding JSON values",
+			inputFile: validPath,
+			setFlags: map[string]string{
+				"function-id":     "cli-function",
+				"version-id":      "cli-version",
+				"graceful":        "true",
+				"deployment-only": "false",
+			},
+			want: &DeleteConfig{FunctionID: "cli-function", VersionID: "cli-version", Graceful: true},
+		},
+		{name: "unreadable file", inputFile: filepath.Join(testDir, "missing.json"), wantErr: true},
+		{name: "malformed JSON", inputFile: malformedPath, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deleteFlags = struct {
+				inputFile            string
+				functionID           string
+				versionID            string
+				graceful             bool
+				deleteDeploymentOnly bool
+			}{}
+			deleteFlags.inputFile = tt.inputFile
+			cmd := &cobra.Command{Use: "delete"}
+			cmd.Flags().StringVar(&deleteFlags.functionID, "function-id", "", "")
+			cmd.Flags().StringVar(&deleteFlags.versionID, "version-id", "", "")
+			cmd.Flags().BoolVar(&deleteFlags.graceful, "graceful", false, "")
+			cmd.Flags().BoolVar(&deleteFlags.deleteDeploymentOnly, "deployment-only", false, "")
+			for name, value := range tt.setFlags {
+				require.NoError(t, cmd.Flags().Set(name, value))
+			}
+
+			config, err := loadDeleteConfig(cmd)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.inputFile)
+				assert.Nil(t, config)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, config)
+		})
+	}
 }
 
 func runTaskCreateWithResponse(t *testing.T, response string) (string, error) {

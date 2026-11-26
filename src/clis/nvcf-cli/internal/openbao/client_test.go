@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -416,6 +417,139 @@ func TestGenerateJWTTokenHandlesSigningResponses(t *testing.T) {
 			}, nil)
 
 			token, err := client.generateJWTToken(context.Background(), "vault-token")
+			if tt.wantErrText == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantToken, token)
+				return
+			}
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErrText)
+			assert.Empty(t, token)
+		})
+	}
+}
+
+func TestExecuteKubectlRunOutputAndErrorPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		output     string
+		exitCode   int
+		wantOutput string
+		wantErr    bool
+	}{
+		{
+			name:       "JSON output",
+			output:     `{"data":{"value":"ok"}}`,
+			wantOutput: `{"data":{"value":"ok"}}`,
+		},
+		{
+			name:       "PEM output",
+			output:     openBaoTestCertPEM,
+			wantOutput: strings.TrimSuffix(openBaoTestCertPEM, "\n"),
+		},
+		{
+			name:       "plain text output",
+			output:     "command completed",
+			wantOutput: "command completed",
+		},
+		{
+			name:     "command failure",
+			output:   "kubectl diagnostic output",
+			exitCode: 7,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testDir := t.TempDir()
+			kubectlPath := filepath.Join(testDir, "kubectl")
+			kubectlScript := "#!/bin/sh\nprintf '%s\\n' 'pod \"utility\" deleted'\nprintf '%s\\n' '" + tt.output + "'\n"
+			if tt.exitCode != 0 {
+				kubectlScript += "exit " + strconv.Itoa(tt.exitCode) + "\n"
+			}
+			require.NoError(t, os.WriteFile(kubectlPath, []byte(kubectlScript), 0o755))
+			t.Setenv("PATH", testDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			client := NewClient(&Config{
+				UtilityImage:     "curlimages/curl:latest",
+				ClusterNamespace: "nvcf",
+				KubeconfigPath:   "/tmp/kubeconfig",
+				KubeContext:      "test-context",
+				Debug:            true,
+			}, nil)
+
+			got, err := client.executeKubectlRun(context.Background(), "test-command", []string{"echo", "hello"})
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, "kubectl run failed: exit status 7")
+				assert.ErrorContains(t, err, "kubectl diagnostic output")
+				assert.Empty(t, got)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantOutput, got)
+		})
+	}
+}
+
+func TestAuthenticateWithOpenBaoHandlesResponses(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		exitCode    int
+		wantToken   string
+		wantErrText string
+	}{
+		{
+			name:      "valid token",
+			output:    `{"auth":{"client_token":"openbao-token"}}`,
+			wantToken: "openbao-token",
+		},
+		{
+			name:        "empty response",
+			output:      " \n\t",
+			wantErrText: "empty response from OpenBao authentication",
+		},
+		{
+			name:        "malformed JSON",
+			output:      "not-json",
+			wantErrText: "failed to unmarshal auth response",
+		},
+		{
+			name:        "missing token",
+			output:      `{"auth":{}}`,
+			wantErrText: "no client token in OpenBao response",
+		},
+		{
+			name:        "kubectl failure",
+			exitCode:    7,
+			wantErrText: "failed to authenticate with OpenBao via kubectl",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testDir := t.TempDir()
+			kubectlPath := filepath.Join(testDir, "kubectl")
+			kubectlScript := "#!/bin/sh\nprintf '%s' '" + tt.output + "'\n"
+			if tt.exitCode != 0 {
+				kubectlScript += "exit " + strconv.Itoa(tt.exitCode) + "\n"
+			}
+			require.NoError(t, os.WriteFile(kubectlPath, []byte(kubectlScript), 0o755))
+			t.Setenv("PATH", testDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			client := NewClient(&Config{
+				OpenBaoURL:         "http://openbao.nvcf.svc.cluster.local:8200",
+				OpenBaoJWTAuthRole: "nvcf-admin",
+				UtilityImage:       "curlimages/curl:latest",
+				ClusterNamespace:   "nvcf",
+				Debug:              true,
+			}, nil)
+
+			token, err := client.authenticateWithOpenBao(context.Background(), "sample-service-account-token")
 			if tt.wantErrText == "" {
 				require.NoError(t, err)
 				assert.Equal(t, tt.wantToken, token)

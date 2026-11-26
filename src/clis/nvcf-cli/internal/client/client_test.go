@@ -42,6 +42,43 @@ func ptrInt(v int) *int { return &v }
 
 func ptrUint32(v uint32) *uint32 { return &v }
 
+func TestGetNamespaceFromKubeconfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   bool
+		script string
+		want   string
+	}{
+		{name: "empty path", want: ""},
+		{name: "trims output", path: true, script: "#!/bin/sh\nprintf '  team-nvcf\\n'\n", want: "team-nvcf"},
+		{name: "empty output", path: true, script: "#!/bin/sh\nexit 0\n", want: ""},
+		{name: "command failure", path: true, script: "#!/bin/sh\nexit 1\n", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.path {
+				if got := getNamespaceFromKubeconfig(""); got != tt.want {
+					t.Errorf("getNamespaceFromKubeconfig(\"\") = %q, want %q", got, tt.want)
+				}
+				return
+			}
+
+			binDir := t.TempDir()
+			kubectlPath := filepath.Join(binDir, "kubectl")
+			if err := os.WriteFile(kubectlPath, []byte(tt.script), 0755); err != nil {
+				t.Fatalf("write fake kubectl: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			kubeconfigPath := filepath.Join(t.TempDir(), "config")
+			if got := getNamespaceFromKubeconfig(kubeconfigPath); got != tt.want {
+				t.Errorf("getNamespaceFromKubeconfig(%q) = %q, want %q", kubeconfigPath, got, tt.want)
+			}
+		})
+	}
+}
+
 type invokeRequestCaptureTransport struct {
 	req *http.Request
 }
@@ -1150,9 +1187,9 @@ func TestJWTRequirementForWriteOperations(t *testing.T) {
 
 func TestDeployFunctionValidation(t *testing.T) {
 	tests := []struct {
-		name          string
+		name           string
 		specifications []GPUSpecificationDto
-		wantError     string
+		wantError      string
 	}{
 		{
 			name:      "empty deployment specifications",
@@ -1836,6 +1873,63 @@ func TestLoadConfigAuthCredentials(t *testing.T) {
 	}
 }
 
+func TestLoadConfigWithoutAuthAuthSelection(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		debug   bool
+		wantAuth AuthType
+	}{
+		{
+			name: "complete oauth2 configuration with debug",
+			env: map[string]string{
+				"NVCF_OAUTH2_CLIENT_ID":      "client-id",
+				"NVCF_OAUTH2_CLIENT_SECRET":  "client-secret",
+				"NVCF_OAUTH2_TOKEN_ENDPOINT": "https://oauth2.localhost/token",
+			},
+			debug:    true,
+			wantAuth: AuthTypeOAuth2,
+		},
+		{name: "api key credentials", env: map[string]string{"NVCF_API_KEY": "api-key"}, wantAuth: AuthTypeBearer},
+		{name: "token credentials", env: map[string]string{"NVCF_TOKEN": "token"}, wantAuth: AuthTypeBearer},
+		{name: "no credentials", wantAuth: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			viper.Reset()
+			viper.SetEnvPrefix("NVCF")
+			viper.AutomaticEnv()
+			t.Cleanup(func() { viper.Reset() })
+			t.Setenv("HOME", t.TempDir())
+			state.ResetDefaultStateManager()
+			for _, key := range []string{
+				"NVCF_API_KEY", "NVCF_TOKEN", "NVCF_OAUTH2_CLIENT_ID",
+				"NVCF_OAUTH2_CLIENT_SECRET", "NVCF_OAUTH2_TOKEN_ENDPOINT", "NVCF_DEBUG",
+			} {
+				t.Setenv(key, "")
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			if tc.debug {
+				t.Setenv("NVCF_DEBUG", "true")
+			}
+
+			config, err := LoadConfigWithoutAuth()
+			if err != nil {
+				t.Fatalf("LoadConfigWithoutAuth() error = %v, want success", err)
+			}
+			if config.AuthType != tc.wantAuth {
+				t.Errorf("AuthType = %q, want %q", config.AuthType, tc.wantAuth)
+			}
+			if config.Debug != tc.debug {
+				t.Errorf("Debug = %t, want %t", config.Debug, tc.debug)
+			}
+		})
+	}
+}
+
 func TestCreateFunctionValidationPaths(t *testing.T) {
 	validHealth := func() *HealthDto {
 		return &HealthDto{
@@ -1856,7 +1950,7 @@ func TestCreateFunctionValidationPaths(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "missing name",
+			name:    "missing name",
 			request: &CreateFunctionRequest{InferenceURL: "/infer"},
 			wantErr: "name is required (1-128 chars, pattern: ^[a-z0-9A-Z][a-z0-9A-Z\\-_]*$)",
 		},
@@ -2082,11 +2176,11 @@ func TestDecodeInvokeFunctionResponseCases(t *testing.T) {
 			resp := &http.Response{
 				StatusCode: tt.status,
 				Header: http.Header{
-					"Nvcf-Reqid":           {"req-123"},
+					"Nvcf-Reqid":            {"req-123"},
 					"Nvcf-Percent-Complete": {"50"},
-					"Nvcf-Status":          {"PENDING"},
-					"Location":             {"https://example.test/result"},
-					"Content-Type":         {"application/json"},
+					"Nvcf-Status":           {"PENDING"},
+					"Location":              {"https://example.test/result"},
+					"Content-Type":          {"application/json"},
 				},
 			}
 			got, err := decodeInvokeFunctionResponse(resp, []byte(tt.body))

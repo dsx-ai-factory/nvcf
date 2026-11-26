@@ -18,12 +18,18 @@ limitations under the License.
 package cmd
 
 import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"nvcf-cli/internal/client"
 	"nvcf-cli/internal/state"
 )
@@ -42,6 +48,86 @@ func TestApplySavedDeployContextFillsMissingFunctionIDs(t *testing.T) {
 	}
 	if config.VersionID != "ver-from-state" {
 		t.Fatalf("VersionID = %q, want ver-from-state", config.VersionID)
+	}
+}
+
+func TestRunDeployGetOutput(t *testing.T) {
+	responseBody := `{"deployment":{"functionId":"function-123","functionVersionId":"version-456","deploymentId":"deployment-789","functionName":"sample-function","ncaId":"nca-012","functionStatus":"ACTIVE","createdAt":"2026-01-02T03:04:05Z","lastUpdatedAt":"2026-01-03T04:05:06Z","healthInfo":[{"status":"HEALTHY","message":"ready","reason":"checks passed"}],"deploymentSpecifications":[{"gpu":"H100","instanceType":"NCP.GPU.H100_1x","minInstances":1,"maxInstances":4,"backend":"backend-a","maxRequestConcurrency":16,"preferredOrder":2,"regions":["us-east"],"availabilityZones":["zone-a"],"clusters":["cluster-a"]}]}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v2/nvcf/deployments/functions/function-123/versions/version-456" {
+			t.Errorf("request = %s %s, want deployment GET", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer deploy-test-token" {
+			t.Errorf("Authorization = %q, want Bearer deploy-test-token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer server.Close()
+
+	previousSettings := viper.GetViper().AllSettings()
+	viper.Reset()
+	previousFunctionID, previousVersionID := deployGetFlags.functionID, deployGetFlags.versionID
+	previousJSONOutput := jsonOutput
+	t.Cleanup(func() {
+		viper.Reset()
+		for key, value := range previousSettings {
+			viper.Set(key, value)
+		}
+		deployGetFlags.functionID, deployGetFlags.versionID = previousFunctionID, previousVersionID
+		jsonOutput = previousJSONOutput
+	})
+	viper.Set("base_http_url", server.URL)
+	viper.Set("token", "deploy-test-token")
+	deployGetFlags.functionID, deployGetFlags.versionID = "function-123", "version-456"
+
+	cases := []struct {
+		name       string
+		jsonOutput bool
+		want       []string
+	}{
+		{
+			name: "formatted deployment details",
+			want: []string{
+				"Function ID:         function-123", "Version ID:          version-456",
+				"Deployment ID:       deployment-789", "Function Name:       sample-function",
+				"NCA ID:              nca-012", "Status:              ACTIVE",
+				"Message: ready", "Reason: checks passed", "GPU:                   H100",
+				"Backend:               backend-a", "Max Concurrency:       16",
+				"Preferred Order:       2", "Regions:               us-east",
+				"Availability Zones:    zone-a", "Clusters:              cluster-a",
+			},
+		},
+		{name: "JSON response", jsonOutput: true, want: []string{`"deploymentId": "deployment-789"`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			jsonOutput = tc.jsonOutput
+			readEnd, writeEnd, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("create stdout pipe: %v", err)
+			}
+			previousStdout := os.Stdout
+			os.Stdout = writeEnd
+			err = runDeployGet(deployGetCmd, nil)
+			os.Stdout = previousStdout
+			if closeErr := writeEnd.Close(); closeErr != nil {
+				t.Fatalf("close stdout pipe: %v", closeErr)
+			}
+			if err != nil {
+				t.Fatalf("runDeployGet: %v", err)
+			}
+			output, err := io.ReadAll(readEnd)
+			_ = readEnd.Close()
+			if err != nil {
+				t.Fatalf("read stdout: %v", err)
+			}
+			for _, expected := range tc.want {
+				if !bytes.Contains(output, []byte(expected)) {
+					t.Errorf("output missing %q:\n%s", expected, output)
+				}
+			}
+		})
 	}
 }
 
@@ -188,6 +274,74 @@ func TestLoadDeployConfig(t *testing.T) {
 	})
 }
 
+func TestLoadDeployConfigChangedFlags(t *testing.T) {
+	previousFlags := deployFlags
+	t.Cleanup(func() { deployFlags = previousFlags })
+	deployFlags = struct {
+		inputFile             string
+		functionID            string
+		versionID             string
+		instanceType          string
+		gpu                   string
+		minInstances          int
+		maxInstances          int
+		backend               string
+		clusters              []string
+		regions               []string
+		availabilityZones     []string
+		attributes            []string
+		maxRequestConcurrency int
+		preferredOrder        int
+		cpuArch               string
+		os                    string
+		driverVersion         string
+		storage               string
+		systemMemory          string
+		gpuMemory             string
+		helmConfig            map[string]string
+		clusterName           string
+		timeout               int
+	}{
+		functionID: "function-flag", versionID: "version-flag", instanceType: "NCP.GPU.B200_1x", gpu: "B200",
+		minInstances: 2, maxInstances: 5, clusters: []string{"cluster-flag"}, regions: []string{"region-flag"},
+		availabilityZones: []string{"zone-flag"}, attributes: []string{"attribute-flag"}, maxRequestConcurrency: 12,
+		preferredOrder: 3, cpuArch: "arm64", os: "linux", driverVersion: "550.54", storage: "80G",
+		systemMemory: "256G", gpuMemory: "180G", clusterName: "legacy-backend", timeout: 1200,
+	}
+
+	cmd := &cobra.Command{}
+	flagValues := map[string]string{
+		"function-id": "function-flag", "version-id": "version-flag", "instance-type": "NCP.GPU.B200_1x", "gpu": "B200",
+		"min-instances": "2", "max-instances": "5", "clusters": "cluster-flag", "regions": "region-flag",
+		"availability-zones": "zone-flag", "attributes": "attribute-flag", "max-request-concurrency": "12",
+		"preferred-order": "3", "cpu-arch": "arm64", "os": "linux", "driver-version": "550.54",
+		"storage": "80G", "system-memory": "256G", "gpu-memory": "180G", "timeout": "1200", "cluster-name": "legacy-backend",
+	}
+	for name, value := range flagValues {
+		cmd.Flags().String(name, "", "")
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set %s flag: %v", name, err)
+		}
+	}
+
+	config, err := loadDeployConfig(cmd)
+	if err != nil {
+		t.Fatalf("load deploy config: %v", err)
+	}
+	if config.FunctionID != "function-flag" || config.VersionID != "version-flag" || config.InstanceType != "NCP.GPU.B200_1x" || config.GPU != "B200" {
+		t.Fatalf("identity/spec fields = (%q, %q, %q, %q)", config.FunctionID, config.VersionID, config.InstanceType, config.GPU)
+	}
+	if config.MinInstances != 2 || config.MaxInstances != 5 || config.Timeout != 1200 {
+		t.Fatalf("counts/timeout = (%d, %d, %d)", config.MinInstances, config.MaxInstances, config.Timeout)
+	}
+	if config.Backend != "legacy-backend" || len(config.Clusters) != 1 || config.Clusters[0] != "cluster-flag" || len(config.Regions) != 1 || config.Regions[0] != "region-flag" || len(config.AvailabilityZones) != 1 || config.AvailabilityZones[0] != "zone-flag" || len(config.Attributes) != 1 || config.Attributes[0] != "attribute-flag" {
+		t.Fatalf("placement fields = backend %q, clusters %v, regions %v, zones %v, attributes %v", config.Backend, config.Clusters, config.Regions, config.AvailabilityZones, config.Attributes)
+	}
+	if config.MaxRequestConcurrency != 12 || config.PreferredOrder != 3 || config.CPUArch != "arm64" || config.OS != "linux" || config.DriverVersion != "550.54" || config.Storage != "80G" || config.SystemMemory != "256G" || config.GPUMemory != "180G" {
+		t.Fatalf("optional fields were not populated: %+v", config)
+	}
+}
+
 func TestDeployUpdateValidationAndGPUSpecResolution(t *testing.T) {
 	min, max, negative, zero := 1, 3, -1, 0
 	validConfig := func() *UpdateDeploymentConfig {
@@ -270,11 +424,11 @@ func TestLoadDeployUpdateConfig(t *testing.T) {
 	}
 
 	tests := []struct {
-		name       string
-		inputFile  string
-		fileData   string
-		writeFile  bool
-		wantErr    bool
+		name      string
+		inputFile string
+		fileData  string
+		writeFile bool
+		wantErr   bool
 	}{
 		{name: "merge file and changed flags", inputFile: inputFile},
 		{name: "malformed JSON", inputFile: "malformed.json", fileData: `{`, writeFile: true, wantErr: true},
@@ -341,6 +495,124 @@ func TestLoadDeployUpdateConfig(t *testing.T) {
 			}
 			if got.AutoscalingConfigurationPolicy != client.AutoscalingPolicyCustom {
 				t.Errorf("AutoscalingConfigurationPolicy = %q, want %q", got.AutoscalingConfigurationPolicy, client.AutoscalingPolicyCustom)
+			}
+		})
+	}
+}
+
+func TestRunDeployUpdateHTTPPaths(t *testing.T) {
+	previousSettings := viper.GetViper().AllSettings()
+	previousFlags := deployUpdateFlags
+	t.Cleanup(func() {
+		viper.Reset()
+		for key, value := range previousSettings {
+			viper.Set(key, value)
+		}
+		deployUpdateFlags = previousFlags
+	})
+
+	cases := []struct {
+		name         string
+		lookupStatus int
+		lookupBody   string
+		patchStatus  int
+		patchBody    string
+		wantErr      string
+		wantPatch    bool
+	}{
+		{
+			name:         "updates matching GPU specification",
+			lookupStatus: http.StatusOK,
+			lookupBody:   `{"deployment":{"deploymentId":"deployment-123","deploymentSpecifications":[{"gpuSpecificationId":"gpu-spec-456","gpu":"H100","instanceType":"NCP.GPU.H100_1x"}]}}`,
+			patchStatus:  http.StatusOK,
+			patchBody:    `{"gpuSpecification":{"gpu":"H100","instanceType":"NCP.GPU.H100_1x","minInstances":2}}`,
+			wantPatch:    true,
+		},
+		{
+			name:         "lookup failure",
+			lookupStatus: http.StatusInternalServerError,
+			lookupBody:   `lookup unavailable`,
+			wantErr:      "failed to look up existing deployment",
+		},
+		{
+			name:         "no matching GPU specification",
+			lookupStatus: http.StatusOK,
+			lookupBody:   `{"deployment":{"deploymentId":"deployment-123","deploymentSpecifications":[{"gpuSpecificationId":"gpu-spec-456","gpu":"A100","instanceType":"NCP.GPU.H100_1x"}]}}`,
+			wantErr:      "no GPU spec matches",
+		},
+		{
+			name:         "PATCH failure",
+			lookupStatus: http.StatusOK,
+			lookupBody:   `{"deployment":{"deploymentId":"deployment-123","deploymentSpecifications":[{"gpuSpecificationId":"gpu-spec-456","gpu":"H100","instanceType":"NCP.GPU.H100_1x"}]}}`,
+			patchStatus:  http.StatusInternalServerError,
+			patchBody:    `update unavailable`,
+			wantErr:      "failed to update GPU specification",
+			wantPatch:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			patchSeen := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					if r.URL.Path != "/v2/nvcf/deployments/functions/function-123/versions/version-456" {
+						t.Errorf("lookup path = %q", r.URL.Path)
+					}
+					w.WriteHeader(tc.lookupStatus)
+					_, _ = io.WriteString(w, tc.lookupBody)
+					return
+				}
+				patchSeen = true
+				if r.Method != http.MethodPatch || r.URL.Path != "/v2/nvcf/deployments/deployment-123/gpu-specifications/gpu-spec-456" {
+					t.Errorf("PATCH request = %s %s", r.Method, r.URL.Path)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read PATCH body: %v", err)
+				} else if !bytes.Contains(body, []byte(`"minInstances":2`)) {
+					t.Errorf("PATCH body %s does not contain minInstances 2", body)
+				}
+				w.WriteHeader(tc.patchStatus)
+				_, _ = io.WriteString(w, tc.patchBody)
+			}))
+			defer server.Close()
+
+			viper.Reset()
+			viper.Set("base_http_url", server.URL)
+			viper.Set("token", "deploy-test-token")
+			inputFile := filepath.Join(t.TempDir(), "update.json")
+			if err := os.WriteFile(inputFile, []byte(`{"functionId":"function-123","versionId":"version-456","gpu":"H100","instanceType":"NCP.GPU.H100_1x","minInstances":2}`), 0o600); err != nil {
+				t.Fatalf("write update config: %v", err)
+			}
+			deployUpdateFlags = struct {
+				inputFile         string
+				functionID        string
+				versionID         string
+				gpu               string
+				instanceType      string
+				minInstances      int
+				maxInstances      int
+				autoscalingPolicy string
+			}{inputFile: inputFile}
+
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("function-id", "", "")
+			cmd.Flags().String("version-id", "", "")
+			cmd.Flags().String("gpu", "", "")
+			cmd.Flags().String("instance-type", "", "")
+			cmd.Flags().Int("min-instances", 0, "")
+			cmd.Flags().Int("max-instances", 0, "")
+			cmd.Flags().String("autoscaling-policy", "", "")
+			err := runDeployUpdate(cmd, nil)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("runDeployUpdate() error = %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("runDeployUpdate() error = %v, want context %q", err, tc.wantErr)
+			}
+			if patchSeen != tc.wantPatch {
+				t.Errorf("PATCH seen = %t, want %t", patchSeen, tc.wantPatch)
 			}
 		})
 	}
