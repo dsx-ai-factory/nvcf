@@ -163,6 +163,173 @@ func TestLoadDeleteConfig(t *testing.T) {
 	}
 }
 
+func TestLoadCreateConfigAppliesAllFlagOverrides(t *testing.T) {
+	originalFlags := createFlags
+	t.Cleanup(func() { createFlags = originalFlags })
+	createFlags = struct {
+		inputFile            string
+		name                 string
+		containerImage       string
+		inferenceURL         string
+		inferencePort        int
+		description          string
+		tags                 []string
+		healthURI            string
+		healthProtocol       string
+		healthPort           int
+		healthTimeout        string
+		healthExpectedStatus int
+		functionType         string
+		apiBodyFormat        string
+		containerArgs        string
+		containerEnvironment []string
+		helmChart            string
+		helmChartServiceName string
+		secrets              []string
+		models               []string
+		llmModels            []string
+		resources            []string
+		rateLimit            string
+		rateLimitExempted    []string
+		rateLimitSync        bool
+		logsTelemetryId      string
+		metricsTelemetryId   string
+		tracesTelemetryId    string
+	}{}
+	inputFile := filepath.Join(t.TempDir(), "create.json")
+	require.NoError(t, os.WriteFile(inputFile, []byte(`{"name":"file-name","containerImage":"file-image","description":"file description","llmInvocationConfig":{"priority":{"defaultPriority":3,"perAccountPriority":{"nca-file":4}}}}`), 0600))
+	createFlags.inputFile = inputFile
+
+	cmd := &cobra.Command{Use: "create"}
+	flags := cmd.Flags()
+	flags.StringVar(&createFlags.name, "name", "", "")
+	flags.StringVar(&createFlags.containerImage, "image", "", "")
+	flags.StringVar(&createFlags.inferenceURL, "inference-url", "", "")
+	flags.IntVar(&createFlags.inferencePort, "inference-port", 0, "")
+	flags.StringVar(&createFlags.description, "description", "", "")
+	flags.StringSliceVar(&createFlags.tags, "tags", nil, "")
+	flags.StringVar(&createFlags.healthURI, "health-uri", "", "")
+	flags.StringVar(&createFlags.healthProtocol, "health-protocol", "", "")
+	flags.IntVar(&createFlags.healthPort, "health-port", 0, "")
+	flags.StringVar(&createFlags.healthTimeout, "health-timeout", "", "")
+	flags.IntVar(&createFlags.healthExpectedStatus, "health-expected-status", 200, "")
+	flags.StringVar(&createFlags.functionType, "function-type", "", "")
+	flags.StringVar(&createFlags.apiBodyFormat, "api-body-format", "", "")
+	flags.StringVar(&createFlags.containerArgs, "container-args", "", "")
+	flags.StringSliceVar(&createFlags.containerEnvironment, "container-env", nil, "")
+	flags.StringVar(&createFlags.helmChart, "helm-chart", "", "")
+	flags.StringVar(&createFlags.helmChartServiceName, "helm-chart-service", "", "")
+	flags.StringSliceVar(&createFlags.secrets, "secrets", nil, "")
+	flags.StringSliceVar(&createFlags.models, "models", nil, "")
+	flags.StringArrayVar(&createFlags.llmModels, "llm-model", nil, "")
+	flags.Uint32(llmDefaultPriorityFlag, 0, "")
+	flags.StringArray(llmPerAccountPriorityFlag, nil, "")
+	flags.StringSliceVar(&createFlags.resources, "resources", nil, "")
+	flags.StringVar(&createFlags.rateLimit, "rate-limit", "", "")
+	flags.StringSliceVar(&createFlags.rateLimitExempted, "rate-limit-exempted", nil, "")
+	flags.BoolVar(&createFlags.rateLimitSync, "rate-limit-sync", false, "")
+	flags.StringVar(&createFlags.logsTelemetryId, "logs-telemetry-id", "", "")
+	flags.StringVar(&createFlags.metricsTelemetryId, "metrics-telemetry-id", "", "")
+	flags.StringVar(&createFlags.tracesTelemetryId, "traces-telemetry-id", "", "")
+
+	values := map[string]string{
+		"name": "flag-name", "image": "registry.example/flag:1", "inference-url": "/flag", "inference-port": "8100",
+		"description": "flag description", "tags": "alpha,beta", "health-uri": "/ready", "health-protocol": "HTTP",
+		"health-port": "8101", "health-timeout": "PT9S", "health-expected-status": "204",
+		"function-type": "STREAMING", "api-body-format": "CUSTOM", "container-args": "--flag",
+		"container-env": "MODE=flag", "helm-chart": "chart:flag", "helm-chart-service": "flag-service",
+		"secrets": "TOKEN=flag", "models": "model:v2:ngc://models/flag", "llm-model": "name=llm,uris=ngc://models/llm,routingMethod=priority",
+		llmDefaultPriorityFlag: "11", llmPerAccountPriorityFlag: "nca-flag:17", "resources": "resource:v3:ngc://resources/flag",
+		"rate-limit": "12-M", "rate-limit-exempted": "nca-exempt", "rate-limit-sync": "true",
+		"logs-telemetry-id": "logs-flag", "metrics-telemetry-id": "metrics-flag", "traces-telemetry-id": "traces-flag",
+	}
+	for name, value := range values {
+		require.NoError(t, flags.Set(name, value), "set %s", name)
+		assert.True(t, flags.Changed(name), "%s should be marked changed", name)
+	}
+
+	config, err := loadCreateConfig(cmd)
+	require.NoError(t, err)
+	assert.Equal(t, "flag-name", config.Name)
+	assert.Equal(t, "registry.example/flag:1", config.ContainerImage)
+	assert.Equal(t, "/flag", config.InferenceURL)
+	assert.Equal(t, 8100, config.InferencePort)
+	assert.Equal(t, "flag description", config.Description)
+	assert.Equal(t, []string{"alpha", "beta"}, config.Tags)
+	assert.Equal(t, "/ready", config.HealthURI)
+	assert.Equal(t, "HTTP", config.HealthProtocol)
+	assert.Equal(t, 8101, config.HealthPort)
+	assert.Equal(t, "PT9S", config.HealthTimeout)
+	assert.Equal(t, 204, config.HealthExpectedStatus)
+	assert.Equal(t, "STREAMING", config.FunctionType)
+	assert.Equal(t, "CUSTOM", config.APIBodyFormat)
+	assert.Equal(t, "--flag", config.ContainerArgs)
+	assert.Equal(t, []ContainerEnvironmentEntry{{Key: "MODE", Value: "flag"}}, config.ContainerEnvironment)
+	assert.Equal(t, "chart:flag", config.HelmChart)
+	assert.Equal(t, "flag-service", config.HelmChartServiceName)
+	assert.Equal(t, []string{"TOKEN=flag"}, config.Secrets)
+	routingMethod := "priority"
+	assert.Equal(t, []ArtifactConfig{{Name: "model", Version: "v2", URI: "ngc://models/flag"}, {Name: "llm", LLMConfig: &LLMConfigInput{URIs: []string{"ngc://models/llm"}, RoutingMethod: &routingMethod}}}, config.Models)
+	assert.Equal(t, []ArtifactConfig{{Name: "resource", Version: "v3", URI: "ngc://resources/flag"}}, config.Resources)
+	assert.Equal(t, "12-M", config.RateLimit)
+	assert.Equal(t, []string{"nca-exempt"}, config.RateLimitExempted)
+	assert.True(t, config.RateLimitSync)
+	assert.Equal(t, "logs-flag", config.LogsTelemetryId)
+	assert.Equal(t, "metrics-flag", config.MetricsTelemetryId)
+	assert.Equal(t, "traces-flag", config.TracesTelemetryId)
+	assertPriorityConfig(t, config.LLMInvocationConfig, 11, map[string]uint32{"nca-flag": 17})
+}
+
+func TestBuildCreateFunctionRequestConvertsSecrets(t *testing.T) {
+	originalSecrets := createFlags.secrets
+	t.Cleanup(func() { createFlags.secrets = originalSecrets })
+
+	tests := []struct {
+		name        string
+		cliSecrets  []string
+		jsonSecrets interface{}
+		want        []client.SecretDto
+		wantErr     bool
+	}{
+		{
+			name:       "combines CLI and JSON secrets and skips unsupported values",
+			cliSecrets: []string{"CLI_TOKEN=cli-value"},
+			jsonSecrets: []interface{}{
+				"JSON_TOKEN=json-value",
+				map[string]interface{}{"name": "OBJECT_TOKEN", "value": "object-value"},
+				42,
+			},
+			want: []client.SecretDto{
+				{Name: "CLI_TOKEN", Value: "cli-value"},
+				{Name: "JSON_TOKEN", Value: "json-value"},
+				{Name: "OBJECT_TOKEN", Value: "object-value"},
+			},
+		},
+		{
+			name:        "malformed CLI pair returns no request",
+			cliSecrets:  []string{"MALFORMED"},
+			jsonSecrets: []interface{}{"JSON_TOKEN=json-value"},
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			createFlags.secrets = tt.cliSecrets
+			req, _, err := buildCreateFunctionRequest(&CreateConfig{Secrets: tt.jsonSecrets})
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, req)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, req)
+			assert.Equal(t, tt.want, req.Secrets)
+		})
+	}
+}
+
 func runTaskCreateWithResponse(t *testing.T, response string) (string, error) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -343,7 +510,7 @@ func TestGenerateDemoFolderWritesOperationFiles(t *testing.T) {
 	assert.Equal(t, false, modelConfig["return_logprobs"])
 
 	for _, tc := range []struct {
-		filename            string
+		filename             string
 		deleteDeploymentOnly bool
 	}{
 		{filename: "delete-function.json", deleteDeploymentOnly: false},
@@ -361,6 +528,47 @@ func TestGenerateDemoFolderWritesOperationFiles(t *testing.T) {
 	assert.Contains(t, string(readme), functionName)
 	for _, filename := range []string{"deploy.json", "invoke.json", "delete-deployment.json", "delete-function.json"} {
 		assert.Contains(t, string(readme), filename)
+	}
+}
+
+func TestGenerateDemoFolderFilesystemErrors(t *testing.T) {
+	t.Run("mkdir", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		const versionID = "version-test-id"
+		demoDir := versionID + "_demo"
+		require.NoError(t, os.WriteFile(demoDir, []byte("file blocks directory creation"), 0644))
+
+		err := generateDemoFolder("function-test-id", versionID, &CreateConfig{Name: "demo-function"})
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "failed to create demo folder")
+	})
+
+	for _, tc := range []struct {
+		filename string
+	}{
+		{filename: "deploy.json"},
+		{filename: "invoke.json"},
+		{filename: "delete-function.json"},
+		{filename: "delete-deployment.json"},
+		{filename: "README.md"},
+	} {
+		t.Run(tc.filename, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			const versionID = "version-test-id"
+			demoDir := versionID + "_demo"
+			require.NoError(t, os.Mkdir(demoDir, 0755))
+			target := filepath.Join(demoDir, tc.filename)
+			require.NoError(t, os.Mkdir(target, 0755))
+
+			err := generateDemoFolder("function-test-id", versionID, &CreateConfig{Name: "demo-function"})
+			require.Error(t, err)
+			wantError := "failed to write file " + target
+			if tc.filename == "README.md" {
+				wantError = "failed to write README.md"
+			}
+			assert.ErrorContains(t, err, wantError)
+			assert.ErrorContains(t, err, target)
+		})
 	}
 }
 

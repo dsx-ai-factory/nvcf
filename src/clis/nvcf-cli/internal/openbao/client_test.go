@@ -19,6 +19,7 @@ package openbao
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -28,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -430,6 +432,60 @@ func TestGenerateJWTTokenHandlesSigningResponses(t *testing.T) {
 	}
 }
 
+func TestGenerateAdminTokenWithRootSecret(t *testing.T) {
+	rootToken := "s.test-root-token"
+	tests := []struct {
+		name        string
+		signingJSON string
+		wantToken   string
+		wantErr     string
+	}{
+		{name: "valid signing response", signingJSON: `{"data":{"token":"admin-jwt"}}`, wantToken: "admin-jwt"},
+		{name: "missing token", signingJSON: `{"data":{}}`, wantErr: "failed to generate JWT token: no token in JWT signing response"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testDir := t.TempDir()
+			kubectlPath := filepath.Join(testDir, "kubectl")
+			commandLog := filepath.Join(testDir, "kubectl.log")
+			encodedRoot := base64.StdEncoding.EncodeToString([]byte(rootToken))
+			kubectlScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$KUBECTL_COMMAND_LOG\"\ncase \" $* \" in\n  *\" get secret \"*) printf '%s\\n' '" + encodedRoot + "'; exit 0 ;;\nesac\nprintf '%s\\n' '" + tt.signingJSON + "'\n"
+			require.NoError(t, os.WriteFile(kubectlPath, []byte(kubectlScript), 0o755))
+			t.Setenv("PATH", testDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("KUBECTL_COMMAND_LOG", commandLog)
+
+			client := NewClient(&Config{
+				OpenBaoURL:            "http://openbao.nvcf.svc.cluster.local:8200",
+				OpenBaoJWTSigningRole: "nvcf-admin",
+				OpenBaoNamespace:      "openbao",
+				OpenBaoSecretName:     "openbao-root-token",
+				ClusterNamespace:      "nvcf",
+				UtilityImage:          "curlimages/curl:latest",
+				Debug:                 true,
+			}, nil)
+
+			token, expiration, err := client.GenerateAdminToken(context.Background())
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.wantErr)
+				assert.Empty(t, token)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantToken, token)
+				assert.WithinDuration(t, time.Now().Add(24*time.Hour), expiration, 5*time.Second)
+			}
+
+			logBody, readErr := os.ReadFile(commandLog)
+			require.NoError(t, readErr)
+			commands := string(logBody)
+			assert.Contains(t, commands, "get secret openbao-root-token -n openbao")
+			assert.Contains(t, commands, "X-Vault-Token: "+rootToken)
+			assert.NotContains(t, commands, "auth/jwt/login")
+		})
+	}
+}
+
 func TestExecuteKubectlRunOutputAndErrorPaths(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -559,6 +615,73 @@ func TestAuthenticateWithOpenBaoHandlesResponses(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tt.wantErrText)
 			assert.Empty(t, token)
+		})
+	}
+}
+
+func TestGenerateUserJWTTokenWithSubjectHandlesResponses(t *testing.T) {
+	tests := []struct {
+		name        string
+		output      string
+		exitCode    int
+		wantToken   string
+		wantErrText string
+	}{
+		{name: "valid token", output: `{"data":{"token":"user-jwt"}}`, wantToken: "user-jwt"},
+		{name: "empty response", output: " \n\t", wantErrText: "empty response from user JWT signing"},
+		{name: "malformed JSON", output: "not-json", wantErrText: "failed to unmarshal user JWT response"},
+		{name: "missing token", output: `{"data":{}}`, wantErrText: "no token in user JWT signing response"},
+		{name: "kubectl failure", exitCode: 7, wantErrText: "failed to sign user JWT token via kubectl"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testDir := t.TempDir()
+			kubectlPath := filepath.Join(testDir, "kubectl")
+			argsLog := filepath.Join(testDir, "args")
+			kubectlScript := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + strconv.Quote(argsLog) + "\nprintf '%s' '" + tt.output + "'\n"
+			if tt.exitCode != 0 {
+				kubectlScript += "exit " + strconv.Itoa(tt.exitCode) + "\n"
+			}
+			require.NoError(t, os.WriteFile(kubectlPath, []byte(kubectlScript), 0o755))
+			t.Setenv("PATH", testDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			client := NewClient(&Config{
+				OpenBaoURL:            "http://openbao.nvcf.svc.cluster.local:8200",
+				OpenBaoJWTSigningRole: "nvcf-user",
+				UtilityImage:          "curlimages/curl:latest",
+				ClusterNamespace:      "nvcf",
+				Debug:                 true,
+			}, nil)
+
+			subject := "user@example.com"
+			token, err := client.generateUserJWTTokenWithSubject(context.Background(), "sample-vault-token", subject)
+			if tt.wantErrText != "" {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.wantErrText)
+				assert.Empty(t, token)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantToken, token)
+			args, readErr := os.ReadFile(argsLog)
+			require.NoError(t, readErr)
+			argList := strings.Split(strings.TrimSpace(string(args)), "\n")
+			assert.Contains(t, argList, "openbao-user-jwt-sign")
+			assert.Contains(t, argList, "http://openbao.nvcf.svc.cluster.local:8200/v1/services/nvcf-api/jwt/sign/nvcf-user")
+			assert.Contains(t, argList, "X-Vault-Token: sample-vault-token")
+			payloadIndex := -1
+			for i, arg := range argList {
+				if arg == "-d" && i+1 < len(argList) {
+					payloadIndex = i + 1
+					break
+				}
+			}
+			require.NotEqual(t, -1, payloadIndex)
+			var payload map[string]string
+			require.NoError(t, json.Unmarshal([]byte(argList[payloadIndex]), &payload))
+			assert.Equal(t, subject, payload["sub"])
 		})
 	}
 }

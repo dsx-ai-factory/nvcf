@@ -259,6 +259,44 @@ func TestApikeyGenerate_BothKeys(t *testing.T) {
 	assert.Contains(t, *issuers, "nvct-api", "should generate task key via NVCT issuer")
 }
 
+func TestApikeyGenerate_IssuerErrors(t *testing.T) {
+	cases := []struct {
+		name          string
+		service       string
+		issuer        string
+		wrapper       string
+	}{
+		{name: "function", service: "function", issuer: "nvcf-api", wrapper: "failed to generate function API key"},
+		{name: "task", service: "task", issuer: "nvct-api", wrapper: "failed to generate task API key"},
+		{name: "event ledger", service: "event-ledger", issuer: "nvcf-api", wrapper: "failed to generate Event Ledger API key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetApikeyFlags(t)
+			var issuers []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.URL.Path == "/v1/keys" {
+					issuers = append(issuers, r.Header.Get("Key-Issuer-Service"))
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			t.Cleanup(srv.Close)
+			configureApikeyTest(t, srv.URL)
+
+			apikeyFor = tc.service
+			apikeyExpiresIn = "1h"
+
+			err := runAPIKeyGenerate(nil, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wrapper)
+			require.Len(t, issuers, 1, "expected exactly one key generation request")
+			assert.Equal(t, tc.issuer, issuers[0])
+		})
+	}
+}
+
 // --- list / delete / clear-all cover NVCT task keys (NVBug 6417533) -----------
 
 type apiKeysRecorder struct {

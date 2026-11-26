@@ -1210,3 +1210,73 @@ func TestTTY_DownCompactFinalSummaries(t *testing.T) {
 		})
 	}
 }
+
+func TestTTY_UpdateInstallEventStateTransitions(t *testing.T) {
+	fixed := ts("2026-04-29T01:30:00Z")
+	m := NewModel(ModelOpts{NowFunc: func() time.Time { return fixed }})
+	update := func(event Event) (Model, tea.Cmd) {
+		t.Helper()
+		model, cmd := m.Update(eventMsg{event})
+		var ok bool
+		m, ok = model.(Model)
+		require.True(t, ok)
+		return m, cmd
+	}
+
+	startedAt := ts("2026-04-29T01:00:00Z")
+	state, cmd := update(PhaseStarted{Num: 1, Name: "Prepare", StartedAt: startedAt, Context: "control"})
+	require.Nil(t, cmd)
+	assert.Equal(t, startedAt, state.started)
+	assert.Equal(t, phaseRunning, state.phases[0].state)
+	assert.Equal(t, "Prepare", state.phases[0].name)
+	assert.Equal(t, startedAt, state.phases[0].startedAt)
+	assert.Equal(t, "control", state.phases[0].ctx)
+
+	for _, progressEvent := range []PhaseProgress{
+		{Num: 1, Resource: "Deployments", Done: 1, Total: 4},
+		{Num: 1, Resource: "Deployments", Done: 3, Total: 4},
+		{Num: 1, Resource: "Empty", Done: 0, Total: 0},
+	} {
+		state, cmd = update(progressEvent)
+		require.Nil(t, cmd)
+	}
+	require.Len(t, state.phases[0].subs, 2)
+	assert.Equal(t, 3, state.phases[0].subs[0].done)
+	assert.Equal(t, .75, state.phases[0].subs[0].pct)
+	assert.Equal(t, float64(0), state.phases[0].subs[1].pct)
+
+	state, _ = update(Waiting{Num: 1, Reason: "waiting for pod"})
+	assert.Equal(t, "waiting for pod", state.phases[0].waiting)
+	state, _ = update(LastProgress{Num: 1, Detail: "pod scheduled"})
+	assert.Empty(t, state.phases[0].waiting)
+	assert.Equal(t, "pod scheduled", state.phases[0].lastProg)
+	assert.Equal(t, fixed, state.phases[0].lastProgAt)
+	state, _ = update(Waiting{Num: 1, Reason: "waiting again"})
+
+	state, cmd = update(PhaseCompleted{Num: 1, Duration: 5 * time.Second})
+	require.Nil(t, cmd)
+	assert.Equal(t, phaseCompleted, state.phases[0].state)
+	assert.Equal(t, 5*time.Second, state.phases[0].duration)
+	assert.Equal(t, fixed, state.phases[0].completedAt)
+	assert.Empty(t, state.phases[0].waiting)
+	assert.Empty(t, state.phases[0].lastProg)
+
+	planned := Planned{Cluster: "cluster", Target: "target", Stack: "stack"}
+	state, cmd = update(planned)
+	assert.Equal(t, planned, *state.planned)
+	assert.True(t, state.finished)
+	require.NotNil(t, cmd)
+	assert.IsType(t, tea.QuitMsg{}, cmd())
+
+	fresh := NewModel(ModelOpts{NowFunc: func() time.Time { return fixed }})
+	model, cmd := fresh.Update(eventMsg{Final{ClusterID: "id", ClusterGroupID: "group", NVCFBackendHealth: "healthy", Duration: time.Minute, PlanOnly: true}})
+	final := model.(Model)
+	assert.True(t, final.finished)
+	assert.Equal(t, "id", final.clusterID)
+	assert.Equal(t, "group", final.clusterGroupID)
+	assert.Equal(t, "healthy", final.nvcfBackendHealth)
+	assert.Equal(t, time.Minute, final.finalDuration)
+	assert.True(t, final.planOnly)
+	require.NotNil(t, cmd)
+	assert.IsType(t, tea.QuitMsg{}, cmd())
+}

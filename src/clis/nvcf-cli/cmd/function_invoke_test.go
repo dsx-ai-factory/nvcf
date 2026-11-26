@@ -19,6 +19,8 @@ package cmd
 
 import (
 	"encoding/json"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -216,5 +218,130 @@ func TestLoadInvokeConfigVanityGatewayFlags(t *testing.T) {
 	}
 	if config.Path != "/bdd/echo" {
 		t.Fatalf("config.Path = %q, want %q", config.Path, "/bdd/echo")
+	}
+}
+
+func TestLoadInvokeConfigFileFlagsAndErrors(t *testing.T) {
+	previousFlags := invokeFlags
+	t.Cleanup(func() { invokeFlags = previousFlags })
+
+	dir := t.TempDir()
+	validFile := dir + "/invoke.json"
+	malformedFile := dir + "/malformed.json"
+	if err := os.WriteFile(validFile, []byte(`{"functionId":"json-function","versionId":"json-version","inferenceUrl":"/json-url","path":"/json-path","vanityHost":"json-host","modelName":"json-model","requestBody":{"source":"json"},"timeout":17,"pollDurationSeconds":9,"grpcService":"json-service","grpcMethod":"JsonMethod","grpcPlaintext":true}`), 0o600); err != nil {
+		t.Fatalf("write valid fixture: %v", err)
+	}
+	if err := os.WriteFile(malformedFile, []byte(`{"functionId":`), 0o600); err != nil {
+		t.Fatalf("write malformed fixture: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		inputFile string
+		changed   map[string]string
+		setFlags  func()
+		want      *InvokeConfig
+		wantErr   string
+	}{
+		{
+			name:      "retains JSON values and defaults when flags are unchanged",
+			inputFile: validFile,
+			want:      &InvokeConfig{FunctionID: "json-function", VersionID: "json-version", InferenceURL: "/json-url", Path: "/json-path", VanityHost: "json-host", ModelName: "json-model", RequestBody: map[string]interface{}{"source": "json"}, Timeout: 17, PollDurationSeconds: 9, GRPCService: "json-service", GRPCMethod: "JsonMethod", GRPCPlaintext: true},
+		},
+		{
+			name:      "changed flags override all JSON values",
+			inputFile: validFile,
+			changed:   map[string]string{"function-id": "flag-function", "version-id": "flag-version", "inference-url": "/flag-url", "path": "/flag-path", "vanity-host": "flag-host", "model-name": "flag-model", "request-body": `{"source":"flag"}`, "timeout": "31", "poll-duration": "12", "grpc-service": "flag-service", "grpc-method": "FlagMethod", "grpc-plaintext": "false"},
+			want:      &InvokeConfig{FunctionID: "flag-function", VersionID: "flag-version", InferenceURL: "/flag-url", Path: "/flag-path", VanityHost: "flag-host", ModelName: "flag-model", RequestBody: map[string]interface{}{"source": "flag"}, Timeout: 31, PollDurationSeconds: 12, GRPCService: "flag-service", GRPCMethod: "FlagMethod"},
+		},
+		{
+			name: "defaults without input file",
+			want: &InvokeConfig{Timeout: 60, PollDurationSeconds: 5},
+		},
+		{name: "missing input file", inputFile: dir + "/missing.json", wantErr: "failed to read input file"},
+		{name: "malformed JSON file", inputFile: malformedFile, wantErr: "failed to parse JSON file"},
+		{name: "invalid request body JSON", changed: map[string]string{"request-body": "{"}, wantErr: "invalid JSON in request-body"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			invokeFlags = struct {
+				inputFile           string
+				functionID          string
+				versionID           string
+				inferenceURL        string
+				path                string
+				vanityHost          string
+				modelName           string
+				requestBody         string
+				timeout             int
+				pollDurationSeconds int
+				useGRPC             bool
+				grpcService         string
+				grpcMethod          string
+				grpcPlaintext       bool
+			}{}
+			invokeFlags.inputFile = tt.inputFile
+			cmd := &cobra.Command{}
+			cmd.Flags().String("function-id", "", "")
+			cmd.Flags().String("version-id", "", "")
+			cmd.Flags().String("inference-url", "", "")
+			cmd.Flags().String("path", "", "")
+			cmd.Flags().String("vanity-host", "", "")
+			cmd.Flags().String("model-name", "", "")
+			cmd.Flags().String("request-body", "", "")
+			cmd.Flags().Int("timeout", 60, "")
+			cmd.Flags().Int("poll-duration", 5, "")
+			cmd.Flags().String("grpc-service", "", "")
+			cmd.Flags().String("grpc-method", "", "")
+			cmd.Flags().Bool("grpc-plaintext", false, "")
+			for name, value := range tt.changed {
+				if err := cmd.Flags().Set(name, value); err != nil {
+					t.Fatalf("set --%s: %v", name, err)
+				}
+				switch name {
+				case "function-id":
+					invokeFlags.functionID = value
+				case "version-id":
+					invokeFlags.versionID = value
+				case "inference-url":
+					invokeFlags.inferenceURL = value
+				case "path":
+					invokeFlags.path = value
+				case "vanity-host":
+					invokeFlags.vanityHost = value
+				case "model-name":
+					invokeFlags.modelName = value
+				case "request-body":
+					invokeFlags.requestBody = value
+				case "timeout":
+					invokeFlags.timeout = 31
+				case "poll-duration":
+					invokeFlags.pollDurationSeconds = 12
+				case "grpc-service":
+					invokeFlags.grpcService = value
+				case "grpc-method":
+					invokeFlags.grpcMethod = value
+				case "grpc-plaintext":
+					invokeFlags.grpcPlaintext = false
+				}
+			}
+			config, err := loadInvokeConfig(cmd)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+				}
+				if config != nil {
+					t.Fatalf("config = %#v, want nil on error", config)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadInvokeConfig: %v", err)
+			}
+			if !reflect.DeepEqual(config, tt.want) {
+				t.Fatalf("config = %#v, want %#v", config, tt.want)
+			}
+		})
 	}
 }

@@ -257,6 +257,74 @@ func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
 	}
 }
 
+func TestParseLLMModelSpecificationsEmptyFragmentsAndValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		parse       func() error
+		wantErrPart string
+	}{
+		{
+			name: "model ignores empty comma fragments",
+			parse: func() error {
+				model, err := parseLLMModelString(" ,name=model,,uris=/v1/chat/completions, ,routingMethod=round_robin,")
+				if err != nil {
+					return err
+				}
+				if model.Name != "model" || model.LLMConfig == nil || len(model.LLMConfig.URIs) != 1 {
+					return fmt.Errorf("unexpected parsed model: %#v", model)
+				}
+				return nil
+			},
+		},
+		{
+			name: "update ignores empty comma fragments",
+			parse: func() error {
+				update, err := parseLLMModelUpdateString(" ,name=model,,routingMethod=round_robin,")
+				if err != nil {
+					return err
+				}
+				if update.ModelName != "model" || stringValue(update.LLMConfig.RoutingMethod) != "round_robin" {
+					return fmt.Errorf("unexpected parsed update: %#v", update)
+				}
+				return nil
+			},
+		},
+		{
+			name: "model requires URI value",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,uris=")
+				return err
+			},
+			wantErrPart: "uris is required",
+		},
+		{
+			name: "model rejects non-integer token rate limit",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,uris=/v1/chat/completions,tokenRateLimit=abc-M")
+				return err
+			},
+			wantErrPart: "must be a positive integer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.parse()
+			if tt.wantErrPart == "" {
+				if err != nil {
+					t.Fatalf("parse specification: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErrPart)
+			}
+		})
+	}
+}
+
 // The API validates routing methods; the CLI forwards every value unchanged.
 var verbatimRoutingMethods = []string{
 	"pulsar",

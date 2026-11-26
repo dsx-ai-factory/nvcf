@@ -544,6 +544,61 @@ esac
 	}
 }
 
+func TestFetchK8sOIDCJWKSErrors(t *testing.T) {
+	tests := []struct {
+		name            string
+		discovery       string
+		jwks            string
+		failDiscovery   bool
+		failJWKS        bool
+		wantError       string
+	}{
+		{name: "discovery command failure", failDiscovery: true, wantError: "failed to fetch OIDC configuration"},
+		{name: "malformed discovery JSON", discovery: "not json", wantError: "failed to parse OIDC configuration"},
+		{name: "missing issuer", discovery: `{"jwks_uri":"https://example.com/keys"}`, wantError: "does not contain an issuer"},
+		{name: "JWKS command failure", discovery: `{"issuer":"https://kubernetes.default.svc.cluster.local"}`, failJWKS: true, wantError: "failed to fetch JWKS"},
+		{name: "malformed JWKS JSON", discovery: `{"issuer":"https://kubernetes.default.svc.cluster.local"}`, jwks: "not json", wantError: "fetched JWKS is not valid JSON"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			kubectl := filepath.Join(binDir, "kubectl")
+			script := `#!/bin/sh
+case "$*" in
+  *"get --raw /.well-known/openid-configuration"*)
+    [ "$FAKE_DISCOVERY_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_DISCOVERY"
+    ;;
+  *"get --raw /openid/v1/jwks"*)
+    [ "$FAKE_JWKS_FAIL" != 1 ] || exit 1
+    printf '%s' "$FAKE_JWKS"
+    ;;
+  *) exit 2 ;;
+esac
+`
+			require.NoError(t, os.WriteFile(kubectl, []byte(script), 0o755))
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("FAKE_DISCOVERY", tt.discovery)
+			t.Setenv("FAKE_JWKS", tt.jwks)
+			t.Setenv("FAKE_DISCOVERY_FAIL", "")
+			t.Setenv("FAKE_JWKS_FAIL", "")
+			if tt.failDiscovery {
+				t.Setenv("FAKE_DISCOVERY_FAIL", "1")
+			}
+			if tt.failJWKS {
+				t.Setenv("FAKE_JWKS_FAIL", "1")
+			}
+
+			issuer, jwks, err := fetchK8sOIDCJWKS(&client.Config{})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantError)
+			assert.Empty(t, issuer)
+			assert.Empty(t, jwks)
+		})
+	}
+}
+
 // --- JWKS Validation ---
 
 func TestJWKSValidation(t *testing.T) {

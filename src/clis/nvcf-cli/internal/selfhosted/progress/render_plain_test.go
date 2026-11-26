@@ -464,3 +464,26 @@ func TestRenderPlain_CheckRowsKeepTheirMessage(t *testing.T) {
 		`registry-credentials/registry-cred-123456789012.dkr.ecr.us-west-2.amazonaws.com passed=true `+
 			`message="skipped (ECR uses SigV4)"`)
 }
+
+func TestModelUpdateTickLifecycleDispatch(t *testing.T) {
+	fixedTime := ts("2026-04-29T03:45:01Z")
+	model := NewModel(ModelOpts{NowFunc: func() time.Time { return fixedTime }})
+
+	updated, cmd := model.Update(tickMsg(fixedTime))
+	active := updated.(Model)
+	assert.Equal(t, fixedTime, active.now)
+	assert.NotNil(t, cmd)
+
+	finishedTime := fixedTime.Add(time.Second)
+	finishedModel := model
+	finishedModel.finished = true
+	updated, cmd = finishedModel.Update(tickMsg(finishedTime))
+	finished := updated.(Model)
+	assert.Equal(t, finishedTime, finished.now)
+	assert.Nil(t, cmd)
+
+	updated, cmd = model.Update("unrelated")
+	unrelated := updated.(Model)
+	assert.Equal(t, model.now, unrelated.now)
+	assert.Nil(t, cmd)
+}
