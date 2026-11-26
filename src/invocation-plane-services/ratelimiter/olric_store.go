@@ -19,15 +19,17 @@ package ratelimiter
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-
+	"fmt"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
-	"go.uber.org/zap"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/olric-data/olric"
 	"github.com/ulule/limiter/v3"
@@ -80,10 +82,20 @@ func (store *Store) Increment(ctx context.Context, key string, count int64, rate
 	return limiter.Context{}, errors.ErrUnsupported
 }
 
+// maxCompareAndSwapAttempts caps the CompareAndSwap retry loop. A mismatch
+// means another check incremented the same key between the read and the swap;
+// each retry reuses the authoritative current value returned by the failed
+// swap, so the loop converges within a few attempts. Exhausting the cap fails
+// the check instead of writing an unvalidated value: Store.Get returns an
+// error and the caller denies the request (fail closed).
+const maxCompareAndSwapAttempts = 100
+
 // Get returns the limit for the given identifier.
 func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (limiter.Context, error) {
-	// This logic is from drivers/store/redis/store.go
-	// Olric operations(expire, increment, put) all eventually go down to Put. Thus, this is all written with Put
+	// This logic is from drivers/store/redis/store.go. The counter update is
+	// not a Get+Put pair: Get followed by Put is not atomic, so concurrent
+	// checks could read the same value and lose one increment. increment
+	// below performs the read-modify-write with CompareAndSwap.
 
 	tracer := otel.Tracer("Olric")
 	ctx, span := tracer.Start(ctx, "Olric-get")
@@ -91,66 +103,166 @@ func (store *Store) Get(ctx context.Context, key string, rate limiter.Rate) (lim
 	span.SetAttributes(attribute.String("key", key))
 
 	fullKey := store.getCacheKey(key)
-	result, err := store.dmap.Get(ctx, fullKey)
-	if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-		zap.L().Error("Failed to get value", zap.Error(err))
+	value, expiration, err := store.increment(ctx, fullKey, rate)
+	if err != nil {
 		return limiter.Context{}, err
-	}
-	value := 1
-	// initialize the value to 1 if key doesn't exist
-	if errors.Is(err, olric.ErrKeyNotFound) {
-		err = store.dmap.Put(ctx, fullKey, 1)
-		if err != nil {
-			return limiter.Context{}, err
-		}
-	} else {
-		if result != nil && result.TTL() > 0 {
-			// update the existing value by incrementing 1
-			old, _ := result.Int()
-			value = old + 1
-			putOption := olric.PX(time.Until(time.UnixMilli(result.TTL())))
-			err := store.dmap.Put(ctx, fullKey, value, putOption)
-			if err != nil {
-				zap.L().Error("Failed to update value", zap.Error(err))
-				return limiter.Context{}, err
-			}
-		} else {
-			// when ttl is 0, reset the value to 1
-			err = store.dmap.Put(ctx, fullKey, 1)
-			if err != nil {
-				zap.L().Error("Failed to update value", zap.Error(err))
-				return limiter.Context{}, err
-			}
-		}
 	}
 	span.SetAttributes(attribute.String("value", strconv.Itoa(value)))
+	span.SetAttributes(attribute.String("expiration", expiration.String()))
 
 	now := time.Now()
-	expiration := now.Add(rate.Period)
-	if value == 1 {
-		if rate.Period.Milliseconds() > 0 {
-			ttlOption := olric.PX(rate.Period)
-			err = store.dmap.Put(ctx, fullKey, value, ttlOption)
+	return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+}
 
-			// ignore key not found error
-			if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-				zap.L().Error("Failed to set expiration", zap.Error(err))
-				return limiter.Context{}, err
+// counterState is the single serialized value stored per rate-limit key. The
+// window expiry rides inside the value so the compare-and-swap expected bytes
+// carry the window identity as well as the counter: a retry that paused
+// across expiry cannot match a new window that restarted at the same counter
+// and write the old expiry over it.
+type counterState struct {
+	Count  int   `json:"c"`
+	Expiry int64 `json:"e"` // window end, absolute Unix milliseconds
+}
+
+// decodeCounter reads a stored counter. Values written with the embedded
+// window identity decode as counterState; a legacy plain-int counter (written
+// by the previous Get+Put code, or seeded without a TTL) falls back to the
+// key's stored TTL as its window identity.
+func decodeCounter(resp *olric.GetResponse) (counterState, error) {
+	var state counterState
+	if err := json.Unmarshal(resp.RawValue(), &state); err == nil {
+		return state, nil
+	}
+	if n, err := resp.Int(); err == nil {
+		return counterState{Count: n, Expiry: resp.TTL()}, nil
+	} else {
+		return counterState{}, fmt.Errorf("decode counter value: %w", err)
+	}
+}
+
+// increment bumps the per-key counter by one and returns the new value with
+// the window expiration.
+//
+// The read-modify-write is a CompareAndSwap retry loop, the same primitive the
+// LLM API gateway uses for its buckets (see
+// llm-api-gateway/ratelimit/olric_store.go). On a mismatch the failed swap
+// returns the authoritative current value, so a retry needs no extra Get.
+//
+// The first check in a window swaps with a nil expected value, which only
+// succeeds when the key does not exist. Counter creation and window TTL
+// arming are therefore a single atomic write. dmap.Incr cannot do this: it
+// has no TTL option, and arming the TTL in a follow-up call would leave the
+// counter without a window whenever that call fails.
+//
+// A read whose window ends before the swap takes the restart branch instead
+// of re-arming a stale expiry: the swap still compares against the old bytes,
+// so the write stays atomic, and the partition owner reports an expired key
+// as absent, so the next attempt inserts a fresh window.
+//
+// The window expiry is embedded in the stored value (see counterState), so
+// the compare-and-swap expected bytes carry the window identity as well as the
+// counter: a retry that paused across expiry cannot match a new window that
+// restarted at the same counter and write the old expiry over it.
+func (store *Store) increment(ctx context.Context, fullKey string, rate limiter.Rate) (int, time.Time, error) {
+	// current is the value the next swap compares against. nil means the key
+	// does not exist and the next swap must insert it.
+	var current *olric.GetResponse
+
+	for attempt := 0; attempt < maxCompareAndSwapAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, time.Time{}, err
+		}
+		var (
+			expected   []byte
+			newValue   []byte
+			newCount   int
+			options    []olric.PutOption
+			expiration time.Time
+		)
+
+		// startWindow restarts the counter at 1 and arms the window TTL in
+		// the same atomic write.
+		startWindow := func() error {
+			expiration = time.Now().Add(rate.Period)
+			newCount = 1
+			b, err := json.Marshal(counterState{Count: newCount, Expiry: expiration.UnixMilli()})
+			if err != nil {
+				return fmt.Errorf("encode counter for %s: %w", redactKey(fullKey), err)
+			}
+			newValue = b
+			if rate.Period.Milliseconds() > 0 {
+				options = append(options, olric.PX(rate.Period))
+			}
+			return nil
+		}
+
+		if current == nil {
+			// Insert-if-absent: expected stays nil, so the swap only succeeds
+			// when the key does not exist. Counter creation and window TTL
+			// arming are a single atomic write.
+			if err := startWindow(); err != nil {
+				return 0, time.Time{}, err
+			}
+		} else {
+			// The expected bytes embed the window expiry, so a retry that
+			// paused across expiry cannot match a new window that restarted
+			// at the same counter.
+			expected = current.RawValue()
+			state, err := decodeCounter(current)
+			if err != nil {
+				// fullKey embeds the raw per-user subject, so only a short hash
+				// prefix may leave the process. The returned error is logged by the
+				// caller - do not log it here as well.
+				return 0, time.Time{}, fmt.Errorf("decode counter for %s: %w", redactKey(fullKey), err)
+			}
+			if window := state.Expiry; window > 0 && time.Until(time.UnixMilli(window)) > 0 {
+				// Same window: increment in place and keep the absolute expiry.
+				// PXAT re-arms the key TTL verbatim, where a remaining-duration
+				// round-trip can truncate to zero near the window edge.
+				expiration = time.UnixMilli(window)
+				newCount = state.Count + 1
+				newValue, err = json.Marshal(counterState{Count: newCount, Expiry: window})
+				if err != nil {
+					return 0, time.Time{}, fmt.Errorf("encode counter for %s: %w", redactKey(fullKey), err)
+				}
+				if ttl := current.TTL(); ttl > 0 {
+					options = append(options, olric.PXAT(time.Duration(ttl)*time.Millisecond))
+				}
+			} else {
+				// The window ended between the read and the swap, or the key
+				// has no TTL left: restart the window at 1. The swap still
+				// compares against the old bytes, so it stays atomic.
+				if err := startWindow(); err != nil {
+					return 0, time.Time{}, err
+				}
 			}
 		}
-		return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+
+		swapped, next, err := store.dmap.CompareAndSwap(ctx, fullKey, expected, newValue, options...)
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("compare-and-swap counter for %s: %w", redactKey(fullKey), err)
+		}
+		if swapped {
+			return newCount, expiration, nil
+		}
+		// Another check updated the key first. next holds what is stored now,
+		// nil when the key expired in between. Retry against that value.
+		current = next
+		// Yield for a short random interval, so a hot key with 100+ concurrent
+		// checks spreads its retries instead of exhausting the attempt budget
+		// in a tight spin.
+		timer := time.NewTimer(time.Duration(rand.Int64N(4)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, time.Time{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
 
-	if err != nil && !errors.Is(err, olric.ErrKeyNotFound) {
-		zap.L().Error("Failed to get remaining ttl", zap.Error(err))
-		return limiter.Context{}, err
-	}
-
-	if result.TTL() > 0 {
-		expiration = now.Add(time.Duration(result.TTL()) * time.Millisecond)
-	}
-	span.SetAttributes(attribute.String("expiration", expiration.String()))
-	return common.GetContextFromState(now, rate, expiration, int64(value)), nil
+	// Attempts exhausted: no log here - the returned error is the single
+	// report, with the key redacted so the raw subject never reaches logs.
+	return 0, time.Time{}, fmt.Errorf("counter %s did not stabilize after %d compare-and-swap attempts", redactKey(fullKey), maxCompareAndSwapAttempts)
 }
 
 // Peek returns the limit for the given identifier, without modification on current values.
@@ -171,6 +283,14 @@ func (store *Store) Reset(ctx context.Context, key string, rate limiter.Rate) (l
 	expiration := now.Add(rate.Period)
 
 	return common.GetContextFromState(now, rate, expiration, 0), nil
+}
+
+// redactKey keeps error messages correlatable without exposing the per-user
+// subject: fullKey embeds the raw ClientAuthSubject, so only a short hash
+// prefix leaves the process.
+func redactKey(fullKey string) string {
+	sum := sha256.Sum256([]byte(fullKey))
+	return hex.EncodeToString(sum[:6])
 }
 
 // getCacheKey returns the full path for an identifier.
