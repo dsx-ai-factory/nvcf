@@ -71,10 +71,10 @@ func TestReplaceIPv4WholeAddressOnly(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"10.0.0.1:80/x", "10.9.9.9:80/x"},
 		{"tcp://10.0.0.1:5", "tcp://10.9.9.9:5"},
-		{"10.0.0.12:80", "10.0.0.12:80"},  // a longer address
-		{"110.0.0.1:80", "110.0.0.1:80"},  // a longer address
-		{"10.0.0.1.5", "10.0.0.1.5"},      // not an address
-		{"a10.0.0.1", "a10.9.9.9"},        // a letter bounds it
+		{"10.0.0.12:80", "10.0.0.12:80"}, // a longer address
+		{"110.0.0.1:80", "110.0.0.1:80"}, // a longer address
+		{"10.0.0.1.5", "10.0.0.1.5"},     // not an address
+		{"a10.0.0.1", "a10.9.9.9"},       // a letter bounds it
 		{"10.0.0.1,10.0.0.1", "10.9.9.9,10.9.9.9"},
 	} {
 		if got := replaceIPv4(tc.in, "10.0.0.1", "10.9.9.9"); got != tc.want {

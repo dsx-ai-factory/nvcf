@@ -749,6 +749,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		return c.companionsUnknown(ctx, criuGroupKeyDriver(instanceConfigURI(ranks), scope, drv), leader, len(ranks), err, log)
 	}
 	c.companionFailures.Delete(leader.UID)
+	if why, err := a.kubeSharedCompanions(ctx, leader, pods.Items, len(companions) > 0); err != nil || why != "" {
+		if err != nil {
+			why = err.Error()
+		}
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false
+	}
 	for _, r := range ranks {
 		// A rank that registers through Kubernetes has no etcd: its
 		// registration is kept with the capture (kube_discovery.go).
@@ -1608,6 +1615,20 @@ func (c *criuAutoRestorer) mayRestoreShared(ctx context.Context, leader *corev1.
 		log.WithError(err).Warn("CRIU group restore: trying again on the leader's next event")
 		c.attempted.Delete("restore/" + string(leader.UID))
 		return false
+	}
+	if why == "" && kubeDiscoveryRank(leader) {
+		cm, gerr := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{})
+		if gerr != nil {
+			log.WithError(gerr).Warn("CRIU group restore: cannot read the record; trying again on the leader's next event")
+			c.attempted.Delete("restore/" + string(leader.UID))
+			return false
+		}
+		why, err = c.a.kubeSharedCompanions(ctx, leader, nil, recordHasCompanions(cm.Data))
+		if err != nil {
+			log.WithError(err).Warn("CRIU group restore: trying again on the leader's next event")
+			c.attempted.Delete("restore/" + string(leader.UID))
+			return false
+		}
 	}
 	if why != "" {
 		c.failGroup(ctx, leader, key, false, errors.New(why), log)
