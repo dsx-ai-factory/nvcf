@@ -780,6 +780,10 @@ class FunctionDeploymentControllerTest {
         }
         assertThat(responseBody.deployment().functionVersionId()).isEqualTo(TEST_VERSION_ID_1);
         assertThat(responseBody.deployment().deploymentId()).isNotNull();
+        var persistedDeployment = functionsDeploymentRepository
+                .getByKeyFunctionVersionId(functionVersionId).orElseThrow();
+        assertThat(persistedDeployment.getShardId())
+                .isEqualTo(Math.floorMod(functionVersionId.hashCode(), 128));
         var deploymentId = responseBody.deployment().deploymentId();
         assertThat(responseBody.deployment().ncaId()).isEqualTo(TEST_NCA_ID);
         assertThat(responseBody.deployment().deploymentSpecifications()).hasSameSizeAs(specs);

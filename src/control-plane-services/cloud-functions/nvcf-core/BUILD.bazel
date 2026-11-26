@@ -90,6 +90,7 @@ nvcf_java_library(
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-audit:nv_boot_starter_audit",
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-cassandra:nv_boot_starter_cassandra",
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-core:nv_boot_starter_core",
+        "//src/libraries/java/nv-boot-parent/nv-boot-starter-data-migration-notification:nv_boot_starter_data_migration_notification",
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-exceptions:nv_boot_starter_exceptions",
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-jwt:nv_boot_starter_jwt",
         "//src/libraries/java/nv-boot-parent/nv-boot-starter-observability:nv_boot_starter_observability",
