@@ -361,7 +361,9 @@ run_case() {
     [[ ${served_a} -gt 0 ]] || fail "pylon-a should keep serving while pylon-b is frozen"
     echo "PASS: pylon-a served ${served_a} of 6 requests while pylon-b was frozen; other results: ${others[*]:-none}"
 
-    # 4. The resumed Pylon reconnects and serves again.
+    # 4. The resumed Pylon reconnects and serves again. Count from here, so a
+    # reconnect during after-quiet does not satisfy the wait.
+    connects_b=$(tunnel_connects b)
     kill -CONT "${pylon_pids[1]}"
     wait_for_reconnect "${connects_b}"
     expect_both_backends_serve after-resume
