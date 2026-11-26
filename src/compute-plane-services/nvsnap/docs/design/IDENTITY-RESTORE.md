@@ -340,7 +340,12 @@ Two guards:
   (`identity.holder`, `namespace/pod/uid`), written with the record's
   version, so of two agents claiming at once one wins. A holder whose pod is
   gone or replaced is taken over; one whose pod lives, being deleted or
-  not (a draining worker keeps its subscriptions), refuses the claim; an
+  not (a draining worker keeps its subscriptions), refuses the claim. A
+  holder being deleted is waited for first (`awaitHolderGone`): an
+  ordinary replacement is admitted while the pod it replaces terminates,
+  so its restore waits, idle, for that pod's remaining grace period, the
+  lease TTL and a few seconds (at most two minutes), then claims the
+  identity, which then names it; an
   unreadable holder refuses it (fail closed). A refused or failed restore
   releases its claim;
 - etcd refuses a grant of a live lease ID, whatever the record says.

@@ -865,6 +865,53 @@ func (a *Agent) holderAlive(ctx context.Context, holder string) (bool, error) {
 	return p.UID == types.UID(parts[2]), nil
 }
 
+// identityHolderWaitMax bounds awaitHolderGone; tests shorten it.
+var identityHolderWaitMax = 2 * time.Minute
+
+// awaitHolderGone waits, before pod claims record key's identity, for a
+// holder that is being deleted to be gone: an ordinary replacement (a pod
+// deleted, a node drained) is admitted while the pod it replaces still
+// terminates, and still holds the identity (holderAlive). The wait is
+// bounded by the holder's remaining grace period, the identity's lease TTL
+// (ttl, seconds) and a margin, at most identityHolderWaitMax; the placeholder
+// idles meanwhile. It returns when the holder is gone, is no other pod's,
+// is not being deleted, or the bound passed: the claim then decides
+// (claimIdentity refuses a live holder). Its lease is waited for after
+// (awaitLeaseFree).
+func (c *criuAutoRestorer) awaitHolderGone(ctx context.Context, key string, pod *corev1.Pod, ttl int64, log *logrus.Entry) {
+	me := holderOf(pod)
+	var deadline time.Time
+	for {
+		d, _, err := c.a.identityRecord(ctx, key)
+		if err != nil {
+			return
+		}
+		h := d[identityHolderKey]
+		parts := strings.SplitN(h, "/", 3)
+		if h == "" || h == me || len(parts) != 3 {
+			return
+		}
+		p, err := c.a.kubeClient.CoreV1().Pods(parts[0]).Get(ctx, parts[1], metav1.GetOptions{})
+		if err != nil || string(p.UID) != parts[2] || p.DeletionTimestamp == nil {
+			return
+		}
+		if deadline.IsZero() {
+			bound := time.Until(p.DeletionTimestamp.Time) + time.Duration(ttl)*time.Second + identityExpirySlack
+			deadline = time.Now().Add(min(max(bound, 0), identityHolderWaitMax))
+			log.WithField("waitAtMost", time.Until(deadline).Round(time.Second).String()).
+				Info("identity restore: the identity's holder is being deleted; waiting for it to be gone")
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(identityPoll):
+		}
+	}
+}
+
 // claimIdentity makes pod the holder of record key's identity. A holder
 // that is another pod, alive, keeps it (refused); one gone is replaced.
 // The update is conditional on the record's version, so of two agents
@@ -1304,6 +1351,7 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 	// alone proves nothing about the lease.
 	adopt := d[identityHolderKey] == holderOf(holder) && d[identityGrantedKey] == holderOf(holder)
 	if !adopt {
+		c.awaitHolderGone(ctx, key, holder, id.TTL, log)
 		if cerr := c.claimIdentity(ctx, key, holder); cerr != nil {
 			return nil, cerr
 		}

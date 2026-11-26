@@ -3070,3 +3070,66 @@ func TestKeepsDynamoIdentity(t *testing.T) {
 		t.Fatal("flag on: a worker the identity restore cannot take keeps its own namespace")
 	}
 }
+
+// An ordinary replacement is admitted while the restored pod it replaces
+// still terminates, and holds the identity. The replacement's restore
+// waits for that holder to be gone (within its grace period, the lease's
+// TTL and a margin), then claims the identity, which now names it, and
+// restores; a holder still there past the bound refuses it (cold start).
+func TestLoneRestore_WaitsForATerminatingHolder(t *testing.T) {
+	for _, gone := range []bool{true, false} {
+		t.Run(fmt.Sprintf("holder gone in time %v", gone), func(t *testing.T) {
+			fastIdentity(t)
+			saved := identityHolderWaitMax
+			identityHolderWaitMax = 1500 * time.Millisecond
+			t.Cleanup(func() { identityHolderWaitMax = saved })
+			ctx := context.Background()
+			f := newFakeEtcd(t)
+			keys := f.dynamoWorkerKeys(idLease, idOldIP)
+			rec := idRecord(t, keys, f)
+			f.mu.Lock()
+			f.kvs = map[string]etcdKV{}
+			f.mu.Unlock()
+			f.grant(idLease, 1) // the old holder's process kept it; it ends with the pod
+			useFakeEtcd(t, f)
+			old := idPlaceholder("w-old", idOldIP)
+			old.Annotations[webhook.CRIURestoredAnnotation] = "yes"
+			when := metav1.NewTime(time.Now().Add(300 * time.Millisecond)) // its grace period ends
+			old.DeletionTimestamp, old.Finalizers = &when, []string{"test"}
+			rec.Data[identityHolderKey], rec.Data[identityGrantedKey], rec.Data[identityHandoffKey] = holderOf(old), holderOf(old), holderOf(old)
+			pod := idPlaceholder("w-new", idNewIP)
+			kc := fake.NewSimpleClientset(rec, old, pod)
+			if gone {
+				go func() {
+					time.Sleep(400 * time.Millisecond)
+					_ = kc.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), "shared", "w-old")
+				}()
+			}
+			c := idAgent(kc, true).criuRestorer()
+			savedR := restoreForRequest
+			t.Cleanup(func() { restoreForRequest = savedR })
+			restored := false
+			restoreForRequest = func(*Agent, context.Context, RestoreRequest) (*RestoreResult, error) {
+				restored = true
+				return nil, errors.New("stop here")
+			}
+			held := decisions(t, identityRefusedHeld)
+			c.restore(ctx, "shared", "w-new", pod.UID, "ck", "main", idKey)
+			if restored != gone {
+				t.Fatalf("restored %v; want %v", restored, gone)
+			}
+			if !gone {
+				if decisions(t, identityRefusedHeld) != held+1 {
+					t.Fatal("a holder still there past the bound was not refused as held")
+				}
+				return
+			}
+			// The failed restore released its claim; before that, the claim
+			// named the replacement, not the old holder.
+			cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+			if h := cm.Data[identityHolderKey]; h == holderOf(old) || cm.Data[identityHandoffKey] == holderOf(old) {
+				t.Fatalf("holder %q handoff %q; the old holder's record was kept", h, cm.Data[identityHandoffKey])
+			}
+		})
+	}
+}
