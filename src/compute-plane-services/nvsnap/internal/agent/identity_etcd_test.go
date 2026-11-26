@@ -1887,8 +1887,13 @@ func TestLoneRestore_PlaceholderReplacedDuringIdentitySetup(t *testing.T) {
 	if err != nil || got.UID != "w-new-replacement" || coldStarted(got) {
 		t.Fatalf("the replacement was touched: %v %+v", err, got)
 	}
+	// The lease is revoked, then the claim released: wait for both.
 	deadline := time.Now().Add(3 * time.Second)
-	for f.live(idLease) && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+		if !f.live(idLease) && cm.Data[identityHolderKey] == "" {
+			break
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
@@ -2176,8 +2181,13 @@ func TestLoneRestore_ReplacedAfterTheCheck(t *testing.T) {
 	if err != nil || got.UID != "w-new-replacement" || coldStarted(got) {
 		t.Fatalf("the replacement was touched: %v %+v", err, got)
 	}
+	// The lease is revoked, then the claim released: wait for both.
 	deadline := time.Now().Add(3 * time.Second)
-	for f.live(idLease) && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+		if !f.live(idLease) && cm.Data[identityHolderKey] == "" {
+			break
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
@@ -2572,14 +2582,126 @@ func TestIdentityRefused_RemoteRankNotDeletedOnRetry(t *testing.T) {
 	fail.Store(false)
 	before := retries.Load()
 	deadline := time.Now().Add(3 * time.Second)
-	for retries.Load() < before+3 && time.Now().Before(deadline) {
-		if _, err := kc.Tracker().Get(corev1.SchemeGroupVersion.WithResource("pods"), "shared", r1.Name); err != nil {
-			t.Fatalf("a rank that could not be inspected was deleted on a retry: %v", err)
-		}
+	for retries.Load() < before+1 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if retries.Load() < before+3 {
+	if retries.Load() < before+1 {
 		t.Fatal("the rank's refusal was not tried again")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := kc.Tracker().Get(corev1.SchemeGroupVersion.WithResource("pods"), "shared", r1.Name); err != nil {
+		t.Fatalf("a rank that could not be inspected was deleted on a retry: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); !strings.Contains(cm.Data[identityRefusingKey], string(r1.UID)+"=") {
+		t.Fatalf("the rank's refusal is no longer recorded for its own agent: %q", cm.Data[identityRefusingKey])
+	}
+}
+
+// A rank on another node is never deleted by the agent that refused its
+// instance, even beside a leader seen idle: its own restore may have run,
+// which only its own agent can see. Its refusal stays recorded for that
+// agent.
+func TestIdentityRefused_RemoteRankLeftToItsAgent(t *testing.T) {
+	ctx := context.Background()
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 20*time.Millisecond)
+	f := newFakeEtcd(t)
+	rec := idRecord(t, f.dynamoWorkerKeys(idLease, idOldIP), f)
+	r0, r1, _ := idGroupPlaceholders()
+	r1.Spec.NodeName = "n1"
+	kc := fake.NewSimpleClientset(rec, r0, r1)
+	saved := podRunsWorkload
+	t.Cleanup(func() { podRunsWorkload = saved })
+	podRunsWorkload = func(_ context.Context, _ *Agent, p *corev1.Pod, _ string) (bool, bool, error) {
+		return false, p.Name == r0.Name, nil // the leader seen idle; the rank not inspectable
+	}
+	refusal := refuseIdentity(identityRefusedLiveLease, errors.New("live"))
+	idAgent(kc, true).criuRestorer().identityRefused(ctx, idKey, "ck", []*corev1.Pod{r0, r1}, refusal, func() {}, idLog())
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, r0.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the idle leader that cannot start cold was kept: %v", err)
+	}
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, r1.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("a rank on another node was deleted: %v", err)
+	}
+	if cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{}); !strings.Contains(cm.Data[identityRefusingKey], string(r1.UID)+"=") {
+		t.Fatalf("the rank's refusal is not recorded for its own agent: %q", cm.Data[identityRefusingKey])
+	}
+}
+
+// With identity restore off, a group's rank whose record is gone and whose
+// leader cannot restore it any more is started cold (here: deleted, as it
+// cannot start cold) by its own agent; one whose leader may still restore
+// it is left to that leader.
+func TestGroupRestore_RecordGoneRankFinishedWithTheFlagOff(t *testing.T) {
+	kc, _, r1, fail := groupRefusal(t, func(kc *fake.Clientset) {
+		_ = kc.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("configmaps"), "nvsnap-system", criuGroupConfigMapName(idKey))
+	})
+	fail.Store(false)
+	other := idAgent(kc, false)
+	other.config.NodeName = "n1"
+	other.criuRestorer().consider(context.Background(), r1)
+	if !idPodGone(t, kc, r1.Name, 5*time.Second) {
+		t.Fatal("the orphaned rank of a record gone was left idle by an agent with the flag off")
+	}
+	// A rank whose leader is a placeholder still: left to the leader.
+	r0, r1b, other2 := idGroupPlaceholders()
+	kc2 := fake.NewSimpleClientset(r0, r1b, other2)
+	c := idAgent(kc2, false).criuRestorer()
+	if c.orphanedRank(context.Background(), r1b) {
+		t.Fatal("a rank whose leader may restore it counted as orphaned")
+	}
+}
+
+// The counted refusals are never dropped to make room: a refusal awaiting
+// its restore's next event keeps its entry however many others are
+// counted, so it is not counted twice; past the bound a new refusal is not
+// counted and its pod not deleted, until entries whose pods are gone go.
+func TestChargeRefusal_NeverEvicts(t *testing.T) {
+	ctx := context.Background()
+	setDeleteRetry(t, time.Millisecond, 5*time.Millisecond, 20*time.Millisecond)
+	f := newFakeEtcd(t)
+	rec := idRecord(t, f.dynamoWorkerKeys(idLease, idOldIP), f)
+	ours := idPlaceholder("w-new", idNewIP)
+	objs := []runtime.Object{ours}
+	counted := []string{holderOf(ours)}
+	for i := range identityRefusalListMax - 1 {
+		p := idPlaceholder(fmt.Sprintf("o-%d", i), idNewIP)
+		p.UID = types.UID(fmt.Sprintf("o-%d-uid", i))
+		objs = append(objs, p)
+		counted = append(counted, holderOf(p))
+	}
+	rec.Data[identityRefusedPodsKey], rec.Data["stalls"] = strings.Join(counted, ","), "1"
+	newer := idPlaceholder("w-newer", idNewIP)
+	newer.UID = "w-newer-uid"
+	kc := fake.NewSimpleClientset(append(objs, rec, newer)...)
+	var failDel atomic.Bool
+	failDel.Store(true)
+	kc.PrependReactor("delete", "pods", func(act k8stesting.Action) (bool, runtime.Object, error) {
+		if failDel.Load() || act.(k8stesting.DeleteAction).GetName() == ours.Name {
+			return true, nil, errors.New("api down")
+		}
+		return false, nil, nil
+	})
+	c := idAgent(kc, true).criuRestorer()
+	refusal := refuseIdentity(identityRefusedLiveLease, errors.New("live"))
+	c.identityRefused(ctx, idKey, "ck", []*corev1.Pod{newer}, refusal, func() {}, idLog())
+	if _, err := kc.CoreV1().Pods("shared").Get(ctx, newer.Name, metav1.GetOptions{}); err != nil {
+		t.Fatalf("a pod whose refusal could not be counted was deleted: %v", err)
+	}
+	c.identityRefused(ctx, idKey, "ck", []*corev1.Pod{ours}, refusal, func() {}, idLog())
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+	if cm.Data["stalls"] != "1" || !strings.Contains(cm.Data[identityRefusedPodsKey], holderOf(ours)) {
+		t.Fatalf("stalls %q, ours listed %v; want our refusal kept and not counted again", cm.Data["stalls"], strings.Contains(cm.Data[identityRefusedPodsKey], holderOf(ours)))
+	}
+	// The others' pods go: their entries are dead, and the newer refusal
+	// is counted.
+	failDel.Store(false)
+	for i := range identityRefusalListMax - 1 {
+		_ = kc.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), "shared", fmt.Sprintf("o-%d", i))
+	}
+	c.identityRefused(ctx, idKey, "ck", []*corev1.Pod{newer}, refusal, func() {}, idLog())
+	cm, _ = kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
+	if cm.Data["stalls"] != "2" || !idPodGone(t, kc, newer.Name, time.Second) {
+		t.Fatalf("stalls %q; want the newer refusal counted once room was made", cm.Data["stalls"])
 	}
 }
 
@@ -2780,7 +2902,7 @@ func TestMarkRefusing_FullListRefuses(t *testing.T) {
 	rec := idRecord(t, f.dynamoWorkerKeys(idLease, idOldIP), f)
 	var l []string
 	for i := range identityRefusalListMax {
-		l = append(l, fmt.Sprintf("u%d/r", i))
+		l = append(l, fmt.Sprintf("u%d=r", i))
 	}
 	rec.Data[identityRefusingKey] = strings.Join(l, ",")
 	pod := idPlaceholder("w-new", idNewIP)
@@ -2795,7 +2917,7 @@ func TestMarkRefusing_FullListRefuses(t *testing.T) {
 		t.Fatalf("acted on an unrecorded refusal: %v, again %v", err, again)
 	}
 	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, rec.Name, metav1.GetOptions{})
-	if got := len(strings.Split(cm.Data[identityRefusingKey], ",")); got != identityRefusalListMax || !strings.HasPrefix(cm.Data[identityRefusingKey], "u0/r,") {
+	if got := len(strings.Split(cm.Data[identityRefusingKey], ",")); got != identityRefusalListMax || !strings.HasPrefix(cm.Data[identityRefusingKey], "u0=r,") {
 		t.Fatalf("the list changed: %d entries", got)
 	}
 }
