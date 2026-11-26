@@ -476,7 +476,7 @@ func gpuContainer(pod *corev1.Pod) string {
 // criuGroupCaptureLeader reports whether pod is rank 0 of a Ready instance
 // that has not been captured from, and returns its cache URI.
 func criuGroupCaptureLeader(pod *corev1.Pod) (uri string, size int, ok bool) {
-	uri = pod.Annotations[cacheURIAnnotation]
+	uri = criuURI(pod)
 	if uri == "" || pod.DeletionTimestamp != nil || pod.Annotations[webhook.CRIURestoreAnnotation] != "" {
 		return "", 0, false
 	}
@@ -766,7 +766,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	}
 	uris := make([]string, 0, len(ranks)+len(companions))
 	for _, r := range ranks {
-		uris = append(uris, r.Annotations[cacheURIAnnotation])
+		uris = append(uris, criuURI(r))
 	}
 	for _, p := range companions {
 		// The identity its replacement is admitted by: the stamp admission
@@ -1123,10 +1123,16 @@ func (c *criuAutoRestorer) listLeaving(ctx context.Context, key, started string,
 // instanceConfigURI is the configuration of an instance: its ranks' shared
 // configuration, or, when they differ, one derived from all of them in rank
 // order.
+// criuURI is the configuration pod's CRIU records are keyed by: its cache
+// URI qualified by its role (webhook.CRIUURI).
+func criuURI(pod *corev1.Pod) string {
+	return webhook.CRIUURI(pod.Annotations[cacheURIAnnotation], pod)
+}
+
 func instanceConfigURI(ranks []*corev1.Pod) string {
 	uris := make([]string, len(ranks))
 	for i, r := range ranks {
-		uris[i] = r.Annotations[cacheURIAnnotation]
+		uris[i] = criuURI(r)
 	}
 	return instanceConfigURIOf(uris)
 }

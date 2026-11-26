@@ -24,6 +24,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/election"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/metrics"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/rootfsonly"
 )
 
 const (
@@ -150,7 +151,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	if !ok {
 		return nil
 	}
-	g, ok := m.CRIUGroups(ctx, pod.Namespace, uri)
+	g, ok := m.CRIUGroups(ctx, pod.Namespace, CRIUURI(uri, pod))
 	if !ok {
 		return nil
 	}
@@ -307,4 +308,16 @@ func (m *Mutator) companionSlot(ctx context.Context, pod *corev1.Pod, g CRIUGrou
 		return 0, fmt.Errorf("%d identical companions and no slot claims", len(slots))
 	}
 	return m.CRIUCompanionSlot(ctx, pod, g, slots)
+}
+
+// CRIUURI is the configuration a pod's CRIU records are keyed by: its cache
+// URI, and the role of a disaggregated worker (rootfsonly.PodRole). The
+// cache URI leaves the role out so that prefill and decode share one model
+// download, but a checkpoint is of a process: a decode worker restored from
+// a prefill worker's would serve as prefill. Unchanged for a pod of no role.
+func CRIUURI(uri string, pod *corev1.Pod) string {
+	if r := rootfsonly.PodRole(pod); uri != "" && r != "" {
+		return uri + "/role=" + r
+	}
+	return uri
 }

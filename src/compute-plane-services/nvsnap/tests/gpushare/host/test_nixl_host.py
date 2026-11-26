@@ -21,7 +21,7 @@ on both sides). Each fake logs what vLLM would do. The test checks that
   * a release the engine started before the pause's deadline is waited
     for, not reported as a failure while it still runs;
   * a process without vLLM answers ok, and a bad host never reaches Python;
-  * nixl-pause names the process's UCX, and refuses a UCX other than 1.22
+  * nixl-pause names the process's UCX, and refuses a UCX other than 1.21 or 1.22
     (restored into another pod, it would keep the old pod's routes);
   * given a GPU process without a control socket (a vLLM API server), the
     tool prints nothing for it and exits 0.
@@ -425,11 +425,16 @@ class NixlPauseResume(unittest.TestCase):
         self.assertIn("released on 1 worker(s), UCX 1.22.0;", self.ok("nixl-pause"))
         self.assertIn("resumed as engine", self.ok("nixl-resume"))
 
-    def test_pause_refuses_other_ucx(self):
+    def test_pause_accepts_ucx_121(self):
         self.start(UCX_LIB=self.ucp, UCX_MINOR="21")
+        self.assertIn("released on 1 worker(s), UCX 1.21.0;", self.ok("nixl-pause"))
+        self.assertIn("resumed as engine", self.ok("nixl-resume"))
+
+    def test_pause_refuses_other_ucx(self):
+        self.start(UCX_LIB=self.ucp, UCX_MINOR="20")
         p = self.tool("nixl-pause")
         self.assertNotEqual(p.returncode, 0, p.stdout)
-        self.assertIn("UCX 1.21.0 is not 1.22", p.stdout)
+        self.assertIn("UCX 1.20.0 is not 1.21 or 1.22", p.stdout)
         self.assertNotIn("pause_state PAUSED_NEW", self.events())  # refused before pausing
 
     def test_without_vllm(self):
