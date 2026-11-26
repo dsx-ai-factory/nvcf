@@ -15,6 +15,8 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +40,10 @@ const (
 	// companion of the instance: a pod without GPUs that its GPU ranks
 	// were connected to (an etcd, a NATS), captured and restored with them.
 	CRIUGroupCompanionAnnotation = "nvsnap.io/criu-group-companion"
+	// CRIUGroupLabel carries the group record key as a label too, so
+	// nvsnap-server can watch a restore's pods by selector and keep its
+	// history (docs/design/FUNCTION-CACHE-STATUS.md, History).
+	CRIUGroupLabel = "nvsnap.io/criu-group"
 )
 
 // CRIUGroup is a complete group capture: the checkpoint of each rank, in
@@ -60,6 +66,15 @@ type CRIUGroup struct {
 	// ahead of its pod's args, as JSON (ColdEntrypointMeta). Empty for
 	// none recorded.
 	ColdEntrypoints []string
+	// ProcessConfigs holds, by slot, each GPU rank's process
+	// configuration as its pod was admitted (ProcessConfig). Empty for
+	// none recorded: a capture from before it was.
+	ProcessConfigs []string
+	// UnusedVolumes are the emptyDir volumes no restored process of any
+	// member uses, whose setup every placeholder skips
+	// (GroupUnusedVolumes); empty for none, or a capture that did not
+	// decide it.
+	UnusedVolumes []string
 	// VerifyNamespace, when set, is the only namespace that may restore
 	// from the capture: the instance stopped for it, whose restore
 	// verifies it. Empty once a restore has succeeded.
@@ -69,6 +84,13 @@ type CRIUGroup struct {
 	// for identical companions (replicas of one template), any of which a
 	// pod of that configuration can restore. Empty otherwise.
 	Slots []int
+	// Leaving holds the UIDs of the captured pods the agent deletes so
+	// their replacements restore from the capture, written to the record
+	// at LeavingAt, before the first delete. A replacement may be admitted
+	// before the API server has accepted a sibling's delete; such a
+	// sibling is leaving, not running. Empty for none.
+	Leaving   []string
+	LeavingAt time.Time
 }
 
 // Ranks is the number of GPU ranks of the group.
@@ -96,6 +118,24 @@ func (g CRIUGroup) CompanionSlots() []int {
 		out = append(out, s)
 	}
 	return out
+}
+
+// matchingSlots returns the slots whose recorded process configuration
+// matches pc (a slot with none recorded matches), and, when none does,
+// what differs from the first.
+func matchingSlots(slots []int, recorded []string, pc string) (match []int, changed []string) {
+	for _, s := range slots {
+		var c []string
+		if s < len(recorded) {
+			c = ProcessConfigChanges(recorded[s], pc)
+		}
+		if len(c) == 0 {
+			match = append(match, s)
+		} else if changed == nil {
+			changed = c
+		}
+	}
+	return match, changed
 }
 
 // criuGroupRestorePatches admits pod as its member's restore placeholder
@@ -132,10 +172,20 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	var ordinal int
 	if companion {
 		if m.CRIUCompanionAdmits != nil {
-			if ok, why := m.CRIUCompanionAdmits(ctx, pod); !ok {
+			if ok, why := m.CRIUCompanionAdmits(ctx, pod, g); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the companion cannot restore with its instance; cold start")
 				return nil
 			}
+		}
+		// Before a slot is claimed, and only slots whose checkpoint has the
+		// pod's configuration: companions that share a cache URI can
+		// differ in fields it leaves out.
+		var changed []string
+		slots, changed = matchingSlots(slots, g.ProcessConfigs, ProcessConfig(pod))
+		if len(slots) == 0 {
+			log.WithField("changed", strings.Join(changed, ", ")).
+				Info("CRIU group restore: the companion's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
+			return nil
 		}
 	} else {
 		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) {
@@ -151,10 +201,20 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 			admit(metrics.AdmitCold, "size-mismatch")
 			return nil
 		}
+		// The restored process keeps the configuration it was captured
+		// with (process_config.go).
+		if ordinal < len(g.ProcessConfigs) {
+			if changed := ProcessConfigChanges(g.ProcessConfigs[ordinal], ProcessConfig(pod)); len(changed) > 0 {
+				log.WithFields(logrus.Fields{"ordinal": ordinal, "changed": strings.Join(changed, ", ")}).
+					Info("CRIU group restore: the pod's process configuration differs from its checkpoint's, which the restored process would keep; cold start")
+				admit(metrics.AdmitCold, "config-changed")
+				return nil
+			}
+		}
 		// Only an instance of several ranks waits for all of them; one
 		// pod restores alone whatever its controller.
 		if ranks > 1 && m.CRIUGroupAdmits != nil {
-			if ok, why := m.CRIUGroupAdmits(ctx, pod); !ok {
+			if ok, why := m.CRIUGroupAdmits(ctx, pod, g); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the instance cannot restore as a group; cold start")
 				admit(metrics.AdmitCold, "not-restorable-as-group")
 				return nil
@@ -194,6 +254,9 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	if ordinal < len(g.ColdEntrypoints) && g.ColdEntrypoints[ordinal] != "" {
 		man.SourcePodMeta[ColdEntrypointMeta] = g.ColdEntrypoints[ordinal]
 	}
+	if len(g.UnusedVolumes) > 0 {
+		man.SourcePodMeta[unusedVolumesMeta] = strings.Join(g.UnusedVolumes, ",")
+	}
 	id := g.Checkpoints[ordinal]
 	// A capture of one pod with no companions restores alone: nothing it
 	// waits on is a placeholder, so it runs its init containers like a
@@ -209,6 +272,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupOrdinalAnnotation), Value: strconv.Itoa(ordinal)},
 		PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupSizeAnnotation), Value: strconv.Itoa(size)},
 	)
+	cp = append(cp, newMetaPatcher(pod).label(CRIUGroupLabel, key)...)
 	if companion {
 		cp = append(cp, PatchOp{Op: "add", Path: "/metadata/annotations/" + jsonPointerEscape(CRIUGroupCompanionAnnotation), Value: "true"})
 		log.WithFields(logrus.Fields{"checkpoint": id, "slot": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its instance's companion placeholder")
@@ -225,6 +289,8 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 		return nil
 	}
 	cp = append(cp, newMetaPatcher(pod).annotation(CacheURIAnnotation, uri)...)
+	cp = append(cp, m.processConfigPatches(pod)...)
+	cp = append(cp, m.placeholderModelCachePatches(ctx, pod, cp)...)
 	log.WithFields(logrus.Fields{"checkpoint": id, "ordinal": ordinal, "size": size}).Info("CRIU group restore: pod admitted as its rank's restore placeholder")
 	admit(metrics.AdmitRestore, "")
 	return mergePatchPlan(withPIDReserve(pod, append(cp, vp...)))

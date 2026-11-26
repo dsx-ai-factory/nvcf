@@ -82,6 +82,28 @@ func TestMarkRestored_SetsTheCondition(t *testing.T) {
 	}
 }
 
+// markRestored writes the annotation before the condition: the condition
+// makes the pod Ready, and the first event that shows it Ready must
+// already say it was restored, or its start is counted cold.
+func TestMarkRestored_AnnotatesBeforeTheCondition(t *testing.T) {
+	c, kc := trustFixture(t)
+	ctx := context.Background()
+	if _, err := kc.CoreV1().Pods("tenant").Create(ctx, gatedPlaceholder("p", false), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	kc.ClearActions()
+	c.a.markRestored(ctx, "tenant", "p", logrus.NewEntry(logrus.New()))
+	var order []string
+	for _, act := range kc.Actions() {
+		if act.GetVerb() == "patch" {
+			order = append(order, act.GetSubresource())
+		}
+	}
+	if len(order) != 2 || order[0] != "" || order[1] != "status" {
+		t.Fatalf("patches (by subresource) = %q, want the annotation, then the status", order)
+	}
+}
+
 // A restored pod found without its condition gets it only when the agent's
 // own records say it restored the pod: the annotation is the pod's to
 // write.

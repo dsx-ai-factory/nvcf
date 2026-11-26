@@ -39,28 +39,12 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
-// recreatingOwners are the controller kinds known to replace a pod of
-// theirs that is deleted. A pod owned by any other kind, or by none, is
-// treated as one nothing recreates: keeping it costs a cold start in place,
-// deleting it may cost the pod.
-var recreatingOwners = map[string]bool{
-	"ReplicaSet":            true,
-	"ReplicationController": true,
-	"StatefulSet":           true,
-	"DaemonSet":             true,
-	"Job":                   true,
-	"PodClique":             true, // grove.io: Dynamo multi-node graphs
-}
-
 // podRecreatedOnDelete reports whether a controller replaces pod when it is
-// deleted.
+// deleted (webhook.RecreatingOwners). A pod owned by any other kind, or by
+// none, is treated as one nothing recreates: keeping it costs a cold start
+// in place, deleting it may cost the pod.
 func podRecreatedOnDelete(pod *corev1.Pod) bool {
-	for _, o := range pod.OwnerReferences {
-		if o.Controller != nil && *o.Controller && recreatingOwners[o.Kind] {
-			return true
-		}
-	}
-	return false
+	return webhook.PodRecreatedOnDelete(pod)
 }
 
 // coldStarted reports whether pod is a placeholder the agent started cold:
@@ -80,20 +64,33 @@ var errNoColdStart = errors.New("the placeholder cannot start its workload in pl
 // its controller; a pod nothing recreates would just be gone, so it starts
 // its workload cold in place instead, and is deleted only when it cannot.
 // A pod that is no longer the one whose restore failed (deleted, or
-// replaced under the same name) is left alone.
-func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, uid types.UID, container string, log *logrus.Entry) {
+// replaced under the same name) is left alone. It reports whether the
+// placeholder is settled: gone, replaced, started (or marked to start)
+// cold, or deleted. Not when the pod could not be read or deleted: a
+// restore marker kept for it is then kept (releaseNotServing), so an agent
+// that restarts replaces the pod.
+func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, uid types.UID, container string, log *logrus.Entry) bool {
+	return a.disposeFailedPlaceholderIn(ctx, ns, name, uid, container, false, log)
+}
+
+// disposeFailedPlaceholderIn is disposeFailedPlaceholder; inPlace starts
+// the workload cold in place even in a pod its controller would replace
+// (deleted only when it cannot): for a failure of the node, where a
+// replacement could land again.
+func (a *Agent) disposeFailedPlaceholderIn(ctx context.Context, ns, name string, uid types.UID, container string, inPlace bool, log *logrus.Entry) bool {
 	pod, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.WithError(err).Error("CRIU auto-restore failed; cannot read the pod, so it is left as it is")
+			return false
 		}
-		return
+		return true
 	}
 	if uid != "" && pod.UID != uid {
 		log.Warn("CRIU auto-restore failed in a pod that has since been replaced; the replacement is left alone")
-		return
+		return true
 	}
-	if !podRecreatedOnDelete(pod) {
+	if inPlace || !podRecreatedOnDelete(pod) {
 		// A failure that may pass (the runtime or the API server busy, the
 		// pod's status behind its container) is tried again: deleting the
 		// pod is for good. Only a pod that cannot start in place, or keeps
@@ -115,7 +112,7 @@ func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, u
 		})
 		if cerr == nil && permanent == nil {
 			log.Warn("CRIU auto-restore failed in a pod nothing would recreate; its workload starts cold in place")
-			return
+			return true
 		}
 		if permanent != nil {
 			cerr = permanent
@@ -123,13 +120,15 @@ func (a *Agent) disposeFailedPlaceholder(ctx context.Context, ns, name string, u
 		if coldStarted(pod) {
 			// Marked: considerColdStart finishes it on the pod's next event.
 			log.WithError(cerr).Error("CRIU auto-restore failed in a pod nothing would recreate; its cold start in place is marked but not done, and is tried again on the pod's next event")
-			return
+			return true
 		}
 		log.WithError(cerr).Error("CRIU auto-restore failed in a pod nothing would recreate, and it cannot start cold in place; deleting it")
 	}
 	if err := a.deletePodRetrying(ctx, ns, name, pod.UID); err != nil {
 		log.WithError(err).Error("CRIU auto-restore: could not delete the failed pod")
+		return false
 	}
+	return true
 }
 
 // coldStartInPlace starts the workload of placeholder pod's container in
@@ -218,11 +217,13 @@ func (a *Agent) coldStartTarget(ctx context.Context, pod *corev1.Pod, container 
 
 // idleColdStartMarker returns the marker of a NUL-separated command line
 // that is the idle program given a workload to start (nvsnap-idle
-// --cold-start MARKER -- ...). Only the webhook's own marker path counts:
-// the agent writes it as root.
+// --cold-start MARKER -- ...). The program blanks the workload's arguments
+// while it idles, so only "--" may show what follows it; the webhook passes
+// "--" only with a workload, which the program refuses to start without.
+// Only the webhook's own marker path counts: the agent writes it as root.
 func idleColdStartMarker(cmdline []byte) (string, bool) {
 	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
-	if len(args) >= 5 && args[0] == webhook.IdleBin && args[1] == "--cold-start" && args[2] == webhook.ColdStartMarker && args[3] == "--" {
+	if len(args) >= 4 && args[0] == webhook.IdleBin && args[1] == "--cold-start" && args[2] == webhook.ColdStartMarker && args[3] == "--" {
 		return args[2], true
 	}
 	return "", false

@@ -159,6 +159,23 @@ helmfile -e <env> apply
 An invalid mode fails the render fast with a clear error, so a typo cannot
 silently disable HA.
 
+> **Single-member Cassandra:** if your Cassandra runs a single member, do not
+> enable HA by setting the mode and applying. The Cassandra chart raises the
+> `system_auth` replication factor in a hook that runs after the StatefulSet
+> scales, and it does not repair the data, so administrator and service logins can
+> fail while every member shows `UN`. The migration ledger in the `schema_migrations`
+> keyspace is affected the same way, and a migration job then replays migrations
+> that already ran. Expand and repair Cassandra first, with the steps in
+> [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first),
+> then apply. Those steps need the setup from the upgrade guide: `kc` and
+> `BACKUP_DIR` from [Set up the session](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#set-up-the-session),
+> `CONTROL_STACK` from [Get the 1.1.5 packages and check artifacts](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#get-the-115-packages-and-check-artifacts),
+> and the migration ledger that
+> [Back up persistent state](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#back-up-persistent-state)
+> saves for the steps to compare against. Outside the upgrade, set `CONTROL_STACK`
+> to the stack directory that holds your edited `environments/<environment-name>.yaml`
+> and `HELMFILE_ENV` to that name, so the steps read your selected HA mode.
+
 ## What HA changes, by tier
 
 ### Replica-safe Deployments
@@ -211,6 +228,22 @@ safely.)
 > These two charts have no rollout-strategy hook. The Kubernetes default
 > (25% `maxUnavailable` and `maxSurge`) rounds to `maxUnavailable: 0` and
 > `maxSurge: 1` at 2 replicas.
+
+**Multi-cluster installs.** Workers in another cluster need a callback path to
+the pod that holds their request. There are two ways to give it, and they are
+alternatives:
+
+| Callback path | How you set it | `invocation-service` and `grpc-proxy` under HA |
+| --- | --- | --- |
+| A fixed callback URL | For `invocation-service`: `global.workerEndpoints.invocationServiceURL` or `WORKER_STREAM_PROPERTIES__SELF_ADDRESS` in `invocation.env`. For `grpc-proxy`: `global.workerEndpoints.grpcProxyWorkerConnectURL` or `grpcproxy.workerConnectBaseURL`. | A single replica of each service whose URL is set |
+| The [Worker Callback Proxy](./worker-callback-proxy.md) | `workerCallbackProxy.enabled: true`, off by default | Two or more replicas each |
+
+Moving from a fixed URL to the proxy changes a multi-cluster install from a
+single replica to multiple replicas for each service that had a fixed URL. Clear the fixed URL
+settings first, because the stack refuses to render when the proxy is enabled
+together with any of them, then follow the proxy page for the worker domain
+DNS, the worker CA and validation. An upgrade alone does not make this change:
+an install that sets a fixed URL stays at a single replica until you move it.
 
 Under HA each of these gets:
 
@@ -520,7 +553,12 @@ in this order:
    labels, and `WaitForFirstConsumer` storage. If the cluster is not ready (or it
    is a single-node install), set `highAvailability.mode: none` to keep the
    current single-replica behavior.
-4. **Apply.** `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
+4. **Apply.** If Cassandra runs a single member and you chose `preferred` or
+   `enforced`, expand and repair it first with the steps in
+   [Expand a single-member Cassandra first](../overview/release-notes/1.0.1-to-1.1.0-upgrade.md#expand-a-single-member-cassandra-first):
+   the sync would otherwise scale it and run the migration job before the ledger
+   is repaired. If a keyspace also replicates to another data center, read the
+   replication-map note in that section first. Then run `HELMFILE_ENV=<environment-name> helmfile sync`. Replica-safe
    Deployments roll with `maxUnavailable: 0` / `maxSurge: 1` (needs headroom for
    one surge pod); quorum services roll one member at a time and keep quorum.
 5. **Raise Cassandra keyspace replication.** The sync scales Cassandra to three
@@ -529,11 +567,16 @@ in this order:
    unavailable. Once all three Cassandra pods are Ready, raise each application
    keyspace to RF=3, then run a full repair on every member so the new replicas
    receive the existing data. Skip any keyspace your install does not have
-   (the query in [Validation](#validation) lists them):
+   (the query in [Validation](#validation) lists them). If you expanded
+   Cassandra first in step 4, these keyspaces are already at RF=3 and running
+   the block again is safe. The commands use the chart's default data-center
+   name, `ncp`; if you set `cassandra.cluster.datacenter` to another name, use
+   that name instead. Each `ALTER` replaces the whole replication map, so if a
+   keyspace also replicates to another data center, keep that entry in the map:
 
    ```bash
    read -rs -p "Cassandra administrator password: " CASSANDRA_PASSWORD; echo
-   for ks in nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
+   for ks in schema_migrations nvcf_api nvct_api ess_api api_keys_api sis_api event_ledger nvcf_autoscaler; do
      kubectl -n cassandra-system exec cassandra-0 -- \
        cqlsh -u cassandra -p "$CASSANDRA_PASSWORD" \
        -e "ALTER KEYSPACE $ks WITH replication = {'class': 'NetworkTopologyStrategy', 'ncp': '3'};"

@@ -178,7 +178,7 @@ func main() {
 	// once the rox PVC binds; kubelet may stall in
 	// ContainerCreating in the meantime).
 	// One-downloader-per-hash admission election for chart-shaped model
-	// workloads (docs/design/helm-chart-cache-election.md). Needs L2.
+	// workloads (docs/ARCHITECTURE.md, section 7). Needs L2.
 	flag.BoolVar(&config.Election.Enabled, "election", false,
 		"Elect one capture leader per cache hash at admission and gate the other model workers until the capture is promoted (needs L2)")
 	flag.DurationVar(&config.Election.Deadline, "election-deadline", 0,
@@ -196,6 +196,21 @@ func main() {
 		"How long a complete model or cache volume is kept after its last use before the reaper frees its storage (0 = keep forever)")
 	flag.DurationVar(&config.ModelVolume.WaitDeadline, "model-volume-wait-deadline", 0,
 		"How long a reader waits for the writer's download before downloading itself (default 1h)")
+	// Node-local model cache (docs/design/node-model-cache.md).
+	flag.BoolVar(&config.NodeModelCache.Enabled, "node-model-cache", false,
+		"Keep downloaded models on the node's disk and seed later cold pods from it or from a peer node (needs --auth-mode=required; not with --model-volume)")
+	flag.StringVar(&config.NodeModelCache.Root, "node-model-cache-root", "",
+		"Host directory of the node model cache, mounted into the agent at the same path")
+	flag.IntVar(&config.NodeModelCache.MaxPercent, "node-model-cache-max-percent", 30,
+		"Most of the cache filesystem the node model cache may use, in percent")
+	flag.IntVar(&config.NodeModelCache.Wait, "node-model-cache-wait", 600,
+		"Most seconds a download init waits for a peer fetch in progress before downloading itself")
+	flag.DurationVar(&config.NodeModelCache.FetchTimeout, "node-model-cache-fetch-timeout", 30*time.Minute,
+		"Most time one fetch of a model from one peer may take")
+	flag.BoolVar(&config.NodeModelCache.SingleFlight, "node-model-cache-single-flight", false,
+		"One pod per model downloads; the others stream its download from its node (docs/design/model-cache-single-flight.md)")
+	flag.StringVar(&config.NodeModelCache.PodsRoot, "node-model-cache-pods-root", "/var/lib/nvsnap/kubelet-pods",
+		"The kubelet pods directory, mounted read-write: single flight writes waiting pods' volumes there")
 	flag.StringVar(&config.ModelVolume.TenantLabel, "model-volume-tenant-label", "",
 		"Namespace label naming the tenant a namespace belongs to; model volumes are shared only between namespaces of one tenant (empty = --tenant-label)")
 	flag.BoolVar(&config.ModelVolume.RefreshDisabled, "cache-set-refresh-disabled", false,
@@ -217,11 +232,19 @@ func main() {
 	flag.StringVar(&config.Webhook.AgentPlacement, "webhook-agent-placement", "",
 		"The agent DaemonSet's nodeSelector and nodeAffinity as JSON; pods nvsnap creates without a GPU request run within it.")
 
+	flag.BoolVar(&config.Webhook.SkipUnusedInits, "webhook-skip-unused-inits", false,
+		"Let a group restore's placeholders skip the init containers that fill only emptyDirs too large to copy into the checkpoint that no restored process uses (a model download), as the group's capture recorded them.")
+
 	flag.StringVar(&config.Webhook.DynamoNamespace, "webhook-dynamo-namespace", "",
 		"Fixed Dynamo namespace (DYN_NAMESPACE, DYN_NAMESPACE_PREFIX) for Dynamo components whose etcd and NATS are their instance's own; empty keeps the operator's.")
 
+	flag.IntVar(&config.CaptureDiskKeepPercent, "capture-disk-keep-percent", 20,
+		"Share of the checkpoint filesystem, in percent, a capture must leave free (the kubelet evicts every pod on the node below its own threshold, 15% by default); 0 turns the check off.")
 	flag.Int64Var(&config.CRIUGhostLimit, "criu-ghost-limit", 0,
 		"Largest deleted file, in bytes, a CRIU dump saves (criu --ghost-limit), such as an engine's CPU KV-cache tier in /dev/shm; 0 is 1 TiB.")
+
+	flag.IntVar(&config.CRIUMinDriverMajor, "criu-min-driver-major", 0,
+		"Oldest NVIDIA driver major CRIU captures and restores on; with any GPU node older, or the GPU nodes on different majors, GPU pods fall back to the cachedir. 0 is 610.")
 
 	flag.BoolVar(&config.RestoreCapturedAddress, "restore-captured-address", false,
 		"Give a restored pod its captured pod address on its loopback, translated to its new address at its edge, when no other pod uses that address, so sockets opened after the restore can use it (docs/design/RESTORE-POD-ADDRESS.md).")
@@ -233,6 +256,11 @@ func main() {
 		"Seconds of silence every liveness probe is widened to tolerate (its failureThreshold raised), so a capture's freeze does not get the pod restarted; 0 leaves probes as they are.")
 	flag.BoolVar(&config.Webhook.CaptureHold, "webhook-capture-hold", false,
 		"Hold a pod a CRIU capture may freeze out of service (a readiness gate) until the node agent has captured it or decided not to, so that a capture never stops an instance that serves.")
+	flag.BoolVar(&config.Webhook.NIXLPause, "webhook-nixl-pause", false,
+		"Honor the nvsnap.io/nixl-pause pod annotation: a gpushare pod that sets it has its vLLM NIXL KV connector released before a capture and brought back after a restore (docs/design/NIXL-PAUSE.md). Off: the annotation is ignored, and such pods are refused as before.")
+
+	flag.BoolVar(&config.Webhook.GPUShareIBV, "webhook-gpushare-ibv", false,
+		"Point NCCL in every pod under the gpushare library at the bundled verbs library (libnvsnap_ibv.so), so that a workload whose NCCL uses RDMA (IB or RoCE) can be captured; a pod annotated nvsnap.io/gpushare-ibv: \"false\" keeps NCCL's own.")
 
 	flag.StringVar(&config.Webhook.HostBundleRoot, "webhook-host-bundle-root", "",
 		"On-host path the nvsnap-agent DaemonSet stages the restore bundle into (default /var/lib/nvsnap/bundle). Function pods mount {root}/nvsnap + {root}/nvsnap-lib via hostPath.")
@@ -293,6 +321,10 @@ func main() {
 	flag.StringVar(&config.Rails.ServeMemory, "rails-serve-memory", "32Gi", "Memory request and limit of a rails serve pod.")
 	flag.StringVar(&config.Rails.FetchCPU, "rails-fetch-cpu", "32", "CPU request and limit of a rails fetch pod.")
 	flag.StringVar(&config.Rails.FetchMemory, "rails-fetch-memory", "64Gi", "Memory request and limit of a rails fetch pod.")
+	flag.StringVar(&config.Rails.NICMode, "rails-nic-mode", "claim",
+		"How a rails pod gets its node's RDMA NICs: claim (every NIC, through DRA) or host (none claimed; the --rails-devices in the host's network namespace).")
+	flag.StringVar(&config.Rails.Devices, "rails-devices", "",
+		"bedrock-peer --devices: all, netns, or comma-separated RDMA device names (empty: all when claiming, netns on host NICs).")
 	flag.IntVar(&config.Rails.KeepFreePercent, "rails-keep-free-percent", 0,
 		"Share of the checkpoint filesystem a rails copy must leave free (0: 10).")
 

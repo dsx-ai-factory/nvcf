@@ -31,6 +31,7 @@ const (
 	CaptureFailed         = "failed"          // the capture itself failed
 	CaptureRefused        = "refused"         // the preflight refused the configuration
 	CaptureGPUShareFailed = "gpushare-failed" // the pod never started under the library
+	CaptureAbandoned      = "abandoned"       // its namespace went before a restore of it served
 )
 
 // Restore outcomes.
@@ -42,6 +43,12 @@ const (
 	// RestoreGPUFault ran and failed on a GPU the probe found faulty: not
 	// counted against the capture.
 	RestoreGPUFault = "gpu-fault"
+)
+
+// Teardown outcomes.
+const (
+	TeardownReleased = "released" // every rank of the restore exited; the pod went
+	TeardownDeadline = "deadline" // the grace period ran out first; the pod was killed
 )
 
 // GPU probe results: the probe of a GPU a failed pod was given.
@@ -101,8 +108,9 @@ var (
 	}, []string{"method", "outcome", "reason", "gpu", "ranks"})
 
 	// RestorePhaseSeconds is the time a restore spent in a phase: per rank
-	// "criu", "gpu" (GPU state reload and resume) and "rank" (the node's
-	// whole restore); per instance
+	// "criu", "gpu" (GPU state reload and resume), "clock_wait" (the part of
+	// "gpu" spent waiting for the restored clocks to reach the dump) and
+	// "rank" (the node's whole restore); per instance
 	// "group" (placeholders running to every rank restored) and "ready"
 	// (restored to the pod Ready).
 	RestorePhaseSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -175,6 +183,75 @@ var (
 		Help:      "Probes of the GPUs of a pod that failed, by GPU product, result and CUDA error.",
 	}, []string{"gpu", "result", "error"})
 
+	// PodStartSeconds is a GPU pod's time from being scheduled, its GPUs
+	// given to it, to Ready, by how it started: the scale-up time. Unlike
+	// PodReadySeconds it leaves out the time the pod waited for GPUs (a
+	// restored instance's pods wait for the instance it replaces to go).
+	PodStartSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Name:      "pod_start_seconds",
+		Help:      "GPU pod time from scheduled to Ready (scale-up), by how it started.",
+		Buckets:   secondsBuckets,
+	}, []string{"method", "gpu", "ranks"})
+
+	// TeardownOutcomes counts how restored ranks' group teardowns ended:
+	// released (every rank of the restore exited, then the pod went) or
+	// deadline (the pod's grace period ran out first, so it was killed).
+	TeardownOutcomes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "teardown_outcomes_total",
+		Help:      "Group teardowns of restored ranks by outcome: released, or deadline (killed at the end of the grace period).",
+	}, []string{"outcome", "gpu", "ranks"})
+
+	// TeardownSeconds is a released rank's time from its delete to every
+	// rank of its restore having exited.
+	TeardownSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Name:      "teardown_seconds",
+		Help:      "Time from a restored rank's delete to every rank of its restore having exited.",
+		Buckets:   secondsBuckets,
+	}, []string{"gpu", "ranks"})
+
+	// CaptureRecords is the number of capture records (the cached
+	// captures restores use) by state and the agent bundle that made them;
+	// an alias of a record is state "alias". Exported by one agent of the
+	// cluster (the inventory leader).
+	CaptureRecords = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "capture_records",
+		Help:      "Capture records by state and the agent bundle that made them (inventory leader only).",
+	}, []string{"state", "bundle"})
+
+	// CaptureRecordOldestSeconds is the age of the oldest capture record
+	// in each state: a record stuck verifying shows here.
+	CaptureRecordOldestSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "capture_record_oldest_seconds",
+		Help:      "Age of the oldest capture record in each state (inventory leader only).",
+	}, []string{"state"})
+
+	// CaptureRecordsUnrestored is the number of complete (verified)
+	// capture records no restore has used since their verifying restore.
+	CaptureRecordsUnrestored = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "capture_records_unrestored",
+		Help:      "Verified capture records not restored since they were verified (inventory leader only).",
+	})
+
+	// InventoryLeader is 1 on the agent that exports the capture-record
+	// inventory, and InventoryScanTimestamp the time its last scan of the
+	// records succeeded.
+	InventoryLeader = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "inventory_leader",
+		Help:      "1 on the agent that exports the capture-record inventory.",
+	})
+	InventoryScanTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Name:      "inventory_scan_timestamp_seconds",
+		Help:      "Unix time of the inventory leader's last successful scan of the capture records.",
+	})
+
 	// BuildInfo is 1 for the agent bundle this agent serves; join on it to
 	// compare releases.
 	BuildInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -185,10 +262,40 @@ var (
 )
 
 // lifecycleCollectors are registered with the agent's.
+// Node-local model cache (docs/design/node-model-cache.md).
+var (
+	// ModelCacheInits counts wrapped download inits that finished, by
+	// what filled the volume: seeded from the cache, downloaded, or the
+	// download failed.
+	ModelCacheInits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_inits_total",
+		Help:      "Model download inits the node cache wraps, by how the volume was filled: seeded, downloaded, failed.",
+	}, []string{"result"})
+
+	// ModelCacheOps counts the agent's cache operations: harvest (keep a
+	// finished download), fetch (copy a key from a peer), evict.
+	ModelCacheOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_operations_total",
+		Help:      "Node model cache operations by kind (harvest, fetch, evict) and result (ok, error, skipped).",
+	}, []string{"op", "result"})
+
+	// ModelCacheBytes counts the bytes harvests and fetches wrote.
+	ModelCacheBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Name:      "model_cache_bytes_total",
+		Help:      "Bytes the node model cache wrote, by operation (harvest, fetch).",
+	}, []string{"op"})
+)
+
 var lifecycleCollectors = []prometheus.Collector{
 	CaptureOutcomes, CapturePhaseSeconds, CaptureBytes,
 	RestoreOutcomes, RestorePhaseSeconds, RestoreFetches, RestoreFetchSeconds,
-	PodReadySeconds, Admissions, WebhookRequests, WebhookSeconds, GPUProbes, BuildInfo,
+	PodReadySeconds, PodStartSeconds, TeardownOutcomes, TeardownSeconds,
+	CaptureRecords, CaptureRecordOldestSeconds, CaptureRecordsUnrestored, InventoryLeader, InventoryScanTimestamp,
+	Admissions, WebhookRequests, WebhookSeconds, GPUProbes, BuildInfo,
+	ModelCacheInits, ModelCacheOps, ModelCacheBytes,
 }
 
 // Ranks buckets an instance size: the label stays bounded for instances of
@@ -225,12 +332,64 @@ func GPU(product string) string {
 	return product
 }
 
+// The texts Reason classes as the workload's own doing, as the agent
+// writes them into a capture's error (lower case: Reason matches them in
+// the lowered text).
+const (
+	// WorkloadExitedText: the container's process was gone when its dump
+	// failed.
+	WorkloadExitedText = "the workload exited during the capture"
+	// NoGPUProcessText: a multi-node instance's pod had no process on the
+	// GPU under the gpushare library to capture.
+	NoGPUProcessText = "no process of this pod runs on the gpu"
+	// ModelExpressVersionText: the workload loads its weights through a
+	// ModelExpress older than 0.7, which cannot release its state for a
+	// capture (the GPU tool's mx-pause refuses it). Not captured until
+	// the workload updates ModelExpress.
+	ModelExpressVersionText = "needs modelexpress >= 0.7"
+)
+
+// The texts Reason classes as a capture that broke the workload it left
+// running: nvsnap's doing, which the capture alert counts.
+const (
+	// GPUFaultText: the node's kernel reported a GPU fault (an NVLink
+	// Xid) on the workload's GPUs between the start of a leave-running
+	// capture and its resume (internal/agent/kmsg.go).
+	GPUFaultText = "the kernel reported a gpu fault during the capture"
+	// ResumeStalledText: a leave-running capture resumed the workload, but
+	// it stopped serving after (internal/agent/resume_guard.go).
+	ResumeStalledText = "the workload stopped making progress after resume"
+)
+
+// BundleUnavailableText starts the error of a restore that cannot run
+// because no node has the bundle version its checkpoint recorded (lower
+// case, as Reason matches it).
+const BundleUnavailableText = "bundle version unavailable"
+
 // Reason classes a failure's text into a bounded label value.
 func Reason(text string) string {
 	t := strings.ToLower(text)
 	switch {
 	case t == "":
 		return ""
+	// An outcome the agent names itself, ahead of any text it carries
+	// (a peer's name may hold "mptcp" or "gpushare").
+	case strings.HasPrefix(t, BundleUnavailableText):
+		return "bundle_unavailable"
+	// A GPU fault the capture raised, next: a workload that exited, or
+	// stopped, after one did so because of it.
+	case strings.Contains(t, GPUFaultText):
+		return "gpu_xid"
+	// The workload's own doing, checked next: the rest of the text is
+	// what the capture ran into because of it.
+	case strings.Contains(t, WorkloadExitedText):
+		return "workload_exited"
+	case strings.Contains(t, NoGPUProcessText):
+		return "no_gpu_process"
+	case strings.Contains(t, ModelExpressVersionText):
+		return "modelexpress_version"
+	case strings.Contains(t, ResumeStalledText):
+		return "resume_stalled"
 	case strings.Contains(t, "mptcp"):
 		return "mptcp"
 	case strings.Contains(t, "no nvsnap agent"):
@@ -250,9 +409,20 @@ func Reason(text string) string {
 	}
 }
 
+// count adds one to v's series of labels, held on its first sight
+// (first_sight.go).
+func count(name string, v *prometheus.CounterVec, labels ...string) {
+	sight.observe(name, labels, func() { v.WithLabelValues(labels...) }, func() { v.WithLabelValues(labels...).Inc() })
+}
+
+// observe records x in h's series of labels, held on its first sight.
+func observe(name string, h *prometheus.HistogramVec, x float64, labels ...string) {
+	sight.observe(name, labels, func() { h.WithLabelValues(labels...) }, func() { h.WithLabelValues(labels...).Observe(x) })
+}
+
 // ObserveCapture counts a capture's outcome.
 func ObserveCapture(method, outcome, reason, gpu string, ranks int) {
-	CaptureOutcomes.WithLabelValues(method, outcome, reason, GPU(gpu), Ranks(ranks)).Inc()
+	count("capture_outcomes", CaptureOutcomes, method, outcome, reason, GPU(gpu), Ranks(ranks))
 }
 
 // ObserveCapturePhase records the time a capture spent in phase.
@@ -260,7 +430,7 @@ func ObserveCapturePhase(method, phase, gpu string, ranks int, d time.Duration) 
 	if d < 0 {
 		return
 	}
-	CapturePhaseSeconds.WithLabelValues(method, phase, GPU(gpu), Ranks(ranks)).Observe(d.Seconds())
+	observe("capture_phase", CapturePhaseSeconds, d.Seconds(), method, phase, GPU(gpu), Ranks(ranks))
 }
 
 // ObserveCaptureBytes records the size of a part of a rank's capture; an
@@ -269,12 +439,12 @@ func ObserveCaptureBytes(method, part, gpu string, n int64) {
 	if n <= 0 {
 		return
 	}
-	CaptureBytes.WithLabelValues(method, part, GPU(gpu)).Observe(float64(n))
+	observe("capture_bytes", CaptureBytes, float64(n), method, part, GPU(gpu))
 }
 
 // ObserveRestore counts a restore's outcome.
 func ObserveRestore(method, outcome, reason, gpu string, ranks int) {
-	RestoreOutcomes.WithLabelValues(method, outcome, reason, GPU(gpu), Ranks(ranks)).Inc()
+	count("restore_outcomes", RestoreOutcomes, method, outcome, reason, GPU(gpu), Ranks(ranks))
 }
 
 // ObserveRestorePhase records the time a restore spent in phase.
@@ -282,7 +452,7 @@ func ObserveRestorePhase(method, phase, gpu string, ranks int, d time.Duration) 
 	if d < 0 {
 		return
 	}
-	RestorePhaseSeconds.WithLabelValues(method, phase, GPU(gpu), Ranks(ranks)).Observe(d.Seconds())
+	observe("restore_phase", RestorePhaseSeconds, d.Seconds(), method, phase, GPU(gpu), Ranks(ranks))
 }
 
 // ObserveFetch records a checkpoint fetch from source that took d.
@@ -294,9 +464,9 @@ func ObserveFetch(source string, ok bool, d time.Duration) {
 	if !ok {
 		result = "failed"
 	}
-	RestoreFetches.WithLabelValues(source, result).Inc()
+	count("restore_fetches", RestoreFetches, source, result)
 	if ok {
-		RestoreFetchSeconds.WithLabelValues(source).Observe(d.Seconds())
+		observe("restore_fetch", RestoreFetchSeconds, d.Seconds(), source)
 	}
 }
 
@@ -305,22 +475,41 @@ func ObservePodReady(method, gpu string, ranks int, d time.Duration) {
 	if d < 0 {
 		return
 	}
-	PodReadySeconds.WithLabelValues(method, GPU(gpu), Ranks(ranks)).Observe(d.Seconds())
+	observe("pod_ready", PodReadySeconds, d.Seconds(), method, GPU(gpu), Ranks(ranks))
+}
+
+// ObservePodStart records a GPU pod's time from being scheduled (its GPUs
+// given to it) to Ready.
+func ObservePodStart(method, gpu string, ranks int, d time.Duration) {
+	if d < 0 {
+		return
+	}
+	observe("pod_start", PodStartSeconds, d.Seconds(), method, GPU(gpu), Ranks(ranks))
+}
+
+// ObserveTeardown records how a restored rank's group teardown ended
+// (TeardownReleased or TeardownDeadline) and, released, how long from
+// its delete it took.
+func ObserveTeardown(outcome, gpu string, ranks int, d time.Duration) {
+	count("teardown_outcomes", TeardownOutcomes, outcome, GPU(gpu), Ranks(ranks))
+	if outcome == TeardownReleased && d >= 0 {
+		observe("teardown", TeardownSeconds, d.Seconds(), GPU(gpu), Ranks(ranks))
+	}
 }
 
 // CountAdmission counts a webhook decision.
 func CountAdmission(decision, reason string) {
-	Admissions.WithLabelValues(decision, reason).Inc()
+	count("admissions", Admissions, decision, reason)
 }
 
 // ObserveGPUProbe counts the probe of one GPU.
 func ObserveGPUProbe(gpu, result, cudaError string) {
-	GPUProbes.WithLabelValues(GPU(gpu), result, cudaError).Inc()
+	count("gpu_probes", GPUProbes, GPU(gpu), result, cudaError)
 }
 
 // ObserveWebhook records an admission request answered with code in d.
 func ObserveWebhook(code int, d time.Duration) {
-	WebhookRequests.WithLabelValues(strconv.Itoa(code)).Inc()
+	count("webhook_requests", WebhookRequests, strconv.Itoa(code))
 	WebhookSeconds.Observe(d.Seconds())
 }
 
@@ -331,4 +520,25 @@ func SetBuildInfo(version string) {
 	}
 	BuildInfo.Reset()
 	BuildInfo.WithLabelValues(version).Set(1)
+}
+
+// CountModelCacheInit counts how a wrapped download init filled its
+// volume (seeded, downloaded, failed), held on first sight.
+func CountModelCacheInit(result string) {
+	count("model_cache_inits", ModelCacheInits, result)
+}
+
+// CountModelCacheOp counts a node model cache operation (harvest, fetch,
+// evict) by result, held on first sight.
+func CountModelCacheOp(op, result string) {
+	count("model_cache_operations", ModelCacheOps, op, result)
+}
+
+// AddModelCacheBytes adds the n bytes op wrote, held on first sight.
+func AddModelCacheBytes(op string, n int64) {
+	if n <= 0 {
+		return
+	}
+	sight.observe("model_cache_bytes", []string{op}, func() { ModelCacheBytes.WithLabelValues(op) },
+		func() { ModelCacheBytes.WithLabelValues(op).Add(float64(n)) })
 }

@@ -1103,7 +1103,7 @@ func defaultOutputs() []OutputFile {
 			Path: "docs/overview/umbrella-releases.md",
 			Blocks: []OutputBlock{{
 				Marker:   "stack-package-downloads",
-				Renderer: "stack-package-downloads",
+				Renderer: "stack-package-downloads-fail-fast",
 			}},
 		},
 		{

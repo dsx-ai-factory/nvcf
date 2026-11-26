@@ -10,7 +10,7 @@ import unittest
 
 SCRIPTS = Path(__file__).parent.resolve()
 SCRIPT = SCRIPTS / "check-upgrade-image-moves.py"
-GUIDE = SCRIPTS.parents[1] / "release-notes/1.0.x-to-1.1.0-upgrade.md"
+GUIDE = SCRIPTS.parents[1] / "release-notes/1.0.1-to-1.1.0-upgrade.md"
 
 
 def deployment(namespace, name, *images):

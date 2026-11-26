@@ -53,7 +53,8 @@ Each request is normalized into a function-scoped request context.
   downstream model is forwarded through headers.
 - `Authorization: Bearer ...` is treated as the caller principal for telemetry
   and is forwarded to NVCF gRPC auth when that adapter is configured.
-- `X-Request-ID` is accepted if present, otherwise the gateway generates one.
+- `X-Request-ID` is kept when it is at most 128 characters and uses `A-Z`,
+  `a-z`, `0-9`, `.`, `_`, `:`, or `-`. Otherwise the gateway generates one.
 - `X-NVCF-Target-Region` is forwarded into the request context.
 - `X-Priority` is reserved for the gateway and derived from the caller's
   resolved priority; a client-supplied `X-Priority` on the LLM endpoints is
@@ -66,6 +67,8 @@ tokenization are not gateway-owned surfaces.
 When a request is forwarded to Stargate, the gateway emits routing headers for
 the selected function/model and estimated prompt size, including
 `x-routing-key`, `x-model`, `x-input-tokens`, and `x-token-estimate`.
+On every route it removes `Authorization`, `X-Api-Key`, `Proxy-Authorization`,
+and `Cookie`, because caller credentials authorize NVCF, not the model server.
 
 For OpenAI-compatible multi-turn stickiness, chat completions and responses
 accept `prompt_cache_key` and return the selected session value in

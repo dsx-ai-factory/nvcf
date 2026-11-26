@@ -958,6 +958,12 @@ type WorkloadConfig struct {
 
 	// TransportTLS configures trust material used by workload transport clients.
 	TransportTLS *TransportTLSConfig `yaml:",omitempty"`
+
+	// LLMInferenceStopPause is how long the inference container of an LLM
+	// container function keeps running after its pod is deleted, so it serves
+	// the requests Pylon is still draining. Pylon's drain timeout and the
+	// pod's grace period are derived from it. Zero uses the translator default.
+	LLMInferenceStopPause time.Duration `yaml:",omitempty"`
 }
 
 // TrustMode controls how the NVCA agent's LLM worker pins the QUIC TLS
@@ -1100,8 +1106,22 @@ func (t WorkloadConfig) Validate() error {
 	if err := t.WorkerInitDownload.Validate(); err != nil {
 		return err
 	}
+	if t.LLMInferenceStopPause != 0 &&
+		(t.LLMInferenceStopPause < MinLLMInferenceStopPause || t.LLMInferenceStopPause > MaxLLMInferenceStopPause) {
+		return fmt.Errorf("workload.llmInferenceStopPause must be between %s and %s, got %s",
+			MinLLMInferenceStopPause, MaxLLMInferenceStopPause, t.LLMInferenceStopPause)
+	}
 	return nil
 }
+
+const (
+	// MinLLMInferenceStopPause leaves Pylon at least 5s of drain after its
+	// own 5s shutdown allowance.
+	MinLLMInferenceStopPause = 10 * time.Second
+	// MaxLLMInferenceStopPause bounds how long a removed LLM pod can hold
+	// its GPU.
+	MaxLLMInferenceStopPause = time.Hour
+)
 
 func (t WorkloadConfig) Complete() WorkloadConfig {
 	t.WorkloadTimeConfig = t.WorkloadTimeConfig.Complete()
@@ -1124,6 +1144,7 @@ const (
 	defaultNamespaceStuckTimeout                     = 5 * time.Minute
 	defaultFailingObjectsBackoffTimeout              = 90 * time.Second
 	defaultFailingObjectsBackoffRequeueInterval      = 30 * time.Second
+	defaultWorkerContainerRestartCountToFailInstance = int32(3)
 )
 
 type WorkloadTimeConfig struct {
@@ -1157,6 +1178,9 @@ type WorkloadTimeConfig struct {
 	FailingObjectsBackoffTimeout time.Duration `yaml:",omitempty"`
 	// FailingObjectsBackoffRequeueInterval is the interval to requeue reconciliation when objects are failing within the backoff period.
 	FailingObjectsBackoffRequeueInterval time.Duration `yaml:",omitempty"`
+	// WorkerContainerRestartCountToFailInstance is the NVCA worker container restart count at which a Pod is
+	// considered to be in a restart loop and its instance is marked failed. Other containers always use 3.
+	WorkerContainerRestartCountToFailInstance int32 `yaml:",omitempty"`
 }
 
 // Complete sets defaults on WorkloadTimeConfig. It panics if some field is not set or defaulted.
@@ -1205,6 +1229,9 @@ func (t WorkloadTimeConfig) Complete() WorkloadTimeConfig {
 	}
 	if t.FailingObjectsBackoffRequeueInterval == 0 {
 		t.FailingObjectsBackoffRequeueInterval = defaultFailingObjectsBackoffRequeueInterval
+	}
+	if t.WorkerContainerRestartCountToFailInstance <= 0 {
+		t.WorkerContainerRestartCountToFailInstance = defaultWorkerContainerRestartCountToFailInstance
 	}
 
 	panicOnUnsetFields(t)

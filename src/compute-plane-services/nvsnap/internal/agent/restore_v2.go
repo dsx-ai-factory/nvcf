@@ -112,14 +112,23 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// From here the restore changes the placeholder; a marker names it until
 	// the restore ends, so the next run of an agent that stops mid-restore
 	// replaces it rather than leave a tree half restored (capture_marker.go).
+	// A restore whose engine runs and takes no requests hands the marker
+	// to whoever disposes of the placeholder (restoreTail.run): an agent
+	// that stops before the disposal replaces it on its next run.
+	clearMarker, markerKept := func() {}, false
 	if uid := placeholderInfo.Labels["io.kubernetes.pod.uid"]; uid != "" {
-		clearMarker, merr := a.markCapturing(captureMarker{Namespace: placeholderInfo.Labels["io.kubernetes.pod.namespace"],
+		c, merr := a.markCapturing(captureMarker{Namespace: placeholderInfo.Labels["io.kubernetes.pod.namespace"],
 			Pod: placeholderInfo.Labels["io.kubernetes.pod.name"], UID: uid})
 		if merr != nil {
 			return nil, merr
 		}
-		defer clearMarker()
+		clearMarker = c
 	}
+	defer func() {
+		if !markerKept {
+			clearMarker()
+		}
+	}()
 
 	// Refuse to restore into a placeholder that never pushed its own pid
 	// allocations clear of the dumped range. CRIU recreates the dumped tree at
@@ -208,6 +217,14 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 			return nil, fmt.Errorf("gpushare: %s is not in the placeholder's node bundle (version %s predates gpushare)", gpushareToolName, tools.version)
 		}
 	}
+	// A restore that could not bring a paused NIXL KV connector back is
+	// refused before CRIU runs, as a restore that did not run here. The
+	// tool's pid is the restored tree's, known after its GPU resume.
+	toolPID := 0
+	resumeNIXL, nerr := a.nixlResumeFor(ctx, gs, tools.gpuToolText(), metadata.SourcePodIP, group, &toolPID, log)
+	if nerr != nil {
+		return nil, nerr
+	}
 	// A group restore's session: the driver learns from it that this pod
 	// is restored, and answers with the unlock (and, for gpushare, the
 	// handle exchange of the resume).
@@ -240,7 +257,22 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// the GPU resume: every task stays stopped until the clocks are there
 	// (restore_clock_gpu.go).
 	clockThroughGPU := gs != nil && clockThroughGPUSupported(a.agentCRIUHelp(), tools.gpuToolText())
-	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU); clockArgs != nil {
+	// firstOnNode: this node has no restore of this checkpoint on record. Its
+	// span is then a sample of the cluster's learned spans
+	// (restore_span_learned.go), which are for exactly such restores.
+	firstOnNode := !hasRestoreSpan(checkpointDir)
+	spanMS, spanLearned := group.SpanMS, group.SpanLearned
+	if clockThroughGPU && spanMS == 0 && firstOnNode {
+		// A restore of its own, the first of this checkpoint on this node:
+		// the cluster's learned span, bounded by the estimate.
+		if gpu, members, size := checkpointShape(metadata); gpu != "" {
+			if ms, ok := a.learnedRestoreSpan(ctx, gpu, members, size); ok {
+				spanMS, spanLearned = ms, true
+				log.WithField("learnedSpanMs", ms).Info("criu-v2: no restore of this checkpoint on this node yet; budgeting the clocks with the cluster's learned span")
+			}
+		}
+	}
+	if clockArgs, budget := restoreClockArgs(checkpointDir, criuSupportsTimensBudget(a.agentCRIUHelp()), clockThroughGPU, spanMS, spanLearned); clockArgs != nil {
 		args = append(args, clockArgs...)
 		msg := "criu-v2: the restored clocks continue from the dump once the restore has taken its budget"
 		if clockThroughGPU {
@@ -354,7 +386,6 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 	// resumeGPU reloads the restored processes' GPU memory (gpushare);
 	// holdGate keeps their GPU launches waiting until gpushareOpen. toolPID
 	// is the pid the resume tool entered, once it ran, for gpushareOpen.
-	toolPID := 0
 	var clockAt int64
 	// clockWait is how long the GPU resume waited for the dumped clock:
 	// not part of the restore's work, so not of the next one's budget.
@@ -386,6 +417,15 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		spent := time.Since(criuStart) - clockWait
 		if err := recordRestoreSpan(checkpointDir, spent); err != nil {
 			log.WithError(err).Warn("criu-v2: cannot record the restore's length; the next one estimates its clock budget")
+		}
+		if gpu, members, size := checkpointShape(metadata); gpu != "" && firstOnNode {
+			// In the background: the rank reports restored, and its group
+			// unlocks, without waiting on the API server.
+			go func(ctx context.Context) {
+				if err := a.recordLearnedSpan(ctx, gpu, members, size, spent); err != nil {
+					log.WithError(err).Warn("criu-v2: cannot add the restore's length to the cluster's learned spans")
+				}
+			}(context.WithoutCancel(ctx))
 		}
 		log.WithFields(logrus.Fields{"tasks": n, "restoreSpan": spent.Round(time.Millisecond).String()}).
 			Info("criu-v2: the restored tasks resumed with their clocks at the dumped values; recorded the restore's length for the next one's clock budget")
@@ -426,8 +466,11 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		toolPID = resumePID
 		// Run to its end under its own deadline: cut off by the agent
 		// stopping, it would leave the tree stopped without its GPU memory.
-		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, clockAt, log)
+		waited, err := gpushareResumeWithGPUsOf(context.WithoutCancel(ctx), resumePID, hostPID, gs.PIDs, gpuMap, fabricDir, holdGate, 0, clockAt, log)
 		clockWait = waited
+		if clockThroughGPU {
+			times.add("clock_wait", waited)
+		}
 		if err != nil {
 			gsSpan.RecordError(err)
 			gsSpan.SetStatus(codes.Error, "gpushare resume failed")
@@ -438,50 +481,32 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 		return nil
 	}
 
-	if sess != nil {
-		// A GPU rank of a group reloads its GPU memory before it reports
-		// restored, its network still locked: the instance's members
-		// without GPU state are restored only once every rank has, so an
-		// etcd among them does not count the reload against its leases
-		// (gpushare_group_restore.go).
-		//
-		// Its GPU launches are held until every pod of the instance has
-		// resumed (gpushareOpen). The unlock below is that point: a pod
-		// reports restored only after its resume, and the unlock comes once
-		// every pod has. On any other outcome they stay held
-		// (openHeldGPUOnUnlock).
-		if gs != nil {
-			if err := resumeGPU(true); err != nil {
-				return nil, err
-			}
-			if err := continueTasks(); err != nil {
-				return nil, err
-			}
-		}
-		// Every pod of the instance must be restored before any of them
-		// sends: hold the lock until the driver says so, then release it in
-		// this pod's network namespace.
-		verdict, err := sess.awaitUnlock(ctx, log)
-		if err := openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
-			if gs == nil {
-				return nil
-			}
-			return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
-		}); err != nil {
-			return nil, err
-		}
-		if group.InetAddrMap != "" {
-			if err := netUnlock(ctx, hostPID, checkpointDir, log); err != nil {
-				return nil, err
-			}
-		}
-	} else if gs != nil {
-		if err := resumeGPU(false); err != nil {
-			return nil, err
-		}
-		if err := continueTasks(); err != nil {
-			return nil, err
-		}
+	tail := restoreTail{
+		group: sess != nil, gpu: gs != nil, netUnlock: group.InetAddrMap != "", placeholder: placeholderInfo,
+		resumeGPU: resumeGPU, continueTasks: continueTasks,
+		awaitOpen: func() error {
+			// Every pod of the instance must be restored before any of them
+			// sends: hold the lock until the driver says so, then release it
+			// in this pod's network namespace.
+			verdict, err := sess.awaitUnlock(ctx, log)
+			return openHeldGPUOnUnlock(group.Session, verdict, err, func() error {
+				if gs == nil {
+					return nil
+				}
+				return gpushareOpen(context.WithoutCancel(ctx), toolPID, gs.PIDs, log)
+			})
+		},
+		unlockNet:  func() error { return netUnlock(ctx, hostPID, checkpointDir, log) },
+		resumeNIXL: resumeNIXL,
+		resumeMX: func() {
+			goResumeRestoredModelExpress(ctx, gs, tools.gpuToolText(), toolPID, a.restoredMXHostFor(ctx, gs, metadata.SourcePodIP, group, tools.gpuToolText()), log)
+		},
+	}
+	tail.releaseMarker = clearMarker
+	err = tail.run()
+	markerKept = tail.markerKept
+	if err != nil {
+		return nil, err
 	}
 
 	duration := time.Since(startTime).Seconds()
@@ -732,4 +757,86 @@ func parsePstreeIDs(b []byte) (map[int]bool, error) {
 		}
 	}
 	return ids, nil
+}
+
+// restoreTail is the end of a restore once CRIU has restored the tree:
+// the GPU resume, the restored tasks let go, a group's open and network
+// unlock, then the NIXL KV connector (checked) and ModelExpress. Its
+// steps are functions, which tests replace.
+type restoreTail struct {
+	// group: a member of a group restore (a fabric session); gpu: the
+	// tree is under the gpushare library; netUnlock: the group's network
+	// is locked behind an address map.
+	group, gpu, netUnlock bool
+	placeholder           *containerd.ContainerInfo
+
+	resumeGPU     func(holdGate bool) error
+	continueTasks func() error
+	awaitOpen     func() error
+	unlockNet     func() error
+	resumeNIXL    func() error
+	resumeMX      func()
+	// releaseMarker removes the placeholder's restore marker
+	// (capture_marker.go). run hands it to a restoredNotServing failure,
+	// and sets markerKept: the marker stays until the placeholder is
+	// disposed of, so an agent that stops first replaces it on its next
+	// run.
+	releaseMarker func()
+	markerKept    bool
+}
+
+// run runs t's steps in order. A GPU rank of a group reloads its GPU memory
+// before it reports restored, its network still locked: the instance's
+// members without GPU state are restored only once every rank has, so an
+// etcd among them does not count the reload against its leases
+// (gpushare_group_restore.go). Its GPU launches are held until every pod
+// of the instance has resumed (gpushareOpen): the unlock is that point, as
+// a pod reports restored only after its resume and the unlock comes once
+// every pod has; on any other outcome they stay held
+// (openHeldGPUOnUnlock). After the network unlock, the NIXL KV connector
+// listens and ModelExpress republishes over it. The engine takes no
+// requests until its connector is back, so a failed resume fails the
+// restore; outside a group, it is marked restoredNotServing, for the
+// placeholder to be disposed of (a group's leader disposes of its
+// members).
+func (t *restoreTail) run() error {
+	if t.group {
+		if t.gpu {
+			if err := t.resumeGPU(true); err != nil {
+				return err
+			}
+			if err := t.continueTasks(); err != nil {
+				return err
+			}
+		}
+		if err := t.awaitOpen(); err != nil {
+			return err
+		}
+		if t.netUnlock {
+			if err := t.unlockNet(); err != nil {
+				return err
+			}
+		}
+		if err := t.resumeNIXL(); err != nil {
+			return err
+		}
+		t.resumeMX()
+		return nil
+	}
+	if !t.gpu {
+		return nil
+	}
+	if err := t.resumeGPU(false); err != nil {
+		return err
+	}
+	if err := t.continueTasks(); err != nil {
+		return err
+	}
+	if err := t.resumeNIXL(); err != nil {
+		e := restoredNotServing(t.placeholder, err).(*restoredNotServingError)
+		e.release, t.markerKept = t.releaseMarker, t.releaseMarker != nil
+		return e
+	}
+	t.resumeMX()
+	return nil
 }

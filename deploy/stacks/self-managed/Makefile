@@ -3,6 +3,7 @@ include Makefile.dist
 
 .PHONY: test test-published-charts
 test:
+	@tests/vanity-request-size.sh
 	@tests/custom-observability-environment.sh
 	@tests/llm-gateway-auth-transport.sh
 	@tests/llm-router-worker-address.sh
@@ -15,6 +16,7 @@ test:
 	@tests/gateway-routes-default-ownership.sh
 	@tests/grpc-proxy-nats-endpoint.sh
 	@tests/grpc-proxy-event-ledger-addr.sh
+	@tests/event-ledger-dependencies.sh
 	@tests/nats-image-overrides.sh
 	@tests/cert-manager-image-overrides.sh
 	@tests/llm-pki-openbao-migration.sh
@@ -37,6 +39,7 @@ test:
 	@tests/image-override-wiring.sh
 	@tests/sidecar-registry-wiring.sh
 	@tests/api-env-wiring.sh
+	@tests/account-bootstrap-wiring.sh
 	@tests/apikeys-env-wiring.sh
 	@tests/notary-env-wiring.sh
 	@tests/ess-base-url-wiring.sh

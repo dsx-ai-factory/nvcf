@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -170,11 +172,11 @@ func TestFailGroup_RestoreFailureBlocksAndAllowsRecapture(t *testing.T) {
 	}
 	// The next Ready instance takes the record over, once.
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
-	first, err := c.claimGroupRecord(ctx, "k1", &p, 2)
+	first, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
 	if err != nil || first == nil || first.Data["captures"] != "2" || first.Data["state"] != "capturing" {
 		t.Fatalf("takeover = %v, %v", first, err)
 	}
-	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
 		t.Errorf("a second claim while capturing = %v, %v; want none", again, err)
 	}
 }
@@ -195,7 +197,7 @@ func TestClaimGroupRecord_FailedCaptureWaitsForAnotherRelease(t *testing.T) {
 	}
 	release("a1")
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
-	first, err := c.claimGroupRecord(ctx, "k2", &p, 2)
+	first, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
 	if err != nil || first == nil || first.Data[groupAgentBundleKey] != "a1" {
 		t.Fatalf("first claim = %v, %v; want one naming release a1", first, err)
 	}
@@ -203,11 +205,11 @@ func TestClaimGroupRecord_FailedCaptureWaitsForAnotherRelease(t *testing.T) {
 	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Update(ctx, first, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if again, err := c.claimGroupRecord(ctx, "k2", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2); err != nil || again != nil {
 		t.Fatalf("the release a capture failed under claimed it again = %v, %v", again, err)
 	}
 	release("b1")
-	next, err := c.claimGroupRecord(ctx, "k2", &p, 2)
+	next, err := c.claimGroupRecord(ctx, "k2", 0, &p, 2)
 	if err != nil || next == nil || next.Data["captures"] != "2" || next.Data[groupAgentBundleKey] != "b1" ||
 		next.Data["previousReason"] != "inet: Unsupported proto 262" {
 		t.Fatalf("another release's claim = %v, %v; want the second capture under b1", next, err)
@@ -608,7 +610,7 @@ func TestFailGroup_RecordsOnlyOnItsOwnRecord(t *testing.T) {
 }
 
 // A group's failure, as its record keeps it, names every member with the
-// start of its own error, however long each member's error is: the member
+// start and end of its own error, however long each member's error is: the member
 // that failed on its own is not hidden behind the others' aborts.
 func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	abort := "checkpoint failed: CRIU dump failed (criu-v2): action.sh exited, status=1 " + strings.Repeat("Unseizing 4174664 into 1 | ", 400)
@@ -628,6 +630,56 @@ func TestMembersFailedKeepsEveryMember(t *testing.T) {
 	}
 	if len(reason) > groupReasonMax || len(reason) > 3*(groupMemberErrorMax+16)+64 {
 		t.Errorf("reason of %d bytes, want each member bounded", len(reason))
+	}
+}
+
+// A member's error keeps its end: a tool's own error comes after its
+// command line and its progress, which alone fill the bound.
+func TestMemberFailureKeepsTheEnd(t *testing.T) {
+	err := "500 Internal Server Error: restore failed: gpushare resume: nvsnap-gpu-suspend --hold-gate --fabric-map /w/.fabric-s1 resume " +
+		strings.Repeat("123 ", 60) + ": exit status 1 (output: " + strings.Repeat("pid=883 fabmap /w/out.883: ok 267 fabric handle(s) | ", 12) +
+		"fabric map: 267 handle(s) in /w/out; waiting for /w/in | no /w/in after 600 s)"
+	got := memberFailure("fn/worker-0", err)
+	if !strings.HasPrefix(got, "fn/worker-0: 500 Internal Server Error: restore failed: gpushare resume") {
+		t.Errorf("lost the start: %q", got[:80])
+	}
+	if !strings.HasSuffix(got, "no /w/in after 600 s)") {
+		t.Errorf("lost the cause at the end: %q", got[len(got)-80:])
+	}
+	if n := len(got) - len("fn/worker-0: "); n != groupMemberErrorMax {
+		t.Errorf("member error of %d bytes, want %d", n, groupMemberErrorMax)
+	}
+	if short := memberFailure("p", "boom"); short != "p: boom" {
+		t.Errorf("a short error changed: %q", short)
+	}
+}
+
+// A multibyte rune at either cut is kept whole or left out, never split:
+// the recorded error stays valid UTF-8 within the bound.
+func TestTruncateMiddleRuneBoundaries(t *testing.T) {
+	const n = groupMemberErrorMax
+	head := n / 3
+	tail := n - head - len(" … ")
+	for _, tc := range []struct{ name, s string }{
+		// é (2 bytes) starts one byte before the head cut.
+		{"head cut", strings.Repeat("a", head-1) + "é" + strings.Repeat("b", 2*n)},
+		// 世 (3 bytes) and 🙂 (4 bytes) straddling the head cut.
+		{"head cut, 3-byte rune", strings.Repeat("a", head-2) + "世" + strings.Repeat("b", 2*n)},
+		{"head cut, 4-byte rune", strings.Repeat("a", head-1) + "🙂" + strings.Repeat("b", 2*n)},
+		// The tail cut falls on é's second byte.
+		{"tail cut", strings.Repeat("a", 2*n) + "é" + strings.Repeat("b", tail-1)},
+		{"tail cut, 4-byte rune", strings.Repeat("a", 2*n) + "🙂" + strings.Repeat("b", tail-2)},
+	} {
+		got := truncateMiddle(tc.s, n)
+		if !utf8.ValidString(got) {
+			t.Errorf("%s: invalid UTF-8 around the cuts: %q ... %q", tc.name, got[head-4:head+8], got[len(got)-tail-8:len(got)-tail+4])
+		}
+		if len(got) > n {
+			t.Errorf("%s: %d bytes, want at most %d", tc.name, len(got), n)
+		}
+		if !strings.HasPrefix(got, "aaaa") || !strings.HasSuffix(got, "bbbb") || !strings.Contains(got, " … ") {
+			t.Errorf("%s: lost the start, the end or the gap", tc.name)
+		}
 	}
 }
 
@@ -686,7 +738,7 @@ func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
 	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "undeployed"})
 	p := stsRank("kimi-0", "0", "2", "sts-c", true)
 	p.Namespace = "fn"
-	claimed, err := c.claimGroupRecord(ctx, "k1", &p, 2)
+	claimed, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2)
 	if err != nil || claimed == nil {
 		t.Fatalf("claim = %v, %v; want the record taken over", claimed, err)
 	}
@@ -694,7 +746,7 @@ func TestClaimGroupRecord_TakesOverVerifyingWithoutItsNamespace(t *testing.T) {
 		t.Errorf("record = %v, want a second capture under way", claimed.Data)
 	}
 	setRecord(t, kc, map[string]string{"state": criuGroupStateVerifying, "sourceNamespace": "fn"})
-	if again, err := c.claimGroupRecord(ctx, "k1", &p, 2); err != nil || again != nil {
+	if again, err := c.claimGroupRecord(ctx, "k1", 0, &p, 2); err != nil || again != nil {
 		t.Errorf("claim = %v, %v; a record still verified in its namespace is not taken over", again, err)
 	}
 }
@@ -773,5 +825,62 @@ func TestRestoreGroup_PlaceholderWithoutAgent(t *testing.T) {
 				t.Errorf("record = %v; a node an agent is on its way to must be waited for\n%s", cm.Data, logs.String())
 			}
 		})
+	}
+}
+
+// A restore refused before CRIU because its node cannot resume the NIXL KV
+// connector says nothing about the capture, nor about the configuration:
+// it is not a stall (three stalls start the configuration cold for good),
+// nor a restore failure. It is counted on its own, and the pods go so
+// their replacements try again.
+func TestFailGroup_NIXLNodeRefusalIsNotAStall(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	cause := fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	// Below the node refusals' own bound (criuGroupMaxNodeRefusals), and
+	// as many as would be stalls that start the configuration cold.
+	n := min(criuGroupMaxStalls, criuGroupMaxNodeRefusals-1)
+	for range n {
+		c.failGroup(ctx, leader, "k1", false, cause, logrus.NewEntry(logrus.New()))
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if cm.Data["stalls"] != "" || cm.Data["state"] != "complete" || cm.Data[groupNodeRefusalsKey] != strconv.Itoa(n) {
+		t.Errorf("record = %v, want complete, no stall, %d node refusals", cm.Data, n)
+	}
+	if _, ok := parseCRIUGroup("k1", cm.Data); !ok {
+		t.Error("the configuration no longer restores")
+	}
+	if c.Blocked(ctx, "c0") {
+		t.Error("a node refusal blocked the checkpoint")
+	}
+}
+
+// A group refused for its node again and again (its replacements land on
+// a node that lags) is bounded: from criuGroupMaxNodeRefusals the
+// configuration starts cold for criuGroupNodeRefusalHold, its checkpoints
+// kept, and then restores again; a restore that runs clears the count.
+func TestFailGroup_NIXLNodeRefusalsAreBounded(t *testing.T) {
+	c, kc, leader := groupFixture(t)
+	ctx := context.Background()
+	cause := fmt.Errorf("%w: %w: no nixl-resume", errCheckpointUnavailable, errNIXLResumeUnavailable)
+	for range criuGroupMaxNodeRefusals {
+		c.failGroup(ctx, leader, "k1", false, cause, logrus.NewEntry(logrus.New()))
+	}
+	cm, _ := kc.CoreV1().ConfigMaps("nvsnap-system").Get(ctx, criuGroupConfigMapName("k1"), metav1.GetOptions{})
+	if _, ok := parseCRIUGroup("k1", cm.Data); ok {
+		t.Errorf("record = %v: the configuration still restores after %d node refusals, want it cold", cm.Data, criuGroupMaxNodeRefusals)
+	}
+	if cm.Data["stalls"] != "" || cm.Data["state"] != "complete" || c.Blocked(ctx, "c0") {
+		t.Errorf("record = %v: want complete, no stall, the checkpoint not blocked", cm.Data)
+	}
+	at, err := time.Parse(time.RFC3339, cm.Data[groupLastNodeRefusalAtKey])
+	if err != nil {
+		t.Fatalf("lastNodeRefusalAt: %v", err)
+	}
+	if nodeRefusalsHold(cm.Data, at.Add(criuGroupNodeRefusalHold)) {
+		t.Error("still cold after the hold: the configuration would start cold for good")
+	}
+	if !recordRestored(cm.Data, "c0", "u/c") || cm.Data[groupNodeRefusalsKey] != "" || cm.Data[groupLastNodeRefusalAtKey] != "" {
+		t.Errorf("record = %v: a restore that ran left the node refusals", cm.Data)
 	}
 }

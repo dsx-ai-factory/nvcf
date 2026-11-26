@@ -59,17 +59,23 @@ HELMFILE_ENV="$environment_name" \
     --output-file-template "$openbao_values" >/dev/null
 
 test -s "$openbao_values" || fail "helmfile wrote no OpenBao values"
-test "$(yq -r '.openbao.migrations.image.tag // ""' "$openbao_values")" = "" ||
-  fail "stack values should let the OpenBao chart supply the migrations image tag"
+stack_migrations_tag="$(yq -r '.global.openbaoMigrations.image.tag // ""' "$stack_dir/environments/base.yaml")"
+test -n "$stack_migrations_tag" ||
+  fail "the stack has no shared migrations image tag"
+test "$(yq -r '.openbao.migrations.image.tag // ""' "$openbao_values")" = "$stack_migrations_tag" ||
+  fail "stack values should pass the shared migrations image tag $stack_migrations_tag to OpenBao"
 
 published_chart="oci://${published_chart_registry}/${published_chart_repository}/helm-nvcf-openbao-server"
-# The pinned chart's own default is the source of truth for the tag.
+# The pinned chart's own default must match the stack's shared tag, so a chart
+# pin that lags the stack default is caught here.
 chart_migrations_tag="$(helm show values "$published_chart" \
   --version "$published_chart_version" |
   yq -r '.openbao.migrations.image.tag // ""')" ||
   fail "could not read published OpenBao $published_chart_version chart values"
 test -n "$chart_migrations_tag" ||
   fail "published OpenBao $published_chart_version chart has no default migrations image tag"
+test "$chart_migrations_tag" = "$stack_migrations_tag" ||
+  fail "published OpenBao $published_chart_version defaults to migrations $chart_migrations_tag, stack tag is $stack_migrations_tag"
 expected_migrations_image="$(yq -r '
   .openbao.migrations.image |
   "\(.registry)/\(.repository)"

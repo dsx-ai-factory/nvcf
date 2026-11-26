@@ -23,7 +23,7 @@ use crate::request_observer::{
 };
 use crate::runtime_state::{ModelGeneration, PylonRuntimeState};
 use crate::sse_message_stream::{RelayOutcome, UpstreamSseReadError, upstream_sse_message_stream};
-use crate::upstream_health::UpstreamHealthPaths;
+use crate::upstream_health::{ReadinessGate, UpstreamHealthPaths};
 use crate::upstream_url::upstream_endpoint;
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -50,6 +50,57 @@ pub(crate) async fn check_upstream_health(
         }
     }
     false
+}
+
+// Statuses that mean the backend does not serve the default check or does not
+// let Pylon call it. 400, 429, and 5xx can mean "not ready", so they never fall
+// back.
+const DEFAULT_CHECK_NOT_SERVED: [StatusCode; 4] = [
+    StatusCode::UNAUTHORIZED,
+    StatusCode::FORBIDDEN,
+    StatusCode::NOT_FOUND,
+    StatusCode::METHOD_NOT_ALLOWED,
+];
+
+pub(crate) async fn check_readiness_gate(
+    http_client: &reqwest::Client,
+    upstream_http_base_url: &str,
+    timeout: Duration,
+    gate: &ReadinessGate,
+    fallback_paths: &UpstreamHealthPaths,
+) -> bool {
+    let timeout = gate.timeout().unwrap_or(timeout);
+    let status = match http_client.get(gate.url()).timeout(timeout).send().await {
+        Ok(response) => response.status(),
+        Err(error) => {
+            let outcome = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            };
+            gate.record_failure(outcome.to_string());
+            return false;
+        }
+    };
+    if status == gate.expected_status() {
+        gate.record_pass();
+        return true;
+    }
+    if !gate.is_control_plane_default() || !DEFAULT_CHECK_NOT_SERVED.contains(&status) {
+        gate.record_failure(format!("HTTP {status}"));
+        return false;
+    }
+    gate.log_fallback_once(status);
+    let is_healthy =
+        check_upstream_health(http_client, upstream_http_base_url, timeout, fallback_paths).await;
+    if is_healthy {
+        gate.record_pass();
+    } else {
+        gate.record_failure(format!("HTTP {status}; the fallback health paths failed"));
+    }
+    is_healthy
 }
 
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, BringupError> {
@@ -117,8 +168,6 @@ pub(super) async fn send_canary_request(
         "messages": [{"role": "user", "content": "1+1="}],
         "max_tokens": canary_max_generation_threshold,
         "seed": 33,
-        "temperature": 0.7,
-        "top_p": 1.0,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -216,6 +265,8 @@ pub(super) async fn send_canary_request(
     Ok(())
 }
 
+// One argument per request input; a parameter struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_completion_request(
     http_client: &reqwest::Client,
     upstream_http_base_url: &str,
@@ -224,6 +275,7 @@ pub(super) async fn send_completion_request(
     request_kind: GeneratedRequestKind,
     generation: &ModelGeneration,
     runtime_state: Option<&PylonRuntimeState>,
+    input_tokens_from_usage: bool,
 ) -> Result<ChatCompletionResponse, BringupError> {
     let request_id = next_generated_request_id(request_kind, generation);
     let model_id = generation.model_id();
@@ -276,7 +328,7 @@ pub(super) async fn send_completion_request(
     .await;
     match result {
         Ok(completion) => {
-            finish_observation(&mut observer, &completion);
+            finish_observation(&mut observer, &completion, input_tokens_from_usage);
             Ok(completion)
         }
         Err(error) => {
@@ -297,11 +349,15 @@ fn observe_response_headers(observer: &mut Option<TunnelRequestObserver>, status
 fn finish_observation(
     observer: &mut Option<TunnelRequestObserver>,
     completion: &ChatCompletionResponse,
+    input_tokens_from_usage: bool,
 ) {
     if let Some(observer) = observer {
         let generation = observer
             .generation_mut()
             .expect("chat completion observer should expose generation progress");
+        if input_tokens_from_usage && let Some(prompt_tokens) = completion.usage.prompt_tokens {
+            generation.observe_input_usage(prompt_tokens, None);
+        }
         generation.observe_generated_output(
             Instant::now(),
             completion.usage.completion_tokens > 0,
@@ -382,6 +438,18 @@ impl BringupError {
             _ => false,
         }
     }
+
+    /// Returns whether the upstream rejected the request as overloaded. 529 is
+    /// Dynamo's default status for a model whose workers are all busy.
+    pub(crate) fn is_overloaded(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if status.as_u16() == 529)
+    }
+
+    /// Returns whether the upstream rejected the request because it is busy:
+    /// 529 from Dynamo, or 429 or 503 from an engine whose queue is full.
+    pub(crate) fn is_busy(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if matches!(status.as_u16(), 429 | 503 | 529))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -389,8 +457,15 @@ pub(super) struct ChatCompletionResponse {
     usage: Usage,
 }
 
+impl ChatCompletionResponse {
+    pub(super) fn has_prompt_tokens(&self) -> bool {
+        self.usage.prompt_tokens.is_some()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Usage {
+    prompt_tokens: Option<u64>,
     completion_tokens: u32,
 }
 

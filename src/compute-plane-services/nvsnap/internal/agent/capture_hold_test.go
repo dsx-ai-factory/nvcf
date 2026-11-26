@@ -161,6 +161,17 @@ func TestConsiderGroupCapture_Decision(t *testing.T) {
 	if c.considerGroupCapture(ctx, decided) {
 		t.Error("a pod whose capture is over is undecided")
 	}
+	// Admitted before a GPU node with an older driver joined: not captured,
+	// decided at once, so its hold is released.
+	c.a.seedDrivers(580, 610)
+	gated := stsRank("gated", "0", "1", "rs-1", false)
+	if c.considerGroupCapture(ctx, &gated) {
+		t.Error("a pod the driver gate keeps from CRIU is undecided")
+	}
+	c.a.seedDrivers(610)
+	if !c.considerGroupCapture(ctx, &gated) {
+		t.Error("with one new enough driver, a pod not warm yet is decided")
+	}
 }
 
 // A rank other than 0 is released once its leader is not held (a

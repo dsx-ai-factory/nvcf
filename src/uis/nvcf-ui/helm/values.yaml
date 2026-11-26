@@ -81,7 +81,7 @@ nvcfUi:
     image:
       registry: ""
       repository: nvcf-openbao-migrations
-      tag: "0.19.10"
+      tag: "0.23.1"
       pullPolicy: IfNotPresent
     # Empty uses the image default. Select "1.36" for Kubernetes 1.35;
     # "1.37" is also supported by the migration image.

@@ -14,6 +14,15 @@ package agent
 //     every tool writes its new handles to DIR/out and waits for DIR/in,
 //     the out files of every pod concatenated.
 //
+// An in-place resume (leave-running) adds a third: no node's GPU launches
+// may run until every node has resumed. Each node binds its share of the
+// memory multicast across nodes (NCCL NVLS) at its resume; a node that
+// launched before another had bound its share would have its NVLink
+// accesses to that node refused (Xid 137) and its kernels would spin for
+// good. So each tool resumes with its launches held, writes DIR/resumed
+// ("<token>"), and waits for DIR/o ("<token> open|abort") before it lets
+// them through (--sync-open, see driveFabric's open phase).
+//
 // DIR is a fabric session directory the agent creates host-side inside the
 // pod's gpushare store (the workload sees it under GPUShareStoreInContainer),
 // fresh for every session, so a list from an earlier cycle can never be
@@ -45,6 +54,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -62,17 +72,39 @@ const (
 	fabricEnv = "NVSNAP_GPUSHARE_FABRIC"
 
 	// fabricVerdictAbort answers a vote once the session cannot succeed.
-	// The tool treats any verdict but "go" as "retry" and gives up at its
-	// own timeout, rolling the workload back.
+	// The tool rolls the workload back as soon as it reads it.
 	fabricVerdictAbort = "abort"
 	// fabricVerdictUnlock tells a restored rank that every pod of its
 	// instance has resumed.
 	fabricVerdictUnlock = "unlock"
+	// fabricVerdictOpen tells a node resumed in place, its GPU launches
+	// held, that every node of the instance has resumed.
+	fabricVerdictOpen = "open"
 
 	fabricPollInterval = 200 * time.Millisecond
 )
 
+// fabricMemberTimeout bounds one request to a member's agent. A reply is a
+// local file read or write on the member's node (milliseconds); the bound
+// keeps a member that accepts a connection and never answers from holding
+// the driver past the vote deadline (2 min) by more than this. A variable
+// for tests.
+var fabricMemberTimeout = 10 * time.Second
+
 var fabricSessionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// fabricOpenTokenRe is the token a tool writes to DIR/resumed: its own
+// pid and its resume's round in it, so that a verdict for another tool or
+// round is never taken for its own.
+var fabricOpenTokenRe = regexp.MustCompile(`^\d{1,10}-\d{1,10}$`)
+
+// fabricOpenDeadline bounds the driver's wait for every node's resumed
+// marker, from the first one it sees: the handle exchange has every node
+// loaded before any remaps, so the markers normally come within a second of
+// each other. At the deadline the nodes that resumed get "abort", and open
+// anyway. The tool's own wait (gpushareSyncOpenWait) is a minute longer,
+// for a driver that never answers.
+const fabricOpenDeadline = 2 * time.Minute
 
 // validFabricSession reports whether s can name a session directory.
 func validFabricSession(s string) bool { return fabricSessionRe.MatchString(s) }
@@ -126,6 +158,14 @@ type fabricSessionDir struct {
 	name   string
 	// container is the directory as the workload and the tool see it.
 	container string
+	// holdsOpen: this node's tool holds the GPU launches at its in-place
+	// resume until the driver's open verdict (--sync-open). The driver
+	// waits only for the members that do.
+	holdsOpen atomic.Bool
+	// warnedMarker: a malformed DIR/resumed was logged. The driver reads
+	// the state every fabricPollInterval, and the workload writes the
+	// marker: it is logged once per session, not at every read.
+	warnedMarker atomic.Bool
 }
 
 // own gives the directory to the user process pid runs as: the tool and
@@ -218,6 +258,12 @@ func gpushareGroupInfo(req CheckpointRequest) *GPUShareGroupInfo {
 type restoreV2Group struct {
 	Session, InetAddrMap string
 	Namespace, Pod       string
+	// SpanMS is the restore span every GPU rank of the group budgets its
+	// clocks with (groupSpanBudget); 0 outside a group restore.
+	SpanMS int64
+	// SpanLearned is whether SpanMS is the cluster's learned span, another
+	// checkpoint's, which the rank's estimate bounds (groupSpanBudget).
+	SpanLearned bool
 }
 
 // restoreSession is one pod's directory in a group restore.
@@ -328,6 +374,12 @@ type fabricState struct {
 	// Restored reports a group restore member's CRIU restore done (it then
 	// holds its network lock until the driver unlocks it).
 	Restored bool `json:"restored,omitempty"`
+	// HoldsOpen: the member's tool holds its GPU launches at an in-place
+	// resume until the open verdict.
+	HoldsOpen bool `json:"holdsOpen,omitempty"`
+	// Resumed is the token of the member's resume, once its tool has
+	// resumed with the launches held (DIR/resumed).
+	Resumed string `json:"resumed,omitempty"`
 }
 
 // parseFabricVote reads "<attempt> ok|busy".
@@ -362,7 +414,23 @@ func readFabricState(s *fabricSessionDir) (fabricState, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return st, err
 	}
+	if b, err := s.read("resumed", fabricSmallLimit); err == nil {
+		// The directory is the workload's to write: a marker that is not
+		// a token is no report (the tool writes one by rename), and the
+		// rest of the state is still served.
+		if tok := strings.TrimSpace(string(b)); fabricOpenTokenRe.MatchString(tok) {
+			st.Resumed = tok
+		} else {
+			if s.warnedMarker.CompareAndSwap(false, true) {
+				logrus.WithFields(logrus.Fields{"session": s.name, "marker": truncate(tok, 64)}).
+					Warn("gpushare fabric: malformed resumed marker; not counted as resumed")
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return st, err
+	}
 	st.HaveIn, st.Restored = s.exists("in"), s.exists("restored")
+	st.HoldsOpen = s.holdsOpen.Load()
 	return st, nil
 }
 
@@ -433,6 +501,25 @@ func (a *Agent) fabricUnlockHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// fabricOpenHandler writes a node's open verdict, "<token> open|abort",
+// for its tool to read in DIR/o.
+func (a *Agent) fabricOpenHandler(w http.ResponseWriter, r *http.Request) {
+	dir, ok := a.fabricDirFor(w, r)
+	if !ok {
+		return
+	}
+	token, verdict := r.URL.Query().Get("token"), r.URL.Query().Get("verdict")
+	if !fabricOpenTokenRe.MatchString(token) || (verdict != fabricVerdictOpen && verdict != fabricVerdictAbort) {
+		http.Error(w, "token (<pid>-<round>) and verdict (open, abort) required", http.StatusBadRequest)
+		return
+	}
+	if err := dir.write("o", []byte(token+" "+verdict+"\n")); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // fabricInLimit bounds a merged handle list: one line per shared allocation
 // per process, around a hundred bytes each.
 const fabricInLimit = 64 << 20
@@ -464,6 +551,8 @@ type fabricMember interface {
 	Verdict(ctx context.Context, attempt int, verdict string) error
 	PutIn(ctx context.Context, data []byte) error
 	Unlock(ctx context.Context, verdict string) error
+	// Open answers the member's resume token with "open" or "abort".
+	Open(ctx context.Context, token, verdict string) error
 }
 
 // fabricOutcome records how the driver ended a session, for the result.
@@ -473,6 +562,12 @@ type fabricOutcome struct {
 	Unlocked  bool `json:"unlocked,omitempty"`
 	Exchanged bool `json:"exchanged"`
 	Handles   int  `json:"handles"`
+	// Opened: every member that held its GPU launches at an in-place
+	// resume got "open".
+	Opened bool `json:"opened,omitempty"`
+	// OpenAborted says why the members that resumed got "abort" instead,
+	// naming the members that did not report resumed.
+	OpenAborted string `json:"openAborted,omitempty"`
 }
 
 // fabricDriveOpts picks the phases a session runs.
@@ -485,12 +580,24 @@ type fabricDriveOpts struct {
 	LostOther func() bool
 	// OnGo runs once, when the vote goes: the GPU ranks stop now.
 	OnGo func()
+	// VoteDeadline ends a vote that has not gone this long after the
+	// first vote: every member is answered "abort" at its next vote, so
+	// all stop at the same attempt and roll back. The members' tools keep
+	// a later deadline of their own, for a driver that never answers.
+	// Zero: none.
+	VoteDeadline time.Duration
 	// Unlock: hold every member until all are restored, then unlock them
 	// together (group restore). The exchange waits for the unlock.
 	Unlock bool
 	// NoExchange: this drive does not exchange handle lists (another drive
 	// of the session does, over the members that have them).
 	NoExchange bool
+	// Open: an in-place resume. The members whose tools hold their GPU
+	// launches at the resume (HoldsOpen) get "open" once every one of
+	// them has reported resumed. OpenDeadline, from the first report,
+	// bounds the wait (zero: none).
+	Open         bool
+	OpenDeadline time.Duration
 }
 
 // driveFabric runs one session until every member's operation has returned
@@ -499,7 +606,10 @@ type fabricDriveOpts struct {
 // Vote: once every member still running has voted the same attempt, the
 // answer is "go" if all are quiesced, else "retry". A member whose
 // checkpoint returned before the go cannot release: every later vote is
-// answered "abort", and the others roll back at their tool's timeout.
+// answered "abort", and the others roll back as soon as they read it. So
+// is every vote once VoteDeadline has passed. A verdict that some members
+// already have reaches the rest first, so no member gets "go" while another
+// gets "abort" for the same attempt.
 //
 // Unlock: once every member has reported its CRIU restore done, all get
 // "unlock". A member that returns first has failed; the rest get "abort".
@@ -508,16 +618,23 @@ type fabricDriveOpts struct {
 // lists are concatenated in member order and delivered once to all of
 // them. A member whose operation returned without an out (it failed, or
 // does not resume) takes no part.
+//
+// Open: see fabricOpener.
 func driveFabric(ctx context.Context, members []fabricMember, done func(i int) bool, opts fabricDriveOpts, log *logrus.Entry) fabricOutcome {
 	var out fabricOutcome
 	vote := &fabricVoter{decided: -1, abortSent: map[int]int{}}
 	aborted := false
+	var firstVote time.Time
 	// Each phase is sent to every running member and retried, each poll, to
 	// the ones it did not reach; it is complete only once all have it. A
 	// member waits for its message, and the receivers' writes are atomic
 	// and idempotent, so a repeat is harmless and a loss is not.
 	var unlock, exchange *fabricDelivery
 	unlockDone, exchanged := false, false
+	var opener *fabricOpener
+	if opts.Open {
+		opener = &fabricOpener{deadline: opts.OpenDeadline, holds: map[int]bool{}, tokens: map[int]string{}, sent: map[int]string{}}
+	}
 	tick := time.NewTicker(fabricPollInterval)
 	defer tick.Stop()
 	for {
@@ -532,22 +649,27 @@ func driveFabric(ctx context.Context, members []fabricMember, done func(i int) b
 		}
 		lostOne := len(running) < len(members)
 
-		states := make(map[int]fabricState, len(running))
-		for _, i := range running {
-			st, ok, err := members[i].State(ctx)
-			if err != nil {
-				log.WithError(err).WithField("member", members[i].Name()).Debug("gpushare fabric: state")
-				continue
-			}
-			if ok {
-				states[i] = st
-			}
-		}
+		states := memberStates(ctx, members, running, log)
 
 		if opts.Vote && !out.Went {
-			if (lostOne || (opts.LostOther != nil && opts.LostOther())) && !aborted {
+			// A go being delivered is never replaced by an abort: a member
+			// that has it may already be suspending (fabricVoter.drive).
+			if !vote.goPending() && (lostOne || (opts.LostOther != nil && opts.LostOther())) && !aborted {
 				aborted = true
 				log.Warn("gpushare fabric: a member ended before the quiesce vote passed; aborting the vote")
+			}
+			if firstVote.IsZero() {
+				for _, st := range states {
+					if st.Vote != nil {
+						firstVote = time.Now()
+						break
+					}
+				}
+			}
+			if !aborted && !vote.goPending() && opts.VoteDeadline > 0 && !firstVote.IsZero() && time.Since(firstVote) > opts.VoteDeadline {
+				aborted = true
+				log.WithFields(logrus.Fields{"deadline": opts.VoteDeadline.String(), "attempts": vote.decided + 1}).
+					Warn("gpushare fabric: the GPU work did not quiesce on every node in time; aborting the vote, the members roll back")
 			}
 			vote.drive(ctx, members, running, states, aborted, &out, log)
 			if out.Went && opts.OnGo != nil {
@@ -581,6 +703,10 @@ func driveFabric(ctx context.Context, members []fabricMember, done func(i int) b
 				out.Unlocked = unlock.value == "unlock"
 				log.WithFields(logrus.Fields{"verdict": unlock.value, "members": len(running)}).Info("gpushare fabric: group restore network lock")
 			}
+		}
+
+		if opener != nil {
+			opener.drive(ctx, members, running, states, &out, log)
 		}
 
 		if !exchanged && !opts.NoExchange && (!opts.Unlock || out.Unlocked) {
@@ -618,6 +744,128 @@ func driveFabric(ctx context.Context, members []fabricMember, done func(i int) b
 	}
 }
 
+// fabricOpener runs the open phase of an in-place group resume. Each
+// member whose tool holds its GPU launches at the resume (HoldsOpen, seen
+// from the vote on) writes DIR/resumed with a token once resumed, and
+// waits for "<token> open" or "<token> abort" in DIR/o.
+//
+//   - Once every member that holds and still runs has reported resumed,
+//     each gets "open" for its own token. A member that reported resumed
+//     and then ended counts as resumed: its share of the multicast memory
+//     was bound.
+//   - A member that holds and ends without reporting resumed (its resume
+//     failed), or one that has not reported by deadline after the first
+//     report, ends the wait: every member that resumed gets "abort", now
+//     or when it reports. Its tool then lets the launches through anyway
+//     and its capture fails as stalled: a launch may hit memory a node
+//     has not bound, but gates left closed would wedge the workload for
+//     good, and the Xid check (kmsg.go) reports a launch that did.
+//
+// The verdict is decided once and never replaced: an "open" that some
+// members already have is delivered to the rest even if one of them ends
+// meanwhile. A member that does not hold (a tool from before --sync-open)
+// is not waited for. Tokens scope the verdicts: a tool reads only a verdict
+// for the token it wrote, in a session directory made fresh for the
+// session. Durations are the driver's own; no clock is compared across
+// nodes.
+type fabricOpener struct {
+	deadline time.Duration
+	holds    map[int]bool   // members seen holding their launches
+	tokens   map[int]string // each member's latest resumed token
+	sent     map[int]string // the token each member has the verdict for
+	first    time.Time      // when the first resumed marker was seen
+	verdict  string         // "", fabricVerdictOpen or fabricVerdictAbort
+	reason   string
+	done     bool
+}
+
+func (o *fabricOpener) drive(ctx context.Context, members []fabricMember, running []int, states map[int]fabricState, out *fabricOutcome, log *logrus.Entry) {
+	if o.done {
+		return
+	}
+	isRunning := make(map[int]bool, len(running))
+	for _, i := range running {
+		isRunning[i] = true
+		st, ok := states[i]
+		if !ok {
+			continue
+		}
+		if st.HoldsOpen {
+			o.holds[i] = true
+		}
+		if st.Resumed != "" {
+			o.tokens[i] = st.Resumed
+			if o.first.IsZero() {
+				o.first = time.Now()
+			}
+		}
+	}
+	if o.verdict == "" {
+		var ended, missing []string
+		waiting := 0
+		for i := range members {
+			switch {
+			case !o.holds[i]:
+			case !isRunning[i]:
+				if o.tokens[i] == "" {
+					ended = append(ended, members[i].Name())
+				}
+			default:
+				waiting++
+				if o.tokens[i] == "" {
+					missing = append(missing, members[i].Name())
+				}
+			}
+		}
+		switch {
+		case len(ended) > 0:
+			o.verdict, o.reason = fabricVerdictAbort, "member(s) ended before reporting resumed: "+strings.Join(ended, ", ")
+		case waiting > 0 && len(missing) == 0:
+			o.verdict = fabricVerdictOpen
+		case o.deadline > 0 && !o.first.IsZero() && time.Since(o.first) > o.deadline:
+			o.verdict, o.reason = fabricVerdictAbort, fmt.Sprintf("member(s) did not report resumed within %s of the first: %s",
+				o.deadline, strings.Join(missing, ", "))
+		}
+		switch o.verdict {
+		case fabricVerdictOpen:
+			log.WithFields(logrus.Fields{"members": waiting, "spread": time.Since(o.first).Round(time.Millisecond).String()}).
+				Info("gpushare fabric: every node resumed; opening the GPU launch gates")
+		case fabricVerdictAbort:
+			log.Warn("gpushare fabric: not every node resumed (" + o.reason + "); the nodes that did let their GPU launches through anyway")
+		}
+	}
+	if o.verdict == "" {
+		return
+	}
+	all := true
+	for _, i := range running {
+		if !o.holds[i] {
+			continue
+		}
+		tok := o.tokens[i]
+		if tok == "" {
+			all = false // answered once it reports
+			continue
+		}
+		if o.sent[i] == tok {
+			continue
+		}
+		if err := members[i].Open(ctx, tok, o.verdict); err != nil {
+			log.WithError(err).WithField("member", members[i].Name()).Warn("gpushare fabric: deliver open verdict; retrying")
+			all = false
+			continue
+		}
+		o.sent[i] = tok
+		if o.verdict == fabricVerdictAbort && out.OpenAborted == "" {
+			out.OpenAborted = o.reason
+		}
+	}
+	if o.verdict == fabricVerdictOpen && all {
+		o.done = true
+		out.Opened = true
+	}
+}
+
 // fabricDelivery is one message to every member, tracked per member.
 type fabricDelivery struct {
 	what, value string
@@ -651,7 +899,17 @@ type fabricVoter struct {
 	abortSent map[int]int // member -> highest attempt it has the abort for
 }
 
+// goPending reports whether a go verdict is being delivered: some members
+// may have it already.
+func (v *fabricVoter) goPending() bool { return v.pending != nil && v.pending.value == "go" }
+
 func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running []int, states map[int]fabricState, aborted bool, out *fabricOutcome, log *logrus.Entry) {
+	// A verdict some members already have is finished before an abort:
+	// a member that got "go" releases, so the others must get "go" too,
+	// not "abort" for the same attempt.
+	if v.pending != nil && !v.finish(ctx, members, running, out, log) {
+		return
+	}
 	if aborted {
 		// An abort answers each member's own attempt as it votes.
 		for _, i := range running {
@@ -694,14 +952,53 @@ func (v *fabricVoter) drive(ctx context.Context, members []fabricMember, running
 		}
 		v.pending, v.attempt = &fabricDelivery{what: "verdict", value: verdict, sent: map[int]bool{}}, attempt
 	}
+	v.finish(ctx, members, running, out, log)
+}
+
+// finish delivers the pending verdict and reports whether every running
+// member now has it.
+func (v *fabricVoter) finish(ctx context.Context, members []fabricMember, running []int, out *fabricOutcome, log *logrus.Entry) bool {
 	p := v.pending
 	if !p.deliver(running, func(i int) error { return members[i].Verdict(ctx, v.attempt, p.value) }, members, log) {
-		return
+		return false
 	}
 	v.decided, v.pending = v.attempt, nil
 	out.Attempts = v.attempt + 1
 	out.Went = p.value == "go"
 	log.WithFields(logrus.Fields{"attempt": v.attempt, "verdict": p.value}).Info("gpushare fabric: quiesce vote")
+	return true
+}
+
+// memberStates asks the running members for their state in parallel, each
+// request bounded by fabricMemberTimeout, so a member that does not answer
+// delays a poll by one timeout, not one per member. A member that fails or
+// has no session is left out.
+func memberStates(ctx context.Context, members []fabricMember, running []int, log *logrus.Entry) map[int]fabricState {
+	type res struct {
+		i  int
+		st fabricState
+		ok bool
+	}
+	ch := make(chan res, len(running))
+	for _, i := range running {
+		go func(i int) {
+			rctx, cancel := context.WithTimeout(ctx, fabricMemberTimeout)
+			defer cancel()
+			st, ok, err := members[i].State(rctx)
+			if err != nil {
+				log.WithError(err).WithField("member", members[i].Name()).Debug("gpushare fabric: state")
+				ok = false
+			}
+			ch <- res{i, st, ok}
+		}(i)
+	}
+	states := make(map[int]fabricState, len(running))
+	for range running {
+		if r := <-ch; r.ok {
+			states[r.i] = r.st
+		}
+	}
+	return states
 }
 
 // httpFabricMember reaches a member's session on its node's agent.
@@ -743,6 +1040,8 @@ func (m *httpFabricMember) State(ctx context.Context) (fabricState, bool, error)
 }
 
 func (m *httpFabricMember) send(ctx context.Context, u string, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, fabricMemberTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -769,6 +1068,10 @@ func (m *httpFabricMember) PutIn(ctx context.Context, data []byte) error {
 
 func (m *httpFabricMember) Unlock(ctx context.Context, verdict string) error {
 	return m.send(ctx, m.url("/unlock?verdict="+url.QueryEscape(verdict)), nil)
+}
+
+func (m *httpFabricMember) Open(ctx context.Context, token, verdict string) error {
+	return m.send(ctx, m.url("/open?token="+url.QueryEscape(token)+"&verdict="+url.QueryEscape(verdict)), nil)
 }
 
 // fabricHTTPClient carries the agent token to peers. No overall timeout: a
@@ -823,6 +1126,8 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 	members := make([]fabricMember, len(req.Members))
 	bases := make([]string, len(req.Members))
 	uids := make([]types.UID, len(req.Members))
+	baselines := make([]memberBaseline, len(req.Members))
+	var rankPods []*corev1.Pod
 	for i, m := range req.Members {
 		if m.Namespace == "" || m.PodName == "" {
 			return nil, fmt.Errorf("member %d: namespace and podName required", i)
@@ -832,6 +1137,10 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			return nil, fmt.Errorf("member %s/%s: %w", m.Namespace, m.PodName, err)
 		}
 		uids[i] = pod.UID
+		baselines[i] = baselineOf(pod)
+		if !m.Companion {
+			rankPods = append(rankPods, pod)
+		}
 		if pod.Spec.NodeName == "" {
 			return nil, fmt.Errorf("member %s/%s is not scheduled", m.Namespace, m.PodName)
 		}
@@ -863,8 +1172,12 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			m.GroupSession = session
 		} else {
 			m.GPUShareFabricSession = session
+			// In place, this driver answers the members' held resumes
+			// (driveFabric's open phase, Open below).
+			m.GPUShareSyncOpen = req.LeaveRunning
 		}
 		m.GPUShareGroupIndex, m.GPUShareGroupSize = i, len(req.Members)
+		m.GPUShareRankNodes = rankNodes(rankPods)
 		m.GroupFreeze = true
 		wg.Add(1)
 		go func(i int, m CheckpointRequest) {
@@ -895,35 +1208,24 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 			return finished[i]
 		}}
 	}
-	// Once the GPU ranks stop, the rest of the instance stops with them:
-	// every member pod is held (pod_hold.go), a rank's engine container
-	// excepted while it saves its GPU memory. The members are released
-	// from the freeze point only once all are held.
-	holdsDone := make(chan struct{})
-	var holding atomic.Bool
-	onGo := sync.OnceFunc(func() {
-		holding.Store(true)
-		go func() {
-			defer close(holdsDone)
-			holdMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
-		}()
-	})
-	defer func() {
-		// A hold still on its way would land after this release and keep
-		// its pod frozen: let every hold land, or fail, first.
-		if holding.Load() {
-			<-holdsDone
-		}
-		releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
-	}()
+	// The instance stops with its GPU ranks (instanceHold): their pods are
+	// held when the vote goes, the companions' once every member waits at
+	// the freeze point. The members are released from it only once all are
+	// held.
+	hold := newInstanceHold(ctx, fabricHTTPClient, session, req.Members, bases, log)
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			hold.wait()
+			hold.cancel()
+			releaseMembers(ctx, fabricHTTPClient, session, req.Members, bases, log)
+		})
+	}
+	defer release()
 	freezeDone := make(chan struct{})
 	go func() {
 		defer close(freezeDone)
-		if driveGroupFreeze(ctx, fabricHTTPClient, session, "", freezeMembers, 200*time.Millisecond, log, holdsDone) {
-			// Dumped, the members wait stopped until all are: none
-			// resumes to talk to one not dumped yet.
-			driveGroupFreeze(ctx, fabricHTTPClient, session, "post", freezeMembers, 100*time.Millisecond, log, nil)
-		}
+		driveInstanceFreeze(ctx, fabricHTTPClient, session, freezeMembers, hold, log)
 	}()
 	// A companion that ends before the vote passed loses the capture: the
 	// GPU ranks must not suspend for it.
@@ -937,7 +1239,10 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		}
 		return false
 	}
-	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: onGo}, log)
+	// In place, the members open their GPU launch gates only once every
+	// one has resumed (fabricOpener).
+	res.Fabric = driveFabric(ctx, fabric, done, fabricDriveOpts{Vote: true, LostOther: lostCompanion, OnGo: hold.steps().onGo,
+		VoteDeadline: gpushareQuiesceTimeout, Open: req.LeaveRunning, OpenDeadline: fabricOpenDeadline}, log)
 	wg.Wait()
 	<-freezeDone
 
@@ -956,8 +1261,29 @@ func (a *Agent) groupCheckpoint(ctx context.Context, req GroupCheckpointRequest,
 		log.Error("group checkpoint: a member was left unusable; deleting every member's pod")
 		a.deleteMembers(context.WithoutCancel(ctx), req.Members, uids, log)
 	}
+	// The members that resumed let their launches through before every
+	// node had: each fails as stalled on its own node too; this names the
+	// members that did not report resumed.
+	var openErr error
+	if res.Fabric.OpenAborted != "" {
+		openErr = fmt.Errorf("group checkpoint %s: %w: the GPU launch gates were opened before every node resumed: %s",
+			session, errResumeStalled, res.Fabric.OpenAborted)
+	}
 	if len(failed) > 0 {
-		return res, membersFailed("group checkpoint", session, len(res.Members), failed)
+		return res, errors.Join(membersFailed("group checkpoint", session, len(res.Members), failed), openErr)
+	}
+	if openErr != nil {
+		return res, openErr
+	}
+	if req.LeaveRunning {
+		// Every member resumed: the instance is seen serving again before
+		// the capture succeeds (resume_guard.go). Released first: a held
+		// pod's readiness probe fails.
+		release()
+		if err := watchMembersAfterResume(ctx, a.kubeClient, baselines, postResumeWatch); err != nil {
+			log.WithError(err).Error("group checkpoint: the instance did not run again after its resume")
+			return res, fmt.Errorf("group checkpoint %s: %w", session, err)
+		}
 	}
 	return res, nil
 }

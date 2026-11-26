@@ -22,12 +22,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +65,14 @@ type PreflightFinding struct {
 	Severity  string `json:"severity"`
 	Check     string `json:"check"`
 	Detail    string `json:"detail"`
+	// PID is the process an RDMA finding is about (host numbering).
+	PID int `json:"pid,omitempty"`
+	// Node, DiskBytes and DiskRoom are a disk finding's node, the bytes the
+	// member's capture writes there and the room the node has
+	// (capture_disk.go).
+	Node      string `json:"node,omitempty"`
+	DiskBytes int64  `json:"diskBytes,omitempty"`
+	DiskRoom  int64  `json:"diskRoom,omitempty"`
 }
 
 // PreflightReport is the preflight of one instance.
@@ -124,6 +134,14 @@ func (a *Agent) podPreflight(pod *corev1.Pod, container string, rank bool) []Pre
 	if rank && !a.gpushareEnabledFor(pod) {
 		add(container, preflightBlock, "gpushare", "a GPU rank without the gpushare library: its GPU memory cannot be saved")
 	}
+	// An opted-in engine (nixlOptIn) that spans nodes is refused
+	// nixl-pause by its spec too: its processes may not show it (a fabric
+	// annotation "false", a renamed process).
+	if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), pod, container); rank && opted {
+		if why := webhook.EngineSpansPods(pod); why != "" {
+			add(container, preflightBlock, "nixl-pause", "the pod opted in to nixl-pause, but its engine spans nodes ("+why+"); nixl-pause is not supported for an engine that spans nodes yet")
+		}
+	}
 	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		add("", preflightInfo, "shared-pid-namespace", "the containers share one pid namespace: the restore recreates the dumped container's pids beside the sidecars' own")
 	}
@@ -168,18 +186,53 @@ func (a *Agent) hostPreflight(ctx context.Context, ns, pod, container string) ([
 	if err != nil {
 		return nil, err
 	}
+	return a.containerFindings(ctx, procBase, int(info.PID), pids, ns, pod, container), nil
+}
+
+// containerFindings is the host checks of the container whose init is
+// initPID and whose processes are pids: what its processes hold, its node
+// bundle, and what the capture releases before its suspend
+// (releaseFindings).
+func (a *Agent) containerFindings(ctx context.Context, procBase string, initPID int, pids []int, ns, pod, container string) []PreflightFinding {
 	fs := processFindings(procBase, pids, pod, container, a.ghostLimit())
+	fs = append(fs, a.diskFindings(procBase, initPID, pids, pod, container)...)
 	// The capture runs its tools from the node bundle mounted in the
 	// container, and only there (bundle_tools.go). A companion that started
 	// before its version was mounted here has it mounted into it, when the
 	// version is staged on this node (companion_tools.go).
-	if err := a.ensureCompanionToolsIn(procBase, int(info.PID)); err != nil {
+	if err := a.ensureCompanionToolsIn(procBase, initPID); err != nil {
 		a.log.WithError(err).WithField("pod", ns+"/"+pod).Warn("node bundle: cannot mount the tools into a pod without GPUs yet; its capture waits for them")
 	}
-	if _, err := bundleToolsOf(procBase, int(info.PID), a.bundleVersionsDir()); err != nil {
-		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
+	tools, err := bundleToolsOf(procBase, initPID, a.bundleVersionsDir())
+	if err != nil {
+		return append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "bundle", Detail: err.Error()})
 	}
-	return fs, nil
+	return a.releaseFindings(ctx, fs, tools.gpuToolText(), procBase, initPID, ns, pod, container)
+}
+
+// releaseFindings applies to a container's findings fs what the capture
+// releases before its suspend, with a GPU tool (its text, toolText) that
+// can: ModelExpress's RDMA (mx-pause) and, for a pod that opted in
+// (nixlOptIn), the NIXL KV connector's (nixl-pause). sessionHostPID is the
+// container's init. A pod that asked for nixl-pause but is not opted in
+// gets a finding saying why, when RDMA blocks its capture.
+func (a *Agent) releaseFindings(ctx context.Context, fs []PreflightFinding, toolText, procBase string, sessionHostPID int, ns, pod, container string) []PreflightFinding {
+	if gpushareMXSupported(toolText) {
+		fs = releasedByMXPause(fs, mxPausable(procBase, sessionHostPID))
+	}
+	if !gpushareNIXLSupported(toolText) {
+		return fs
+	}
+	optedIn, why := a.nixlOptIn(ctx, ns, pod, container)
+	if !optedIn {
+		if why != "" && slices.ContainsFunc(fs, func(f PreflightFinding) bool { return f.Check == "rdma" && f.Severity == preflightBlock }) {
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "nixl-pause",
+				Detail: "the pod's RDMA is not released for the capture: " + why})
+		}
+		return fs
+	}
+	return nixlPauseFindings(fs, nixlGPUProcesses(procBase, sessionHostPID),
+		nixlPauseLimit(procBase, sessionPIDs(procBase, sessionHostPID), "", 1), pod, container)
 }
 
 // processFindings is the host checks of a container's processes pids.
@@ -187,7 +240,9 @@ func processFindings(procBase string, pids []int, pod, container string, ghostLi
 	ghosts, anon, rdma := map[string]ghostFile{}, int64(0), map[int][]string{}
 	var sockets socketScan
 	for _, pid := range pids {
-		deletedFiles(procBase, pid, ghosts)
+		// The host check reports what it could see; the disk estimate
+		// (capture_disk.go) fails on a file it could not size.
+		_ = deletedFiles(procBase, pid, ghosts)
 		anon += anonymousBytes(procBase, pid)
 		if devs := rdmaDevices(procBase, pid); len(devs) > 0 {
 			rdma[pid] = devs
@@ -327,8 +382,32 @@ func rdmaDevices(procBase string, pid int) []string {
 	return devs
 }
 
+// ibvLibName is the verbs library a pod annotated nvsnap.io/gpushare-ibv
+// gives NCCL (webhook GPUShareIBVLibPath).
+const ibvLibName = "libnvsnap_ibv.so"
+
+// mapsIBVLib reports whether process pid has libnvsnap_ibv.so loaded.
+func mapsIBVLib(procBase string, pid int) bool {
+	b, err := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "maps"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) >= 6 && filepath.Base(f[5]) == ibvLibName {
+			return true
+		}
+	}
+	return false
+}
+
 // rdmaFindings blocks the capture of a container whose processes hold
-// RDMA devices, one finding per process, naming it and its devices.
+// RDMA devices, one finding per process, naming it and its devices. A
+// process whose NCCL takes its verbs from libnvsnap_ibv.so only warns:
+// the GPU suspend destroys NCCL's RDMA state and the restore creates it
+// again. Which of its device files are NCCL's cannot be told from here;
+// the process itself tells them apart (nvsnap_ibv_fds), and its "quiesce"
+// refuses RDMA left outside NCCL's (UCX, NIXL), before anything stops, so
+// the workload runs on (gpushare.c do_quiesce).
 func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []PreflightFinding {
 	pids := make([]int, 0, len(rdma))
 	for pid := range rdma {
@@ -338,7 +417,13 @@ func rdmaFindings(procBase, pod, container string, rdma map[int][]string) []Pref
 	fs := make([]PreflightFinding, 0, len(pids))
 	for _, pid := range pids {
 		comm, _ := os.ReadFile(filepath.Join(procBase, strconv.Itoa(pid), "comm"))
-		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "rdma",
+		if mapsIBVLib(procBase, pid) {
+			fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightWarn, Check: "rdma", PID: pid,
+				Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s through %s: NCCL's are released at the GPU suspend; RDMA anything else in it holds refuses the quiesce, and the workload runs on uncaptured",
+					pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "), ibvLibName)})
+			continue
+		}
+		fs = append(fs, PreflightFinding{Pod: pod, Container: container, Severity: preflightBlock, Check: "rdma", PID: pid,
 			Detail: fmt.Sprintf("process %d (%s) holds RDMA devices %s: a checkpoint cannot save RDMA state (checkpoint-restore/criu#267); the workload has to release them before it is captured",
 				pid, strings.TrimSpace(string(comm)), strings.Join(rdma[pid], ", "))})
 	}
@@ -397,16 +482,25 @@ func cgroupPIDs(dir string) ([]int, error) {
 
 // deletedFiles adds the deleted regular files process pid holds open or
 // mapped to ghosts, keyed by device and inode. memfd files are not ghost
-// files (criu dumps them as memfd) and are left out.
-func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) {
+// files (criu dumps them as memfd) and are left out. It returns the first
+// error statting such a file, other than one gone since it was listed:
+// the file was left out, which a size estimate must not ignore.
+func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) error {
 	base := filepath.Join(procBase, strconv.Itoa(pid))
 	mounts := readMountinfo(filepath.Join(base, "mountinfo"))
+	var firstErr error
 	see := func(link, target string) {
 		if !strings.HasSuffix(target, " (deleted)") || strings.HasPrefix(target, "/memfd:") || !strings.HasPrefix(target, "/") {
 			return
 		}
 		var st syscall.Stat_t
-		if err := syscall.Stat(link, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		if err := syscall.Stat(link, &st); err != nil {
+			if !errors.Is(err, syscall.ENOENT) && firstErr == nil {
+				firstErr = fmt.Errorf("cannot size the deleted file %s of pid %d: %w", strings.TrimSuffix(target, " (deleted)"), pid, err)
+			}
+			return
+		}
+		if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
 			return
 		}
 		key := fmt.Sprintf("%d:%d", st.Dev, st.Ino)
@@ -431,6 +525,7 @@ func deletedFiles(procBase string, pid int, ghosts map[string]ghostFile) {
 			}
 		}
 	}
+	return firstErr
 }
 
 // anonymousBytes is the anonymous memory of process pid.
@@ -472,6 +567,18 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 	for _, m := range members {
 		fs = append(fs, a.podPreflight(m.pod, m.container, m.rank)...)
 	}
+	// The capture's rule (nixlSpansNodes): an engine whose GPU ranks run on
+	// more than one node is not paused. One rank with its companions is.
+	// Only a rank opted in (nixlOptInFromPod) is paused: a rank annotated
+	// but admitted without the marker is captured as not opted in.
+	if n := rankNodes(ranks); n > 1 && a.nixlPauseOn() {
+		for _, r := range ranks {
+			if opted, _ := nixlOptInFromPod(a.nixlPauseOn(), r, gpuContainer(r)); opted {
+				fs = append(fs, PreflightFinding{Pod: r.Name, Container: gpuContainer(r), Severity: preflightBlock, Check: "nixl-pause",
+					Detail: fmt.Sprintf("the pod opted in to nixl-pause, but its engine spans nodes (its GPU ranks run on %d nodes); nixl-pause is not supported for an engine that spans nodes yet", n)})
+			}
+		}
+	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, m := range members {
@@ -485,13 +592,25 @@ func (a *Agent) capturePreflight(ctx context.Context, ranks, companions []*corev
 				log.WithError(err).WithField("pod", m.pod.Name).Warn("capture preflight: cannot run the host checks of a member")
 				fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightWarn, Check: "host",
 					Detail: "host checks did not run: " + err.Error()})
+				// The disk check is one of them, and does not fail open
+				// (capture_disk.go).
+				if a.config.CaptureDiskKeepPercent > 0 {
+					fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightBlock, Check: diskCheck,
+						Detail: "the checkpoint disk of the member's node was not checked: " + err.Error()})
+				}
 				return
 			}
 			fs = append(fs, host...)
+			// Every member's node must have checked its disk: one whose
+			// agent has the check off, or predates it, sends none.
+			if a.config.CaptureDiskKeepPercent > 0 && !hasDiskFinding(host, m.pod.Name, m.pod.Spec.NodeName) {
+				fs = append(fs, PreflightFinding{Pod: m.pod.Name, Container: m.container, Severity: preflightBlock, Check: diskCheck,
+					Detail: "the member's node did not check its checkpoint disk (its agent has the check off or predates it)"})
+			}
 		}(m)
 	}
 	wg.Wait()
-	return fs
+	return append(fs, nodeDiskFindings(fs)...)
 }
 
 // fetchHostPreflight runs the host checks of a member on its node's agent.

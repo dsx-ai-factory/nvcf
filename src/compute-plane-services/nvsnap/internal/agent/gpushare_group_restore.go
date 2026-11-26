@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,14 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	// (which fetch the checkpoints there first).
 	res := &GroupRestoreResult{Members: make([]GroupRestoreMemberResult, len(req.Members))}
 	entries := make([]groupRestoreEntry, len(req.Members))
+	// spans[i] is rank i's last restore of its checkpoint on its node
+	// (spanKnown[i]): the ranks budget their clocks with the largest
+	// (groupSpanBudget).
+	spans := make([]int64, len(req.Members))
+	spanKnown := make([]bool, len(req.Members))
+	// metas[i] is rank i's checkpoint metadata, for the learned span when
+	// a rank has no span of its own (learnedGroupSpan).
+	metas := make([]*CheckpointMetadata, len(req.Members))
 	bases := make([]string, len(req.Members))
 	// Every node fetches its rank's checkpoint at once: each is the size of
 	// its rank's GPU memory.
@@ -211,6 +220,10 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 				fetchErrs[i] = fmt.Errorf("%s: checkpoint %s: %w", name, m.CheckpointID, err)
 				return
 			}
+			if md.GPUShareGroup != nil && !md.GPUShareGroup.Companion {
+				spans[i], spanKnown[i] = fetchRestoreSpan(ctx, fabricHTTPClient, base, m.CheckpointID)
+				metas[i] = md
+			}
 			entries[i] = groupRestoreEntry{Name: name, OldIP: md.SourcePodIP, NewIP: newIPs[i], Group: md.GPUShareGroup}
 			res.Members[i] = GroupRestoreMemberResult{CheckpointID: m.CheckpointID, Pod: name, OldIP: md.SourcePodIP, NewIP: newIPs[i]}
 		}(i, m)
@@ -227,7 +240,34 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 	res.InetAddrMap = addrMap
 	res.Session = newFabricSession()
 	log = log.WithFields(logrus.Fields{"fabricSession": res.Session, "inetAddrMap": addrMap})
-	log.Info("group restore: starting every member's restore")
+	var rankSpans []int64
+	var rankKnown []bool
+	var rankMetas []*CheckpointMetadata
+	for i := range req.Members {
+		if !entries[i].Group.Companion {
+			rankSpans, rankKnown = append(rankSpans, spans[i]), append(rankKnown, spanKnown[i])
+			rankMetas = append(rankMetas, metas[i])
+		}
+	}
+	groupSpan := groupRestoreSpan(rankSpans, rankKnown)
+	// spanLearned: the ranks' span is the cluster's learned one, which each
+	// rank's estimate bounds.
+	spanLearned := false
+	if groupSpan == groupSpanUnknown && len(rankMetas) > 0 {
+		// A rank new to its node: the cluster's learned span, but never
+		// less than a rank's own last span (which is then the span, not
+		// bounded by an estimate).
+		if ms := a.learnedGroupSpan(ctx, rankMetas, log); ms != groupSpanUnknown {
+			spanLearned = true
+			for i, known := range rankKnown {
+				if known && rankSpans[i] >= ms {
+					ms, spanLearned = rankSpans[i], false
+				}
+			}
+			groupSpan = ms
+		}
+	}
+	log.WithField("rankSpanMs", groupSpan).Info("group restore: starting every member's restore")
 
 	// c-e. Restore every pod and unlock them together. The GPU ranks go
 	// first: each reloads its GPU memory (exchanging handle lists with the
@@ -261,6 +301,8 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 				ReservePIDs:              m.ReservePIDs,
 				GPUShareFabricSession:    res.Session,
 				InetAddrMap:              addrMap,
+				GroupRestoreSpanMS:       rankSpan(entries[i].Group, groupSpan),
+				GroupRestoreSpanLearned:  spanLearned && rankSpan(entries[i].Group, groupSpan) > 0,
 			})
 			mu.Lock()
 			defer mu.Unlock()
@@ -290,7 +332,7 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 		if !awaitRestored(ctx, members, ranks, done) {
 			mu.Lock()
 			for _, i := range companions {
-				res.Members[i].Error = "not restored: a GPU rank of the instance did not restore"
+				res.Members[i].Error = companionNotRestored
 				finished[i] = true
 			}
 			mu.Unlock()
@@ -342,6 +384,14 @@ func (a *Agent) groupRestore(ctx context.Context, req GroupRestoreRequest, log *
 			res.DeletedPods = append(res.DeletedPods, name)
 		}
 	}
+	if nixlResumeUnavailable(res.Members) {
+		// A member's node cannot bring its paused NIXL KV connector back:
+		// it refused before CRIU ran, and the others failed with it. The
+		// checkpoint is not at fault. The members' errors are strings, so
+		// the sentinel is wrapped here, for recordFailure to count a node
+		// refusal rather than a stall.
+		return res, fmt.Errorf("%w: %w: %w", errCheckpointUnavailable, errNIXLResumeUnavailable, membersFailed("group restore", res.Session, len(res.Members), failed))
+	}
 	failure := &groupRestoreFailure{err: membersFailed("group restore", res.Session, len(res.Members), failed)}
 	var faults []gpuFault
 	for _, m := range res.Members {
@@ -384,6 +434,39 @@ func (e *groupRestoreFailure) Unwrap() []error {
 		return []error{e.err, e.fault}
 	}
 	return []error{e.err}
+}
+
+// nixlResumeUnavailable reports whether the group's restore did not run,
+// as far as its capture goes: a member refused it before CRIU because its
+// node cannot resume the NIXL KV connector (errNIXLResumeUnavailable, as
+// text from its agent), and every other member that failed was aborted
+// for it (openHeldGPUOnUnlock, or no unlock in time). Another member that
+// failed on its own makes the failure that member's.
+func nixlResumeUnavailable(members []GroupRestoreMemberResult) bool {
+	refused := false
+	for _, m := range members {
+		switch {
+		case m.Error == "":
+		case strings.Contains(m.Error, errNIXLResumeUnavailable.Error()):
+			refused = true
+		case !abortedByAPeer(m.Error):
+			return false
+		}
+	}
+	return refused
+}
+
+// companionNotRestored is the error of a companion (a member without GPU
+// state) not restored because a GPU rank of its instance did not.
+const companionNotRestored = "not restored: a GPU rank of the instance did not restore"
+
+// abortedByAPeer reports whether a member's restore error (text from its
+// agent) says it failed because another member did; a companion that was
+// never launched for a rank's failure counts.
+func abortedByAPeer(e string) bool {
+	return strings.Contains(e, "aborted: another pod of the instance failed to restore") ||
+		strings.Contains(e, "the other pods did not finish restoring") ||
+		e == companionNotRestored
 }
 
 // allRefusedAsRestored reports whether every member refused the restore
@@ -478,6 +561,39 @@ func fetchCheckpointMetadata(ctx context.Context, client *http.Client, base, id 
 		return nil, fmt.Errorf("decode metadata: %w", err)
 	}
 	return &md, nil
+}
+
+// fetchRestoreSpan reads what the last restore of checkpoint id took on
+// the agent at base (restoreSpanFile); false when it has none or it cannot
+// be read, which leaves the group on the estimate.
+func fetchRestoreSpan(ctx context.Context, client *http.Client, base, id string) (int64, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1/checkpoints/"+url.PathEscape(id)+"/file?path="+restoreSpanFile, http.NoBody)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || ms < 0 {
+		return 0, false
+	}
+	return ms, true
+}
+
+// rankSpan is the span a member's restore budgets its clocks with: the
+// group's for a GPU rank, none (its own budget) for a companion.
+func rankSpan(g *GPUShareGroupInfo, groupSpan int64) int64 {
+	if g == nil || g.Companion {
+		return 0
+	}
+	return groupSpan
 }
 
 // postRestore runs one member's restore on its node's agent.

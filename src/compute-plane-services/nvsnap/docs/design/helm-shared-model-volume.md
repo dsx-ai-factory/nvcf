@@ -11,7 +11,7 @@ Status: all five mechanisms built and verified on an H100 cluster with NVMesh st
 volume per configuration; see the results at the end. Under CRIU capture
 (`agent.captureMethod: criu`) only the model volume runs; the cache set
 (mechanism 5) does not (`internal/webhook/criu_identity.go`).
-Supersedes the gate-and-promote path of `helm-chart-cache-election.md`
+Supersedes the gate-and-promote path of the election (ARCHITECTURE.md section 7)
 for Helm functions. Issue #2099. Diagrams are checked with
 `scripts/check-mermaid.sh`.
 
@@ -573,7 +573,7 @@ admission to Ready 183 to 223 s (490 s plain cold). What remains per
 worker is the engine's own 25 s process start, 10 s weight read, 1 s
 profile run, 3 s graph capture and 13 s to Ready, plus pod creation and
 NVMesh attach before the engine starts. Set refresh
-(`helm-chart-cache-refresh.md`) exists for engines that compile at
+(ARCHITECTURE.md section 7) exists for engines that compile at
 startup what a cold run does not, and ships off by default.
 
 NVMesh shared read-only attach can take up to 30 s under 8 to 16

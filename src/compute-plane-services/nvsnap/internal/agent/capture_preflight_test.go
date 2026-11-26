@@ -115,7 +115,9 @@ func TestDeletedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	ghosts := map[string]ghostFile{}
-	deletedFiles("/proc", os.Getpid(), ghosts)
+	if err := deletedFiles("/proc", os.Getpid(), ghosts); err != nil {
+		t.Fatal(err)
+	}
 	found := false
 	for _, g := range ghosts {
 		if g.path == f.Name() {
@@ -279,6 +281,25 @@ func TestRDMAFindingsBlock(t *testing.T) {
 	}
 	if fs := rdmaFindings(proc, "w-0", "main", map[int][]string{}); len(fs) != 0 {
 		t.Errorf("findings without RDMA devices: %+v", fs)
+	}
+}
+
+// A process whose NCCL takes its verbs from libnvsnap_ibv.so warns instead
+// of blocking: the GPU suspend releases NCCL's RDMA state.
+func TestRDMAFindingsIBVLibWarns(t *testing.T) {
+	proc := t.TempDir()
+	fakeRDMAProc(t, proc, 41, "VllmWorker", nil,
+		"7f0000002000-7f0000003000 r-xp 00000000 103:01 78 /opt/nvsnap/bin/libnvsnap_ibv.so\n")
+	fakeRDMAProc(t, proc, 9, "nixl", nil, "7f0000002000-7f0000003000 r-xp 00000000 103:01 77 /usr/lib/libibverbs.so.1\n")
+	fs := rdmaFindings(proc, "w-0", "main", map[int][]string{
+		41: {"/dev/infiniband/uverbs0"},
+		9:  {"/dev/infiniband/uverbs2"},
+	})
+	if len(fs) != 2 || fs[0].Severity != preflightBlock || fs[1].Severity != preflightWarn {
+		t.Fatalf("want process 9 blocking and process 41 warning: %+v", fs)
+	}
+	if !strings.Contains(fs[1].Detail, "process 41 (VllmWorker) holds RDMA devices /dev/infiniband/uverbs0 through libnvsnap_ibv.so") {
+		t.Errorf("warning detail: %s", fs[1].Detail)
 	}
 }
 

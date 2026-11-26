@@ -29,7 +29,7 @@ func fallbackModelMutator(t *testing.T, fb CRIUFallback, ok bool) (*Mutator, *co
 	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
 	m.CRIUCapture, m.Kube, m.GPUShareByDefault, m.CheckpointHostRoot = true, kc, true, fbCheckpoints
 	asked := 0
-	m.CRIUFallback = func(_ context.Context, ns, uri string, ordinal int) (CRIUFallback, bool) {
+	m.CRIUFallback = func(_ context.Context, ns, uri string, ordinal int, _ string) (CRIUFallback, bool) {
 		asked++
 		if ns != "sr-fn" || !strings.HasPrefix(uri, "cache://") || ordinal != 0 {
 			t.Errorf("asked for %s %s %d", ns, uri, ordinal)
@@ -177,7 +177,7 @@ func TestCRIUFallbackWithoutModelVolume(t *testing.T) {
 	id := FallbackCaptureID("k", 0)
 	m := &Mutator{Backend: newBackend(t), CacheDir: "/opt/nvsnap", Composer: &rootfsonly.HashInputComposer{CUDADriverMajor: 610}, CRIUCapture: true,
 		CheckpointHostRoot: fbCheckpoints,
-		CRIUFallback: func(context.Context, string, string, int) (CRIUFallback, bool) {
+		CRIUFallback: func(context.Context, string, string, int, string) (CRIUFallback, bool) {
 			return CRIUFallback{Reason: "restore-failed", Capture: id}, true
 		}}
 	pod := gpuRank("engine-0", metav1.OwnerReference{Kind: "StatefulSet", Name: "engine"})
@@ -197,7 +197,7 @@ func TestCRIUFallbackNotForPlaceholders(t *testing.T) {
 	g := CRIUGroup{Checkpoints: []string{"r0__1", "r1__1"}, Nodes: []string{"n0", "n1"}}
 	m, _ := groupMutator(t, g, "")
 	m.CRIUCapture, m.CacheDir = true, "/opt/nvsnap"
-	m.CRIUFallback = func(context.Context, string, string, int) (CRIUFallback, bool) {
+	m.CRIUFallback = func(context.Context, string, string, int, string) (CRIUFallback, bool) {
 		t.Error("asked for a fallback")
 		return CRIUFallback{Reason: "failed"}, true
 	}
@@ -215,5 +215,28 @@ func TestFallbackCaptureID(t *testing.T) {
 	}
 	if slices.Contains([]bool{validFallbackCapture("cachedir-a/b"), validFallbackCapture("x")}, true) {
 		t.Error("an invalid capture name accepted")
+	}
+}
+
+// A configuration the cluster's GPU drivers keep from CRIU goes without
+// the library too (nothing is captured with it), gets the cachedir, and
+// is not held for a capture.
+func TestCRIUFallbackDriverReader(t *testing.T) {
+	m, pod, _ := fallbackModelMutator(t, CRIUFallback{Reason: FallbackDriver}, true)
+	got := admit(t, m, pod)
+	main := got.Spec.Containers[0]
+	if strings.Contains(fbEnv(main)["LD_PRELOAD"], GPUShareLibPath) {
+		t.Error("the library was placed for a configuration the drivers keep from CRIU")
+	}
+	if v := volumeNamed(got, cacheDirVolumeName); v == nil || v.EmptyDir == nil {
+		t.Fatalf("no cachedir: %v", got.Spec.Volumes)
+	}
+	if a := got.Annotations; a[CaptureMethodAnnotation] != "cachedir" || a[FallbackReasonAnnotation] != FallbackDriver {
+		t.Errorf("annotations %v", a)
+	}
+	for _, g := range got.Spec.ReadinessGates {
+		if strings.Contains(string(g.ConditionType), "capture") {
+			t.Errorf("held for a capture: %v", got.Spec.ReadinessGates)
+		}
 	}
 }

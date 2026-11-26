@@ -9,10 +9,101 @@ Run from the repository root:
 ```sh
 go test -C tools/docs-version-sync ./...
 go vet -C tools/docs-version-sync ./...
-NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestImageCatalogCharts$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestChartImageCoverage|TestChartImageCoverageReportsEachFailure|TestImageCatalogRepositoriesReuseNamesAcrossCharts)$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^TestNATSAndOpenBaoChartImageGuards$' -count=1
+NVCF_IMAGE_CATALOG_E2E=1 go test -C tools/docs-version-sync -run '^(TestStackImageSources|TestStackImageSourcesReportsEachFailure)$' -count=1
 ```
 
-The chart test renders prefilled image defaults and ordinary Helm overrides.
-It downloads pinned NATS and OpenBao dependencies into test-owned directories.
-It does not create a cluster or verify registry publication. Keep the chart
-probe and override helpers test-only; installation uses native Helm values.
+`TestChartImageCoverageReportsEachFailure` runs the same evaluation on a
+fixture repository, one chart per rule.
+
+`TestChartImageCoverage` checks every tracked `Chart.yaml`. A chart either
+declares `thirdPartyImages` or `ownedImages` in its `values.yaml` and passes
+the chart image checks, or carries an entry in `chart-image-exclusions.yaml`.
+The test first classifies each chart. A chart is stack-deployed when a
+released stack (one with `release-inventory.yaml`) declares a release of it,
+enabled or not, resolved as the stack image source check resolves releases.
+Every other chart is standalone. Classification runs `helmfile build`, so the
+chart test needs `helmfile` as well as `helm`. Use the `HELMFILE_VERSION`
+pinned in `.github/workflows/build-test.yml`. Findings name the class, such as
+`deploy/helm/x (standalone)`. For an indexed chart the test requires:
+
+- Stack-deployed: every indexed image `registry` and `repository` in the chart
+  `values.yaml` is written as `""`, and a render with only the defaults fails
+  with an error that names an indexed `registry` or `repository` path.
+- Standalone: every indexed `registry` and `repository` holds a non-empty
+  default, so a plain `helm install` works. The defaults render is not
+  checked.
+- A `repository` never contains a registry host. Tag and digest may be
+  prefilled. The alternate source fields in `imageValueExceptions` stay empty
+  in both classes, so each image has one source.
+- The chart's own templates contain no literal registry host in an image
+  reference and no `default` with a literal registry or repository.
+- Emptying any indexed `registry` or `repository` fails with an error that
+  names its values path. Wrappers add this guard for images that an upstream
+  subchart renders.
+- Every CI values scenario in `tools/ci/helm-chart-values.yaml` supplies
+  `registry` and `repository` for every indexed image. Each scenario renders
+  only indexed images, and ordinary overrides layered on it reach every image.
+
+The test downloads remote dependencies into test-owned directories. It does
+not create a cluster or verify registry publication. Keep the chart probe and
+override helpers test-only; installation uses native Helm values.
+
+A chart that only an unreleased development stack deploys is listed as
+`dev-only`. The entry fails when a released stack deploys the chart. Where the
+chart lives is not checked. CI cannot build a `dev-only` stack, so whether one
+deploys the chart is not verified. Never list a chart that users install
+directly as `dev-only`; it must pass the standalone checks instead. Review
+enforces this.
+
+A chart that declares an image index cannot be listed as `test-fixture` or
+`no-runtime-image`, so do not commit an indexed fixture chart. Build it in a
+temporary tree with `writeChartFixtureTree`, as the matrix tests do.
+
+When a pending-fix chart is fixed, remove its exclusion entry in the same Pull
+Request. Image value shapes that differ from `registry`/`repository`/`tag`/
+`digest` belong in `imageValueExceptions` in `chart_image_exceptions_test.go`.
+
+## Stack image sources
+
+`TestStackImageSources` checks every Helmfile stack under `deploy/stacks/`. A
+stack passes or carries an entry in `stack-image-exclusions.yaml`
+(`pending-fix`, or `dev-only` for a stack without `release-inventory.yaml`).
+`TestStackImageSourcesReportsEachFailure` runs the same evaluation on a fixture
+repository, one stack per rule. For a stack the test requires:
+
+- No stack `.gotmpl` file defaults an image `registry`, `repository`, `tag` or
+  `digest` to a literal. The forms live in `literalDefaultFormTable`, shared
+  with the chart gate.
+- Every rendered image takes its `registry` and `repository` from the stack's
+  `environments/base.yaml`, or from an included stack's `base.yaml` that the
+  including state forwards. An image value lives in a map named `image`, a
+  map ending in `Image`, or `global.image`; a `registry` under any other map,
+  such as `global.helm.sources`, is not an image source. A single image
+  string or a `repository` with a registry host fails. A `tag` or `digest` set in `base.yaml` reaches a
+  rendered image.
+
+The test renders each state that `release-inventory.yaml` lists, plus
+`stackExtraStates`, with a layered `probe` environment that sets a sentinel for
+every image value in `base.yaml`. Stack charts render from the tracked chart at
+HEAD; third-party charts are pulled from their public repositories. A chart
+whose source is not tracked is skipped only when listed in
+`untrackedStackCharts`. When a pending-fix stack is fixed, remove its entry in
+the same Pull Request.
+
+## Indirect image convention
+
+The scanner reads every `image` field. Other image references are visible
+only through these registered patterns:
+
+- `--<name>-image=<ref>` arguments
+- the `AGENT_INJECT_VAULT_IMAGE` environment variable
+- the `OTEL_COLLECTOR_IMAGE_REPO` and `OTEL_COLLECTOR_IMAGE_TAG` pair
+- `BYOO_OTEL_COLLECTOR_CONTAINER` inside the base64 environment overrides
+- `release-artifact-*-image` keys
+
+Avoid indirect images. When one is necessary, use a registered pattern. A
+change that introduces a new indirect pattern adds it to the scanner in
+`resolved_inventory.go` in the same Pull Request. An image in any other form,
+such as a ConfigMap string, is invisible to the chart image checks.

@@ -1056,7 +1056,7 @@ func TestBackendK8sSyncAllFeatures(t *testing.T) {
 			},
 		}).
 		WithK8sClusterNetworkCIDRs([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/12"}).
-		WithNVCFWorkerConfig(true, types.DefaultCacheCSIMountOptions, 90*time.Minute)
+		WithNVCFWorkerConfig(true, types.DefaultCacheCSIMountOptions, 90*time.Minute, 0)
 
 	bc, _, err := b.Start(ctx)
 	require.NoError(t, err)
@@ -1298,7 +1298,7 @@ func TestBackendK8sSyncAllFeaturesCSIOptionOverride(t *testing.T) {
 		WithClients(clients).
 		WithGXCache(clustermgmt.DefaultGXCacheNamespace, true).
 		WithK8sClusterNetworkCIDRs([]string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/12"}).
-		WithNVCFWorkerConfig(true, "remount,rw", 90*time.Minute)
+		WithNVCFWorkerConfig(true, "remount,rw", 90*time.Minute, 0)
 
 	bc, _, err := b.Start(ctx)
 	require.NoError(t, err)
@@ -4086,4 +4086,32 @@ func TestCleanupResources_RemovesNVCFBackendFinalizer(t *testing.T) {
 	assert.NotContains(t, after.Finalizers, cleanup.NVCAOperatorFinalizer,
 		"cleanupResources must strip the operator finalizer so K8s can GC the CR; "+
 			"otherwise the reconciler loops forever on the same deletionTimestamp")
+}
+
+func TestBackendK8sCacheBuilder_Start_UsesSystemNamespace(t *testing.T) {
+	ctx, cancel := context.WithCancel(newTestContext())
+	t.Cleanup(cancel)
+
+	const systemNamespace = "some-other-ns"
+	bc, _, err := NewBackendK8sCacheBuilder().
+		WithSystemNamespace(systemNamespace).
+		WithNGCServiceKeyFetcher(&mockTokenFetcher{token: "randomkey"}).
+		WithClients(mockKubeClients()).
+		Start(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, systemNamespace, bc.operatorNamespace)
+}
+
+func TestBackendK8sCacheBuilder_Start_DefaultsOperatorNamespace(t *testing.T) {
+	ctx, cancel := context.WithCancel(newTestContext())
+	t.Cleanup(cancel)
+
+	bc, _, err := NewBackendK8sCacheBuilder().
+		WithNGCServiceKeyFetcher(&mockTokenFetcher{token: "randomkey"}).
+		WithClients(mockKubeClients()).
+		Start(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, NVCAOperatorNamespace, bc.operatorNamespace)
 }

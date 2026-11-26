@@ -101,6 +101,22 @@ agent:
   # tier (--kv-offloading-size 600) is one 600 GiB file in /dev/shm. A dump
   # saves it whole, so the checkpoint grows by that much. Empty is 1 TiB.
   criuGhostLimit: ""
+  # Share of the checkpoint filesystem, in percent, a capture must leave
+  # free. A capture writes its pods' memory there (about 570 GB per rank of
+  # a large model); below the kubelet's eviction threshold (15% by default)
+  # the kubelet evicts every pod on the node. A capture that would not leave
+  # this much free is skipped before any member suspends. 0 turns the check
+  # off; empty is the default, 20.
+  captureDiskKeepPercent: 20
+
+  # Oldest NVIDIA driver major CRIU captures and restores on. Each agent
+  # reports its node's driver; when any GPU node's is older, or the GPU
+  # nodes run more than one major, GPU pods fall back to the cachedir
+  # instead (fallback reason "driver"). Driver 580 cannot restore the
+  # multicast memory tensor-parallel engines use on NVSwitch systems
+  # (docs/design/GPUSHARE.md). A cluster whose workloads keep multicast
+  # off can lower it. Empty is 610.
+  criuMinDriverMajor: ""
 
   # Give a restored pod the pod address it had when it was captured, on its
   # loopback and translated to its new address at its edge, so sockets the
@@ -131,7 +147,7 @@ agent:
   podCacheDir: "/opt/nvsnap"
 
   # One downloader per cache hash for chart-shaped model workloads
-  # (docs/design/helm-chart-cache-election.md). At admission the
+  # (docs/ARCHITECTURE.md, section 7). At admission the
   # webhook composes the cache hash of every GPU pod that names a model;
   # if a promoted capture exists the pod restores from it, otherwise one
   # pod is elected to capture and the rest are held by a scheduling gate
@@ -154,6 +170,30 @@ agent:
   # modelVolume.readerMode: pvc); readerMode: hostPath schedules readers
   # at once and binds the volume in, for gang-scheduled charts where
   # policy allows hostPath. Needs agent.l2. Off until qualified.
+  # Node-local model cache (docs/design/node-model-cache.md). A cold pod
+  # whose init downloads its model into an emptyDir seeds it from a copy on
+  # its node, or one the agent fetches from a peer node, instead of
+  # downloading; after a real download the agent keeps a copy. The pod's
+  # volumes, its main container and restores are unchanged, and any cache
+  # problem falls back to the pod's own download. Needs agent.auth
+  # enabled with mode required; not with modelVolume.
+  nodeModelCache:
+    enabled: false
+    # Host directory of the cache, on the node's local disk (NVMe).
+    root: /var/lib/containers/nvsnap-model-cache
+    # Most of root's filesystem the cache may use, in percent. 10% of the
+    # filesystem always stays free.
+    maxPercent: 30
+    # Most seconds a download init waits for a peer fetch in progress.
+    wait: 600
+    # Most time one fetch from one peer may take.
+    fetchTimeout: 30m
+    # One pod per model downloads from the registry; the other pods stream
+    # its download from its node as the files land, instead of each
+    # downloading (docs/design/model-cache-single-flight.md). The agent then
+    # mounts kubeletPodsDir read-write, to write those pods' volumes.
+    singleFlight: false
+    kubeletPodsDir: /var/lib/kubelet/pods
   modelVolume:
     enabled: false
     # How long a reader waits for the writer's download before it downloads
@@ -173,7 +213,7 @@ agent:
     # captures and caches.
     tenantLabel: ""
 
-  # Compile cache set refresh (docs/design/helm-chart-cache-refresh.md),
+  # Compile cache set refresh (docs/ARCHITECTURE.md, section 7),
   # off by default. When on, a warm rank whose cachedir gained files before
   # it reported Ready (what the next start pays for) proposes a refresh;
   # one agent collects a new generation of the set from the warm ranks and
@@ -181,7 +221,7 @@ agent:
   # refreshCooldown is the least time between generations of one set; a
   # superseded generation with no reader bound is retired about an hour
   # after it is replaced. Turn on per cluster when a measured case needs
-  # it (docs/design/helm-chart-cache-refresh.md records its one run).
+  # it (docs/results/HELM-CHART-CACHE-2026-09.md records its one run).
   cacheVolume:
     refresh: false
     refreshCooldown: 6h
@@ -508,6 +548,22 @@ agent:
         prometheus.agent/servicemonitor-discover: "true"
         nvcf.nvidia.com/observability-target: "true"
       interval: 30s
+    # The NvSnap alerts (files/prometheus-rules.yaml; runbook
+    # docs/operate/RUNBOOK.md) as a Prometheus Operator PrometheusRule.
+    # enabled, namespace and labels work as serviceMonitor's: labels are
+    # what the cluster's Prometheus selects rules by. The default suits a
+    # kube-prometheus-stack Prometheus installed as release prometheus-agent
+    # that evaluates the rules and remote-writes their ALERTS series; where
+    # alerts are routed, and at what severity, is the service on-call's
+    # decision (every alert is "info" until then). A cluster whose
+    # collector evaluates no PrometheusRules (an OpenTelemetry collector,
+    # deploy/stacks/observability) gets no NvSnap alerts from this: load
+    # files/prometheus-rules.yaml into its rule evaluator instead.
+    prometheusRule:
+      enabled: auto
+      namespace: monitoring
+      labels:
+        release: prometheus-agent
     # A Grafana dashboard of the history, as a ConfigMap labelled for the
     # Grafana dashboard sidecar (grafana_dashboard: "1").
     dashboard:
@@ -554,6 +610,16 @@ agent:
       memory: 64Gi
     # Share of the checkpoint filesystem a copy must leave free.
     keepFreePercent: 10
+    # How a rails pod gets its node's RDMA NICs. "claim": every NIC,
+    # through DRA (deviceClass). "host": none claimed; it runs in the
+    # host's network namespace, privileged, on `devices`. For clusters
+    # whose NICs are a device-plugin resource the workers take whole, with
+    # the physical functions left on the host (the workers hold virtual
+    # functions): the copy shares the ports with the workers' traffic.
+    nicMode: claim
+    # bedrock-peer --devices: all, netns, or comma-separated RDMA device
+    # names. Empty: all when claiming, netns on host NICs.
+    devices: ""
 
 # ─── NvSnap Server (REST API + UI) ───────────────────────────────────────
 
@@ -645,6 +711,18 @@ webhook:
   # or for a gradual rollout. The pod-level opt-out applies in both.
   injectScope: all
 
+  # Let a group restore's placeholders skip the init containers that fill
+  # only emptyDirs too large to copy into the checkpoint (over
+  # NVSNAP_REPLAY_EMPTYDIR_MAX_BYTES, 4 GiB) that no restored process of
+  # any member uses, typically a model download: without a model volume,
+  # every placeholder would download the whole model again before its
+  # restore could start. Decided once per group at capture, from the dumps;
+  # pods with no recreating controller, Jobs' pods, and pods annotated
+  # nvsnap.io/keep-inits never skip. Verify does not send inference
+  # requests, so a workload that reads its model files again after it
+  # starts would serve errors from a restore: keep off in production until
+  # verify checks inference.
+  skipUnusedInits: false
   # Fixed Dynamo namespace (DYN_NAMESPACE and DYN_NAMESPACE_PREFIX) for
   # Dynamo components whose etcd and NATS are services of their own
   # Kubernetes namespace. The operator derives the Dynamo namespace from the
@@ -686,6 +764,31 @@ webhook:
   # is down stays held until the agent is back. false: pods serve as soon
   # as they are Ready, and a capture may stop an instance that serves.
   captureHold: true
+
+  # Point NCCL in every GPU pod under the gpushare library at the bundled
+  # verbs library (libnvsnap_ibv.so, NCCL_IBVERBS_LIB), so that a workload
+  # whose NCCL uses RDMA (IB or RoCE) can be captured: the library releases
+  # NCCL's RDMA state before the checkpoint and creates it again after the
+  # restore. Without it, the capture of such a workload is refused and it
+  # starts cold. A pod annotated nvsnap.io/gpushare-ibv: "false", or one
+  # that sets NCCL_IBVERBS_LIB itself, keeps NCCL's own library. Other RDMA
+  # users in the pod (UCX, NIXL) are not covered.
+  gpushareIBV: false
+
+  # Capture disaggregated vLLM pods whose KV transfer is NIXL over RDMA
+  # (docs/design/NIXL-PAUSE.md). A pod opts in with the annotation
+  # nvsnap.io/nixl-pause: "true"; this switch decides whether the cluster
+  # honors it. On, an opted-in pod under the gpushare library gets
+  # NVSNAP_NIXL_PAUSE=1 and NVSNAP_GPUSHARE_CTL_ON_CUDA_USE=1, and a capture
+  # has its NIXL KV connector release its RDMA state right before the
+  # suspend (refused, with the reason, if any RDMA is still held: NCCL over
+  # RDMA, say); its restore brings the connector back at the new pod's
+  # address, or fails and starts cold. Off (default): the annotation is
+  # ignored, and such pods are refused by the capture preflight as before.
+  # A change applies to pods admitted after it; a checkpoint taken with the
+  # connector paused still brings it back on restore. Rolls the agents.
+  nixlPause:
+    enabled: false
 
   # Operator salt folded into every cache identity the webhook composes.
   # The identity covers image, model, arguments, cache-relevant env, driver

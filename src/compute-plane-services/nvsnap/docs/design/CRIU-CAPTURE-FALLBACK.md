@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # When a CRIU capture or the gpushare library fails: the caches
 
-Status: 2.1, 2.3, 2.5 done; 2.2, 2.6, 2.7 implemented 2026-11-01, gate scenarios pending. Scope: `internal/agent/criu_group.go` (capture attempts and
+Status: 2.1, 2.3, 2.5 done; 2.2, 2.6, 2.7 implemented 2026-11-01, gate scenarios pending; 2.8 implemented 2026-11-12, not on a cluster yet. Scope: `internal/agent/criu_group.go` (capture attempts and
 the group record), `internal/webhook/mutate.go`, `cachedir.go` and `gpushare.go` (method per configuration),
 `internal/agent/gpushare.go` (resume after a failed dump), `internal/rootfsonly` and `internal/agent/rails_*.go`
 (the cachedir capture under a CRIU cluster and its transport).
@@ -14,175 +14,226 @@ the group record), `internal/webhook/mutate.go`, `cachedir.go` and `gpushare.go`
 **Contents**
 
 - [1. Problem](#1-problem)
-- [2. Proposal](#2-proposal)
+- [2. Design](#2-design)
   - [2.1 One CRIU attempt per configuration and agent version](#21-one-criu-attempt-per-configuration-and-agent-version)
   - [2.2 A configuration CRIU cannot serve falls back to the caches](#22-a-configuration-criu-cannot-serve-falls-back-to-the-caches)
   - [2.3 Every member's error, kept in the record](#23-every-members-error-kept-in-the-record)
-  - [2.5 What the preflight can find, it finds before the freeze](#25-what-the-preflight-can-find-it-finds-before-the-freeze)
   - [2.4 A failed dump resumes the workload](#24-a-failed-dump-resumes-the-workload)
+  - [2.5 What the preflight can find, it finds before the freeze](#25-what-the-preflight-can-find-it-finds-before-the-freeze)
   - [2.6 A workload that fails under the gpushare library](#26-a-workload-that-fails-under-the-gpushare-library)
   - [2.7 The cachedir capture over the bedrock peer](#27-the-cachedir-capture-over-the-bedrock-peer)
+  - [2.8 GPU drivers CRIU cannot serve on](#28-gpu-drivers-criu-cannot-serve-on)
 - [3. Status](#3-status)
 - [4. Tests](#4-tests)
-- [5. Not in this proposal](#5-not-in-this-proposal)
+- [5. Not in this design](#5-not-in-this-design)
 <!-- /toc -->
 
 ## 1. Problem
 
-On a cluster whose agents capture with CRIU (`agent.captureMethod: criu`), a configuration is captured with CRIU or
-not at all: the webhook skips the cachedir capture and its compile-cache set for every pod (`Mutator.CRIUCapture`).
-A configuration whose CRIU capture fails gets nothing, and is tried again up to `criuGroupMaxCaptures` (3) times.
-Each attempt freezes the live workload.
+On a cluster whose agents capture with CRIU (`agent.captureMethod: criu`), the webhook skips the cachedir capture and
+its compile-cache set for every pod (`Mutator.CRIUCapture`). Without this design, a configuration whose CRIU capture
+fails gets nothing, and is retried up to `criuGroupMaxCaptures` (3) times, each attempt freezing the live workload.
+One process CRIU cannot dump (an MPTCP socket, `inet: Unsupported proto 262`; Go 1.24 and later open MPTCP listeners
+by default) fails the whole instance's capture, and the group record used to keep only the first member's abort, cut
+at 1024 bytes.
 
-Seen on a test cluster with every function opted in: a single-node Dynamo function (one pod of 4 GPUs with the
-frontend in it, plus etcd and NATS) was captured three times, 20:54, 21:10 and 21:26. Each time the NATS member's
-dump failed: `nats-server` held an MPTCP socket (`inet: Unsupported proto 262`; Go 1.24 and later open MPTCP
-listeners by default), which CRIU cannot dump. The other two members, waiting at the post-dump barrier, were
-aborted (`.dump-hook/action.sh` exited 1). The gpushare resume of the worker then failed, it stayed suspended
-(`errSourceLeftSuspended`), and its pod was replaced, three times.
-
-The cause was in the failed dumps' logs, which the agent keeps under `<checkpoint dir>/.failed-logs/`. The group
-record showed only the first member's abort: its reason was cut at 1024 bytes.
-
-## 2. Proposal
+## 2. Design
 
 ### 2.1 One CRIU attempt per configuration and agent version
 
-A configuration's CRIU capture is attempted once per agent bundle version (the `agentBundle` field the record
-keeps). A failure is recorded as `state=failed` with every member's first error (§2.3). It is retried only when
-something that could change the outcome changes: the agent bundle version (a fix shipped), or the configuration
-itself (a new image or arguments, which is a new configuration key anyway). A stall the code already classifies as
-transient (the instance not ready, agents settling) is not a failure and does not count.
+A configuration's CRIU capture is attempted once per agent bundle version (the record's `agentBundle`). A failure
+is recorded as `state=failed` with every member's first error (2.3). It is retried only when the agent bundle
+version or the configuration (a new configuration key) changes, and only while fewer than `criuGroupMaxCaptures` (3)
+captures have been made (`criuGroupRecaptures`). A stall the code classifies as transient (the
+instance not ready, agents settling) does not count as a failure.
 
 ### 2.2 A configuration CRIU cannot serve falls back to the caches
 
-A configuration falls back when its group record (`nvsnap-criu-group-<key>`, keyed by the configuration and its
-tenant) says CRIU cannot serve it with the current agent bundle (`agentBundle`):
+A configuration falls back when its group record (`nvsnap-criu-group-<key>`, keyed by configuration and tenant) says,
+for the current `agentBundle`, `state=failed` (capture failed), `state=restore-failed` (restore failed) or
+`state=gpushare-failed` (2.6). It falls back only once CRIU will not capture it again under the current bundle
+(`criuGroupRecaptures`): a failed capture of another bundle version is captured again, and a failed restore under
+any bundle, until `criuGroupMaxCaptures` is spent; once it is, the record falls back whatever its bundle. A fallback pod is never taken for a CRIU capture, since its restore
+placeholder would lack its cachedir. A usable record, or none, changes nothing.
 
-- `state=failed`: its capture failed (§2.1);
-- `state=restore-failed`: it was captured and its restore failed;
-- `state=gpushare-failed` (§2.6): the workload does not start under the gpushare library.
+A record of another process configuration is replaced, whatever its state, unless it is `capturing` or `verifying`.
+The key leaves out per-deployment settings such as `DYN_NAMESPACE_WORKER_SUFFIX`, and admission refuses to restore a
+pod whose process configuration differs from its checkpoint's, so after a redeploy that changes one, the record could
+otherwise never be restored from or captured again. The capture compares each member with the record's slots as
+admission does (`processConfigChanged`, `internal/agent/criu_group.go`): a rank against its own slot, a companion
+against every companion slot. It replaces the record (`claimGroupRecord`), and that configuration's attempts start
+over. A record is kept for `recordReplaceCooldown` (30 minutes) after it was verified or started, so a value that
+differs per instance rather than per deploy, or two configurations alternating during a rollout, costs at most one
+capture per cooldown. The members' configurations are written at the claim, so a capture that then fails still says
+which configuration failed. The replaced capture's checkpoints are retired by the checkpoint reaper, which removes an
+instance capture no complete record names.
 
-A configuration falls back only once CRIU will not capture it again under the current bundle
-(`criuGroupRecaptures`): a record of another bundle version is not a fallback, the new version tries CRIU (and the
-library) once; and a failed restore is captured again, as before, until `criuGroupMaxCaptures` is spent. A fallback
-pod is never taken for a CRIU capture: the placeholder of its restore would not have its cachedir. A record that is
-usable, or none, changes nothing.
+A failed record does not send a pod of another process configuration to the fallback: the pod's rank slot differs
+(`otherConfiguration`, `internal/agent/criu_fallback.go`), and its instance's capture replaces the record. That pod's
+admission also marks the record `reconfiguredAt` (`markReconfigured`), after which no pod falls back on it, so a leader
+whose own slot still matches, when a redeploy changed only the workers, does not keep its instance from capturing. A
+failure under the library marks the record with the failing pod's process configuration (`markFailedConfiguration`):
+unless the pod's slot already holds it, every slot is dropped and the pod's written, and the `reconfiguredAt` mark
+goes, so the configuration's next pods fall back without the library instead of failing under it again.
 
 For a GPU pod of a configuration that falls back, the webhook, in place of the CRIU-only decoration:
 
-1. does not inject the gpushare library when the reason is `gpushare-failed`. For the other two it is kept: the
-   workload runs under it, and a later CRIU attempt needs it;
-2. gives the pod the cachedir: an emptyDir at `CacheDir` and the cache environment, as on a cluster without CRIU
-   (`cacheDirCapturePatchesFor`; for a pod whose model comes from a model volume, the cache entries only, the model
-   staying in its volume). No `nvsnap.io/capture` label is needed: the configuration is opted in already;
-3. annotates the pod `nvsnap.io/capture-method: cachedir`, `nvsnap.io/fallback-reason: <state>`,
-   `nvsnap.io/fallback-cache: <key>` and its rank, `nvsnap.io/fallback-cache-ordinal: <n>`;
-4. when the record of §2.7 holds a complete capture of the pod's rank, also restores it (§2.7).
+1. does not inject the gpushare library when the reason is `gpushare-failed`; otherwise keeps it, as a later CRIU
+   attempt needs it;
+2. gives the pod the cachedir: an emptyDir at `CacheDir` and the cache environment (`cacheDirCapturePatchesFor`;
+   for a pod whose model comes from a model volume, the cache entries only). No `nvsnap.io/capture` label is needed;
+3. annotates the pod `nvsnap.io/capture-method: cachedir` and `nvsnap.io/fallback-reason: <state>`, and, when its
+   rank has a complete capture and the checkpoint root is configured, `nvsnap.io/fallback-capture: <capture>`
+   (`internal/webhook/criu_fallback.go` `fallbackPatches`). The configuration and rank come from the pod's identity
+   annotations, `nvsnap.io/cache-uri` and `nvsnap.io/cache-ordinal`;
+4. when the record of 2.7 holds a complete capture of the pod's rank, also restores it (2.7).
 
 ### 2.3 Every member's error, kept in the record
 
-Each member's error is bounded on its own (768 bytes) and the record's reason holds all of them (up to 16 KiB),
-so the member that failed on its own is not hidden behind the others' aborts. The failed dumps' `dump.log` files
-are already kept on each node under `<checkpoint dir>/.failed-logs/`.
-
-### 2.5 What the preflight can find, it finds before the freeze
-
-The capture preflight already blocks a capture whose processes hold RDMA devices. It now also reads the protocol of
-every socket of every member's processes (through `pidfd_getfd`, on a duplicate it closes) and blocks a capture of a
-process that holds an MPTCP socket, naming it. The instance is never frozen for a capture that cannot succeed. Capturing such processes is tracked in #2926.
-
-A block every pod of the configuration would hit is recorded as a failed capture of the current agent bundle
-(`configurationRefusal` in `internal/agent/capture_preflight.go`, `recordRefusal` in `criu_group.go`): today only an MPTCP socket, which the
-program opens itself. The configuration then falls back (§2.2) without being frozen, and a new bundle tries CRIU
-again. The other blocks can clear (a pod restarted after an agent upgrade, RDMA devices released, a companion opted
-in), so they only skip the capture, as before.
+Each member's error is bounded on its own (768 bytes) and the record's reason holds all of them (up to 16 KiB), so
+the member that failed is not hidden behind the others' aborts. Failed dumps' `dump.log` files stay on each node
+under `<checkpoint dir>/.failed-logs/`.
 
 ### 2.4 A failed dump resumes the workload
 
-`errSourceLeftSuspended` today makes the caller replace the source pods: correct when the GPU state cannot be
-brought back, but it should be rare. The resume path after a rolled-back dump will be reproduced (§3) and its
-failure fixed before cluster-wide opt-in is turned on again. Until the cause is known this section is a requirement,
-not a design.
+Not done. A dump that fails can leave the GPU workload suspended (`errSourceLeftSuspended`), and the caller then
+replaces the source pods. That should be rare; the cause of the failed resume after a rolled-back dump is not yet
+known, so this section is a requirement, not a design.
+
+### 2.5 What the preflight can find, it finds before the freeze
+
+The capture preflight blocks a capture whose processes hold RDMA devices, and one where a process holds an MPTCP
+socket (it reads every socket's protocol through `pidfd_getfd`, on a duplicate it closes), naming the process, so
+the instance is not frozen for a capture these would fail. Not guaranteed: when no socket's protocol can be read, the
+preflight only warns (`socketScan.findings`), and an undetected MPTCP socket still fails the dump after the freeze. Capturing such processes is tracked in #2926.
+
+A block every pod of the configuration would hit (today only an MPTCP socket) is recorded as a failed capture of
+the current bundle (`configurationRefusal` in `internal/agent/capture_preflight.go`, `recordRefusal` in
+`criu_group.go`), so the configuration falls back (2.2) without being frozen, and a new bundle tries CRIU again.
+Blocks that can clear (a pod restarted after an agent upgrade, RDMA devices released, a companion opted in) only
+skip the capture.
 
 ### 2.6 A workload that fails under the gpushare library
 
 The gpushare library (`libnvsnap_gpushare.so`) is preloaded into every GPU container of a CRIU cluster. A fault in it
-takes the workload down before it serves, and the agent never sees a capture to fail (a vLLM engine
-with the NIXL connector crashed in the library at startup).
+takes the workload down before it serves, so the agent never sees a capture to fail.
 
-The agent on each node watches the GPU pods it runs that carry the library. When a pod's GPU container has
-terminated with a failure (exit code not 0, or a signal) twice, and the agent has not seen the pod Ready, it:
+The agent on each node watches its GPU pods that carry the library. When a pod's GPU container has terminated with a
+failure (non-zero exit or a signal) twice and the agent has not seen the pod Ready, it:
 
-1. records `state=gpushare-failed` on the configuration's group record, with the bundle version and the container's
-   last termination (reason, exit code), creating the record when there is none. A usable record (a complete CRIU
-   capture) is left alone: its pods restore and never start under the library;
-2. deletes the pod (UID precondition), so its replacement is admitted again and gets §2.2. A pod no controller
-   recreates (a bare pod, or one whose owner does not replace its pods) is left as it is: deleted, it would just be
-   gone. Its configuration's next pods still get §2.2.
+1. records `state=gpushare-failed` on the configuration's group record, with the bundle version and the last
+   termination (reason, exit code, the container's termination message, and for a SIGKILL that was not an OOM
+   kill the kubelet's account from the pod's events, such as a failed liveness probe), creating the record if needed. A usable record (a complete CRIU capture) is left
+   alone. The mark keeps `gpushareEvidence` too: the last termination with its times, the container's probes and
+   grace period, and the pod's last 20 events, within 16 KiB (`gpushare_evidence.go`);
+2. before it deletes the pod, logs the end of the failed run's log (200 lines, 16 KiB) in its own log, never on the
+   record: it is the workload's output;
+3. deletes the pod (UID precondition), so its replacement is admitted again and gets 2.2. A pod no controller
+   recreates is left as it is; its configuration's next pods still get 2.2.
 
-- A workload that fails for a reason of its own (a bad argument, a dependency not up yet) is also marked. When a
-  pod of a marked configuration, admitted without the library, fails twice the same way, the mark is cleared: the
-  library was not the cause, and the next pod gets it again.
-- The mark is per bundle version: a new agent version (a library fix) gives the library one more try.
-- "Not seen Ready" is the agent's memory of the pods it watched; an agent restarted between a pod's Ready and two
-  crashes of it could mark it. The second rule above undoes such a mark.
+- A workload that fails for its own reason is also marked. When a pod of a marked configuration, admitted without the
+  library, fails twice the same way, the mark is cleared and the next pod gets the library again. This also undoes a
+  wrong mark from an agent restarted between a pod's Ready and two crashes ("not seen Ready" is the agent's memory).
+- The mark is per bundle version: a new agent version gives the library one more try.
 - `criuGroupRecaptures` treats `gpushare-failed` like `failed`: no CRIU capture under the same bundle.
 
 ### 2.7 The cachedir capture over the bedrock peer
 
-The capture is per rank, by the agent on the rank's node:
+Capture, per rank, by the agent on the rank's node (`considerFallbackCapture`): a pod annotated
+`nvsnap.io/fallback-reason`, and not `nvsnap.io/fallback-capture`, that has been Ready for
+the warm-up (60 s) and whose cachedir has stopped changing is captured once per rank. The agent claims the rank in the
+record `nvsnap-cachedir-<key>` (compare-and-swap, so of two pods of one rank one is captured), copies the cachedir to
+`<checkpoint dir>/cachedir-<key>-<n>/tree`, writes a manifest of files and sizes (directories and symbolic links
+last), registers it in the catalog as a checkpoint held by its node (only with a catalog URL configured), and records the
+rank complete. A failed registration is logged and the rank is still recorded complete; other nodes then cannot fetch
+the capture, and a pod there waits for it before starting without it (`captureFallbackRank`). The pod can write
+its cachedir during the copy, so the agent reads it through an `os.Root`; links live only in the manifest, never in
+the directory the peers serve.
 
-- a pod annotated `nvsnap.io/fallback-cache` that has been Ready for the warm-up (60 s) and whose cachedir tree has
-  stopped changing is captured once per rank: the agent claims the rank in the record `nvsnap-cachedir-<key>`
-  (compare-and-swap, so of two pods of one rank one is captured), copies the pod's cachedir emptyDir to
-  `<checkpoint dir>/cachedir-<key>-<n>/tree`, writes a manifest of its files and sizes, directories and symbolic
-  links last, registers it in the catalog as a checkpoint held by its node, and records the rank complete. The pod
-  can write its cachedir while it is copied, so the agent reads it through an `os.Root`; its links are kept in the
-  manifest only, never made in the directory the peers serve;
-- the capture is the checkpoint directory's like any CRIU checkpoint: the node's bedrock-peer serve pods serve it,
-  and `EnsureLocal` fetches it the way it fetches a checkpoint (rails for a large one, the HTTP peers for a small
-  one). `EnsureLocal` takes the cachedir manifest as a capture's completion, as it takes CRIU's `inventory.img`.
+The capture is served and fetched like any CRIU checkpoint: the node's bedrock-peer serve pods serve it, and
+`EnsureLocal` fetches it (rails for a large one, HTTP peers for a small one), taking the manifest as completion as it
+takes CRIU's `inventory.img`.
 
-The restore, for a rank whose capture is complete:
+Restore, for a rank whose capture is complete:
 
-- the webhook mounts the capture's directory on the node, `<checkpoint dir>/cachedir-<key>-<n>`, read-only, and a
-  per-capture ready directory beside it, and adds an init container that waits for the ready marker, then copies
-  the tree into the pod's cachedir (the model too, when it is there) and makes the manifest's links in it;
-- the agent on the node the pod is scheduled to fetches the capture (`EnsureLocal`) and writes the ready marker; the
-  capturing node writes it when the capture completes;
-- past a deadline (15 minutes) without the marker, the init container copies nothing and the engine starts as it
-  would have, compiling.
+- the webhook mounts `<checkpoint dir>/cachedir-<key>-<n>` read-only, plus a per-capture ready directory, and adds an
+  init container that waits for the ready marker, copies the tree into the pod's cachedir (and the model, when
+  present) and makes the manifest's links;
+- the agent on the pod's node fetches the capture (`EnsureLocal`) and writes the marker; the capturing node writes it
+  when the capture completes;
+- past 15 minutes without the marker, the init container copies nothing and the engine starts and compiles as usual.
 
-The pod mounts only its capture and its marker directory, never the checkpoint directory. No new process, port or
-pod: the serve pods and the fetches are the ones CRIU restores use. Captures no record names are retired by the
-checkpoint reaper like an instance capture no record names.
+The pod mounts only its capture and marker directory, never the checkpoint directory. No new process, port or pod.
+The checkpoint reaper retires captures no record names.
+
+### 2.8 GPU drivers CRIU cannot serve on
+
+**Problem.** A driver older than 610 cannot restore multicast (NVLS) objects: tensor-parallel engines on NVSwitch
+systems fail at `remap` ([GPUSHARE.md](GPUSHARE.md#requirements-and-limits)). Nothing checked the driver, so on such
+a cluster each configuration would spend up to three captures, each with a failed restore and a cold start, before
+2.2 fell it back. And the group record key named no driver, so a capture could be restored under another one.
+
+**Design** (`internal/agent/driver_gate.go`):
+
+- **Each agent reports its node's driver.** At start it reads the major from `/proc/driver/nvidia/version` (else the
+  node's `nvidia.com/cuda.driver.major` label) and stamps it on its own pod as `nvsnap.io/driver-major`
+  (`reportDriver`, tried again every 30 s until done). A GPU node whose driver is not loaded yet (the agent can
+  start before the GPU operator) keeps trying; only a node without GPUs reports none.
+- **Admission goes by every GPU node.** The webhook does not know the node a pod will run on, so the agent answering
+  it reads every agent pod's report, and its own node's driver (`clusterDriver`, cached a minute; a failed read keeps
+  the last view and is tried again after the minute). CRIU serves only when every report names
+  the same major, at least `agent.criuMinDriverMajor` (`--criu-min-driver-major`, default 610). Otherwise
+  (`driverGate`):
+  - a GPU pod falls back to the cachedir with reason `driver`, with or without a record (`criuFallbackFor`), and
+    without the gpushare library;
+  - no capture is restored, so a companion starts cold (`lookupCRIUGroupFor`);
+  - a pod admitted before the drivers changed is not captured (`considerGroupCapture`, and again in
+    `captureGroup` with the read its keys are made from), and its capture hold is released;
+  - the checkpoint reaper keeps the cachedir records these pods are seeded from, which have no group record.
+- **The key names the driver.** With one major reported, the group record key is made with it
+  (`criuGroupKeyDriver`; the tenant scope is unchanged) and the record keeps it (`driver`). A capture is never
+  restored under another major: after a driver upgrade every configuration is captured once more. The trust check
+  takes the record's driver as well as the cluster's (`groupKeyRefusal`), so a placeholder admitted just before a
+  change is not refused, which would leave it waiting. On its node the restore does not run when the node's driver is
+  not the record's (`driverMismatch`): the pod is replaced, as for a checkpoint that could not be fetched, without
+  counting against the capture, and its replacement is admitted under the drivers as they are now. A group restore
+  checks every rank's node before it starts (`groupDriverMismatch`), by the driver the node's agent stamps on its pod
+  (this node's own for the leader): one rank on another driver ends the restore as not run, every pod of the instance
+  is replaced, and the checkpoints are kept. A node whose agent reports no driver is not refused.
+- **No reports, no change.** With no agent reporting (an older agent build), keys and decisions are as before.
+
+**Limits.**
+
+- One node on another major turns CRIU off for the whole cluster, though most pods would land on nodes it could
+  serve. Pinning restores to nodes of the capture's driver (node affinity) would keep it on, at the risk of pods
+  pending when those nodes are full; not done.
+- Rolling out this change, or a driver upgrade, makes every configuration's records unreachable: their keys name no
+  driver, or the old one. Each configuration is captured once more, and its old records and captures are retired by
+  the reaper.
+- Pods restored outside group records (the lone-pod catalog path) are keyed by driver already
+  (`checkpointstore.HashInput.CUDADriverMajor`), but not held to the minimum.
 
 ## 3. Status
 
-Done (unit tested): 2.1 (`agentBundle` in the record), 2.3, 2.5. Done (unit tested, not yet on a cluster): 2.2, 2.6, 2.7.
-Not done: 2.4 (why the worker's resume failed after the others' abort).
+Done (unit tested): 2.1, 2.3, 2.5. Done (unit tested, not yet on a cluster): 2.2, 2.6, 2.7, 2.8. Not done: 2.4.
 
 ## 4. Tests
 
-- Unit: one attempt per bundle version (a failed record blocks a second attempt; a new bundle version allows one);
-  the webhook's method choice for each record state; the record holds every member's error and is bounded.
-- Reproduction on the test cluster: a single-node, 4-GPU Dynamo vLLM function with the frontend in the worker pod,
-  plus etcd and NATS, opted in by function id; capture it, find the post-dump action's failure, and check the
-  workload resumes.
-- Conformance gate: a scenario whose CRIU capture is made to fail (a post-dump action that exits 1): the workload
-  keeps serving without being replaced, the record says `failed` with every member's error, and the next pod is
-  admitted with the cachedir capture.
+- Unit: one attempt per bundle version; the webhook's fallback lookup and method choice for each record state and
+  bundle; a fallback pod gets the cachedir mutations and, for `gpushare-failed`, no library; the record holds every
+  member's error and is bounded; the agent marks a configuration after two failed starts of a never-Ready pod, not
+  of a Ready one; the rails fetch of a prefix, its sources from the manifest and its completeness check. The driver
+  gate (`driver_gate_test.go`): the driver line of each kernel module form, the gate for no, one, an old and mixed
+  majors, the agents' reports read and cached, an agent stamping only its own pod, the key, admission and lookup
+  under each, the record's driver in the trust check, the capture skipped; a `driver` fallback pod has no library
+  and no capture hold.
+- Conformance gate: a CRIU capture made to fail (a post-dump action that exits 1) leaves the workload serving without
+  replacement, the record `failed` with every member's error, and the next pod admitted with the cachedir capture; a
+  workload that exits at start under the library is marked, readmitted without it, captured with cachedir, and its
+  next pod on another node restored from the cache over the bedrock peer; `mptcp1`, whose CRIU capture is refused,
+  falls back to the cachedir capture.
 
-- Unit: the webhook's fallback lookup for each record state and bundle; a fallback pod gets the cachedir mutations
-  and, for `gpushare-failed`, no library; the agent marks a configuration after two failed starts of a pod that was
-  never Ready, and not for a pod that was Ready; the rails fetch of a prefix, its sources from the manifest and its
-  completeness check.
-- Conformance gate, two scenarios: a workload that exits at start when the library is loaded (marked, readmitted
-  without it, captured with cachedir, its next pod on another node restored from the cache over the bedrock peer);
-  and `mptcp1`, whose CRIU capture is refused, now expected to fall back to the cachedir capture.
+## 5. Not in this design
 
-## 5. Not in this proposal
-
-- Cluster-wide opt-in (`criuCaptureOptIn: [{label: function-id}]`) stays off until §2.4 is fixed and the gate's
+- Cluster-wide opt-in (`criuCaptureOptIn: [{label: function-id}]`) stays off until 2.4 is fixed and the gate's
   failure scenario passes.

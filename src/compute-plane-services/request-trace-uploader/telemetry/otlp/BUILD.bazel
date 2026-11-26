@@ -1,0 +1,67 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "otlp",
+    srcs = [
+        "errors.go",
+        "otlp.go",
+        "sdklog.go",
+        "signals.go",
+    ],
+    importpath = "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry/otlp",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/compute-plane-services/request-trace-uploader/telemetry",
+        "@com_github_go_logr_logr//:logr",
+        "@io_opentelemetry_go_contrib_bridges_otelslog//:otelslog",
+        "@io_opentelemetry_go_otel//:otel",
+        "@io_opentelemetry_go_otel//attribute",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlplog_otlploggrpc//:otlploggrpc",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlplog_otlploghttp//:otlploghttp",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlpmetric_otlpmetricgrpc//:otlpmetricgrpc",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlpmetric_otlpmetrichttp//:otlpmetrichttp",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlptrace_otlptracegrpc//:otlptracegrpc",
+        "@io_opentelemetry_go_otel_exporters_otlp_otlptrace_otlptracehttp//:otlptracehttp",
+        "@io_opentelemetry_go_otel_metric//:metric",
+        "@io_opentelemetry_go_otel_sdk//resource",
+        "@io_opentelemetry_go_otel_sdk//trace",
+        "@io_opentelemetry_go_otel_sdk_log//:log",
+        "@io_opentelemetry_go_otel_sdk_metric//:metric",
+        "@io_opentelemetry_go_otel_trace//:trace",
+        "@org_golang_google_grpc//credentials",
+        "@org_golang_google_grpc//credentials/insecure",
+    ],
+)
+
+alias(
+    name = "go_default_library",
+    actual = ":otlp",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "otlp_test",
+    srcs = [
+        "buckets_test.go",
+        "errors_test.go",
+        "otlp_env_test.go",
+        "otlp_test.go",
+        "resource_test.go",
+        "sdklog_test.go",
+        "signals_test.go",
+    ],
+    embed = [":otlp"],
+    deps = [
+        "//src/compute-plane-services/request-trace-uploader/telemetry",
+        "@com_github_go_logr_logr//:logr",
+        "@io_opentelemetry_go_otel//:otel",
+        "@io_opentelemetry_go_proto_otlp//collector/logs/v1:logs",
+        "@io_opentelemetry_go_proto_otlp//collector/metrics/v1:metrics",
+        "@io_opentelemetry_go_proto_otlp//collector/trace/v1:trace",
+        "@io_opentelemetry_go_proto_otlp//common/v1:common",
+        "@io_opentelemetry_go_proto_otlp//metrics/v1:metrics",
+        "@org_golang_google_grpc//:grpc",
+        "@org_golang_google_grpc//metadata",
+        "@org_golang_google_protobuf//proto",
+    ],
+)
