@@ -184,6 +184,7 @@ func newCobraCommand(
 				NVCAAdminAddr:                           cfg.Agent.AdminAddr,
 				NVCADebugAddr:                           cfg.Agent.DebugAddr,
 				HeartbeatInterval:                       cfg.Agent.HeartbeatInterval,
+				MinHealthcheckRefreshWait:               cfg.Agent.MinHealthcheckRefreshWait,
 				CredRenewInterval:                       cfg.Agent.CredRenewInterval,
 				SyncQueueInterval:                       cfg.Agent.SyncQueueInterval,
 				SyncRequestStatusInterval:               cfg.Agent.SyncRequestStatusInterval,

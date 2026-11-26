@@ -19,6 +19,8 @@ package nodefeatures
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -230,4 +232,35 @@ func newMockStaticClient(t *testing.T, gpuData string) Client {
 	sc := NewStaticClient(clients, GetGPUAllocationFunc(rg), "nvca-system", 5)
 
 	return sc
+}
+
+func TestStaticClientConcurrentCapacityReadsKeepAllocationFresh(t *testing.T) {
+	sc := newMockStaticClient(t, gpuData).(*staticClient)
+	var allocated atomic.Uint64
+	allocated.Store(1)
+	sc.gpuAllocGetter = GetGPUAllocationFunc(func(context.Context, types.GPUName) (uint64, error) {
+		return allocated.Load(), nil
+	})
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := sc.GetGPUResources(context.Background(), "L40")
+			assert.NoError(t, err)
+			assert.EqualValues(t, 10, got.Capacity)
+			assert.EqualValues(t, 1, got.Allocated)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	k8sclient := sc.clients.K8s.(*fakek8sclient.Clientset)
+	require.Len(t, k8sclient.Actions(), 1, "concurrent cache misses should share one capacity lookup")
+	allocated.Store(3)
+	got, err := sc.GetGPUResources(context.Background(), "L40")
+	require.NoError(t, err)
+	require.EqualValues(t, 3, got.Allocated, "caching capacity must not cache allocation")
+	require.Len(t, k8sclient.Actions(), 1)
 }

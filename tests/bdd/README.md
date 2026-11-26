@@ -129,6 +129,18 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   SAMPLE_LLM_DECISIONS_IMAGE=<optional-image-reference-enables-decision-routes> \
   go test -run '^TestSingleClusterHelmfile$' -timeout 90m -v
 
+# Full local installation, upgrade to an explicit candidate agent, and saturated
+# capacity recovery in dynamic and static discovery modes. Build the candidate
+# in the selected sample repository and import it into each local k3d node (or
+# publish it to a registry you control). The released pin does not test a patch.
+# Requires the NGC variables above; Helm sample charts are not needed.
+# For local import, prepare a fresh ncp-local topology using the documented local
+# development workflow, then load the tagged candidate before running this test:
+# k3d image import nvcr.io/<org>/<team>/nvca:<candidate-image-tag> --cluster ncp-local
+NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
+  CAPACITY_NVCA_AGENT_VERSION=<candidate-image-tag> \
+  go test -run '^TestSingleClusterCapacityRecovery$' -timeout 90m -v
+
 # Single-cluster HA Helmfile feature: installs the control plane with
 # highAvailability.mode preferred and checks that nvcf-api runs 2 Ready
 # replicas on distinct nodes with a PDB and a surge-first rollout strategy.
@@ -168,6 +180,95 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
   LLM_REQUEST_ROUTER_IMAGE_TAG=<optional-tag> \
   LAST_CLUSTER_INSTANCE_TYPE=<optional-type> \
   go test -run '^TestMultiClusterHelmfileLLMLastClusterAffinity$' -timeout 120m -v
+```
+
+The capacity checks fill all four simulated GPUs with independent one-worker
+functions using minInstances=maxInstances=1. Each verifies the candidate image and
+its occupied heartbeat after a complete agent restart, removes one worker, and
+requires released capacity within 60 seconds and a replacement Ready within
+180 seconds. Both checks must also finish before the next periodic heartbeat,
+measured from the occupied heartbeat's receive time, even if allocation release
+is slow. Blocking observations use the remaining deadline budget, and late
+responses cannot pass. The check also requires a successful heartbeat log with
+`heartbeat_trigger=capacity`, so an immediate or randomly offset startup
+heartbeat cannot satisfy publication.
+The successful publication log remains valid if replacement placement consumes
+the free capacity before the next availability read; readiness is checked separately.
+Run evidence is written under
+`out/capacity-recovery-*`; the check deletes only its own function definitions
+and deployments on completion or
+failure. Static discovery explicitly disables the dynamic discovery gate and
+uses `fixtures/capacity-gpus.json`. The probe waits for the generated discovery
+configuration and restarts the agent if its startup settings are stale.
+It also waits for all test capacity to be available before creating functions,
+including when workers from the preceding example are still terminating.
+The general Helmfile suite excludes this candidate-only scenario. This validates
+real Kubernetes and control-plane behavior with simulated GPUs and a CPU sample, and does not
+validate physical GPU or application-specific shutdown behavior.
+
+After a full installation, use `TestExistingClusterCapacityRecovery` with the
+same environment to rerun only the two recovery cases on that local stack. Keep
+the generated compute-plane registration values from the full installation.
+
+The capacity probe's pure checks can also run without a cluster:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_capacity_recovery.py'
+```
+
+### Fake Kit session lifecycle on an existing local stack
+
+`TestExistingClusterFakeKitSessions` exercises real NVCA agents, NVCF services,
+the kubelet, and the normal utils HTTP readiness probe. A small Python fixture
+implements Resume and End. End returns a successful response and then exits
+the inference process with code zero or one. Use a published image with Python
+and no fixed entrypoint; the existing load tester sample supports the explicit
+container arguments used by this fixture. The filler image must serve `/echo`
+and `/health` on port 8000.
+
+Build a red-control agent in a separate checkout by applying
+`fixtures/legacy-restart-control.patch`, then load that image into every local
+node. It restores only the cumulative-restart predicate and is not a released
+older stack. The green image must match the currently installed candidate and
+contain both the clean-exit handling and prompt capacity publication fixes.
+
+From `tests/bdd`, with the installed `ncp-local` stack idle:
+
+```bash
+FAKE_KIT_RED_AGENT_VERSION=<control-tag> \
+CAPACITY_NVCA_AGENT_VERSION=<installed-candidate-tag> \
+FAKE_KIT_RUNTIME_IMAGE=<published-python-capable-image> \
+FAKE_KIT_FILLER_IMAGE=<published-http-echo-image> \
+  go test -run '^TestExistingClusterFakeKitSessions$' -timeout 90m -v
+```
+
+Leave `BDD_CLEANUP_MODE` unset. The scenario occupies all four GPU slots,
+waits for actual Pod age above 600 seconds in each red/green phase, and performs
+four clean session ends. The red control must purge the original worker; the
+green agent must preserve it. After each restart, the fixture warms up for
+30 seconds and the driver requires utils readiness to fall and recover before
+the next session, preventing stale Ready status from completing a cycle.
+The function stays deployed for ten minutes of
+unattended observation. A final nonzero exit must cause a purge and an automatic
+replacement, with capacity publication within 60 seconds and readiness within
+180 seconds of allocation release, both before the next periodic heartbeat.
+The periodic heartbeat remains 300 seconds. Function status reconciliation is
+separate: after the replacement Pod is Ready, the function must become ACTIVE
+within another 90 seconds and serve a status invocation. The local API defaults
+to a one-minute deployment reconciliation delay. Evidence records Pod readiness
+and function status convergence as separate measurements.
+
+Evidence under `out/fake-kit-*` includes container status watches, exit codes,
+readiness transitions, reported instance states, function state, GPU usage,
+filtered heartbeat and
+placement logs, and agent image IDs. Each invocation uses a unique CLI context,
+deletes its own function definitions, revokes its invocation key, and restores
+the original agent configuration. This simulates the application lifecycle;
+actual Kit, WebRTC, physical GPUs, and older operator compatibility require
+separate qualification.
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_fake_kit_sessions.py'
 ```
 
 ### OpenBao JWT plugin lifecycle

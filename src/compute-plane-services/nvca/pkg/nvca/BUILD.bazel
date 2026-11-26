@@ -183,6 +183,7 @@ go_test(
         "agent_metrics_test.go",
         "agent_self_destruct_test.go",
         "agent_test.go",
+        "agent_capacity_test.go",
         "agent_updates_test.go",
         "backendk8scache_gxcache_test.go",
         "backendk8scache_test.go",

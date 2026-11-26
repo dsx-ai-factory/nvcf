@@ -611,7 +611,7 @@ func TestDecisionRouteScenariosSkipWithoutDecisionsImage(t *testing.T) {
 	}
 
 	t.Setenv(sampleLLMDecisionsImageEnv, "nvcr.io/test-org/test-team/openai-compatible-decisions:test")
-	if tags := singleClusterHelmfileTags(); tags != "" {
-		t.Fatalf("tags with SAMPLE_LLM_DECISIONS_IMAGE set = %q, want every scenario", tags)
+	if tags := singleClusterHelmfileTags(); tags != "~@capacity-recovery" {
+		t.Fatalf("tags with SAMPLE_LLM_DECISIONS_IMAGE set = %q, want only candidate capacity validation excluded", tags)
 	}
 }

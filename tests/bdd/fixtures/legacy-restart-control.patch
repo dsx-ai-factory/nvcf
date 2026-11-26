@@ -1,0 +1,7 @@
+diff --git a/src/compute-plane-services/nvca/internal/util/k8sutil/pod.go b/src/compute-plane-services/nvca/internal/util/k8sutil/pod.go
+--- a/src/compute-plane-services/nvca/internal/util/k8sutil/pod.go
++++ b/src/compute-plane-services/nvca/internal/util/k8sutil/pod.go
+@@ -315,2 +315,2 @@ func IsContainerInRestartLoop(pod *corev1.Pod, cs corev1.ContainerStatus, k8sTimeConfi
+-	return !exitedCleanlyAfterPodReady(pod.Status, cs)
++	return true // Test control: restore cumulative-restart classification regardless of exit code.
+ }

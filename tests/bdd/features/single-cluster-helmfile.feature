@@ -32,6 +32,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | global.image.repository         | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM} |
       And I prepare self-managed secrets file "deploy/stacks/self-managed/secrets/local-bdd-secrets.yaml" from template "deploy/stacks/self-managed/secrets/secrets.yaml.template" using the current NGC registry credential
 
+    @capacity-install
     Scenario: Operator validates the authored Helmfile environment renders
       When I successfully run command "make -C deploy/stacks/self-managed template HELMFILE_ENV=local-bdd"
 
@@ -66,7 +67,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
         | nvca-operator    |
         | cert-manager     |
 
-    @llm-gateway
+    @llm-gateway @capacity-install
     Scenario: Operator installs the control plane through the local Helmfile environment
       When I successfully run command "make -C deploy/stacks/self-managed install HELMFILE_ENV=local-bdd"
 
@@ -127,7 +128,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       # pull secrets, and Helmfile control-plane releases. The
       # @nvca-registration scenario is not a standalone tag target.
 
-    @nvca-registration
+    @nvca-registration @capacity-install
     Scenario: Operator registers the local cluster and installs the NVCA operator
       Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
 
@@ -329,7 +330,7 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
     # This scenario intentionally has no Background. It depends on the
     # earlier control-plane install and NVCA registration scenario in
     # this feature run, and is not a standalone tag target.
-    @function-lifecycle
+    @function-lifecycle @capacity-install
     Scenario: Operator invokes the Load Tester Supreme sample function through default and vanity endpoints
       Given I use NVCF CLI config "${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml"
 
@@ -393,6 +394,48 @@ Feature: Install a local single-cluster NVCF stack with Helmfile
       # Remove the deployment: the local sizing cannot hold every
       # scenario's deployment at once.
       And I successfully undeploy the function selected by NVCF CLI
+
+    # This focused check requires an explicitly built candidate image. It fills
+    # the four simulated GPUs with independent min=max=1 functions, verifies a
+    # fresh occupied heartbeat, then deletes one worker with five-second grace.
+    @capacity-recovery
+    Scenario Outline: Operator recovers a worker using <discovery_mode> discovery with no spare capacity
+      Given environment variable "CAPACITY_NVCA_AGENT_VERSION" is set
+      And I prepare Helmfile environment "local-bdd" for stack "nvcf-compute-plane" from fixture "tests/bdd/fixtures/nvcf-compute-plane-local-bdd.yaml" with values:
+        | global.imagePullSecrets[0].name            | nvcr-pull-secret                         |
+        | global.helm.sources.repository            | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
+        | global.image.repository                   | ${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}       |
+        | global.nvcaOperator.selfManaged.nvcaVersion | ${CAPACITY_NVCA_AGENT_VERSION} |
+        | global.nvcaOperator.selfManaged.featureGateValues[2] | <discovery_gate> |
+      When I successfully run command:
+        """
+        python3 -c 'import base64,pathlib; print(base64.b64encode(pathlib.Path("${REPO_ROOT}/tests/bdd/fixtures/capacity-gpus.json").read_bytes()).decode())'
+        """
+      And I export command output to environment variable "BDD_CAPACITY_GPU_CONFIG"
+      And I update yaml file "deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml" with keys:
+        | selfManaged.gpuManualInstanceConfigB64 | ${BDD_CAPACITY_GPU_CONFIG} |
+      And I set yaml file "deploy/stacks/nvcf-compute-plane/registration/ncp-local-register-values.yaml" key "worker.staticGPUCapacity" to:
+        """
+        <static_capacity>
+        """
+      When I successfully run command:
+        """
+        ${NVCF_CLI} --config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml init
+        """
+      When I successfully run command:
+        """
+        make -C deploy/stacks/nvcf-compute-plane install CLUSTER_NAME=ncp-local HELMFILE_ENV=local-bdd NVCF_CLI=${NVCF_CLI} NVCF_CLI_CONFIG=${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml
+        """
+      When I successfully run command:
+        """
+        python3 ${REPO_ROOT}/tests/bdd/scripts/check_capacity_recovery.py --cli ${NVCF_CLI} --cli-config ${REPO_ROOT}/tests/bdd/fixtures/nvcf-cli-local.yaml --state-file ${HOME}/.nvcf-cli.nvcf-cli-local.state --context k3d-ncp-local --backend ncp-local --agent-version ${CAPACITY_NVCA_AGENT_VERSION} --discovery-mode <discovery_mode> --image nvcr.io/${SAMPLE_NGC_ORG}/${SAMPLE_NGC_TEAM}/load_tester_supreme:0.0.8 --gpu H100 --instance-type NCP.GPU.H100_1x --region us-west-1 --account nvcf-default --api-url http://127.0.0.1:8080 --icms-host sis.localhost --expected-capacity 4 --publication-timeout 60 --recovery-timeout 180 --output-dir ${REPO_ROOT}/tests/bdd/out
+        """
+      Then the command output should contain "capacity recovery passed"
+
+      Examples:
+        | discovery_mode | discovery_gate       | static_capacity |
+        | dynamic        | DynamicGPUDiscovery  | 0               |
+        | static         | -DynamicGPUDiscovery | 4               |
 
     @function-lifecycle @helm-function
     Scenario: Operator sees a Helm function without resource limits fail
