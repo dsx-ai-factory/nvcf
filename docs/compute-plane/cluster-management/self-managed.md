@@ -769,9 +769,10 @@ Cleanup Script appendix in the self-hosted troubleshooting guide.
   done
   ```
 
-  The operator repairs a mismatch on its next periodic sync and records a
-  Warning event on the NVCFBackend. If either line still does not end in `OK`,
-  force a rollout. The operator rewrites the certificate Secrets and both webhook
+  The operator repairs a mismatch on a periodic sync, which can take up to
+  about 30 minutes, and records a Warning event on the NVCFBackend. To repair
+  it immediately, or if either line still does not end in `OK`, force a
+  rollout. The operator rewrites the certificate Secrets and both webhook
   configurations from one certificate and CA:
 
   ```bash
