@@ -6,7 +6,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	k8stesting "k8s.io/client-go/testing"
 	"reflect"
 	"strings"
 	"testing"
@@ -369,5 +373,76 @@ func TestInstanceIDs(t *testing.T) {
 	raw, _ := json.Marshal(workerSpec("10.0.0.1"))
 	if got := instanceIDs(raw); len(got) != 1 || got[0] != "7965170713353809" {
 		t.Errorf("got %v", got)
+	}
+}
+
+// A placeholder starting cold in place keeps no restored registration: when
+// it cannot be removed, the pod is deleted instead of starting in place.
+func TestColdInPlaceAllowed(t *testing.T) {
+	ctx := context.Background()
+	log := logrus.NewEntry(logrus.New())
+	dyn := fakeDyn(workerCR("b", "w", "w", "u", true, workerSpec("10.0.0.2")))
+	a := &Agent{dynClient: dyn}
+	if !a.coldInPlaceAllowed(ctx, "b", "u", false, log) {
+		t.Error("etcd worker: not allowed in place")
+	}
+	if !a.coldInPlaceAllowed(ctx, "b", "u", true, log) {
+		t.Error("registration removed: not allowed in place")
+	}
+	if l, _ := dyn.Resource(dynamoWorkerMetadata).Namespace("b").List(ctx, metav1.ListOptions{}); len(l.Items) != 0 {
+		t.Errorf("registration left: %d", len(l.Items))
+	}
+	failing := fakeDyn(workerCR("b", "w", "w", "u", true, workerSpec("10.0.0.2")))
+	failing.PrependReactor("delete", "dynamoworkermetadatas", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	if (&Agent{dynClient: failing}).coldInPlaceAllowed(ctx, "b", "u", true, log) {
+		t.Error("registration not removed: allowed in place; want the pod deleted")
+	}
+}
+
+// Deletes are bound to the listed object's UID.
+func TestDeleteRegistrationsPreconditionUID(t *testing.T) {
+	ctx := context.Background()
+	cr := workerCR("b", "w", "w", "u", true, workerSpec("10.0.0.2"))
+	cr.SetUID("obj-1")
+	dyn := fakeDyn(cr)
+	var got *metav1.Preconditions
+	dyn.PrependReactor("delete", "dynamoworkermetadatas", func(act k8stesting.Action) (bool, runtime.Object, error) {
+		got = act.(k8stesting.DeleteAction).GetDeleteOptions().Preconditions
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "nvidia.com", Resource: "dynamoworkermetadatas"}, "w", errors.New("uid differs"))
+	})
+	if err := (&Agent{dynClient: dyn}).deleteRegistrations(ctx, "b", "u"); err != nil {
+		t.Fatalf("a replaced object (Conflict) is an error: %v", err)
+	}
+	if got == nil || got.UID == nil || *got.UID != "obj-1" {
+		t.Errorf("delete preconditions %+v, want UID obj-1", got)
+	}
+}
+
+func TestReadyOnlyOnceRestoredEnvFrom(t *testing.T) {
+	p := kubeRank("a", "w", "u", "10.0.0.1", "kubernetes")
+	p.Spec.Containers[0].Resources.Limits = corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+	p.Spec.Containers[0].EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "dyn"}}}}
+	if err := readyOnlyOnceRestored(p); err == nil {
+		t.Error("envFrom may set container mode: no readiness probe passed")
+	}
+	p.Spec.Containers[0].Env = append(p.Spec.Containers[0].Env, corev1.EnvVar{Name: "DYN_KUBE_DISCOVERY_MODE", Value: "pod"})
+	if err := readyOnlyOnceRestored(p); err != nil {
+		t.Errorf("explicit pod mode beside envFrom: %v", err)
+	}
+}
+
+func TestForeignAddressURLHostWithoutPort(t *testing.T) {
+	spec := workerSpec("10.0.0.1")
+	spec["data"].(map[string]any)["model_card"] = map[string]any{"tokenizer": "http://worker-old/tokenizer.json"}
+	raw, _ := json.Marshal(spec)
+	if got := foreignAddress(raw, "10.0.0.1"); got == "" {
+		t.Error("a URL naming another host without a port passed")
+	}
+	spec["data"].(map[string]any)["model_card"] = map[string]any{"tokenizer": "http://10.0.0.1/tokenizer.json"}
+	raw, _ = json.Marshal(spec)
+	if got := foreignAddress(raw, "10.0.0.1"); got != "" {
+		t.Errorf("own address without a port flagged: %s", got)
 	}
 }

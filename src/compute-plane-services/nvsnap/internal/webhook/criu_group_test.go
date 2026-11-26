@@ -336,3 +336,14 @@ func TestCRIUURIRole(t *testing.T) {
 		t.Fatalf("no configuration: %q, want \"\"", got)
 	}
 }
+
+// A single-rank record that restores companions is checked by the group
+// admission guard too; one without companions restores alone.
+func TestHasCompanion(t *testing.T) {
+	if hasCompanion(CRIUGroup{Companion: []bool{false}}) || hasCompanion(CRIUGroup{}) {
+		t.Error("a record of ranks only has companions")
+	}
+	if !hasCompanion(CRIUGroup{Companion: []bool{false, true}}) {
+		t.Error("a record with a companion slot has none")
+	}
+}

@@ -863,6 +863,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	if again, skip := c.sharedCompanionsBlockCapture(ctx, leader, nil, log); skip {
 		return again
 	}
+	if why, err := a.kubeSharedCompanions(ctx, leader, nil, len(companions) > 0); err != nil {
+		log.WithError(err).Info("CRIU group capture: waiting to read the namespace's pods")
+		return true
+	} else if why != "" {
+		log.WithField("reason", why).Info("CRIU group capture: skipped; the instance starts from the caches")
+		return false
+	}
 	// Held for the capture before it is claimed: a member already
 	// released into service (its hold expired) is not stopped for it.
 	if serves, err := c.holdForCapture(ctx, members, log); serves != "" {

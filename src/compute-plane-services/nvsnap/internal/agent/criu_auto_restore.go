@@ -348,14 +348,7 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		// replacement could land on this node again.
 		log.WithError(err).Warn("CRIU auto-restore refused: this node cannot resume the pod's NIXL KV connector; the pod starts cold in place")
 		record(func(d map[string]string) bool { return recordFailure(d, id, false, err) })
-		inPlace = true
-		if kube {
-			// It registers anew as it starts; the restored registration
-			// must not route to it meanwhile.
-			if derr := a.deleteRegistrations(context.WithoutCancel(ctx), ns, uid); derr != nil {
-				log.WithError(derr).Warn("CRIU auto-restore: cannot remove the restored registration of the pod that starts cold in place")
-			}
-		}
+		inPlace = a.coldInPlaceAllowed(context.WithoutCancel(ctx), ns, uid, kube, log)
 	case fault != nil:
 		log.WithError(err).Warn("CRIU auto-restore failed on a faulty GPU; it is not counted against the checkpoint, and the pod is deleted so its replacement restores again")
 		record(func(d map[string]string) bool { return recordGPUFault(d, id, fault) })

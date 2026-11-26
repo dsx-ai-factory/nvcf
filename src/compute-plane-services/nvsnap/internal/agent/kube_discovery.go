@@ -35,7 +35,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"net"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -146,10 +148,17 @@ func (a *Agent) registrationsOf(ctx context.Context, pod *corev1.Pod) (rankRegis
 func readyOnlyOnceRestored(pod *corev1.Pod) error {
 	container := false
 	for _, c := range pod.Spec.Containers {
+		explicit := false
 		for _, e := range c.Env {
-			if e.Name == "DYN_KUBE_DISCOVERY_MODE" && (e.ValueFrom != nil || e.Value == "container") {
-				container = true // by reference: cannot tell, so as container mode
+			if e.Name == "DYN_KUBE_DISCOVERY_MODE" {
+				explicit = true
+				if e.ValueFrom != nil || e.Value == "container" {
+					container = true // by reference: cannot tell, so as container mode
+				}
 			}
+		}
+		if !explicit && len(c.EnvFrom) > 0 {
+			container = true // envFrom may set it: cannot tell, so as container mode
 		}
 	}
 	if !container {
@@ -298,6 +307,15 @@ func foreignAddress(spec json.RawMessage, ip string) string {
 			return s
 		}
 		toks := ipv4Tokens(s)
+		if other == "" && strings.Contains(s, "://") {
+			// A URL's host, with or without a port: a name the restore
+			// cannot move.
+			if u, err := url.Parse(s); err == nil {
+				if h := u.Hostname(); h != "" && h != ip && net.ParseIP(h) == nil {
+					other = s
+				}
+			}
+		}
 		if len(toks) == 0 && other == "" && hostPort.MatchString(s) {
 			// A host named, not addressed: the restore cannot move it.
 			other = s
@@ -556,7 +574,10 @@ func (a *Agent) deleteRegistrations(ctx context.Context, ns string, uid types.UI
 			if r.UID != uid {
 				continue
 			}
-			if err := api.Delete(ctx, list.Items[i].GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			// Bound to the object listed: one of the same name a later
+			// restore wrote is not removed (Conflict).
+			oid := list.Items[i].GetUID()
+			if err := api.Delete(ctx, list.Items[i].GetName(), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &oid}}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 				return err
 			}
 		}
@@ -592,4 +613,20 @@ func instanceIDs(spec json.RawMessage) []string {
 	}
 	walk(v)
 	return out
+}
+
+// coldInPlaceAllowed reports whether a placeholder refused for its node may
+// start cold in place. One that registers through Kubernetes registers anew
+// as it starts, and the restored registration must not route to it
+// meanwhile: it is removed first, and when it cannot be, the pod is deleted
+// instead (the registration is the pod's, so it goes with it).
+func (a *Agent) coldInPlaceAllowed(ctx context.Context, ns string, uid types.UID, kube bool, log *logrus.Entry) bool {
+	if !kube {
+		return true
+	}
+	if err := a.deleteRegistrations(ctx, ns, uid); err != nil {
+		log.WithError(err).Warn("CRIU auto-restore: cannot remove the restored registration; deleting the pod instead of starting it cold in place")
+		return false
+	}
+	return true
 }

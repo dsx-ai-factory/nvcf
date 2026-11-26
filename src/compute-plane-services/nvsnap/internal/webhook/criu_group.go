@@ -213,8 +213,9 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 			}
 		}
 		// Only an instance of several ranks waits for all of them; one
-		// pod restores alone whatever its controller.
-		if ranks > 1 && m.CRIUGroupAdmits != nil {
+		// pod restores alone whatever its controller, unless it restores
+		// companions too, which the namespace's other workers may share.
+		if (ranks > 1 || hasCompanion(g)) && m.CRIUGroupAdmits != nil {
 			if ok, why := m.CRIUGroupAdmits(ctx, pod, g); !ok {
 				log.WithField("reason", why).Info("CRIU group restore: the instance cannot restore as a group; cold start")
 				admit(metrics.AdmitCold, "not-restorable-as-group")
@@ -320,4 +321,15 @@ func CRIUURI(uri string, pod *corev1.Pod) string {
 		return uri + "/role=" + r
 	}
 	return uri
+}
+
+// hasCompanion reports a group record that restores companions (members
+// without GPUs) with its ranks.
+func hasCompanion(g CRIUGroup) bool {
+	for _, c := range g.Companion {
+		if c {
+			return true
+		}
+	}
+	return false
 }
