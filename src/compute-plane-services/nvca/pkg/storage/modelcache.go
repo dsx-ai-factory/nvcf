@@ -1301,9 +1301,12 @@ func (r *Reconciler) doInitModelCacheNVMesh(ctx context.Context,
 		r.initStatuses.put(cacheHandle, stCopy.Status)
 	}
 
-	// Consolidate result.
+	// Consolidate result. The lease result's RequeueAfter is the renewal
+	// deadline, an upper bound on how long the holder may wait; a shorter
+	// explicit requeue from the init path (such as the writer detach poll)
+	// must win, or it would be stretched to half the lease duration.
 	res.Requeue = res.Requeue || lres.Requeue //nolint:staticcheck
-	if lres.RequeueAfter > res.RequeueAfter {
+	if lres.RequeueAfter > 0 && (res.RequeueAfter == 0 || lres.RequeueAfter < res.RequeueAfter) {
 		res.RequeueAfter = lres.RequeueAfter
 	}
 	return res, err
@@ -1404,7 +1407,29 @@ func (r *Reconciler) reconcileInitModelCacheNVMesh(ctx context.Context,
 				// NVMesh: retain the bound dynamic PV as the cross-namespace
 				// "primary" PV (it carries the data volume handle that secondary
 				// PVs copy) and tear down the writer job/RW PVC.
-				log.Info("Cache init RW PVC bound, finalizing primary PV")
+				//
+				// The primary label is what every namespace's reconcile keys on to
+				// publish its read-only reader, so it must not be set while the
+				// writer still holds the volume read-write. The completed writer
+				// Pod unmounts and detaches asynchronously after the Job reports
+				// success; a reader staged before that sees the on-disk state
+				// without the writer's unflushed metadata (mounted ro,norecovery)
+				// and so a cache missing its last files. Wait for the detach here,
+				// never blocking the reconcile worker, and publish afterwards.
+				detached, err := r.isVolumeDetached(ctx, rwPVC.Spec.VolumeName)
+				if err != nil {
+					if k8sutil.IsTransientK8sError(err) {
+						log.V(1).Info("Transient error checking writer volume attachment, requeuing", "error", err)
+						return reconcile.Result{Requeue: true}, nil
+					}
+					return reconcile.Result{}, err
+				}
+				if !detached {
+					log.V(1).Info("Cache init RW PVC bound, waiting for the writer volume to detach before publishing the primary PV",
+						"pv", rwPVC.Spec.VolumeName)
+					return reconcile.Result{RequeueAfter: volumeDetachRequeueInterval}, nil
+				}
+				log.Info("Cache init RW PVC bound and writer volume detached, finalizing primary PV")
 				if err := r.finalizePrimaryPVOnSuccessfulInit(ctx, stCopy, rwPVC); err != nil {
 					log.Error(err, "Failed to finalize primary PV")
 					return reconcile.Result{}, err
