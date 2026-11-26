@@ -1152,7 +1152,7 @@ func TestCaptureGroup_IdentityRecorded(t *testing.T) {
 	var reqs []CheckpointRequest
 	checkpointMember = func(_ *Agent, _ context.Context, req CheckpointRequest) (*CheckpointResult, error) {
 		reqs = append(reqs, req)
-		return &CheckpointResult{CheckpointID: "ck-a", PeersReset: len(req.ResetPeersOutside) > 0}, nil
+		return &CheckpointResult{CheckpointID: "ck-a", PeersReset: len(req.ResetPeersOutside) > 0, IdentityChecked: req.IdentityCheck != nil}, nil
 	}
 	deleteMember = func(*Agent, context.Context, string, string, types.UID) error { return nil }
 	before := decisions(t, identityCaptured)
@@ -1161,6 +1161,9 @@ func TestCaptureGroup_IdentityRecorded(t *testing.T) {
 	}
 	if len(reqs) != 1 || reqs[0].PodName != "w-a" || strings.Join(reqs[0].ResetPeersOutside, ",") != idOldIP+",fd00::8" {
 		t.Fatalf("checkpoint requests %+v; want the worker alone, its outside connections reset", reqs)
+	}
+	if c := reqs[0].IdentityCheck; c == nil || c.Lease != idLease || len(c.Keys) != len(keys) {
+		t.Fatalf("identity check %+v; want the identity read before the freeze", c)
 	}
 	cms, _ := kc.CoreV1().ConfigMaps("nvsnap-system").List(ctx, metav1.ListOptions{})
 	var rec map[string]string

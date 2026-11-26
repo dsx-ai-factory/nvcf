@@ -925,7 +925,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	cctx, cancel := context.WithTimeout(ctx, criuGroupCaptureTimeout)
 	defer cancel()
 	if identity != nil {
-		cctx = withPeerReset(cctx, memberAddresses(members))
+		cctx = withPeerReset(withIdentityCheck(cctx, identity), memberAddresses(members))
 	}
 	t0 := time.Now()
 	// Read while the ranks run: a capture stops them.
@@ -1523,9 +1523,17 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	// Only an instance of several members restores as a group, whose
 	// placeholders may skip setup.
 	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
-	for _, p := range ranks {
-		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use,
-			ResetPeersOutside: peerResetFrom(ctx)})
+	// The identity read before the freeze is checked again under it, by
+	// the agent that dumps the rank holding the lease (maybe on another
+	// node).
+	idc := identityCheckFrom(ctx)
+	for i, p := range ranks {
+		req := CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use,
+			ResetPeersOutside: peerResetFrom(ctx)}
+		if idc != nil && i == idc.Member {
+			req.IdentityCheck = idc
+		}
+		reqs = append(reqs, req)
 	}
 	for _, p := range companions {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: companionContainers[p.Name],
@@ -1537,10 +1545,14 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 		if cerr != nil {
 			return nil, false, cerr
 		}
-		if err := peersResetDone(reqs, []*CheckpointResult{r}); err != nil {
+		out := []*CheckpointResult{r}
+		if err := peersResetDone(reqs, out); err != nil {
 			return nil, true, err
 		}
-		return []*CheckpointResult{r}, true, nil
+		if ierr := identityUnchecked(idc, out); ierr != nil {
+			return nil, true, ierr // dumped: the source is gone
+		}
+		return out, true, nil
 	}
 	res, err := c.a.groupCheckpoint(ctx, GroupCheckpointRequest{Members: reqs}, log)
 	stopped = res != nil && res.Fabric.Went
@@ -1556,6 +1568,9 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	}
 	if err := peersResetDone(reqs, out); err != nil {
 		return nil, true, err
+	}
+	if ierr := identityUnchecked(idc, out); ierr != nil {
+		return nil, true, ierr // every member was dumped: the instance is gone
 	}
 	return out, stopped, nil
 }
