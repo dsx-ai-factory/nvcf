@@ -680,6 +680,10 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 				resyncPeriod,
 				k8sinformers.WithTransform(k8sutil.StripManagedFields),
 			)
+			podWatchers := []workloadWatcher{watchForPodCrashesRestarts, onNVCFPodUpdateFunc}
+			if c.k8sTimeConfig != nil && !c.k8sTimeConfig.CountAllWorkerRestarts {
+				podWatchers = append(podWatchers, recordWorkerRestartScore(k8sClient, c.k8sTimeConfig))
+			}
 			podInf := podInfFactory.Core().V1().Pods()
 			_, err := podInf.Informer().AddEventHandler(&cache.ResourceEventHandlerFuncs{
 				UpdateFunc: func(oldObj, newObj any) {
@@ -694,7 +698,7 @@ func (b *BackendK8sCacheBuilder) Start(ctx context.Context) (*BackendK8sCache, <
 						return
 					}
 					// Iterate through the pod workload watchers
-					for _, ww := range []workloadWatcher{watchForPodCrashesRestarts, onNVCFPodUpdateFunc} {
+					for _, ww := range podWatchers {
 						ww(ctx, oldPod, newPod)
 					}
 				},
