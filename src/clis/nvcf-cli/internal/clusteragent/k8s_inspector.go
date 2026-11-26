@@ -89,13 +89,14 @@ func (k *k8sInspector) ListFunctions(ctx context.Context, opts ListOptions) ([]S
 		return nil, err
 	}
 
+	terminating := terminationListedIDs(items)
 	result := make([]ScheduledFunction, 0, len(items))
 	for i := range items {
 		fid, vid, ok := resolveFunctionIdentity(items[i].Object, items[i].GetNamespace(), items)
 		if !ok {
 			continue
 		}
-		fn := scheduledFunctionFromObj(items[i].Object, items[i].GetNamespace(), fid, vid)
+		fn := scheduledFunctionFromObj(items[i].Object, items[i].GetNamespace(), fid, vid, terminating[items[i].GetNamespace()])
 		if opts.PhaseFilter != "" && fn.Phase != opts.PhaseFilter {
 			continue
 		}
@@ -135,7 +136,8 @@ func (k *k8sInspector) GetFunction(ctx context.Context, functionID, versionID st
 		if versionID != "" && vid != versionID {
 			continue
 		}
-		return functionDetailFromObj(obj, items[i].GetNamespace(), fid, vid), nil
+		return functionDetailFromObj(obj, items[i].GetNamespace(), fid, vid,
+			terminationListedIDs(items)[items[i].GetNamespace()]), nil
 	}
 
 	if versionID != "" {
@@ -191,8 +193,11 @@ func sortICMSRequests(items []unstructured.Unstructured) {
 
 // scheduledFunctionFromObj builds the list-level summary for one ICMSRequest.
 // functionID/versionID are resolved by the caller via resolveFunctionIdentity,
-// since a termination request's own spec never carries them.
-func scheduledFunctionFromObj(obj map[string]interface{}, namespace, functionID, versionID string) ScheduledFunction {
+// since a termination request's own spec never carries them. terminating holds
+// the instance IDs that termination requests in the same namespace list.
+func scheduledFunctionFromObj(obj map[string]interface{}, namespace, functionID, versionID string,
+	terminating map[string]bool,
+) ScheduledFunction {
 	action := nestedString(obj, "spec", "action")
 	requestStatus := nestedString(obj, "status", "requestStatus")
 	instances := extractInstances(obj)
@@ -203,14 +208,29 @@ func scheduledFunctionFromObj(obj map[string]interface{}, namespace, functionID,
 		Namespace:         namespace,
 		Action:            action,
 		RequestStatus:     requestStatus,
-		Phase:             DerivePhase(requestStatus, action, false, instancesTerminating(instances)),
-		InstanceCount:     len(instances),
+		Phase:             DerivePhase(requestStatus, action, false, instancesTerminating(instances, terminating)),
+		InstanceCount:     activeInstanceCount(instances),
 	}
 }
 
-func functionDetailFromObj(obj map[string]interface{}, namespace, functionID, versionID string) *FunctionDetail {
+// activeInstanceCount returns how many of instances NVCA has not reported
+// terminated. NVCA keeps an instance it has reported terminated listed while the
+// rest of its request runs, so those entries are history, not instances.
+func activeInstanceCount(instances []Instance) int {
+	n := 0
+	for _, in := range instances {
+		if !instanceReportedTerminated(in) {
+			n++
+		}
+	}
+	return n
+}
+
+func functionDetailFromObj(obj map[string]interface{}, namespace, functionID, versionID string,
+	terminating map[string]bool,
+) *FunctionDetail {
 	return &FunctionDetail{
-		ScheduledFunction:  scheduledFunctionFromObj(obj, namespace, functionID, versionID),
+		ScheduledFunction:  scheduledFunctionFromObj(obj, namespace, functionID, versionID, terminating),
 		Instances:          extractInstances(obj),
 		LastStatusUpdated:  nestedString(obj, "status", "lastStatusUpdated"),
 		LastACKTimestamp:   nestedString(obj, "status", "lastACKTimestamp"),
@@ -320,18 +340,60 @@ func extractGPUUsage(obj map[string]interface{}) []GPUUsage {
 	return gpus
 }
 
-// instancesTerminating reports whether any instance is mid-termination, used as
-// a DRAINING signal. Note: cluster-wide CordonAndDrain maintenance mode is a
-// stronger signal but is not carried on the ICMSRequest CR; wiring that from
+// instancesTerminating reports whether an instance is mid-termination, or listed
+// in terminating by a termination request, or every instance is reported
+// terminated, used as a DRAINING signal. NVCA keeps an instance it has reported
+// terminated listed while the rest of its request runs, so on its own that
+// instance is not a drain. Note: cluster-wide CordonAndDrain maintenance mode is
+// a stronger signal but is not carried on the ICMSRequest CR; wiring that from
 // the NVCFBackend CR is a follow-up once the field is confirmed.
-func instancesTerminating(instances []Instance) bool {
+func instancesTerminating(instances []Instance, terminating map[string]bool) bool {
+	reportedTerminated := 0
 	for _, in := range instances {
-		if strings.Contains(strings.ToLower(in.Status), "terminat") ||
+		if instanceReportedTerminated(in) {
+			reportedTerminated++
+			continue
+		}
+		if terminating[in.ID] || strings.Contains(strings.ToLower(in.Status), "terminat") ||
 			strings.Contains(strings.ToLower(in.LastReportedStatus), "terminat") {
 			return true
 		}
 	}
-	return false
+	return len(instances) > 0 && reportedTerminated == len(instances)
+}
+
+// terminationListedIDs returns, by namespace, the instance IDs that termination
+// requests list. NVCA records a termination on the termination request, so
+// until it reports them terminated, the instances it is removing look running on
+// their creation request. A failed termination request is not removing the
+// instances it lists, so they are left out.
+func terminationListedIDs(items []unstructured.Unstructured) map[string]map[string]bool {
+	ids := map[string]map[string]bool{}
+	for i := range items {
+		if nestedString(items[i].Object, "spec", "action") != actionTermination {
+			continue
+		}
+		switch nestedString(items[i].Object, "status", "requestStatus") {
+		case statusFailed, statusFailureAcknowledged:
+			continue
+		}
+		listed, _, _ := unstructured.NestedStringSlice(items[i].Object, "spec", "terminationMsgInfo", "instanceIds")
+		namespace := items[i].GetNamespace()
+		for _, id := range listed {
+			if ids[namespace] == nil {
+				ids[namespace] = map[string]bool{}
+			}
+			ids[namespace][id] = true
+		}
+	}
+	return ids
+}
+
+// instanceReportedTerminated reports whether NVCA has reported the instance
+// terminated, after which the Pod or MiniService backing it is expected to be
+// gone.
+func instanceReportedTerminated(in Instance) bool {
+	return strings.EqualFold(in.LastReportedStatus, "terminated")
 }
 
 // wrapCRDError turns common dynamic-client failures into actionable messages.

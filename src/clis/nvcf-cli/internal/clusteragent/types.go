@@ -75,7 +75,7 @@ type AgentStatus struct {
 	KubernetesVersion   string     `json:"kubernetesVersion,omitempty"`
 	LastUpdated         string     `json:"lastUpdated,omitempty"`
 	GPU                 []GPUUsage `json:"gpu,omitempty"`
-	ControlPlane        *ICMSInfo   `json:"controlPlane,omitempty"`
+	ControlPlane        *ICMSInfo  `json:"controlPlane,omitempty"`
 }
 
 // Instance is one running instance backing a scheduled function, from
@@ -98,7 +98,8 @@ type ScheduledFunction struct {
 	Action            string `json:"action,omitempty"`
 	RequestStatus     string `json:"requestStatus"`
 	Phase             Phase  `json:"phase"`
-	InstanceCount     int    `json:"instanceCount"`
+	// InstanceCount counts the instances NVCA has not reported terminated.
+	InstanceCount int `json:"instanceCount"`
 }
 
 // FunctionDetail is the detailed view of one scheduled function version.

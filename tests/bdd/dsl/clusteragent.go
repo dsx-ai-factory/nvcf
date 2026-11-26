@@ -46,7 +46,8 @@ type scheduledFunction struct {
 type functionDetail struct {
 	InstanceCount int `json:"instanceCount"`
 	Instances     []struct {
-		Status string `json:"status"`
+		Status             string `json:"status"`
+		LastReportedStatus string `json:"lastReportedStatus"`
 	} `json:"instances"`
 }
 
@@ -97,9 +98,11 @@ func ScheduledFunctionInstancesAbsent(raw, functionID, versionID string) error {
 }
 
 // FunctionInstancesReady requires `cluster agent get-function --json` to report
-// exactly count instances and exactly count of them to carry status. The
-// compute-plane CLI does not normalize instance status, so the comparison is
-// case-insensitive. Surplus instance entries are rejected.
+// exactly count instances and exactly count of them to carry status. NVCA keeps
+// an instance it has reported terminated listed while the rest of its request
+// runs, so entries whose last reported status is terminated are history and are
+// left out. The compute-plane CLI does not normalize instance status, so the
+// comparisons are case-insensitive. Surplus instance entries are rejected.
 func FunctionInstancesReady(raw string, count int, status string) error {
 	var detail functionDetail
 	if err := json.Unmarshal([]byte(raw), &detail); err != nil {
@@ -108,15 +111,19 @@ func FunctionInstancesReady(raw string, count int, status string) error {
 	if detail.InstanceCount != count {
 		return fmt.Errorf("instance count = %d, want %d", detail.InstanceCount, count)
 	}
-	if len(detail.Instances) != count {
-		return fmt.Errorf("instance entries count = %d, want %d", len(detail.Instances), count)
-	}
 	expected := strings.ToLower(strings.TrimSpace(status))
-	matched := 0
+	active, matched := 0, 0
 	for _, instance := range detail.Instances {
+		if strings.EqualFold(strings.TrimSpace(instance.LastReportedStatus), "terminated") {
+			continue
+		}
+		active++
 		if strings.ToLower(strings.TrimSpace(instance.Status)) == expected {
 			matched++
 		}
+	}
+	if active != count {
+		return fmt.Errorf("instance entries count = %d, want %d", active, count)
 	}
 	if matched != count {
 		return fmt.Errorf("%d instances report status %q, want %d", matched, status, count)

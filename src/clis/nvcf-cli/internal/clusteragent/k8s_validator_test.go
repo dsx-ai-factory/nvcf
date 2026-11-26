@@ -683,6 +683,166 @@ func TestValidateDeploymentPodReadinessFallsBackForUnrecognizedInstanceType(t *t
 	}
 }
 
+// TestValidateDeploymentSkipsInstancesReportedTerminated covers an instance
+// NVCA has reported terminated, which stays listed while the rest of its
+// request runs and whose Pod is expected to be gone. pod-readiness checks only
+// the other instances, and warns when its Pod is still there and not being
+// deleted. queue-health does not take it for a drain unless a termination
+// request lists the other instances too.
+func TestValidateDeploymentSkipsInstancesReportedTerminated(t *testing.T) {
+	deleting := fakePod(testRequestsNS, "inst-a", corev1.ConditionFalse)
+	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	tests := []struct {
+		name          string
+		instances     map[string]interface{}
+		terminating   []string
+		pods          []runtime.Object
+		wantReadiness CheckStatus
+		wantMessage   string
+		wantQueue     CheckStatus
+	}{
+		{
+			name: "reported terminated beside running instances",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+				"inst-c": podInstanceRecord("running", "running"),
+			},
+			pods: []runtime.Object{
+				fakePod(testRequestsNS, "inst-b", corev1.ConditionTrue),
+				fakePod(testRequestsNS, "inst-c", corev1.ConditionTrue),
+			},
+			wantReadiness: CheckPassed,
+			wantMessage:   "2 instances healthy",
+			wantQueue:     CheckPassed,
+		},
+		{
+			// NVCA reports an instance terminated even when deleting its Pod failed.
+			name: "reported terminated while its pod is still there",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			pods: []runtime.Object{
+				fakePod(testRequestsNS, "inst-a", corev1.ConditionFalse),
+				fakePod(testRequestsNS, "inst-b", corev1.ConditionTrue),
+			},
+			wantReadiness: CheckWarning,
+			wantMessage:   "instance inst-a was reported terminated but its pod still exists",
+			wantQueue:     CheckPassed,
+		},
+		{
+			name: "reported terminated while its pod is being deleted",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			pods:          []runtime.Object{deleting, fakePod(testRequestsNS, "inst-b", corev1.ConditionTrue)},
+			wantReadiness: CheckPassed,
+			wantMessage:   "1 instance healthy",
+			wantQueue:     CheckPassed,
+		},
+		{
+			// nvcf-cli kill sets only lastReportedStatus.
+			name: "killed by nvcf-cli beside a running instance",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("running", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			pods:          []runtime.Object{fakePod(testRequestsNS, "inst-b", corev1.ConditionTrue)},
+			wantReadiness: CheckPassed,
+			wantMessage:   "1 instance healthy",
+			wantQueue:     CheckPassed,
+		},
+		{
+			// A termination request removes every instance, and one is reported.
+			name: "scale to zero before the last instance is reported",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			terminating:   []string{"inst-a", "inst-b"},
+			pods:          []runtime.Object{fakePod(testRequestsNS, "inst-b", corev1.ConditionTrue)},
+			wantReadiness: CheckPassed,
+			wantMessage:   "1 instance healthy",
+			wantQueue:     CheckWarning,
+		},
+		{
+			name: "every instance reported terminated",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			wantReadiness: CheckFailed,
+			wantMessage:   "no instances running for this function version",
+			wantQueue:     CheckWarning,
+		},
+		{
+			name: "every instance reported terminated while a pod is still there",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			pods:          []runtime.Object{fakePod(testRequestsNS, "inst-a", corev1.ConditionFalse)},
+			wantReadiness: CheckFailed,
+			wantMessage: "no instances running for this function version; " +
+				"instance inst-a was reported terminated but its pod still exists",
+			wantQueue: CheckWarning,
+		},
+		{
+			name: "every instance reported terminated while its pod is being deleted",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			pods:          []runtime.Object{deleting},
+			wantReadiness: CheckFailed,
+			wantMessage:   "no instances running for this function version",
+			wantQueue:     CheckWarning,
+		},
+		{
+			name: "reported terminated while its pod is still there, beside a pod not ready yet",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			pods: []runtime.Object{
+				fakePod(testRequestsNS, "inst-a", corev1.ConditionTrue),
+				fakePod(testRequestsNS, "inst-b", corev1.ConditionFalse),
+			},
+			wantReadiness: CheckWarning,
+			wantMessage: "instance inst-b not yet ready: pod condition Ready=False; " +
+				"instance inst-a was reported terminated but its pod still exists",
+			wantQueue: CheckPassed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := icmsWithInstances(testRequestsNS, "r1", "fn-1", "v1", statusCompletionAcknowledged, nil)
+			if err := unstructured.SetNestedMap(req.Object, tt.instances, "status", "instances"); err != nil {
+				t.Fatalf("set status.instances: %v", err)
+			}
+			objs := []runtime.Object{validatorBackend(testSystemNS, agentStatusHealthy, 8, 5), req}
+			if tt.terminating != nil {
+				objs = append(objs, icmsTerminationRequest(testRequestsNS, "r2", statusCompleted, tt.terminating...))
+			}
+			v := newFakeValidator(nil, objs, tt.pods)
+
+			out, err := v.ValidateDeployment(context.Background(), "fn-1", "v1", ValidateOptions{BackendNS: testBackendNS})
+			if err != nil {
+				t.Fatalf("ValidateDeployment returned error: %v", err)
+			}
+			if got := checkByName(t, out.Checks, "pod-readiness"); got.Status != tt.wantReadiness || got.Message != tt.wantMessage {
+				t.Errorf("pod-readiness = %s (%s), want %s (%s)", got.Status, got.Message, tt.wantReadiness, tt.wantMessage)
+			}
+			if got := checkByName(t, out.Checks, "queue-health"); got.Status != tt.wantQueue {
+				t.Errorf("queue-health = %s (%s), want %s", got.Status, got.Message, tt.wantQueue)
+			}
+		})
+	}
+}
+
 func TestValidateDeploymentQueueHealthWarnsOnDeploying(t *testing.T) {
 	v := newFakeValidator(nil,
 		[]runtime.Object{

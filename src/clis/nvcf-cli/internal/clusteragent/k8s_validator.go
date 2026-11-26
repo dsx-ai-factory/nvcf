@@ -410,7 +410,7 @@ func (v *k8sValidator) ValidateDeployment(ctx context.Context, functionID, versi
 	instances := extractInstances(match)
 	out.Checks = append(out.Checks,
 		checkPodReadiness(ctx, v.cs, v.dc, matchNamespace, instances),
-		checkQueueHealth(match, instances),
+		checkQueueHealth(match, instances, terminationListedIDs(items)[matchNamespace]),
 		checkGPUUtilization(cc.backend),
 	)
 	return out, nil
@@ -431,16 +431,46 @@ const utilsPodName = "utils"
 // container state) instead of the ICMSRequest CR's mirrored status string,
 // which can lag or omit a crash NVCA hasn't reconciled forward yet. A
 // container function's Pod is named after the instance ID; a MiniService
-// (Helm) instance resolves to the "utils" Pod in its own namespace.
+// (Helm) instance resolves to the "utils" Pod in its own namespace. An
+// instance NVCA has reported terminated is not checked for readiness: it stays
+// listed while the rest of its request runs, and its Pod is expected to be gone.
+// A Pod of such an instance that is still there, and not being deleted, is
+// reported whatever the readiness of the other instances: NVCA reports an
+// instance terminated even when deleting its Pod failed, and deletes it again on
+// a later pass. It is a warning when the other instances are healthy, and is
+// added to the message otherwise.
 func checkPodReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.Interface, namespace string, instances []Instance) CheckResult {
+	var live, ended []Instance
+	for _, in := range instances {
+		if instanceReportedTerminated(in) {
+			ended = append(ended, in)
+		} else {
+			live = append(live, in)
+		}
+	}
+	res := liveInstancesReadiness(ctx, cs, dc, namespace, live)
+	if msg := remainingPodWarning(ctx, cs, namespace, ended); msg != "" {
+		if res.Status == CheckPassed {
+			res.Status = CheckWarning
+			res.Message = msg
+		} else {
+			res.Message += "; " + msg
+		}
+	}
+	return res
+}
+
+// liveInstancesReadiness checks the Pods of the instances NVCA has not reported
+// terminated.
+func liveInstancesReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.Interface, namespace string, live []Instance) CheckResult {
 	res := CheckResult{Name: "pod-readiness"}
-	if len(instances) == 0 {
+	if len(live) == 0 {
 		res.Status = CheckFailed
 		res.Message = "no instances running for this function version"
 		return res
 	}
 	var warnMsg string
-	for _, in := range instances {
+	for _, in := range live {
 		var pod *corev1.Pod
 		var err error
 		switch {
@@ -487,8 +517,28 @@ func checkPodReadiness(ctx context.Context, cs kubernetes.Interface, dc dynamic.
 		return res
 	}
 	res.Status = CheckPassed
-	res.Message = fmt.Sprintf("%s healthy", pluralize(len(instances), "instance"))
+	res.Message = fmt.Sprintf("%s healthy", pluralize(len(live), "instance"))
 	return res
+}
+
+// remainingPodWarning returns a warning for the first Pod-backed instance of
+// ended whose Pod still exists and is not being deleted, or "" when there is none.
+func remainingPodWarning(ctx context.Context, cs kubernetes.Interface, namespace string, ended []Instance) string {
+	for _, in := range ended {
+		if !isPodBackedInstance(in) {
+			continue
+		}
+		pod, err := cs.CoreV1().Pods(namespace).Get(ctx, in.ID, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			continue
+		case err != nil:
+			return fmt.Sprintf("instance %s: failed to read pod: %v", in.ID, err)
+		case pod.DeletionTimestamp == nil:
+			return fmt.Sprintf("instance %s was reported terminated but its pod still exists", in.ID)
+		}
+	}
+	return ""
 }
 
 // isPodBackedInstance reports whether an instance is backed by a single Pod
@@ -611,11 +661,11 @@ func podReadyConditionStatus(status corev1.PodStatus) corev1.ConditionStatus {
 
 // checkQueueHealth maps the collapsed request phase to a verdict: ACTIVE passes,
 // DEPLOYING/DRAINING warn (transient), FAILED fails.
-func checkQueueHealth(obj map[string]interface{}, instances []Instance) CheckResult {
+func checkQueueHealth(obj map[string]interface{}, instances []Instance, terminating map[string]bool) CheckResult {
 	res := CheckResult{Name: "queue-health"}
 	requestStatus := nestedString(obj, "status", "requestStatus")
 	action := nestedString(obj, "spec", "action")
-	phase := DerivePhase(requestStatus, action, false, instancesTerminating(instances))
+	phase := DerivePhase(requestStatus, action, false, instancesTerminating(instances, terminating))
 	switch phase {
 	case PhaseActive:
 		res.Status = CheckPassed

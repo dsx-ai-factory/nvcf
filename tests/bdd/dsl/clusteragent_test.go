@@ -122,8 +122,9 @@ func TestFunctionInstancesReadyFailsOnInstanceCount(t *testing.T) {
 	}
 }
 
-// The compute-plane CLI derives instanceCount from the instances array, so this
-// shape should not occur. A surplus entry must not read as readiness if it does.
+// The compute-plane CLI derives instanceCount from the instances it lists that
+// NVCA has not reported terminated, so this shape should not occur. A surplus
+// entry must not read as readiness if it does.
 func TestFunctionInstancesReadyFailsOnSurplusInstances(t *testing.T) {
 	raw := `{"instanceCount": 1, "instances": [{"status": "running"}, {"status": "pending"}]}`
 	err := FunctionInstancesReady(raw, 1, "running")
@@ -158,5 +159,33 @@ func TestFunctionInstancesReadyFailsOnPartialStatusMatch(t *testing.T) {
 func TestFunctionInstancesReadyParseError(t *testing.T) {
 	if err := FunctionInstancesReady("", 1, "running"); err == nil {
 		t.Fatal("expected parse error")
+	}
+}
+
+// NVCA keeps an instance it has reported terminated listed while the rest of
+// its request runs. That entry is history and does not count toward readiness.
+func TestFunctionInstancesReadyIgnoresInstancesReportedTerminated(t *testing.T) {
+	raw := `{"instanceCount": 1, "instances": [
+		{"id": "i-1", "status": "terminated", "lastReportedStatus": "TERMINATED"},
+		{"id": "i-2", "status": "running", "lastReportedStatus": "running"}
+	]}`
+	if err := FunctionInstancesReady(raw, 1, "running"); err != nil {
+		t.Fatalf("instances ready: %v", err)
+	}
+}
+
+// An instance being terminated that NVCA has not reported yet still counts, so
+// it is a surplus entry.
+func TestFunctionInstancesReadyCountsInstancesNotYetReportedTerminated(t *testing.T) {
+	raw := `{"instanceCount": 1, "instances": [
+		{"id": "i-1", "status": "terminated"},
+		{"id": "i-2", "status": "running", "lastReportedStatus": "running"}
+	]}`
+	err := FunctionInstancesReady(raw, 1, "running")
+	if err == nil {
+		t.Fatal("expected error when an instance not reported terminated is surplus")
+	}
+	if !strings.Contains(err.Error(), "instance entries count = 2, want 1") {
+		t.Fatalf("error = %v, want instance entries count mismatch", err)
 	}
 }

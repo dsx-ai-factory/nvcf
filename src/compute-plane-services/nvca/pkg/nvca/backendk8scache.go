@@ -221,6 +221,10 @@ type BackendK8sCache struct {
 	periodicInstanceStatusUpdateInterval time.Duration
 	csiVolumeMountOptions                []string
 
+	// Live reads of Pod instances by the instance status loop, which bound how long an instance is
+	// served from the informer cache.
+	instancePodLiveReads instancePodLiveReads
+
 	// Node features client, for retrieving instance type data.
 	nfClient nodefeatures.Client
 	// Registration instance type cache, since computing may be expensive.
@@ -2293,8 +2297,14 @@ func (c *BackendK8sCache) applyICMSRequestStatusChange(ctx context.Context,
 		}
 
 		// Update ICMS request
+		storedReqStatus := srLat.Status.RequestStatus
 		modify(ctx, srLat)
 		newReqStatus = srLat.Status.RequestStatus
+		if newReqStatus == storedReqStatus {
+			// This write leaves the request status as stored, so it records no span transition and leaves
+			// the span bookkeeping to the write that changed the status.
+			newReqStatus = prevReqStatus
+		}
 
 		// set the lastUpdatedTimeStamp
 		lastUpdatedTime = metav1.Time{Time: core.GetCurrentTime(ctx)}
@@ -3194,13 +3204,38 @@ func (c *BackendK8sCache) shouldReportInstanceStatusHeartbeat(
 		return false
 	}
 
-	if time.Since(lastReportedTimeStamp.Time) >= c.periodicInstanceStatusUpdateInterval {
+	if c.instanceStatusHeartbeatDue(lastReportedTimeStamp, core.GetCurrentTime(ctx)) {
 		return true
 	}
 
 	log.Debugf("skip status for %v, currentStatus: %v, lastReportedStatus: %v, lastReportedTimeStamp: %v",
 		instanceID, currentStatus, lastReportedStatus, lastReportedTimeStamp)
 	return false
+}
+
+// instanceStatusHeartbeatDue reports whether the periodic report of an instance's unchanged state,
+// last reported at lastReported, is due at now.
+func (c *BackendK8sCache) instanceStatusHeartbeatDue(lastReported *metav1.Time, now time.Time) bool {
+	return c.enablePeriodicInstanceStatusUpdate && lastReported != nil &&
+		now.Sub(lastReported.Time) >= c.periodicInstanceStatusUpdateInterval
+}
+
+// awaitsTaskAcknowledgement reports whether req is a task request in progress that has not been
+// acknowledged, while tasks are acknowledged only after their Pods are scheduled. The
+// acknowledgement worker acknowledges such a request only while it is InstancesInProgress, and the
+// status loop holds back its fulfillment until then, so it must not complete before.
+func (c *BackendK8sCache) awaitsTaskAcknowledgement(req *nvcav2beta1new.ICMSRequest) bool {
+	if req.Spec.Action != common.RequestICMSInstancesForTask && req.Spec.Action != common.TaskCreationAction {
+		return false
+	}
+	switch req.Status.RequestStatus {
+	case nvcav2beta1new.ICMSRequestStatusCachingInProgress, nvcav2beta1new.ICMSRequestStatusPending,
+		nvcav2beta1new.ICMSRequestStatusInProgress, nvcav2beta1new.ICMSRequestStatusInstancesInProgress:
+	default:
+		return false
+	}
+	return req.Status.LastACKTimestamp == nil &&
+		c.featureFlagFetcher.IsFeatureFlagEnabled(featureflag.AckTaskRequestAfterPodsScheduled)
 }
 
 func (c *BackendK8sCache) ApplyICMSRequestStatusChange(ctx context.Context, req *nvcav2beta1new.ICMSRequest) error {
@@ -3210,6 +3245,11 @@ func (c *BackendK8sCache) ApplyICMSRequestStatusChange(ctx context.Context, req 
 
 	switch c.icmsRequestHelper.AggregateInstanceStatuses(ctx, req) {
 	case AggregatedInstanceStatusSucceeded:
+		if c.awaitsTaskAcknowledgement(req) {
+			// Completes once acknowledged, which the acknowledgement worker does only in InstancesInProgress.
+			newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusInstancesInProgress)
+			break
+		}
 		newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusCompleted)
 	case AggregatedInstanceStatusFailed:
 		newReqStatus = reqStatusPtr(nvcav2beta1new.ICMSRequestStatusFailed)

@@ -121,6 +121,12 @@ func icmsTerminationRequest(namespace, name, status string, instanceIDs ...strin
 	}}
 }
 
+// podInstanceRecord builds one Pod-backed status.instances record with the
+// state NVCA last recorded and the state it last reported to ICMS.
+func podInstanceRecord(status, lastReportedStatus string) map[string]interface{} {
+	return map[string]interface{}{"type": "Pod", "status": status, "lastReportedStatus": lastReportedStatus}
+}
+
 func TestStatusExtractsBackendFields(t *testing.T) {
 	insp := newFakeInspector(nvcfBackend("nvca-operator", "backend"))
 
@@ -211,7 +217,9 @@ func TestListFunctionsRecoversIdentityForTerminationRequestViaInstanceIDs(t *tes
 	// ICMSRequest CR carries no functionId/functionVersionId directly (see
 	// icmsTerminationRequest), but shares an instance ID with the function's
 	// creation-action CR. The DRAINING record must recover the real identity
-	// via that shared instance ID rather than reporting empty strings.
+	// via that shared instance ID rather than reporting empty strings. The
+	// creation request is DRAINING too, since the termination request lists its
+	// instance.
 	insp := newFakeInspector(
 		icmsRequest("nvcf-backend", "r1", "fn-1", "v1", "", statusCompleted, false),
 		icmsTerminationRequest("nvcf-backend", "r2", statusCompleted, "inst-a"),
@@ -221,11 +229,57 @@ func TestListFunctionsRecoversIdentityForTerminationRequestViaInstanceIDs(t *tes
 	if err != nil {
 		t.Fatalf("ListFunctions returned error: %v", err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("got %d functions, want 1 DRAINING record: %+v", len(got), got)
+	if len(got) != 2 {
+		t.Fatalf("got %d functions, want 2 DRAINING records: %+v", len(got), got)
 	}
-	if got[0].FunctionID != "fn-1" || got[0].FunctionVersionID != "v1" {
-		t.Errorf("DRAINING record identity = %q/%q, want fn-1/v1 recovered via instance ID", got[0].FunctionID, got[0].FunctionVersionID)
+	actions := map[string]bool{}
+	for _, fn := range got {
+		actions[fn.Action] = true
+		if fn.FunctionID != "fn-1" || fn.FunctionVersionID != "v1" {
+			t.Errorf("DRAINING %q record identity = %q/%q, want fn-1/v1 recovered via instance ID", fn.Action, fn.FunctionID, fn.FunctionVersionID)
+		}
+	}
+	if !actions[actionTermination] {
+		t.Errorf("DRAINING records %+v lack the termination request", got)
+	}
+}
+
+// A termination request that failed is not removing the instances it lists, so
+// it does not make the function they belong to DRAINING.
+func TestListFunctionsIgnoresFailedTerminationRequestsForDrain(t *testing.T) {
+	tests := []struct {
+		terminationStatus string
+		want              Phase
+	}{
+		{terminationStatus: statusInProgress, want: PhaseDraining},
+		{terminationStatus: statusCompleted, want: PhaseDraining},
+		{terminationStatus: statusFailed, want: PhaseActive},
+		{terminationStatus: statusFailureAcknowledged, want: PhaseActive},
+	}
+	for _, tt := range tests {
+		t.Run(tt.terminationStatus, func(t *testing.T) {
+			insp := newFakeInspector(
+				icmsRequest("nvcf-backend", "r1", "fn-1", "v1", "", statusCompleted, false),
+				icmsTerminationRequest("nvcf-backend", "r2", tt.terminationStatus, "inst-a"),
+			)
+
+			got, err := insp.ListFunctions(context.Background(), ListOptions{})
+			if err != nil {
+				t.Fatalf("ListFunctions returned error: %v", err)
+			}
+			var creation *ScheduledFunction
+			for i := range got {
+				if got[i].Action != actionTermination {
+					creation = &got[i]
+				}
+			}
+			if creation == nil {
+				t.Fatalf("no creation request record in %+v", got)
+			}
+			if creation.Phase != tt.want {
+				t.Errorf("creation request phase = %q, want %q", creation.Phase, tt.want)
+			}
+		})
 	}
 }
 
@@ -330,5 +384,119 @@ func TestGetFunctionNotFound(t *testing.T) {
 	insp := newFakeInspector(icmsRequest("ns-a", "r1", "fn-1", "v1", "", statusCompleted, false))
 	if _, err := insp.GetFunction(context.Background(), "missing", ""); err == nil {
 		t.Fatal("expected error for missing function")
+	}
+}
+
+// TestScheduledFunctionPhaseWithTerminatedInstances covers an instance NVCA has
+// reported terminated, which stays listed while the rest of its request runs.
+// Beside a running instance it is not a drain. The request is DRAINING when
+// every instance is reported terminated, when an instance is terminated but
+// not yet reported, or when a termination request lists an instance that is
+// not reported terminated yet.
+// Instances NVCA has reported terminated are history: they neither make a
+// function DRAINING on their own nor count as its instances.
+func TestScheduledFunctionWithTerminatedInstances(t *testing.T) {
+	tests := []struct {
+		name        string
+		instances   map[string]interface{}
+		terminating map[string]bool
+		want        Phase
+		wantCount   int
+	}{
+		{
+			name: "running instances are active",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("running", "running"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			want:      PhaseActive,
+			wantCount: 2,
+		},
+		{
+			name:      "no instances keeps the request phase",
+			instances: map[string]interface{}{},
+			want:      PhaseActive,
+			wantCount: 0,
+		},
+		{
+			name: "one reported terminated beside running instances is active",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+				"inst-c": podInstanceRecord("running", "running"),
+			},
+			want:      PhaseActive,
+			wantCount: 2,
+		},
+		{
+			name: "every instance reported terminated is draining",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("terminated", "terminated"),
+			},
+			want:      PhaseDraining,
+			wantCount: 0,
+		},
+		{
+			// NVCA maintenance eviction records the instance before the
+			// status loop reports it.
+			name: "evicted instance not yet reported is draining",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", ""),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			want:      PhaseDraining,
+			wantCount: 2,
+		},
+		{
+			// nvcf-cli kill sets only lastReportedStatus.
+			name: "instance killed by nvcf-cli beside a running instance is active",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("running", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			want:      PhaseActive,
+			wantCount: 1,
+		},
+		{
+			// A termination request removes every instance, and one is reported.
+			name: "scale to zero before the last instance is reported is draining",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			terminating: map[string]bool{"inst-a": true, "inst-b": true},
+			want:        PhaseDraining,
+			wantCount:   1,
+		},
+		{
+			// A termination request removed one instance, which is reported.
+			name: "scale down after the removed instance is reported is active",
+			instances: map[string]interface{}{
+				"inst-a": podInstanceRecord("terminated", "terminated"),
+				"inst-b": podInstanceRecord("running", "running"),
+			},
+			terminating: map[string]bool{"inst-a": true},
+			want:        PhaseActive,
+			wantCount:   1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := map[string]interface{}{
+				"status": map[string]interface{}{
+					"requestStatus": statusCompletionAcknowledged,
+					"instances":     tt.instances,
+				},
+			}
+			got := scheduledFunctionFromObj(obj, "ns-a", "fn-1", "v1", tt.terminating)
+			if got.Phase != tt.want {
+				t.Errorf("phase = %q, want %q", got.Phase, tt.want)
+			}
+			if got.InstanceCount != tt.wantCount {
+				t.Errorf("instance count = %d, want %d", got.InstanceCount, tt.wantCount)
+			}
+		})
 	}
 }
