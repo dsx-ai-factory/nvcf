@@ -55,10 +55,14 @@ pub struct QuicTunnelConfig {
 
 /// QUIC liveness settings for reverse tunnels accepted from Pylon.
 ///
-/// QUIC peers use the smaller of their two idle timeouts, so the Stargate value
-/// bounds how long a Pylon that vanished without closing its tunnel keeps
-/// receiving requests. Stargate also sends the keep-alive itself, so quiet but
-/// healthy tunnels stay open under the shorter timeout whatever the Pylon sends.
+/// QUIC peers use the smaller of their two idle timeouts, so when Pylon connects
+/// directly to Stargate the Stargate value bounds how long a Pylon that vanished
+/// without closing its tunnel keeps receiving requests, plus up to one keep-alive
+/// interval (see `docs/tunnel-transports.md`). Behind `stargate-k8s-router` it
+/// covers only the router to Stargate connection; detecting a Pylon that vanished
+/// behind the router follows the router's own idle timeout. Stargate also sends
+/// the keep-alive itself, so quiet but healthy tunnels stay open under the
+/// shorter timeout whatever the Pylon sends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReverseTunnelLiveness {
     pub keep_alive_interval: Duration,

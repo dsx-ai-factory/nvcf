@@ -83,7 +83,9 @@ idle_timeout_ms="${E2E_IDLE_TIMEOUT_MS:-1000}"
 # Seconds without client traffic, three idle timeouts and at least 3 s.
 quiet_seconds=$(((3 * idle_timeout_ms + 999) / 1000))
 [[ ${quiet_seconds} -ge 3 ]] || quiet_seconds=3
-# Longest accepted time from SIGSTOP to Stargate closing the tunnel.
+# Longest accepted time from SIGSTOP to Stargate closing the tunnel. The first
+# packet Stargate sends after the frozen Pylon's last one restarts the idle
+# timer; the 1 s health probes keep that extension under the 3 s margin.
 detect_limit_seconds=$(((idle_timeout_ms + 3000 + 999) / 1000))
 # Pylon keeps the quinn default 30 s idle timeout on its side, so after
 # SIGCONT it may take that long to notice the closed tunnel and reconnect.
@@ -333,16 +335,19 @@ run_case() {
     echo "PASS: tunnels stayed open for ${quiet_seconds} s without client traffic"
 
     # 3. A frozen Pylon's tunnel is closed within the idle timeout.
-    local started=${SECONDS} elapsed
+    # Count from here: a close and reconnect during after-quiet must not count.
+    local started=${SECONDS} elapsed closes_a closes_b
+    closes_a=$(tunnel_closes a)
+    closes_b=$(tunnel_closes b)
     kill -STOP "${pylon_pids[1]}"
-    until [[ "$(tunnel_closes b)" != 0 ]]; do
+    until [[ "$(tunnel_closes b)" -gt "${closes_b}" ]]; do
         elapsed=$((SECONDS - started))
         [[ ${elapsed} -le ${detect_limit_seconds} ]] ||
             fail "stargate kept the frozen pylon-b tunnel for more than ${detect_limit_seconds} s"
         sleep 0.1
     done
     elapsed=$((SECONDS - started))
-    [[ "$(tunnel_closes a)" == 0 ]] || fail "stargate closed pylon-a's healthy tunnel"
+    [[ "$(tunnel_closes a)" == "${closes_a}" ]] || fail "stargate closed pylon-a's healthy tunnel"
     echo "PASS: stargate closed the frozen pylon-b tunnel after about ${elapsed} s (limit ${detect_limit_seconds} s)"
 
     local index served served_a=0 others=()

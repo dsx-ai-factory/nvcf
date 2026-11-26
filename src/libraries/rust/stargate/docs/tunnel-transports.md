@@ -53,8 +53,11 @@ QUIC listener. Use `reverse` where pylon must dial a Stargate reverse listener.
   `--reverse-tunnel-keep-alive-interval-ms` (default `5000`) and closes a
   tunnel that stays silent for `--reverse-tunnel-max-idle-timeout-ms` (default
   `15000`). QUIC uses the lower idle timeout of the two peers, so Stargate
-  notices a pylon that disappears without closing its tunnel within that
-  bound. Behind `stargate-k8s-router`, these settings cover the router to
+  notices a pylon that disappears without closing its tunnel after about that
+  timeout. It is not a strict deadline: the first ack-eliciting packet Stargate
+  sends after the pylon's last packet, such as a keep-alive, restarts the idle
+  timer, so detection can take up to one keep-alive interval longer (about 20 s
+  with the defaults when nothing else crosses the tunnel). Behind `stargate-k8s-router`, these settings cover the router to
   Stargate connection; the pylon to router connection keeps the router's
   `--relay-idle-timeout-ms` and `--relay-keep-alive-ms`.
 
