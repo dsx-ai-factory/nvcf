@@ -139,7 +139,6 @@ public enum Events {
 
     DATABASE_CLEANUP_TASK("DatabaseCleanupTask"),
 
-    GPUS_V5_POPULATION_EVENT("GpusV5PopulationTask"),
 
     ERROR_EVENT("ErrorEvent"),
 

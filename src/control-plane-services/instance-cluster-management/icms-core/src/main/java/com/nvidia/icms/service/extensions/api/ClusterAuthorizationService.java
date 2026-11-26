@@ -18,7 +18,7 @@ package com.nvidia.icms.service.extensions.api;
 
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterGroups;
 import com.nvidia.icms.inbound.rest.model.byoc.InstanceTypeUsageEnum;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotNull;
 
@@ -70,5 +70,5 @@ public interface ClusterAuthorizationService {
      */
     void filterAuthorizedClusters(
             @NotNull String requestingNcaId,
-            @NotNull Set<ClusterByGroupIdAndIdEntity> allClusters);
+            @NotNull Set<ClusterEntity> allClusters);
 }

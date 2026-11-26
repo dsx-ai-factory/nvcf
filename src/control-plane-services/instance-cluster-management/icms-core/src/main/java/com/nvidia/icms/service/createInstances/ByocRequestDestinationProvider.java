@@ -20,8 +20,7 @@ import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.service.account.GpuUsageFilter;
 import com.nvidia.icms.service.byoc.ByocValidationService;
@@ -71,7 +70,7 @@ public class ByocRequestDestinationProvider {
      * capacity checks (SPOT/RESERVED) independently before invoking this method.
      */
     public boolean isClusterAllowed(
-            @NotNull ClusterByGroupIdAndIdEntity cluster,
+            @NotNull ClusterEntity cluster,
             @NotNull GpuUsageFilter filter) {
 
         if (!filter.isRegionNameAllowed(cluster.getRegion())) {
@@ -95,7 +94,7 @@ public class ByocRequestDestinationProvider {
         }
 
         return byocValidationService.validateClustersStatusAndGetProviderForNvca(
-                cluster.getKey().getClusterId()) != null;
+                cluster.getClusterId()) != null;
     }
 
     /**
@@ -103,18 +102,19 @@ public class ByocRequestDestinationProvider {
      * one per GPU / instance-type combination that satisfies {@code filter}.
      */
     public @NotNull Set<RequestInstanceDestination> generateTargetedDestinationList(
-            @NotNull Set<ClusterByGroupIdAndIdEntity> clusters,
+            @NotNull Set<ClusterEntity> clusters,
             @NotNull GpuUsageFilter filter,
             @NotNull SpotInstanceRequestSchema instanceRequest) {
 
         Set<RequestInstanceDestination> result = new HashSet<>();
 
-        for (ClusterByGroupIdAndIdEntity entity : clusters) {
+        for (ClusterEntity entity : clusters) {
             Map<String, String> queueUrlByGpuNameMap = new HashMap<>();
-            if (entity.getGpusV5() == null) {
+            Set<GpuV5Udt> gpus = entity.getGpusV5();
+            if (gpus.isEmpty()) {
                 continue;
             }
-            for (GpuV5Udt gpu : entity.getGpusV5()) {
+            for (GpuV5Udt gpu : gpus) {
                 if (filter.isGpuNameAllowed(gpu.getName())) {
                     // See getNonTargetedDestinations for rationale — "" means NATS mode, not missing.
                     String queueUrl = byocValidationService.getCreationQueueForReadyCluster(
@@ -126,7 +126,7 @@ public class ByocRequestDestinationProvider {
             CloudProvider cloudProvider = getCloudProviderFromClusterProvider(entity.getClusterProvider());
             if (cloudProvider == null) {
                 log.warn("{}: Unable to determine cloud provider for cluster {}",
-                         instanceRequest.getLoggingId(), entity.getKey().getClusterId());
+                         instanceRequest.getLoggingId(), entity.getClusterId());
             }
             result.addAll(destinationCreator.addAvailableDestinations(
                     new DestinationClusterData(entity, queueUrlByGpuNameMap),
@@ -152,22 +152,23 @@ public class ByocRequestDestinationProvider {
                 .build();
 
         // Fetch clusters for the NCA ID and merge with WILDCARD, excluding non-BYOC clusters
-        List<ClustersByAuthorizedAccountsEntity> clustersForNcaId =
+        List<ClusterEntity> clustersForNcaId =
                 new ArrayList<>(nvcaClusterRepository.getAllClustersInAuthorizedAccount(instanceRequest.getNcaId()));
-        List<ClustersByAuthorizedAccountsEntity> availableClusters = new ArrayList<>(clustersForNcaId);
+        List<ClusterEntity> availableClusters = new ArrayList<>(clustersForNcaId);
         availableClusters.addAll(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD));
         availableClusters = availableClusters.stream()
                 .filter(entity -> !computePlatformService.isPlatformCluster(entity.getClusterGroupName()))
                 .toList();
 
         Set<RequestInstanceDestination> result = new HashSet<>();
-        for (ClustersByAuthorizedAccountsEntity entity : availableClusters) {
+        for (ClusterEntity entity : availableClusters) {
             Map<String, String> queueUrlByGpuNameMap = new HashMap<>();
-            if (entity.getGpusV5() == null) {
+            Set<GpuV5Udt> gpus = entity.getGpusV5();
+            if (gpus.isEmpty()) {
                 continue;
             }
 
-            for (GpuV5Udt gpu : entity.getGpusV5()) {
+            for (GpuV5Udt gpu : gpus) {
                 if (filter.isGpuNameAllowed(gpu.getName())) {
                     // Always put the URL (even "") so DestinationCreator can distinguish
                     // "GPU filtered out" (absent key) from "NATS mode, no SQS queue" (empty
@@ -180,16 +181,16 @@ public class ByocRequestDestinationProvider {
             }
 
             CloudProvider cloudProvider =
-                    byocValidationService.validateClustersStatusAndGetProviderForNvca(entity.getKey().getClusterId());
+                    byocValidationService.validateClustersStatusAndGetProviderForNvca(entity.getClusterId());
             if (cloudProvider == null) {
                 log.warn("ByocRequestDestinationProvider: Unable to determine cloud provider for cluster {},"
                                  + " cluster is probably unhealthy",
-                         entity.getKey().getClusterId());
+                          entity.getClusterId());
                 continue;
             }
 
             result.addAll(destinationCreator.addAvailableDestinations(
-                    new DestinationClusterData(entity, queueUrlByGpuNameMap),
+                    new DestinationClusterData(entity, queueUrlByGpuNameMap, false),
                     filter, cloudProvider, instanceRequest.getInstanceCount()));
         }
 

@@ -19,10 +19,7 @@ package com.nvidia.icms.outbound.cassandra.byoc;
 import static com.nvidia.icms.service.byoc.nvca.clustermanagement.ClusterCreationService.getClusterIdFromAuthClientId;
 
 import com.nvidia.icms.errors.IcmsInternalServerException;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupByGroupIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterHealthEntity;
 import com.nvidia.icms.service.scheduled.request.ClusterHealthMonitorTask;
 import io.micrometer.observation.annotation.Observed;
@@ -83,23 +80,21 @@ public class ClusterRepository {
                 .collect(Collectors.toSet());
     }
 
-    public Optional<ClusterGroupsByAccountEntity> getClusterGroupInfoByAccountAndNameInMainAccount(
+    public Optional<ClusterEntity> getClusterGroupInfoByAccountAndNameInMainAccount(
             String ncaId, String clusterGroupName) {
 
         // No index on cluster_group_name: query by nca_id SAI and filter in memory.
         return clusterByIdRepo.findAllByNcaId(ncaId).stream()
                 .filter(entity -> clusterGroupName.equals(entity.getClusterGroupName()))
-                .findFirst()
-                .map(NvcaConverter::toClusterGroupsByAccountsEntity);
+                .findFirst();
     }
 
 
-    public Optional<ClusterGroupByGroupIdEntity> getClusterGroupInfoByClusterGroupId(
+    public Optional<ClusterEntity> getClusterGroupInfoByClusterGroupId(
             String clusterGroupId) {
 
         return clusterByIdRepo.findAllByClusterGroupId(clusterGroupId).stream()
-                .findFirst()
-                .map(NvcaConverter::toClusterGroupByGroupIdEntity);
+                .findFirst();
     }
 
     public Optional<ClusterEntity> getClusterByAccountAndName(String ncaId, String name) {
@@ -148,12 +143,8 @@ public class ClusterRepository {
         }
     }
 
-    public List<ClusterByGroupIdAndIdEntity> getClustersFromClusterGroup(String clusterGroupId) {
-
-        return clusterByIdRepo.findAllByClusterGroupId(clusterGroupId).stream()
-                .map(NvcaConverter::toClusterByGroupIdAndIdEntity)
-                .collect(Collectors.toList());
-
+    public List<ClusterEntity> getClustersFromClusterGroup(String clusterGroupId) {
+        return clusterByIdRepo.findAllByClusterGroupId(clusterGroupId);
     }
 
     /**

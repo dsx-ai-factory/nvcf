@@ -36,8 +36,6 @@ import com.nvidia.icms.inbound.rest.model.account.InstanceTypeAvailabilityRespon
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterProviderEnum;
 import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;

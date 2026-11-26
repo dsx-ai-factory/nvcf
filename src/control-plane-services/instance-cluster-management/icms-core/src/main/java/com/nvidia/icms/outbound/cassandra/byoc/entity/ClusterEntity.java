@@ -65,7 +65,6 @@ public class ClusterEntity {
     public static final String COLUMN_CAPABILITIES = "capabilities";
     public static final String COLUMN_ATTRIBUTES = "attributes";
     public static final String COLUMN_GPUS_V2 = "gpus_v2";
-    public static final String COLUMN_GPUS_V4 = "gpus_v4";
     public static final String COLUMN_GPUS_V5 = "gpus_v5";
     public static final String COLUMN_NVCA_VERSION = "nvca_version";
     public static final String COLUMN_AUTH_CLIENT_ID = "auth_client_id";
@@ -95,7 +94,6 @@ public class ClusterEntity {
     @Column(COLUMN_REGISTRATION_TIME)
     private Instant registrationTime;
 
-    // common fields with ClusterByGroupIdAndIdEntity
     @Column(COLUMN_CLUSTER_NAME)
     private String clusterName;
 
@@ -146,9 +144,6 @@ public class ClusterEntity {
 
     @Column(COLUMN_ATTRIBUTES)
     private Set<String> attributes;
-
-    @Column(COLUMN_GPUS_V4)
-    private Set<GpuV4Udt> gpusV4;
 
     @Column(COLUMN_GPUS_V5)
     private Set<GpuV5Udt> gpusV5;
@@ -229,14 +224,6 @@ public class ClusterEntity {
         }
 
         return this.attributes;
-    }
-
-    public Set<GpuV4Udt> getGpusV4() {
-        if (this.gpusV4 == null) {
-            this.gpusV4 = new HashSet<>();
-        }
-
-        return this.gpusV4;
     }
 
     public Map<String, CreationQueueUdt> getCreationQueues() {

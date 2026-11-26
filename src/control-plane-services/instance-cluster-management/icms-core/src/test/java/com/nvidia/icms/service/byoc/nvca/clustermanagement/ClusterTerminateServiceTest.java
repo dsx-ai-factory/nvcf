@@ -43,7 +43,6 @@ import com.nvidia.icms.errors.IcmsNotFoundException;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.sqs.QueueManager;
@@ -382,10 +381,9 @@ class ClusterTerminateServiceTest {
     void deleteClusterForReconfiguration_singleClusterInGroup_noActiveInstances_success() {
         // Prepare
         ClusterEntity clusterEntity = getDummyClusterEntity();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = new ClusterByGroupIdAndIdEntity();
 
         when(clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId()))
-                .thenReturn(List.of(clusterByGroupIdAndIdEntity));
+                .thenReturn(List.of(clusterEntity));
         doNothing().when(nvcaClusterRepository).deleteClusterInfo(any());
         doNothing().when(auditService).sendAuditEventForClusterEntity(any(), any(), any());
         when(instanceServiceHelper.isNatsEnabled()).thenReturn(true);
@@ -407,8 +405,8 @@ class ClusterTerminateServiceTest {
     void deleteClusterForReconfiguration_multipleClustersInGroup_success() {
         // Prepare
         ClusterEntity clusterEntity = getDummyClusterEntity();
-        ClusterByGroupIdAndIdEntity cluster1 = new ClusterByGroupIdAndIdEntity();
-        ClusterByGroupIdAndIdEntity cluster2 = new ClusterByGroupIdAndIdEntity();
+        ClusterEntity cluster1 = clusterEntity;
+        ClusterEntity cluster2 = ClusterEntity.builder().clusterId("second-cluster").build();
 
         when(clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId()))
                 .thenReturn(List.of(cluster1, cluster2));
@@ -433,10 +431,9 @@ class ClusterTerminateServiceTest {
     void deleteClusterForReconfiguration_singleClusterWithActiveInstances_throwsException() {
         // Prepare
         ClusterEntity clusterEntity = getDummyClusterEntity();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = new ClusterByGroupIdAndIdEntity();
 
         when(clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId()))
-                .thenReturn(List.of(clusterByGroupIdAndIdEntity));
+                .thenReturn(List.of(clusterEntity));
 
         // Act
         IcmsConflictException exception = assertThrows(
@@ -460,7 +457,6 @@ class ClusterTerminateServiceTest {
     void deleteClusterForReconfiguration_withNatsDisabled_deletesQueues() {
         // Prepare
         ClusterEntity clusterEntity = getDummyClusterEntity();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = new ClusterByGroupIdAndIdEntity();
         CreationQueueUdt creationQueue = CreationQueueUdt.builder()
                 .url(DUMMY_CREATION_QUEUE_URL)
                 .queueType("queue_type")
@@ -468,7 +464,7 @@ class ClusterTerminateServiceTest {
         clusterEntity.setCreationQueues(Map.of("AZURE", creationQueue));
 
         when(clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId()))
-                .thenReturn(List.of(clusterByGroupIdAndIdEntity));
+                .thenReturn(List.of(clusterEntity));
         when(instanceServiceHelper.isNatsEnabled()).thenReturn(false);
         when(clusterRepository.getClusterGroupInfoByClusterGroupId(clusterEntity.getClusterGroupId()))
                 .thenReturn(Optional.empty());
@@ -490,10 +486,9 @@ class ClusterTerminateServiceTest {
     void deleteClusterForReconfiguration_withNatsEnabled_doesNotDeleteQueues() {
         // Prepare
         ClusterEntity clusterEntity = getDummyClusterEntity();
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = new ClusterByGroupIdAndIdEntity();
 
         when(clusterRepository.getClustersFromClusterGroup(clusterEntity.getClusterGroupId()))
-                .thenReturn(List.of(clusterByGroupIdAndIdEntity));
+                .thenReturn(List.of(clusterEntity));
         when(instanceServiceHelper.isNatsEnabled()).thenReturn(true);
         doNothing().when(nvcaClusterRepository).deleteClusterInfo(any());
         doNothing().when(auditService).sendAuditEventForClusterEntity(any(), any(), any());

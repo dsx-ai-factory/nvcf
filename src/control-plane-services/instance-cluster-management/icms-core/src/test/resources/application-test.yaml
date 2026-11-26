@@ -288,8 +288,6 @@ icms:
   async-wild-card-cache-update-task-schedule-duration: PT20S
   wild-card-stale-cached-data-valid-duration-in-sec: 60
   cluster-group-instance-type-usage-filtering-enabled: true
-  gpu-v5-population-task-enabled: false
-  gpus-v-5-population-task-lock-ttl-in-seconds: 14400
   include-custom-public-clusters-in-account-info-apis: true
   # This should not be more than 10, code will override it to 10 is set higher than 10
   sqs-batch-size: 5

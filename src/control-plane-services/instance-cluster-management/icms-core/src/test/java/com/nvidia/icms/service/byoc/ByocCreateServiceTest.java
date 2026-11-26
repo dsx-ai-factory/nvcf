@@ -53,8 +53,6 @@ import com.nvidia.icms.inbound.rest.model.nvct.ResultHandlingStrategy;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
@@ -1325,7 +1323,7 @@ public class ByocCreateServiceTest {
                 .build();
     }
 
-    private ClusterByGroupIdAndIdEntity getDummyClusterGroup(
+    private ClusterEntity getDummyClusterGroup(
             String clusterGroupName,
             ClusterStatusEnum clusterStatusEnum,
             String clusterId,
@@ -1351,12 +1349,10 @@ public class ByocCreateServiceTest {
                                          .url("dummy_task_url")
                                          .build()));
 
-        return ClusterByGroupIdAndIdEntity.builder()
+        return ClusterEntity.builder()
                 .clusterGroupName(clusterGroupName)
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
-                             .clusterId(clusterId)
-                             .build())
+                .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
+                .clusterId(clusterId)
                 .clusterDescription("dummy_cluster_description")
                 .k8sVersion("v1.25.9")
                 .clusterStatus(clusterStatusEnum)

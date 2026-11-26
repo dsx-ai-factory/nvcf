@@ -25,9 +25,7 @@ import com.nvidia.icms.configuration.bean.IcmsConfigurationProperties;
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterStatusEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.CloudHealthRepository;
 import com.nvidia.icms.service.telemetry.TelemetryEventClient;
 import com.nvidia.icms.service.telemetry.TelemetryEventClient.EventMetaData;
@@ -54,7 +52,7 @@ import org.springframework.stereotype.Service;
 @AllArgsConstructor
 public class WildCardAllowedClustersCacheService {
 
-    private record ClusterInfoSnapshot(Set<ClusterByGroupIdAndIdEntity> clusterInfo, Instant lastUpdated) {}
+    private record ClusterInfoSnapshot(Set<ClusterEntity> clusterInfo, Instant lastUpdated) {}
 
     private final NvcaClusterRepository nvcaClusterRepository;
 
@@ -69,7 +67,7 @@ public class WildCardAllowedClustersCacheService {
     // This function will be invoked from a scheduled task to refresh the cache
     @Observed
     public void refreshCache() {
-        Set<ClusterByGroupIdAndIdEntity> readyClusterInfo = getReadyClustersForWildCardNcaId();
+        Set<ClusterEntity> readyClusterInfo = getReadyClustersForWildCardNcaId();
         ClusterInfoSnapshot snapshot = new ClusterInfoSnapshot(readyClusterInfo,
                                                                Instant.now());
         cachedClusterInfo.set(snapshot);
@@ -82,7 +80,7 @@ public class WildCardAllowedClustersCacheService {
      * @return Set of ReadyClusterInfo
      */
     @Observed
-    public Set<ClusterByGroupIdAndIdEntity> getCachedReadyClusters() {
+    public Set<ClusterEntity> getCachedReadyClusters() {
 
         ClusterInfoSnapshot latestSnapshot = cachedClusterInfo.get();
 
@@ -108,14 +106,14 @@ public class WildCardAllowedClustersCacheService {
         return getReadyClustersForWildCardNcaId();
     }
 
-    private Set<ClusterByGroupIdAndIdEntity> getReadyClustersForWildCardNcaId() {
+    private Set<ClusterEntity> getReadyClustersForWildCardNcaId() {
 
-        List<ClustersByAuthorizedAccountsEntity> allClustersInAuthorizedAccount =
+        List<ClusterEntity> allClustersInAuthorizedAccount =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD);
 
         Set<String> processedClusterGroups = new HashSet<>();
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
-        for (ClustersByAuthorizedAccountsEntity authorizedAccountsEntity : allClustersInAuthorizedAccount) {
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
+        for (ClusterEntity authorizedAccountsEntity : allClustersInAuthorizedAccount) {
 
             // If cluster group is already processed, then skipping it
             if (processedClusterGroups.contains(authorizedAccountsEntity.getClusterGroupId())) {
@@ -124,7 +122,7 @@ public class WildCardAllowedClustersCacheService {
 
             // Fetching ready clusters from cluster group
             processedClusterGroups.add(authorizedAccountsEntity.getClusterGroupId());
-            Set<ClusterByGroupIdAndIdEntity> allReadyClusters = getAllReadyClustersFromClusterGroup(
+            Set<ClusterEntity> allReadyClusters = getAllReadyClustersFromClusterGroup(
                     authorizedAccountsEntity.getClusterGroupId());
             readyClusterEntities.addAll(allReadyClusters);
         }
@@ -133,13 +131,13 @@ public class WildCardAllowedClustersCacheService {
     }
 
 
-    private Set<ClusterByGroupIdAndIdEntity> getAllReadyClustersFromClusterGroup(String clusterGroupId) {
+    private Set<ClusterEntity> getAllReadyClustersFromClusterGroup(String clusterGroupId) {
         return clusterRepository.getClustersFromClusterGroup(clusterGroupId)
                 .stream()
                 .filter(entity -> ClusterStatusEnum.READY.equals(entity.getClusterStatus())
                         && entity.getNvcaVersion() != null
                         && isClusterTargetingEnabled(entity.getAllowClusterTargeting())
-                        && !isSetEmptyOrNull(NvcaConverter.getGpusV5(entity)))
+                        && !isSetEmptyOrNull(entity.getGpusV5()))
                 .collect(Collectors.toSet());
     }
 

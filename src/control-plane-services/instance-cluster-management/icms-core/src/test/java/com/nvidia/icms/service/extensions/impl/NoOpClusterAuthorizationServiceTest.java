@@ -18,8 +18,7 @@ package com.nvidia.icms.service.extensions.impl;
 
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterGroups;
 import com.nvidia.icms.inbound.rest.model.byoc.InstanceTypeUsageEnum;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashSet;
@@ -48,10 +47,10 @@ class NoOpClusterAuthorizationServiceTest {
 
     @Test
     void filterAuthorizedClusters_leavesSetUnchanged() {
-        ClusterByGroupIdAndIdEntity cluster1 = entity("cluster-1", "group-1");
-        ClusterByGroupIdAndIdEntity cluster2 = entity("cluster-2", "group-2");
-        Set<ClusterByGroupIdAndIdEntity> clusters = new HashSet<>(Set.of(cluster1, cluster2));
-        Set<ClusterByGroupIdAndIdEntity> expectedContents = new HashSet<>(clusters);
+        ClusterEntity cluster1 = entity("cluster-1", "group-1");
+        ClusterEntity cluster2 = entity("cluster-2", "group-2");
+        Set<ClusterEntity> clusters = new HashSet<>(Set.of(cluster1, cluster2));
+        Set<ClusterEntity> expectedContents = new HashSet<>(clusters);
 
         noop.filterAuthorizedClusters("any-nca-id", clusters);
 
@@ -62,7 +61,7 @@ class NoOpClusterAuthorizationServiceTest {
 
     @Test
     void filterAuthorizedClusters_emptySetRemainsEmpty() {
-        Set<ClusterByGroupIdAndIdEntity> empty = new HashSet<>();
+        Set<ClusterEntity> empty = new HashSet<>();
 
         noop.filterAuthorizedClusters("any-nca-id", empty);
 
@@ -71,9 +70,9 @@ class NoOpClusterAuthorizationServiceTest {
 
     @Test
     void filterAuthorizedClusters_preservesIdentityOfSuppliedSet() {
-        Set<ClusterByGroupIdAndIdEntity> clusters = new HashSet<>();
+        Set<ClusterEntity> clusters = new HashSet<>();
         clusters.add(entity("cluster-x", "group-x"));
-        Set<ClusterByGroupIdAndIdEntity> suppliedReference = clusters;
+        Set<ClusterEntity> suppliedReference = clusters;
 
         noop.filterAuthorizedClusters("any-nca-id", clusters);
 
@@ -82,9 +81,10 @@ class NoOpClusterAuthorizationServiceTest {
         assertSame(suppliedReference, clusters);
     }
 
-    private static ClusterByGroupIdAndIdEntity entity(String clusterId, String clusterGroupId) {
-        ClusterByGroupIdAndIdEntity entity = new ClusterByGroupIdAndIdEntity();
-        entity.setKey(new ClusterByGroupIdAndIdKey(clusterGroupId, clusterId));
+    private static ClusterEntity entity(String clusterId, String clusterGroupId) {
+        ClusterEntity entity = new ClusterEntity();
+        entity.setClusterId(clusterId);
+        entity.setClusterGroupId(clusterGroupId);
         return entity;
     }
 }

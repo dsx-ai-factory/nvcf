@@ -37,8 +37,7 @@ import static org.mockito.Mockito.when;
 import com.nvidia.icms.configuration.bean.IcmsConfigurationProperties;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.service.telemetry.TelemetryEventClient;
 import java.util.List;
 import java.util.Set;
@@ -71,7 +70,7 @@ class WildCardAllowedClustersCacheServiceTest {
     @Test
     void getReadyClustersForWildCardNcaId_withValidCache_returnFromCache(){
         // Prepare
-        ClustersByAuthorizedAccountsEntity clustersByAuthorizedAccountsEntity =
+        ClusterEntity clustersByAuthorizedAccountsEntity =
                 getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
                                                         DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                                                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -79,7 +78,7 @@ class WildCardAllowedClustersCacheServiceTest {
                                                         DUMMY_GPU_NAME, 8,
                                                         "*");
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
+        ClusterEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
                 DUMMY_CLUSTER_ID, DUMMY_BYOC_CLUSTER_NAME, DUMMY_CLUSTER_GROUP_ID,
                 DUMMY_BYOC_CLUSTER_GROUP_NAME,
                 DUMMY_BYOC_NCA_ID, Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 8,
@@ -93,7 +92,7 @@ class WildCardAllowedClustersCacheServiceTest {
         doNothing().when(telemetryEventClient).triggerEvent(Mockito.any());
 
         // Act
-        Set<ClusterByGroupIdAndIdEntity> resp = wildCardAllowedClustersCacheService.getCachedReadyClusters();
+        Set<ClusterEntity> resp = wildCardAllowedClustersCacheService.getCachedReadyClusters();
 
         // Assert
         assertEquals(Set.of(clusterByGroupIdAndIdEntity), resp);
@@ -105,7 +104,7 @@ class WildCardAllowedClustersCacheServiceTest {
     @Test
     void getCachedReadyClusters_withValidCache_returnFromCache(){
         // Prepare
-        ClustersByAuthorizedAccountsEntity clustersByAuthorizedAccountsEntity =
+        ClusterEntity clustersByAuthorizedAccountsEntity =
                 getDummyClustersByAuthorizedAccountResp(DUMMY_BYOC_CLUSTER_GROUP_NAME,
                                                         DUMMY_CLUSTER_GROUP_ID, DUMMY_CLUSTER_ID,
                                                         DUMMY_BYOC_NCA_ID, DUMMY_BYOC_INSTANCE_TYPE,
@@ -113,7 +112,7 @@ class WildCardAllowedClustersCacheServiceTest {
                                                         DUMMY_GPU_NAME, 8,
                                                         "*");
 
-        ClusterByGroupIdAndIdEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
+        ClusterEntity clusterByGroupIdAndIdEntity = getClusterByGroupIdAndIdEntity(
                 DUMMY_CLUSTER_ID, DUMMY_BYOC_CLUSTER_NAME, DUMMY_CLUSTER_GROUP_ID,
                 DUMMY_BYOC_CLUSTER_GROUP_NAME,
                 DUMMY_BYOC_NCA_ID, Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 8,
@@ -130,7 +129,7 @@ class WildCardAllowedClustersCacheServiceTest {
         // Act
         // Updating the cache
         wildCardAllowedClustersCacheService.refreshCache();
-        Set<ClusterByGroupIdAndIdEntity> resp = wildCardAllowedClustersCacheService.getCachedReadyClusters();
+        Set<ClusterEntity> resp = wildCardAllowedClustersCacheService.getCachedReadyClusters();
 
         // Assert
         assertEquals(Set.of(clusterByGroupIdAndIdEntity), resp);

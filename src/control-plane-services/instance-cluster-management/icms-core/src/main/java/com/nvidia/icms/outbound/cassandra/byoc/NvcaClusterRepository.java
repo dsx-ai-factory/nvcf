@@ -16,15 +16,11 @@
  */
 package com.nvidia.icms.outbound.cassandra.byoc;
 
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.toClustersByAuthorizedAccountsEntity;
-
 import com.nvidia.icms.errors.IcmsConflictException;
 import com.nvidia.icms.errors.IcmsInternalServerException;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
 
 import java.util.List;
-import java.util.stream.Collectors;
 
 import jakarta.validation.constraints.NotNull;
 import lombok.AllArgsConstructor;
@@ -84,11 +80,9 @@ public class NvcaClusterRepository {
         }
     }
 
-    public List<ClustersByAuthorizedAccountsEntity> getAllClustersInAuthorizedAccount(
+    public List<ClusterEntity> getAllClustersInAuthorizedAccount(
             String ncaId) {
-        return clusterRepository.getAllClustersForAuthorizationKey(ncaId).stream()
-                .map(entity -> toClustersByAuthorizedAccountsEntity(entity, entity.getNcaId()))
-                .collect(Collectors.toList());
+        return clusterRepository.getAllClustersForAuthorizationKey(ncaId);
     }
 
     public void saveClusterInfo(ClusterEntity entity) {

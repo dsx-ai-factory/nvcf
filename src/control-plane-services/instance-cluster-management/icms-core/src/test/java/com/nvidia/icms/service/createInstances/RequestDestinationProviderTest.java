@@ -30,7 +30,7 @@ import static org.mockito.Mockito.when;
 
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.service.extensions.api.InstanceDestinationProvider;
 import com.nvidia.icms.service.byoc.ClusterTargetingHelper;
@@ -78,7 +78,7 @@ class RequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getAllTargetedDestinations_shouldDelegateClusterValidationAndGenerationToByocProvider() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         RequestInstanceDestination dest = createDestination(null);
 
         when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID)).thenReturn(Set.of(cluster));
@@ -102,7 +102,7 @@ class RequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getAllTargetedDestinations_whenClusterNotAllowed_shouldBeExcludedBeforeGeneration() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
 
         when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID)).thenReturn(Set.of(cluster));
         when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(ClusterRepository.WILDCARD)).thenReturn(Set.of());
@@ -122,7 +122,7 @@ class RequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getAllTargetedDestinations_whenNoTargetingEnabled_shouldExcludeCluster() {
-        ClusterByGroupIdAndIdEntity cluster = createClusterEntity();
+        ClusterEntity cluster = createClusterEntity();
         cluster.setAllowClusterTargeting(false);
 
         when(clusterTargetingHelper.getReadyClusterEntitiesForNcaId(DUMMY_BYOC_NCA_ID)).thenReturn(Set.of(cluster));

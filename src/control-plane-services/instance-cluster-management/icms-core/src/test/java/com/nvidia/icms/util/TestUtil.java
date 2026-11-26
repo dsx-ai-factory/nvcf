@@ -16,8 +16,6 @@
  */
 package com.nvidia.icms.util;
 
-import static com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter.toGpusV4;
-
 import com.amazonaws.services.sqs.model.QueueAttributeName;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.ObjectMapper;
@@ -60,21 +58,12 @@ import com.nvidia.icms.inbound.rest.model.nvca.SisConfig;
 import com.nvidia.icms.inbound.rest.model.nvca.VaultConfig;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupByGroupIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterHealthEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuUdt;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV4Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeUdt;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV3Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthKey;
@@ -581,11 +570,8 @@ public class TestUtil {
                 .nvcaVersion("1.0.0")
                 .authClientId("dummy_auth_client_id")
                 .nvcaLastConnected(Instant.now())
-                .gpusV4(Set.of(getDummyGpuV4(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1,
-                                      "AZURE")))
-                .gpusV5(NvcaConverter.getGpusV5(Collections.emptySet(), Set.of(
-                        getDummyGpuV4(DUMMY_BYOC_INSTANCE_TYPE, DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1,
-                                      "AZURE"))))
+                .gpusV5(Set.of(getDummyGpuV5(DUMMY_BYOC_INSTANCE_TYPE,
+                        DUMMY_BYOC_INSTANCE_TYPE_VALUE, 1, "AZURE")))
                 .build();
     }
 
@@ -639,52 +625,11 @@ public class TestUtil {
         return Set.of(gpu);
     }
 
-    public static ClusterGroupByGroupIdEntity toClusterGroupByGroupIdEntity(ClusterEntity entity) {
-        return ClusterGroupByGroupIdEntity.builder()
-                .clusterGroupName(entity.getClusterGroupName())
-                .clusterGroupId(entity.getClusterGroupId())
-                .creationQueueUrl(entity.getCreationQueueUrl())
-                .creationQueueType(entity.getCreationQueueType())
-                .gpus(entity.getGpus())
-                .ncaId(entity.getNcaId())
-                .authorizedNcaIds(entity.getAuthorizedNcaIds())
-                .build();
-    }
-
-    public static ClusterByGroupIdAndIdEntity toClusterByGroupIdAndIdEntity(ClusterEntity entity) {
-        return ClusterByGroupIdAndIdEntity.builder()
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterId(entity.getClusterId())
-                             .clusterGroupId(entity.getClusterGroupId())
-                             .build())
-                .clusterName(entity.getClusterName())
-
-                .ncaId(entity.getNcaId())
-                .terminationQueueUrl(entity.getTerminationQueueUrl())
-                .terminationQueueType(entity.getTerminationQueueType())
-                .clusterDescription(entity.getClusterDescription())
-                .clusterProvider(entity.getClusterProvider())
-                .clusterStatus(entity.getClusterStatus())
-                .k8sVersion(entity.getK8sVersion())
-                .clusterGroupName(entity.getClusterGroupName())
-                .gpusV4(entity.getGpusV4())
-                .capabilities(entity.getCapabilities())
-                .attributes(entity.getAttributes())
-                .nvcaVersion(entity.getNvcaVersion())
-                .authClientId(entity.getAuthClientId())
-                .creationQueues(entity.getCreationQueues())
-                .authorizedNcaIds(entity.getAuthorizedNcaIds())
-                .requestDump(entity.getRequestDump())
-                .build();
-    }
-
-    public static ClusterByGroupIdAndIdEntity getClusterByGroupIdAndIdEntity(String clusterId,String clusterName, String clusterGroupId,
-                                                                            String clusterGroupName, String ncaId, Set<GpuV5Udt> gpuV5Set) {
-        ClusterByGroupIdAndIdEntity entity = ClusterByGroupIdAndIdEntity.builder()
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterId(clusterId)
-                             .clusterGroupId(clusterGroupId)
-                             .build())
+    public static ClusterEntity getClusterByGroupIdAndIdEntity(String clusterId,String clusterName, String clusterGroupId,
+                                                                             String clusterGroupName, String ncaId, Set<GpuV5Udt> gpuV5Set) {
+        ClusterEntity entity = ClusterEntity.builder()
+                .clusterId(clusterId)
+                .clusterGroupId(clusterGroupId)
                 .clusterName(clusterName)
                 .ncaId(ncaId)
                 .clusterDescription(DUMMY_CLUSTER_DESCRIPTION)
@@ -702,7 +647,6 @@ public class TestUtil {
 
         if (gpuV5Set != null && !gpuV5Set.isEmpty()) {
             entity.setGpusV5(gpuV5Set);
-            entity.setGpusV4(toGpusV4(gpuV5Set));
 
             Map<String, CreationQueueUdt> creationQueueMap = new HashMap<>();
             Map<String, CreationQueueUdt> clusterCreationQueueMap = new HashMap<>();
@@ -902,22 +846,6 @@ public class TestUtil {
                 .build();
     }
 
-    public static InstanceTypeV3Udt getDummyInstanceTypeV2() {
-        return InstanceTypeV3Udt.builder()
-                .name("dummy_instance_type")
-                .value("dummy_value")
-                .gpuMemory("dummy_gpu_memory")
-                .systemMemory("dummy_system_memory")
-                .isDefault(true)
-                .description("dummy_description")
-                .cpuCores(1)
-                .driverVersion("dummy_driver_detail")
-                .storage("80G")
-                .cpuArch("AMD66")
-                .os("linux")
-                .build();
-    }
-
     public static GpuRequestSchema getDummyGpuRequestSchema() {
         return GpuRequestSchema.builder()
                 .instanceTypes(Set.of(getDummyInstanceTypeRequestSchema()))
@@ -995,7 +923,7 @@ public class TestUtil {
                 .build();
     }
 
-    public static ClustersByAuthorizedAccountsEntity getDummyClustersByAuthorizedAccountResp(
+    public static ClusterEntity getDummyClustersByAuthorizedAccountResp(
             String clusterGroupName, String clusterGroupId,
             String clusterId, String ncaId,
             String instanceTypeName,
@@ -1007,36 +935,14 @@ public class TestUtil {
                 .url("creation_queue_url")
                 .queueType(QueueAttributeName.FifoQueue.toString())
                 .build());
-        return ClustersByAuthorizedAccountsEntity.builder()
-                .key(ClustersByAuthorizedAccountsKey.builder()
-                             .ncaIdKey(authorizedNcaId)
-                             .clusterId(clusterId)
-                             .build())
+        return ClusterEntity.builder()
+                .clusterId(clusterId)
                 .ncaId(ncaId)
                 .clusterGroupName(clusterGroupName)
                 .clusterGroupId(clusterGroupId)
                 .authorizedNcaIds(Set.of(authorizedNcaId))
                 .creationQueues(creationQueueMap)
                 .gpusV5(Set.of(getDummyGpuV5(instanceTypeName, instanceTypeValue, gpuCount, gpuName)))
-                .build();
-    }
-
-    public static GpuV4Udt getDummyGpuV4(String name, String value, int gpuCount, String gpuName) {
-        var instanceTypeV3Udt = InstanceTypeV3Udt.builder()
-                .gpuCount(gpuCount)
-                .name(name)
-                .value(value)
-                .description("GPU")
-                .cpuCores(4)
-                .gpuMemory("20Gi")
-                .systemMemory("10Gi")
-                .isDefault(true)
-                .build();
-
-        return GpuV4Udt.builder()
-                .name(gpuName)
-                .capacity(8)
-                .instanceTypes(Set.of(instanceTypeV3Udt))
                 .build();
     }
 
@@ -1072,13 +978,12 @@ public class TestUtil {
                 .build();
     }
 
-    public static ClusterGroupsByAccountEntity getDummyClusterGroupsByAccountEntity(
+    public static ClusterEntity getDummyClusterGroupsByAccountEntity(
             String clusterGroupName, String ncaId) {
-        return ClusterGroupsByAccountEntity.builder()
-                .key(ClusterGroupsByAccountKey.builder()
-                             .clusterGroupName(clusterGroupName)
-                             .ncaId(ncaId)
-                             .build())
+        return ClusterEntity.builder()
+                .clusterId("group-representative")
+                .clusterGroupName(clusterGroupName)
+                .ncaId(ncaId)
                 .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
                 .authorizedNcaIds(Set.of())
                 .build();

@@ -24,7 +24,7 @@ import com.nvidia.icms.inbound.rest.model.account.InstanceTypeAvailabilityRespon
 import com.nvidia.icms.inbound.rest.model.account.InstanceTypeAvailabilityResponse.NodeType;
 import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.GpuCapacity;
@@ -259,7 +259,7 @@ public class ClusterGpuInfoHelper {
 
     public Set<ReadyClusterInfo> getReadyClusterInfo(@NotNull String ncaId) {
 
-        Set<ClusterByGroupIdAndIdEntity> allClusters = new HashSet<>(
+        Set<ClusterEntity> allClusters = new HashSet<>(
                 clusterTargetingHelper.getWildCardAllowedClusterCachedInfo());
 
         if (!ncaId.equals(ClusterRepository.WILDCARD)) {

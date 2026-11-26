@@ -33,7 +33,6 @@ import com.nvidia.icms.inbound.rest.model.nvca.NvcaAccessCreds;
 import com.nvidia.icms.inbound.rest.model.nvca.NvcaRegistrationRequest;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
@@ -47,7 +46,6 @@ import com.nvidia.icms.service.telemetry.TelemetryEventClient;
 import com.nvidia.icms.inbound.rest.model.byoc.InstanceTypeRequestSchema;
 import com.nvidia.icms.inbound.rest.model.byoc.GpuRequestSchema;
 import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
-import com.nvidia.icms.util.TestUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -138,10 +136,8 @@ class NvcaClusterRegistrationServiceQueueManagementTest {
         
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false))
             .thenReturn(Optional.of(cluster));
-        ClusterByGroupIdAndIdEntity clusterByGroupId = TestUtil.toClusterByGroupIdAndIdEntity(cluster);
-        clusterByGroupId.setGpusV5(cluster.getGpusV5());
         when(clusterRepository.getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID))
-            .thenReturn(List.of(clusterByGroupId));
+            .thenReturn(List.of(cluster));
         when(clusterQueueAccessCredsService.generateCredsForNvcaQueues(any()))
             .thenReturn(getDummyNvcaAccessCreds(cluster));
         
@@ -238,15 +234,8 @@ class NvcaClusterRegistrationServiceQueueManagementTest {
         
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false))
             .thenReturn(Optional.of(cluster1));
-        // Convert to ClusterByGroupIdAndIdEntity and ensure gpusV5 is set
-        ClusterByGroupIdAndIdEntity cluster1ByGroupId = TestUtil.toClusterByGroupIdAndIdEntity(cluster1);
-        cluster1ByGroupId.setGpusV5(cluster1.getGpusV5());
-        
-        ClusterByGroupIdAndIdEntity cluster2ByGroupId = TestUtil.toClusterByGroupIdAndIdEntity(cluster2);
-        cluster2ByGroupId.setGpusV5(cluster2.getGpusV5());
-        
         when(clusterRepository.getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID))
-            .thenReturn(List.of(cluster1ByGroupId, cluster2ByGroupId));
+            .thenReturn(List.of(cluster1, cluster2));
         when(clusterQueueAccessCredsService.generateCredsForNvcaQueues(any()))
             .thenReturn(getDummyNvcaAccessCreds(cluster1));
         when(instanceServiceHelper.isTaskClusterCreationQueuesAllowed(any())).thenReturn(true);
@@ -313,10 +302,8 @@ class NvcaClusterRegistrationServiceQueueManagementTest {
         
         when(clusterRepository.getClusterInfoByClusterId(DUMMY_CLUSTER_ID, false))
             .thenReturn(Optional.of(cluster));
-        ClusterByGroupIdAndIdEntity clusterByGroupId = TestUtil.toClusterByGroupIdAndIdEntity(cluster);
-        clusterByGroupId.setGpusV5(cluster.getGpusV5());
         when(clusterRepository.getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID))
-            .thenReturn(List.of(clusterByGroupId));
+            .thenReturn(List.of(cluster));
         when(clusterQueueAccessCredsService.generateCredsForNvcaQueues(any()))
             .thenReturn(getDummyNvcaAccessCreds(cluster));
         
@@ -418,10 +405,8 @@ class NvcaClusterRegistrationServiceQueueManagementTest {
             .thenReturn(Optional.of(cluster));
         when(clusterQueueAccessCredsService.generateCredsForNvcaQueues(any()))
             .thenReturn(getDummyNvcaAccessCreds(cluster));
-        ClusterByGroupIdAndIdEntity clusterByGroupId = TestUtil.toClusterByGroupIdAndIdEntity(cluster);
-        clusterByGroupId.setGpusV5(cluster.getGpusV5());
         when(clusterRepository.getClustersFromClusterGroup(DUMMY_CLUSTER_GROUP_ID))
-            .thenReturn(List.of(clusterByGroupId));
+            .thenReturn(List.of(cluster));
         
         // Mock repository update
         doNothing().when(nvcaClusterRepository).updateClusterRegistration(any());

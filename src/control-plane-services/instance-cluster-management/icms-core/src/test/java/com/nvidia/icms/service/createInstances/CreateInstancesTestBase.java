@@ -32,11 +32,7 @@ import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.inbound.rest.model.ResourceProvider;
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterProviderEnum;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsKey;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.CreationQueueUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeUdt;
@@ -68,13 +64,10 @@ public class CreateInstancesTestBase {
         return request;
     }
 
-    public ClusterByGroupIdAndIdEntity createClusterEntity() {
-        ClusterByGroupIdAndIdEntity entity = new ClusterByGroupIdAndIdEntity();
-        ClusterByGroupIdAndIdKey key = ClusterByGroupIdAndIdKey.builder()
-                .clusterGroupId(DUMMY_CLUSTER_GROUP_ID)
-                .clusterId(DUMMY_CLUSTER_ID)
-                .build();
-        entity.setKey(key);
+    public ClusterEntity createClusterEntity() {
+        ClusterEntity entity = new ClusterEntity();
+        entity.setClusterGroupId(DUMMY_CLUSTER_GROUP_ID);
+        entity.setClusterId(DUMMY_CLUSTER_ID);
         entity.setClusterName(DUMMY_BYOC_CLUSTER_NAME);
         entity.setRegion(DUMMY_REGION);
         entity.setAttributes(DUMMY_ATTRIBUTES);
@@ -121,13 +114,9 @@ public class CreateInstancesTestBase {
 
 
     // Helper methods for creating test objects
-    public ClustersByAuthorizedAccountsEntity createNvcaCluster(String clusterGroupId, String clusterGroupName, String clusterName) {
-        ClustersByAuthorizedAccountsEntity entity = new ClustersByAuthorizedAccountsEntity();
-        ClustersByAuthorizedAccountsKey key = ClustersByAuthorizedAccountsKey.builder()
-                .ncaIdKey(DUMMY_BYOC_NCA_ID)
-                .clusterId(clusterName)
-                .build();
-        entity.setKey(key);
+    public ClusterEntity createNvcaCluster(String clusterGroupId, String clusterGroupName, String clusterName) {
+        ClusterEntity entity = new ClusterEntity();
+        entity.setClusterId(clusterName);
         entity.setClusterGroupId(clusterGroupId);
         entity.setClusterGroupName(clusterGroupName);
         entity.setClusterName(clusterName);
@@ -136,13 +125,9 @@ public class CreateInstancesTestBase {
         return entity;
     }
 
-    public ClustersByAuthorizedAccountsEntity createNvcaClusterWithCustomGpu(String clusterGroupId, String clusterGroupName, String gpuName) {
-        ClustersByAuthorizedAccountsEntity cluster = new ClustersByAuthorizedAccountsEntity();
-        ClustersByAuthorizedAccountsKey key = ClustersByAuthorizedAccountsKey.builder()
-                .ncaIdKey(DUMMY_BYOC_NCA_ID)
-                .clusterId(clusterGroupName)
-                .build();
-        cluster.setKey(key);
+    public ClusterEntity createNvcaClusterWithCustomGpu(String clusterGroupId, String clusterGroupName, String gpuName) {
+        ClusterEntity cluster = new ClusterEntity();
+        cluster.setClusterId(clusterGroupName);
         cluster.setClusterGroupId(clusterGroupId);
         cluster.setClusterGroupName(clusterGroupName);
         cluster.setNcaId(DUMMY_BYOC_NCA_ID);
@@ -154,13 +139,9 @@ public class CreateInstancesTestBase {
         return cluster;
     }
 
-    public ClustersByAuthorizedAccountsEntity createNvcaClusterWithCustomInstanceType(String clusterGroupId, String clusterGroupName, String instanceTypeName) {
-        ClustersByAuthorizedAccountsEntity cluster = new ClustersByAuthorizedAccountsEntity();
-        ClustersByAuthorizedAccountsKey key = ClustersByAuthorizedAccountsKey.builder()
-                .ncaIdKey(DUMMY_BYOC_NCA_ID)
-                .clusterId(clusterGroupName)
-                .build();
-        cluster.setKey(key);
+    public ClusterEntity createNvcaClusterWithCustomInstanceType(String clusterGroupId, String clusterGroupName, String instanceTypeName) {
+        ClusterEntity cluster = new ClusterEntity();
+        cluster.setClusterId(clusterGroupName);
         cluster.setClusterGroupId(clusterGroupId);
         cluster.setClusterGroupName(clusterGroupName);
         cluster.setNcaId(DUMMY_BYOC_NCA_ID);
@@ -183,15 +164,11 @@ public class CreateInstancesTestBase {
         return instanceType;
     }
 
-    public ClustersByAuthorizedAccountsEntity createClusterForByoc(String ncaId, String clusterGroupName, String clusterGroupId, String clusterId) {
+    public ClusterEntity createClusterForByoc(String ncaId, String clusterGroupName, String clusterGroupId, String clusterId) {
         return createClusterForByoc(ncaId, clusterGroupName, clusterGroupId, clusterId, DUMMY_GPU, DUMMY_NON_BYOC_INSTANCE_TYPE);
     }
 
-    public ClustersByAuthorizedAccountsEntity createClusterForByoc(String ncaId, String clusterGroupName, String clusterGroupId, String clusterId, String gpuName, String instanceName) {
-        ClustersByAuthorizedAccountsKey key = ClustersByAuthorizedAccountsKey.builder()
-                .ncaIdKey(ncaId)
-                .clusterId(clusterId)
-                .build();
+    public ClusterEntity createClusterForByoc(String ncaId, String clusterGroupName, String clusterGroupId, String clusterId, String gpuName, String instanceName) {
 
         Set<GpuV5Udt> gpusV5 = new HashSet<>();
         gpusV5.add(GpuV5Udt.builder()
@@ -202,8 +179,8 @@ public class CreateInstancesTestBase {
                                                          .build()))
                            .build());
 
-        return  ClustersByAuthorizedAccountsEntity.builder()
-                .key(key)
+        return ClusterEntity.builder()
+                .clusterId(clusterId)
                 .clusterGroupName(clusterGroupName)
                 .clusterGroupId(clusterGroupId)
                 .creationQueues(Map.of(gpuName,
@@ -244,22 +221,4 @@ public class CreateInstancesTestBase {
                 .build();
     }
 
-    public static ClusterEntity toClusterEntity(
-            ClustersByAuthorizedAccountsEntity entity) {
-        return ClusterEntity.builder()
-                .clusterId(entity.getKey().getClusterId())
-                .ncaId(entity.getNcaId())
-                .clusterName(entity.getClusterName())
-                .clusterGroupName(entity.getClusterGroupName())
-                .clusterGroupId(entity.getClusterGroupId())
-                .creationQueues(entity.getCreationQueues())
-                .gpusV4(entity.getGpusV4())
-                .gpusV5(entity.getGpusV5())
-                .authorizedNcaIds(entity.getAuthorizedNcaIds())
-                .nvcaLastConnected(entity.getNvcaLastConnected())
-                .clusterCreationQueues(entity.getClusterCreationQueues())
-                .clusterCreationQueuesForTasks(entity.getClusterCreationQueueForTasks())
-                .clusterKeyId(entity.getClusterKeyId())
-                .build();
-    }
 }

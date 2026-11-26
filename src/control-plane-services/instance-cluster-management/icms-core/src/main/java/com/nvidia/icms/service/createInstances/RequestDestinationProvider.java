@@ -18,7 +18,7 @@ package com.nvidia.icms.service.createInstances;
 
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.service.extensions.api.InstanceDestinationProvider;
 import com.nvidia.icms.service.byoc.ClusterTargetingHelper;
@@ -81,12 +81,12 @@ public class RequestDestinationProvider {
             @NotNull Map<String, CloudHealthEntity> cloudHealthByClusterId) {
 
         // Fetch ready clusters from the targeting system (NCA-specific + wildcard)
-        Set<ClusterByGroupIdAndIdEntity> readyClustersForRequestedNcaId = new HashSet<>(
+        Set<ClusterEntity> readyClustersForRequestedNcaId = new HashSet<>(
                 clusterTargetingHelper.getReadyClusterEntitiesForNcaId(instanceRequest.getNcaId()));
-        Set<ClusterByGroupIdAndIdEntity> readyClustersForWildcardNcaId =
+        Set<ClusterEntity> readyClustersForWildcardNcaId =
                 clusterTargetingHelper.getReadyClusterEntitiesForNcaId(ClusterRepository.WILDCARD);
 
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>(readyClustersForRequestedNcaId);
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>(readyClustersForRequestedNcaId);
         readyClusterEntities.addAll(readyClustersForWildcardNcaId);
 
         log.info("InstanceRequest: {}: Total clusters available is {}.",

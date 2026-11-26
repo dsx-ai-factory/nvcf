@@ -20,7 +20,7 @@ import com.nvidia.icms.service.extensions.api.ClusterAuthorizationService;
 
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterGroups;
 import com.nvidia.icms.inbound.rest.model.byoc.InstanceTypeUsageEnum;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import jakarta.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
@@ -48,7 +48,7 @@ public class NoOpClusterAuthorizationService implements ClusterAuthorizationServ
     @Override
     public void filterAuthorizedClusters(
             String requestingNcaId,
-            Set<ClusterByGroupIdAndIdEntity> allClusters) {
+            Set<ClusterEntity> allClusters) {
         // No-op: non-BYOC module is not active so there are no non-BYOC clusters to filter.
     }
 

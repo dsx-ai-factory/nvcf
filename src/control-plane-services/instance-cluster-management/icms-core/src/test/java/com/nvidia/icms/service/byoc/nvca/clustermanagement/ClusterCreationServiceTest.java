@@ -61,7 +61,6 @@ import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterConfigurationRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
@@ -736,7 +735,7 @@ class ClusterCreationServiceTest {
         when(clusterRepository.getClusterByAccountAndName(
                 DUMMY_BYOC_NCA_ID, DUMMY_BYOC_CLUSTER_NAME)).thenReturn(Optional.empty());
 
-        ClusterGroupsByAccountEntity clusterGroupsByAccountEntity =
+        ClusterEntity clusterGroupsByAccountEntity =
                 getDummyClusterGroupsByAccountEntity(DUMMY_BYOC_CLUSTER_GROUP_NAME,
                                                      DUMMY_BYOC_NCA_ID);
         clusterGroupsByAccountEntity.setGpus(Set.of(
@@ -1504,7 +1503,7 @@ class ClusterCreationServiceTest {
     @Test
     void validateClusterGroupForNvca2Flow_emptyGpus_success() {
         // Prepare
-        ClusterGroupsByAccountEntity clusterGroup =
+        ClusterEntity clusterGroup =
                 getDummyClusterGroupsByAccountEntity(DUMMY_BYOC_CLUSTER_GROUP_NAME, DUMMY_BYOC_NCA_ID);
         clusterGroup.setGpus(null);
 
@@ -1515,7 +1514,7 @@ class ClusterCreationServiceTest {
     @Test
     void validateClusterGroupForNvca2Flow_withGpus_throwsException() {
         // Prepare
-        ClusterGroupsByAccountEntity clusterGroup =
+        ClusterEntity clusterGroup =
                 getDummyClusterGroupsByAccountEntity(DUMMY_BYOC_CLUSTER_GROUP_NAME, DUMMY_BYOC_NCA_ID);
         clusterGroup.setGpus(Set.of(GpuUdt.builder()
                 .name("gpu1")

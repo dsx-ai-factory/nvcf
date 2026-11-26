@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -40,8 +41,7 @@ import com.nvidia.icms.configuration.bean.ComputePlatform;
 import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.inbound.rest.model.swagger.schema.SpotInstanceRequestSchema;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
@@ -80,7 +80,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     private ByocRequestDestinationProvider provider;
     private SpotInstanceRequestSchema instanceRequest;
-    private ClusterByGroupIdAndIdEntity clusterEntity;
+    private ClusterEntity clusterEntity;
     private GpuV5Udt gpuV5;
 
     @BeforeEach
@@ -242,8 +242,8 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void generateTargetedDestinationList_withMultipleClusters_processesAll() {
-        ClusterByGroupIdAndIdEntity cluster2 = createClusterEntity();
-        cluster2.getKey().setClusterId("cluster-2");
+        ClusterEntity cluster2 = createClusterEntity();
+        cluster2.setClusterId("cluster-2");
         GpuUsageFilter filter = GpuUsageFilter.builder()
                 .gpuNames(Set.of(DUMMY_GPU))
                 .instanceTypes(Set.of(DUMMY_NON_BYOC_INSTANCE_TYPE))
@@ -262,8 +262,8 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withValidClusters_returnsMatchingDestinations() {
-        ClustersByAuthorizedAccountsEntity cluster1 = createNvcaCluster(GROUP_1_ID, NVCA_CLUSTER_1_NAME, CLUSTER_1_NAME);
-        ClustersByAuthorizedAccountsEntity cluster2 = createNvcaCluster(GROUP_2_ID, NVCA_CLUSTER_2_NAME, CLUSTER_2_NAME);
+        ClusterEntity cluster1 = createNvcaCluster(GROUP_1_ID, NVCA_CLUSTER_1_NAME, CLUSTER_1_NAME);
+        ClusterEntity cluster2 = createNvcaCluster(GROUP_2_ID, NVCA_CLUSTER_2_NAME, CLUSTER_2_NAME);
 
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
                 .thenReturn(List.of(cluster1, cluster2));
@@ -285,6 +285,24 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
     }
 
     @Test
+    void getNonTargetedDestinations_doesNotSetRegionOnDestination() {
+        ClusterEntity cluster = createNvcaCluster(
+                DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DUMMY_BYOC_CLUSTER_NAME);
+        cluster.setRegion(DUMMY_REGION);
+        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(DUMMY_BYOC_NCA_ID))
+                .thenReturn(List.of(cluster));
+        when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(ClusterRepository.WILDCARD))
+                .thenReturn(List.of());
+        when(byocValidationService.validateClustersStatusAndGetProviderForNvca(anyString()))
+                .thenReturn(CloudProvider.AWS);
+
+        provider.getNonTargetedDestinations(instanceRequest);
+
+        verify(destinationCreator).addAvailableDestinations(
+                argThat(data -> data.getRegion() == null), any(), any(), any());
+    }
+
+    @Test
     void getNonTargetedDestinations_withNoClusters_returnsEmpty() {
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(anyString())).thenReturn(List.of());
 
@@ -295,7 +313,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withUnhealthyClusters_returnsEmpty() {
-        ClustersByAuthorizedAccountsEntity cluster = createNvcaCluster(DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DUMMY_BYOC_CLUSTER_NAME);
+        ClusterEntity cluster = createNvcaCluster(DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DUMMY_BYOC_CLUSTER_NAME);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(anyString())).thenReturn(List.of(cluster));
         when(byocValidationService.validateClustersStatusAndGetProviderForNvca(anyString())).thenReturn(null);
 
@@ -306,7 +324,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withWildcardNcaId_includesWildcardClusters() {
-        ClustersByAuthorizedAccountsEntity wildcardCluster = createNvcaCluster(
+        ClusterEntity wildcardCluster = createNvcaCluster(
                 WILDCARD_GROUP_ID, NVCA_CLUSTER_NAME, DUMMY_BYOC_CLUSTER_NAME);
         wildcardCluster.setNcaId(ClusterRepository.WILDCARD);
 
@@ -332,7 +350,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
                 new ComputePlatformService(List.of(
                         ComputePlatform.builder().name("platform").clusterGroupName(PLATFORM_CLUSTER_GROUP_NAME).build())));
 
-        ClustersByAuthorizedAccountsEntity platformCluster = createNvcaCluster(
+        ClusterEntity platformCluster = createNvcaCluster(
                 DUMMY_CLUSTER_GROUP_ID, PLATFORM_CLUSTER_GROUP_NAME, DUMMY_BYOC_CLUSTER_NAME);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(anyString()))
                 .thenReturn(List.of(platformCluster));
@@ -347,7 +365,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withInvalidGpu_returnsEmpty() {
-        ClustersByAuthorizedAccountsEntity cluster = createNvcaClusterWithCustomGpu(
+        ClusterEntity cluster = createNvcaClusterWithCustomGpu(
                 DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DIFFERENT_GPU);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(anyString())).thenReturn(List.of(cluster));
 
@@ -358,7 +376,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withInvalidInstanceType_returnsEmpty() {
-        ClustersByAuthorizedAccountsEntity cluster = createNvcaClusterWithCustomInstanceType(
+        ClusterEntity cluster = createNvcaClusterWithCustomInstanceType(
                 DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DIFFERENT_INSTANCE_TYPE);
         when(nvcaClusterRepository.getAllClustersInAuthorizedAccount(anyString())).thenReturn(List.of(cluster));
 
@@ -369,7 +387,7 @@ class ByocRequestDestinationProviderTest extends CreateInstancesTestBase {
 
     @Test
     void getNonTargetedDestinations_withMultipleGpus_onlyIncludesAllowedGpu() {
-        ClustersByAuthorizedAccountsEntity cluster = createNvcaCluster(
+        ClusterEntity cluster = createNvcaCluster(
                 DUMMY_CLUSTER_GROUP_ID, NVCA_CLUSTER_NAME, DUMMY_BYOC_CLUSTER_NAME);
         GpuV5Udt additionalGpu = new GpuV5Udt();
         additionalGpu.setName("gpu-2");

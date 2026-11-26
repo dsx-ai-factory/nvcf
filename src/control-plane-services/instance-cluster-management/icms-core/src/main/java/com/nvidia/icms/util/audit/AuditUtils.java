@@ -19,7 +19,6 @@ package com.nvidia.icms.util.audit;
 import static com.amazonaws.http.AmazonHttpClient.HEADER_USER_AGENT;
 import static com.nvidia.icms.scheduled.ByocClusterHealthMonitorTaskController.CLUSTER_HEALTH_MONITOR_TASK_NAME;
 import static com.nvidia.icms.scheduled.DatabaseCleanupTaskController.DATABASE_CLEANUP_JOB_NAME;
-import static com.nvidia.icms.service.scheduled.GpusV5PopulationTask.GPUS_V5_POPULATION_TASK_NAME;
 
 import com.nvidia.icms.errors.IcmsInternalServerException;
 import tools.jackson.core.JacksonException;
@@ -290,25 +289,6 @@ public class AuditUtils {
         auditProps.put(AUDIT_OBJECT_LOCATION_KEY, AUDIT_OBJECT_LOCATION_CLUSTER);
         auditProps.put(AUDIT_STATE_KEY, AuditState.UPDATED_CLUSTER.toString());
         auditProps.put(AUDIT_SUMMARY_KEY, "Updated cluster with id " + clusterId);
-    }
-
-    public static void populateAuditValuesForGpuV4PopulationTask(
-            @NotNull Map<String, Object> auditProps,
-            @Nullable String clusterId) {
-
-        auditProps.put(AUDIT_ACTOR_ID_KEY, GPUS_V5_POPULATION_TASK_NAME );
-        auditProps.put(AUDIT_SUBJECT_ID_KEY, GPUS_V5_POPULATION_TASK_NAME );
-        auditProps.put(AUDIT_ACTOR_LOCATION_KEY, AUDIT_ACTOR_LOCATION_ASYNC_OPERATION);
-        auditProps.put(AUDIT_SUBJECT_LOCATION_KEY, AUDIT_SUBJECT_LOCATION_ASYNC_OPERATION);
-
-        auditProps.put(AUDIT_OPERATION_KEY,
-                       AuditOperation.UPDATE_CLUSTER.toString());
-        auditProps.put(AUDIT_TYPE_KEY, AUDIT_CLUSTER_TYPE);
-        auditProps.put(AUDIT_OBJECT_ID_KEY, clusterId);
-        auditProps.put(AUDIT_OBJECT_LOCATION_KEY, AUDIT_OBJECT_LOCATION_CLUSTER);
-        auditProps.put(AUDIT_STATE_KEY, AuditState.UPDATED_CLUSTER.toString());
-        auditProps.put(AUDIT_SUMMARY_KEY, "Populated GpuV5 for the cluster with id " + clusterId);
-
     }
 
     public static void populateAuditValuesForClusterHealthMonitorTask(

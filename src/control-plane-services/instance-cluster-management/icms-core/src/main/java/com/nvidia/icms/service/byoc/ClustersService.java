@@ -31,8 +31,7 @@ import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.service.InstanceServiceHelper;
@@ -175,7 +174,7 @@ public class ClustersService {
          */
 
         // 1. Fetch allClusters available for given ncaId
-        List<ClustersByAuthorizedAccountsEntity> clustersInAuthorizedAccount = nvcaClusterRepository.getAllClustersInAuthorizedAccount(
+        List<ClusterEntity> clustersInAuthorizedAccount = nvcaClusterRepository.getAllClustersInAuthorizedAccount(
                 ncaId);
 
         // Replacing WILDCARD with * for comparison
@@ -183,7 +182,7 @@ public class ClustersService {
 
         Map<String, Set<ReadyClusterInfo>> groupIdToReadyClustersInfoCache = new HashMap<>();
 
-        for (ClustersByAuthorizedAccountsEntity entity : clustersInAuthorizedAccount) {
+        for (ClusterEntity entity : clustersInAuthorizedAccount) {
             // If cluster belongs to a first-party compute platform cluster group then skip it
             if (computePlatformService.isPlatformCluster(entity.getClusterGroupName())) {
                 continue;
@@ -193,7 +192,7 @@ public class ClustersService {
                                              groupIdToReadyClustersInfoCache);
             Set<ReadyClusterInfo> readyClusterSet = groupIdToReadyClustersInfoCache.get(
                     entity.getClusterGroupId());
-            ReadyClusterInfo readyClusterInfo = getClusterInfo(entity.getKey().getClusterId(),
+            ReadyClusterInfo readyClusterInfo = getClusterInfo(entity.getClusterId(),
                                                                readyClusterSet);
 
             // 3. Validate clusterHealthStatus if not READY then ignore
@@ -203,7 +202,7 @@ public class ClustersService {
 
             // 4. Find allowed GPUs for given ncaId
             Set<GpuV5Udt> allowedGpusFromEntityForNcaId = getAllowedGpus(
-                    NvcaConverter.getGpusV5(entity), ncaId, readyClusterSet);
+                    entity.getGpusV5(), ncaId, readyClusterSet);
 
             // 5. Filter allowed GPUs against instanceTypeUsage filter
             Set<GpuResponse> filteredGpuResposneSet = applyInstanceTypeUsageFilter(
@@ -213,7 +212,7 @@ public class ClustersService {
             if (filteredGpuResposneSet.isEmpty()) {
                 log.info(
                         "cluster with id {} don't have any GPUs for instanceTypeUsageFilter {}, ignoring cluster from response",
-                        entity.getKey().getClusterId(), instanceTypeUsageEnum);
+                        entity.getClusterId(), instanceTypeUsageEnum);
 
                 continue;
             }
@@ -395,16 +394,16 @@ public class ClustersService {
         });
     }
 
-    public Set<ClusterByGroupIdAndIdEntity> getAllReadyClusters(String clusterGroupId) {
+    public Set<ClusterEntity> getAllReadyClusters(String clusterGroupId) {
         return clusterRepository.getClustersFromClusterGroup(clusterGroupId)
                 .stream()
                 .filter(entity -> ClusterStatusEnum.READY.equals(entity.getClusterStatus())
-                        && !isSetEmptyOrNull(NvcaConverter.getGpusV5(entity)))
+                        && !isSetEmptyOrNull(entity.getGpusV5()))
                 .collect(Collectors.toSet());
     }
 
     public static Set<ClustersService.ReadyClusterInfo> toReadyClusterInfo(
-            Set<ClusterByGroupIdAndIdEntity> clusterByGroupIdAndIdEntities) {
+            Set<ClusterEntity> clusterByGroupIdAndIdEntities) {
         return clusterByGroupIdAndIdEntities
                 .stream()
                 .flatMap(entity -> toReadyClusterInfo(entity).stream())
@@ -412,9 +411,9 @@ public class ClustersService {
     }
 
     public static Set<ClustersService.ReadyClusterInfo> toReadyClusterInfo(
-            ClusterByGroupIdAndIdEntity entity) {
+            ClusterEntity entity) {
         Set<ClustersService.ReadyClusterInfo> clusterInfo = new HashSet<>();
-        for (GpuV5Udt gpuV5 : NvcaConverter.getGpusV5(entity)) {
+        for (GpuV5Udt gpuV5 : entity.getGpusV5()) {
             ReadyClusterInfo readyClusterInfo = toReadyClusterInfo(gpuV5, entity);
             clusterInfo.add(readyClusterInfo);
         }
@@ -422,17 +421,17 @@ public class ClustersService {
     }
 
     public static ReadyClusterInfo toReadyClusterInfo(
-            GpuV5Udt gpuV5, ClusterByGroupIdAndIdEntity entity) {
+            GpuV5Udt gpuV5, ClusterEntity entity) {
         return ReadyClusterInfo.builder()
                 .gpu(gpuV5.getName())
                 .instanceTypes(gpuV5.getInstanceTypes())
                 .supportedNodeTypes(getNodeTypesForInstanceType(gpuV5.getInstanceTypes()))
-                .clusterId(entity.getKey().getClusterId())
+                .clusterId(entity.getClusterId())
                 .clusterName(entity.getClusterName())
                 .name(entity.getClusterName())
                 .clusterStatus(entity.getClusterStatus())
                 .k8sVersion(entity.getK8sVersion())
-                .clusterGroupId(entity.getKey().getClusterGroupId())
+                .clusterGroupId(entity.getClusterGroupId())
                 .clusterGroupName(entity.getClusterGroupName())
                 .primaryNcaId(entity.getNcaId())
                 .authorizedNcaIds(entity.getAuthorizedNcaIds())

@@ -70,8 +70,6 @@ import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterConfigurationByClus
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterGroupsByAccountKey;
 import com.nvidia.icms.outbound.cassandra.instance.entity.InstanceByZoneEntity;
 import com.nvidia.icms.outbound.cassandra.instance.entity.InstanceByZoneKey;
 import com.nvidia.icms.service.AppAuditService;
@@ -444,11 +442,10 @@ class ClusterReconfigurationServiceTest {
                 .thenReturn(Collections.emptyList());
         when(clusterRepository.getClusterGroupInfoByAccountAndNameInMainAccount(
                 clusterEntity.getNcaId(), newClusterGroupName))
-                .thenReturn(Optional.of(ClusterGroupsByAccountEntity.builder()
-                        .key(ClusterGroupsByAccountKey.builder()
-                                .clusterGroupName(newClusterGroupName)
-                                .ncaId(clusterEntity.getNcaId())
-                                .build())
+                .thenReturn(Optional.of(ClusterEntity.builder()
+                        .clusterId("group-representative")
+                        .clusterGroupName(newClusterGroupName)
+                        .ncaId(clusterEntity.getNcaId())
                         .clusterGroupId("test-group-id")
                         .build()));
         doNothing().when(clusterTerminateService).deleteClusterForReconfiguration(
@@ -1402,11 +1399,10 @@ class ClusterReconfigurationServiceTest {
                 clusterEntity.getAuthorizedNcaIds(),
                 Set.of());
 
-        ClusterGroupsByAccountEntity nvca1ClusterGroup = ClusterGroupsByAccountEntity.builder()
-                .key(ClusterGroupsByAccountKey.builder()
-                        .clusterGroupName(newGroupName)
-                        .ncaId(clusterEntity.getNcaId())
-                        .build())
+        ClusterEntity nvca1ClusterGroup = ClusterEntity.builder()
+                .clusterId("group-representative")
+                .clusterGroupName(newGroupName)
+                .ncaId(clusterEntity.getNcaId())
                 .clusterGroupId("test-group-id")
                 .gpus(Set.of(com.nvidia.icms.outbound.cassandra.byoc.entity.GpuUdt.builder()
                         .name("GPU")

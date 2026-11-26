@@ -24,9 +24,7 @@ import com.nvidia.icms.inbound.rest.model.CloudHealthStatus;
 import com.nvidia.icms.inbound.rest.model.byoc.ClusterStatusEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.NvcaClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.NvcaConverter;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClustersByAuthorizedAccountsEntity;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.CloudHealthRepository;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.CloudHealthEntity;
 import com.nvidia.icms.outbound.cassandra.cloudhealth.entity.GpuCapacity;
@@ -67,19 +65,19 @@ public class ClusterTargetingHelper {
     }
 
 
-    public Set<ClusterByGroupIdAndIdEntity> getWildCardAllowedClusterCachedInfo() {
+    public Set<ClusterEntity> getWildCardAllowedClusterCachedInfo() {
         return wildCardAllowedClustersCacheService.getCachedReadyClusters();
     }
 
 
     @Observed
-    public @NotNull Set<ClusterByGroupIdAndIdEntity> getReadyClusterEntitiesForNcaId(@NotNull String ncaId) {
-        List<ClustersByAuthorizedAccountsEntity> allClustersInAuthorizedAccount =
+    public @NotNull Set<ClusterEntity> getReadyClusterEntitiesForNcaId(@NotNull String ncaId) {
+        List<ClusterEntity> allClustersInAuthorizedAccount =
                 nvcaClusterRepository.getAllClustersInAuthorizedAccount(ncaId);
 
         Set<String> processedClusterGroups = new HashSet<>();
-        Set<ClusterByGroupIdAndIdEntity> readyClusterEntities = new HashSet<>();
-        for (ClustersByAuthorizedAccountsEntity authorizedAccountsEntity : allClustersInAuthorizedAccount) {
+        Set<ClusterEntity> readyClusterEntities = new HashSet<>();
+        for (ClusterEntity authorizedAccountsEntity : allClustersInAuthorizedAccount) {
 
             // If cluster group is already processed, then skipping it
             if (processedClusterGroups.contains(authorizedAccountsEntity.getClusterGroupId())) {
@@ -88,7 +86,7 @@ public class ClusterTargetingHelper {
 
             // Fetching ready clusters from cluster group
             processedClusterGroups.add(authorizedAccountsEntity.getClusterGroupId());
-            Set<ClusterByGroupIdAndIdEntity> allReadyClusters = getAllReadyClustersFromClusterGroup(
+            Set<ClusterEntity> allReadyClusters = getAllReadyClustersFromClusterGroup(
                     authorizedAccountsEntity.getClusterGroupId());
             readyClusterEntities.addAll(allReadyClusters);
         }
@@ -140,13 +138,13 @@ public class ClusterTargetingHelper {
     }
 
 
-    private Set<ClusterByGroupIdAndIdEntity> getAllReadyClustersFromClusterGroup(String clusterGroupId) {
+    private Set<ClusterEntity> getAllReadyClustersFromClusterGroup(String clusterGroupId) {
         return clusterRepository.getClustersFromClusterGroup(clusterGroupId)
                 .stream()
                 .filter(entity -> ClusterStatusEnum.READY.equals(entity.getClusterStatus())
                         && entity.getNvcaVersion() != null
                         && isClusterTargetingEnabled(entity.getAllowClusterTargeting())
-                        && !isSetEmptyOrNull(NvcaConverter.getGpusV5(entity)))
+                        && !isSetEmptyOrNull(entity.getGpusV5()))
                 .collect(Collectors.toSet());
     }
 }

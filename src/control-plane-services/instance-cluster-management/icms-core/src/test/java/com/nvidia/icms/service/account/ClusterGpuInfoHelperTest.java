@@ -26,8 +26,7 @@ import com.nvidia.icms.inbound.rest.model.byoc.ClusterStatusEnum;
 import com.nvidia.icms.inbound.rest.model.byoc.InstanceTypeUsageEnum;
 import com.nvidia.icms.inbound.rest.model.byoc.NodeTypeEnum;
 import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdEntity;
-import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterByGroupIdAndIdKey;
+import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.GpuV5Udt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeUdt;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
@@ -777,8 +776,8 @@ class ClusterGpuInfoHelperTest {
     void getReadyClusterInfo_CombinesWildcardAndNcaSpecificClusters() {
         // Given
         String ncaId = "test-nca-id";
-        ClusterByGroupIdAndIdEntity wildcardCluster = createClusterEntity("wildcard-cluster", ClusterRepository.WILDCARD);
-        ClusterByGroupIdAndIdEntity ncaSpecificCluster = createClusterEntity("nca-specific-cluster", ncaId);
+        ClusterEntity wildcardCluster = createClusterEntity("wildcard-cluster", ClusterRepository.WILDCARD);
+        ClusterEntity ncaSpecificCluster = createClusterEntity("nca-specific-cluster", ncaId);
 
         // Mock clusterTargetingHelper to return test clusters
         ClusterTargetingHelper mockClusterTargetingHelper = mock(ClusterTargetingHelper.class);
@@ -834,7 +833,7 @@ class ClusterGpuInfoHelperTest {
     @Test
     void getReadyClusterInfo_WithWildcardNcaId_ReturnsOnlyWildcardClusters() {
         // Given
-        ClusterByGroupIdAndIdEntity wildcardCluster = createClusterEntity("wildcard-cluster", ClusterRepository.WILDCARD);
+        ClusterEntity wildcardCluster = createClusterEntity("wildcard-cluster", ClusterRepository.WILDCARD);
 
         // Mock clusterTargetingHelper to return test cluster
         ClusterTargetingHelper mockClusterTargetingHelper = mock(ClusterTargetingHelper.class);
@@ -867,7 +866,7 @@ class ClusterGpuInfoHelperTest {
         String ncaId = "disallowed-nca";
         // createClusterEntity uses ClusterProviderEnum.OCI (a compute platform in the fixture)
         // and gpu == TEST_GPU_NAME.
-        ClusterByGroupIdAndIdEntity platformCluster = createClusterEntity("platform-cluster", ncaId);
+        ClusterEntity platformCluster = createClusterEntity("platform-cluster", ncaId);
 
         ClusterTargetingHelper mockClusterTargetingHelper = mock(ClusterTargetingHelper.class);
         when(mockClusterTargetingHelper.getWildCardAllowedClusterCachedInfo()).thenReturn(Set.of());
@@ -892,7 +891,7 @@ class ClusterGpuInfoHelperTest {
     @Test
     void getReadyClusterInfo_showsRestrictedGpuOnComputePlatform_forAllowedNca() {
         String ncaId = "allowed-nca";
-        ClusterByGroupIdAndIdEntity platformCluster = createClusterEntity("platform-cluster", ncaId);
+        ClusterEntity platformCluster = createClusterEntity("platform-cluster", ncaId);
 
         ClusterTargetingHelper mockClusterTargetingHelper = mock(ClusterTargetingHelper.class);
         when(mockClusterTargetingHelper.getWildCardAllowedClusterCachedInfo()).thenReturn(Set.of());
@@ -917,7 +916,7 @@ class ClusterGpuInfoHelperTest {
     @Test
     void getReadyClusterInfo_keepsRestrictedGpuOnByocCluster_forDisallowedNca() {
         String ncaId = "disallowed-nca";
-        ClusterByGroupIdAndIdEntity byocCluster = createClusterEntity(
+        ClusterEntity byocCluster = createClusterEntity(
                 "byoc-cluster", ncaId, TEST_CLUSTER_GROUP, ClusterProviderEnum.AWS, null);
 
         ClusterTargetingHelper mockClusterTargetingHelper = mock(ClusterTargetingHelper.class);
@@ -937,20 +936,20 @@ class ClusterGpuInfoHelperTest {
     }
 
     /**
-     * Creates a ClusterByGroupIdAndIdEntity object with test data.
+     * Creates a ClusterEntity object with test data.
      * 
      * @param clusterName The name of the cluster
      * @param ncaId The NVIDIA Cloud Account ID this cluster belongs to
-     * @return A ClusterByGroupIdAndIdEntity object with the specified properties
+     * @return A ClusterEntity object with the specified properties
      */
-    private ClusterByGroupIdAndIdEntity createClusterEntity(String clusterName, String ncaId) {
+    private ClusterEntity createClusterEntity(String clusterName, String ncaId) {
         return createClusterEntity(clusterName, ncaId, TEST_CLUSTER_GROUP, ClusterProviderEnum.OCI, null);
     }
 
-    private ClusterByGroupIdAndIdEntity createClusterEntity(
+    private ClusterEntity createClusterEntity(
             String clusterId, String ncaId, String clusterGroupName,
             ClusterProviderEnum provider, Set<String> authorizedNcaIds) {
-        ClusterByGroupIdAndIdEntity entity = new ClusterByGroupIdAndIdEntity();
+        ClusterEntity entity = new ClusterEntity();
         entity.setClusterName(clusterId);
         entity.setNcaId(ncaId);
         entity.setClusterGroupName(clusterGroupName);
@@ -961,11 +960,8 @@ class ClusterGpuInfoHelperTest {
             entity.setAuthorizedNcaIds(authorizedNcaIds);
         }
 
-        ClusterByGroupIdAndIdKey key = ClusterByGroupIdAndIdKey.builder()
-            .clusterId(clusterId)
-            .clusterGroupId(clusterGroupName)
-            .build();
-        entity.setKey(key);
+        entity.setClusterId(clusterId);
+        entity.setClusterGroupId(clusterGroupName);
 
         GpuV5Udt gpu = GpuV5Udt.builder()
             .name(TEST_GPU_NAME)
@@ -1918,4 +1914,4 @@ class ClusterGpuInfoHelperTest {
         // Assert
         assertEquals(10, result, "Should return reserved + spot capacity (0 + 10 = 10) when flag is enabled");
     }
-} 
+}

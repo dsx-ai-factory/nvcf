@@ -346,11 +346,9 @@ class AccountInfoServiceIntegrationTest extends IntegrationTest {
         Set<String> attributes = Set.of("test-attr1", "test-attr2");
 
         // Create cluster entity
-        ClusterByGroupIdAndIdEntity clusterEntity = ClusterByGroupIdAndIdEntity.builder()
-                .key(ClusterByGroupIdAndIdKey.builder()
-                             .clusterId(clusterId)
-                             .clusterGroupId(clusterGroup)
-                             .build())
+        ClusterEntity clusterEntity = ClusterEntity.builder()
+                .clusterId(clusterId)
+                .clusterGroupId(clusterGroup)
                 .clusterName(clusterName)
                 .clusterProvider(ClusterProviderEnum.AWS)
                 .clusterGroupName(clusterGroup)
