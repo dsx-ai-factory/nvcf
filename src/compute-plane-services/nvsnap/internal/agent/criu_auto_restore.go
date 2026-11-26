@@ -201,7 +201,7 @@ func (c *criuAutoRestorer) consider(ctx context.Context, pod *corev1.Pod) {
 	if _, done := c.attempted.LoadOrStore(pod.UID, struct{}{}); done {
 		return
 	}
-	go c.restore(ctx, pod.Namespace, pod.Name, pod.UID, id, container, pod.Annotations[webhook.CRIUGroupAnnotation])
+	go c.restore(ctx, pod.Namespace, pod.Name, pod.UID, id, container, pod.Annotations[webhook.CRIUGroupAnnotation], kubeDiscoveryRank(pod))
 }
 
 // admitted reports whether the restorer may act on pod's restore
@@ -261,7 +261,7 @@ func (c *criuAutoRestorer) prefetch(ctx context.Context, pod *corev1.Pod) {
 	}()
 }
 
-func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid types.UID, id, container, groupKey string) {
+func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid types.UID, id, container, groupKey string, kube bool) {
 	defer metrics.Active("restore")()
 	a := c.a
 	log := a.log.WithFields(logrus.Fields{"pod": ns + "/" + pod, "checkpoint": id, "container": container})
@@ -278,7 +278,10 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		// Before the restore, as a group's (kube_discovery.go): a worker
 		// that registers through Kubernetes is routed to only once its
 		// registration names this pod.
-		if groupKey != "" {
+		if kube {
+			if groupKey == "" {
+				return fmt.Errorf("%w: a worker that registers through Kubernetes restores only from a group record, which keeps its registration", errCheckpointUnavailable)
+			}
 			p, gerr := a.kubeClient.CoreV1().Pods(ns).Get(rctx, pod, metav1.GetOptions{})
 			if gerr == nil && p.UID != uid {
 				gerr = fmt.Errorf("pod %s/%s was replaced", ns, pod)
@@ -346,6 +349,13 @@ func (c *criuAutoRestorer) restore(ctx context.Context, ns, pod string, uid type
 		log.WithError(err).Warn("CRIU auto-restore refused: this node cannot resume the pod's NIXL KV connector; the pod starts cold in place")
 		record(func(d map[string]string) bool { return recordFailure(d, id, false, err) })
 		inPlace = true
+		if kube {
+			// It registers anew as it starts; the restored registration
+			// must not route to it meanwhile.
+			if derr := a.deleteRegistrations(context.WithoutCancel(ctx), ns, uid); derr != nil {
+				log.WithError(derr).Warn("CRIU auto-restore: cannot remove the restored registration of the pod that starts cold in place")
+			}
+		}
 	case fault != nil:
 		log.WithError(err).Warn("CRIU auto-restore failed on a faulty GPU; it is not counted against the checkpoint, and the pod is deleted so its replacement restores again")
 		record(func(d map[string]string) bool { return recordGPUFault(d, id, fault) })

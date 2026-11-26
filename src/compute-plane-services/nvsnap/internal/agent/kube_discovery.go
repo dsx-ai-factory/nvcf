@@ -36,6 +36,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"regexp"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +45,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
@@ -93,6 +96,9 @@ func (a *Agent) registrationsOf(ctx context.Context, pod *corev1.Pod) (rankRegis
 	if net.ParseIP(ip).To4() == nil {
 		return out, fmt.Errorf("pod %s has no IPv4 address (%q)", pod.Name, ip)
 	}
+	if err := readyOnlyOnceRestored(pod); err != nil {
+		return out, err
+	}
 	list, err := a.dynClient.Resource(dynamoWorkerMetadata).Namespace(pod.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return out, fmt.Errorf("list DynamoWorkerMetadata in %s: %w", pod.Namespace, err)
@@ -130,6 +136,32 @@ func (a *Agent) registrationsOf(ctx context.Context, pod *corev1.Pod) (rankRegis
 		return out, fmt.Errorf("pod %s owns no DynamoWorkerMetadata: it has not registered", pod.Name)
 	}
 	return out, nil
+}
+
+// readyOnlyOnceRestored fails for a rank a frontend could route to before
+// its restore runs. In container mode a frontend takes a container's own
+// readiness, which nvsnap's readiness gate does not reach: a container
+// without a readiness probe is ready while it is still a placeholder, and
+// its registration is written before the restore.
+func readyOnlyOnceRestored(pod *corev1.Pod) error {
+	container := false
+	for _, c := range pod.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == "DYN_KUBE_DISCOVERY_MODE" && (e.ValueFrom != nil || e.Value == "container") {
+				container = true // by reference: cannot tell, so as container mode
+			}
+		}
+	}
+	if !container {
+		return nil // pod mode: the pod's readiness, which the gate holds
+	}
+	name := gpuContainer(pod)
+	for _, c := range pod.Spec.Containers {
+		if c.Name == name && c.ReadinessProbe == nil {
+			return fmt.Errorf("container %s of pod %s has no readiness probe: in container discovery mode it would be routed to before its restore", name, pod.Name)
+		}
+	}
+	return nil
 }
 
 // recordRegistrations reads every Kubernetes-discovery rank's
@@ -265,7 +297,12 @@ func foreignAddress(spec json.RawMessage, ip string) string {
 		if !transport && !strings.Contains(s, "://") {
 			return s
 		}
-		for _, a := range ipv4Tokens(s) {
+		toks := ipv4Tokens(s)
+		if len(toks) == 0 && other == "" && hostPort.MatchString(s) {
+			// A host named, not addressed: the restore cannot move it.
+			other = s
+		}
+		for _, a := range toks {
 			if a != ip && other == "" {
 				other = a
 			}
@@ -274,6 +311,10 @@ func foreignAddress(spec json.RawMessage, ip string) string {
 	})
 	return other
 }
+
+// hostPort matches a host name with a port, as a transport or URL names a
+// peer by name.
+var hostPort = regexp.MustCompile(`(^|//)[A-Za-z][-A-Za-z0-9.]*:[0-9]+`)
 
 // walkStrings replaces, in place, every string of v with f's result; f
 // learns whether the string is under a "transport" key.
@@ -359,20 +400,38 @@ func (c *criuAutoRestorer) writeGroupRegistrations(ctx context.Context, key stri
 	return c.a.writeRegistrations(ctx, cm.Data, ranks)
 }
 
-// instanceIDsFree fails when another pod of p's namespace registers an
-// instance ID that regs does. The restored process answers to the IDs it
-// was captured with: two replicas restored from one capture would both
-// claim them, and a frontend routes an ID to one of them. The first
+// instanceIDsFree fails when another live pod of p's namespace answers
+// to an instance ID that regs does. The restored process answers to the
+// IDs it was captured with: two replicas restored from one capture would
+// both claim them, and a frontend routes an ID to one of them. The first
 // restore keeps them; a later one starts cold.
+//
+// Two restores at once must not both pass: each ID is claimed first with
+// an object only one pod can create (claimInstanceID). Then the
+// registrations of the namespace are checked, for a pod that registered
+// the ID itself (the captured pod, before its capture stopped it). A pod
+// gone or terminating holds nothing: the captured pod is deleted as its
+// replacement is admitted, and its objects outlive it until the garbage
+// collector removes them.
 func (a *Agent) instanceIDsFree(ctx context.Context, p *corev1.Pod, regs rankRegistrations) error {
 	mine := map[string]bool{}
+	var ids []string
 	for _, o := range regs.Objects {
 		for _, id := range instanceIDs(o.Spec) {
-			mine[id] = true
+			if !mine[id] {
+				mine[id] = true
+				ids = append(ids, id)
+			}
 		}
 	}
-	if len(mine) == 0 {
+	if len(ids) == 0 {
 		return fmt.Errorf("the captured registration names no instance ID")
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := a.claimInstanceID(ctx, p, id); err != nil {
+			return err
+		}
 	}
 	list, err := a.dynClient.Resource(dynamoWorkerMetadata).Namespace(p.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -380,20 +439,125 @@ func (a *Agent) instanceIDsFree(ctx context.Context, p *corev1.Pod, regs rankReg
 	}
 	for i := range list.Items {
 		o := &list.Items[i]
-		owned := false
-		for _, r := range o.GetOwnerReferences() {
-			owned = owned || r.UID == p.UID
-		}
-		if owned {
-			continue // the placeholder's own, from an earlier attempt
-		}
 		raw, err := json.Marshal(o.Object["spec"])
 		if err != nil {
 			continue
 		}
+		shared := ""
 		for _, id := range instanceIDs(raw) {
 			if mine[id] {
-				return fmt.Errorf("instance %s of the capture is registered by DynamoWorkerMetadata %s already (another replica restored from the same capture)", id, o.GetName())
+				shared = id
+				break
+			}
+		}
+		if shared == "" {
+			continue
+		}
+		live, err := a.ownerLive(ctx, p, o.GetNamespace(), o.GetOwnerReferences())
+		if err != nil {
+			return err
+		}
+		if live {
+			return fmt.Errorf("instance %s of the capture is registered by DynamoWorkerMetadata %s of a running pod (another replica restored from the same capture)", shared, o.GetName())
+		}
+	}
+	return nil
+}
+
+// instanceClaimPrefix names the ConfigMap that claims a Dynamo instance ID
+// in a namespace for the pod that owns it.
+const instanceClaimPrefix = "nvsnap-dynamo-instance-"
+
+// claimInstanceID makes p the holder of instance ID id in its namespace:
+// a ConfigMap of that name, owned by p, so it goes when p goes. Creating
+// it is atomic; one a pod gone or terminating holds is taken over with a
+// compare-and-swap update. Held by another live pod, it fails.
+func (a *Agent) claimInstanceID(ctx context.Context, p *corev1.Pod, id string) error {
+	if a.kubeClient == nil {
+		return fmt.Errorf("no Kubernetes client")
+	}
+	no := false
+	name := instanceClaimPrefix + id
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: p.Namespace,
+		Labels:          map[string]string{"app.kubernetes.io/managed-by": "nvsnap"},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: p.Name, UID: p.UID, BlockOwnerDeletion: &no}},
+	}, Data: map[string]string{"pod": p.Name}}
+	api := a.kubeClient.CoreV1().ConfigMaps(p.Namespace)
+	_, err := api.Create(ctx, cm, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("claim instance %s: %w", id, err)
+	}
+	cur, err := api.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("claim instance %s: %w", id, err)
+	}
+	for _, r := range cur.OwnerReferences {
+		if r.UID == p.UID {
+			return nil // this pod's, from an earlier attempt
+		}
+	}
+	live, err := a.ownerLive(ctx, p, p.Namespace, cur.OwnerReferences)
+	if err != nil {
+		return err
+	}
+	if live {
+		return fmt.Errorf("instance %s of the capture is held by pod %s (another replica restored from the same capture)", id, cur.Data["pod"])
+	}
+	cm.ResourceVersion = cur.ResourceVersion
+	if _, err := api.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("claim instance %s from a pod that is gone: %w", id, err)
+	}
+	return nil
+}
+
+// ownerLive reports whether a pod among refs, other than p, exists in ns
+// with that UID and is not terminating.
+func (a *Agent) ownerLive(ctx context.Context, p *corev1.Pod, ns string, refs []metav1.OwnerReference) (bool, error) {
+	for _, r := range refs {
+		if r.Kind != "Pod" || r.UID == p.UID {
+			continue
+		}
+		if a.kubeClient == nil {
+			return true, nil // cannot tell: held
+		}
+		o, err := a.kubeClient.CoreV1().Pods(ns).Get(ctx, r.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("get pod %s/%s: %w", ns, r.Name, err)
+		}
+		if o.UID == r.UID && o.DeletionTimestamp == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// deleteRegistrations removes the DynamoWorkerMetadata objects pod uid
+// owns in ns: a placeholder that starts cold in place registers anew, and
+// the restored registration (the capture's instance IDs at its address)
+// must not route to it meanwhile.
+func (a *Agent) deleteRegistrations(ctx context.Context, ns string, uid types.UID) error {
+	if a.dynClient == nil {
+		return nil
+	}
+	api := a.dynClient.Resource(dynamoWorkerMetadata).Namespace(ns)
+	list, err := api.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for i := range list.Items {
+		for _, r := range list.Items[i].GetOwnerReferences() {
+			if r.UID != uid {
+				continue
+			}
+			if err := api.Delete(ctx, list.Items[i].GetName(), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return err
 			}
 		}
 	}
