@@ -221,9 +221,13 @@ A refused restore blocks no checkpoint. `identity_etcd.go`
   replace, and only once the record counts a stall for the refusal
   (`chargeRefusal`), so replacements refused the same way stop at the stall
   bound. One refusal counts one stall, however often it is tried again
-  (`refusedPods` on the record keeps every pod of the last refusal);
+  and whichever agent counts it first (`refusedPods` on the record lists
+  the refusals counted, each named by its first pod's UID);
 - a pod of which it cannot be told whether it runs a workload is never
-  deleted: it starts cold in place, or is kept and tried again.
+  deleted: it starts cold in place, or is kept and tried again. A pod on
+  another node cannot be inspected by the refusing agent: it is deleted
+  only beside a pod of its instance on that agent's node seen running no
+  workload, and is otherwise left to its own agent.
 
 Each pod's outcome is its own: a pod that cannot be read does not keep the
 other pods from starting cold or being deleted. A pod left unfinished (it
@@ -234,11 +238,16 @@ leader's). Otherwise the restore cannot run again, and the agent that
 refused it finishes the unfinished pods itself (`finishRefused`, backing
 off up to 30 s, for at most a day): reading and deleting a pod works for
 pods on any node. A refusal is also recorded on the group record before any
-pod is acted on (`refusingPods`, by pod UID; when it cannot be recorded,
-nothing is done and the restore's next event decides again), so that a pod
-it left unfinished is finished by the pod's own agent on its next event
-(`considerRefusing`), after the refusing agent restarted or past its retry
-window. A pod started cold or deleted gives up its claim on the identity.
+pod is acted on (`refusingPods`, by pod UID and refusal; when it cannot be
+recorded, nothing is done and the restore's next event decides again), so
+that a pod it left unfinished is finished by the pod's own agent on its
+next event (`considerRefusing`), after the refusing agent restarted (with
+identity restore on or off) or past its retry window. The list never drops
+an entry to make room: past 512 entries a refusal is not recorded, and so
+not acted on, until entries settle. With identity restore on, a pod whose
+group record is gone is finished by its own agent too: any restore of it
+is refused. A pod started cold or deleted gives up its claim on the
+identity.
 
 ## 6. One live restore per identity
 

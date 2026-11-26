@@ -46,6 +46,9 @@ type fakeEtcd struct {
 	// onTimeToLiveReply, when set, runs (under the lock) once a
 	// timetolive answer is computed and before it is sent: a late reply.
 	onTimeToLiveReply func()
+	// onKeepAliveReply, when set, runs (under the lock) once a keep-alive
+	// renewed its lease and before it answers: a late reply.
+	onKeepAliveReply func()
 }
 
 func newFakeEtcd(t *testing.T) *fakeEtcd {
@@ -273,6 +276,9 @@ func (f *fakeEtcd) serve(w http.ResponseWriter, r *http.Request) {
 		if l := f.leases[id]; l != nil {
 			l.expires = time.Now().Add(time.Duration(l.ttl) * time.Second)
 			res["TTL"] = strconv.FormatInt(l.ttl, 10)
+			if f.onKeepAliveReply != nil {
+				f.onKeepAliveReply()
+			}
 		}
 		_, _ = w.Write([]byte(mustJSON(map[string]any{"result": res}) + "\n"))
 	case "/v3/lease/revoke":

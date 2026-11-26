@@ -970,11 +970,18 @@ func (k *leaseKeeper) run(ctx context.Context) {
 			if !above.IsZero() && at.Sub(above) >= ttl {
 				// A late reply may tell of a lease that expired since:
 				// renewed once more, it is shown live now, or lost.
+				sent := time.Now()
 				got, kerr := k.e.KeepAlive(ctx, k.id)
 				switch {
 				case kerr != nil:
 					k.log.WithError(kerr).Warn("identity restore: cannot confirm the lease before handing it off; trying again")
 					own, ownTTL, above = time.Now(), ttl, time.Time{}
+				case got > 0 && time.Since(sent) >= time.Duration(got)*time.Second:
+					// The renewal's reply came as late as the TTL it
+					// granted: the lease may have expired since. Not a
+					// handoff; the next sample tells.
+					k.log.Warn("identity restore: the lease's renewal answered too late to confirm it; checking it again")
+					own, ownTTL, above = sent, time.Duration(got)*time.Second, time.Time{}
 				case got <= 0:
 					k.log.Error("identity restore: the lease expired before the handoff; ending the restored pod")
 					end(identityHandoffLost, false, k.onZombie)
@@ -1130,7 +1137,25 @@ func (c *criuAutoRestorer) identityBeforeRestore(ctx, keep context.Context, key 
 	}
 	observeIdentity(identityRegranted)
 	log.Info("identity restore: the captured lease is granted again; restoring")
+	c.clearRefusal(ctx, key, refusalID(slots), log)
 	return k, nil
+}
+
+// clearRefusal drops refusal rid's counted stall entry from record key:
+// its restore runs now, so a later refusal of these pods is a new one.
+func (c *criuAutoRestorer) clearRefusal(ctx context.Context, key, rid string, log *logrus.Entry) {
+	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
+		r := listed(d[identityRefusedPodsKey])
+		n := len(r)
+		r = slices.DeleteFunc(r, func(x string) bool { return x == rid })
+		if len(r) == n {
+			return false
+		}
+		setListed(d, identityRefusedPodsKey, r)
+		return true
+	}); err != nil && !apierrors.IsNotFound(err) {
+		log.WithError(err).Warn("identity restore: cannot clear an earlier refusal from the group record")
+	}
 }
 
 // identityKeeper is the keeper of identity id of record key for holder,
@@ -1263,14 +1288,15 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint 
 	decision := identityDecision(err)
 	observeIdentity(decision)
 	log = log.WithError(err).WithField("decision", decision)
-	if merr := c.markRefusing(ctx, key, pods, nil); merr != nil {
+	rid := refusalID(pods)
+	if merr := c.markRefusing(ctx, key, rid, pods); merr != nil {
 		log.WithError(merr).Warn("identity restore: cannot record the refusal on the group record; nothing done, it is tried again")
 		if again != nil {
 			again()
 		}
 		return
 	}
-	pending, running, acted := c.settleRefused(ctx, key, checkpoint, pods, err, log)
+	pending, running, acted := c.settleRefused(ctx, key, checkpoint, rid, pods, err, log)
 	retry := len(pending) > 0 || (len(running) > 0 && decision == identityRefusedError)
 	if retry && !acted && again != nil {
 		c.unmarkRefusing(ctx, key, pods, false, log)
@@ -1279,8 +1305,18 @@ func (c *criuAutoRestorer) identityRefused(ctx context.Context, key, checkpoint 
 	}
 	c.unmarkRefusing(ctx, key, settledOf(pods, pending), true, log)
 	if len(pending) > 0 {
-		go c.finishRefused(ctx, key, checkpoint, pending, err, log)
+		go c.finishRefused(ctx, key, checkpoint, rid, pending, err, log)
 	}
+}
+
+// refusalID names the refusal of pods (by slot) on the group record: its
+// first pod's UID (a group's leader, or the lone pod). A refusal decided
+// again by the restore's next event keeps it.
+func refusalID(pods []*corev1.Pod) string {
+	if len(pods) == 0 {
+		return ""
+	}
+	return string(pods[0].UID)
 }
 
 // settledOf is pods without pending, by UID.
@@ -1304,13 +1340,13 @@ var (
 // finishRefused tries pods' unfinished refusal again until every pod is
 // settled, for at most identityFinishRetry's total or until ctx ends. Past
 // that, each pod's own agent finishes it (considerRefusing).
-func (c *criuAutoRestorer) finishRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) {
+func (c *criuAutoRestorer) finishRefused(ctx context.Context, key, checkpoint, rid string, pods []*corev1.Pod, err error, log *logrus.Entry) {
 	identityFinishRetryMu.RLock()
 	b := identityFinishRetry
 	identityFinishRetryMu.RUnlock()
 	time.Sleep(b.first)
 	if rerr := retryUntil(ctx, b.first, b.max, b.total, func() (bool, error) {
-		pending, _, _ := c.settleRefused(ctx, key, checkpoint, pods, err, log)
+		pending, _, _ := c.settleRefused(ctx, key, checkpoint, rid, pods, err, log)
 		c.unmarkRefusing(ctx, key, settledOf(pods, pending), true, log)
 		pods = pending
 		return len(pods) == 0, nil
@@ -1319,17 +1355,30 @@ func (c *criuAutoRestorer) finishRefused(ctx context.Context, key, checkpoint st
 	}
 }
 
-// Record keys of refusals in progress: the UIDs (comma-separated) of the
-// pods a refusal acts on, until each is settled, and of those a stall was
-// counted for (chargeRefusal), until each is gone. At most
-// identityRefusalListMax each; the oldest go first.
+// Record keys of refusals in progress. identityRefusingKey lists the pods
+// refusals act on, as "uid/refusal" (refusalID), each until it is
+// settled; identityRefusedPodsKey lists the refusals a stall was counted
+// for (chargeRefusal), each until its pods are settled or its restore runs.
+//
+// identityRefusingKey never drops an entry to make room: a refusal that
+// would take it past identityRefusalListMax is not recorded, and so not
+// acted on, until entries settle (markRefusing). Every listed refusal has
+// at least one entry there, so identityRefusedPodsKey holds at most that
+// many refusals still in progress; beyond the bound, only refusals with no
+// pod in progress are dropped, oldest first (a refusal handed back to its
+// restore's next event that then never came back: dropped, it could count
+// one stall more if refused again, never fewer).
 const (
 	identityRefusingKey    = "refusingPods"
 	identityRefusedPodsKey = "refusedPods"
 	identityRefusalListMax = 512
 )
 
-// listed returns record list v as UIDs.
+// errRefusalListFull is a refusal that cannot be recorded: too many are in
+// progress on the record.
+var errRefusalListFull = errors.New("too many refusals in progress on the group record")
+
+// listed returns record list v.
 func listed(v string) []string {
 	if v == "" {
 		return nil
@@ -1337,72 +1386,108 @@ func listed(v string) []string {
 	return strings.Split(v, ",")
 }
 
-// setListed stores UIDs uids as record list k of d, at most
-// identityRefusalListMax of them; an empty list is removed.
-func setListed(d map[string]string, k string, uids []string) {
-	if n := len(uids); n > identityRefusalListMax {
-		uids = uids[n-identityRefusalListMax:]
-	}
-	if len(uids) == 0 {
+// setListed stores list l as record key k of d; an empty list is removed.
+func setListed(d map[string]string, k string, l []string) {
+	if len(l) == 0 {
 		delete(d, k)
 		return
 	}
-	d[k] = strings.Join(uids, ",")
+	d[k] = strings.Join(l, ",")
 }
 
-// markRefusing records pods' refusal in progress on record key. A record
-// gone is no error: nothing can be recorded, or restored, from it.
-func (c *criuAutoRestorer) markRefusing(ctx context.Context, key string, pods []*corev1.Pod, _ *logrus.Entry) error {
+// refusing returns record data d's refusals in progress, by pod UID.
+func refusing(d map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, e := range listed(d[identityRefusingKey]) {
+		if uid, rid, ok := strings.Cut(e, "/"); ok {
+			out[uid] = rid
+		}
+	}
+	return out
+}
+
+// markRefusing records refusal rid of pods on record key, before any pod
+// is acted on. A record gone is no error with identity restore on: every
+// restore of its placeholders is refused, and each pod's own agent
+// finishes it (considerRefusing). With the flag off it is an error: the
+// restore's next event decides again, from no identity.
+func (c *criuAutoRestorer) markRefusing(ctx context.Context, key, rid string, pods []*corev1.Pod) error {
 	if key == "" || len(pods) == 0 {
 		return nil
 	}
 	err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
-		uids := listed(d[identityRefusingKey])
-		changed := false
+		l, in := listed(d[identityRefusingKey]), refusing(d)
+		n := len(l)
 		for _, p := range pods {
-			if !slices.Contains(uids, string(p.UID)) {
-				uids, changed = append(uids, string(p.UID)), true
+			if _, ok := in[string(p.UID)]; !ok {
+				l = append(l, string(p.UID)+"/"+rid)
 			}
 		}
-		if changed {
-			setListed(d, identityRefusingKey, uids)
+		if len(l) == n || len(l) > identityRefusalListMax {
+			return false
 		}
-		return changed
+		setListed(d, identityRefusingKey, l)
+		return true
 	})
-	if apierrors.IsNotFound(err) {
+	if err == nil {
+		// Read back: a list that was full was left as it is.
+		d, _, rerr := c.a.identityRecord(ctx, key)
+		if rerr != nil {
+			err = rerr
+		} else {
+			in := refusing(d)
+			for _, p := range pods {
+				if _, ok := in[string(p.UID)]; !ok {
+					return errRefusalListFull
+				}
+			}
+		}
+	}
+	if apierrors.IsNotFound(err) && c.a.identityEnabled() {
 		return nil
 	}
 	return err
 }
 
-// unmarkRefusing drops pods from record key's refusals in progress, and,
-// once settled (not acted on again), from its counted stalls; pods handed
-// back to their restore's next event stay counted. A failure leaves them
-// listed, which only has their agents find them settled.
+// unmarkRefusing drops pods from record key's refusals in progress. Once
+// they are settled (not acted on again), a refusal with no pod left in
+// progress also drops its counted stall's entry; pods handed back to their
+// restore's next event keep it, so that refusal is not counted again. A
+// failure leaves them listed, which only has their agents find them
+// settled.
 func (c *criuAutoRestorer) unmarkRefusing(ctx context.Context, key string, pods []*corev1.Pod, settled bool, log *logrus.Entry) {
 	if key == "" || len(pods) == 0 {
 		return
 	}
-	drop := func(uids []string) ([]string, bool) {
-		n := len(uids)
-		uids = slices.DeleteFunc(uids, func(u string) bool {
-			return slices.ContainsFunc(pods, func(p *corev1.Pod) bool { return string(p.UID) == u })
-		})
-		return uids, len(uids) != n
-	}
 	if err := c.updateGroupRecord(ctx, key, func(d map[string]string) bool {
-		a, ca := drop(listed(d[identityRefusingKey]))
-		b, cb := listed(d[identityRefusedPodsKey]), false
+		rids := map[string]bool{}
+		l := listed(d[identityRefusingKey])
+		n := len(l)
+		l = slices.DeleteFunc(l, func(e string) bool {
+			uid, rid, _ := strings.Cut(e, "/")
+			drop := slices.ContainsFunc(pods, func(p *corev1.Pod) bool { return string(p.UID) == uid })
+			if drop {
+				rids[rid] = true
+			}
+			return drop
+		})
+		changed := len(l) != n
+		setListed(d, identityRefusingKey, l)
 		if settled {
-			b, cb = drop(b)
+			left := map[string]bool{}
+			for _, e := range l {
+				_, rid, _ := strings.Cut(e, "/")
+				left[rid] = true
+			}
+			r := listed(d[identityRefusedPodsKey])
+			m := len(r)
+			r = slices.DeleteFunc(r, func(rid string) bool { return rids[rid] && !left[rid] })
+			if len(r) != m {
+				setListed(d, identityRefusedPodsKey, r)
+				changed = true
+			}
 		}
-		if ca {
-			setListed(d, identityRefusingKey, a)
-		}
-		if cb {
-			setListed(d, identityRefusedPodsKey, b)
-		}
-		return ca || cb
+		return changed
 	}); err != nil && !apierrors.IsNotFound(err) {
 		log.WithError(err).Warn("identity restore: cannot clear settled pods from the group record's refusal")
 	}
@@ -1410,18 +1495,29 @@ func (c *criuAutoRestorer) unmarkRefusing(ctx context.Context, key string, pods 
 
 // considerRefusing finishes, on a pod's own event and on its own node, a
 // refusal recorded for it (markRefusing) that the agent which refused it
-// left unfinished: that agent may have restarted, or the pod may be on
-// another node. It reports whether the pod is under such a refusal, which
-// then is the only thing done for it.
+// left unfinished: that agent may have restarted (with identity restore
+// on or off), or the pod may be on another node. With the flag on, a pod
+// whose group record is gone is refused all the same: any restore of it
+// would be (identityBeforeRestore). It reports whether the pod is under
+// such a refusal, which then is the only thing done for it.
 func (c *criuAutoRestorer) considerRefusing(ctx context.Context, pod *corev1.Pod) bool {
 	key := pod.Annotations[webhook.CRIUGroupAnnotation]
 	ck, _, ready := criuRestoreTarget(pod)
-	if !c.a.identityEnabled() || key == "" || !ready {
+	if key == "" || !ready {
 		return false
 	}
 	d, _, err := c.a.identityRecord(ctx, key)
-	if err != nil || !slices.Contains(listed(d[identityRefusingKey]), string(pod.UID)) {
+	var rid string
+	switch {
+	case apierrors.IsNotFound(err) && c.a.identityEnabled():
+		rid = string(pod.UID)
+	case err != nil:
 		return false
+	default:
+		var ok bool
+		if rid, ok = refusing(d)[string(pod.UID)]; !ok {
+			return false
+		}
 	}
 	if _, busy := c.attempted.LoadOrStore("refusing/"+string(pod.UID), struct{}{}); busy {
 		return true
@@ -1429,8 +1525,8 @@ func (c *criuAutoRestorer) considerRefusing(ctx context.Context, pod *corev1.Pod
 	go func() {
 		defer c.attempted.Delete("refusing/" + string(pod.UID))
 		log := c.a.log.WithFields(logrus.Fields{"pod": pod.Namespace + "/" + pod.Name, "criuGroup": key})
-		cause := refuseIdentity(identityRefusedError, errors.New("a refusal recorded on the group record, finished by the pod's own agent"))
-		pending, _, _ := c.settleRefused(context.WithoutCancel(ctx), key, ck, []*corev1.Pod{pod}, cause, log)
+		cause := refuseIdentity(identityRefusedError, errors.New("a refusal recorded on the group record, or a group record gone, finished by the pod's own agent"))
+		pending, _, _ := c.settleRefused(context.WithoutCancel(ctx), key, ck, rid, []*corev1.Pod{pod}, cause, log)
 		c.unmarkRefusing(context.WithoutCancel(ctx), key, settledOf([]*corev1.Pod{pod}, pending), true, log)
 	}()
 	return true
@@ -1475,18 +1571,18 @@ var podRunsWorkload = func(ctx context.Context, a *Agent, pod *corev1.Pod, conta
 //     admitted at once and refused the same way, end at
 //     criuGroupMaxStalls;
 //   - a pod of which it cannot be told whether it runs a workload is never
-//     deleted: it starts cold, or is kept and tried again. When a pod on
-//     this node cannot be inspected, neither can be told of a pod on
-//     another node, which is decided with them.
+//     deleted: it starts cold, or is kept and tried again. A pod on
+//     another node cannot be inspected here: it is deleted only beside a
+//     pod of its instance on this node seen running no workload.
 //
 // A pod started cold or deleted gives up its claim on the identity. A pod
 // that cannot be read, or deleted, or whose stall cannot be counted, or
 // that another refusal of this agent is acting on, is returned unfinished
 // (pending), and nothing is deleted then. acted reports whether a pod
 // started cold or was deleted.
-func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint string, pods []*corev1.Pod, err error, log *logrus.Entry) (pending, running []*corev1.Pod, acted bool) {
+func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint, rid string, pods []*corev1.Pod, err error, log *logrus.Entry) (pending, running []*corev1.Pod, acted bool) {
 	var live, unsure, remote []*corev1.Pod
-	runs := false
+	runs, inspected := false, false
 	for _, p := range pods {
 		pl := log.WithField("pod", p.Namespace+"/"+p.Name)
 		if _, busy := c.attempted.LoadOrStore("settling/"+string(p.UID), struct{}{}); busy {
@@ -1520,13 +1616,20 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 			runs = true
 		case !local:
 			remote = append(remote, pod)
+		default:
+			inspected = true
 		}
 	}
 	if runs {
 		log.Warn("identity restore refused, and the instance already runs its workload: its pods are kept as they are")
 		return pending, live, false
 	}
-	if len(unsure) > 0 {
+	// A pod on another node cannot be inspected from here. It is decided
+	// with a pod of its instance this agent inspected, seen running no
+	// workload, and is never deleted without one: when a pod here cannot
+	// be inspected, and on a retry of the remote pods alone. It is then
+	// kept, and finished by its own agent (considerRefusing).
+	if len(unsure) > 0 || !inspected {
 		unsure = append(unsure, remote...)
 	}
 	var cold []*corev1.Pod
@@ -1551,7 +1654,7 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 	}
 	var uerr error
 	if key != "" {
-		uerr = c.updateGroupRecord(ctx, key, func(d map[string]string) bool { return chargeRefusal(d, checkpoint, cold, pods, err) })
+		uerr = c.updateGroupRecord(ctx, key, func(d map[string]string) bool { return chargeRefusal(d, checkpoint, rid, err) })
 	}
 	if uerr != nil && !apierrors.IsNotFound(uerr) {
 		log.WithError(uerr).Warn("identity restore: cannot count the refusal on the group record; its pods are kept and the refusal tried again")
@@ -1569,25 +1672,29 @@ func (c *criuAutoRestorer) settleRefused(ctx context.Context, key, checkpoint st
 	return pending, nil, acted
 }
 
-// chargeRefusal counts on group record d one stall for the refusal of all,
-// whose pods cold are deleted next (recordFailure). A refusal is counted
-// once: when every pod of cold is listed already (identityRefusedPodsKey:
-// the refusal tried again after a delete failed, or a rank that could not
-// be read before), nothing is counted again. A pod stays listed until it
-// is settled (unmarkRefusing), so refusals of other instances sharing the
-// record do not push it out.
-func chargeRefusal(d map[string]string, checkpoint string, cold, all []*corev1.Pod, cause error) bool {
+// chargeRefusal counts on group record d one stall for refusal rid, whose
+// pods that cannot start cold are deleted next (recordFailure). A refusal
+// is counted once, whichever agent counts it first: the refusing agent,
+// a retry of it, or a pod's own agent finishing it (considerRefusing),
+// all name it by rid. Beyond identityRefusalListMax, refusals with no pod
+// in progress are dropped, oldest first (see identityRefusingKey).
+func chargeRefusal(d map[string]string, checkpoint, rid string, cause error) bool {
 	charged := listed(d[identityRefusedPodsKey])
-	fresh := false
-	for _, p := range cold {
-		fresh = fresh || !slices.Contains(charged, string(p.UID))
-	}
-	if !fresh || !recordFailure(d, checkpoint, false, cause) {
+	if slices.Contains(charged, rid) || !recordFailure(d, checkpoint, false, cause) {
 		return false
 	}
-	for _, p := range all {
-		if !slices.Contains(charged, string(p.UID)) {
-			charged = append(charged, string(p.UID))
+	charged = append(charged, rid)
+	if len(charged) > identityRefusalListMax {
+		live := map[string]bool{}
+		for _, r := range refusing(d) {
+			live[r] = true
+		}
+		for i := 0; i < len(charged) && len(charged) > identityRefusalListMax; {
+			if !live[charged[i]] && charged[i] != rid {
+				charged = slices.Delete(charged, i, i+1)
+				continue
+			}
+			i++
 		}
 	}
 	setListed(d, identityRefusedPodsKey, charged)
