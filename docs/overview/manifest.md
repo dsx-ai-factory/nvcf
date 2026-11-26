@@ -42,6 +42,42 @@ The generated image tables below record the selected tags. The `k8s` image
 provides a CLI toolbox used by two independently configured hooks. It is not a
 Kubernetes server image. Retain the selected helper versions when mirroring.
 
+The `kubectl` inside `alpine/k8s:<tag>` must stay within one minor version of
+every API server the hooks reach (the upstream kubectl skew policy). During a
+control-plane upgrade the cluster serves two versions at once - a `1.37.0`
+client is outside the skew of a `1.35` API server even when `1.36` servers
+exist - so qualify against the oldest API server in the fleet. The selected
+`1.37.0` tag serves clusters whose oldest API server is Kubernetes 1.36. For
+an older fleet, pick the `alpine/k8s` tag matching that oldest minor (the tag
+is the packaged `kubectl` version) for both hooks (`api.accountBootstrap.image`
+and `upgradeReceipt.image`).
+
+To qualify, run a one-off probe job with the selected image - the receipt job
+container exits after writing its ConfigMap, so it cannot be exec'd into - and
+read the versions from the job's logs. Set `K8S_VERSION_CHECK_IMAGE` to each
+distinct helper image the hooks actually use (`api.accountBootstrap.image` and
+`upgradeReceipt.image` after your registry mirroring) and probe every one of
+them; the command below only defaults to the published tag:
+
+```bash
+K8S_VERSION_CHECK_IMAGE="${K8S_VERSION_CHECK_IMAGE:-docker.io/alpine/k8s:1.37.0}"
+kubectl run k8s-version-check --image="$K8S_VERSION_CHECK_IMAGE" \
+  --restart=Never --command -- kubectl version --client
+# The probe pod never becomes Ready, so the finished phase is the only signal
+# that kubectl version has actually been written to the logs.
+if ! kubectl wait --for=jsonpath='{.status.phase}'=Succeeded \
+    pod/k8s-version-check --timeout="${K8S_VERSION_CHECK_TIMEOUT:-120}s"; then
+  # Report the failure and leave the probe in place for inspection - do not
+  # delete it before it has produced its version evidence.
+  kubectl logs k8s-version-check || true
+  kubectl get pod k8s-version-check -o wide || true
+  echo "k8s-version-check did not reach Succeeded; check the image reference" >&2
+  exit 1
+fi
+kubectl logs k8s-version-check
+kubectl delete pod k8s-version-check
+```
+
 Other enabled stacks and optional components use upstream registries; inspect
 every image in the render and generated inventory, not just this helper table.
 
