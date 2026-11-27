@@ -297,6 +297,7 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 			"other-asset": serverURL + downloadPrefix + remote.Tag + "/" + names[len(names)-1],
 			"other-tag":   serverURL + downloadPrefix + "nvcf/9.9.9/" + name,
 			"other-repo":  serverURL + "/other/repo/releases/download/" + remote.Tag + "/" + name,
+			"other-host":  "https://unrelated.example" + downloadPrefix + remote.Tag + "/" + name,
 			"credentials": strings.Replace(serverURL, "http://", "http://user:pass@", 1) + downloadPrefix + remote.Tag + "/" + name,
 		} {
 			downloadURLs[name] = url
@@ -318,6 +319,34 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 				t.Fatal("changed public asset accepted")
 			}
 			assets[name] = original
+		})
+	}
+}
+
+func TestUmbrellaPublicAssetURLHost(t *testing.T) {
+	asset := func(url string) umbrellaReleaseAsset {
+		return umbrellaReleaseAsset{Name: "manifest.json", BrowserDownloadURL: url}
+	}
+	const path = "/dsx-ai-factory/nvcf/releases/download/nvcf/1.1.1/manifest.json"
+	for _, test := range []struct {
+		name, api, url string
+		ok             bool
+	}{
+		{"github-downloads-come-from-github.com", "https://api.github.com", "https://github.com" + path, true},
+		{"api-host-is-not-a-download-origin", "https://api.github.com", "https://api.github.com" + path, false},
+		{"unrelated-https-host", "https://api.github.com", "https://unrelated.example" + path, false},
+		{"lookalike-host", "https://api.github.com", "https://github.com.evil.example" + path, false},
+		{"plain-http-to-github", "https://api.github.com", "http://github.com" + path, false},
+		{"enterprise-serves-downloads-on-its-api-host", "https://ghe.example/api/v3", "https://ghe.example" + path, true},
+		{"local-test-server", "http://127.0.0.1:8080", "http://127.0.0.1:8080" + path, true},
+		{"other-local-port", "http://127.0.0.1:8080", "http://127.0.0.1:9090" + path, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publisher := umbrellaPublisher{api: test.api, repository: "dsx-ai-factory/nvcf"}
+			_, err := publisher.publicAssetURL("nvcf/1.1.1", asset(test.url))
+			if (err == nil) != test.ok {
+				t.Fatalf("publicAssetURL(%q) error = %v, want ok=%v", test.url, err, test.ok)
+			}
 		})
 	}
 }

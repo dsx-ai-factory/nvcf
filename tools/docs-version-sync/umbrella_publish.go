@@ -81,24 +81,50 @@ func (p umbrellaPublisher) request(method, endpoint, contentType string, data []
 	return contents, nil
 }
 
-// downloadPublicAsset reads one release asset from the public download URL in the
-// release metadata, anonymously. Public asset bytes do not need the REST asset
-// endpoint, which GitHub can reject with HTTP 403 for public releases. The URL
-// must name this repository, tag and asset, so release metadata cannot send the
-// read somewhere else. Callers still verify the returned bytes.
-func (p umbrellaPublisher) downloadPublicAsset(tag string, asset umbrellaReleaseAsset) ([]byte, error) {
+// publicDownloadOrigin returns the only origin that serves public release asset
+// downloads for the configured API. GitHub serves them from github.com, not from
+// api.github.com. A server that exposes both, such as a GitHub Enterprise host or
+// a local test server, serves them from the API origin itself.
+func (p umbrellaPublisher) publicDownloadOrigin() (*url.URL, error) {
+	api, err := url.Parse(p.api)
+	if err != nil || api.Scheme == "" || api.Host == "" {
+		return nil, fmt.Errorf("invalid release API %q", p.api)
+	}
+	if api.Scheme == "https" && api.Host == "api.github.com" {
+		return &url.URL{Scheme: "https", Host: "github.com"}, nil
+	}
+	return &url.URL{Scheme: api.Scheme, Host: api.Host}, nil
+}
+
+// publicAssetURL validates the public download URL in the release metadata. It
+// must use the download origin and name exactly this repository, tag and asset,
+// with no credentials or query, so release metadata cannot send the read to
+// another host or object.
+func (p umbrellaPublisher) publicAssetURL(tag string, asset umbrellaReleaseAsset) (*url.URL, error) {
 	location, err := url.Parse(asset.BrowserDownloadURL)
 	if err != nil || asset.BrowserDownloadURL == "" {
 		return nil, fmt.Errorf("release asset %s has no valid public download URL", asset.Name)
 	}
-	api, err := url.Parse(p.api)
+	origin, err := p.publicDownloadOrigin()
 	if err != nil {
 		return nil, err
 	}
-	sameAPIHost := location.Scheme == api.Scheme && location.Host == api.Host
-	if (location.Scheme != "https" && !sameAPIHost) || location.User != nil || location.RawQuery != "" ||
+	if location.Scheme != origin.Scheme || location.Host != origin.Host || location.User != nil ||
+		location.RawQuery != "" || location.Fragment != "" ||
 		location.Path != "/"+p.repository+"/releases/download/"+tag+"/"+asset.Name {
 		return nil, fmt.Errorf("release asset %s has an unexpected public download URL", asset.Name)
+	}
+	return location, nil
+}
+
+// downloadPublicAsset reads one release asset from the public download URL in the
+// release metadata, anonymously. Public asset bytes do not need the REST asset
+// endpoint, which GitHub can reject with HTTP 403 for public releases. Callers
+// still verify the returned bytes.
+func (p umbrellaPublisher) downloadPublicAsset(tag string, asset umbrellaReleaseAsset) ([]byte, error) {
+	location, err := p.publicAssetURL(tag, asset)
+	if err != nil {
+		return nil, err
 	}
 	req, err := http.NewRequest("GET", location.String(), nil)
 	if err != nil {
