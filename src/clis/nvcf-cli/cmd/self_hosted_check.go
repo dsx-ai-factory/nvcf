@@ -20,6 +20,7 @@ package cmd
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -656,18 +657,12 @@ func checkedBeforeInstall(planeFlag bool) bool {
 //     it, so the working tree here can differ. With neither a flag nor a
 //     built-in stack, the stack checkout above the working directory is read.
 //
-// Otherwise nothing is read, and every stack-derived input is left out.
+// Otherwise nothing is read, and every stack-derived input is left out. When
+// that is because <env>.yaml cannot be read, stackEnvironmentSkip says so for
+// the plane whose checks use those inputs.
 func stackValuesForRun(t stackTarget) ([]string, bool) {
-	env, ok := stackEnvForRun(t)
-	if !ok {
-		return nil, false
-	}
-	dir := stackDirForRun(t)
-	if dir == "" {
-		return nil, false
-	}
-	envFile := filepath.Join(dir, "environments", env+".yaml")
-	if !isRegularFile(envFile) {
+	dir, envFile, problem := stackEnvFile(t)
+	if envFile == "" || problem != "" {
 		return nil, false
 	}
 	var files []string
@@ -675,6 +670,49 @@ func stackValuesForRun(t stackTarget) ([]string, bool) {
 		files = append(files, base)
 	}
 	return append(files, envFile), true
+}
+
+// stackEnvFile returns the root of t's stack and its file for the install's
+// environment, as stackValuesForRun finds them, and why that file cannot be
+// read: "" when it can. Both paths are "" when the environment is not known
+// or the stack cannot be read here. The file must be read, not only found:
+// LoadStackValues skips a file it cannot read or parse, which would leave
+// base.yaml alone describing the install.
+func stackEnvFile(t stackTarget) (dir, envFile, problem string) {
+	env, ok := stackEnvForRun(t)
+	if !ok {
+		return "", "", ""
+	}
+	if dir = stackDirForRun(t); dir == "" {
+		return "", "", ""
+	}
+	envFile = filepath.Join(dir, "environments", env+".yaml")
+	fi, err := os.Stat(envFile)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		problem = "is missing"
+	case err == nil && !fi.Mode().IsRegular():
+		problem = "is not a regular file"
+	case err != nil || !selfhosted.ValuesFileReadable(envFile):
+		problem = "cannot be read or is not valid YAML"
+	}
+	return dir, envFile, problem
+}
+
+// stackEnvironmentSkip is the warning row for a plane whose stack has no
+// readable file for the install's environment, so the run leaves out
+// leftOut, what it reads from that stack. None when the file is read, or when
+// the environment is not known or the stack cannot be read here: those runs
+// leave the stack out by design.
+func stackEnvironmentSkip(category string, t stackTarget, leftOut string) []selfhosted.SkippedCheck {
+	_, envFile, problem := stackEnvFile(t)
+	if problem == "" {
+		return nil
+	}
+	return []selfhosted.SkippedCheck{{
+		Category: category, ID: "stack-environment", Warn: true,
+		Message: "stack values not read: " + envFile + " " + problem + "; " + leftOut + " are not used",
+	}}
 }
 
 // stackEnvForRun returns the environment the install of t's plane used, and
@@ -1051,6 +1089,25 @@ func runPreflightByRole(
 	computeSkips = append(computeSkips,
 		validatorSkip(selfhosted.CategoryComputePlane, clusterValidatorImage, unresolvedImage)...)
 	cpSkips := validatorSkip(selfhosted.CategoryControlPlane, clusterValidatorImage, unresolvedImage)
+	// A plane says when its stack's environment file was not read, rather than
+	// checking without that stack's values and saying nothing, but only where
+	// the run uses them: the registry check uses registryTarget's stack, and
+	// the cluster-validator the control plane's. Elsewhere those values go
+	// unused whether the file is read or not. --local-only, which reads no
+	// stack, has returned above.
+	registriesFromCP := registryTarget().name == controlPlaneStackTarget().name
+	switch {
+	case clusterValidatorImage != "":
+		cpSkips = append(cpSkips, stackEnvironmentSkip(selfhosted.CategoryControlPlane, controlPlaneStackTarget(),
+			"the stack's registries, Gateway names, Envoy Gateway namespace, external components and StorageClass")...)
+	case registriesFromCP:
+		cpSkips = append(cpSkips, stackEnvironmentSkip(selfhosted.CategoryControlPlane, controlPlaneStackTarget(),
+			"the stack's registries")...)
+	}
+	if !registriesFromCP {
+		computeSkips = append(computeSkips, stackEnvironmentSkip(selfhosted.CategoryComputePlane,
+			computePlaneStackTarget(), "the stack's registries")...)
+	}
 
 	// clusterValidatorImage is resolved by the caller. Empty value means
 	// either the operator explicitly opted out (--skip-cluster-validation /
