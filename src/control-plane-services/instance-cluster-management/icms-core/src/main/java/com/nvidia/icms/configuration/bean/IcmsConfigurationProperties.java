@@ -167,6 +167,10 @@ public class IcmsConfigurationProperties {
     // tables. Writes to the by-day tables are unaffected.
     private boolean creationBucketReadsEnabled = true;
 
+    // Use the indexed main tables to discover cleanup candidates. Keep the by-day cleanup path
+    // available for rollback while by-day writes and partition deletion remain in place.
+    private boolean databaseCleanupMainTableReadsEnabled = true;
+
     private Map<String, List<String>> supportedGpuDetails = new HashMap<>();
     private Map<String, String> gpusToQueueUrlGpuNameMap = new HashMap<>();
 

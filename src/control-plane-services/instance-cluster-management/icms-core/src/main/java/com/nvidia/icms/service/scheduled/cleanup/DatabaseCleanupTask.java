@@ -150,6 +150,11 @@ public class DatabaseCleanupTask<T> {
             log.info("Processing database cleanup task {} for {} ", jobName, day.toString());
             sendTelemetryEvent(STARTED, jobName, day, null);
 
+            if (icmsConfigurationProperties.isDatabaseCleanupMainTableReadsEnabled()) {
+                executeMainTableCleanup(cleanupExecutor, jobName, day, daysToKeep);
+                return;
+            }
+
             T firstRecord = cleanupExecutor.getFirstRecord(day);
             if (firstRecord == null) {
                 log.info("Database cleanup task {} for {}: no records found.", jobName, day);
@@ -189,6 +194,29 @@ public class DatabaseCleanupTask<T> {
             log.error(message, e);
             sendErrorTelemetryEvent(jobName, day, e);
             throw e;
+        }
+    }
+
+    private void executeMainTableCleanup(DatabaseCleanupExecutor<T> cleanupExecutor,
+                                         String jobName, Instant day, int daysToKeep) {
+        boolean hasMainRecords = cleanupExecutor.hasMainRecordsForDay(day);
+        if (day.isBefore(TimeUtils.getPreviousDate(daysToKeep)) && hasMainRecords) {
+            cleanupExecutor.cleanupRecordsFromMainTable(day);
+            sendTelemetryEvent(DELETED_ALL_RECORDS, jobName, day, null);
+            hasMainRecords = cleanupExecutor.hasMainRecordsForDay(day);
+        }
+
+        // Only remove the by-day partition after every live main record has gone. An in-flight
+        // termination leaves its main record in place so it can be retried on the next run.
+        if (hasMainRecords) {
+            log.info("Database cleanup task {} for {}: main records remain; keeping by-day data.",
+                    jobName, day);
+            sendTelemetryEvent(SKIPPED_ACTIVE, jobName, day, null);
+        } else {
+            log.info("Database cleanup task {} for {}: no main records remain; removing by-day data.",
+                    jobName, day);
+            cleanupExecutor.deleteRecordsByDay(day);
+            sendTelemetryEvent(DELETED_DAY_DATA, jobName, day, null);
         }
     }
 

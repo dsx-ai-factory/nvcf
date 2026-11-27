@@ -72,6 +72,38 @@ public class InstancesByDayCleanupExecutor implements
     }
 
     @Override
+    public boolean hasMainRecordsForDay(Instant day) {
+        return instanceV2Repository.getInstanceV2Repo()
+                .findInstanceIdsByCreationBucket(day).iterator().hasNext();
+    }
+
+    @Override
+    public void cleanupRecordsFromMainTable(Instant day) {
+        var rows = instanceV2Repository.getInstanceV2Repo()
+                .findInstanceIdsByCreationBucket(day);
+        for (var row : rows) {
+            String instanceId = row.getString(InstanceV2Entity.COLUMN_INSTANCE_ID);
+            if (instanceId != null) {
+                instanceV2Repository.findInstanceById(instanceId).ifPresent(this::cleanupInstance);
+            }
+        }
+    }
+
+    private void cleanupInstance(InstanceV2Entity instance) {
+        Optional<InstanceRequestV2Entity> request =
+                instanceRequestV2Repository.findRequestById(instance.getRequestId());
+        if (request.isEmpty()) {
+            log.info("InstancesByDayCleanupExecutor : RequestId {} InstanceId {}: terminating instance because request does not exist.",
+                    instance.getRequestId(), instance.getInstanceId());
+            instanceV2Repository.delete(instance, true);
+        } else {
+            log.info("InstancesByDayCleanupExecutor : RequestId {} InstanceId {}: terminating instance due to age.",
+                    instance.getRequestId(), instance.getInstanceId());
+            expiredInstanceTerminateService.terminateExpiredInstances(List.of(instance));
+        }
+    }
+
+    @Override
     public void cleanupRecordsByDay(Instant day) {
         SliceResult<InstanceByDayEntity> entities = new SliceResult<>(null,
                                                                                   icmsConfigurationProperties.getDatabaseCleanupDbPageSize());

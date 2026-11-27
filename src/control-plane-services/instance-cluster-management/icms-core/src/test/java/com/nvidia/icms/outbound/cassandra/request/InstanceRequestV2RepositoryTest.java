@@ -679,8 +679,9 @@ public class InstanceRequestV2RepositoryTest  extends InstanceRequestTestBase {
     }
 
 
-    @Test
-    void DatabaseCleanupTask_ok()
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void DatabaseCleanupTask_ok(boolean mainTableReadsEnabled)
             throws InterruptedException {
 
         // Arrange
@@ -688,6 +689,8 @@ public class InstanceRequestV2RepositoryTest  extends InstanceRequestTestBase {
         RequestsByDayCleanupExecutor executor = new RequestsByDayCleanupExecutor(instanceRequestV2Repository, terminateInstanceService, icmsConfigurationProperties);
 
         Mockito.when(icmsConfigurationProperties.isDatabaseCleanupTaskEnabled()).thenReturn(true);
+        Mockito.when(icmsConfigurationProperties.isDatabaseCleanupMainTableReadsEnabled())
+                .thenReturn(mainTableReadsEnabled);
         Mockito.when(icmsConfigurationProperties.getDatabaseCleanupLookupPeriodInDays()).thenReturn(10);
         Mockito.when(icmsConfigurationProperties.getDatabaseRecordsTtlInDays()).thenReturn(3);
         Mockito.when(icmsConfigurationProperties.getDatabaseCleanupLockTtlInSeconds()).thenReturn(15);
@@ -701,6 +704,13 @@ public class InstanceRequestV2RepositoryTest  extends InstanceRequestTestBase {
         //These records are day that is beyond keep period which is 3 days. All records will be removed by job
         Instant dayExpired =  TimeUtils.getPreviousDate(5);
         List<InstanceRequestV2Entity> newExpiredRecords = insertRequestsInDb("db_cleanup_expired", 2, dayExpired, null, null);
+
+        // A stranded by-day entry has no main record. The new scan must still clear its partition.
+        Instant orphanDay = TimeUtils.getPreviousDate(6);
+        var orphan = new InstanceRequestV2ByDayEntity(
+                new InstanceRequestV2ByDayKey(orphanDay, "db_cleanup_orphan"),
+                TimeUtils.getTimeUuidNow(), false);
+        instanceRequestV2ByDayRepo.update(orphan);
 
         List<InstanceRequestV2Entity> recordsToKeep = insertRequestsInDb("db_cleanup", 2, TimeUtils.getPreviousDate(1), null,null);
 
@@ -724,6 +734,9 @@ public class InstanceRequestV2RepositoryTest  extends InstanceRequestTestBase {
 
         requestsByDay = instanceRequestV2Repository.instanceRequestV2ByDayRepo.findAllByKeyTruncatedTsByDay(dayExpired, Limit.unlimited());
         assertTrue(requestsByDay.isEmpty()); // this table should not have any records for this day
+
+        assertTrue(instanceRequestV2ByDayRepo
+                .findAllByKeyTruncatedTsByDay(orphanDay, Limit.unlimited()).isEmpty());
 
         requestIds.clear();
         recordsToKeep.forEach(r -> requestIds.add(r.getRequestId()));

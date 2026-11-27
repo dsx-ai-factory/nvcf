@@ -64,4 +64,10 @@ public interface DatabaseCleanupExecutor<T> {
      */
     void cleanupRecordsByDay(Instant day);
 
+    /** Returns whether the indexed main table contains records for this day. */
+    boolean hasMainRecordsForDay(Instant day);
+
+    /** Processes records found through the indexed main table for this day. */
+    void cleanupRecordsFromMainTable(Instant day);
+
 }

@@ -73,6 +73,43 @@ public class RequestsByDayCleanupExecutor implements
     }
 
     @Override
+    public boolean hasMainRecordsForDay(Instant day) {
+        return instanceRequestV2Repository.getInstanceRequestV2Repo()
+                .findRequestIdsByCreationBucket(day).iterator().hasNext();
+    }
+
+    @Override
+    public void cleanupRecordsFromMainTable(Instant day) {
+        var rows = instanceRequestV2Repository.getInstanceRequestV2Repo()
+                .findRequestIdsByCreationBucket(day);
+        for (var row : rows) {
+            String requestId = row.getString(InstanceRequestV2Entity.COLUMN_REQUEST_ID);
+            if (requestId != null) {
+                cleanupRequest(requestId);
+            }
+        }
+    }
+
+    private void cleanupRequest(String requestId) {
+        Optional<InstanceRequestV2Entity> request =
+                instanceRequestV2Repository.findRequestById(requestId);
+        if (request.isEmpty()) {
+            return;
+        }
+        Map<String, Object> auditProps = new HashMap<>();
+        AuditUtils.populateAuditValuesForCleanupInstanceRequest(auditProps, requestId);
+        log.info("RequestsByDayCleanupExecutor : RequestId {} : terminating instance request due to age.",
+                requestId);
+        TerminateInstancesResponse result = terminateInstanceService.terminateInstanceRequests(
+                request.get().getCustomer(), Set.of(requestId), auditProps);
+        if (result.getTerminatingInstances().isEmpty()) {
+            log.info("RequestsByDayCleanupExecutor : RequestId {} : deleting request without instances from DB due to age.",
+                    requestId);
+            instanceRequestV2Repository.delete(request.get());
+        }
+    }
+
+    @Override
     public void cleanupRecordsByDay(Instant day) {
         String cursor = null;
         boolean hasData = true;
