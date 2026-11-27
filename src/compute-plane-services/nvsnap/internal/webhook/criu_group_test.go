@@ -36,7 +36,7 @@ func groupMutator(t *testing.T, g CRIUGroup, blocked string) (*Mutator, *string)
 	var asked string
 	m := &Mutator{Backend: newBackend(t), Composer: &rootfsonly.HashInputComposer{CUDADriverMajor: 610},
 		CheckpointHostRoot: "/var/lib/containerd/nvsnap-checkpoints",
-		CRIUGroups: func(_ context.Context, ns, uri string) (CRIUGroup, bool) {
+		CRIUGroups: func(_ context.Context, ns, uri, _ string) (CRIUGroup, bool) {
 			asked = "key-of/" + ns + "/" + uri
 			g.Key = asked
 			return g, uri != ""
@@ -171,7 +171,7 @@ func TestCRIUGroupRestore_PlaceholderGetsOnlyTheLanding(t *testing.T) {
 	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
 	m.CRIUCapture = true
 	m.CheckpointHostRoot = "/var/lib/containerd/nvsnap-checkpoints"
-	m.CRIUGroups = func(_ context.Context, ns, uri string) (CRIUGroup, bool) {
+	m.CRIUGroups = func(_ context.Context, ns, uri, _ string) (CRIUGroup, bool) {
 		return CRIUGroup{Key: "key-of/" + ns + "/" + uri, Checkpoints: []string{"r0__1"}, GPUShare: true}, true
 	}
 	completeModelPV(t, kc, scoped("sr-fn", ngcFunctionKey))
@@ -221,7 +221,7 @@ func TestCRIUGroupRestore_PlaceholderWithoutTheModelStartsCold(t *testing.T) {
 	kc := fake.NewSimpleClientset()
 	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
 	m.CRIUCapture = true
-	m.CRIUGroups = func(_ context.Context, ns, uri string) (CRIUGroup, bool) {
+	m.CRIUGroups = func(_ context.Context, ns, uri, _ string) (CRIUGroup, bool) {
 		return CRIUGroup{Key: "k", Checkpoints: []string{"r0__1"}, GPUShare: true}, true
 	}
 	pod := ngcFunctionPod()
@@ -289,7 +289,7 @@ func TestCRIUGroupRestore_PlaceholderGetsTheLandingsEnvironment(t *testing.T) {
 	m, _ := mvMutatorReader(t, modelvolume.ModeBlock, "", election.RoleFollower, kc)
 	m.CRIUCapture = true
 	m.CheckpointHostRoot = "/var/lib/containerd/nvsnap-checkpoints"
-	m.CRIUGroups = func(_ context.Context, ns, uri string) (CRIUGroup, bool) {
+	m.CRIUGroups = func(_ context.Context, ns, uri, _ string) (CRIUGroup, bool) {
 		return CRIUGroup{Key: "key-of/" + ns + "/" + uri, Checkpoints: []string{"r0__1"}, GPUShare: true}, true
 	}
 	completeModelPV(t, kc, scoped("sr-fn", ngcFunctionKey))

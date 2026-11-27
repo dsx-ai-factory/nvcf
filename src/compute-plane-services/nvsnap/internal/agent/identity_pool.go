@@ -29,6 +29,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 // identityPoolSlots bounds the slots of one configuration in one tenant
@@ -138,11 +140,11 @@ func (a *Agent) instanceIDHeld(ctx context.Context, ns string, ids []string) (st
 }
 
 // poolSlotForRestore returns the record key a pod of the configuration base
-// in ns restores from: base itself for a configuration without a pool (its
+// in ns, of process configuration processConfig, restores from: base itself for a configuration without a pool (its
 // record names no instance ID, or there is none), else the first complete
 // slot whose instance IDs no running pod of ns holds. "" when every slot is
 // in use: the pod starts cold, and is captured into a new slot.
-func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string {
+func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base, processConfig string) string {
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
 	for k := 0; k < identityPoolSlots; k++ {
 		key := poolSlotKey(base, k)
@@ -154,15 +156,13 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string 
 			return ""
 		}
 		if err != nil {
-			// Cannot tell: the configuration's own record, as before pools;
-			// the restore's claim still refuses a held identity.
-			return base
+			return "" // cannot tell which record restores this pod: cold
 		}
 		ids := recordInstanceIDs(cm.Data)
 		if len(ids) == 0 {
 			return key // not a pool
 		}
-		if !slotRestorableIn(key, cm.Data, ns) {
+		if !slotRestorableIn(key, cm.Data, ns) || !slotOfConfig(cm.Data, processConfig) {
 			continue
 		}
 		held, err := a.instanceIDHeld(ctx, ns, ids)
@@ -174,6 +174,18 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string 
 		}
 	}
 	return ""
+}
+
+// slotOfConfig reports whether the single-rank slot record d was captured
+// with process configuration pc (webhook.ProcessConfig): the one rule
+// admission and capture share, so a pod restores only from a slot its
+// restored process could run as, and a slot of another configuration is
+// replaced by a new capture. A record or a pod without one matches.
+func slotOfConfig(d map[string]string, pc string) bool {
+	if pc == "" {
+		return true
+	}
+	return len(webhook.ProcessConfigChanges(d["processConfig.0"], pc)) == 0
 }
 
 // slotRestorableIn reports whether the slot record key, with data d, can
@@ -207,7 +219,7 @@ func (a *Agent) poolHasFreeSlot(ctx context.Context, ns, base string, pod *corev
 		// ns (not a stalled verification, which a capture may replace) and of
 		// pod's process configuration (an older one is replaced instead).
 		if !slotRestorableIn(poolSlotKey(base, k), cm.Data, ns) ||
-			len(processConfigChanged(cm.Data, []*corev1.Pod{pod}, 1, nil)) > 0 {
+			!slotOfConfig(cm.Data, pod.Annotations[webhook.ProcessConfigAnnotation]) {
 			continue
 		}
 		ids := recordInstanceIDs(cm.Data)

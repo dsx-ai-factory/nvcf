@@ -111,7 +111,7 @@ func criuGroupKey(cacheURI, scope string) string {
 
 // lookupCRIUGroupFor is the webhook's view of the group records: the
 // complete capture of uri in namespace ns's scope.
-func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook.CRIUGroup, bool) {
+func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri, processConfig string) (webhook.CRIUGroup, bool) {
 	scope, err := a.criuGroupScope(ctx, ns)
 	if err != nil {
 		a.log.WithError(err).WithField("namespace", ns).Warn("CRIU group restore: cannot read the namespace's scope; cold start")
@@ -125,7 +125,7 @@ func (a *Agent) lookupCRIUGroupFor(ctx context.Context, ns, uri string) (webhook
 	key := criuGroupKeyDriver(uri, scope, a.keyDriver(ctx))
 	// A configuration with an identity pool restores from a slot no pod of
 	// the namespace holds (identity_pool.go); with every slot held, cold.
-	if key = a.poolSlotForRestore(ctx, ns, key); key == "" {
+	if key = a.poolSlotForRestore(ctx, ns, key, processConfig); key == "" {
 		return webhook.CRIUGroup{}, false
 	}
 	g, ok := a.lookupCRIUGroup(ctx, key)

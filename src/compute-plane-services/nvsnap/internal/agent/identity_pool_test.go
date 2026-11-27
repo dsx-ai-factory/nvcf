@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/webhook"
 )
 
 func TestPoolSlotKeys(t *testing.T) {
@@ -73,10 +75,10 @@ func TestPoolSlotForRestore(t *testing.T) {
 		livePod("fn", "prefill-a", "ua"), instanceClaim("fn", "111", "prefill-a", "ua"), // slot 0 held
 	}
 	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(objs...), dynClient: fakeDyn()}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "cfg-s1" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "cfg-s1" {
 		t.Fatalf("slot 0 held: %q, want cfg-s1", got)
 	}
-	if got := a.poolSlotForRestore(ctx, "other", "cfg"); got != "cfg" {
+	if got := a.poolSlotForRestore(ctx, "other", "cfg", ""); got != "cfg" {
 		t.Fatalf("another namespace: %q, want cfg (the claim is per namespace)", got)
 	}
 	// Slot 1 held by a running pod's own registration (no claim).
@@ -88,7 +90,7 @@ func TestPoolSlotForRestore(t *testing.T) {
 	if err := a.kubeClient.(*k8sfake.Clientset).Tracker().Add(livePod("fn", "prefill-b", "ub")); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "cfg-s2" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "cfg-s2" {
 		t.Fatalf("slots 0 and 1 held: %q, want cfg-s2", got)
 	}
 	if err := a.kubeClient.(*k8sfake.Clientset).Tracker().Add(livePod("fn", "prefill-c", "uc")); err != nil {
@@ -97,14 +99,14 @@ func TestPoolSlotForRestore(t *testing.T) {
 	if err := a.kubeClient.(*k8sfake.Clientset).Tracker().Add(instanceClaim("fn", "333", "prefill-c", "uc")); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "" {
 		t.Fatalf("every slot held: %q, want none", got)
 	}
 	// A claim whose pod is gone holds nothing.
 	if err := a.kubeClient.(*k8sfake.Clientset).Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), "fn", "prefill-a"); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "cfg" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "cfg" {
 		t.Fatalf("slot 0's holder gone: %q, want cfg", got)
 	}
 }
@@ -116,10 +118,10 @@ func TestPoolSlotForRestoreWithoutPool(t *testing.T) {
 	plain := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName("cfg"), Namespace: "nvsnap-system"},
 		Data: map[string]string{"state": criuGroupStateComplete, "size": "1"}}
 	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(plain), dynClient: fakeDyn()}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "cfg" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "cfg" {
 		t.Fatalf("plain record: %q", got)
 	}
-	if got := a.poolSlotForRestore(ctx, "fn", "nothing"); got != "nothing" {
+	if got := a.poolSlotForRestore(ctx, "fn", "nothing", ""); got != "nothing" {
 		t.Fatalf("no record: %q, want the key (the lookup finds nothing, as before)", got)
 	}
 }
@@ -182,7 +184,7 @@ func TestPoolSlotEligibility(t *testing.T) {
 	if a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
 		t.Error("a stalled verification counts as a free slot: the capture that would replace it is skipped")
 	}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "" {
 		t.Errorf("admission chose the stalled slot %q", got)
 	}
 
@@ -197,10 +199,10 @@ func TestPoolSlotEligibility(t *testing.T) {
 	verifying := poolRecord("cfg", "10.0.0.1", 111)
 	verifying.Data["state"], verifying.Data["sourceNamespace"] = criuGroupStateVerifying, "ns-a"
 	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(verifying, poolRecord("cfg-s1", "10.0.0.2", 222)), dynClient: fakeDyn()}
-	if got := a.poolSlotForRestore(ctx, "ns-b", "cfg"); got != "cfg-s1" {
+	if got := a.poolSlotForRestore(ctx, "ns-b", "cfg", ""); got != "cfg-s1" {
 		t.Errorf("slot 0 verifying for ns-a, admission in ns-b: %q, want cfg-s1", got)
 	}
-	if got := a.poolSlotForRestore(ctx, "ns-a", "cfg"); got != "cfg" {
+	if got := a.poolSlotForRestore(ctx, "ns-a", "cfg", ""); got != "cfg" {
 		t.Errorf("its own namespace's verification restore: %q, want cfg", got)
 	}
 
@@ -212,7 +214,36 @@ func TestPoolSlotEligibility(t *testing.T) {
 		return false, nil, nil
 	})
 	a = &Agent{kubeClient: kc, dynClient: fakeDyn()}
-	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "" {
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "" {
 		t.Errorf("holder check failed: %q, want cold", got)
+	}
+}
+
+// Admission and capture share one configuration rule: with slot 0 of an
+// older process configuration and slot 1 of the pod's, admission restores
+// from slot 1, and the capture side counts slot 1 as free. A record read
+// error starts the pod cold.
+func TestPoolSlotSameConfigRule(t *testing.T) {
+	ctx := context.Background()
+	old := poolRecord("cfg", "10.0.0.1", 111)
+	old.Data["processConfig.0"] = "v1 main/args=aaaaaaaaaaaa"
+	cur := poolRecord("cfg-s1", "10.0.0.2", 222)
+	cur.Data["processConfig.0"] = "v1 main/args=bbbbbbbbbbbb"
+	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(old, cur), dynClient: fakeDyn()}
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", "v1 main/args=bbbbbbbbbbbb"); got != "cfg-s1" {
+		t.Errorf("admission: %q, want the slot of the pod's configuration (cfg-s1)", got)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{webhook.ProcessConfigAnnotation: "v1 main/args=bbbbbbbbbbbb"}}}
+	if !a.poolHasFreeSlot(ctx, "fn", "cfg", pod) {
+		t.Error("capture side: slot 1 of the pod's configuration is free, but not counted")
+	}
+
+	kc := k8sfake.NewSimpleClientset()
+	kc.PrependReactor("get", "configmaps", func(act k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	a = &Agent{kubeClient: kc, dynClient: fakeDyn()}
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", ""); got != "" {
+		t.Errorf("record read failed: %q, want cold", got)
 	}
 }

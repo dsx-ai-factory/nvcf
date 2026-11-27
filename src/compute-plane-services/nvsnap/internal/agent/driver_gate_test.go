@@ -194,7 +194,7 @@ func TestDriverGateAdmission(t *testing.T) {
 	if _, err := cs.CoreV1().ConfigMaps(ns).Create(ctx, &rec, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if g, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg"); !ok || g.Key != key {
+	if g, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg", ""); !ok || g.Key != key {
 		t.Fatalf("driver 610: lookup %+v %v, want the capture keyed with 610", g, ok)
 	}
 	if fb, ok := a.criuFallbackFor(ctx, "fn", "cache://cfg", 0, ""); ok {
@@ -206,7 +206,7 @@ func TestDriverGateAdmission(t *testing.T) {
 	// record falls back too.
 	driverAgentPod(t, cs, ns, "gpu-2", 580)
 	a.drivers.at = time.Time{}
-	if _, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg"); ok {
+	if _, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg", ""); ok {
 		t.Fatal("a capture restores while a GPU node runs 580")
 	}
 	for _, uri := range []string{"cache://cfg", "cache://never-captured"} {
@@ -230,7 +230,7 @@ func TestDriverGateAdmission(t *testing.T) {
 		t.Fatalf("minimum 580, all on 580: falls back %+v", fb)
 	}
 	// The 610 capture is not restored under 580: its key names 610.
-	if g, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg"); ok {
+	if g, ok := a.lookupCRIUGroupFor(ctx, "fn", "cache://cfg", ""); ok {
 		t.Fatalf("a 610 capture is restored under 580: %+v", g)
 	}
 }
