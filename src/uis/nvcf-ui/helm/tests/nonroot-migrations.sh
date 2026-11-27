@@ -34,6 +34,7 @@ render_migration_case() {
 # Older saved values can omit the selector; null is also removed by Helm.
 cp -R "$chart" "$work_dir/legacy-chart"
 yq -i 'del(.nvcfUi.openbaoMigrations.kubectlMinor)' "$work_dir/legacy-chart/values.yaml"
+yq -i 'del(.nvcfUi.openbaoMigrations.jwtPluginVersion)' "$work_dir/legacy-chart/values.yaml"
 migration_chart="$work_dir/legacy-chart" render_migration_case
 test -z "$(yq -rN "$container | .env[] | select(.name == \"NVCF_KUBECTL_MINOR\") | .value" "$work_dir/migration.yaml")"
 render_migration_case --set nvcfUi.openbaoMigrations.kubectlMinor=null
@@ -71,5 +72,21 @@ if render_migration_case --set-string nvcfUi.openbaoMigrations.kubectlMinor=1.35
   exit 1
 fi
 grep -Fq 'nvcfUi.openbaoMigrations.kubectlMinor must be empty, 1.36, or 1.37' "$work_dir/invalid-client.err"
+
+# New UI-owned JWT mounts must remain explicitly pinned after legacy removal.
+source "$repo_root/infra/openbao/jwt-plugin-versions.env"
+render_migration_case --set-string "nvcfUi.openbaoMigrations.jwtPluginVersion=$JWT_PLUGIN_TARGET_VERSION"
+test "$(yq -rN "$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value" "$work_dir/migration.yaml")" = "$JWT_PLUGIN_TARGET_VERSION"
+render_migration_case
+test -z "$(yq -rN "$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value" "$work_dir/migration.yaml")"
+render_migration_case --set nvcfUi.openbaoMigrations.jwtPluginVersion=null
+test -z "$(yq -rN "$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value" "$work_dir/migration.yaml")"
+for invalid in latest v1.2 'v1.2.3/invalid' false 0; do
+  if render_migration_case --set-string "nvcfUi.openbaoMigrations.jwtPluginVersion=$invalid" 2> "$work_dir/invalid-version.err"; then
+    echo 'FAIL: invalid JWT plugin version rendered' >&2
+    exit 1
+  fi
+  grep -Fq 'jwtPluginVersion must be empty or a v-prefixed plugin version' "$work_dir/invalid-version.err"
+done
 
 echo "nonroot-ui-migrations: all checks passed"

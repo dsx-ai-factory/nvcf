@@ -175,11 +175,16 @@ NGC_API_KEY=<key> SAMPLE_NGC_ORG=<org> SAMPLE_NGC_TEAM=<team> \
 `TestOpenBaoJWTPluginLifecycle` exercises real file-backed OpenBao restarts,
 declarative registration, version tuning, plugin reload, rollback, and gated
 cleanup. The test verifies JWT signatures, retained public keys, and recovery
-when migrations have not created their first JWT mount. It uses new disposable
+when a fresh target-only server has not created its first JWT mount. It uses new disposable
 Docker containers without installing a Kubernetes stack. It starts the
 published legacy server binary, upgrades to the bridge server binary, and tests
 legacy, bridge, and target-only plugin layouts with retained storage. The test
 does not qualify Helm hooks, HA failover, or multi-architecture release images.
+It also rejects direct legacy-to-target-only deployment and tests post-removal
+recovery by restoring the bridge layout after catalog cleanup, selecting the
+old plugin, verifying retained keys, and re-upgrading. This file-backed check
+does not qualify the all-member Kubernetes cleanup tool or a production recovery
+artifact.
 
 Follow the root local QA rules before running. Use a fresh worktree containing
 the candidate changes, inventory existing Docker and cluster state, and choose
@@ -214,6 +219,26 @@ go test -run '^TestOpenBaoJWTPluginLifecycle$' -timeout 15m -v
 
 The `-short` suite runs a separate fake-runner wiring check. It does not
 validate an OpenBao deployment.
+
+### OpenBao JWT plugin HA
+
+`TestOpenBaoJWTPluginHA` uses a fresh lifecycle test container. It starts three
+persistent voters, rotates every checked standby, and probes JWT version, SHA,
+retained keys and voters before and after normal failover. It covers old pin,
+target upgrade, rollback, re-upgrade and target-only rollout. It requires no
+custom server API and does not require every voter to become active.
+
+```bash
+export OPENBAO_RAFT_TEST_CONTAINER="nvcf-jwt-ha-$OPENBAO_JWT_TEST_ID"
+docker run -d --name "$OPENBAO_RAFT_TEST_CONTAINER" --network none \
+  "$OPENBAO_JWT_TEST_IMAGE"
+cd "$(git rev-parse --show-toplevel)/tests/bdd"
+go test -run '^TestOpenBaoJWTPluginHA$' -timeout 20m -v
+```
+
+This three-process Raft check does not qualify Kubernetes rollout hooks,
+the cluster cleanup tool or published release artifacts. The short suite's
+wiring checks remain separate from live results.
 
 ### BYOO features
 
