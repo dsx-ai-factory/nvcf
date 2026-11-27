@@ -36,7 +36,7 @@ grpcproxy:
 
     pullPolicy: IfNotPresent
 
-    tag: "1.37.0"
+    tag: "1.40.3"
 
   # Image pull secrets for private registries
   imagePullSecrets: []
@@ -98,10 +98,14 @@ grpcproxy:
       cpu: 1000m
       memory: 1Gi
 
+  # Liveness uses /livez on the admin port, which fails only when a NATS
+  # connection is closed. Readiness uses /health on the client port, which also
+  # fails while NATS is reconnecting or nvcf-api is unreachable, so those
+  # outages take the pod out of service without restarting it.
   livenessProbe:
     httpGet:
-      path: /health
-      port: client
+      path: /livez
+      port: metrics
   readinessProbe:
     httpGet:
       path: /health
