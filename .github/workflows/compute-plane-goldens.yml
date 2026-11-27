@@ -16,9 +16,10 @@
 # is pulled from a registry at the version the stack pins. So the paths below
 # are the stack itself, plus this workflow and the script it runs.
 #
-# The render pulls charts from the registry named by NCP_DEV_REGISTRY, so it
-# runs for pushes and for pull requests from branches of this repository. A
-# pull request from a fork gets a notice instead.
+# The render pulls charts from the registry named by NCP_DEV_REGISTRY. Fork
+# repositories and PRs from forks may not have those secrets; skip the render
+# there when they are absent, while treating missing credentials in upstream
+# runs from non-fork branches as a configuration error.
 
 name: compute-plane goldens
 
@@ -94,16 +95,22 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
 
       - name: Log in to the chart registry
+        id: registry
         # The render pulls the charts the stack pins from this registry. Same
-        # login as chart-push-manual.yml. This job only runs where the
-        # secrets are provided, so a missing one is a configuration error and
-        # fails the check rather than passing it unchecked.
+        # login as chart-push-manual.yml. Upstream runs require both secrets;
+        # fork repositories and PRs from forks may omit them and skip this check.
         env:
           NGC_KEY: ${{ secrets.NGC_NCP_DEV_KEY }}
           REGISTRY: ${{ secrets.NCP_DEV_REGISTRY }}
+          RUN_IS_FORK: ${{ github.event.repository.fork || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
         run: |
           set -euo pipefail
           if [ -z "${NGC_KEY}" ] || [ -z "${REGISTRY}" ]; then
+            if [ "${RUN_IS_FORK}" = "true" ]; then
+              echo "::notice::The compute-plane goldens were not rendered because registry secrets are not available in this fork"
+              echo "skipped=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
             echo "::error::secrets NGC_NCP_DEV_KEY and NCP_DEV_REGISTRY are not set, so the compute-plane goldens cannot be checked"
             exit 1
           fi
@@ -112,4 +119,5 @@ jobs:
           printf '%s' "${NGC_KEY}" | helm registry login "${host}" -u '$oauthtoken' --password-stdin
 
       - name: Compare the goldens with a fresh render
+        if: steps.registry.outputs.skipped != 'true'
         run: tools/ci/refresh-compute-plane-goldens check
