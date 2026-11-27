@@ -162,12 +162,12 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string 
 		if len(ids) == 0 {
 			return key // not a pool
 		}
-		if !recordUsable(cm.Data) {
+		if !slotRestorableIn(key, cm.Data, ns) {
 			continue
 		}
 		held, err := a.instanceIDHeld(ctx, ns, ids)
 		if err != nil {
-			return key
+			return "" // cannot tell whether its identity is free: cold
 		}
 		if held == "" {
 			return key
@@ -176,11 +176,24 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string 
 	return ""
 }
 
-// poolHasFreeSlot reports whether the configuration base has a complete
-// slot whose instance IDs no running pod of ns holds: a replica that started
-// cold anyway did so for another reason than a full pool, and is not
-// captured into a new slot. False when it has no record at all.
-func (a *Agent) poolHasFreeSlot(ctx context.Context, ns, base string) bool {
+// slotRestorableIn reports whether the slot record key, with data d, can
+// restore a pod of ns now: a record admission accepts (complete, or being
+// verified by its own instance's restore, and not stalled), whose
+// verification, if any, is ns's.
+func slotRestorableIn(key string, d map[string]string, ns string) bool {
+	g, ok := parseCRIUGroup(key, d)
+	if !ok {
+		return false
+	}
+	return g.VerifyNamespace == "" || g.VerifyNamespace == ns
+}
+
+// poolHasFreeSlot reports whether the configuration base has a slot pod
+// could restore from in ns (slotRestorableIn, of pod's process
+// configuration) whose instance IDs no running pod of ns holds: a replica
+// that started cold anyway did so for another reason than a full pool, and
+// is not captured into a new slot. False when it has no record at all.
+func (a *Agent) poolHasFreeSlot(ctx context.Context, ns, base string, pod *corev1.Pod) bool {
 	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
 	for k := 0; k < identityPoolSlots; k++ {
 		cm, err := cms.Get(ctx, criuGroupConfigMapName(poolSlotKey(base, k)), metav1.GetOptions{})
@@ -190,7 +203,11 @@ func (a *Agent) poolHasFreeSlot(ctx context.Context, ns, base string) bool {
 		if err != nil {
 			return true // cannot tell: not captured now; a later event tries again
 		}
-		if !recordUsable(cm.Data) {
+		// Only a slot pod could restore from counts: one admission accepts in
+		// ns (not a stalled verification, which a capture may replace) and of
+		// pod's process configuration (an older one is replaced instead).
+		if !slotRestorableIn(poolSlotKey(base, k), cm.Data, ns) ||
+			len(processConfigChanged(cm.Data, []*corev1.Pod{pod}, 1, nil)) > 0 {
 			continue
 		}
 		ids := recordInstanceIDs(cm.Data)

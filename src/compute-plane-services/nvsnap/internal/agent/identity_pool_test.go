@@ -6,6 +6,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	k8stesting "k8s.io/client-go/testing"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,7 +41,8 @@ func poolRecord(key, ip string, id int64) *corev1.ConfigMap {
 	raw, _ := json.Marshal(spec)
 	regs, _ := json.Marshal(rankRegistrations{PodIP: ip, Objects: []workerRegistration{{Controller: true, Spec: raw}}})
 	return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: criuGroupConfigMapName(key), Namespace: "nvsnap-system"},
-		Data: map[string]string{"state": criuGroupStateComplete, "size": "1", "kubeRegistrations.0": string(regs)}}
+		Data: map[string]string{"state": criuGroupStateComplete, "size": "1", "checkpoint.0": key + "__20261127-000000",
+			"node.0": "n1", "kubeRegistrations.0": string(regs)}}
 }
 
 func livePod(ns, name, uid string) *corev1.Pod {
@@ -147,22 +150,69 @@ func TestPoolSlotForCapture(t *testing.T) {
 func TestPoolHasFreeSlot(t *testing.T) {
 	ctx := context.Background()
 	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(), dynClient: fakeDyn()}
-	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+	if a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
 		t.Fatal("no record: reported a free slot, so the first replica would never be captured")
 	}
 	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(poolRecord("cfg", "10.0.0.1", 111)), dynClient: fakeDyn()}
-	if !a.poolHasFreeSlot(ctx, "fn", "cfg") {
+	if !a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
 		t.Fatal("slot 0 complete and unheld: no free slot")
 	}
 	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(poolRecord("cfg", "10.0.0.1", 111),
 		livePod("fn", "prefill-a", "ua"), instanceClaim("fn", "111", "prefill-a", "ua")), dynClient: fakeDyn()}
-	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+	if a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
 		t.Fatal("the only slot held: reported free, so the second replica would never be captured")
 	}
 	capturing := poolRecord("cfg", "10.0.0.1", 111)
 	capturing.Data["state"] = criuGroupStateCapturing
 	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(capturing), dynClient: fakeDyn()}
-	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+	if a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
 		t.Fatal("a slot still capturing is not a free complete slot")
+	}
+}
+
+// Review fixes: a stalled verification or a slot of an older process
+// configuration does not count as free (a capture may replace it); a slot
+// verifying for another namespace is skipped at admission; an unreadable
+// holder starts the pod cold.
+func TestPoolSlotEligibility(t *testing.T) {
+	ctx := context.Background()
+	stalled := poolRecord("cfg", "10.0.0.1", 111)
+	stalled.Data["state"], stalled.Data["sourceNamespace"], stalled.Data["stalls"] = criuGroupStateVerifying, "fn", "3"
+	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(stalled), dynClient: fakeDyn()}
+	if a.poolHasFreeSlot(ctx, "fn", "cfg", &corev1.Pod{}) {
+		t.Error("a stalled verification counts as a free slot: the capture that would replace it is skipped")
+	}
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "" {
+		t.Errorf("admission chose the stalled slot %q", got)
+	}
+
+	old := poolRecord("cfg", "10.0.0.1", 111)
+	old.Data["processConfig.0"] = "v1 main/args=aaaaaaaaaaaa"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"nvsnap.io/process-config": "v1 main/args=bbbbbbbbbbbb"}}}
+	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(old), dynClient: fakeDyn()}
+	if a.poolHasFreeSlot(ctx, "fn", "cfg", pod) {
+		t.Error("a slot of another process configuration counts as free: the replacement capture is skipped")
+	}
+
+	verifying := poolRecord("cfg", "10.0.0.1", 111)
+	verifying.Data["state"], verifying.Data["sourceNamespace"] = criuGroupStateVerifying, "ns-a"
+	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(verifying, poolRecord("cfg-s1", "10.0.0.2", 222)), dynClient: fakeDyn()}
+	if got := a.poolSlotForRestore(ctx, "ns-b", "cfg"); got != "cfg-s1" {
+		t.Errorf("slot 0 verifying for ns-a, admission in ns-b: %q, want cfg-s1", got)
+	}
+	if got := a.poolSlotForRestore(ctx, "ns-a", "cfg"); got != "cfg" {
+		t.Errorf("its own namespace's verification restore: %q, want cfg", got)
+	}
+
+	kc := k8sfake.NewSimpleClientset(poolRecord("cfg", "10.0.0.1", 111))
+	kc.PrependReactor("get", "configmaps", func(act k8stesting.Action) (bool, runtime.Object, error) {
+		if act.GetNamespace() == "fn" {
+			return true, nil, errors.New("apiserver unavailable")
+		}
+		return false, nil, nil
+	})
+	a = &Agent{kubeClient: kc, dynClient: fakeDyn()}
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg"); got != "" {
+		t.Errorf("holder check failed: %q, want cold", got)
 	}
 }
