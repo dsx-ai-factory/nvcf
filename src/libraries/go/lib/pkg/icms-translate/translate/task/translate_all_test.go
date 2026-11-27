@@ -19,6 +19,7 @@ package task
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -410,4 +411,25 @@ func envValue(envs []corev1.EnvVar, name string) string {
 		}
 	}
 	return ""
+}
+
+// TestTranslateContainerWithEmptyHelmChartKey covers a container task message
+// that carries "helmChart": "" (or null). encoding/json allocates the embedded
+// Helm pointer for such a key, so a nil check alone would route the task to
+// the Helm translation.
+func TestTranslateContainerWithEmptyHelmChartKey(t *testing.T) {
+	for _, raw := range []string{`""`, `null`} {
+		t.Run(raw, func(t *testing.T) {
+			var spec LaunchSpecification
+			require.NoError(t, json.Unmarshal([]byte(`{"containerImage":"nvcr.io/nvidia/task:latest","helmChart":`+raw+`}`), &spec))
+			require.NotNil(t, spec.HelmChartLaunchSpecification, "decoder allocates the embedded pointer")
+			assert.False(t, spec.HelmChartLaunchSpecification.Defined())
+
+			msg := newTaskMessage(false)
+			msg.LaunchSpecification.HelmChartLaunchSpecification = spec.HelmChartLaunchSpecification
+			objs, err := Translate(msg, newTaskTranslateConfig())
+			require.NoError(t, err)
+			findTaskPodByName(t, objs, "0-request-task")
+		})
+	}
 }

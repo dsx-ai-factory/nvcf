@@ -40,7 +40,7 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -53,7 +53,7 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						TaskLaunchSpecification: &task.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -107,7 +107,7 @@ func TestIsMiniServiceType(t *testing.T) {
 							},
 						},
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -120,7 +120,7 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 							CacheLaunchSpecification:     &common.CacheLaunchSpecification{},
 						},
 					},
@@ -134,7 +134,7 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						TaskLaunchSpecification: &task.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 							CacheLaunchSpecification:     &common.CacheLaunchSpecification{},
 						},
 					},
@@ -225,7 +225,7 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 						TaskLaunchSpecification: &task.LaunchSpecification{
 							CacheLaunchSpecification: &common.CacheLaunchSpecification{},
@@ -244,7 +244,7 @@ func TestIsMiniServiceType(t *testing.T) {
 							CacheLaunchSpecification: &common.CacheLaunchSpecification{},
 						},
 						TaskLaunchSpecification: &task.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -257,10 +257,10 @@ func TestIsMiniServiceType(t *testing.T) {
 				Spec: nvcav2beta1.ICMSRequestSpec{
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 						TaskLaunchSpecification: &task.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -277,6 +277,34 @@ func TestIsMiniServiceType(t *testing.T) {
 						},
 						TaskLaunchSpecification: &task.LaunchSpecification{
 							CacheLaunchSpecification: &common.CacheLaunchSpecification{},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			// A container message that carries "helmChart": "" allocates the
+			// embedded pointer on decode; it is not a Helm workload.
+			name: "function request with allocated but empty helm chart launch specification",
+			request: &nvcav2beta1.ICMSRequest{
+				Spec: nvcav2beta1.ICMSRequestSpec{
+					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
+						FunctionLaunchSpecification: &function.LaunchSpecification{
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "task request with allocated but empty helm chart launch specification",
+			request: &nvcav2beta1.ICMSRequest{
+				Spec: nvcav2beta1.ICMSRequestSpec{
+					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
+						TaskLaunchSpecification: &task.LaunchSpecification{
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
 						},
 					},
 				},
@@ -315,7 +343,7 @@ func TestIsMiniServiceCreateRequest(t *testing.T) {
 					Action: common.FunctionCreationAction,
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -329,7 +357,7 @@ func TestIsMiniServiceCreateRequest(t *testing.T) {
 					Action: common.TaskCreationAction,
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						TaskLaunchSpecification: &task.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},
@@ -357,7 +385,7 @@ func TestIsMiniServiceCreateRequest(t *testing.T) {
 					Action: "wrong_action",
 					CreationMsgInfo: nvcav2beta1.ICMSCreationMessageInfo{
 						FunctionLaunchSpecification: &function.LaunchSpecification{
-							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{},
+							HelmChartLaunchSpecification: &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"},
 						},
 					},
 				},

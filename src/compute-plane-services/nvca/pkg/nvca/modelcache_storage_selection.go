@@ -41,14 +41,14 @@ func cacheSelectionInput(
 	case req.Spec.CreationMsgInfo.FunctionLaunchSpecification != nil:
 		spec := req.Spec.CreationMsgInfo.FunctionLaunchSpecification
 		workflow := nvcastorage.ModelCacheWorkflowRegular
-		if spec.HelmChartLaunchSpecification != nil {
+		if spec.HelmChartLaunchSpecification.Defined() {
 			workflow = nvcastorage.ModelCacheWorkflowHelm
 		}
 		return spec.CacheLaunchSpecification, workflow
 	case req.Spec.CreationMsgInfo.TaskLaunchSpecification != nil:
 		spec := req.Spec.CreationMsgInfo.TaskLaunchSpecification
 		workflow := nvcastorage.ModelCacheWorkflowRegular
-		if spec.HelmChartLaunchSpecification != nil {
+		if spec.HelmChartLaunchSpecification.Defined() {
 			workflow = nvcastorage.ModelCacheWorkflowHelm
 		}
 		return spec.CacheLaunchSpecification, workflow

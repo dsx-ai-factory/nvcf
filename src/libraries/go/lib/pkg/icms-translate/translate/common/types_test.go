@@ -391,3 +391,10 @@ func TestMessageAction_UnmarshalJSON_Errors(t *testing.T) {
 		})
 	}
 }
+
+func TestHelmChartLaunchSpecificationDefined(t *testing.T) {
+	var nilSpec *HelmChartLaunchSpecification
+	assert.False(t, nilSpec.Defined(), "nil spec is not a Helm workload")
+	assert.False(t, (&HelmChartLaunchSpecification{}).Defined(), "allocated spec without a URL is not a Helm workload")
+	assert.True(t, (&HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"}).Defined())
+}

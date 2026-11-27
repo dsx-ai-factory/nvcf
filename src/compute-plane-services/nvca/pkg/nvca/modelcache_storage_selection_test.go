@@ -22,6 +22,7 @@ import (
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
+	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/task"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -431,4 +432,48 @@ func TestHelmRWXSelectionRoutesToSharedFS(t *testing.T) {
 	backend, err := nvcastorage.HelmCacheBackendFromSelection(selection)
 	require.NoError(t, err)
 	assert.Equal(t, nvcastorage.HelmCacheBackendSharedFS, backend)
+}
+
+// TestCacheSelectionInputIgnoresEmptyHelmChart covers container workloads
+// whose creation message carries "helmChart": "" or null. The decoder
+// allocates the embedded Helm pointer for that key, which once persisted
+// helmModelCache for a container task that the container flow then rejected,
+// leaving the task on an uncached emptyDir.
+func TestCacheSelectionInputIgnoresEmptyHelmChart(t *testing.T) {
+	cache := &common.CacheLaunchSpecification{CacheArtifacts: true, CacheSize: 8 << 30}
+	emptyHelm := &common.HelmChartLaunchSpecification{}
+	helm := &common.HelmChartLaunchSpecification{HelmChartURL: "https://example.invalid/chart.tgz"}
+
+	for name, tc := range map[string]struct {
+		info nvcav2beta1.ICMSCreationMessageInfo
+		want nvcastorage.ModelCacheWorkflow
+	}{
+		"container task with empty helm key": {
+			info: nvcav2beta1.ICMSCreationMessageInfo{TaskLaunchSpecification: &task.LaunchSpecification{
+				HelmChartLaunchSpecification: emptyHelm, CacheLaunchSpecification: cache}},
+			want: nvcastorage.ModelCacheWorkflowRegular,
+		},
+		"helm task": {
+			info: nvcav2beta1.ICMSCreationMessageInfo{TaskLaunchSpecification: &task.LaunchSpecification{
+				HelmChartLaunchSpecification: helm, CacheLaunchSpecification: cache}},
+			want: nvcastorage.ModelCacheWorkflowHelm,
+		},
+		"container function with empty helm key": {
+			info: nvcav2beta1.ICMSCreationMessageInfo{FunctionLaunchSpecification: &function.LaunchSpecification{
+				HelmChartLaunchSpecification: emptyHelm, CacheLaunchSpecification: cache}},
+			want: nvcastorage.ModelCacheWorkflowRegular,
+		},
+		"helm function": {
+			info: nvcav2beta1.ICMSCreationMessageInfo{FunctionLaunchSpecification: &function.LaunchSpecification{
+				HelmChartLaunchSpecification: helm, CacheLaunchSpecification: cache}},
+			want: nvcastorage.ModelCacheWorkflowHelm,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := &nvcav2beta1.ICMSRequest{Spec: nvcav2beta1.ICMSRequestSpec{CreationMsgInfo: tc.info}}
+			spec, workflow := cacheSelectionInput(req)
+			require.Same(t, cache, spec)
+			assert.Equal(t, tc.want, workflow)
+		})
+	}
 }
