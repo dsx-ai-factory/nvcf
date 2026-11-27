@@ -4,11 +4,6 @@ The NVCF API validates credentials and images for every supported registry. This
 
 For a registry that NVCF does not support, use [Allowlisting an Unsupported Registry](./registry-allowlist.md) instead. NVCF does not validate unsupported registries.
 
-<Warning>
-Container-based functions and tasks only. Helm-based functions and tasks do not support this setup.
-
-</Warning>
-
 ## What each check does
 
 Each supported registry has two checks in the NVCF API. Both checks are on by default.
@@ -31,6 +26,7 @@ Read these effects before you change a setting:
 - Each setting applies to every account on the control plane and to every hostname that maps to the registry entry.
 - With artifact validation off, function create and deploy no longer check that the image exists. A wrong image path or tag fails at deployment, with `ErrImagePull` on the function pod.
 - If NVCF stores no credential for a registry, NVCF sends no image pull secret for it. The cluster must pull the image on its own, through a kubelet credential provider or an image pull secret that the cluster adds to function pods.
+- The settings apply to container functions and container tasks. Helm functions and Helm tasks do not support this setup.
 
 ## Find the registry entry
 
@@ -81,7 +77,7 @@ The `harbor` and `artifactory` entries have no default. The NVCF API requires `n
 
    The output shows `enabled: false` under each check that you turned off.
 
-For container-based tasks, set `artifact-validation` for the NVCT API under `nvctApi.remoteConfig.configData.nvct.registries.recognized.container.<key>`.
+For container tasks, set `artifact-validation` for the NVCT API under `nvctApi.remoteConfig.configData.nvct.registries.recognized.container.<key>`.
 
 ## ECR example with the EKS node IAM role
 
