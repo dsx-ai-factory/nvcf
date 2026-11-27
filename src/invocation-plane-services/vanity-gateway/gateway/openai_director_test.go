@@ -133,6 +133,12 @@ func TestExtractOpenAIJSONBody(t *testing.T) {
 			expectedStream: false,
 		},
 		{
+			name:           "Null stream defaults to false",
+			requestBody:    `{"model":"gpt-4","stream":null}`,
+			expectedModel:  "gpt-4",
+			expectedStream: false,
+		},
+		{
 			name:        "Invalid JSON",
 			requestBody: `{invalid json}`,
 			expectError: true,
@@ -179,6 +185,14 @@ func TestExtractOpenAIJSONBody(t *testing.T) {
 
 	t.Run("JSON without model field returns errModelFieldMissing", func(t *testing.T) {
 		req, err := http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"stream":true}`))
+		require.NoError(t, err)
+
+		_, err = extractOpenAIJSONBody(req)
+		require.ErrorIs(t, err, errModelFieldMissing)
+	})
+
+	t.Run("Null model returns errModelFieldMissing", func(t *testing.T) {
+		req, err := http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":null}`))
 		require.NoError(t, err)
 
 		_, err = extractOpenAIJSONBody(req)
@@ -1308,9 +1322,7 @@ func TestOpenAIRoutesReportInvalidFieldTypes(t *testing.T) {
 		name, body, param, expectedType string
 	}{
 		{"model must be a string", `{"model":1}`, "model", "string"},
-		{"model cannot be null", `{"model":null}`, "model", "string"},
 		{"stream must be a boolean", `{"model":"llm","stream":"true"}`, "stream", "boolean"},
-		{"stream cannot be null", `{"model":"llm","stream":null}`, "stream", "boolean"},
 	}
 	mux := openAIMux(t, llmMappings(llmModelEntry()), "http://nvcf.invalid", "http://llm.invalid")
 	for _, route := range routes {
@@ -1333,6 +1345,22 @@ func TestOpenAIRoutesReportInvalidFieldTypes(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestOpenAIRouteReportsInvalidFieldTypeAfterPrefixFallback(t *testing.T) {
+	const paddingSize = 70 << 10
+	body := `{"model":1,"padding":"` + string(bytes.Repeat([]byte{'x'}, paddingSize)) + `"}`
+	mux := openAIMux(t, llmMappings(llmModelEntry()), "http://nvcf.invalid", "http://llm.invalid")
+	req := openAIRequest(t, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	var payload OpenAIError
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	require.Equal(t, "invalid_type", payload.Error.Code)
+	require.Equal(t, "model", payload.Error.Param)
 }
 
 func TestOpenAIRouteBodyReadFailureStaysServerError(t *testing.T) {

@@ -1193,7 +1193,7 @@ func decodeOpenAIRequestFields(body []byte) (openAIRequestBody, error) {
 	}
 
 	request := openAIRequestBody{}
-	if value := bytes.TrimSpace(fields.Model); len(value) > 0 {
+	if value := bytes.TrimSpace(fields.Model); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
 		if value[0] != '"' {
 			return openAIRequestBody{}, &openAIFieldTypeError{param: "model", expected: "a string"}
 		}
@@ -1201,7 +1201,7 @@ func decodeOpenAIRequestFields(body []byte) (openAIRequestBody, error) {
 			return openAIRequestBody{}, fmt.Errorf("%w: %w", errInvalidJSONBody, err)
 		}
 	}
-	if value := bytes.TrimSpace(fields.Stream); len(value) > 0 {
+	if value := bytes.TrimSpace(fields.Stream); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
 		if value[0] != 't' && value[0] != 'f' {
 			return openAIRequestBody{}, &openAIFieldTypeError{param: "stream", expected: "a boolean"}
 		}
@@ -1423,7 +1423,7 @@ func writeInvalidJSONBody(writer http.ResponseWriter, request *http.Request, err
 		writeNativeError(writer, request, status, kind, message)
 		return
 	}
-	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json")
+	writeOpenAIError(writer, http.StatusBadRequest, "request body is not valid JSON", "invalid_json", nil)
 }
 
 func requestReadFailure(protocol nativeProtocol, err error) (int, string, string) {
