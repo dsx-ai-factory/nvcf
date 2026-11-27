@@ -923,6 +923,9 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 			// that start together pick the same free slot): this one tries
 			// again on its next event, which picks the next slot.
 			log.Info("CRIU group capture: another replica took this identity-pool slot; trying the next")
+			// As for a claim that failed: this attempt did not start its
+			// capture, so the members are held as before, not as captured.
+			c.unholdForCapture(ctx, members, log)
 			return true
 		}
 		return false // another agent captures it
