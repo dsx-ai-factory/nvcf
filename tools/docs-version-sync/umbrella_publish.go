@@ -34,9 +34,10 @@ type umbrellaPublisher struct {
 	api, uploads, repository, token string
 }
 type umbrellaReleaseAsset struct {
-	ID    int64  `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	State              string `json:"state"`
+	BrowserDownloadURL string `json:"browser_download_url,omitempty"`
 }
 type umbrellaRelease struct {
 	ID         int64  `json:"id"`
@@ -76,6 +77,47 @@ func (p umbrellaPublisher) request(method, endpoint, contentType string, data []
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, &umbrellaHTTPError{method: method, path: req.URL.Path, status: response.StatusCode}
+	}
+	return contents, nil
+}
+
+// downloadPublicAsset reads one release asset from the public download URL in the
+// release metadata, anonymously. Public asset bytes do not need the REST asset
+// endpoint, which GitHub can reject with HTTP 403 for public releases. The URL
+// must name this repository, tag and asset, so release metadata cannot send the
+// read somewhere else. Callers still verify the returned bytes.
+func (p umbrellaPublisher) downloadPublicAsset(tag string, asset umbrellaReleaseAsset) ([]byte, error) {
+	location, err := url.Parse(asset.BrowserDownloadURL)
+	if err != nil || asset.BrowserDownloadURL == "" {
+		return nil, fmt.Errorf("release asset %s has no valid public download URL", asset.Name)
+	}
+	api, err := url.Parse(p.api)
+	if err != nil {
+		return nil, err
+	}
+	sameAPIHost := location.Scheme == api.Scheme && location.Host == api.Host
+	if (location.Scheme != "https" && !sameAPIHost) || location.User != nil || location.RawQuery != "" ||
+		location.Path != "/"+p.repository+"/releases/download/"+tag+"/"+asset.Name {
+		return nil, fmt.Errorf("release asset %s has an unexpected public download URL", asset.Name)
+	}
+	req, err := http.NewRequest("GET", location.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	contents, err := io.ReadAll(io.LimitReader(response.Body, umbrellaBundleMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(contents) > umbrellaBundleMaxBytes {
+		return nil, fmt.Errorf("release asset %s exceeds size limit", asset.Name)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, &umbrellaHTTPError{method: "GET", path: location.Path, status: response.StatusCode}
 	}
 	return contents, nil
 }
