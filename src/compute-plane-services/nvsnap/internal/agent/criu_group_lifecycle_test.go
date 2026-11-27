@@ -375,10 +375,10 @@ func TestLookupCRIUGroupFor_VerifyingOnlyItsNamespace(t *testing.T) {
 	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Create(ctx, record, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if g, ok := a.lookupCRIUGroupFor(ctx, "fn-a", "cache://w"); !ok || g.VerifyNamespace != "fn-a" {
+	if g, ok := a.lookupCRIUGroupFor(ctx, "fn-a", "cache://w", ""); !ok || g.VerifyNamespace != "fn-a" {
 		t.Fatalf("its own namespace: %+v %v", g, ok)
 	}
-	if _, ok := a.lookupCRIUGroupFor(ctx, "fn-b", "cache://w"); ok {
+	if _, ok := a.lookupCRIUGroupFor(ctx, "fn-b", "cache://w", ""); ok {
 		t.Fatal("another instance restored from a capture not verified yet")
 	}
 	record.Data["state"] = "complete"
@@ -386,7 +386,7 @@ func TestLookupCRIUGroupFor_VerifyingOnlyItsNamespace(t *testing.T) {
 	if _, err := kc.CoreV1().ConfigMaps("nvsnap-system").Update(ctx, record, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if g, ok := a.lookupCRIUGroupFor(ctx, "fn-b", "cache://w"); !ok || g.VerifyNamespace != "" {
+	if g, ok := a.lookupCRIUGroupFor(ctx, "fn-b", "cache://w", ""); !ok || g.VerifyNamespace != "" {
 		t.Fatalf("a verified capture is for every instance: %+v %v", g, ok)
 	}
 	if _, ok := parseCRIUGroup("k", map[string]string{"state": "verifying", "size": "1", "checkpoint.0": "c0"}); ok {

@@ -70,7 +70,7 @@ func TestCRIUGroupRestore_CountsAdmissions(t *testing.T) {
 // A pod of no captured configuration is not a decision to count.
 func TestCRIUGroupRestore_NoCaptureNotCounted(t *testing.T) {
 	m, _ := groupMutator(t, CRIUGroup{}, "")
-	m.CRIUGroups = func(context.Context, string, string) (CRIUGroup, bool) { return CRIUGroup{}, false }
+	m.CRIUGroups = func(context.Context, string, string, string) (CRIUGroup, bool) { return CRIUGroup{}, false }
 	before := admissions(t, metrics.AdmitRestore, "") + admissions(t, metrics.AdmitCold, "size-mismatch")
 	m.criuGroupRestorePatches(context.Background(), lwsRank("0"))
 	if admissions(t, metrics.AdmitRestore, "")+admissions(t, metrics.AdmitCold, "size-mismatch") != before {

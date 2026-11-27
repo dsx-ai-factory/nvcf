@@ -151,7 +151,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 	if !ok {
 		return nil
 	}
-	g, ok := m.CRIUGroups(ctx, pod.Namespace, CRIUURI(uri, pod))
+	g, ok := m.CRIUGroups(ctx, pod.Namespace, CRIUURI(uri, pod), ProcessConfig(pod))
 	if !ok {
 		return nil
 	}
