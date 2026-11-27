@@ -83,7 +83,7 @@ For container tasks, set `artifact-validation` for the NVCT API under `nvctApi.r
 
 This example shows one way to pull from ECR without long-lived IAM user keys. The kubelet on each EKS GPU node pulls the image with the node IAM role, and NVCF stores no ECR credential. If you give the cluster access to ECR in another way, replace step 1 with your own setup. Steps 2 to 6 stay the same.
 
-1. Give the node IAM role of the GPU nodes that run function pods read access to your ECR repositories. The AWS managed policy `AmazonEC2ContainerRegistryReadOnly` grants this access. For a least-privilege policy, attach the private ECR policy from [Step 2: Create and Attach ECR Policy](./third-party-registries.md#step-2-create-and-attach-ecr-policy) to the node role.
+1. Give the node IAM role of the GPU nodes that run function pods read access to your ECR repositories. The AWS managed policy `AmazonEC2ContainerRegistryReadOnly` grants this access. For a least-privilege policy, attach the private ECR policy from [Step 2: Create and Attach ECR Policy](./third-party-registries.md#step-2-create-and-attach-ecr-policy) to the node role. If the ECR repositories are in another AWS account, also add a repository policy in that account that allows the node IAM role to pull images.
 
 2. Delete any ECR Private credential that NVCF stores. If one exists, NVCF sends it to the cluster, and the pull uses its keys. Find it with `./nvcf-cli registry-credential list`, then delete it as described in [Deleting Registry Credentials](./third-party-registries.md#deleting-registry-credentials).
 
