@@ -624,7 +624,21 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 		// Not when the record is an alias (a rank with companions: the
 		// instance's own record decides) or of another process
 		// configuration that may be replaced (captureGroup decides).
-		if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) &&
+		base := criuGroupKeyDriver(uri, scope, c.a.keyDriver(ctx))
+		if kubeDiscoveryRank(pod) {
+			// An identity pool (identity_pool.go): a replica that started
+			// cold because every slot was in use is captured into the next
+			// one. One that started cold for another reason, while a slot
+			// was free, is not: it would only fill the pool.
+			if c.a.poolSlotForRestore(ctx, pod.Namespace, base) != "" {
+				return false
+			}
+			if _, ok := c.poolSlotForCapture(ctx, base, func(d map[string]string) bool {
+				return replaceableRecord(d, time.Now()) && len(processConfigChanged(d, []*corev1.Pod{pod}, 1, nil)) > 0
+			}); !ok {
+				return false
+			}
+		} else if prev, err := c.a.kubeClient.CoreV1().ConfigMaps(c.a.criuFailedNamespace()).Get(ctx, criuGroupConfigMapName(base), metav1.GetOptions{}); err == nil && !c.groupRecaptures(ctx, prev.Data) &&
 			prev.Data["state"] != criuGroupStateAlias &&
 			!(replaceableRecord(prev.Data, time.Now()) && len(processConfigChanged(prev.Data, []*corev1.Pod{pod}, 1, nil)) > 0) {
 			return false
@@ -782,7 +796,6 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		uris = append(uris, u)
 	}
 	key := criuGroupKeyDriver(instanceConfigURIOf(uris), scope, drv)
-	log = log.WithField("criuGroup", key)
 	// A record of another process configuration (a redeploy gave the
 	// workers a new DYN_NAMESPACE_WORKER_SUFFIX, which the key leaves out)
 	// is one admission never restores this instance from: it is replaced,
@@ -791,6 +804,18 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	reconfigured := func(data map[string]string) bool {
 		return len(processConfigChanged(data, members0, len(ranks), companionContainers)) > 0
 	}
+	if len(ranks) == 1 && len(companions) == 0 && kubeDiscoveryRank(ranks[0]) {
+		// Into the identity pool's next slot (identity_pool.go).
+		slot, ok := c.poolSlotForCapture(ctx, key, func(d map[string]string) bool {
+			return replaceableRecord(d, time.Now()) && reconfigured(d)
+		})
+		if !ok {
+			log.WithField("criuGroup", key).Info("CRIU group capture: skipped; the configuration's identity pool is full")
+			return false
+		}
+		key = slot
+	}
+	log = log.WithField("criuGroup", key)
 	if prev, gerr := cms.Get(ctx, criuGroupConfigMapName(key), metav1.GetOptions{}); gerr == nil && !c.groupRecaptures(ctx, prev.Data) {
 		if changed := processConfigChanged(prev.Data, members0, len(ranks), companionContainers); len(changed) > 0 && replaceableRecord(prev.Data, time.Now()) {
 			log.WithFields(logrus.Fields{"state": prev.Data["state"], "changed": changed[0]}).
