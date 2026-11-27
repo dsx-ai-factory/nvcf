@@ -5,12 +5,17 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvsnap/internal/checkpointstore"
 )
 
 const deepseekNS = "sr-3d68984c-077b-46d0-9a33-6512f427a612"
@@ -173,5 +178,62 @@ func TestProcessConfigWorkerSuffix(t *testing.T) {
 	ea.Spec.Containers[0].Env[0].Value, eb.Spec.Containers[0].Env[0].Value = "etcd", "etcd"
 	if ProcessConfig(ea) == ProcessConfig(eb) {
 		t.Error("etcd workers differing in the suffix: same process configuration, want different")
+	}
+}
+
+// One admission decides once: the restore check (asAdmitted) and the
+// patches the pod gets agree even when a later read of the namespace fails.
+func TestSharedNamespaceDecidedOncePerAdmission(t *testing.T) {
+	m := sharedMutator()
+	lists := 0
+	m.Kube.(*fake.Clientset).PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists++
+		if lists > 1 {
+			return true, nil, errors.New("apiserver unavailable")
+		}
+		return false, nil, nil
+	})
+	pod := deepseekPod("prefill-0", "2")
+	ctx := withSharedNamespaceDecision(context.Background(), pod)
+	if v := mainEnv(m.asAdmitted(ctx, pod), "DYN_NAMESPACE"); v != "nvcf-nvsnap-dsv41-flash" {
+		t.Fatalf("restore check saw DYN_NAMESPACE %q, want the shared name", v)
+	}
+	got := applyPatches(t, pod, m.sharedNamespacePatches(ctx, pod))
+	if v := mainEnv(got, "DYN_NAMESPACE"); v != "nvcf-nvsnap-dsv41-flash" {
+		t.Fatalf("pod admitted with DYN_NAMESPACE %q after the restore check accepted the shared name", v)
+	}
+	if lists != 1 {
+		t.Errorf("namespace listed %d times in one admission, want 1", lists)
+	}
+	// Without the admission's decision a failed read keeps the original
+	// name: the case the shared decision guards against.
+	if ops := m.sharedNamespacePatches(context.Background(), pod); len(ops) != 0 {
+		t.Errorf("a failed read still rewrote the namespace: %v", ops)
+	}
+}
+
+// A pod restored by its restore-from annotation (not a group record) is
+// admitted with the shared Dynamo namespace its restore check judged it
+// with.
+func TestSharedNamespaceOnExplicitRestorePlaceholder(t *testing.T) {
+	man := criuCaptureRecord()
+	man.SourcePodMeta[checkpointstore.CRIUScopeMetaKey] = CRIUNamespaceScope(deepseekNS)
+	m := criuMutator(t, man)
+	m.MainContainer = 0
+	m.DynamoNamespace = "nvcf-nvsnap"
+	m.Kube = fake.NewSimpleClientset()
+	pod := deepseekPod("prefill-0", "1")
+	pod.Annotations = map[string]string{RestoreFromAnnotation: "abc123"}
+	pod.Spec.Containers[0].Image, pod.Spec.Containers[0].Command = "vllm", []string{"python3", "-m", "dynamo.vllm"}
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := applyPatches(t, pod, patches)
+	if got.Annotations[CRIURestoreAnnotation] == "" {
+		t.Fatalf("not admitted as the restore placeholder: %v", got.Annotations)
+	}
+	if v := mainEnv(got, "DYN_NAMESPACE"); v != "nvcf-nvsnap-dsv41-flash" {
+		t.Fatalf("placeholder DYN_NAMESPACE %q, want the shared nvcf-nvsnap-dsv41-flash", v)
 	}
 }

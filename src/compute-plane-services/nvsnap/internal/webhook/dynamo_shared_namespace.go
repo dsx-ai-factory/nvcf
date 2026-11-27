@@ -50,7 +50,38 @@ func kubeDiscoveryComponent(pod *corev1.Pod) bool {
 // them, with the namespace replaced by m.DynamoNamespace. None when there
 // is nothing to replace, or the namespace still runs a Dynamo pod under
 // the original name (or that cannot be read).
+//
+// One admission decides once (withSharedNamespaceDecision): the checks that
+// judge the restored process (asAdmitted) and the patches the pod gets
+// (sharedNamespacePatches) then agree even if a later read of the
+// namespace would fail or see other pods.
 func (m *Mutator) sharedNamespaceValues(ctx context.Context, pod *corev1.Pod) map[int]map[string]string {
+	if d, ok := ctx.Value(sharedNamespaceKey{}).(*sharedNamespaceDecision); ok && d.pod == pod {
+		if !d.done {
+			d.vals, d.done = m.decideSharedNamespace(ctx, pod), true
+		}
+		return d.vals
+	}
+	return m.decideSharedNamespace(ctx, pod)
+}
+
+type sharedNamespaceKey struct{}
+
+// sharedNamespaceDecision is the shared-namespace decision of one admitted
+// pod, made on first use.
+type sharedNamespaceDecision struct {
+	pod  *corev1.Pod
+	done bool
+	vals map[int]map[string]string
+}
+
+// withSharedNamespaceDecision returns ctx under which every
+// sharedNamespaceValues of pod returns the same decision.
+func withSharedNamespaceDecision(ctx context.Context, pod *corev1.Pod) context.Context {
+	return context.WithValue(ctx, sharedNamespaceKey{}, &sharedNamespaceDecision{pod: pod})
+}
+
+func (m *Mutator) decideSharedNamespace(ctx context.Context, pod *corev1.Pod) map[int]map[string]string {
 	if m.DynamoNamespace == "" || pod.Namespace == "" || !kubeDiscoveryComponent(pod) {
 		return nil
 	}
