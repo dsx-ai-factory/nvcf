@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -41,6 +42,294 @@ import (
 func ptrInt(v int) *int { return &v }
 
 func ptrUint32(v uint32) *uint32 { return &v }
+
+func TestFunctionManagementHTTPResponses(t *testing.T) {
+	type requestCapture struct {
+		method string
+		path   string
+		query  string
+	}
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		query      string
+		statusCode int
+		body       string
+		call       func(*Client) error
+		wantError  string
+		wantID     string
+	}{
+		{
+			name:   "create function",
+			method: http.MethodPost, path: "/v2/nvcf/functions", statusCode: http.StatusOK,
+			body: `{"function":{"id":"function-id","versionId":"version-id","name":"test"}}`,
+			call: func(c *Client) error {
+				result, err := c.CreateFunction(context.Background(), &CreateFunctionRequest{Name: "test", InferenceURL: "http://inference", InferencePort: 8000})
+				if err == nil && result.Function.ID != "function-id" {
+					return errors.New("decoded function ID did not match")
+				}
+				return err
+			}, wantID: "function-id",
+		},
+		{
+			name: "create function malformed JSON", method: http.MethodPost, path: "/v2/nvcf/functions", statusCode: http.StatusOK, body: `{`,
+			call: func(c *Client) error {
+				_, err := c.CreateFunction(context.Background(), &CreateFunctionRequest{Name: "test", InferenceURL: "http://inference"})
+				return err
+			}, wantError: "failed to decode response",
+		},
+		{
+			name: "delete function", method: http.MethodDelete, path: "/v2/nvcf/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusNoContent,
+			call: func(c *Client) error { return c.DeleteFunction(context.Background(), "function/id", "version?id") },
+		},
+		{
+			name: "delete function API error", method: http.MethodDelete, path: "/v2/nvcf/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusBadRequest, body: `delete failed`,
+			call: func(c *Client) error { return c.DeleteFunction(context.Background(), "function/id", "version?id") }, wantError: "delete failed",
+		},
+	}
+	for _, status := range []int{http.StatusOK, http.StatusAccepted} {
+		tests = append(tests, struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{name: http.StatusText(status) + " deploy", method: http.MethodPost, path: "/v2/nvcf/deployments/functions/function%2Fid/versions/version%3Fid", statusCode: status,
+			call: func(c *Client) error {
+				return c.DeployFunction(context.Background(), "function/id", "version?id", &FunctionDeploymentRequest{DeploymentSpecifications: []GPUSpecificationDto{{GPU: "A100", InstanceType: "gpu", MinInstances: 0, MaxInstances: 1}}})
+			}})
+	}
+	tests = append(tests,
+		struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{
+			name: "deploy API error", method: http.MethodPost, path: "/v2/nvcf/deployments/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusBadRequest, body: "deploy failed",
+			call: func(c *Client) error {
+				return c.DeployFunction(context.Background(), "function/id", "version?id", &FunctionDeploymentRequest{DeploymentSpecifications: []GPUSpecificationDto{{GPU: "A100", InstanceType: "gpu", MaxInstances: 1}}})
+			}, wantError: "deploy failed",
+		},
+		struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{
+			name: "update metadata", method: http.MethodPut, path: "/v2/nvcf/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusOK,
+			call: func(c *Client) error {
+				return c.UpdateFunctionMetadata(context.Background(), "function/id", "version?id", &UpdateFunctionMetadataRequest{Description: "updated"})
+			},
+		},
+		struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{
+			name: "update metadata API error", method: http.MethodPut, path: "/v2/nvcf/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusBadRequest, body: "update failed",
+			call: func(c *Client) error {
+				return c.UpdateFunctionMetadata(context.Background(), "function/id", "version?id", &UpdateFunctionMetadataRequest{})
+			}, wantError: "update failed",
+		},
+		struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{
+			name: "delete deployment", method: http.MethodDelete, path: "/v2/nvcf/deployments/functions/function%2Fid/versions/version%3Fid", query: "graceful=true", statusCode: http.StatusOK,
+			call: func(c *Client) error {
+				return c.DeleteDeployment(context.Background(), "function/id", "version?id", true)
+			},
+		},
+		struct {
+			name       string
+			method     string
+			path       string
+			query      string
+			statusCode int
+			body       string
+			call       func(*Client) error
+			wantError  string
+			wantID     string
+		}{
+			name: "delete deployment API error", method: http.MethodDelete, path: "/v2/nvcf/deployments/functions/function%2Fid/versions/version%3Fid", statusCode: http.StatusBadRequest, body: "deployment delete failed",
+			call: func(c *Client) error {
+				return c.DeleteDeployment(context.Background(), "function/id", "version?id", false)
+			}, wantError: "deployment delete failed",
+		},
+	)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got requestCapture
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = requestCapture{method: r.Method, path: r.URL.EscapedPath(), query: r.URL.RawQuery}
+				w.WriteHeader(tt.statusCode)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+			c := &Client{httpClient: server.Client(), baseURL: server.URL, config: &Config{Token: "test-token", BaseHTTPURL: server.URL}}
+			err := tt.call(c)
+			if tt.wantError == "" && err != nil {
+				t.Fatalf("call returned error: %v", err)
+			}
+			if tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("call error = %v, want it to contain %q", err, tt.wantError)
+			}
+			if got.method != tt.method || got.path != tt.path || got.query != tt.query {
+				t.Errorf("request = %s %s?%s, want %s %s?%s", got.method, got.path, got.query, tt.method, tt.path, tt.query)
+			}
+		})
+	}
+}
+
+func TestWaitForFunctionDeployment(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantError  []string
+	}{
+		{
+			name:       "active",
+			statusCode: http.StatusOK,
+			body:       `{"function":{"status":"ACTIVE"}}`,
+		},
+		{
+			name:       "failed",
+			statusCode: http.StatusOK,
+			body:       `{"function":{"status":"FAILED"}}`,
+			wantError:  []string{"FAILED"},
+		},
+		{
+			name:       "http error",
+			statusCode: http.StatusBadGateway,
+			body:       `upstream unavailable`,
+			wantError:  []string{`502`, `upstream unavailable`},
+		},
+		{
+			name:       "malformed json",
+			statusCode: http.StatusOK,
+			body:       `{`,
+			wantError:  []string{"failed to decode response"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			client := &Client{
+				httpClient: server.Client(),
+				baseURL:    server.URL,
+				config:    &Config{BaseHTTPURL: server.URL},
+			}
+			err := client.WaitForFunctionDeployment(context.Background(), "function-id", "version-id", 1)
+			if len(tt.wantError) == 0 {
+				if err != nil {
+					t.Fatalf("WaitForFunctionDeployment returned error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("WaitForFunctionDeployment returned nil error")
+			}
+			for _, want := range tt.wantError {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+
+	t.Run("canceled context", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("handler called for canceled context")
+		}))
+		defer server.Close()
+
+		client := &Client{
+			httpClient: server.Client(),
+			baseURL:    server.URL,
+			config:    &Config{BaseHTTPURL: server.URL},
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := client.WaitForFunctionDeployment(ctx, "function-id", "version-id", 1)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitForFunctionDeployment error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestGetNamespaceFromKubeconfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   bool
+		script string
+		want   string
+	}{
+		{name: "empty path", want: ""},
+		{name: "trims output", path: true, script: "#!/bin/sh\nprintf '  team-nvcf\\n'\n", want: "team-nvcf"},
+		{name: "empty output", path: true, script: "#!/bin/sh\nexit 0\n", want: ""},
+		{name: "command failure", path: true, script: "#!/bin/sh\nexit 1\n", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.path {
+				if got := getNamespaceFromKubeconfig(""); got != tt.want {
+					t.Errorf("getNamespaceFromKubeconfig(\"\") = %q, want %q", got, tt.want)
+				}
+				return
+			}
+
+			binDir := t.TempDir()
+			kubectlPath := filepath.Join(binDir, "kubectl")
+			if err := os.WriteFile(kubectlPath, []byte(tt.script), 0755); err != nil {
+				t.Fatalf("write fake kubectl: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			kubeconfigPath := filepath.Join(t.TempDir(), "config")
+			if got := getNamespaceFromKubeconfig(kubeconfigPath); got != tt.want {
+				t.Errorf("getNamespaceFromKubeconfig(%q) = %q, want %q", kubeconfigPath, got, tt.want)
+			}
+		})
+	}
+}
 
 type invokeRequestCaptureTransport struct {
 	req *http.Request
@@ -972,6 +1261,65 @@ func TestLLMInvocationHostPreservesPort(t *testing.T) {
 	}
 }
 
+func TestDirectInvocationURLValidationAndPathHandling(t *testing.T) {
+	tests := []struct {
+		name          string
+		baseInvokeURL string
+		functionID    string
+		inferenceURL  string
+		want          string
+		wantErr       string
+	}{
+		{
+			name:          "malformed URL",
+			baseInvokeURL: "http://%",
+			functionID:    "fn",
+			wantErr:       "failed to parse invoke URL \"http://%\": parse \"http://%\": invalid URL escape \"%\"",
+		},
+		{
+			name:          "URL without scheme and host",
+			baseInvokeURL: "invocation.example.com",
+			functionID:    "fn",
+			wantErr:       "invoke URL must include scheme and host: \"invocation.example.com\"",
+		},
+		{
+			name:          "fallback function-specific invocation domain",
+			baseInvokeURL: "https://custom.example.com",
+			functionID:    "fn",
+			inferenceURL:  "/predict",
+			want:          "https://fn.invocation.custom.example.com/predict",
+		},
+		{
+			name:          "preserve trailing inference slash",
+			baseInvokeURL: "https://invocation.example.com",
+			functionID:    "fn",
+			inferenceURL:  "/v1/",
+			want:          "https://fn.invocation.example.com/v1/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := directInvocationURL(tt.baseInvokeURL, tt.functionID, tt.inferenceURL)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("directInvocationURL returned no error")
+				}
+				if err.Error() != tt.wantErr {
+					t.Fatalf("directInvocationURL error = %q, want %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("directInvocationURL returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("directInvocationURL = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func assertInvocationBodyField(t *testing.T, body []byte, key, want string) {
 	t.Helper()
 
@@ -1084,6 +1432,79 @@ func TestJWTRequirementForWriteOperations(t *testing.T) {
 			}
 			if err.Error() != tt.expectedError {
 				t.Errorf("Expected error %q, got %q", tt.expectedError, err.Error())
+			}
+		})
+	}
+}
+
+func TestDeployFunctionValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		specifications []GPUSpecificationDto
+		wantError      string
+	}{
+		{
+			name:      "empty deployment specifications",
+			wantError: "deploymentSpecifications is required (at least 1 specification must be provided)",
+		},
+		{
+			name: "missing GPU",
+			specifications: []GPUSpecificationDto{{
+				InstanceType: "test",
+				MaxInstances: 1,
+			}},
+			wantError: "deploymentSpecifications[0].gpu is required",
+		},
+		{
+			name: "missing instance type",
+			specifications: []GPUSpecificationDto{{
+				GPU:          "L40S",
+				MaxInstances: 1,
+			}},
+			wantError: "deploymentSpecifications[0].instanceType is required",
+		},
+		{
+			name: "negative minimum instances",
+			specifications: []GPUSpecificationDto{{
+				GPU:          "L40S",
+				InstanceType: "test",
+				MinInstances: -1,
+				MaxInstances: 1,
+			}},
+			wantError: "deploymentSpecifications[0].minInstances must be >= 0",
+		},
+		{
+			name: "nonpositive maximum instances",
+			specifications: []GPUSpecificationDto{{
+				GPU:          "L40S",
+				InstanceType: "test",
+				MaxInstances: 0,
+			}},
+			wantError: "deploymentSpecifications[0].maxInstances must be > 0",
+		},
+		{
+			name: "minimum exceeds maximum instances",
+			specifications: []GPUSpecificationDto{{
+				GPU:          "L40S",
+				InstanceType: "test",
+				MinInstances: 2,
+				MaxInstances: 1,
+			}},
+			wantError: "deploymentSpecifications[0].minInstances (2) cannot be greater than maxInstances (1)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{config: &Config{}}
+			err := c.DeployFunction(context.Background(), "func-id", "ver-id", &FunctionDeploymentRequest{
+				DeploymentSpecifications: tt.specifications,
+			})
+			if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if err.Error() != tt.wantError {
+				t.Fatalf("error = %q, want %q", err.Error(), tt.wantError)
 			}
 		})
 	}
@@ -1699,6 +2120,544 @@ func TestLoadConfigAuthCredentials(t *testing.T) {
 				if strings.Contains(err.Error(), omit) {
 					t.Errorf("error %q names %s, which is set", err, omit)
 				}
+			}
+		})
+	}
+}
+
+func TestLoadConfigWithoutAuthAuthSelection(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		debug   bool
+		wantAuth AuthType
+	}{
+		{
+			name: "complete oauth2 configuration with debug",
+			env: map[string]string{
+				"NVCF_OAUTH2_CLIENT_ID":      "client-id",
+				"NVCF_OAUTH2_CLIENT_SECRET":  "client-secret",
+				"NVCF_OAUTH2_TOKEN_ENDPOINT": "https://oauth2.localhost/token",
+			},
+			debug:    true,
+			wantAuth: AuthTypeOAuth2,
+		},
+		{name: "api key credentials", env: map[string]string{"NVCF_API_KEY": "api-key"}, wantAuth: AuthTypeBearer},
+		{name: "token credentials", env: map[string]string{"NVCF_TOKEN": "token"}, wantAuth: AuthTypeBearer},
+		{name: "no credentials", wantAuth: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			viper.Reset()
+			viper.SetEnvPrefix("NVCF")
+			viper.AutomaticEnv()
+			t.Cleanup(func() { viper.Reset() })
+			t.Setenv("HOME", t.TempDir())
+			state.ResetDefaultStateManager()
+			for _, key := range []string{
+				"NVCF_API_KEY", "NVCF_TOKEN", "NVCF_OAUTH2_CLIENT_ID",
+				"NVCF_OAUTH2_CLIENT_SECRET", "NVCF_OAUTH2_TOKEN_ENDPOINT", "NVCF_DEBUG",
+			} {
+				t.Setenv(key, "")
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			if tc.debug {
+				t.Setenv("NVCF_DEBUG", "true")
+			}
+
+			config, err := LoadConfigWithoutAuth()
+			if err != nil {
+				t.Fatalf("LoadConfigWithoutAuth() error = %v, want success", err)
+			}
+			if config.AuthType != tc.wantAuth {
+				t.Errorf("AuthType = %q, want %q", config.AuthType, tc.wantAuth)
+			}
+			if config.Debug != tc.debug {
+				t.Errorf("Debug = %t, want %t", config.Debug, tc.debug)
+			}
+		})
+	}
+}
+
+func TestCreateFunctionValidationPaths(t *testing.T) {
+	validHealth := func() *HealthDto {
+		return &HealthDto{
+			Protocol:           "HTTP",
+			URI:                "/health",
+			Port:               8080,
+			Timeout:            "PT10S",
+			ExpectedStatusCode: http.StatusOK,
+		}
+	}
+	validRequest := func() *CreateFunctionRequest {
+		return &CreateFunctionRequest{Name: "valid-name", InferenceURL: "/infer"}
+	}
+
+	tests := []struct {
+		name    string
+		request *CreateFunctionRequest
+		wantErr string
+	}{
+		{
+			name:    "missing name",
+			request: &CreateFunctionRequest{InferenceURL: "/infer"},
+			wantErr: "name is required (1-128 chars, pattern: ^[a-z0-9A-Z][a-z0-9A-Z\\-_]*$)",
+		},
+		{
+			name:    "missing inference URL",
+			request: &CreateFunctionRequest{Name: "valid-name"},
+			wantErr: "inferenceUrl is required",
+		},
+		{
+			name: "missing health protocol",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Health = validHealth()
+				req.Health.Protocol = ""
+				return req
+			}(),
+			wantErr: "health.protocol is required when health is specified (must be 'HTTP' or 'gRPC')",
+		},
+		{
+			name: "missing health URI",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Health = validHealth()
+				req.Health.URI = ""
+				return req
+			}(),
+			wantErr: "health.uri is required when health is specified",
+		},
+		{
+			name: "invalid health port",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Health = validHealth()
+				req.Health.Port = 0
+				return req
+			}(),
+			wantErr: "health.port is required when health is specified (must be a positive number)",
+		},
+		{
+			name: "missing health timeout",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Health = validHealth()
+				req.Health.Timeout = ""
+				return req
+			}(),
+			wantErr: "health.timeout is required when health is specified (ISO 8601 duration format, e.g., 'PT10S')",
+		},
+		{
+			name: "invalid health expected status code",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Health = validHealth()
+				req.Health.ExpectedStatusCode = 0
+				return req
+			}(),
+			wantErr: "health.expectedStatusCode is required when health is specified (must be a positive number)",
+		},
+		{
+			name: "helm chart without service name",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.HelmChart = "chart"
+				return req
+			}(),
+			wantErr: "helmChartServiceName is required when helmChart is specified",
+		},
+		{
+			name: "secret with empty name",
+			request: func() *CreateFunctionRequest {
+				req := validRequest()
+				req.Secrets = []SecretDto{{Value: "secret-value"}}
+				return req
+			}(),
+			wantErr: "secrets[0].name is required (1-48 chars, pattern: ^[a-z0-9A-Z][a-z0-9A-Z\\_\\.\\-]*$)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := &updateRequestCaptureTransport{}
+			client := &Client{
+				config:     &Config{Token: "token"},
+				baseURL:    "https://api.example.com",
+				httpClient: &http.Client{Transport: capture},
+			}
+
+			_, err := client.CreateFunction(context.Background(), tt.request)
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("CreateFunction error = %v, want %q", err, tt.wantErr)
+			}
+			if capture.req != nil {
+				t.Fatalf("transport received unexpected request: %s %s", capture.req.Method, capture.req.URL)
+			}
+		})
+	}
+}
+
+func TestTokenExpirationAndTildePathHelpers(t *testing.T) {
+	now := time.Now()
+	expirationCases := []struct {
+		name       string
+		expiration time.Time
+		want       bool
+	}{
+		{name: "zero expiration", expiration: time.Time{}, want: false},
+		{name: "future expiration", expiration: now.Add(time.Hour), want: false},
+		{name: "past expiration", expiration: now.Add(-time.Hour), want: true},
+	}
+	for _, tt := range expirationCases {
+		t.Run("expiration/"+tt.name, func(t *testing.T) {
+			if got := isTokenExpired(tt.expiration); got != tt.want {
+				t.Errorf("isTokenExpired(%v) = %t, want %t", tt.expiration, got, tt.want)
+			}
+		})
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	pathCases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "empty", path: "", want: ""},
+		{name: "without tilde prefix", path: "relative/path", want: "relative/path"},
+		{name: "tilde prefix", path: "~/suffix/path", want: filepath.Join(home, "suffix/path")},
+	}
+	for _, tt := range pathCases {
+		t.Run("path/"+tt.name, func(t *testing.T) {
+			if got := expandTildePath(tt.path); got != tt.want {
+				t.Errorf("expandTildePath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeploymentReadAndDeleteResponsePaths(t *testing.T) {
+	const deploymentPath = "/v2/nvcf/deployments/functions/func-123/versions/ver-456"
+	tests := []struct {
+		name         string
+		method       string
+		responseCode int
+		responseBody string
+		graceful     bool
+		wantQuery    string
+		wantID       string
+		wantError    string
+	}{
+		{name: "get success", method: http.MethodGet, responseCode: http.StatusOK, responseBody: `{"deployment":{"deploymentId":"deployment-789"}}`, wantID: "deployment-789"},
+		{name: "get api error", method: http.MethodGet, responseCode: http.StatusBadRequest, responseBody: `{"message":"bad request"}`, wantError: `API error 400: {"message":"bad request"}`},
+		{name: "get malformed json", method: http.MethodGet, responseCode: http.StatusOK, responseBody: `{`, wantError: "failed to decode response:"},
+		{name: "delete immediate", method: http.MethodDelete, responseCode: http.StatusOK},
+		{name: "delete graceful", method: http.MethodDelete, responseCode: http.StatusOK, graceful: true, wantQuery: "graceful=true"},
+		{name: "delete api error", method: http.MethodDelete, responseCode: http.StatusBadRequest, responseBody: `{"message":"cannot delete"}`, wantError: `API error 400: {"message":"cannot delete"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			capture := &updateRequestCaptureTransport{statusCode: tt.responseCode, responseBody: tt.responseBody}
+			client := &Client{
+				config:     &Config{Token: "token"},
+				baseURL:    "https://api.example.com",
+				httpClient: &http.Client{Transport: capture},
+			}
+
+			if tt.method == http.MethodGet {
+				result, err := client.GetDeployment(context.Background(), "func-123", "ver-456")
+				if tt.wantError != "" {
+					if err == nil || !strings.HasPrefix(err.Error(), tt.wantError) {
+						t.Fatalf("GetDeployment error = %v, want prefix %q", err, tt.wantError)
+					}
+				} else if err != nil {
+					t.Fatalf("GetDeployment returned error: %v", err)
+				} else if result.Deployment.DeploymentID != tt.wantID {
+					t.Fatalf("deployment ID = %q, want %q", result.Deployment.DeploymentID, tt.wantID)
+				}
+			} else {
+				err := client.DeleteDeployment(context.Background(), "func-123", "ver-456", tt.graceful)
+				if tt.wantError != "" {
+					if err == nil || err.Error() != tt.wantError {
+						t.Fatalf("DeleteDeployment error = %v, want %q", err, tt.wantError)
+					}
+				} else if err != nil {
+					t.Fatalf("DeleteDeployment returned error: %v", err)
+				}
+			}
+			if capture.req == nil {
+				t.Fatal("expected deployment request")
+			}
+			if got := capture.req.Method; got != tt.method {
+				t.Errorf("method = %q, want %q", got, tt.method)
+			}
+			if got := capture.req.URL.Path; got != deploymentPath {
+				t.Errorf("path = %q, want %q", got, deploymentPath)
+			}
+			if got := capture.req.URL.RawQuery; got != tt.wantQuery {
+				t.Errorf("query = %q, want %q", got, tt.wantQuery)
+			}
+		})
+	}
+}
+
+func TestDecodeInvokeFunctionResponseCases(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		body         string
+		wantField    string
+		wantValue    interface{}
+		wantError    string
+		wantResponse bool
+	}{
+		{name: "successful object", status: http.StatusOK, body: `{"answer":42}`, wantResponse: true, wantField: "answer", wantValue: float64(42)},
+		{name: "successful scalar", status: http.StatusOK, body: `"ready"`, wantResponse: true, wantField: "result", wantValue: "ready"},
+		{name: "malformed successful payload", status: http.StatusOK, body: `not-json`, wantResponse: true, wantField: "rawResponse", wantValue: "not-json"},
+		{name: "redirect", status: http.StatusFound, wantResponse: true},
+		{name: "intermediate response", status: http.StatusAccepted, body: `{"queued":true}`, wantField: "queued", wantValue: true},
+		{name: "client error", status: http.StatusBadRequest, body: `invalid request`, wantError: "400"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: tt.status,
+				Header: http.Header{
+					"Nvcf-Reqid":            {"req-123"},
+					"Nvcf-Percent-Complete": {"50"},
+					"Nvcf-Status":           {"PENDING"},
+					"Location":              {"https://example.test/result"},
+					"Content-Type":          {"application/json"},
+				},
+			}
+			got, err := decodeInvokeFunctionResponse(resp, []byte(tt.body))
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("decode error = %v, want it to contain %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeInvokeFunctionResponse returned error: %v", err)
+			}
+			if got == nil {
+				t.Fatal("decodeInvokeFunctionResponse returned nil response")
+			}
+			if got.RequestID != "req-123" || got.PercentComplete != "50" || got.Status != "PENDING" || got.LocationURL != "https://example.test/result" {
+				t.Errorf("response metadata = %+v", got)
+			}
+			payload := got.Response
+			if tt.status != http.StatusOK {
+				payload = got.ResponseBody
+			}
+			if tt.wantResponse && tt.status == http.StatusFound {
+				if len(got.Response) != 0 || len(got.ResponseBody) != 0 {
+					t.Errorf("redirect unexpectedly has payloads: response=%v responseBody=%v", got.Response, got.ResponseBody)
+				}
+			} else if tt.wantField != "" && payload[tt.wantField] != tt.wantValue {
+				t.Errorf("payload[%q] = %v, want %v", tt.wantField, payload[tt.wantField], tt.wantValue)
+			}
+		})
+	}
+}
+
+type collectionResponseTransport struct {
+	status int
+	body   string
+	req    *http.Request
+}
+
+func (t *collectionResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.req = req
+	return &http.Response{
+		StatusCode: t.status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(t.body)),
+		Request:    req,
+	}, nil
+}
+
+func TestCollectionAndQueueReadResponses(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		payload  string
+		invoke   func(*Client) (interface{}, error)
+		check    func(*testing.T, interface{})
+	}{
+		{
+			name: "function IDs", endpoint: "/v2/nvcf/functions/ids", payload: `{"functionIds":["fn-1"]}`,
+			invoke: func(c *Client) (interface{}, error) { return c.ListFunctionIDs(context.Background()) },
+			check: func(t *testing.T, v interface{}) {
+				if got := v.(*ListFunctionIdsResponse).FunctionIDs; len(got) != 1 || got[0] != "fn-1" {
+					t.Fatalf("FunctionIDs = %v", got)
+				}
+			},
+		},
+		{
+			name: "functions", endpoint: "/v2/nvcf/functions", payload: `{"functions":[{"id":"fn-1","name":"sample"}]}`,
+			invoke: func(c *Client) (interface{}, error) { return c.ListFunctions(context.Background()) },
+			check: func(t *testing.T, v interface{}) {
+				got := v.(*ListFunctionsResponse).Functions
+				if len(got) != 1 || got[0].ID != "fn-1" || got[0].Name != "sample" {
+					t.Fatalf("Functions = %+v", got)
+				}
+			},
+		},
+		{
+			name: "function versions", endpoint: "/v2/nvcf/functions/fn%2Fone/versions", payload: `{"functions":[{"versionId":"ver-1"}]}`,
+			invoke: func(c *Client) (interface{}, error) { return c.ListFunctionVersions(context.Background(), "fn/one") },
+			check: func(t *testing.T, v interface{}) {
+				got := v.(*ListFunctionsResponse).Functions
+				if len(got) != 1 || got[0].VersionID != "ver-1" {
+					t.Fatalf("Functions = %+v", got)
+				}
+			},
+		},
+		{
+			name: "cluster groups", endpoint: "/v2/nvcf/clusterGroups", payload: `{"clusterGroups":[{"id":"cg-1","name":"group"}]}`,
+			invoke: func(c *Client) (interface{}, error) { return c.ListClusterGroups(context.Background()) },
+			check: func(t *testing.T, v interface{}) {
+				got := v.(*ClusterGroupsResponse).ClusterGroups
+				if len(got) != 1 || got[0].ID != "cg-1" || got[0].Name != "group" {
+					t.Fatalf("ClusterGroups = %+v", got)
+				}
+			},
+		},
+		{
+			name: "queue position", endpoint: "/v2/nvcf/queues/req%2Fone/position", payload: `{"position":3}`,
+			invoke: func(c *Client) (interface{}, error) { return c.GetQueuePosition(context.Background(), "req/one") },
+			check: func(t *testing.T, v interface{}) {
+				if got := v.(*GetPositionInQueueResponse).Position; got != 3 {
+					t.Fatalf("Position = %d, want 3", got)
+				}
+			},
+		},
+		{
+			name: "queue details", endpoint: "/v2/nvcf/queues/functions/fn%2Fone", payload: `{"queues":[{"functionId":"fn-1","size":4}]}`,
+			invoke: func(c *Client) (interface{}, error) { return c.GetQueueDetails(context.Background(), "fn/one") },
+			check: func(t *testing.T, v interface{}) {
+				got := v.(*GetQueuesResponse).Queues
+				if len(got) != 1 || got[0].FunctionID != "fn-1" || got[0].Size != 4 {
+					t.Fatalf("Queues = %+v", got)
+				}
+			},
+		},
+		{
+			name: "version queue details", endpoint: "/v2/nvcf/queues/functions/fn%2Fone/versions/ver%2Fone", payload: `{"queues":[{"functionVersionId":"ver-1","estimatedWaitTime":9}]}`,
+			invoke: func(c *Client) (interface{}, error) {
+				return c.GetQueueDetailsForVersion(context.Background(), "fn/one", "ver/one")
+			},
+			check: func(t *testing.T, v interface{}) {
+				got := v.(*GetQueuesResponse).Queues
+				if len(got) != 1 || got[0].FunctionVersionID != "ver-1" || got[0].EstimatedWaitTime != 9 {
+					t.Fatalf("Queues = %+v", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, responseCase := range []struct {
+				name, body string
+				status     int
+			}{
+				{name: "success", status: http.StatusOK, body: tt.payload},
+				{name: "API error", status: http.StatusBadRequest, body: `{"message":"request rejected"}`},
+				{name: "malformed JSON", status: http.StatusOK, body: `not-json`},
+			} {
+				t.Run(responseCase.name, func(t *testing.T) {
+					transport := &collectionResponseTransport{status: responseCase.status, body: responseCase.body}
+					c := &Client{
+						httpClient: &http.Client{Transport: transport},
+						baseURL:    "https://api.example.test",
+						config:     &Config{},
+					}
+					got, err := tt.invoke(c)
+					switch responseCase.name {
+					case "success":
+						if err != nil {
+							t.Fatalf("request returned error: %v", err)
+						}
+						tt.check(t, got)
+						if transport.req == nil || transport.req.Method != http.MethodGet || transport.req.URL.EscapedPath() != tt.endpoint {
+							t.Fatalf("request = %v, want GET %s", transport.req, tt.endpoint)
+						}
+					case "API error":
+						if err == nil || !strings.Contains(err.Error(), `API error 400: {"message":"request rejected"}`) {
+							t.Fatalf("error = %v, want API response body", err)
+						}
+					case "malformed JSON":
+						if err == nil || !strings.Contains(err.Error(), "failed to decode response") {
+							t.Fatalf("error = %v, want decode error", err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestInvocationURLValidationAndTrailingSlash(t *testing.T) {
+	tests := []struct {
+		name        string
+		baseURL     string
+		inference   string
+		wantLLM     string
+		wantGateway string
+		wantError   string
+	}{
+		{
+			name:      "malformed base URL",
+			baseURL:   "http://%",
+			inference: "/v1/infer",
+			wantError: `failed to parse invoke URL "http://%": parse "http://%": invalid URL escape "%"`,
+		},
+		{
+			name:      "missing scheme and host",
+			baseURL:   "invocation.example.test",
+			inference: "/v1/infer",
+			wantError: `invoke URL must include scheme and host: "invocation.example.test"`,
+		},
+		{
+			name:        "preserve inference path trailing slash",
+			baseURL:     "https://api.example.test/base",
+			inference:   "/v1/infer/",
+			wantLLM:     "https://llm.invocation.example.test/base/v1/infer/",
+			wantGateway: "https://api.example.test/base/v1/infer/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotLLM, errLLM := llmInvocationURL(tt.baseURL, tt.inference)
+			gotGateway, errGateway := gatewayInvocationURL(tt.baseURL, tt.inference)
+			if tt.wantError != "" {
+				if errLLM == nil || errLLM.Error() != tt.wantError {
+					t.Errorf("llmInvocationURL error = %v, want %q", errLLM, tt.wantError)
+				}
+				if errGateway == nil || errGateway.Error() != tt.wantError {
+					t.Errorf("gatewayInvocationURL error = %v, want %q", errGateway, tt.wantError)
+				}
+				return
+			}
+			if errLLM != nil {
+				t.Fatalf("llmInvocationURL returned error: %v", errLLM)
+			}
+			if gotLLM != tt.wantLLM {
+				t.Errorf("llmInvocationURL = %q, want %q", gotLLM, tt.wantLLM)
+			}
+			if errGateway != nil {
+				t.Fatalf("gatewayInvocationURL returned error: %v", errGateway)
+			}
+			if gotGateway != tt.wantGateway {
+				t.Errorf("gatewayInvocationURL = %q, want %q", gotGateway, tt.wantGateway)
 			}
 		})
 	}

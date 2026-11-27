@@ -455,6 +455,49 @@ func TestTTY_StatusDegraded(t *testing.T) {
 	assertGolden(t, "testdata/tty_status_degraded.golden", final.View())
 }
 
+func TestTTY_StatusFailedAndUnrecognizedEvents(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	now := ts("2026-04-29T03:45:12Z")
+	m := NewModel(ModelOpts{
+		Mode:      ModeStatus,
+		AsciiOnly: true,
+		NowFunc:   func() time.Time { return now },
+	})
+	m.SetSize(120, 40)
+
+	events := []Event{
+		Snapshot{Verdict: "failed"},
+		ComponentHealth{Name: "cassandra", Ready: 0, Total: 1, Healthy: false},
+		ComponentHealth{Name: "mystery-service", Ready: 1, Total: 2, Healthy: false},
+		ClusterRow{Name: "broken-cluster", GPU: "H100", GPUCount: 4, ActiveDeployments: 2, LastSeenAgeSec: 9, Healthy: false},
+		RecentEvent{AgeSec: -1, Kind: "cluster-deregistered", Name: "gone-cluster"},
+		RecentEvent{AgeSec: 12, Kind: "custom-warning-kind", Status: "Needs-Attention", Name: "worker-0"},
+	}
+	var model tea.Model = m
+	for _, event := range events {
+		model, _ = model.(Model).applyStatusEvent(event)
+	}
+	out := model.(Model).View()
+
+	assert.Contains(t, out, "✘ failed")
+	assert.Contains(t, out, "0/1 not ready")
+	assert.Contains(t, out, "1/2 not ready")
+	assert.Contains(t, out, "Cassandra")
+	assert.Contains(t, out, "Mystery-service")
+	assert.Contains(t, out, "broken-cluster")
+	assert.Contains(t, out, "cluster deregistered")
+	assert.Contains(t, out, "worker-0 custom warning kind   Needs-Attention")
+	assert.Contains(t, out, "NVCF self-hosted: ")
+	assert.Contains(t, out, "Target: ")
+	assert.Contains(t, out, "Stack:  ")
+	assert.Contains(t, out, "00m00s ago")
+
+	unknown := m
+	model = unknown
+	model, _ = model.(Model).applyStatusEvent(Snapshot{Verdict: "future-verdict"})
+	assert.Contains(t, model.(Model).View(), "? unknown")
+}
+
 // ─── ModeCheck tests ──────────────────────────────────────────────────────────
 
 func TestTTY_CheckInflight(t *testing.T) {
@@ -491,6 +534,34 @@ func TestTTY_CheckInflight(t *testing.T) {
 	}
 	final := model.(Model)
 	assertGolden(t, "testdata/tty_check_inflight.golden", final.View())
+}
+
+func TestTTY_CheckPendingRowAndEmptyCategory(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	m := NewModel(ModelOpts{
+		Mode:      ModeCheck,
+		AsciiOnly: true,
+		NowFunc:   func() time.Time { return ts("2026-04-29T03:45:12Z") },
+	})
+	m.checkCategories = []checkCategoryState{
+		{
+			name: "local-host-tools",
+			checks: []checkRow{{
+				id: "kubectl-on-path",
+			}},
+		},
+		{name: "pre-kubernetes-setup"},
+	}
+
+	out := m.View()
+
+	assert.Contains(t, out, "Local host")
+	assert.Contains(t, out, "[ ]")
+	assert.Contains(t, out, "kubectl-on-path")
+	assert.Contains(t, out, "Cluster setup")
+	assert.Contains(t, out, "   ...")
+	assert.NotContains(t, out, "PASS")
+	assert.NotContains(t, out, "FAIL")
 }
 
 func TestTTY_CheckComplete(t *testing.T) {
@@ -814,6 +885,47 @@ func TestTTY_DownComplete(t *testing.T) {
 	assertGolden(t, "testdata/tty_down_complete.golden", out)
 }
 
+func TestTTY_DownPlanOnlyRemovalSummary(t *testing.T) {
+	now := ts("2026-04-29T01:24:52Z")
+	m := NewModel(ModelOpts{
+		Mode:        ModeDown,
+		Cluster:     "ncp-local",
+		Target:      "https://nvcf.nvidia.com",
+		Stack:       "v1.14.2@sha256:deadbeef",
+		TotalPhases: 3,
+		AsciiOnly:   true,
+		Started:     ts("2026-04-29T01:23:43Z"),
+		NowFunc:     func() time.Time { return now },
+	})
+	m.SetSize(130, 36)
+	m.now = now
+
+	final := applyAll(t, m, []tea.Msg{
+		eventMsg{Planned{
+			Cluster:     "ncp-local",
+			Target:      "https://nvcf.nvidia.com",
+			Stack:       "v1.14.2@sha256:deadbeef",
+			Phases:      []PlannedPhase{{Num: 1, Name: "Pre-flight checks", ETASec: 12}, {Num: 2, Name: "Uninstall compute plane", ETASec: 34}, {Num: 3, Name: "Uninstall control plane", ETASec: 56}},
+			TotalETASec: 102,
+			WillUninstall: []ReleaseDescriptor{{
+				Kind: "helm", Name: "nvcf-compute", Namespace: "nvcf", Command: "helm uninstall nvcf-compute -n nvcf",
+			}},
+		}},
+		eventMsg{Final{PlanOnly: true}},
+	})
+	final.now = now
+	out := stripSpinner(final.View())
+
+	require.Contains(t, out, "Plan (dry run")
+	assert.Contains(t, out, "cluster=ncp-local")
+	assert.Contains(t, out, "[01/3]")
+	assert.Contains(t, out, "Pre-flight checks")
+	assert.Contains(t, out, "~12s")
+	assert.Contains(t, out, "helm/nvcf-compute")
+	assert.Contains(t, out, "helm uninstall nvcf-compute -n nvcf")
+	assert.Contains(t, out, "Total estimated time: ~102s")
+}
+
 // TestTTY_UninstallRunning verifies ModeDown with TotalPhases=3 (uninstall)
 // shows only 3 phases in the checklist. (M+11.9)
 func TestTTY_UninstallRunning(t *testing.T) {
@@ -1044,4 +1156,127 @@ func TestTTYRenderer_CloseTwice(t *testing.T) {
 			t.Fatalf("Close call %d did not return", i+1)
 		}
 	}
+}
+
+func TestTTY_DownCompactFinalSummaries(t *testing.T) {
+	const now = "2026-04-29T01:31:25Z"
+	tests := []struct {
+		name       string
+		event      Event
+		want       []string
+		omit       []string
+	}{
+		{
+			name:  "success",
+			event: Final{Success: true, Duration: 2*time.Minute + 5*time.Second},
+			want:  []string{"NVCF self-hosted teardown:", "my-cluster teardown complete in 02m05s", "press q to quit"},
+		},
+		{
+			name: "failure with remediation",
+			event: PhaseFailed{
+				Num: 3, Name: "Uninstall compute plane", ErrCategory: "helm_destroy",
+				ErrMessage: "release still has resources", Remediation: []string{"inspect resources", "retry teardown"},
+			},
+			want: []string{"NVCF self-hosted teardown:", "Phase 3 Uninstall compute plane failed", "helm_destroy", "release still has resources", "Remediation: inspect resources; retry teardown", "press q to quit"},
+		},
+		{
+			name: "failure without remediation",
+			event: PhaseFailed{
+				Num: 3, Name: "Uninstall compute plane", ErrCategory: "helm_destroy",
+				ErrMessage: "release still has resources",
+			},
+			want: []string{"NVCF self-hosted teardown:", "Phase 3 Uninstall compute plane failed", "helm_destroy", "release still has resources", "press q to quit"},
+			omit: []string{"Remediation:"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixed := ts(now)
+			m := NewModel(ModelOpts{
+				Mode: ModeDown, TotalPhases: 7, Cluster: "my-cluster",
+				NowFunc: func() time.Time { return fixed },
+				Started: fixed.Add(-time.Minute),
+			})
+			m.SetSize(80, 24)
+			final := applyAll(t, m, []tea.Msg{eventMsg{tt.event}})
+			out := stripSpinner(final.View())
+			for _, text := range tt.want {
+				assert.Contains(t, out, text)
+			}
+			for _, text := range tt.omit {
+				assert.NotContains(t, out, text)
+			}
+		})
+	}
+}
+
+func TestTTY_UpdateInstallEventStateTransitions(t *testing.T) {
+	fixed := ts("2026-04-29T01:30:00Z")
+	m := NewModel(ModelOpts{NowFunc: func() time.Time { return fixed }})
+	update := func(event Event) (Model, tea.Cmd) {
+		t.Helper()
+		model, cmd := m.Update(eventMsg{event})
+		var ok bool
+		m, ok = model.(Model)
+		require.True(t, ok)
+		return m, cmd
+	}
+
+	startedAt := ts("2026-04-29T01:00:00Z")
+	state, cmd := update(PhaseStarted{Num: 1, Name: "Prepare", StartedAt: startedAt, Context: "control"})
+	require.Nil(t, cmd)
+	assert.Equal(t, startedAt, state.started)
+	assert.Equal(t, phaseRunning, state.phases[0].state)
+	assert.Equal(t, "Prepare", state.phases[0].name)
+	assert.Equal(t, startedAt, state.phases[0].startedAt)
+	assert.Equal(t, "control", state.phases[0].ctx)
+
+	for _, progressEvent := range []PhaseProgress{
+		{Num: 1, Resource: "Deployments", Done: 1, Total: 4},
+		{Num: 1, Resource: "Deployments", Done: 3, Total: 4},
+		{Num: 1, Resource: "Empty", Done: 0, Total: 0},
+	} {
+		state, cmd = update(progressEvent)
+		require.Nil(t, cmd)
+	}
+	require.Len(t, state.phases[0].subs, 2)
+	assert.Equal(t, 3, state.phases[0].subs[0].done)
+	assert.Equal(t, .75, state.phases[0].subs[0].pct)
+	assert.Equal(t, float64(0), state.phases[0].subs[1].pct)
+
+	state, _ = update(Waiting{Num: 1, Reason: "waiting for pod"})
+	assert.Equal(t, "waiting for pod", state.phases[0].waiting)
+	state, _ = update(LastProgress{Num: 1, Detail: "pod scheduled"})
+	assert.Empty(t, state.phases[0].waiting)
+	assert.Equal(t, "pod scheduled", state.phases[0].lastProg)
+	assert.Equal(t, fixed, state.phases[0].lastProgAt)
+	state, _ = update(Waiting{Num: 1, Reason: "waiting again"})
+
+	state, cmd = update(PhaseCompleted{Num: 1, Duration: 5 * time.Second})
+	require.Nil(t, cmd)
+	assert.Equal(t, phaseCompleted, state.phases[0].state)
+	assert.Equal(t, 5*time.Second, state.phases[0].duration)
+	assert.Equal(t, fixed, state.phases[0].completedAt)
+	assert.Empty(t, state.phases[0].waiting)
+	assert.Empty(t, state.phases[0].lastProg)
+
+	planned := Planned{Cluster: "cluster", Target: "target", Stack: "stack"}
+	state, cmd = update(planned)
+	assert.Equal(t, planned, *state.planned)
+	assert.True(t, state.finished)
+	require.NotNil(t, cmd)
+	assert.IsType(t, tea.QuitMsg{}, cmd())
+
+	fresh := NewModel(ModelOpts{NowFunc: func() time.Time { return fixed }})
+	model, cmd := fresh.Update(eventMsg{Final{ClusterID: "id", ClusterGroupID: "group", NVCFBackendHealth: "healthy", Duration: time.Minute, PlanOnly: true}})
+	final := model.(Model)
+	assert.True(t, final.finished)
+	assert.Equal(t, "id", final.clusterID)
+	assert.Equal(t, "group", final.clusterGroupID)
+	assert.Equal(t, "healthy", final.nvcfBackendHealth)
+	assert.Equal(t, time.Minute, final.finalDuration)
+	assert.True(t, final.planOnly)
+	require.NotNil(t, cmd)
+	assert.IsType(t, tea.QuitMsg{}, cmd())
 }

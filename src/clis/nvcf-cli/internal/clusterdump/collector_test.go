@@ -348,3 +348,93 @@ func TestPodReason(t *testing.T) {
 	assert.Equal(t, int32(3), row.Restarts)
 	assert.Equal(t, "0/1", row.Ready)
 }
+
+func TestCollectNodesDetails(t *testing.T) {
+	old := func(name string) *corev1.Node {
+		n := readyNode(name, 0)
+		n.CreationTimestamp = metav1.NewTime(fixedNow.Add(-time.Hour))
+		n.Status.NodeInfo.KubeletVersion = "v1.30.1"
+		return n
+	}
+	worker := old("worker-b")
+	worker.Labels = map[string]string{"node-role.kubernetes.io/worker": "", "node-role.kubernetes.io/control-plane": ""}
+	worker.Spec.Unschedulable = true
+	worker.Status.Capacity = corev1.ResourceList{gpuResourceName: *resource.NewQuantity(4, resource.DecimalSI)}
+	worker.Status.Conditions = append(worker.Status.Conditions,
+		corev1.NodeCondition{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionTrue},
+		corev1.NodeCondition{Type: corev1.NodeDiskPressure, Status: corev1.ConditionFalse},
+		corev1.NodeCondition{Type: corev1.NodePIDPressure, Status: corev1.ConditionTrue},
+		corev1.NodeCondition{Type: corev1.NodeNetworkUnavailable, Status: corev1.ConditionTrue})
+	notReady := old("worker-a")
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+	pc := &PlaneCollector{Kube: k8sfake.NewSimpleClientset(worker, notReady), NowFunc: nowFunc}
+
+	summary, rows, err := pc.collectNodes(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, NodeSummary{Ready: 1, Total: 2, GPUCount: 4}, summary)
+	require.Len(t, rows, 2)
+	assert.Equal(t, "worker-a", rows[0].Name)
+	assert.False(t, rows[0].Ready)
+	assert.Equal(t, "<none>", rows[0].Roles)
+	assert.Equal(t, "worker-b", rows[1].Name)
+	assert.True(t, rows[1].Ready)
+	assert.False(t, rows[1].Schedulable)
+	assert.Equal(t, "control-plane,worker", rows[1].Roles)
+	assert.Equal(t, int64(4), rows[1].GPU)
+	assert.Equal(t, "v1.30.1", rows[1].KubeletVersion)
+	assert.Equal(t, []string{"MemoryPressure", "PIDPressure", "NetworkUnavailable"}, rows[1].Pressures)
+	assert.Equal(t, HumanDuration(time.Hour), rows[1].Age)
+}
+
+func TestPodReasonPrecedence(t *testing.T) {
+	cases := []struct {
+		name   string
+		status corev1.PodStatus
+		want   string
+	}{
+		{name: "pod reason wins", status: corev1.PodStatus{Reason: "Evicted", ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "Pending"}}}}}, want: "Evicted"},
+		{name: "waiting reason", status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}}}}, want: "ImagePullBackOff"},
+		{name: "terminated reason", status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Error"}}}}}, want: "Error"},
+		{name: "empty", status: corev1.PodStatus{}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, podReason(&corev1.Pod{Status: tc.status}))
+		})
+	}
+}
+
+func TestEventTimeSelection(t *testing.T) {
+	last, event, first := fixedNow.Add(-time.Minute), fixedNow.Add(-2*time.Minute), fixedNow.Add(-3*time.Minute)
+	cases := []struct {
+		name  string
+		event corev1.Event
+		want  time.Time
+	}{
+		{name: "last timestamp", event: corev1.Event{LastTimestamp: metav1.NewTime(last), EventTime: metav1.NewMicroTime(event), FirstTimestamp: metav1.NewTime(first)}, want: last},
+		{name: "event time", event: corev1.Event{EventTime: metav1.NewMicroTime(event), FirstTimestamp: metav1.NewTime(first)}, want: event},
+		{name: "first timestamp", event: corev1.Event{FirstTimestamp: metav1.NewTime(first)}, want: first},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { assert.Equal(t, tc.want, eventTime(&tc.event)) })
+	}
+}
+
+func TestCollectNVCFBackendsSortedAndUnknownFallback(t *testing.T) {
+	missing := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "nvcf.nvidia.io/v1", "kind": "NVCFBackend",
+		"metadata": map[string]interface{}{"name": "backend-a", "namespace": "nvca-operator", "creationTimestamp": fixedNow.Add(-time.Hour).Format(time.RFC3339)},
+	}}
+	pc := &PlaneCollector{Dynamic: newDynamicFake(nvcfBackend("backend-z", "Healthy", "2.0", 3), missing), NowFunc: nowFunc}
+	rows, err := pc.collectNVCFBackends(context.Background())
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.Equal(t, "backend-a", rows[0].Name)
+	assert.Equal(t, "Unknown", rows[0].AgentStatus)
+	assert.Empty(t, rows[0].NVCAVersion)
+	assert.Equal(t, HumanDuration(time.Hour), rows[0].Age)
+	assert.Equal(t, "backend-z", rows[1].Name)
+	assert.Equal(t, "Healthy", rows[1].AgentStatus)
+	assert.Equal(t, "2.0", rows[1].NVCAVersion)
+	assert.Equal(t, int64(3), rows[1].GPUCapacity)
+}

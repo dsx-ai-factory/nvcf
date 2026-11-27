@@ -259,6 +259,44 @@ func TestApikeyGenerate_BothKeys(t *testing.T) {
 	assert.Contains(t, *issuers, "nvct-api", "should generate task key via NVCT issuer")
 }
 
+func TestApikeyGenerate_IssuerErrors(t *testing.T) {
+	cases := []struct {
+		name          string
+		service       string
+		issuer        string
+		wrapper       string
+	}{
+		{name: "function", service: "function", issuer: "nvcf-api", wrapper: "failed to generate function API key"},
+		{name: "task", service: "task", issuer: "nvct-api", wrapper: "failed to generate task API key"},
+		{name: "event ledger", service: "event-ledger", issuer: "nvcf-api", wrapper: "failed to generate Event Ledger API key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetApikeyFlags(t)
+			var issuers []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.URL.Path == "/v1/keys" {
+					issuers = append(issuers, r.Header.Get("Key-Issuer-Service"))
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			t.Cleanup(srv.Close)
+			configureApikeyTest(t, srv.URL)
+
+			apikeyFor = tc.service
+			apikeyExpiresIn = "1h"
+
+			err := runAPIKeyGenerate(nil, nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wrapper)
+			require.Len(t, issuers, 1, "expected exactly one key generation request")
+			assert.Equal(t, tc.issuer, issuers[0])
+		})
+	}
+}
+
 // --- list / delete / clear-all cover NVCT task keys (NVBug 6417533) -----------
 
 type apiKeysRecorder struct {
@@ -952,4 +990,101 @@ func TestApikeyShow_ListsAllSavedKeys(t *testing.T) {
 		got[k.Service] = k.APIKey
 	}
 	assert.Equal(t, map[string]string{"function": "nvapi-fn", "task": "nvapi-task", "event-ledger": "nvapi-el"}, got)
+}
+
+func TestApikeyShowAndClearBranches(t *testing.T) {
+	resetApikeyFlags(t)
+	srv, _, _ := fakeAPIKeysServer(t)
+	configureApikeyTest(t, srv.URL)
+
+	oldJSONOutput, oldStdout := jsonOutput, os.Stdout
+	t.Cleanup(func() {
+		jsonOutput = oldJSONOutput
+		os.Stdout = oldStdout
+		clearForce = false
+	})
+
+	cases := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{name: "display expiration states", run: func(t *testing.T) {
+		jsonOutput = false
+		past := time.Now().Add(-time.Hour).Truncate(time.Second)
+		future := time.Now().Add(time.Hour).Truncate(time.Second)
+		sm := GetStateManagerForCurrentCommand()
+		sm.SetTokens("admin-token", "function-key", time.Time{}, time.Time{})
+		sm.SetNVCTAPIKey("task-key", past)
+		sm.SetEventLedgerAPIKey("event-ledger-key", future)
+		require.NoError(t, SaveStateForCurrentCommand())
+
+		reader, writer, err := os.Pipe()
+		require.NoError(t, err)
+		os.Stdout = writer
+		runErr := runShowAPIKey(nil, nil)
+		require.NoError(t, writer.Close())
+		os.Stdout = oldStdout
+		require.NoError(t, runErr)
+		var output bytes.Buffer
+		_, err = io.Copy(&output, reader)
+		require.NoError(t, err)
+		text := output.String()
+		assert.Contains(t, text, "function key: function-key")
+		assert.Contains(t, text, "task key: task-key")
+		assert.Contains(t, text, "event-ledger key: event-ledger-key")
+		assert.Contains(t, text, "(EXPIRED)")
+		assert.Contains(t, text, future.Format("2006-01-02 15:04:05 MST"))
+		assert.NotContains(t, text, "function-key\n  Expires:")
+		}},
+
+		{name: "empty state JSON", run: func(t *testing.T) {
+		jsonOutput = true
+		sm := GetStateManagerForCurrentCommand()
+		sm.SetTokens("admin-token", "", time.Time{}, time.Time{})
+		sm.ClearNVCTAPIKey()
+		sm.ClearEventLedgerAPIKey()
+		require.NoError(t, SaveStateForCurrentCommand())
+
+		reader, writer, err := os.Pipe()
+		require.NoError(t, err)
+		os.Stdout = writer
+		runErr := runShowAPIKey(nil, nil)
+		require.NoError(t, writer.Close())
+		os.Stdout = oldStdout
+		require.NoError(t, runErr)
+		var output bytes.Buffer
+		_, err = io.Copy(&output, reader)
+		require.NoError(t, err)
+		var result map[string]interface{}
+		require.NoError(t, json.Unmarshal(output.Bytes(), &result))
+		assert.Equal(t, false, result["hasKey"])
+		}},
+
+		{name: "cancel clear", run: func(t *testing.T) {
+		jsonOutput = false
+		clearForce = false
+		seedSavedAPIKeys(t)
+		oldStdin := os.Stdin
+		input, err := os.CreateTemp(t.TempDir(), "confirmation")
+		require.NoError(t, err)
+		_, err = input.WriteString("n\n")
+		require.NoError(t, err)
+		_, err = input.Seek(0, 0)
+		require.NoError(t, err)
+		os.Stdin = input
+		t.Cleanup(func() {
+			os.Stdin = oldStdin
+			_ = input.Close()
+		})
+
+		require.NoError(t, runClearAPIKey(nil, nil))
+		st := GetCurrentState()
+		assert.Equal(t, "nvapi-fn", st.APIKey)
+		assert.Equal(t, "nvapi-task", st.NVCTAPIKey)
+		assert.Equal(t, "nvapi-el", st.EventLedgerAPIKey)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, tc.run)
+	}
 }

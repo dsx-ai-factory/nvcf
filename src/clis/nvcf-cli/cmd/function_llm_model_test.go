@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -154,6 +155,173 @@ func TestParseLLMModelString(t *testing.T) {
 	assertStringSlice(t, model.LLMConfig.URIs, []string{"/v1/chat/completions", "/v1/responses", "/v1/embeddings"})
 	if got := stringValue(model.LLMConfig.RoutingMethod); got != "power_of_two" {
 		t.Fatalf("routingMethod = %q, want power_of_two", got)
+	}
+}
+
+func TestParseLLMModelSpecificationsRejectInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		parse       func(*testing.T) error
+		wantErrPart string
+	}{
+		{
+			name: "model malformed key value",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelString("name")
+				return err
+			},
+			wantErrPart: `invalid field "name"`,
+		},
+		{
+			name: "model unknown field",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelString("name=model,unknown=value")
+				return err
+			},
+			wantErrPart: `unknown llm model field "unknown"`,
+		},
+		{
+			name: "model missing name",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelString("uris=/v1/chat/completions")
+				return err
+			},
+			wantErrPart: "name is required",
+		},
+		{
+			name: "model empty uri element",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelString("name=model,uris=/v1/chat/completions|")
+				return err
+			},
+			wantErrPart: "uris cannot contain empty values",
+		},
+		{
+			name: "update malformed key value",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelUpdateString("name")
+				return err
+			},
+			wantErrPart: `invalid field "name"`,
+		},
+		{
+			name: "update unknown field",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelUpdateString("name=model,unknown=value")
+				return err
+			},
+			wantErrPart: `unknown llm model update field "unknown"`,
+		},
+		{
+			name: "update requires a change",
+			parse: func(t *testing.T) error {
+				_, err := parseLLMModelUpdateString("name=model")
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+		{
+			name: "update list wraps invalid item and discards partial results",
+			parse: func(t *testing.T) error {
+				invalid := "name=model"
+				updates, err := parseLLMModelUpdateStrings([]string{"name=valid,routingMethod=round_robin", invalid})
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				if updates != nil {
+					t.Fatalf("updates = %#v, want nil", updates)
+				}
+				if !strings.Contains(err.Error(), invalid) {
+					t.Fatalf("error %q does not include invalid specification %q", err, invalid)
+				}
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.parse(t)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %q, want it to contain %q", err, tt.wantErrPart)
+			}
+		})
+	}
+}
+
+func TestParseLLMModelSpecificationsEmptyFragmentsAndValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		parse       func() error
+		wantErrPart string
+	}{
+		{
+			name: "model ignores empty comma fragments",
+			parse: func() error {
+				model, err := parseLLMModelString(" ,name=model,,uris=/v1/chat/completions, ,routingMethod=round_robin,")
+				if err != nil {
+					return err
+				}
+				if model.Name != "model" || model.LLMConfig == nil || len(model.LLMConfig.URIs) != 1 {
+					return fmt.Errorf("unexpected parsed model: %#v", model)
+				}
+				return nil
+			},
+		},
+		{
+			name: "update ignores empty comma fragments",
+			parse: func() error {
+				update, err := parseLLMModelUpdateString(" ,name=model,,routingMethod=round_robin,")
+				if err != nil {
+					return err
+				}
+				if update.ModelName != "model" || stringValue(update.LLMConfig.RoutingMethod) != "round_robin" {
+					return fmt.Errorf("unexpected parsed update: %#v", update)
+				}
+				return nil
+			},
+		},
+		{
+			name: "model requires URI value",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,uris=")
+				return err
+			},
+			wantErrPart: "uris is required",
+		},
+		{
+			name: "model rejects non-integer token rate limit",
+			parse: func() error {
+				_, err := parseLLMModelString("name=model,uris=/v1/chat/completions,tokenRateLimit=abc-M")
+				return err
+			},
+			wantErrPart: "must be a positive integer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.parse()
+			if tt.wantErrPart == "" {
+				if err != nil {
+					t.Fatalf("parse specification: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErrPart)
+			}
+		})
 	}
 }
 
@@ -376,6 +544,94 @@ func TestLoadCreateConfigAppendsLLMModelFlag(t *testing.T) {
 	assertStringSlice(t, model.LLMConfig.URIs, []string{"/v1/chat/completions", "/v1/embeddings"})
 }
 
+func TestApplyCreateFlagOverridesArtifactAndEnvironmentPaths(t *testing.T) {
+	originalFlags := createFlags
+	t.Cleanup(func() {
+		createFlags = originalFlags
+	})
+
+	tests := []struct {
+		name         string
+		containerEnv []string
+		models       []string
+		llmModels    []string
+		resources    []string
+		wantErr      bool
+	}{
+		{
+			name:         "parses and combines overrides",
+			containerEnv: []string{"MODE=serve", "PORT=8080"},
+			models:       []string{"base:1.0:s3://models/base"},
+			llmModels:    []string{"name=chat,uris=/v1/chat/completions,routingMethod=round_robin"},
+			resources:    []string{"weights:2.0:s3://resources/weights"},
+		},
+		{
+			name:         "rejects invalid container environment",
+			containerEnv: []string{"MODE"},
+			wantErr:      true,
+		},
+		{
+			name:    "rejects invalid artifact",
+			models:  []string{"invalid-artifact"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			createFlags.containerEnvironment = tt.containerEnv
+			createFlags.models = tt.models
+			createFlags.llmModels = tt.llmModels
+			createFlags.resources = tt.resources
+
+			cmd := &cobra.Command{}
+			cmd.Flags().StringSlice("container-env", nil, "")
+			cmd.Flags().StringSlice("models", nil, "")
+			cmd.Flags().StringArray("llm-model", nil, "")
+			cmd.Flags().StringSlice("resources", nil, "")
+			flagValues := map[string]string{
+				"container-env": strings.Join(tt.containerEnv, ","),
+				"models":        strings.Join(tt.models, ","),
+				"resources":     strings.Join(tt.resources, ","),
+			}
+			if len(tt.llmModels) > 0 {
+				flagValues["llm-model"] = tt.llmModels[0]
+			} else {
+				flagValues["llm-model"] = ""
+			}
+			for _, name := range []string{"container-env", "models", "llm-model", "resources"} {
+				if err := cmd.Flags().Set(name, flagValues[name]); err != nil {
+					t.Fatalf("mark %s changed: %v", name, err)
+				}
+			}
+
+			config := CreateConfig{Models: []ArtifactConfig{{Name: "existing"}}}
+			err := applyCreateFlagOverrides(cmd, &config)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("applyCreateFlagOverrides() error = nil, want error")
+				}
+				if len(config.Models) != 1 || config.Models[0].Name != "existing" {
+					t.Fatalf("models after failed override = %#v, want original model", config.Models)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyCreateFlagOverrides(): %v", err)
+			}
+			if len(config.ContainerEnvironment) != 2 || config.ContainerEnvironment[0].Key != "MODE" || config.ContainerEnvironment[0].Value != "serve" || config.ContainerEnvironment[1].Key != "PORT" || config.ContainerEnvironment[1].Value != "8080" {
+				t.Fatalf("container environment = %#v, want MODE=serve and PORT=8080", config.ContainerEnvironment)
+			}
+			if len(config.Models) != 2 || config.Models[0].Name != "base" || config.Models[1].Name != "chat" {
+				t.Fatalf("models = %#v, want base artifact followed by chat LLM model", config.Models)
+			}
+			if len(config.Resources) != 1 || config.Resources[0].Name != "weights" {
+				t.Fatalf("resources = %#v, want weights artifact", config.Resources)
+			}
+		})
+	}
+}
+
 func TestUpdateConfigParsesLLMModelUpdatesFromJSON(t *testing.T) {
 	t.Parallel()
 
@@ -541,6 +797,126 @@ func TestValidateUpdateConfigRejectsNoUpdates(t *testing.T) {
 	err := validateUpdateConfig(&UpdateConfig{FunctionID: "func-123", VersionID: "ver-456"})
 	if err == nil {
 		t.Fatal("expected no updates error")
+	}
+}
+
+func TestLLMConfigConversionAndUpdateRequestValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		convert     func() error
+		wantErrPart string
+	}{
+		{
+			name: "nil llm input",
+			convert: func() error {
+				got, err := llmConfigInputToClient(nil)
+				if err == nil && got != nil {
+					return fmt.Errorf("result = %#v, want nil", got)
+				}
+				return err
+			},
+		},
+		{
+			name: "empty uri list",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{})
+				return err
+			},
+			wantErrPart: "uris is required",
+		},
+		{
+			name: "blank uri",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{URIs: []string{"  "}})
+				return err
+			},
+			wantErrPart: "uris cannot contain empty values",
+		},
+		{
+			name: "invalid token rate limit",
+			convert: func() error {
+				_, err := llmConfigInputToClient(&LLMConfigInput{
+					URIs:           []string{"/v1/chat/completions"},
+					TokenRateLimit: optionalString("100-A"),
+				})
+				return err
+			},
+			wantErrPart: "invalid tokenRateLimit unit",
+		},
+		{
+			name: "blank model name",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{
+					ModelName: " \t",
+					LLMConfig: &LLMConfigUpdateInput{RoutingMethod: optionalString("round_robin")},
+				})
+				return err
+			},
+			wantErrPart: "modelName is required",
+		},
+		{
+			name: "missing update llm config",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{ModelName: "model"})
+				return err
+			},
+			wantErrPart: "llmConfig is required",
+		},
+		{
+			name: "update with no changes",
+			convert: func() error {
+				_, err := modelUpdateConfigToClient(ModelUpdateConfig{
+					ModelName: "model",
+					LLMConfig: &LLMConfigUpdateInput{},
+				})
+				return err
+			},
+			wantErrPart: "at least one of routingMethod or tokenRateLimit is required",
+		},
+		{
+			name: "invalid invocation priority",
+			convert: func() error {
+				_, err := updateConfigToClientRequest(&UpdateConfig{
+					LLMInvocationConfig: &LLMInvocationConfigInput{
+						Priority: &PriorityInput{PerAccountPriority: map[string]uint32{"nca-1": 1}},
+					},
+				})
+				return err
+			},
+			wantErrPart: "defaultPriority is required",
+		},
+		{
+			name: "model update error includes model name",
+			convert: func() error {
+				_, err := updateConfigToClientRequest(&UpdateConfig{
+					ModelUpdates: []ModelUpdateConfig{{ModelName: "broken-model"}},
+				})
+				return err
+			},
+			wantErrPart: `model update "broken-model": llmConfig is required`,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.convert()
+			if tt.wantErrPart == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q", tt.wantErrPart)
+			}
+			if !strings.Contains(err.Error(), tt.wantErrPart) {
+				t.Fatalf("error = %q, want it to contain %q", err, tt.wantErrPart)
+			}
+		})
 	}
 }
 

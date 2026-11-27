@@ -19,6 +19,10 @@ package cmd
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +30,8 @@ import (
 
 	"nvcf-cli/internal/client"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -476,4 +482,267 @@ func TestRegistryCredentialAddHelp(t *testing.T) {
 		"registry add command help should provide file example")
 	assert.Contains(t, registryAddCmd.Long, "--secret-file -",
 		"registry add command help should provide stdin example")
+}
+
+func TestRunUpdateRegistryCredentialValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "request rejected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NVCF_API_KEY", "test-api-key")
+	t.Setenv("NVCF_BASE_HTTP_URL", server.URL)
+	t.Setenv("NVCF_BASE_GRPC_URL", "127.0.0.1:50051")
+	previousCfgFile := cfgFile
+	t.Cleanup(func() {
+		cfgFile = previousCfgFile
+		viper.Reset()
+	})
+	cfgFile = ""
+	viper.Reset()
+	viper.SetEnvPrefix("NVCF")
+	viper.AutomaticEnv()
+
+	tests := []struct {
+		name    string
+		flags   []string
+		wantErr string
+	}{
+		{name: "no update flags", wantErr: "no updates specified. Use --username/--password or --artifact-type flags"},
+		{name: "only username", flags: []string{"--username", "alice"}, wantErr: "both username and password must be provided together"},
+		{name: "only password", flags: []string{"--password", "secret"}, wantErr: "both username and password must be provided together"},
+		{name: "invalid artifact type", flags: []string{"--artifact-type", "UNKNOWN"}, wantErr: "invalid artifact type 'UNKNOWN'"},
+		{name: "valid updates reach API", flags: []string{"--username", "alice", "--password", "secret", "--artifact-type", "CONTAINER", "--artifact-type", "MODEL"}, wantErr: "failed to update registry credential:"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("username", "", "")
+			cmd.Flags().String("password", "", "")
+			cmd.Flags().StringSlice("artifact-type", nil, "")
+			require.NoError(t, cmd.Flags().Parse(tt.flags))
+
+			err := runUpdateRegistryCredential(cmd, []string{"credential-id"})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func setupRegistryCommandEnvironment(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("NVCF_API_KEY", "test-api-key")
+	t.Setenv("NVCF_BASE_HTTP_URL", server.URL)
+	t.Setenv("NVCF_BASE_GRPC_URL", "127.0.0.1:50051")
+	previousCfgFile := cfgFile
+	t.Cleanup(func() {
+		cfgFile = previousCfgFile
+		viper.Reset()
+	})
+	cfgFile = ""
+	viper.Reset()
+	viper.SetEnvPrefix("NVCF")
+	viper.AutomaticEnv()
+	return server
+}
+
+func TestRunListRegistryCredentials(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   string
+		flags      []string
+		artifact   []string
+		provision  []string
+	}{
+		{name: "empty response", response: `{"registryCredentials":[]}`},
+		{name: "formatted populated response", response: `{"registryCredentials":[{"registryCredentialId":"id","registryName":"abcdefghijklmnopqrstuvwxyz0123456789","registryHostname":"registry.example.com/with/a/long/path","artifactTypes":["CONTAINER","HELM","MODEL"],"provisionedBy":"USER"}]}`},
+		{name: "filters are uppercased", response: `{"registryCredentials":[]}`, flags: []string{"--artifact-type", "container", "--provisioned-by", "user"}, artifact: []string{"CONTAINER"}, provision: []string{"USER"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := setupRegistryCommandEnvironment(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "/v2/nvcf/registry-credentials", r.URL.Path)
+				assert.Equal(t, tt.artifact, r.URL.Query()["artifactType"])
+				assert.Equal(t, tt.provision, r.URL.Query()["provisionedBy"])
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.response))
+			})
+			_ = server
+			cmd := &cobra.Command{Use: "list"}
+			cmd.Flags().StringSlice("artifact-type", nil, "")
+			cmd.Flags().StringSlice("provisioned-by", nil, "")
+			require.NoError(t, cmd.Flags().Parse(tt.flags))
+			require.NoError(t, runListRegistryCredentials(cmd, nil))
+		})
+	}
+}
+
+func TestRunAddRegistryCredential(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		flags      []string
+		wantErr    string
+		wantCalled bool
+	}{
+		{name: "missing artifact types", flags: []string{"--hostname", "registry.example.com", "--username", "alice", "--password", "secret"}, wantErr: "at least one artifact type must be specified"},
+		{name: "invalid artifact type", flags: []string{"--hostname", "registry.example.com", "--username", "alice", "--password", "secret", "--artifact-type", "UNKNOWN"}, wantErr: "invalid artifact type 'UNKNOWN'"},
+		{name: "valid request", flags: []string{"--hostname", "registry.example.com", "--username", "alice", "--password", "secret", "--artifact-type", "container", "--artifact-type", "model", "--description", "private registry", "--tag", "team:ml", "--tag", "env:test"}, wantCalled: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			setupRegistryCommandEnvironment(t, func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				assert.Equal(t, http.MethodPost, r.Method)
+				assert.Equal(t, "/v2/nvcf/registry-credentials", r.URL.Path)
+				var body struct {
+					RegistryHostname string `json:"registryHostname"`
+					Secret struct { Name string `json:"name"`; Value string `json:"value"` } `json:"secret"`
+					ArtifactTypes []string `json:"artifactTypes"`
+					Description string `json:"description"`
+					Tags []string `json:"tags"`
+				}
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				assert.Equal(t, "registry.example.com", body.RegistryHostname)
+				assert.Equal(t, "credentials", body.Secret.Name)
+				assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("alice:secret")), body.Secret.Value)
+				assert.Equal(t, []string{"CONTAINER", "MODEL"}, body.ArtifactTypes)
+				assert.Equal(t, "private registry", body.Description)
+				assert.Equal(t, []string{"team:ml", "env:test"}, body.Tags)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"registryCredential":{"registryCredentialId":"id","registryName":"registry","registryHostname":"registry.example.com","artifactTypes":["CONTAINER"],"provisionedBy":"USER","createdAt":"2025-01-01T00:00:00Z"}}`))
+			})
+			cmd := &cobra.Command{Use: "add"}
+			cmd.Flags().String("hostname", "", "")
+			cmd.Flags().String("username", "", "")
+			cmd.Flags().String("password", "", "")
+			cmd.Flags().String("secret", "", "")
+			cmd.Flags().String("secret-file", "", "")
+			cmd.Flags().StringSlice("artifact-type", nil, "")
+			cmd.Flags().String("description", "", "")
+			cmd.Flags().StringSlice("tag", nil, "")
+			require.NoError(t, cmd.Flags().Parse(tt.flags))
+			err := runAddRegistryCredential(cmd, nil)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantCalled, called)
+		})
+	}
+}
+
+func TestRegistryCredentialCommandOutputAndDeletePaths(t *testing.T) {
+	credential := `{"registryCredential":{"registryCredentialId":"cred-123","ncaId":"nca-1","registryCredentialName":"private","registryName":"Example Registry","registryHostname":"registry.example.com","artifactTypes":["CONTAINER","HELM"],"provisionedBy":"USER","createdAt":"2025-01-02T03:04:05Z","lastUpdatedAt":"2025-02-03T04:05:06Z","description":"private images","tags":["team:ml","env:test"]}}`
+	tests := []struct {
+		name       string
+		json       bool
+		command    string
+		response   string
+		wantMethod string
+		wantPath   string
+		flags      []string
+		wantBody   bool
+	}{
+		{name: "get formatted", command: "get", response: credential, wantMethod: http.MethodGet, wantPath: "/v2/nvcf/registry-credentials/cred-123"},
+		{name: "get JSON", command: "get", json: true, response: credential, wantMethod: http.MethodGet, wantPath: "/v2/nvcf/registry-credentials/cred-123"},
+		{name: "update formatted", command: "update", response: credential, wantMethod: http.MethodPatch, wantPath: "/v2/nvcf/registry-credentials/cred-123", flags: []string{"--username", "alice", "--password", "secret", "--artifact-type", "MODEL"}, wantBody: true},
+		{name: "update JSON", command: "update", json: true, response: credential, wantMethod: http.MethodPatch, wantPath: "/v2/nvcf/registry-credentials/cred-123", flags: []string{"--username", "alice", "--password", "secret", "--artifact-type", "MODEL"}, wantBody: true},
+		{name: "delete formatted", command: "delete", wantMethod: http.MethodDelete, wantPath: "/v2/nvcf/registry-credentials/cred-123", flags: []string{"--force"}},
+		{name: "delete JSON", command: "delete", json: true, wantMethod: http.MethodDelete, wantPath: "/v2/nvcf/registry-credentials/cred-123", flags: []string{"--force"}},
+		{name: "recognized empty", command: "recognized", response: `{"recognizedRegistries":{}}`, wantMethod: http.MethodGet, wantPath: "/v2/nvcf/recognized-registries"},
+		{name: "recognized populated", command: "recognized", response: `{"recognizedRegistries":{"Docker Hub":[{"hostname":"docker.io","type":"CONTAINER"}],"NVIDIA NGC":[{"hostname":"nvcr.io","type":"CONTAINER"},{"hostname":"helm.ngc.nvidia.com","type":"HELM"}]}}`, wantMethod: http.MethodGet, wantPath: "/v2/nvcf/recognized-registries"},
+		{name: "recognized populated JSON", command: "recognized", json: true, response: `{"recognizedRegistries":{"Docker Hub":[{"hostname":"docker.io"}],"NVIDIA NGC":[{"hostname":"nvcr.io"}]}}`, wantMethod: http.MethodGet, wantPath: "/v2/nvcf/recognized-registries"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			previousJSON := jsonOutput
+			jsonOutput = tt.json
+			t.Cleanup(func() { jsonOutput = previousJSON })
+			setupRegistryCommandEnvironment(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, tt.wantMethod, r.Method)
+				assert.Equal(t, tt.wantPath, r.URL.Path)
+				if tt.wantBody {
+					var body struct {
+						Secret struct {
+							Name  string `json:"name"`
+							Value string `json:"value"`
+						} `json:"secret"`
+						ArtifactTypes []string `json:"artifactTypeEnums"`
+					}
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+					assert.Equal(t, "credentials", body.Secret.Name)
+					assert.Equal(t, base64.StdEncoding.EncodeToString([]byte("alice:secret")), body.Secret.Value)
+					assert.Equal(t, []string{"MODEL"}, body.ArtifactTypes)
+				}
+				if tt.command == "delete" {
+					assert.Equal(t, "/v2/nvcf/registry-credentials/cred-123", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tt.command == "delete" {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				_, _ = w.Write([]byte(tt.response))
+			})
+			var cmd *cobra.Command
+			var run func() error
+			switch tt.command {
+			case "get":
+				cmd = &cobra.Command{Use: "get"}
+				run = func() error { return runGetRegistryCredential(cmd, []string{"cred-123"}) }
+			case "update":
+				cmd = &cobra.Command{Use: "update"}
+				cmd.Flags().String("username", "", "")
+				cmd.Flags().String("password", "", "")
+				cmd.Flags().StringSlice("artifact-type", nil, "")
+				require.NoError(t, cmd.Flags().Parse(tt.flags))
+				run = func() error { return runUpdateRegistryCredential(cmd, []string{"cred-123"}) }
+			case "delete":
+				cmd = &cobra.Command{Use: "delete"}
+				cmd.Flags().Bool("force", false, "")
+				require.NoError(t, cmd.Flags().Parse(tt.flags))
+				run = func() error { return runDeleteRegistryCredential(cmd, []string{"cred-123"}) }
+			default:
+				cmd = &cobra.Command{Use: "list-recognized"}
+				run = func() error { return runListRecognizedRegistries(cmd, nil) }
+			}
+			if tt.json {
+				oldStdout := os.Stdout
+				reader, writer, err := os.Pipe()
+				require.NoError(t, err)
+				os.Stdout = writer
+				err = run()
+				_ = writer.Close()
+				os.Stdout = oldStdout
+				output, readErr := io.ReadAll(reader)
+				_ = reader.Close()
+				require.NoError(t, err)
+				require.NoError(t, readErr)
+				if tt.command == "recognized" {
+					assert.Contains(t, string(output), "recognizedRegistries")
+					if tt.name == "recognized populated JSON" {
+						assert.Contains(t, string(output), "docker.io")
+						assert.Contains(t, string(output), "nvcr.io")
+					}
+				} else if tt.command == "delete" {
+					assert.Contains(t, string(output), `"status": "deleted"`)
+					assert.Contains(t, string(output), "cred-123")
+				} else {
+					assert.Contains(t, string(output), "registryCredentialId")
+					assert.Contains(t, string(output), "cred-123")
+				}
+			} else {
+				require.NoError(t, run())
+			}
+		})
+	}
 }
