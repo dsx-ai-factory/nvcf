@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Inventory profile for the separately installed, optional container cache.
+# Kept outside helmfile.d so ordinary compute-plane operations do not install it.
+environments:
+  default:
+    values:
+      - ../environments/base.yaml
+      {{- if env "HELMFILE_ENV" }}
+      - ../environments/{{ requiredEnv "HELMFILE_ENV" }}.yaml
+      {{- end }}
+      - containerCache:
+          enabled: false
+          monitoring: false
+
+---
+
+repositories:
+  - name: nvcf
+{{- if dig "global" "helm" "sources" "url" "" .Values }}
+    url: {{ .Values.global.helm.sources.url }}
+{{- else }}
+    url: {{ .Values.global.helm.sources.registry }}/{{ .Values.global.helm.sources.repository }}
+    oci: true
+{{- end }}
+
+releases:
+  - name: nvcf-container-cache
+    namespace: container-caching
+    condition: containerCache.enabled
+    chart: nvcf/nvcf-container-cache
+    version: 0.30.11
+    values:
+      - monitoring:
+          enabled: {{ .Values.containerCache.monitoring }}
+        images:
+          server: {{ printf "%s/%s:%s" .Values.containerCache.serverImage.registry .Values.containerCache.serverImage.repository .Values.containerCache.serverImage.tag | quote }}
+          exporter: {{ printf "%s/%s:%s" .Values.containerCache.exporterImage.registry .Values.containerCache.exporterImage.repository .Values.containerCache.exporterImage.tag | quote }}
+          certificates: {{ printf "%s/%s:%s" .Values.containerCache.certificatesImage.registry .Values.containerCache.certificatesImage.repository .Values.containerCache.certificatesImage.tag | quote }}
+          init: {{ printf "%s/%s:%s" .Values.containerCache.initImage.registry .Values.containerCache.initImage.repository .Values.containerCache.initImage.tag | quote }}

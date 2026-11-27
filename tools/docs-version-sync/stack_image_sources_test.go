@@ -222,6 +222,17 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 			}
 		}
 	}
+	// Inventory-only profiles get the same image checks as deployed states.
+	for _, name := range []string{"covered", "no-source"} {
+		dir := "deploy/stacks/" + name + "/"
+		state := dir + "inventory/cache.yaml.gotmpl"
+		files[state] = files[dir+"helmfile.d/01.yaml.gotmpl"]
+		if name == "no-source" {
+			files[state] = fixtureStateHeader + fixtureRelease("inventory-only", "helm-defaulted", "repository: team/inventory-only\n")
+		}
+		files[dir+stackInventoryFile] = strings.Replace(files[dir+stackInventoryFile], "publishedChartRepository:",
+			"  - {plane: control-plane, path: "+state+"}\npublishedChartRepository:", 1)
+	}
 	// The second state of unlisted-state is missing from its inventory.
 	for name, content := range fixtureStack("unlisted-state", fixtureBase, sourced) {
 		files[name] = content
@@ -264,7 +275,7 @@ func TestStackImageSourcesReportsEachFailure(t *testing.T) {
 	want := map[string]struct{ category, problem string }{
 		"deploy/stacks/template-default":     {findingImageSource, `helmfile.d/01.yaml.gotmpl:17: default "docker.io" supplies an image source`},
 		"deploy/stacks/dig-default":          {findingImageSource, `helmfile.d/01.yaml.gotmpl:17: default "docker.io" supplies an image source`},
-		"deploy/stacks/no-source":            {findingImageSource, "image.repository: image does not take its registry and repository from base.yaml"},
+		"deploy/stacks/no-source":            {findingImageSource, "docker.io/team/inventory-only:v1 image.repository: image does not take its registry and repository from base.yaml"},
 		"deploy/stacks/comment-only":         {findingImageSource, "chart image guard rejects the probe values"},
 		"deploy/stacks/undeclared-key":       {findingImageSource, "chart image guard rejects the probe values"},
 		"deploy/stacks/empty-key":            {findingImageSource, "chart image guard rejects the probe values"},

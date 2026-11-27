@@ -214,3 +214,24 @@ addons:
         registry: docker.io
         repository: library/nats
         tag: 2.10.21-alpine
+
+# Images inventoried for the separately installed, optional container cache.
+# Override registry and repository when mirroring this chart's images.
+containerCache:
+  serverImage:
+    registry: nvcr.io
+    repository: nvidia/nvcf/nvcf-container-cache
+    tag: v1.1.42
+  exporterImage:
+    registry: docker.io
+    repository: nginx/nginx-prometheus-exporter
+    tag: 1.5.3
+  certificatesImage:
+    registry: nvcr.io
+    repository: nvidia/nvcf/nvcf-proxy-tls-certs
+    tag: v1.2.15
+  # The ownership init container uses the certificates image by default.
+  initImage:
+    registry: nvcr.io
+    repository: nvidia/nvcf/nvcf-proxy-tls-certs
+    tag: v1.2.15

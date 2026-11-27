@@ -11,7 +11,7 @@ The Container Cache acts as a proxy between your Kubernetes cluster and the NGC 
 ### Prerequisites
 
 - A running Kubernetes cluster with `kubectl` access
-- **Helm** >= 3.12
+- Helm >= 3.12
 - Credentials for the registry where your NVCF charts and images are stored
 
 ### Step 1. Authenticate Helm to your chart registry
@@ -67,10 +67,13 @@ If you use a different secret name, update the values file to match.
 ### Step 3. Create a values file
 
 Create a `values.yaml` using the complete example in [Base Configuration] below.
+Use the image tags from the selected release's
+[Artifact Manifest](../../overview/manifest.md) for each image-tag placeholder.
+Keep the chart and image versions from the same release.
 
-- **BYOC users** pulling directly from NGC can use the `nvcr.io/nvidia/nvcf-byoc/` image
+- BYOC users pulling directly from NGC can use the `nvcr.io/nvidia/nvcf-byoc/` image
   paths without mirroring.
-- **Self-hosted users** should replace the `<your-registry>/<your-repo>` placeholders with
+- Self-hosted users should replace the `<your-registry>/<your-repo>` placeholders with
   their mirrored registry path (see the Artifact Manifest in the self-hosted installation guide).
 
 Adjust `storageClassName` for your environment (e.g., `gp3` for AWS EKS).
@@ -81,11 +84,14 @@ Adjust `storageClassName` for your environment (e.g., `gp3` for AWS EKS).
 <Tab title="Self-Hosted (OCI)">
 
 Replace `<your-registry>/<your-repo>` with your mirrored registry path.
+Use the chart version listed in the selected release's
+[Artifact Manifest](../../overview/manifest.md). Mirror and install that same
+version.
 
 ```bash
 helm upgrade --install container-cache \
   oci://<your-registry>/<your-repo>/nvcf-container-cache \
-  --version 0.25.22 \
+  --version <chart-version-from-manifest> \
   --namespace container-caching \
   --values values.yaml
 ```
@@ -98,10 +104,10 @@ helm upgrade --install container-cache \
 
 Container Cache deploys two workloads:
 
-- A **StatefulSet** (`container-cache`) with the number of replicas set by `replicaCount`.
+- A StatefulSet (`container-cache`) with the number of replicas set by `replicaCount`.
   Each replica runs two containers (nginx proxy + prometheus exporter) and provisions two PVCs
   (`cache` and `proxy-cache`).
-- A **DaemonSet** (`container-cache-cc`) that runs on every node and configures the container
+- A DaemonSet (`container-cache-cc`) that runs on every node and configures the container
   runtime (containerd) to route image pulls through the cache.
 
 ```bash
@@ -125,10 +131,12 @@ kubectl get pvc -n container-caching
 
 The following is a complete example `values.yaml` for deploying Container Cache.
 Copy this file and adjust values for your environment. Each section is explained in detail
-below.
+below. Use the image tags from the selected release's
+[Artifact Manifest](../../overview/manifest.md) for each image-tag placeholder.
+Keep the chart and image versions from the same release.
 
-- **BYOC users** can use the `nvcr.io/nvidia/nvcf-byoc/` paths directly.
-- **Self-hosted users** should replace `<your-registry>/<your-repo>` with their mirrored
+- BYOC users can use the `nvcr.io/nvidia/nvcf-byoc/` paths directly.
+- Self-hosted users should replace `<your-registry>/<your-repo>` with their mirrored
   registry path (see the Artifact Manifest in the self-hosted installation guide for source image paths).
 
 ```yaml
@@ -137,9 +145,9 @@ replicaCount: 3
 targetHost: nvcr.io,docker.io
 
 images:
-  server: <your-registry>/<your-repo>/nvcf-container-cache:v1.1.31
-  exporter: nginx/nginx-prometheus-exporter:1.0
-  certificates: <your-registry>/<your-repo>/nvcf-proxy-tls-certs:1.2.0
+  server: <your-registry>/<your-repo>/nvcf-container-cache:<cache-image-tag-from-manifest>
+  exporter: docker.io/nginx/nginx-prometheus-exporter:<exporter-image-tag-from-manifest>
+  certificates: <your-registry>/<your-repo>/nvcf-proxy-tls-certs:<certificates-image-tag-from-manifest>
   secrets:
     - nvcr-creds
 
@@ -155,7 +163,7 @@ persistentVolumeClaim:
   sizeProxyGB: 100
 
 service:
-  type: ClusterIP
+  type: NodePort
   port: 30345
 
 metrics:
@@ -233,13 +241,13 @@ Container Cache uses specific images for the server, exporter, and certificates:
 
 images:
   # Container Cache Nginx Proxy
-  server: <your-registry>/<your-repo>/nvcf-container-cache:v1.1.31
+  server: <your-registry>/<your-repo>/nvcf-container-cache:<cache-image-tag-from-manifest>
 
-  # Nginx Prometheus Exporter (public image, no mirroring required)
-  exporter: nginx/nginx-prometheus-exporter:1.0
+  # Nginx Prometheus Exporter (public image; mirror for offline installs)
+  exporter: docker.io/nginx/nginx-prometheus-exporter:<exporter-image-tag-from-manifest>
 
   # TLS Certificates
-  certificates: <your-registry>/<your-repo>/nvcf-proxy-tls-certs:1.2.0
+  certificates: <your-registry>/<your-repo>/nvcf-proxy-tls-certs:<certificates-image-tag-from-manifest>
 
   # Image pull secret created in Step 2
   secrets:
@@ -330,7 +338,7 @@ metrics:
 
 ### Resource Requests and Limits
 
-Resource requests and limits for the Container Cache StatefulSet pods are **required**. The
+Resource requests and limits for the Container Cache StatefulSet pods are required. The
 chart will fail to install without them.
 
 ```yaml
@@ -357,18 +365,18 @@ deployments with high pull rates may need more memory and CPU.
 
 Container Cache consists of several components:
 
-1. **Nginx Proxy Server**: Handles incoming requests and serves cached content
-2. **Prometheus Exporter**: Provides metrics for monitoring
-3. **Persistent Storage**: Stores cached container images
-4. **DaemonSet**: Configures containerd on worker nodes to use the cache
+1. Nginx Proxy Server: Handles incoming requests and serves cached content
+2. Prometheus Exporter: Provides metrics for monitoring
+3. Persistent Storage: Stores cached container images
+4. DaemonSet: Configures containerd on worker nodes to use the cache
 
 ### Data Flow
 
-1. **Initial Request**: Worker node requests a container image
-2. **Cache Check**: Container Cache checks if image is cached locally
-3. **Cache Hit**: If cached, serve image directly from local storage
-4. **Cache Miss**: If not cached, fetch from upstream registry and cache locally
-5. **Response**: Return image to requesting worker node
+1. Initial Request: Worker node requests a container image
+2. Cache Check: Container Cache checks if image is cached locally
+3. Cache Hit: If cached, serve image directly from local storage
+4. Cache Miss: If not cached, fetch from upstream registry and cache locally
+5. Response: Return image to requesting worker node
 
 ## Performance Considerations
 
@@ -376,17 +384,17 @@ Container Cache consists of several components:
 
 The cache size should be sized based on your workload requirements:
 
-- **Small deployments**: 50-100GB
-- **Medium deployments**: 100-500GB
-- **Large deployments**: 500GB+
+- Small deployments: 50-100GB
+- Medium deployments: 100-500GB
+- Large deployments: 500GB+
 
 ### Storage Performance
 
 For optimal performance, use high-performance storage:
 
-- **AWS**: Use gp3 or io1/io2 EBS volumes
-- **Azure**: Use Premium SSD storage
-- **GCP**: Use SSD persistent disks
+- AWS: Use gp3 or io1/io2 EBS volumes
+- Azure: Use Premium SSD storage
+- GCP: Use SSD persistent disks
 
 ### Network Configuration
 
@@ -402,10 +410,10 @@ Container Cache should be deployed close to worker nodes to minimize network lat
 
 Container Cache provides several key metrics:
 
-- **Cache hit ratio**: Percentage of requests served from cache
-- **Cache size**: Current size of cached data
-- **Request throughput**: Number of requests per second
-- **Response times**: Time to serve cached vs. uncached content
+- Cache hit ratio: Percentage of requests served from cache
+- Cache size: Current size of cached data
+- Request throughput: Number of requests per second
+- Response times: Time to serve cached vs. uncached content
 
 ### Logging
 
@@ -420,19 +428,19 @@ Container Cache logs include:
 
 ### Common Issues
 
-**Cache Not Working**
+Cache Not Working
 : - Verify containerd configuration on worker nodes
 
 - Check network connectivity to Container Cache service
 - Ensure proper DNS resolution
 
-**Low Cache Hit Ratio**
+Low Cache Hit Ratio
 : - Review cache size configuration
 
 - Check cache eviction policies
 - Monitor storage performance
 
-**Storage Issues**
+Storage Issues
 : - Verify storage class availability
 
 - Check persistent volume claims

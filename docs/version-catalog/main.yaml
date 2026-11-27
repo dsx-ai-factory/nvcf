@@ -957,6 +957,12 @@ manifest:
       requirement: optional
       description: Caches container image layers on GPU cluster nodes.
       github_url: https://github.com/NVIDIA/nvcf/tree/main/deploy/helm/container-cache
+    - artifact_id: nginx-prometheus-exporter
+      plane: compute
+      kind: service-image
+      requirement: optional
+      description: Exports metrics for the optional container cache.
+      upstream_url: https://github.com/nginx/nginx-prometheus-exporter
     - artifact_id: nvcf-proxy-tls-certs
       plane: compute
       kind: service-image
@@ -1834,6 +1840,14 @@ supplemental_artifacts:
     registry: public-images
     upstream_repository: docker.io/fluent/fluent-bit
     version: "3.2"
+    stacks:
+      - compute-plane
+    requirement: optional
+  - name: nginx-prometheus-exporter
+    type: image
+    registry: public-images
+    upstream_repository: docker.io/nginx/nginx-prometheus-exporter
+    version: 1.5.3
     stacks:
       - compute-plane
     requirement: optional

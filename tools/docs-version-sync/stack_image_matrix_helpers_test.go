@@ -110,13 +110,14 @@ func discoverTrackedStacks(repoRoot string) (trackedStacks, error) {
 	return tracked, nil
 }
 
-// stackStates returns the states of each tracked helmfile.d file or
-// helmfile.yaml.gotmpl, in file order.
+// stackStates returns tracked deployment and inventory-only states, in file
+// order. Inventory profiles stay outside helmfile.d to avoid installing addons.
 func (t trackedStacks) stackStates(stack string) []string {
 	var states []string
 	for _, file := range t.files[stack] {
 		inside := strings.TrimPrefix(file, stack+"/")
-		if (path.Dir(inside) == "helmfile.d" && strings.HasSuffix(inside, ".gotmpl")) || inside == "helmfile.yaml.gotmpl" {
+		if ((path.Dir(inside) == "helmfile.d" || path.Dir(inside) == "inventory") && strings.HasSuffix(inside, ".gotmpl")) ||
+			inside == "helmfile.yaml.gotmpl" {
 			states = append(states, file)
 		}
 	}
@@ -205,7 +206,7 @@ func stackRenderStates(repoRoot, stack string, tracked trackedStacks, check *sta
 	}
 	for _, state := range sortedKeys(listed) {
 		check.fail(findingStackConfig, "", "", state, "listed state is not a tracked Helmfile state of the stack",
-			"states under "+stack+"/helmfile.d", "correct the state path")
+			"states under "+stack+"/helmfile.d or "+stack+"/inventory", "correct the state path")
 	}
 	return states
 }
