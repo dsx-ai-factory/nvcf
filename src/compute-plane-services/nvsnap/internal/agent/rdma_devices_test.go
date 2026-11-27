@@ -120,7 +120,7 @@ func TestChmodNodeAtDoesNotFollowALink(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = d.Close() }()
-	if err := chmodNodeAt(d, filepath.Join(rdmaDevDir, "uverbs4"), 231<<8|196, 0o666); err == nil {
+	if err := setNodeAttrsAt(d, filepath.Join(rdmaDevDir, "uverbs4"), 231<<8|196, 0o666, 0, 0); err == nil {
 		t.Error("a symlink in the node's place was changed")
 	}
 	if st, _ := os.Stat(target); st.Mode().Perm() != 0o600 {
@@ -171,5 +171,44 @@ func TestInstallPlaceholderRDMAMountPoints(t *testing.T) {
 	bind(filepath.Join(src, "uverbs9"), filepath.Join(tree, rdmaDevDir, "uverbs9"))
 	if _, err := installPlaceholderRDMA(proc, 1, 2); err == nil || !strings.Contains(err.Error(), "mount point") {
 		t.Errorf("another device mounted in the restored /dev: %v; want a mount-point error", err)
+	}
+}
+
+// A group-restricted device (0660, group rdma) keeps its owner and group in
+// the restored tree, so a workload in that group can still open it. Root
+// only.
+func TestInstallPlaceholderRDMAKeepsOwnership(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	proc, placeholder, tree := rdmaFixture(t)
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	p := filepath.Join(placeholder, rdmaDevDir, "uverbs4")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mknod(p, syscall.S_IFCHR|0o660, 231<<8|196); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(p, 0, 4242); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if made, err := installPlaceholderRDMA(proc, 1, 2); err != nil || len(made) != 1 {
+		t.Fatalf("made %v, %v", made, err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(filepath.Join(tree, rdmaDevDir, "uverbs4"), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode&0o777 != 0o660 || st.Uid != 0 || st.Gid != 4242 {
+		t.Errorf("restored uverbs4: mode %o owner %d:%d, want 660 0:4242", st.Mode&0o777, st.Uid, st.Gid)
+	}
+	// Already the pod's, owner included: left in place on a second pass.
+	if made, err := installPlaceholderRDMA(proc, 1, 2); err != nil || len(made) != 0 {
+		t.Errorf("second pass: made %v, %v; want nothing", made, err)
 	}
 }

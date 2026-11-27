@@ -80,14 +80,14 @@ func installPlaceholderRDMA(procBase string, placeholderPID, nestedPID int) ([]s
 	for _, n := range names {
 		st := want[n]
 		rel := filepath.Join(rdmaDevDir, n)
-		// The pod's own node, already in place (a node the runtime bind-mounts,
-		// say): left as it is.
+		// The pod's own node, already in place with its mode and owner (a node
+		// the runtime bind-mounts, say): left as it is.
 		var cur syscall.Stat_t
 		if err := syscall.Lstat(filepath.Join(procBase, strconv.Itoa(nestedPID), "root", rel), &cur); err == nil &&
-			cur.Mode == st.Mode && cur.Rdev == st.Rdev {
+			cur.Mode == st.Mode && cur.Rdev == st.Rdev && cur.Uid == st.Uid && cur.Gid == st.Gid {
 			continue
 		}
-		if err := mknodIn(dst, rel, st.Mode, st.Rdev); err != nil {
+		if err := mknodIn(dst, rel, st); err != nil {
 			return made, rdmaEntryError("create the pod's", n, err)
 		}
 		made = append(made, "/"+rel)
