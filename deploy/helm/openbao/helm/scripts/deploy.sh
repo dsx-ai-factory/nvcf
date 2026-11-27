@@ -32,6 +32,7 @@ fi
 
 source "$DEPLOY_SCRIPT_DIR/utils/utils.sh"
 source "$DEPLOY_SCRIPT_DIR/utils/jwt-plugin.sh"
+source "$DEPLOY_SCRIPT_DIR/utils/bootstrap.sh"
 
 if ! check_kubernetes; then
     log_error "kubernetes check failed"
@@ -56,9 +57,10 @@ fi
 
 # Helper function to get root token
 get_root_token() {
-    local namespace=$1
-    local statefulset=$2
-    kubectl get secret ${statefulset}-root-token -n ${namespace} -o jsonpath='{.data.root_token}' | base64 -d
+    local namespace=$1 statefulset=$2 encoded
+    encoded=$(bootstrap_kubectl get secret "$statefulset-root-token" -n "$namespace" \
+        -o jsonpath='{.data.root_token}') || return 1
+    printf '%s' "$encoded" | base64 -d
 }
 
 # Resolve the seal mode to use for init and unseal, into the global
@@ -231,29 +233,19 @@ install_openbao() {
 initialize_cluster() {
     local namespace=$1
     local statefulset=$2
+    local bootstrap_deadline="" bootstrap_request_timeout=5
 
     log_section "Initializing OpenBao nodes"
 
-    # Wait for pods to be ready with 2-minute timeout
-    log_info "Waiting for OpenBao pods to be ready (timeout: 2 minutes)..."
-    local end=$((SECONDS + 120)) # 120 seconds = 2 minutes
-
-    for i in {0..2}; do
-        while [[ $(kubectl get pod $statefulset-${i} -n ${namespace} -o jsonpath='{.status.containerStatuses[0].ready}') != "true" ]]; do
-            if [ $SECONDS -gt $end ]; then
-                log_error "Timeout waiting for pod ${statefulset}-${i} to be ready"
-                return 1
-            fi
-            log_info "Waiting for pod ${statefulset}-${i} to be ready..."
-            sleep 5
-        done
-    done
-    log_info "All OpenBao pods are ready"
-
-    log_info "Initializing OpenBao cluster"
-    if ! resolve_seal_mode "${namespace}" "${statefulset}"; then
-        return 1
+    wait_for_openbao_api "$namespace" "$statefulset" || return 1
+    check_sidecar_version "$namespace" "$statefulset" || return 1
+    resolve_seal_mode "$namespace" "$statefulset" || return 1
+    check_bootstrap_credentials "$namespace" "$statefulset" "$RESOLVED_SEAL_MODE" || return 1
+    if [ "$BOOTSTRAP_INITIALIZED" = true ]; then
+        return 0
     fi
+    bootstrap_prepare_initialization "$namespace" || return 1
+    log_info "Initializing OpenBao cluster"
     local init_output
     local root_token
     if [ "${RESOLVED_SEAL_MODE}" = "auto" ]; then
@@ -263,12 +255,12 @@ initialize_cluster() {
         local recovery_shares="${RECOVERY_SHARES:-5}"
         local recovery_threshold="${RECOVERY_THRESHOLD:-3}"
         log_info "Auto-unseal seal detected; initializing with ${recovery_shares} recovery shares (threshold ${recovery_threshold})"
-        if ! init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-            bao operator init \
+        if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+            env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init \
             -recovery-shares=${recovery_shares} \
             -recovery-threshold=${recovery_threshold} \
             -format=json); then
-            log_error "bao operator init failed. If the server is now initialized its keys were not captured; tear down with cleanup.sh and reinitialize."
+            log_error "OpenBao initialization failed; check server state and recover matching credentials before retrying"
             return 1
         fi
         root_token=$(echo ${init_output} | jq -r '.root_token')
@@ -287,31 +279,17 @@ initialize_cluster() {
             log_error "Initialization did not return recovery keys (.recovery_keys_b64 is null). Aborting."
             return 1
         fi
-        local persisted=false
-        for attempt in 1 2 3; do
-            if kubectl create secret generic ${statefulset}-recovery-keys \
-                -n ${namespace} \
-                --from-literal=recovery_keys_b64="${recovery_keys}" \
-                --dry-run=client -o yaml | kubectl apply -f -; then
-                persisted=true
-                break
-            fi
-            log_warn "Could not persist recovery keys (attempt ${attempt}/3); retrying..."
-            sleep 3
-        done
-        if [ "${persisted}" != "true" ]; then
-            log_error "Failed to store recovery keys in Secret '${statefulset}-recovery-keys'. The server is initialized but the keys are not saved, so break-glass recovery is impossible. Tear down with cleanup.sh and reinitialize."
-            return 1
-        fi
+        persist_bootstrap_credentials "$namespace" "$statefulset" recovery-keys recovery_keys_b64 \
+            "$recovery_keys" "$root_token" create || return 1
         log_warn "Recovery keys stored in Secret '${statefulset}-recovery-keys'. Export them to a break-glass store and delete this Secret."
     else
         # Shamir seal: a single unseal key, stored for the auto-unseal sidecar.
-        if ! init_output=$(kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
-            bao operator init \
+        if ! init_output=$(bootstrap_kubectl exec ${statefulset}-0 -c openbao -n ${namespace} -- \
+            env BAO_CLIENT_TIMEOUT="${OPENBAO_API_TIMEOUT_SECONDS-600}s" bao operator init \
             -key-shares=1 \
             -key-threshold=1 \
             -format=json); then
-            log_error "bao operator init failed. If the server is now initialized its keys were not captured; tear down with cleanup.sh and reinitialize."
+            log_error "OpenBao initialization failed; check server state and recover matching credentials before retrying"
             return 1
         fi
         local unseal_key=$(echo ${init_output} | jq -r '.unseal_keys_b64[0]')
@@ -320,89 +298,27 @@ initialize_cluster() {
             log_error "Failed to get unseal key from initialization output"
             return 1
         fi
-        if ! kubectl patch secret ${statefulset}-unseal \
-            --patch "data:
-    unseal_key: $(echo -n "${unseal_key}" | base64)" \
-            -n ${namespace}; then
-            log_error "Failed to store unseal key in Secret '${statefulset}-unseal'. The server is initialized but the unseal key is not saved; tear down with cleanup.sh and reinitialize."
+        if [ -z "$root_token" ] || [ "$root_token" = null ]; then
+            log_error "Failed to get root token from initialization output"
             return 1
         fi
-        log_info "Updated Kubernetes secret '${statefulset}-unseal' with unseal key"
+        persist_bootstrap_credentials "$namespace" "$statefulset" unseal unseal_key \
+            "$unseal_key" "$root_token" patch || return 1
     fi
-
-    # Store root token in a new secret
-    log_info "Creating secret '${statefulset}-root-token' with root token..."
-    kubectl create secret generic ${statefulset}-root-token \
-        -n ${namespace} \
-        --from-literal=root_token=${root_token}
 }
 
 get_unseal_key() {
-    local namespace=$1
-    local statefulset=$2
-    kubectl get secret ${statefulset}-unseal -n ${namespace} -o jsonpath='{.data.unseal_key}' | base64 -d
+    local namespace=$1 statefulset=$2 encoded
+    encoded=$(bootstrap_kubectl get secret "$statefulset-unseal" -n "$namespace" \
+        -o jsonpath='{.data.unseal_key}') || return 1
+    printf '%s' "$encoded" | base64 -d
 }
 
 # Step 4: Unseal the cluster
 unseal_cluster() {
-    local namespace=$1
-    local statefulset=$2
-
-    log_section "Unsealing OpenBao cluster"
-
-    if ! resolve_seal_mode "${namespace}" "${statefulset}"; then
-        return 1
-    fi
-    if [ "${RESOLVED_SEAL_MODE}" = "auto" ]; then
-        # The auto-unseal seal unseals each node on start, and retry_join in the
-        # raft config joins the peers. No manual unseal or raft join is needed;
-        # wait for every pod to report unsealed.
-        log_info "Auto-unseal seal detected; waiting for all pods to unseal"
-        local end=$((SECONDS + 120))
-        for i in {0..2}; do
-            while [ "$(kubectl exec ${statefulset}-${i} -c openbao -n ${namespace} -- bao status -format=json 2>/dev/null | jq -r '.sealed' 2>/dev/null)" != "false" ]; do
-                if [ $SECONDS -gt $end ]; then
-                    log_error "Timeout waiting for pod ${statefulset}-${i} to auto-unseal"
-                    return 1
-                fi
-                log_info "Waiting for ${statefulset}-${i} to auto-unseal..."
-                sleep 5
-            done
-        done
-        log_info "All pods auto-unsealed"
-        return 0
-    fi
-
-    local unseal_key=$(get_unseal_key "${namespace}" "${statefulset}")
-
-    # First unseal the primary node (pod 0)
-    log_info "Unsealing primary pod ${statefulset}-0"
-    if ! kubectl exec ${statefulset}-0 -n ${namespace} -- \
-        bao operator unseal ${unseal_key}; then
-        log_error "Failed to unseal primary pod ${statefulset}-0"
-        return 1
-    fi
-
-    # Wait a moment for the primary to be ready
-    sleep 5
-
-    # Join and unseal remaining pods
-    for i in {1..2}; do
-        log_info "Joining pod ${statefulset}-${i} to Raft cluster"
-        if ! kubectl exec ${statefulset}-${i} -c openbao -n ${namespace} -- \
-            bao operator raft join http://${statefulset}-0.${statefulset}-internal:8200; then
-            log_error "Failed to join pod ${statefulset}-${i} to Raft cluster"
-            return 1
-        fi
-
-        log_info "Unsealing pod ${statefulset}-${i}"
-        if ! kubectl exec ${statefulset}-${i} -c openbao -n ${namespace} -- \
-            bao operator unseal ${unseal_key}; then
-            log_error "Failed to unseal pod ${statefulset}-${i}"
-            return 1
-        fi
-    done
-    log_info "All pods joined Raft cluster and unsealed successfully"
+    local namespace=$1 statefulset=$2
+    resolve_seal_mode "$namespace" "$statefulset" || return 1
+    unseal_openbao_members "$namespace" "$statefulset" "$RESOLVED_SEAL_MODE"
 }
 
 get_and_save_jwt_signing_key() {
@@ -496,21 +412,16 @@ else
     log_info "Skipping local installation as install_method is not 'script'"
 fi
 
-if ! check_sidecar_version ${namespace} ${statefulset}; then
-    log_error "Aborting before any bao operations due to sidecar/server version skew"
-    exit 1
+if [ "${install_method}" = "$INSTALL_METHOD_SCRIPT" ] || [ "${OPENBAO_BOOTSTRAP_ONLY:-false}" = true ]; then
+    initialize_cluster "$namespace" "$statefulset" || exit 1
+    unseal_cluster "$namespace" "$statefulset" || exit 1
+    log_success "OpenBao bootstrap completed"
+else
+    wait_for_openbao_bootstrap "$namespace" "$statefulset" || exit 1
 fi
 
-if ! initialize_cluster ${namespace} ${statefulset}; then
-    exit 1
-else
-    log_success "Successfully initialized the cluster"
-fi
-
-if ! unseal_cluster ${namespace} ${statefulset}; then
-    exit 1
-else
-    log_success "Successfully unsealed the cluster"
+if [ "${OPENBAO_BOOTSTRAP_ONLY:-false}" = true ] || [ "${OPENBAO_WAIT_ONLY:-false}" = true ]; then
+    exit 0
 fi
 
 if ! get_and_save_jwt_signing_key ${namespace} ${statefulset}; then

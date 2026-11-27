@@ -41,6 +41,8 @@ openbao:
 
   hooks:
     initializeCluster:
+      apiTimeoutSeconds: 600
+      credentialTimeoutSeconds: 120
       podAnnotations: {}
       schedulingGates: []
       resources:
@@ -176,7 +178,7 @@ openbao:
     # Readiness probe
     readinessProbe:
       enabled: true
-      path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204"
+      path: "/v1/sys/health?standbyok=true"
 
     # Disable audit logs
     auditStorage:

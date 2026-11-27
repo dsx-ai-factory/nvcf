@@ -60,6 +60,31 @@ Resolve the fullname used by the embedded OpenBao chart.
 {{- $mode -}}
 {{- end -}}
 
+{{/* Keep release identities distinct when their readable prefixes match. */}}
+{{- define "nvcf-openbao.bootstrapJobName" -}}
+{{- $name := include "nvcf-openbao.serverFullname" . -}}
+{{- printf "%s-%s-bootstrap-%d" ($name | trunc 20 | trimSuffix "-") ($name | sha256sum | trunc 10) .Release.Revision -}}
+{{- end -}}
+
+{{- define "nvcf-openbao.apiTimeoutSeconds" -}}
+{{- if hasKey .Values.openbao.hooks.initializeCluster "apiTimeoutSeconds" -}}
+{{- .Values.openbao.hooks.initializeCluster.apiTimeoutSeconds -}}
+{{- else -}}600{{- end -}}
+{{- end -}}
+
+{{- define "nvcf-openbao.credentialTimeoutSeconds" -}}
+{{- if hasKey .Values.openbao.hooks.initializeCluster "credentialTimeoutSeconds" -}}
+{{- .Values.openbao.hooks.initializeCluster.credentialTimeoutSeconds -}}
+{{- else -}}120{{- end -}}
+{{- end -}}
+
+{{/* One overall deadline, shared by all retries, plus hook observation grace. */}}
+{{- define "nvcf-openbao.bootstrapDeadlineSeconds" -}}
+{{- $api := include "nvcf-openbao.apiTimeoutSeconds" . | int -}}
+{{- $credentials := include "nvcf-openbao.credentialTimeoutSeconds" . | int -}}
+{{- max 1 (add (mul 3 $api) (mul 4 $credentials) 60) -}}
+{{- end -}}
+
 {{- define "nvcf-openbao.adminEnvironment" -}}
 export BAO_ADDR="http://{{ include "nvcf-openbao.serverFullname" . }}-active:8200"
 export BAO_TOKEN="$(cat /secrets/root_token/root_token)"
