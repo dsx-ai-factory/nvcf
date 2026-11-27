@@ -26,6 +26,8 @@ NVCF supports the following container registries:
 - **JFrog Artifactory**
 - **Harbor**
 
+To run container functions from a supported registry without a registry credential in NVCF, see [Turn off validation for a supported registry](./registry-validation.md).
+
 ### Registry Credential Format
 
 All registry credentials in NVCF use a base64-encoded `username:password` format:
@@ -122,7 +124,9 @@ kubectl -n nvcf rollout restart deployment/nvct-api
 
 ## Adding AWS ECR Registry Credentials
 
-AWS ECR requires **permanent IAM credentials** (Access Key ID + Secret Access Key). Temporary SSO/STS credentials will not work.
+An ECR registry credential requires permanent IAM credentials (an access key ID and a secret access key). Temporary SSO or STS credentials do not work.
+
+If your organization does not allow long-lived IAM user keys, do not add an ECR credential. Instead, give the cluster its own access to ECR and turn off ECR validation in NVCF. See [Turn off validation for a supported registry](./registry-validation.md), which uses the EKS node IAM role as an example.
 
 <Info>
 **Why SSO credentials don't work:** AWS SSO and assumed role credentials include a session token that must be passed alongside the access key and secret. The NVCF registry credential format (`ACCESS_KEY_ID:SECRET_ACCESS_KEY`) does not support session tokens, so temporary credentials will fail with `UnrecognizedClientException`.

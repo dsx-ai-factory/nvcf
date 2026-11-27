@@ -17,7 +17,7 @@ Use this only if all of the following are true:
 - Your cluster (kubelet or the worker init container) can already pull from that registry.
 - You accept that the NVCF API will not pre-validate that the image exists at function-create time. Any pull failure surfaces later as `ErrImagePull` on the workload pod.
 
-If the registry you need is in the supported list (ECR, NGC, ACR, VolcEngine, Artifactory, Harbor), follow the standard registry guidance instead. See [Working with Third-Party Registries](./third-party-registries.md).
+If the registry you need is in the supported list (ECR, NGC, ACR, VolcEngine, Artifactory, Harbor), follow the standard registry guidance instead. See [Working with Third-Party Registries](./third-party-registries.md). To use a supported registry without a registry credential in NVCF, see [Turn off validation for a supported registry](./registry-validation.md).
 
 ## Step 1: Apply the Helm env vars
 
@@ -106,4 +106,4 @@ Then repeat Step 2 (force rollout) and Step 3 (verify the env vars are gone). Af
 
 This procedure does not pull the image. The cluster is responsible for that. The kubelet (or the worker init container) must already have a way to authenticate to the registry. Common paths are an auto-injected image pull secret on the workload namespace (for example via Kyverno), or a kubelet integration provided by the cloud (for example ECR, GCR, and ACR on CSP-managed clusters where node IAM lets the kubelet pull without an explicit secret).
 
-The `REG_KEY` you choose is a Spring Boot map key. Use anything short and uppercase that is not already in use by a built-in registry (`DOCKER`, `NGC`, `ECR`, `ECR_PUBLIC`, `VOLCENGINE`, `ACR`).
+The `REG_KEY` you choose is a Spring Boot map key. Use anything short and uppercase that is not already in use by a built-in registry (`DOCKER`, `NGC`, `ECR`, `ECR_PUBLIC`, `VOLCENGINE`, `ACR`, `HARBOR`, `ARTIFACTORY`).

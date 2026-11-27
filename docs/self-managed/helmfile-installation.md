@@ -777,10 +777,15 @@ printf '%s' '$oauthtoken:YOUR_NGC_API_KEY' | base64 | tr -d '\n'
 
 <Tab title="Amazon ECR">
 
-For AWS ECR, NVCF requires permanent IAM credentials. You must first create a
-dedicated IAM user with ECR permissions. See
+For AWS ECR, an NVCF registry credential requires permanent IAM credentials.
+You must first create a dedicated IAM user with ECR permissions. See
 [ecr-registry-setup](./third-party-registries.md) for complete setup
 instructions.
+
+If your organization does not allow long-lived IAM user keys, leave ECR out of
+the bootstrap list. Instead, give the cluster its own access to ECR and turn off
+ECR validation in NVCF. See
+[Turn off validation for a supported registry](./registry-validation.md).
 
 Once you have created the IAM user and obtained the access keys:
 
