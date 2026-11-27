@@ -247,3 +247,17 @@ func TestPoolSlotSameConfigRule(t *testing.T) {
 		t.Errorf("record read failed: %q, want cold", got)
 	}
 }
+
+// An instance of several ranks is no pool: admission returns its record as
+// before, whatever rank 0's process configuration or its identities' holders,
+// and the restore checks each rank at its own ordinal.
+func TestPoolSlotForRestoreMultiRankIsNoPool(t *testing.T) {
+	ctx := context.Background()
+	rec := poolRecord("cfg", "10.0.0.1", 111)
+	rec.Data["size"], rec.Data["checkpoint.1"], rec.Data["node.1"] = "2", "cfg__20261127-000001", "n2"
+	rec.Data["processConfig.0"], rec.Data["processConfig.1"] = "v1 main/args=aaaaaaaaaaaa", "v1 main/args=bbbbbbbbbbbb"
+	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(rec, livePod("fn", "rank0", "u0"), instanceClaim("fn", "111", "rank0", "u0")), dynClient: fakeDyn()}
+	if got := a.poolSlotForRestore(ctx, "fn", "cfg", "v1 main/args=bbbbbbbbbbbb"); got != "cfg" {
+		t.Errorf("rank 1 of a two-rank record: %q, want cfg (checked per ordinal downstream)", got)
+	}
+}

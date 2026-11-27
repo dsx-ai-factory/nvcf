@@ -159,8 +159,11 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base, processConfig 
 			return "" // cannot tell which record restores this pod: cold
 		}
 		ids := recordInstanceIDs(cm.Data)
-		if len(ids) == 0 {
-			return key // not a pool
+		if len(ids) == 0 || cm.Data["size"] != "1" {
+			// Not a pool: workers without Kubernetes registrations, or an
+			// instance of several ranks (only single-rank configurations get
+			// slots), whose ranks the restore checks per ordinal.
+			return key
 		}
 		if !slotRestorableIn(key, cm.Data, ns) || !slotOfConfig(cm.Data, processConfig) {
 			continue
