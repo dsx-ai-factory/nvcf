@@ -73,6 +73,9 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -491,143 +494,219 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
      * 2. No processing is performed
      */
     @Test
-    void keepNonByocAsSingleDestinationPerRegion_WithEmptyInput_ShouldReturnEmptySet() {
-        // Arrange
-        Set<RequestInstanceDestination> destinations = new HashSet<>();
-
-        // Act
-        Set<RequestInstanceDestination> result = createInstanceService.keepNonByocAsSingleDestinationPerRegion(
-            destinations);
-
-        // Assert
-        assertTrue(result.isEmpty());
+    void deduplicatePlatformDestinations_emptyInput_returnsEmptySet() {
+        assertTrue(createInstanceService.deduplicatePlatformDestinations(Set.of()).isEmpty());
     }
 
-    /**
-     * Tests {@code keepNonByocAsSingleDestinationPerRegion} when the input has no Non BYOC clusters
-     * (only a BYOC/AWS destination). Only Non BYOC destinations are collapsed to one per region;
-     * BYOC destinations pass through unchanged.
-     * The test verifies that the single BYOC destination is retained (returned set has size 1).
-     */
     @Test
-    void keepNonByocAsSingleDestinationPerRegion_WithNoNonByocClusters_ShouldReturnEmptySet() {
-        // Arrange
-        Set<RequestInstanceDestination> destinations = new HashSet<>();
-        RequestInstanceDestination awsDestination = createDestination(CloudProvider.AWS);
-        destinations.add(awsDestination);
+    void deduplicatePlatformDestinations_distinctQueuesInSameRegion_retainsBoth() {
+        var first = platformDestination("zone-a", "region-1", "queue-a");
+        var second = platformDestination("zone-b", "region-1", "queue-b");
 
-        // Act
-        Set<RequestInstanceDestination> result = createInstanceService.keepNonByocAsSingleDestinationPerRegion(
-            destinations);
+        assertEquals(Set.of(first, second), createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second)));
+    }
 
-        // Assert
+    @Test
+    void deduplicatePlatformDestinations_distinctQueuesInDifferentRegions_retainsBoth() {
+        var first = platformDestination("zone-a", "region-1", "queue-a");
+        var second = platformDestination("zone-b", "region-2", "queue-b");
+
+        assertEquals(Set.of(first, second), createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second)));
+    }
+
+    @Test
+    void deduplicatePlatformDestinations_sharedQueueAcrossRegions_publishesOnce() {
+        var first = platformDestination("zone-a", "region-1", "global-queue");
+        var second = platformDestination("zone-b", "region-2", "global-queue");
+
+        var result = createInstanceService.deduplicatePlatformDestinations(Set.of(first, second));
+
         assertEquals(1, result.size());
+        assertEquals("global-queue", result.iterator().next().getCreationQueueUrl());
     }
 
-    /**
-     * Tests the extraction of Non BYOC destinations with single region.
-     * This scenario occurs when all Non BYOC clusters are in the same region.
-     * The test verifies that:
-     * 1. Only one destination per region is returned
-     * 2. The correct region is preserved
-     */
     @Test
-    void keepNonByocAsSingleDestinationPerRegion_WithSingleRegion_ShouldReturnOneDestination() {
-        // Arrange
-        Set<RequestInstanceDestination> destinations = new HashSet<>();
+    void deduplicatePlatformDestinations_noRegion_retainsEveryDistinctQueue() {
+        var first = platformDestination("zone-a", null, "queue-a");
+        var second = platformDestination("zone-b", "", "queue-b");
 
-        // Add two Non BYOC destinations in the same region
-        RequestInstanceDestination nonByocDestination1 = createDestination(CloudProvider.OCI);
-        nonByocDestination1.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        nonByocDestination1.setRegion("region1");
-        destinations.add(nonByocDestination1);
-
-        RequestInstanceDestination nonByocDestination2 = createDestination(CloudProvider.OCI);
-        nonByocDestination2.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        nonByocDestination2.setRegion("region1");
-        destinations.add(nonByocDestination2);
-
-        // Act
-        Set<RequestInstanceDestination> result = createInstanceService.keepNonByocAsSingleDestinationPerRegion(
-            destinations);
-
-        // Assert
-        assertEquals(1, result.size());
-        RequestInstanceDestination resultDestination = result.iterator().next();
-        assertEquals("region1", resultDestination.getRegion());
+        assertEquals(Set.of(first, second), createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second)));
     }
 
-    /**
-     * Tests the extraction of Non BYOC destinations with multiple regions.
-     * This scenario occurs when Non BYOC clusters are spread across different regions.
-     * The test verifies that:
-     * 1. One destination per region is returned
-     * 2. All regions are represented
-     * 3. The correct regions are preserved
-     */
-    @Test
-    void extractNonByocAsSingleDestinationPerRegion_WithMultipleRegions_ShouldReturnOneDestinationPerRegion() {
-        // Arrange
-        Set<RequestInstanceDestination> destinations = new HashSet<>();
+    @ParameterizedTest
+    @ValueSource(strings = {"wildcard", "null", "empty", "mixed-wildcard"})
+    void deduplicatePlatformDestinations_publicAuthorization_retainsOneSpotPerRegion(
+            String authorization) {
+        Set<String> authorizedNcaIds = switch (authorization) {
+            case "wildcard" -> Set.of("*");
+            case "empty" -> Set.of();
+            case "mixed-wildcard" -> Set.of("*", TEST_NCA_ID);
+            default -> null;
+        };
+        var first = platformDestination("zone-a", "region-1", "queue-a").toBuilder()
+                .authorizedNcaIds(authorizedNcaIds).build();
+        var second = first.toBuilder().clusterId("zone-b").region("REGION-1")
+                .creationQueueUrl("queue-b").build();
+        var third = first.toBuilder().clusterId("zone-c").region("region-2")
+                .creationQueueUrl("queue-c").build();
 
-        // Add Non BYOC destinations in different regions
-        RequestInstanceDestination nonByocDestination1 = createDestination(CloudProvider.OCI);
-        nonByocDestination1.setRegion("region1");
-        nonByocDestination1.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        destinations.add(nonByocDestination1);
+        var result = createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second, third));
 
-        RequestInstanceDestination nonByocDestination2 = createDestination(CloudProvider.OCI);
-        nonByocDestination2.setRegion("region2");
-        nonByocDestination2.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        destinations.add(nonByocDestination2);
-
-        // Act
-        Set<RequestInstanceDestination> result = createInstanceService.keepNonByocAsSingleDestinationPerRegion(
-            destinations);
-
-        // Assert
         assertEquals(2, result.size());
-        Set<String> regions = result.stream()
-            .map(RequestInstanceDestination::getRegion)
-            .collect(Collectors.toSet());
-        assertEquals(Set.of("region1", "region2"), regions);
+        assertTrue(result.contains(third));
+        assertEquals(1, result.stream()
+                .filter(destination -> "region-1".equalsIgnoreCase(destination.getRegion()))
+                .count());
     }
 
-    /**
-     * Tests the extraction of Non BYOC destinations with mixed cloud providers.
-     * This scenario occurs when there are both Non BYOC and BYOC destinations.
-     * The test verifies that:
-     * 1. Only Non BYOC destinations are processed
-     * 2. One destination per region is returned for Non BYOC
-     * 3. BYOC destinations are ignored
-     */
     @Test
-    void extractNonByocAsSingleDestinationPerRegion_WithMixedCloudProviders_ShouldReturnNonByocDestinationsOnly() {
-        // Arrange
+    void deduplicatePlatformDestinations_publicAndAuthorizedSameRegion_retainsEachZoneQueue() {
+        var first = platformDestination("zone-a", "region-1", "zone-a-queue");
+        var second = platformDestination("zone-b", "region-1", "zone-b-queue");
+        var publicFirst = platformDestination("public-a", "region-1", "regional-queue")
+                .toBuilder().authorizedNcaIds(Set.of("*")).build();
+        var publicSecond = publicFirst.toBuilder().clusterId("public-b").build();
 
-        Set<RequestInstanceDestination> destinations = new HashSet<>();
+        var result = createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second, publicFirst, publicSecond));
 
-        // Add AWS destination
-        RequestInstanceDestination awsDestination = createDestination(CloudProvider.AWS);
-        destinations.add(awsDestination);
-
-        // Add Non BYOC destinations in different regions
-        RequestInstanceDestination nonByocDestination1 = createDestination(CloudProvider.OCI);
-        nonByocDestination1.setRegion("region1");
-        nonByocDestination1.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        destinations.add(nonByocDestination1);
-
-        RequestInstanceDestination nonByocDestination2 = createDestination(CloudProvider.OCI);
-        nonByocDestination2.setRegion("region2");
-        nonByocDestination2.setClusterGroupName(PLATFORM_CLUSTER_GROUP_NAME);
-        destinations.add(nonByocDestination2);
-
-        // Act
-        Set<RequestInstanceDestination> result = createInstanceService.keepNonByocAsSingleDestinationPerRegion(
-            destinations);
-
-        // Assert
         assertEquals(3, result.size());
+        assertTrue(result.containsAll(Set.of(first, second)));
+    }
+
+    @Test
+    void deduplicatePlatformDestinations_authorizationFilteringOff_sharedQueuePublishesOnce() {
+        var first = platformDestination("zone-a", "region-1", "regional-queue");
+        var second = first.toBuilder().clusterId("zone-b")
+                .instanceType(InstanceTypeV5Udt.builder()
+                        .name("alternative").value("alternative-value").build()).build();
+
+        var result = createInstanceService.deduplicatePlatformDestinations(Set.of(first, second));
+
+        assertEquals(1, result.size());
+        assertEquals("regional-queue", result.iterator().next().getCreationQueueUrl());
+    }
+
+    @Test
+    void deduplicatePlatformDestinations_publicSpotWithoutRegion_retainsLegacyExclusion() {
+        var first = platformDestination("zone-a", null, "queue-a").toBuilder()
+                .authorizedNcaIds(Set.of("*")).build();
+        var second = first.toBuilder().clusterId("zone-b").region("")
+                .creationQueueUrl("queue-b").build();
+
+        assertTrue(createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second)).isEmpty());
+    }
+
+    @Test
+    void deduplicatePlatformDestinations_nvcaClustersWithSharedQueue_retainsBoth() {
+        var first = platformDestination("zone-a", "region-1", "shared-queue");
+        first.setClusterGroupName(DUMMY_BYOC_CLUSTER_GROUP_NAME);
+        var second = first.toBuilder().clusterId("zone-b").build();
+
+        assertEquals(Set.of(first, second), createInstanceService.deduplicatePlatformDestinations(
+                Set.of(first, second)));
+    }
+
+    @Test
+    void deduplicatePlatformDestinations_reservedIdentityAndCapacityTypes_retainsEachPayload() {
+        UUID reservationId = UUID.randomUUID();
+        var reserved = platformDestination("zone-a", "region-1", "shared-queue").toBuilder()
+                .capacityType(CapacityType.RESERVED).reservationId(reservationId).build();
+        var reservedBackup = reserved.toBuilder().capacityType(CapacityType.RESERVED_BACKUP).build();
+        var otherReservation = reservedBackup.toBuilder().reservationId(UUID.randomUUID()).build();
+        var duplicateBackup = reservedBackup.toBuilder().clusterId("zone-b").build();
+        var spot = reserved.toBuilder().capacityType(CapacityType.SPOT).reservationId(null).build();
+
+        assertEquals(Set.of(reserved, reservedBackup, otherReservation, spot).size(),
+                createInstanceService.deduplicatePlatformDestinations(Set.of(
+                        reserved, reservedBackup, otherReservation, duplicateBackup, spot)).size());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void processTargetedInstanceRequest_retainsEligibleZoneQueuesAfterFiltering(
+            boolean taskRequest, boolean regionsProvided) {
+        var instanceRequest = createInstanceRequestSchema(
+                DUMMY_NON_BYOC_INSTANCE_TYPE, null, DUMMY_GPU, TEST_NCA_ID, true);
+        instanceRequest.setRegions(regionsProvided ? Set.of("region-1", "region-2") : null);
+        if (taskRequest) {
+            instanceRequest.setTaskId(UUID.randomUUID());
+        } else {
+            instanceRequest.setFunctionId(FUNCTION_ID);
+            instanceRequest.setFunctionVersionId(FUNCTION_VERSION_ID);
+        }
+
+        var first = platformDestination("zone-a", "region-1", "zone-a-queue");
+        var second = platformDestination("zone-b", "region-1", "zone-b-queue");
+        var third = platformDestination("zone-c", "region-2", "zone-c-queue");
+        var unhealthy = platformDestination("unhealthy", "region-1", "unhealthy-queue");
+        var gated = platformDestination("gated", "region-2", "gated-queue");
+        var destinations = Set.of(first, second, third, unhealthy, gated);
+        Map<String, CloudHealthEntity> healthMap = new HashMap<>();
+        for (var destination : destinations) {
+            var status = destination == unhealthy
+                    ? CloudHealthStatus.UNHEALTHY : CloudHealthStatus.HEALTHY;
+            healthMap.put(destination.getClusterId(), createCloudHealthEntity(
+                    destination.getClusterId(), DUMMY_GPU, status,
+                    ResourceProvider.BYOC, 10, 5, 5));
+        }
+
+        // The provider supplies destinations after readiness, authorization and targeting filters.
+        var destinationProvider = Mockito.mock(RequestDestinationProvider.class);
+        when(destinationProvider.getAllTargetedDestinations(instanceRequest, healthMap))
+                .thenReturn(destinations);
+        var platformService = ComputePlatformTestFixtures.nonByocComputePlatformService();
+        createInstanceService = new CreateInstanceService(
+                byocCreateService, instanceLifecycleService, byocValidationService,
+                icmsConfigurationProperties, capacityGatingProperties, destinationProvider,
+                clusterTargetingHelper, telemetryEventClient, reservationProcessor, platformService,
+                instanceValidationService,
+                new CapacityGatingService(capacityGatingProperties, unifiedErrorReporter));
+        mockNonByocReservationProcessorWithNoOp();
+        when(capacityGatingProperties.isNcaAllowedForGpu(DUMMY_GPU, TEST_NCA_ID)).thenReturn(true);
+        when(capacityGatingProperties.hasCapacityGating(TEST_NCA_ID)).thenReturn(true);
+        when(capacityGatingProperties.isGpuAllowedForNca(TEST_NCA_ID, DUMMY_GPU)).thenReturn(true);
+        when(capacityGatingProperties.isInstanceTypeAllowedForNca(
+                TEST_NCA_ID, DUMMY_GPU, DUMMY_NON_BYOC_INSTANCE_TYPE)).thenReturn(true);
+        for (var destination : Set.of(first, second, third)) {
+            when(capacityGatingProperties.isClusterAllowedForNca(
+                    TEST_NCA_ID, destination.getClusterId())).thenReturn(true);
+        }
+        when(capacityGatingProperties.isClusterAllowedForNca(TEST_NCA_ID, "gated"))
+                .thenReturn(false);
+        var expectedResponse = new CreateSpotInstancesResponse();
+        Map<String, Object> auditProps = Map.of();
+        when(byocCreateService.processCreateRequest(TEST_CUSTOMER, Set.of(first, second, third),
+                instanceRequest, auditProps)).thenReturn(expectedResponse);
+
+        assertEquals(expectedResponse, createInstanceService.processTargetedInstanceRequest(
+                TEST_CUSTOMER, instanceRequest, auditProps, healthMap));
+        verify(byocCreateService).processCreateRequest(TEST_CUSTOMER, Set.of(first, second, third),
+                instanceRequest, auditProps);
+    }
+
+    private RequestInstanceDestination platformDestination(
+            String clusterId, String region, String queue) {
+        return RequestInstanceDestination.builder()
+                .clusterGroupName(PLATFORM_CLUSTER_GROUP_NAME)
+                .clusterGroupId(PLATFORM_CLUSTER_GROUP_ID)
+                .clusterId(clusterId)
+                .clusterName(clusterId)
+                .region(region)
+                .creationQueueUrl(queue)
+                .cloudProvider(CloudProvider.OCI)
+                .authorizedNcaIds(Set.of(TEST_NCA_ID))
+                .gpuName(DUMMY_GPU)
+                .instanceType(createInstanceTypeV5())
+                .capacityType(CapacityType.SPOT)
+                .instanceBatchCount(1)
+                .maxFulfillableInstances(1)
+                .build();
     }
 
     //////////////////////////////////////////////////////

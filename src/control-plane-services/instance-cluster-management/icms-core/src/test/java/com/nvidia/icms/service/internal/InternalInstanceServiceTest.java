@@ -470,7 +470,7 @@ class InternalInstanceServiceTest {
         doReturn(30).when(icmsConfigurationProperties).getRequestCancelDurationInMin();
         doNothing().when(telemetryEventClient).triggerEvent(List.of(genericMetric1));
         doNothing().when(telemetryEventClient).triggerEvent(List.of(genericMetric2));
-        doNothing().when(sqsMessageRepository).update(Mockito.argThat(
+        doNothing().when(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         doReturn(getDummyInstancePlacementValidationResponse(placement, CloudProvider.OCI,
                                                              ResourceProvider.OCI)).when(
@@ -492,7 +492,7 @@ class InternalInstanceServiceTest {
         verify(telemetryEventClient).triggerEvent(List.of(genericMetric2));
         verify(auditService).sendAuditEventForInstanceRequest(Mockito.any(), Mockito.any(),
                                                           Mockito.any());
-        verify(sqsMessageRepository).update(Mockito.argThat(
+        verify(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         verify(internalInstanceServiceHelper).validateInstancePlacement(placement, DUMMY_CLUSTER_ID,
                                                                     DUMMY_REQUEST_ID);
@@ -557,7 +557,7 @@ class InternalInstanceServiceTest {
         doNothing().when(telemetryEventClient).triggerEvent(List.of(genericMetric1));
         doNothing().when(telemetryEventClient).triggerEvent(List.of(genericMetric2));
 
-        doNothing().when(sqsMessageRepository).update(Mockito.argThat(
+        doNothing().when(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         doReturn(getDummyInstancePlacementValidationResponse(statusUpdateRequest1.getPlacement(),
                                                              CloudProvider.AZURE,
@@ -579,7 +579,7 @@ class InternalInstanceServiceTest {
         verify(telemetryEventClient).triggerEvent(List.of(genericMetric2));
         verify(auditService).sendAuditEventForInstanceRequest(Mockito.any(), Mockito.any(),
                                                           Mockito.any());
-        verify(sqsMessageRepository).update(Mockito.argThat(
+        verify(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         verify(internalInstanceServiceHelper).validateInstancePlacement(instancePlacement,
                                                                     DUMMY_CLUSTER_ID,
@@ -693,7 +693,7 @@ class InternalInstanceServiceTest {
                         internalInstanceServiceHelper)
                 .validateInstancePlacement(placement, DUMMY_CLUSTER_ID, DUMMY_REQUEST_ID);
 
-        doNothing().when(sqsMessageRepository).update(Mockito.argThat(
+        doNothing().when(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         doNothing().when(telemetryEventClient).triggerEvent(Mockito.anyList());
         when(instanceServiceHelper.getLaunchSpecificationForTelemetry(Mockito.any())).thenReturn(
@@ -707,7 +707,7 @@ class InternalInstanceServiceTest {
         // Assert
         verify(instanceRequestV2Repository).findRequestById(DUMMY_REQUEST_ID);
         verifyNoMoreInteractions(instanceRequestV2Repository);
-        verify(sqsMessageRepository).update(
+        verify(sqsMessageRepository).insert(
                 Mockito.argThat(entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         verify(telemetryEventClient).triggerEvent(Mockito.anyList());
         verify(internalInstanceServiceHelper).validateInstancePlacement(placement, DUMMY_CLUSTER_ID,
@@ -728,6 +728,7 @@ class InternalInstanceServiceTest {
         InstanceRequestV2Entity instanceRequestEntity1 =
                 getInstanceRequestEntity(
                         SpotInstanceRequestState.OPEN, PENDING_FULFILLMENT, ResourceProvider.OCI);
+        instanceRequestEntity1.setCheckBatchwiseInfo(true);
         instanceRequestEntity1.setCheckBatchwiseInfo(true);
 
         SpotInstanceRequestStatusUpdateRequest statusUpdateRequest =
@@ -806,7 +807,7 @@ class InternalInstanceServiceTest {
                 .findRequestById(DUMMY_REQUEST_ID);
         doReturn(30).when(icmsConfigurationProperties).getRequestCancelDurationInMin();
         doThrow(new IcmsInternalServerException("dummy_exception")).when(sqsMessageRepository)
-                .update(Mockito.argThat(
+                .insert(Mockito.argThat(
                         entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         doReturn(getDummyInstancePlacementValidationResponse(placement, CloudProvider.OCI,
                                                              ResourceProvider.OCI)).when(
@@ -829,7 +830,7 @@ class InternalInstanceServiceTest {
         // Assert
         verify(instanceRequestV2Repository).findRequestById(DUMMY_REQUEST_ID);
         verifyNoMoreInteractions(instanceRequestV2Repository);
-        verify(sqsMessageRepository).update(Mockito.argThat(
+        verify(sqsMessageRepository).insert(Mockito.argThat(
                 entity -> validateSqsMessageEntityMock(entity, sqsMessageEntity)));
         verifyNoInteractions(telemetryEventClient);
         verify(internalInstanceServiceHelper).validateInstancePlacement(placement, DUMMY_CLUSTER_ID,
@@ -874,9 +875,10 @@ class InternalInstanceServiceTest {
 
         // Assert
         verify(instanceRequestV2Repository).findRequestById(DUMMY_REQUEST_ID);
-        verifyNoMoreInteractions(instanceRequestV2Repository);
-        verifyNoInteractions(telemetryEventClient);
+        verify(instanceRequestV2Repository).update(instanceRequestEntity1);
+        verify(telemetryEventClient).triggerEvent(Mockito.anyList());
         verify(sqsMessageRepository).findByRequestId(DUMMY_REQUEST_ID);
+        verify(sqsMessageRepository).insert(Mockito.any());
         verifyNoMoreInteractions(sqsMessageRepository);
         verify(internalInstanceServiceHelper).validateInstancePlacement(
                 statusUpdateRequest.getPlacement(), DUMMY_CLUSTER_ID, DUMMY_REQUEST_ID);
@@ -885,6 +887,7 @@ class InternalInstanceServiceTest {
         assertThat(instanceRequestEntity1.getStatusCode()).isEqualTo(
                 PENDING_FULFILLMENT.toString());
         assertThat(instanceRequestEntity1.getStatusMessage()).isEqualTo("dummy_message");
+        assertThat(instanceRequestEntity1.getCheckBatchwiseInfo()).isTrue();
         assertThat(instanceRequestEntity1.getStatusUpdateTime()).isNotNull();
     }
 
@@ -1449,7 +1452,7 @@ class InternalInstanceServiceTest {
         doReturn(30).when(icmsConfigurationProperties).getRequestCancelDurationInMin();
         doReturn(List.of(cannotFulfillBatch)).when(sqsMessageRepository)
                 .findByRequestId(DUMMY_REQUEST_ID);
-        doNothing().when(sqsMessageRepository).update(Mockito.any(SqsMessageEntity.class));
+        doNothing().when(sqsMessageRepository).insert(Mockito.any(SqsMessageEntity.class));
         doReturn(getDummyInstancePlacementValidationResponse(placement, CloudProvider.OCI,
                                                              ResourceProvider.OCI)).when(
                         internalInstanceServiceHelper)
@@ -1461,7 +1464,7 @@ class InternalInstanceServiceTest {
         assertDoesNotThrow(() -> internalInstanceService.updateInstanceRequestStatus(
                 DUMMY_CLUSTER_ID, DUMMY_REQUEST_ID, statusUpdateRequest, auditProps));
 
-        verify(sqsMessageRepository).update(Mockito.argThat(entity ->
+        verify(sqsMessageRepository).insert(Mockito.argThat(entity ->
                 entity.getKey().getMessageBatchId().equals(DUMMY_MESSAGE_BATCH_ID + "_2")
                         && entity.getStatus() == PENDING_FULFILLMENT
                         && entity.getAcknowledgedInstances() == 60));
@@ -1539,7 +1542,7 @@ class InternalInstanceServiceTest {
         doReturn(30).when(icmsConfigurationProperties).getRequestCancelDurationInMin();
         doReturn(List.of(legacyNullAckBatch)).when(sqsMessageRepository)
                 .findByRequestId(DUMMY_REQUEST_ID);
-        doNothing().when(sqsMessageRepository).update(Mockito.any(SqsMessageEntity.class));
+        doNothing().when(sqsMessageRepository).insert(Mockito.any(SqsMessageEntity.class));
         doReturn(getDummyInstancePlacementValidationResponse(placement, CloudProvider.OCI,
                                                              ResourceProvider.OCI)).when(
                         internalInstanceServiceHelper)

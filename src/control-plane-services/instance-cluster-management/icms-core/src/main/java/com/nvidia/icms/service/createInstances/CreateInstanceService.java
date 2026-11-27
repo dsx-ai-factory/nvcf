@@ -18,7 +18,7 @@ package com.nvidia.icms.service.createInstances;
 
 import static com.nvidia.icms.inbound.rest.converters.ErrorDataConverter.toUnifiedErrorData;
 import static com.nvidia.icms.service.byoc.ClusterTargetingHelper.isClusterHealthyAndCapacityAvailable;
-import static com.nvidia.icms.service.createInstances.RequestInstanceDestination.isReservedOrReservedBackupDestination;
+import static com.nvidia.icms.service.createInstances.RequestInstanceDestination.getDestinationsForPublishing;
 import static com.nvidia.icms.service.createInstances.RequestInstanceDestination.isReservedOrReservedBackupDestinations;
 import static com.nvidia.icms.uec.IcmsUnifiedError.NVCF_CUSTOMER_NO_ACCESS_TO_GPU;
 import static com.nvidia.icms.uec.IcmsUnifiedError.NVCF_CUSTOMER_NO_ACCESS_TO_INSTANCE_TYPE;
@@ -108,9 +108,7 @@ public class CreateInstanceService {
         // GET all READY BYOC and non-BYOC clusters for provided request but without checking a capacity
         Set<RequestInstanceDestination> filteredDestinations = filterAndValidateDestinations(requestDestinationProvider.getAllTargetedDestinations(instanceRequest, cloudHealthByClusterId),
                 instanceRequest, cloudHealthByClusterId);
-        // Generate list of non-BYOC clusters which will contain 1 non-BYOC cluster per region, NVCA and reserved destinations,
-        // For non-BYOC targeting we want to send SQS message at region level as zone level is not present
-        filteredDestinations = keepNonByocAsSingleDestinationPerRegion(filteredDestinations);
+        filteredDestinations = deduplicatePlatformDestinations(filteredDestinations);
 
         return byocCreateService.processCreateRequest(customer,
                                                       filteredDestinations,
@@ -238,28 +236,34 @@ public class CreateInstanceService {
     }
 
 
-    protected @NotNull Set<RequestInstanceDestination> keepNonByocAsSingleDestinationPerRegion(
+    protected @NotNull Set<RequestInstanceDestination> deduplicatePlatformDestinations(
             @NotNull Set<RequestInstanceDestination> destinations) {
 
         Set<RequestInstanceDestination> result = new HashSet<>();
-        Set<String> regionsAlreadyCovered = new HashSet<>();
+        Set<RequestInstanceDestination> platformDestinations = new HashSet<>();
+        Set<String> publicRegionsAlreadyCovered = new HashSet<>();
 
         for (RequestInstanceDestination destination : destinations) {
-            // Selecting destination as it is if it is for NVCA or reserved (RESERVED or RESERVED_BACKUP or RESERVED + RESERVED_BACKUP)
-            if (!computePlatformService.isPlatformCluster(destination.getClusterGroupName())
-                    || isReservedOrReservedBackupDestination(destination)) {
-                result.add(destination);
-            } else {
-                // If a non-BYOC zone for the region is not already added then add it
-                // TODO: When regions are not provided we we set Global queue for function/task for such request we should select destination per unique queue not region
-                // In that case we will send multiple messages in global SQS queue because of destination selection is based on region not on unique queue
-                if (StringUtils.isNotBlank(destination.getRegion()) &&
-                        !regionsAlreadyCovered.contains(destination.getRegion().toLowerCase())) {
-                    result.add(destination);
-                    regionsAlreadyCovered.add(destination.getRegion().toLowerCase());
+            if (computePlatformService.isPlatformCluster(destination.getClusterGroupName())) {
+                Set<String> authorizedNcaIds = destination.getAuthorizedNcaIds();
+                boolean publicDestination = isSetEmptyOrNull(authorizedNcaIds)
+                        || authorizedNcaIds.contains("*");
+                // Keep legacy regional selection for public SPOT capacity. Explicitly
+                // authorized zones retain their individual queues, even in the same region.
+                if (destination.isSpot() && publicDestination
+                        && (StringUtils.isBlank(destination.getRegion())
+                        || !publicRegionsAlreadyCovered.add(
+                                StringUtils.toRootLowerCase(destination.getRegion())))) {
+                    continue;
                 }
+                platformDestinations.add(destination);
+            } else {
+                result.add(destination);
             }
         }
+        // With authorization filtering disabled, explicitly authorized zones still use
+        // shared regional/global queues and are collapsed by the effective queue here.
+        result.addAll(getDestinationsForPublishing(platformDestinations));
         return result;
     }
 

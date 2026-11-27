@@ -34,10 +34,12 @@ import static com.nvidia.icms.util.audit.AuditUtils.AUDIT_TYPE_KEY;
 import com.nvidia.icms.configuration.bean.IcmsConfigurationProperties;
 import com.nvidia.icms.errors.PreConditionFailedException;
 import com.nvidia.icms.errors.IcmsBadRequestException;
+import com.nvidia.icms.errors.IcmsConflictException;
 import com.nvidia.icms.errors.IcmsNotFoundException;
 import com.nvidia.icms.inbound.rest.model.ClientRequestDataModel;
 import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.inbound.rest.model.ResourceProvider;
+import com.nvidia.icms.inbound.rest.model.SpotInstanceRequestState;
 import com.nvidia.icms.inbound.rest.model.SpotInstanceRequestStatusUpdateRequest;
 import com.nvidia.icms.inbound.rest.model.SpotInstanceStatusUpdateRequest;
 import com.nvidia.icms.inbound.rest.model.SpotInstanceStatusUpdateRequest.InstancePlacement;
@@ -74,7 +76,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.UUID;
 import jakarta.annotation.Nullable;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -207,14 +208,16 @@ public class InternalInstanceService {
         // 3. Check if status in request body == "pending-fulfillment" or "schedule-expired" or "cannot-fulfill" else error
         switch (updateRequest.getStatus()) {
             case SCHEDULE_EXPIRED ->
-                    handleScheduledExpiredStateUpdate(updateRequest, instanceRequestEntity, genericMetric);
+                    handleScheduledExpiredStateUpdate(updateRequest, instanceRequestEntity,
+                            genericMetric, cloudProvider, clusterName);
 
             case PENDING_FULFILLMENT ->
                     handlePendingFulfillmentStateUpdate(clientId, instanceRequestEntity, updateRequest,
                                                         auditProps, genericMetric, cloudProvider, clusterName);
 
             case CANNOT_FULFILL ->
-                    handleCannotFulfill(updateRequest, clientId, instanceRequestEntity, genericMetric);
+                    handleCannotFulfill(updateRequest, clientId, instanceRequestEntity,
+                            genericMetric, cloudProvider, clusterName);
 
             default -> {
                 String errMsg = String.format("'status' field in request body must be '%s'",
@@ -244,7 +247,9 @@ public class InternalInstanceService {
             @NotNull SpotInstanceRequestStatusUpdateRequest updateRequest,
             @NotNull String clientId,
             @NotNull InstanceRequestV2Entity instanceRequestEntity,
-            @NotNull GenericMetric genericMetric) {
+            @NotNull GenericMetric genericMetric,
+            @NotNull CloudProvider cloudProvider,
+            @Nullable String clusterName) {
 
         // For cannot-fulfill update messageBatchId must be provided
         if (!isMessageBatchIdProvided(updateRequest)) {
@@ -271,8 +276,10 @@ public class InternalInstanceService {
         // All existing consumers of acknowledgedInstances filter by status, so
         // not zeroing here has no effect on legacy describe / over-allocation paths.
         SqsMessageEntity sqsMessageEntity = optionalSqsMessageEntity.get();
-        sqsMessageEntity.setStatus(updateRequest.getStatus());
-        sqsMessageRepository.update(sqsMessageEntity);
+        validateMessageBatchOwner(sqsMessageEntity, instanceRequestEntity, updateRequest,
+                cloudProvider, clusterName);
+        sqsMessageRepository.update(sqsMessageEntity.toBuilder()
+                .status(updateRequest.getStatus()).build());
 
         sendTelemetryEventForCannotFulfill(instanceRequestEntity, updateRequest, genericMetric);
     }
@@ -288,7 +295,9 @@ public class InternalInstanceService {
     private void handleScheduledExpiredStateUpdate(
             @NotNull SpotInstanceRequestStatusUpdateRequest updateRequest,
             @NotNull InstanceRequestV2Entity instanceRequestEntity,
-            @NotNull GenericMetric genericMetric) {
+            @NotNull GenericMetric genericMetric,
+            @NotNull CloudProvider cloudProvider,
+            @Nullable String clusterName) {
 
         if (isMessageBatchIdProvided(updateRequest)) {
             Optional<SqsMessageEntity> optionalSqsMessageEntity =
@@ -296,14 +305,32 @@ public class InternalInstanceService {
                             instanceRequestEntity.getRequestId(), updateRequest.getMessageBatchId());
             if (optionalSqsMessageEntity.isPresent()) {
                 SqsMessageEntity sqsMessageEntity = optionalSqsMessageEntity.get();
-                sqsMessageEntity.setStatus(updateRequest.getStatus());
-                sqsMessageRepository.update(sqsMessageEntity);
+                validateMessageBatchOwner(sqsMessageEntity, instanceRequestEntity, updateRequest,
+                        cloudProvider, clusterName);
+                sqsMessageRepository.update(sqsMessageEntity.toBuilder()
+                        .status(updateRequest.getStatus()).build());
             }
         }
 
         genericMetric.withEventName(SCHEDULE_EXPIRED_STATE_UPDATE.toString());
         genericMetric.withRequestState(instanceRequestEntity.getState().toString());
         telemetryEventClient.triggerEvent(List.of(genericMetric));
+    }
+
+    private void validateMessageBatchOwner(
+            SqsMessageEntity entity,
+            InstanceRequestV2Entity instanceRequestEntity,
+            SpotInstanceRequestStatusUpdateRequest updateRequest,
+            CloudProvider cloudProvider,
+            @Nullable String clusterName) {
+        String zone = getClusterIdFromRequest(updateRequest);
+        if (!Objects.equals(entity.getZone(), zone)) {
+            String errorMessage = String.format(MSG_ALREADY_ACK,
+                    updateRequest.getMessageBatchId(), zone);
+            sendPreConditionFailedTelemetryEvent(instanceRequestEntity, zone, updateRequest,
+                    errorMessage, cloudProvider, clusterName);
+            throw new PreConditionFailedException(errorMessage);
+        }
     }
 
     private void validateRequestStateUpdateDuration(
@@ -406,8 +433,13 @@ public class InternalInstanceService {
             if (sqsMessageEntity.getKey().getMessageBatchId()
                     .equals(updateRequest.getMessageBatchId()) && instancePlacement != null) {
 
-                // If from same zone then avoid further processing and return
-                if (sqsMessageEntity.getZone().equals(instancePlacement.getAvailabilityZone())) {
+                // Preserve retries from the winning zone, including after cannot-fulfill.
+                // Reservation retries can offer a different count after a quota refresh.
+                // Copies received by other zones must not take ownership of the batch.
+                if (Objects.equals(sqsMessageEntity.getZone(),
+                        instancePlacement.getAvailabilityZone())) {
+                    repairRequestAfterMessageBatchClaim(updateRequest, instanceRequestEntity,
+                            clientId, auditProps, genericMetric);
                     sendSqsBatchStatusUpdateTelemetryEvent(instanceRequestEntity,
                             CopyUtil.deepCopy(genericMetric),
                             Events.RECEIVED_MULTIPLE_SQS_BATCH_STATUS_UPDATE.toString(),
@@ -438,18 +470,37 @@ public class InternalInstanceService {
         validateReservationIdForRequestStateUpdate(updateRequest, instancePlacement, instanceRequestEntity,
                 cloudProvider, clusterName);
 
-        // 6. If request status is already updated by previous batch, insert new batchId in DB and exit without updating status again
-        if (Objects.equals(updateRequest.getStatus().toString(),
-                instanceRequestEntity.getStatusCode())) {
+        // Claim first so a losing zone cannot update request state or emit acceptance events.
+        insertMessageBatchId(updateRequest, instanceRequestEntity, clientId, cloudProvider);
 
-            // Insert message-batch-id in DB
-            insertMessageBatchId(updateRequest, instanceRequestEntity, clientId, genericMetric, cloudProvider);
-            return;
+        repairRequestAfterMessageBatchClaim(updateRequest, instanceRequestEntity,
+                clientId, auditProps, genericMetric);
+        sendSqsBatchStatusUpdateTelemetryEvent(instanceRequestEntity,
+                CopyUtil.deepCopy(genericMetric),
+                Events.RECEIVED_SQS_BATCH_STATUS_UPDATE.toString(), updateRequest);
+    }
+
+    private void repairRequestAfterMessageBatchClaim(
+            SpotInstanceRequestStatusUpdateRequest updateRequest,
+            InstanceRequestV2Entity instanceRequestEntity,
+            String clientId,
+            Map<String, Object> auditProps,
+            GenericMetric genericMetric) {
+        // A claim can survive a failed parent write. Repair only the initial status so a delayed
+        // acknowledgment cannot regress an active, fulfilled request to pending fulfillment.
+        if (instanceRequestEntity.getState() == SpotInstanceRequestState.OPEN
+                && Objects.equals(instanceRequestEntity.getStatusCode(),
+                        SpotRequestStatusCode.PENDING_EVALUATION.toString())) {
+            updateRequestStateUpdateInDb(updateRequest, instanceRequestEntity,
+                    clientId, auditProps, genericMetric);
+        } else if (!isBatchWiseInfoFetchingEnabled(instanceRequestEntity)) {
+            var entityBefore = AuditUtils.deepCopyInstanceRequestEntity(instanceRequestEntity);
+            instanceRequestEntity.setCheckBatchwiseInfo(true);
+            instanceRequestV2Repository.update(instanceRequestEntity);
+            populateAuditValuesForUpdateInstanceRequest(auditProps, instanceRequestEntity.getRequestId());
+            auditService.sendAuditEventForInstanceRequest(auditProps, entityBefore,
+                    AuditUtils.deepCopyInstanceRequestEntity(instanceRequestEntity));
         }
-
-        // 5. Update request status for first time and insert batchId in DB
-        updateRequestStateUpdateInDb(updateRequest, instanceRequestEntity, clientId, auditProps, genericMetric);
-        insertMessageBatchId(updateRequest, instanceRequestEntity, clientId, genericMetric, cloudProvider);
     }
 
     private void updateRequestStateUpdateInDb(
@@ -578,50 +629,55 @@ public class InternalInstanceService {
             @NotNull SpotInstanceRequestStatusUpdateRequest updateRequest,
             @NotNull InstanceRequestV2Entity instanceRequestEntity,
             @NotNull String clientId,
-            @NotNull GenericMetric genericMetric,
             @NotNull CloudProvider cloudProvider) {
-        if (isMessageBatchIdProvided(updateRequest) && isBatchWiseInfoFetchingEnabled(
-                instanceRequestEntity)) {
-            try {
-                log.info("Received SQS batch status update, request-id {} updateRequest {}",
-                         instanceRequestEntity.getRequestId(), GsonCompatMapper.toJson(updateRequest));
+        try {
+            log.info("Received SQS batch status update, request-id {} updateRequest {}",
+                    instanceRequestEntity.getRequestId(), GsonCompatMapper.toJson(updateRequest));
 
+            SqsMessageEntity entity = SqsMessageEntity.builder()
+                    .key(new SqsMessageKey(instanceRequestEntity.getRequestId(),
+                            updateRequest.getMessageBatchId()))
+                    .acknowledgedInstances(updateRequest.getInstanceCount())
+                    .zone(getClusterIdFromRequest(updateRequest))
+                    .status(updateRequest.getStatus())
+                    .creationTime(Instant.now())
+                    .cloudProvider(cloudProvider.toString())
+                    .reservationId(updateRequest.getReservationId())
+                    .capacityType(updateRequest.getCapacityType())
+                    .build();
 
+            claimMessageBatch(entity, instanceRequestEntity, updateRequest, cloudProvider);
+        } catch (Exception exception) {
+            logError(instanceRequestEntity.getRequestId(), clientId, updateRequest,
+                    String.format("Error occurred while inserting SQS message entry in DB %s",
+                            exception.getMessage()));
+            throw exception;
+        }
+    }
 
-                SqsMessageEntity entity = SqsMessageEntity.builder()
-                        .key(SqsMessageKey.builder()
-                                     .messageBatchId(updateRequest.getMessageBatchId() != null ? updateRequest.getMessageBatchId() : "FixedNull_" + UUID.randomUUID())
-                                     .requestId(instanceRequestEntity.getRequestId())
-                                     .build())
-                        .acknowledgedInstances(updateRequest.getInstanceCount())
-                        .zone(getClusterIdFromRequest(updateRequest))
-                        .status(updateRequest.getStatus())
-                        .creationTime(Instant.now())
-                        .cloudProvider(cloudProvider.toString())
-                        .reservationId(updateRequest.getReservationId())
-                        .capacityType(updateRequest.getCapacityType())
-                        .build();
-
-                /*
-                We will update the entity instead of insert:
-                If request-state update comes for first time, it will insert in DB
-                If request-state update comes for multiple times(with same or different request-state), it will update in DB (cannot-fullfill -> pending-fulfillment)
-                 */
-                sqsMessageRepository.update(entity);
-
-                sendSqsBatchStatusUpdateTelemetryEvent(instanceRequestEntity,
-                                                       CopyUtil.deepCopy(genericMetric),
-                                                       Events.RECEIVED_SQS_BATCH_STATUS_UPDATE.toString(),
-                                                       updateRequest);
-
-            } catch (Exception exception) {
-                logError(instanceRequestEntity.getRequestId(), clientId, updateRequest,
-                        String.format("Error occurred while inserting SQS message entry in DB %s",
-                                exception.getMessage()));
-
-                // rethrowing same exception
-                throw exception;
+    private void claimMessageBatch(
+            SqsMessageEntity entity,
+            InstanceRequestV2Entity instanceRequestEntity,
+            SpotInstanceRequestStatusUpdateRequest updateRequest,
+            CloudProvider cloudProvider) {
+        try {
+            // Copies sent to multiple queues share a logical batch ID. The conditional insert
+            // chooses one zone even when separate ICMS pods read the batch before it is claimed.
+            sqsMessageRepository.insert(entity);
+        } catch (IcmsConflictException conflict) {
+            Optional<SqsMessageEntity> claimedBatch =
+                    sqsMessageRepository.findByRequestIdAndMessageBatchId(
+                            entity.getKey().getRequestId(), entity.getKey().getMessageBatchId());
+            if (claimedBatch.isPresent()
+                    && Objects.equals(claimedBatch.get().getZone(), entity.getZone())) {
+                return;
             }
+
+            String errorMessage = String.format(MSG_ALREADY_ACK,
+                    entity.getKey().getMessageBatchId(), entity.getZone());
+            sendPreConditionFailedTelemetryEvent(instanceRequestEntity, entity.getZone(),
+                    updateRequest, errorMessage, cloudProvider, null);
+            throw new PreConditionFailedException(errorMessage);
         }
     }
 

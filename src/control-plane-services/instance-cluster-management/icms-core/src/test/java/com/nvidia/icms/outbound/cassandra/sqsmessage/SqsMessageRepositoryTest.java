@@ -24,10 +24,14 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.nvidia.icms.errors.IcmsConflictException;
+import com.nvidia.icms.inbound.rest.model.SpotRequestStatusCode;
 import com.nvidia.icms.integration.IntegrationTest;
 import com.nvidia.icms.outbound.cassandra.sqsmessage.entity.SqsMessageEntity;
 import com.nvidia.icms.outbound.cassandra.sqsmessage.entity.SqsMessageKey;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -118,5 +122,49 @@ class SqsMessageRepositoryTest extends IntegrationTest {
         assertEquals(
                 "MessageBatch with dummy_request_id request-id and dummy_message_batch_id messageBatchId already exists",
                 icmsConflictException.getBody().getDetail());
+    }
+
+    @Test
+    void concurrentInsertsForSameLogicalBatch_persistExactlyOneZoneClaim() throws Exception {
+        var first = SqsMessageEntity.builder()
+                .key(new SqsMessageKey(DUMMY_REQUEST_ID, DUMMY_MESSAGE_BATCH_ID))
+                .acknowledgedInstances(2)
+                .zone("zone-a")
+                .status(SpotRequestStatusCode.PENDING_FULFILLMENT)
+                .build();
+        var second = first.toBuilder().zone("zone-b").build();
+        var ready = new CountDownLatch(2);
+        var start = new CountDownLatch(1);
+
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var firstClaim = executor.submit(() -> insertWhenReady(first, ready, start));
+            var secondClaim = executor.submit(() -> insertWhenReady(second, ready, start));
+            try {
+                assertTrue(ready.await(5, TimeUnit.SECONDS));
+            } finally {
+                start.countDown();
+            }
+            int accepted = firstClaim.get(30, TimeUnit.SECONDS)
+                    + secondClaim.get(30, TimeUnit.SECONDS);
+            assertEquals(1, accepted);
+        }
+
+        var claims = sqsMessageRepository.findByRequestId(DUMMY_REQUEST_ID);
+        assertEquals(1, claims.size());
+        assertTrue(claims.getFirst().getZone().equals("zone-a")
+                || claims.getFirst().getZone().equals("zone-b"));
+        assertEquals(2, claims.getFirst().getAcknowledgedInstances());
+    }
+
+    private int insertWhenReady(SqsMessageEntity entity, CountDownLatch ready, CountDownLatch start)
+            throws InterruptedException {
+        ready.countDown();
+        assertTrue(start.await(5, TimeUnit.SECONDS));
+        try {
+            sqsMessageRepository.insert(entity);
+            return 1;
+        } catch (IcmsConflictException expected) {
+            return 0;
+        }
     }
 }

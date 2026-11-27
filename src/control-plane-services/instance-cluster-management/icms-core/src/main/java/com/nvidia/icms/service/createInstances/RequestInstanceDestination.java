@@ -22,7 +22,13 @@ import com.nvidia.icms.inbound.rest.model.CloudProvider;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.InstanceTypeV5Udt;
 import com.nvidia.icms.outbound.sqs.model.CapacityType;
 import jakarta.annotation.Nullable;
+import jakarta.validation.constraints.NotNull;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import lombok.AllArgsConstructor;
@@ -130,5 +136,59 @@ public class RequestInstanceDestination {
 
     public static boolean isReservedOrReservedBackupDestination(RequestInstanceDestination destination) {
         return destination != null && (destination.isReserved() || destination.isReservedBackup());
+    }
+
+    /**
+     * Returns one SPOT destination per effective queue and one reserved destination per queue
+     * and creation payload. SPOT payload alternatives in the same queue are represented by one
+     * candidate so an accepted logical batch is not published repeatedly to that queue.
+     * Cluster and region metadata can differ for destinations that publish the same message.
+     * Reserved requests precede their backup and spot alternatives. Destinations without a
+     * capacity type cannot be published.
+     */
+    public static List<RequestInstanceDestination> getDestinationsForPublishing(
+            @NotNull Set<RequestInstanceDestination> destinations) {
+        Map<PublishingDestinationKey, RequestInstanceDestination> uniqueDestinations =
+                new LinkedHashMap<>();
+        destinations.stream()
+                .filter(destination -> destination.getCapacityType() != null)
+                .sorted(Comparator.comparingInt(RequestInstanceDestination::publishingPriority))
+                .forEach(destination -> uniqueDestinations.putIfAbsent(
+                        PublishingDestinationKey.from(destination), destination));
+        return new ArrayList<>(uniqueDestinations.values());
+    }
+
+    private static int publishingPriority(RequestInstanceDestination destination) {
+        return switch (destination.getCapacityType()) {
+            case RESERVED -> 0;
+            case RESERVED_BACKUP -> 1;
+            case SPOT -> 2;
+        };
+    }
+
+    private record PublishingDestinationKey(
+            String creationQueueUrl,
+            CapacityType capacityType,
+            UUID reservationId,
+            String instanceTypeName,
+            String instanceTypeValue,
+            String gpuName,
+            Integer maxFulfillableInstances,
+            Integer instanceBatchCount) {
+
+        private static PublishingDestinationKey from(RequestInstanceDestination destination) {
+            if (destination.isSpot()) {
+                return new PublishingDestinationKey(destination.getCreationQueueUrl(),
+                        CapacityType.SPOT, null, null, null, null, null, null);
+            }
+            InstanceTypeV5Udt instanceType = destination.getInstanceType();
+            return new PublishingDestinationKey(
+                    destination.getCreationQueueUrl(), destination.getCapacityType(),
+                    destination.getReservationId(),
+                    instanceType == null ? null : instanceType.getName(),
+                    instanceType == null ? null : instanceType.getValue(),
+                    destination.getGpuName(), destination.getMaxFulfillableInstances(),
+                    destination.getInstanceBatchCount());
+        }
     }
 }
