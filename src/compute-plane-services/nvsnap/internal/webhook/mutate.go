@@ -669,6 +669,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	injectPatches = append(injectPatches, m.debugEnvPatches(pod)...)
 	injectPatches = append(injectPatches, m.dynamoNamespacePatches(ctx, pod)...)
+	injectPatches = append(injectPatches, m.sharedNamespacePatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.livenessBudgetPatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.companionToolsPatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.criuIdentityPatches(ctx, pod)...)

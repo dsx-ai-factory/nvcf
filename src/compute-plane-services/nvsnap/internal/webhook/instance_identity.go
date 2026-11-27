@@ -32,6 +32,9 @@ func NamesOwnInstance(pod *corev1.Pod) string {
 			continue
 		}
 		for _, e := range c.Env {
+			if kubeDiscoveryExempt(pod, &c, e.Name) {
+				continue
+			}
 			if e.ValueFrom == nil && strings.Contains(e.Value, pod.Namespace) && token.MatchString(e.Value) {
 				return e.Name
 			}
