@@ -608,6 +608,15 @@ impl CassandraServiceManager {
         node_id: &str,
         ttl_seconds: i32,
     ) -> Result<bool> {
+        let Some(lock) = self.get_lock(lock_name).await? else {
+            return Ok(false);
+        };
+        if lock.node_id != node_id {
+            return Ok(false);
+        }
+        // Keep the acquisition timestamp stable and condition the refresh on it,
+        // so a lock reacquired after this read cannot be refreshed by this LWT.
+        let acquired_at = lock.acquired_at;
         let session = self.get_session().await?;
         with_cassandra_timing("refresh_lock_ttl", || async {
             let mut prepared = session
@@ -616,17 +625,25 @@ impl CassandraServiceManager {
             prepared.set_consistency(Consistency::LocalQuorum);
             prepared.set_serial_consistency(Some(SerialConsistency::Serial));
             prepared.set_is_idempotent(false);
-            let refreshed_at = Utc::now();
             let result = session
                 .execute_unpaged(
                     &prepared,
-                    (ttl_seconds, node_id, refreshed_at, lock_name, node_id),
+                    (
+                        ttl_seconds,
+                        node_id,
+                        acquired_at.clone(),
+                        lock_name,
+                        node_id,
+                        acquired_at,
+                    ),
                 )
                 .await?;
             let rows = result.into_rows_result()?;
-            // On a CAS miss, Scylla returns [applied]=false + the IF-clause columns (node_id).
-            // Check for that shape first; if node_id is present we know applied=false.
-            if rows.column_specs().get_by_name("node_id").is_some() {
+            // On a CAS miss, Scylla returns [applied]=false plus the IF columns.
+            // Check for that shape first to avoid decoding the returned row as (bool,).
+            if rows.column_specs().get_by_name("node_id").is_some()
+                || rows.column_specs().get_by_name("acquired_at").is_some()
+            {
                 return Ok(false);
             }
             if let Some(row) = rows.rows::<(bool,)>()?.next() {
@@ -1078,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires running Cassandra"]
-    async fn test_refresh_lock_renews_all_columns_for_contending_node() {
+    async fn test_refresh_lock_preserves_generation_and_renews_all_columns() {
         let settings = create_test_settings().await;
         let secrets_path = get_test_secrets_path();
         let secrets_watcher = Arc::new(
@@ -1101,9 +1118,13 @@ mod tests {
             .unwrap());
 
         // The original acquired_at TTL has expired, but the refresh must keep
-        // the complete row readable while the renewed lease remains active.
+        // the complete row readable while preserving this acquisition generation.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(manager.get_lock(&lock.lock_name).await.unwrap().is_some());
+        let refreshed_lock = manager.get_lock(&lock.lock_name).await.unwrap().unwrap();
+        assert_eq!(
+            refreshed_lock.acquired_at.timestamp_millis(),
+            lock.acquired_at.timestamp_millis()
+        );
 
         let contender = DistributedLock {
             lock_name: lock.lock_name.clone(),
@@ -1112,13 +1133,11 @@ mod tests {
         };
         assert!(!manager.put_lock(&contender, ttl_seconds).await.unwrap());
 
-        // Refresh rewrites acquired_at, so release with the current value if the row is still live.
-        if let Some(current) = manager.get_lock(&lock.lock_name).await.unwrap() {
-            manager
-                .delete_lock_if_owner(&lock.lock_name, &lock.node_id, current.acquired_at)
-                .await
-                .unwrap();
-        }
+        // Refresh preserves acquired_at, so cleanup uses the original generation.
+        manager
+            .delete_lock_if_owner(&lock.lock_name, &lock.node_id, lock.acquired_at)
+            .await
+            .unwrap();
     }
 
     /// Builds a manager against the local test Cassandra; requires a running cluster.
