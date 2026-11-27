@@ -72,4 +72,22 @@ if render_migration_case --set-string nvcfUi.openbaoMigrations.kubectlMinor=1.35
 fi
 grep -Fq 'nvcfUi.openbaoMigrations.kubectlMinor must be empty, 1.36, or 1.37' "$work_dir/invalid-client.err"
 
+# JWT selection is optional for legacy values and explicit for target-only
+# images. Matching the selected server image is the release qualification gate.
+jwt_env="$container | .env[] | select(.name == \"BAO_JWT_PLUGIN_VERSION\") | .value"
+render_migration_case
+test -z "$(yq -rN "$jwt_env" "$work_dir/migration.yaml")"
+target=$(sed -n 's/^JWT_PLUGIN_TARGET_VERSION=//p' "$repo_root/infra/openbao/jwt-plugin-versions.env")
+render_migration_case --set-string "nvcfUi.openbaoMigrations.jwtPluginVersion=$target"
+test "$(yq -rN "$jwt_env" "$work_dir/migration.yaml")" = "$target"
+render_migration_case --set nvcfUi.openbaoMigrations.jwtPluginVersion=null
+test -z "$(yq -rN "$jwt_env" "$work_dir/migration.yaml")"
+for invalid in latest 1.2.3 false 0; do
+  if render_migration_case --set "nvcfUi.openbaoMigrations.jwtPluginVersion=$invalid" 2> "$work_dir/invalid-jwt.err"; then
+    echo 'FAIL: invalid explicit JWT catalog version rendered' >&2
+    exit 1
+  fi
+  grep -Fq 'nvcfUi.openbaoMigrations.jwtPluginVersion must be an explicit JWT catalog version' "$work_dir/invalid-jwt.err"
+done
+
 echo "nonroot-ui-migrations: all checks passed"

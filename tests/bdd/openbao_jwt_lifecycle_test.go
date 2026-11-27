@@ -18,10 +18,14 @@ limitations under the License.
 package bdd_tmp
 
 import (
+	"fmt"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/cucumber/godog"
+	"github.com/google/shlex"
 
 	"nvcf-bdd/harness"
 	"nvcf-bdd/steps"
@@ -71,6 +75,59 @@ func TestOpenBaoJWTPluginLifecycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live OpenBao lifecycle requires a prepared isolated container")
 	}
-	t.Setenv("BDD_CLEANUP_MODE", "")
-	runLiveFeature(t, "openbao-jwt-plugin-lifecycle.feature")
+	if os.Getenv("BDD_CLEANUP_MODE") != "" {
+		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
+	}
+	runLiveFeature(t, "openbao-jwt-plugin-lifecycle.feature", harness.WithoutCLI(), harness.WithTempWorkspace())
+}
+
+func TestOpenBaoUIJWTVersionFeatureFileWiresToSteps(t *testing.T) {
+	for _, stack := range []string{"/tmp/selected stack", `/tmp/release\candidate`, `/tmp/release'"${LITERAL}`} {
+		t.Run(stack, func(t *testing.T) {
+			t.Setenv("OPENBAO_UI_JWT_STACK", stack)
+			t.Setenv("OPENBAO_UI_JWT_ENVIRONMENT", "release")
+			runner := newFakeRunner(nil)
+			runner.onRun = func(command string) error {
+				args, err := shlex.Split(command)
+				expected := []string{"tools/ci/qualify-openbao-ui-jwt-version", stack, "release"}
+				if err != nil || !slices.Equal(args, expected) {
+					return fmt.Errorf("unexpected qualification command: %q", command)
+				}
+				return nil
+			}
+			runner.respond = func(command string) (harness.Result, bool) {
+				return harness.Result{ExitCode: 0, Stdout: "openbao-ui-jwt-version: target-only registry.example.com/server:fixture -> registry.example.com/migrations:fixture uses v99.1.2\n"}, true
+			}
+			sc := steps.NewScenarioContext(newWiringSuite(t, runner))
+			var out strings.Builder
+			status := godog.TestSuite{
+				Name: "openbao-ui-jwt-version-wiring",
+				ScenarioInitializer: func(ctx *godog.ScenarioContext) {
+					steps.RegisterAll(ctx, sc)
+				},
+				Options: &godog.Options{
+					Format: "pretty",
+					Paths:  []string{mustResolveFeaturePath(t, "openbao-ui-jwt-version.feature")},
+					Strict: true,
+					Output: &out,
+				},
+			}.Run()
+			if status != 0 {
+				t.Fatalf("godog suite status = %d\n%s", status, out.String())
+			}
+			if !commandRanThatContains(runner.runs, "qualify-openbao-ui-jwt-version") {
+				t.Fatal("release qualification command was never invoked")
+			}
+		})
+	}
+}
+
+func TestOpenBaoUIJWTVersion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires a saved target-only release environment and registry access")
+	}
+	if os.Getenv("BDD_CLEANUP_MODE") != "" {
+		t.Fatal("unset BDD_CLEANUP_MODE before running this cluster-free suite")
+	}
+	runLiveFeature(t, "openbao-ui-jwt-version.feature", harness.WithoutCLI(), harness.WithTempWorkspace())
 }

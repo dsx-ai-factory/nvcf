@@ -35,7 +35,7 @@ func TestUpgradeReadOnlyChecks(t *testing.T) {
 	if os.Getenv("BDD_CLEANUP_MODE") != "" {
 		t.Fatal("read-only checks require BDD_CLEANUP_MODE to be unset")
 	}
-	runLiveFeature(t, "upgrade-readonly-checks.feature")
+	runLiveFeature(t, "upgrade-readonly-checks.feature", harness.WithoutCLI())
 }
 
 func TestUpgradeReadOnlyChecksFeatureFileWiresToSteps(t *testing.T) {

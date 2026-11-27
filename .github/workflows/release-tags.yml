@@ -300,7 +300,8 @@ jobs:
   tag-release-notes:
     name: tag release
     if: github.ref_type == 'tag'
-    runs-on: linux-amd64-cpu4
+    # OpenBao image qualification needs the hosted runner's Docker daemon.
+    runs-on: ${{ startsWith(github.ref_name, 'deploy/stacks/self-managed/v') && 'ubuntu-latest' || 'linux-amd64-cpu4' }}
     permissions:
       contents: write
     steps:
@@ -341,6 +342,62 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/bin"
           mv helmfile "${RUNNER_TEMP}/bin/"
           echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Resolve release publication mode
+        id: release-mode
+        run: |
+          python3 -c 'import runpy; mode = runpy.run_path("tools/ci/github-release")["github_release_mode"](); print("publish=" + str(not mode[1]).lower())' >> "$GITHUB_OUTPUT"
+
+      - name: Install yq for OpenBao UI release qualification
+        if: startsWith(github.ref_name, 'deploy/stacks/self-managed/v') && steps.release-mode.outputs.publish == 'true'
+        env:
+          YQ_VERSION: "4.47.1"
+          YQ_SHA256: "0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o yq \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "$YQ_SHA256  yq" | sha256sum -c -
+          chmod +x yq
+          mv yq "$RUNNER_TEMP/bin/"
+
+      - name: Qualify selected OpenBao and UI migration images
+        if: startsWith(github.ref_name, 'deploy/stacks/self-managed/v') && steps.release-mode.outputs.publish == 'true'
+        timeout-minutes: 20
+        env:
+          NVCF_RELEASE_HELM_REGISTRY: ${{ secrets.NCP_DEV_REGISTRY }}
+          NVCF_RELEASE_NGC_API_KEY: ${{ secrets.NGC_NCP_DEV_KEY }}
+        run: |
+          set -euo pipefail
+          chart_source=$NVCF_RELEASE_HELM_REGISTRY
+          chart_source="${chart_source#"${chart_source%%[![:space:]]*}"}"
+          chart_source="${chart_source%"${chart_source##*[![:space:]]}"}"
+          while [[ $chart_source == */ ]]; do chart_source=${chart_source%/}; done
+          export NVCF_RELEASE_HELM_REGISTRY=$chart_source
+          if [[ -z $chart_source || $chart_source != */* || $chart_source == *://* || $chart_source == *[@?#[:space:]]* ]]; then
+            echo 'NVCF_RELEASE_HELM_REGISTRY must use host/repository format' >&2
+            exit 1
+          fi
+          case "/$chart_source/" in
+            *//*|*/../*|*/./*)
+              echo 'NVCF_RELEASE_HELM_REGISTRY must use host/repository format' >&2
+              exit 1 ;;
+          esac
+          # Exercise the release inventory's optional UI profile. Keep the
+          # plugin version and all image/chart tags in the release's values.
+          tools/ci/qualify-openbao-ui-jwt-version deploy/stacks/self-managed base \
+            --state-values-set global.helm.sources.url= \
+            --state-values-set "global.helm.sources.registry=${chart_source%%/*}" \
+            --state-values-set "global.helm.sources.repository=${chart_source#*/}" \
+            --state-values-set global.image.registry=nvcr.io \
+            --state-values-set global.image.repository=nvidia/nvcf \
+            --state-values-set addons.nvcfUi.enabled=true \
+            --state-values-set ingress.gatewayApi.controllerNamespace=envoy-gateway-system \
+            --state-values-set ingress.gatewayApi.gateways.shared.name=shared-gw \
+            --state-values-set ingress.gatewayApi.gateways.shared.namespace=envoy-gateway-system \
+            --state-values-set ingress.gatewayApi.gateways.grpc.name=grpc-gw \
+            --state-values-set ingress.gatewayApi.gateways.grpc.namespace=envoy-gateway-system
 
       - name: Validate tag and create release notes
         env:

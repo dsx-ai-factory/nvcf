@@ -2490,6 +2490,9 @@ nvcfUi:
     nvctUrl: {{ printf "%s.%s.svc.cluster.local:%v" $nvctApiBackend.name $nvctApiBackend.namespace $nvctApiBackend.port | quote }}
     sisUrl: {{ printf "%s.%s.svc.cluster.local:%v" $sisBackend.name $sisBackend.namespace $sisBackend.port | quote }}
   openbaoMigrations:
+    {{- if hasKey (dig "addons" "nvcfUi" "openbaoMigrations" dict .Values) "jwtPluginVersion" }}
+    jwtPluginVersion: {{ dig "addons" "nvcfUi" "openbaoMigrations" "jwtPluginVersion" "" .Values | quote }}
+    {{- end }}
     image:
       registry: {{ .Values.global.image.registry }}
       repository: {{ .Values.global.image.repository }}/nvcf-openbao-migrations

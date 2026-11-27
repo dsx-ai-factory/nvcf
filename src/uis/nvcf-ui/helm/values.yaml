@@ -86,6 +86,9 @@ nvcfUi:
     # Empty uses the image default. Select "1.36" for Kubernetes 1.35;
     # "1.37" is also supported by the migration image.
     kubectlMinor: ""
+    # Explicit catalog version from the selected OpenBao server image manifest.
+    # Required when that image contains only the target JWT plugin.
+    jwtPluginVersion: ""
     # OpenBao connection. When baoService is empty, the template derives
     # openbao-server.<namespace>.svc.cluster.local.
     baoService: ""

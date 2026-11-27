@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Render the selected published charts with actual environment values. Extra
+# arguments after STACK ENV are passed to Helmfile as state configuration.
+set -euo pipefail
+fail() { echo "qualify-openbao-ui-jwt-version: $*" >&2; exit 1; }
+[[ $# -ge 2 ]] || fail 'usage: qualify-openbao-ui-jwt-version STACK_DIR ENVIRONMENT [HELMFILE_GLOBAL_ARGS...]'
+script_dir=$(CDPATH='' cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+stack=$(CDPATH='' cd -P -- "$1" && pwd -P) environment=$2
+shift 2
+release_registry=${NVCF_RELEASE_HELM_REGISTRY:-}
+release_registry="${release_registry#"${release_registry%%[![:space:]]*}"}"
+release_registry="${release_registry%"${release_registry##*[![:space:]]}"}"
+while [[ $release_registry == */ ]]; do release_registry=${release_registry%/}; done
+if [[ -n ${NVCF_RELEASE_HELM_REGISTRY:-} ]]; then
+  [[ -n $release_registry && $release_registry == */* && $release_registry != *://* && $release_registry != *[@?#[:space:]]* ]] || fail 'NVCF_RELEASE_HELM_REGISTRY must use host/repository format'
+  case "/$release_registry/" in
+    *//*|*/../*|*/./*) fail 'NVCF_RELEASE_HELM_REGISTRY must use host/repository format' ;;
+  esac
+fi
+export NVCF_RELEASE_HELM_REGISTRY=$release_registry
+temp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
+work=$(mktemp -d "$temp_base/openbao-ui-jwt.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+export TMPDIR=$work
+umask 077
+# Let Helmfile resolve state operands relative to its state directory, including
+# template includes. Resolve them once and share the resulting values.
+args=() state_args=(--environment default)
+while (($#)); do
+  case "$1" in
+    --state-values-file|--state-values-file=*)
+      if [[ $1 == --state-values-file ]]; then
+        (($# >= 2)) || fail "$1 requires a value"
+        values_file=$2
+        shift
+      else
+        values_file=${1#*=}
+      fi
+      # Match the original state's base directory, even outside the stack.
+      case "$values_file" in
+        /*|*://*|*::*) : ;;
+        *) values_file="$stack/helmfile.d/$values_file" ;;
+      esac
+      state_args+=(--state-values-file "$values_file") ;;
+    --state-values-set|--state-values-set-string)
+      (($# >= 2)) || fail "$1 requires a value"
+      state_args+=("$1" "$2")
+      shift ;;
+    --state-values-set=*|--state-values-set-string=*)
+      state_args+=("$1") ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+set --
+if ((${#args[@]})); then set -- "${args[@]}"; fi
+# Materialize source symlinks so no later write can reach the operator's tree.
+cp -RL "$stack" "$work/stack"
+stack="$work/stack"
+state_dir=$(CDPATH='' cd -P -- "$stack/helmfile.d" && pwd -P)
+[[ $state_dir == "$work/"* ]] || fail 'copied Helmfile state directory is outside the qualification workspace'
+[[ -f $stack/environments/$environment.yaml ]] || fail "environment $environment does not exist"
+# Render-only qualification needs no application credentials. Retain supplied
+# secrets when present because they can affect the selected release values.
+[[ -f $stack/secrets/$environment-secrets.yaml ]] || printf '{}\n' > "$stack/secrets/$environment-secrets.yaml"
+export HELMFILE_ENV=$environment
+export HELMFILE_CACHE_HOME="$work/helmfile-cache"
+registry_config=$(helm env HELM_REGISTRY_CONFIG)
+export HELM_CACHE_HOME="$work/helm/cache"
+export HELM_CONFIG_HOME="$work/helm/config"
+export HELM_DATA_HOME="$work/helm/data"
+export HELM_REGISTRY_CONFIG="$HELM_CONFIG_HOME/registry/config.json"
+export HELM_REPOSITORY_CONFIG="$HELM_CONFIG_HOME/repositories.yaml"
+export HELM_REPOSITORY_CACHE="$HELM_CACHE_HOME/repository"
+if [[ -f $registry_config ]]; then
+  mkdir -p "$HELM_CONFIG_HOME/registry"
+  cp "$registry_config" "$HELM_CONFIG_HOME/registry/config.json"
+fi
+
+# Saved repository passwords can appear in Helmfile's rendered debug state.
+# Override both caller flags and environment settings on every invocation.
+helmfile_safe() {
+  HELMFILE_DEBUG=false helmfile "$@" --debug=false --log-level warn
+}
+# Build serializes the merged state without evaluating it as release values.
+# Unused vals references must remain unresolved, particularly when UI is off.
+snapshot=$(mktemp "$state_dir/qualification-values.XXXXXX")
+mv "$snapshot" "$snapshot.yaml.gotmpl"
+snapshot="$snapshot.yaml.gotmpl"
+awk '/^---[[:space:]]*$/ { exit } { print }' "$state_dir/02-core.yaml.gotmpl" > "$snapshot"
+printf '\n---\nreleases: []\n' >> "$snapshot"
+helmfile_safe --environment default --allow-no-matching-release -f "$snapshot" "${state_args[@]}" \
+  build > "$work/state-values.yaml"
+yq -e '.renderedvalues | tag == "!!map"' "$work/state-values.yaml" >/dev/null || fail 'Helmfile build did not return merged state values'
+yq '.renderedvalues' "$work/state-values.yaml" > "$work/effective-values.yaml"
+# Prevent either original environment header from re-reading mutable inputs.
+for state in 01-dependencies.yaml.gotmpl 02-core.yaml.gotmpl; do
+  {
+    printf 'environments:\n  default:\n    values:\n      - ../../effective-values.yaml\n'
+    awk 'found || /^---[[:space:]]*$/ { found=1; print } END { if (!found) exit 1 }' "$stack/helmfile.d/$state"
+  } > "$work/frozen-header"
+  mv "$work/frozen-header" "$stack/helmfile.d/$state"
+done
+helmfile_safe --environment default -f "$stack/helmfile.d/02-core.yaml.gotmpl" "$@" \
+  --allow-no-matching-release -l name=nvcf-ui list --skip-charts --output json > "$work/ui-releases.json"
+if [[ $(yq -r 'length' "$work/ui-releases.json") == 0 ]]; then
+  echo 'openbao-ui-jwt-version: UI disabled; no UI migration Job to qualify'
+  exit 0
+fi
+# Build with an empty local chart to avoid downloading unauthenticated charts.
+# Embed all release values, restore the selected chart, and render this frozen
+# state without loading caller-supplied values a second time.
+mkdir -p "$work/source-chart"
+printf 'apiVersion: v2\nname: source-check\nversion: 0.0.0\n' > "$work/source-chart/Chart.yaml"
+render_release() {
+  local state=$1 release=$2
+  shift 2
+  local frozen="$work/$release.yaml" chart origin oci
+  helmfile_safe --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" list --skip-charts --output json > "$work/releases.json"
+  [[ $(yq -r 'length' "$work/releases.json") == 1 ]] || fail "expected one selected $release release"
+  chart=$(yq -er '.[0].chart' "$work/releases.json")
+  helmfile_safe --environment default -f "$stack/helmfile.d/$state" "$@" \
+    -l "name=$release" --chart "$work/source-chart" build --embed-values > "$frozen"
+  OPENBAO_UI_JWT_CHART=$chart OPENBAO_UI_JWT_RELEASE=$release yq -i \
+    'del(.environments, .values, .templates, .chart) |
+     .releases |= map(select(.name == strenv(OPENBAO_UI_JWT_RELEASE))) |
+     del(.releases[].condition, .releases[].needs) |
+     .releases[].chart = strenv(OPENBAO_UI_JWT_CHART)' "$frozen"
+  origin=$(yq -r '.repositories[] | select(.name == "nvcf") | .url' "$frozen")
+  oci=$(yq -r '.repositories[] | select(.name == "nvcf") | .oci' "$frozen")
+  if [[ $oci == true && $origin == *://* ]]; then
+    fail 'OCI registry must use a bare host or a single oci:// prefix in global.helm.sources.registry'
+  fi
+  if [[ -n $release_registry ]]; then
+    [[ $chart == nvcf/* && $oci == true && $origin == "$release_registry" ]] || \
+      fail 'qualified chart origin differs from NVCF_RELEASE_HELM_REGISTRY'
+  fi
+  if [[ -n ${NVCF_RELEASE_NGC_API_KEY:-} ]]; then
+    if [[ $oci != true && ( $origin == https://helm.ngc.nvidia.com || $origin == https://helm.ngc.nvidia.com/* ) ]]; then
+      # Explicit saved mirror credentials must not override the NGC key.
+      yq -i '(.repositories[] | select(.name == "nvcf")) |= del(.username, .password)' "$frozen"
+      NVCF_USERNAME=\$oauthtoken NVCF_PASSWORD=$NVCF_RELEASE_NGC_API_KEY \
+        helmfile_safe -f "$frozen" -l "name=$release" template
+      return
+    elif [[ $oci == true && ( $origin == nvcr.io/* || $origin == nvcr.io:443/* ) ]]; then
+      local host=$origin
+      host=${host%%/*}
+      local ngc_config="$work/helm-ngc-${host//:/_}.json"
+      if [[ ! -f $ngc_config ]]; then
+        OPENBAO_UI_JWT_REGISTRY_HOST=$host yq -n -o=json '.auths[strenv(OPENBAO_UI_JWT_REGISTRY_HOST)] = {}' > "$ngc_config"
+        printf '%s' "$NVCF_RELEASE_NGC_API_KEY" | HELM_REGISTRY_CONFIG="$ngc_config" \
+          helm registry login "$host" --username \$oauthtoken --password-stdin >&2
+      fi
+      yq -i '(.repositories[] | select(.name == "nvcf")) |= del(.username, .password)' "$frozen"
+      HELM_REGISTRY_CONFIG=$ngc_config NVCF_USERNAME='' NVCF_PASSWORD='' \
+        helmfile_safe -f "$frozen" -l "name=$release" template
+      return
+    fi
+  fi
+  # Pull/render with Helm's full credential discovery, including implicit
+  # native stores. A hand-written credential precheck can reject valid logins.
+  if ! helmfile_safe -f "$frozen" -l "name=$release" template; then
+    if [[ $oci == true ]]; then
+      local host=${origin%%/*}
+      fail "chart pull or render failed for $host; run helm registry login for that host or configure repository credentials"
+    fi
+    fail "chart rendering failed for $release"
+  fi
+}
+render_release 01-dependencies.yaml.gotmpl openbao-server "$@" > "$work/openbao.yaml"
+render_release 02-core.yaml.gotmpl nvcf-ui "$@" > "$work/ui.yaml"
+"$script_dir/check-openbao-ui-jwt-version" "$work/openbao.yaml" "$work/ui.yaml"

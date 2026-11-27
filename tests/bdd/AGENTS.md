@@ -155,6 +155,12 @@ logic into `dsl/`.
   token never appears in argv or per-command logs. Do not introduce
   step handlers that capture secrets into env vars; relying on the
   state file keeps the JWT out of `<seq>.cmd` lines.
+- Render-only and container-only suites use `harness.WithoutCLI()` to skip
+  CLI builds and login-state snapshots. Keep the default state tracking for
+  suites that run `nvcf-cli init`.
+- Use `harness.WithTempWorkspace()` when child commands can create temporary
+  secrets. It sets a suite-owned `TMPDIR`. Normal and signal teardown remove
+  that directory after active steps and their process groups have stopped.
 - The live runner installs SIGINT and SIGTERM cleanup before scenarios run.
   Interrupt cleanup cancels the active step and its Unix process group, waits
   for that step to stop writing, then restores the same file and environment

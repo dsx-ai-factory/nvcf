@@ -31,7 +31,7 @@ import (
 )
 
 // Suite is the top-level lifecycle owner for one live BDD run. It
-// builds nvcf-cli, exports NVCF_CLI and REPO_ROOT into the process
+// builds nvcf-cli by default, exports NVCF_CLI and REPO_ROOT into the process
 // environment, and exposes the Ledger, EnvLedger, and CommandCache
 // that step handlers share across scenarios.
 type Suite struct {
@@ -47,39 +47,55 @@ type Suite struct {
 	signalCancel  context.CancelFunc
 	stepMu        sync.RWMutex
 	teardownMu    sync.Mutex
+	skipCLI       bool
+	isolateTemp   bool
+	tempWorkspace string
 }
+
+// SuiteOption changes optional live-suite resources. Defaults preserve CLI use.
+type SuiteOption func(*Suite)
+
+// WithoutCLI skips CLI build, environment setup, and login-state tracking.
+func WithoutCLI() SuiteOption { return func(s *Suite) { s.skipCLI = true } }
+
+// WithTempWorkspace owns subprocess temporary files through signal teardown.
+func WithTempWorkspace() SuiteOption { return func(s *Suite) { s.isolateTemp = true } }
 
 // NewSuite resolves Config, creates the run-id directory tree, builds
 // nvcf-cli into Config.CLIPath, and exports the env vars feature files
 // interpolate. The returned Suite is ready to drive a Godog scenario
-// initializer.
-func NewSuite(t *testing.T) (*Suite, error) {
+// initializer. WithoutCLI disables CLI setup; WithTempWorkspace registers
+// subprocess temporary files for normal and signal cleanup.
+func NewSuite(t *testing.T, options ...SuiteOption) (*Suite, error) {
 	t.Helper()
 	cfg, err := ResolveConfig()
 	if err != nil {
 		return nil, err
 	}
+	return newSuite(t, cfg, options...)
+}
+
+func newSuite(t *testing.T, cfg Config, options ...SuiteOption) (*Suite, error) {
+	t.Helper()
 	for _, dir := range []string{cfg.OutDir, cfg.LedgerDir, cfg.CommandLogDir, cfg.DiagnosticsDir, filepath.Dir(cfg.CLIPath)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 	}
-	runner := NewCommandRunner(cfg.RepoRoot, cfg.CommandLogDir)
-	if err := buildCLI(cfg); err != nil {
-		return nil, err
-	}
-	// t.Setenv scopes the env vars to the test that called NewSuite so
-	// the live entry points do not leak them into later tests in the
-	// same go test invocation.
-	t.Setenv("NVCF_CLI", cfg.CLIPath)
-	t.Setenv("REPO_ROOT", cfg.RepoRoot)
 	suite := &Suite{
-		Config:    cfg,
-		Runner:    runner,
-		Ledger:    NewLedger(cfg.LedgerDir),
-		EnvLedger: NewEnvLedger(),
-		Cache:     NewCommandCache(),
+		Config: cfg, Runner: NewCommandRunner(cfg.RepoRoot, cfg.CommandLogDir),
+		Ledger: NewLedger(cfg.LedgerDir), EnvLedger: NewEnvLedger(), Cache: NewCommandCache(),
 	}
+	for _, option := range options {
+		option(suite)
+	}
+	if !suite.skipCLI {
+		if err := buildCLI(cfg); err != nil {
+			return nil, err
+		}
+		t.Setenv("NVCF_CLI", cfg.CLIPath)
+	}
+	t.Setenv("REPO_ROOT", cfg.RepoRoot)
 	// Pre-suite destructive cleanup (BDD_CLEANUP_MODE) runs BEFORE
 	// snapshotting the CLI state file. Rationale: any destructive
 	// mode invalidates the operator's pre-suite admin JWT (the cluster
@@ -107,6 +123,11 @@ func NewSuite(t *testing.T) (*Suite, error) {
 	if err := suite.snapshotCLIStateFile("nvcf-cli-local"); err != nil {
 		return nil, err
 	}
+	if suite.isolateTemp {
+		if err := suite.createTempWorkspace(); err != nil {
+			return nil, err
+		}
+	}
 	return suite, nil
 }
 
@@ -117,12 +138,47 @@ func NewSuite(t *testing.T) (*Suite, error) {
 // tests/bdd/fixtures/nvcf-cli-local.yaml, so this is hardcoded. If a
 // future feature introduces a second config, this call must be extended.
 func (s *Suite) snapshotCLIStateFile(contextName string) error {
+	if s.skipCLI {
+		return nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolve home dir: %w", err)
 	}
 	statePath := filepath.Join(home, fmt.Sprintf(".nvcf-cli.%s.state", contextName))
-	return s.Ledger.Snapshot(statePath)
+	return s.snapshotCLIStatePath(statePath)
+}
+
+func (s *Suite) snapshotCLIStatePath(path string) error {
+	if s.skipCLI {
+		return nil
+	}
+	return s.Ledger.Snapshot(path)
+}
+
+func (s *Suite) createTempWorkspace() error {
+	resolved, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("resolve temporary base symlinks: %w", err)
+	}
+	base, err := filepath.Abs(resolved)
+	if err != nil {
+		return fmt.Errorf("resolve temporary base: %w", err)
+	}
+	dir, err := os.MkdirTemp(base, "nvcf-bdd-work-")
+	if err != nil {
+		return fmt.Errorf("create temporary workspace: %w", err)
+	}
+	if err := s.EnvLedger.Snapshot("TMPDIR"); err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	if err := os.Setenv("TMPDIR", dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	s.tempWorkspace = dir
+	return nil
 }
 
 // Teardown restores every file the Ledger tracked and every env var
@@ -130,7 +186,11 @@ func (s *Suite) snapshotCLIStateFile(contextName string) error {
 func (s *Suite) Teardown() error {
 	s.teardownMu.Lock()
 	defer s.teardownMu.Unlock()
-	return errors.Join(s.Ledger.RestoreAll(), s.EnvLedger.RestoreAll())
+	err := errors.Join(s.Ledger.RestoreAll(), s.EnvLedger.RestoreAll())
+	if s.tempWorkspace != "" {
+		err = errors.Join(err, os.RemoveAll(s.tempWorkspace))
+	}
+	return err
 }
 
 type signalSafeStepKey struct{}
@@ -180,7 +240,8 @@ func (s *Suite) EndSignalSafeStep(ctx context.Context) context.Context {
 // InstallSignalCleanup restores ledger-backed files and environment variables
 // before an interrupted live run exits. It first cancels the active step, then
 // waits for that step to quiesce before restoring. The returned stop function
-// joins the signal goroutine and must run before normal Teardown.
+// joins the signal goroutine and must run after normal Teardown, so signals
+// remain handled until workspace removal completes.
 func (s *Suite) InstallSignalCleanup() func() {
 	signals := make(chan os.Signal, 1)
 	stop := make(chan struct{})
