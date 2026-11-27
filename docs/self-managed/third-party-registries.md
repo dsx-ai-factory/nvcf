@@ -124,7 +124,7 @@ kubectl -n nvcf rollout restart deployment/nvct-api
 
 ## Adding AWS ECR Registry Credentials
 
-An ECR registry credential requires permanent IAM credentials (Access Key ID + Secret Access Key). Temporary SSO/STS credentials will not work.
+An ECR registry credential requires permanent IAM credentials (an access key ID and a secret access key). Temporary SSO or STS credentials do not work.
 
 If your organization does not allow long-lived IAM user keys, do not add an ECR credential. Instead, give the cluster its own access to ECR and turn off ECR validation in NVCF. See [Turn off validation for a supported registry](./registry-validation.md), which uses the EKS node IAM role as an example.
 
