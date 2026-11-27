@@ -234,6 +234,7 @@ assert_resource_count "$default_render" ReferenceGrant allow-tcproute-to-nats na
 
 helm template nvcf-gateway-routes "$repo_root/chart" \
   --set nvcfGatewayRoutes.routes.llmInvocation.enabled=true \
+  --set nvcfGatewayRoutes.routes.vanityGateway.enabled=true \
   --set nvcfGatewayRoutes.routes.nvcfApi.grpc.enabled=true \
   --set nvcfGatewayRoutes.routes.nvctApi.grpc.enabled=true \
   --set nvcfGatewayRoutes.routes.grpcWorker.enabled=true \
@@ -251,6 +252,12 @@ assert_resource_field "$enabled_render" HTTPRoute llm-invocation gateway '.spec.
 assert_resource_field "$enabled_render" HTTPRoute llm-invocation gateway '.spec.rules[0].backendRefs[0].name' llm-api-gateway
 assert_resource_field "$enabled_render" HTTPRoute llm-invocation gateway '.spec.rules[0].backendRefs[0].namespace' nvcf
 assert_resource_field "$enabled_render" HTTPRoute llm-invocation gateway '.spec.rules[0].backendRefs[0].port' 8080
+
+assert_resource_count "$enabled_render" HTTPRoute vanity-gateway gateway 1
+assert_resource_field "$enabled_render" HTTPRoute vanity-gateway gateway '.spec.rules[0].backendRefs[0].name' vanity-gateway
+# Same as llm-api-gateway: vanity serves SSE chat completions, and Envoy's
+# default 15 s request timeout cuts them mid-stream.
+assert_resource_field "$enabled_render" HTTPRoute vanity-gateway gateway '.spec.rules[0].timeouts.request' 0s
 
 assert_resource_count "$enabled_render" GRPCRoute nvcf-api-grpc gateway 1
 assert_resource_field "$enabled_render" GRPCRoute nvcf-api-grpc gateway '.metadata.labels."app.kubernetes.io/component"' nvcf-api-grpc-route
