@@ -215,10 +215,28 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 	sort.Strings(names)
 	remote := umbrellaRelease{ID: 1, Tag: umbrellaTag(manifest.Version)}
 	unavailable := false
+	serverURL := ""
+	// downloadURLs overrides the public download URL the release listing reports.
+	downloadURLs := map[string]string{}
+	downloadPrefix := "/dsx-ai-factory/nvcf/releases/download/"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/repos/dsx-ai-factory/nvcf")
 		if r.Method != "GET" || r.Header.Get("Authorization") != "" {
 			t.Error("docs artifact check must be public and read-only")
+		}
+		if strings.HasPrefix(r.URL.Path, downloadPrefix) {
+			if unavailable {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			name := strings.TrimPrefix(r.URL.Path, downloadPrefix+remote.Tag+"/")
+			content, ok := assets[name]
+			if !ok {
+				w.WriteHeader(404)
+				return
+			}
+			w.Write(content)
+			return
 		}
 		switch {
 		case strings.HasPrefix(path, "/git/ref/tags/"):
@@ -229,26 +247,25 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 			list := []umbrellaReleaseAsset{}
 			for i, name := range names {
 				if _, ok := assets[name]; ok {
-					list = append(list, umbrellaReleaseAsset{ID: int64(i + 10), Name: name, State: "uploaded"})
+					url, overridden := downloadURLs[name]
+					if !overridden {
+						url = serverURL + downloadPrefix + remote.Tag + "/" + name
+					}
+					list = append(list, umbrellaReleaseAsset{ID: int64(i + 10), Name: name, State: "uploaded", BrowserDownloadURL: url})
 				}
 			}
 			json.NewEncoder(w).Encode(list)
 		case strings.HasPrefix(path, "/releases/assets/"):
-			if unavailable {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			id, _ := strconv.Atoi(strings.TrimPrefix(path, "/releases/assets/"))
-			if id < 10 || id >= 10+len(names) {
-				w.WriteHeader(404)
-				return
-			}
-			w.Write(assets[names[id-10]])
+			// The authenticated-style API download is the request that GitHub
+			// rejects with HTTP 403 for public release assets (issue 3713).
+			t.Errorf("docs product read must use the public download URL, not %s", r.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
 		default:
 			w.WriteHeader(404)
 		}
 	}))
 	defer server.Close()
+	serverURL = server.URL
 	publisher := umbrellaPublisher{api: server.URL, repository: "dsx-ai-factory/nvcf", client: server.Client()}
 	readback, err := readPublishedDocsProduct(fixture.root, release, publisher)
 	if err != nil {
@@ -273,6 +290,23 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 		t.Fatalf("accepted unavailable product assets: %v", err)
 	}
 	unavailable = false
+	t.Run("download-url-must-name-the-release-asset", func(t *testing.T) {
+		name := names[0]
+		for label, url := range map[string]string{
+			"missing":     "",
+			"other-asset": serverURL + downloadPrefix + remote.Tag + "/" + names[len(names)-1],
+			"other-tag":   serverURL + downloadPrefix + "nvcf/9.9.9/" + name,
+			"other-repo":  serverURL + "/other/repo/releases/download/" + remote.Tag + "/" + name,
+			"other-host":  "https://unrelated.example" + downloadPrefix + remote.Tag + "/" + name,
+			"credentials": strings.Replace(serverURL, "http://", "http://user:pass@", 1) + downloadPrefix + remote.Tag + "/" + name,
+		} {
+			downloadURLs[name] = url
+			if err := verifyPublishedDocsProduct(fixture.root, release, publisher); err == nil || !strings.Contains(err.Error(), "public download URL") {
+				t.Errorf("%s: accepted download URL %q: %v", label, url, err)
+			}
+		}
+		delete(downloadURLs, name)
+	})
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
 			original := assets[name]
@@ -285,6 +319,34 @@ func testUmbrellaDocsProductAssetReadback(t *testing.T, schema int) {
 				t.Fatal("changed public asset accepted")
 			}
 			assets[name] = original
+		})
+	}
+}
+
+func TestUmbrellaPublicAssetURLHost(t *testing.T) {
+	asset := func(url string) umbrellaReleaseAsset {
+		return umbrellaReleaseAsset{Name: "manifest.json", BrowserDownloadURL: url}
+	}
+	const path = "/dsx-ai-factory/nvcf/releases/download/nvcf/1.1.1/manifest.json"
+	for _, test := range []struct {
+		name, api, url string
+		ok             bool
+	}{
+		{"github-downloads-come-from-github.com", "https://api.github.com", "https://github.com" + path, true},
+		{"api-host-is-not-a-download-origin", "https://api.github.com", "https://api.github.com" + path, false},
+		{"unrelated-https-host", "https://api.github.com", "https://unrelated.example" + path, false},
+		{"lookalike-host", "https://api.github.com", "https://github.com.evil.example" + path, false},
+		{"plain-http-to-github", "https://api.github.com", "http://github.com" + path, false},
+		{"enterprise-serves-downloads-on-its-api-host", "https://ghe.example/api/v3", "https://ghe.example" + path, true},
+		{"local-test-server", "http://127.0.0.1:8080", "http://127.0.0.1:8080" + path, true},
+		{"other-local-port", "http://127.0.0.1:8080", "http://127.0.0.1:9090" + path, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publisher := umbrellaPublisher{api: test.api, repository: "dsx-ai-factory/nvcf"}
+			_, err := publisher.publicAssetURL("nvcf/1.1.1", asset(test.url))
+			if (err == nil) != test.ok {
+				t.Fatalf("publicAssetURL(%q) error = %v, want ok=%v", test.url, err, test.ok)
+			}
 		})
 	}
 }
