@@ -141,3 +141,28 @@ func TestPoolSlotForCapture(t *testing.T) {
 		t.Fatalf("full pool: %q", got)
 	}
 }
+
+// The capture side's question: a free complete slot exists. No record at all
+// is no free slot (the configuration's first replica is captured).
+func TestPoolHasFreeSlot(t *testing.T) {
+	ctx := context.Background()
+	a := &Agent{kubeClient: k8sfake.NewSimpleClientset(), dynClient: fakeDyn()}
+	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+		t.Fatal("no record: reported a free slot, so the first replica would never be captured")
+	}
+	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(poolRecord("cfg", "10.0.0.1", 111)), dynClient: fakeDyn()}
+	if !a.poolHasFreeSlot(ctx, "fn", "cfg") {
+		t.Fatal("slot 0 complete and unheld: no free slot")
+	}
+	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(poolRecord("cfg", "10.0.0.1", 111),
+		livePod("fn", "prefill-a", "ua"), instanceClaim("fn", "111", "prefill-a", "ua")), dynClient: fakeDyn()}
+	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+		t.Fatal("the only slot held: reported free, so the second replica would never be captured")
+	}
+	capturing := poolRecord("cfg", "10.0.0.1", 111)
+	capturing.Data["state"] = criuGroupStateCapturing
+	a = &Agent{kubeClient: k8sfake.NewSimpleClientset(capturing), dynClient: fakeDyn()}
+	if a.poolHasFreeSlot(ctx, "fn", "cfg") {
+		t.Fatal("a slot still capturing is not a free complete slot")
+	}
+}

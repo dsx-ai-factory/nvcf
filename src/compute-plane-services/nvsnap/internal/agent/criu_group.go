@@ -630,7 +630,7 @@ func (c *criuAutoRestorer) considerGroupCapture(ctx context.Context, pod *corev1
 			// cold because every slot was in use is captured into the next
 			// one. One that started cold for another reason, while a slot
 			// was free, is not: it would only fill the pool.
-			if c.a.poolSlotForRestore(ctx, pod.Namespace, base) != "" {
+			if c.a.poolHasFreeSlot(ctx, pod.Namespace, base) {
 				return false
 			}
 			if _, ok := c.poolSlotForCapture(ctx, base, func(d map[string]string) bool {

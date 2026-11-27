@@ -176,6 +176,34 @@ func (a *Agent) poolSlotForRestore(ctx context.Context, ns, base string) string 
 	return ""
 }
 
+// poolHasFreeSlot reports whether the configuration base has a complete
+// slot whose instance IDs no running pod of ns holds: a replica that started
+// cold anyway did so for another reason than a full pool, and is not
+// captured into a new slot. False when it has no record at all.
+func (a *Agent) poolHasFreeSlot(ctx context.Context, ns, base string) bool {
+	cms := a.kubeClient.CoreV1().ConfigMaps(a.criuFailedNamespace())
+	for k := 0; k < identityPoolSlots; k++ {
+		cm, err := cms.Get(ctx, criuGroupConfigMapName(poolSlotKey(base, k)), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false
+		}
+		if err != nil {
+			return true // cannot tell: not captured now; a later event tries again
+		}
+		if !recordUsable(cm.Data) {
+			continue
+		}
+		ids := recordInstanceIDs(cm.Data)
+		if len(ids) == 0 {
+			return true
+		}
+		if held, err := a.instanceIDHeld(ctx, ns, ids); err != nil || held == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // poolSlotForCapture returns the slot key of the configuration base that
 // a capture of a cold-started replica goes into: the first slot with no
 // record, or whose record may be captured again (or replaced, by replace).
