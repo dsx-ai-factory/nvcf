@@ -31,6 +31,8 @@ import com.nvidia.icms.service.platform.ComputePlatformService;
 import jakarta.annotation.Nullable;
 import jakarta.validation.constraints.NotNull;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +40,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 
 @Slf4j
@@ -71,9 +74,15 @@ public class GpuUsageService {
             Map<String, List<InstanceV2Entity>> requestIdToInstances = getInstancesForRequestIds(
                     requestIds);
 
-            List<GpuUsageResponse.Gpu> gpus = processInstances(requestIdToInstances, clusterGpuInfoHelper.getReadyClusterInfo(ncaId));
+            // IDs and counts mutate, so track each region/GPU/type node by identity.
+            Map<GpuUsageResponse.Cluster, String> combinedClusterIdByCluster =
+                    new IdentityHashMap<>();
+            List<GpuUsageResponse.Gpu> gpus = processInstances(requestIdToInstances,
+                                                              clusterGpuInfoHelper.getReadyClusterInfo(ncaId),
+                                                              combinedClusterIdByCluster);
 
             capacityGatingService.removeGatedFromGpuUsage(gpus, ncaId);
+            combineComputePlatformClusters(gpus, combinedClusterIdByCluster);
 
             return GpuUsageResponse.builder()
                     .gpus(gpus)
@@ -106,9 +115,14 @@ public class GpuUsageService {
             Map<String, List<InstanceV2Entity>> requestIdToInstances = getInstancesForRequestIds(
                     requestIds);
 
-            List<GpuUsageResponse.Gpu> gpus = processInstances(requestIdToInstances, clusterGpuInfoHelper.getReadyClusterInfo(ncaId));
+            Map<GpuUsageResponse.Cluster, String> combinedClusterIdByCluster =
+                    new IdentityHashMap<>();
+            List<GpuUsageResponse.Gpu> gpus = processInstances(requestIdToInstances,
+                                                              clusterGpuInfoHelper.getReadyClusterInfo(ncaId),
+                                                              combinedClusterIdByCluster);
 
             capacityGatingService.removeGatedFromGpuUsage(gpus, ncaId);
+            combineComputePlatformClusters(gpus, combinedClusterIdByCluster);
 
             return DeploymentGpuUsageResponse.builder()
                     .deployments(List.of(DeploymentGpuUsageResponse.Deployment.builder()
@@ -204,15 +218,23 @@ public class GpuUsageService {
      * objects, each containing information about instance types, regions, and clusters where the GPU is used.
      * The resulting structure provides a comprehensive view of GPU usage across the infrastructure.
      *
+     * <p>Compute-platform clusters are reported under their real cluster id here, not under the
+     * combined {@code <regionName>-<computePlatform>} id the response ultimately carries. Capacity
+     * gating names real cluster ids, so it has to run while they are still present;
+     * {@link #combineComputePlatformClusters} applies the combined id afterwards.
+     *
      * @param requestIdToInstances A map where keys are request IDs and values are lists of InstanceV2Entity
      *                            objects associated with each request
      * @param clusterInfoMap A map of cluster IDs to ReadyClusterInfo objects containing cluster metadata
+     * @param combinedClusterIdByCluster Identity-keyed mapping from each compute-platform response
+     *                                   node to its combined id, including missing-zone fallback nodes
      * @return A list of GpuUsageResponse.Gpu objects representing the hierarchical organization of GPU usage,
      *         with each GPU containing instance types, regions, and clusters with their usage statistics
      */
     private List<GpuUsageResponse.Gpu> processInstances(
             @NotNull Map<String, List<InstanceV2Entity>> requestIdToInstances,
-            @NotNull Set<ReadyClusterInfo> clusterInfoMap) {
+            @NotNull Set<ReadyClusterInfo> clusterInfoMap,
+            @NotNull Map<GpuUsageResponse.Cluster, String> combinedClusterIdByCluster) {
 
         List<GpuUsageResponse.Gpu> result = new ArrayList<>();
 
@@ -239,19 +261,27 @@ public class GpuUsageService {
 
                 GpuUsageResponse.Region regionInResponse = findRegionInResponse(instanceV2Entity.getRegion(), instanceInResponse.getRegions());
 
-                String nonByocClusterId;
-                // For all non-BYOC clusters in that region has to be combined under artificial name
+                // All non-BYOC clusters in a region are reported under the artificial name
                 // <regionName>-<computePlatform>, where the suffix is the matched compute-platform
-                // provider, until we find a way to report them separately
+                // provider, until we find a way to report them separately. The combining is
+                // deferred so capacity gating still sees the real cluster id.
+                String clusterId = instanceV2Entity.getZone();
+                String combinedClusterId = null;
                 if (computePlatformService.isComputePlatformProvider(instanceV2Entity.getResourceProvider())) {
-                    nonByocClusterId = instanceV2Entity.getRegion() + "-" + instanceV2Entity.getResourceProvider();
-                } else {
-                    nonByocClusterId = instanceV2Entity.getZone();
+                    combinedClusterId =
+                            instanceV2Entity.getRegion() + "-" + instanceV2Entity.getResourceProvider();
+                    if (StringUtils.isBlank(clusterId)) {
+                        // No real cluster id to gate on, so keep the combined id this row has always carried.
+                        clusterId = combinedClusterId;
+                    }
                 }
 
-                GpuUsageResponse.Cluster clusterInResponse = findClusterInResponse(nonByocClusterId,
+                GpuUsageResponse.Cluster clusterInResponse = findClusterInResponse(clusterId,
                                                                                     readyClusterInfo != null ? readyClusterInfo.getClusterGroupName() : "UNKNOWN",
                                                                                     regionInResponse.getClusters());
+                if (combinedClusterId != null) {
+                    combinedClusterIdByCluster.put(clusterInResponse, combinedClusterId);
+                }
 
                 if (instanceV2Entity.getInstanceStateName() == SpotInstanceInternalState.RUNNING) {
                     clusterInResponse.getStatus().setActiveInstances(clusterInResponse.getStatus().getActiveInstances() + 1);
@@ -263,5 +293,74 @@ public class GpuUsageService {
         }
 
         return result;
+    }
+
+    /**
+     * Collapses every compute-platform cluster in a region under the combined
+     * {@code <regionName>-<computePlatform>} id, summing their instance counts, so the underlying
+     * zone structure stays hidden from NGC users who cannot target an individual zone.
+     *
+     * <p>Deliberately runs after {@code removeGatedFromGpuUsage}. An {@code icms.capacity-gating}
+     * cluster allow list names real cluster ids, which for compute-platform rows are zone names,
+     * so gating has to be applied before those ids are replaced by one that matches nothing in the
+     * policy. {@code getInstanceTypeAvailability} combines after gating for the same reason.
+     *
+     * @param gpus the gated usage response, mutated in place
+     * @param combinedClusterIdByCluster Identity-keyed mapping from response nodes to combined ids,
+     *                                   as collected by {@link #processInstances}
+     */
+    private void combineComputePlatformClusters(
+            @Nullable List<GpuUsageResponse.Gpu> gpus,
+            @NotNull Map<GpuUsageResponse.Cluster, String> combinedClusterIdByCluster) {
+
+        if (gpus == null || combinedClusterIdByCluster.isEmpty()) {
+            return;
+        }
+
+        for (GpuUsageResponse.Gpu gpu : gpus) {
+            if (gpu.getInstances() == null) {
+                continue;
+            }
+            for (GpuUsageResponse.Instance instance : gpu.getInstances()) {
+                if (instance.getRegions() == null) {
+                    continue;
+                }
+                for (GpuUsageResponse.Region region : instance.getRegions()) {
+                    combineComputePlatformClustersInRegion(region, combinedClusterIdByCluster);
+                }
+            }
+        }
+    }
+
+    private void combineComputePlatformClustersInRegion(
+            @NotNull GpuUsageResponse.Region region,
+            @NotNull Map<GpuUsageResponse.Cluster, String> combinedClusterIdByCluster) {
+
+        List<GpuUsageResponse.Cluster> clusters = region.getClusters();
+        if (clusters == null) {
+            return;
+        }
+
+        Map<String, GpuUsageResponse.Cluster> combinedClusters = new LinkedHashMap<>();
+        clusters.removeIf(cluster -> {
+            String combinedClusterId = combinedClusterIdByCluster.get(cluster);
+            if (combinedClusterId == null) {
+                return false;
+            }
+
+            GpuUsageResponse.Cluster alreadyCombined =
+                    combinedClusters.putIfAbsent(combinedClusterId, cluster);
+            if (alreadyCombined == null) {
+                // First compute-platform cluster for this combined id keeps the node and takes the id.
+                cluster.setClusterId(combinedClusterId);
+                return false;
+            }
+
+            GpuUsageResponse.Status target = alreadyCombined.getStatus();
+            GpuUsageResponse.Status source = cluster.getStatus();
+            target.setActiveInstances(target.getActiveInstances() + source.getActiveInstances());
+            target.setPendingInstances(target.getPendingInstances() + source.getPendingInstances());
+            return true;
+        });
     }
 }
