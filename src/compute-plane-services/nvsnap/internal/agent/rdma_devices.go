@@ -68,7 +68,7 @@ func installPlaceholderRDMA(procBase string, placeholderPID, nestedPID int) ([]s
 			continue
 		}
 		if err := dst.root.Remove(filepath.Join(rdmaDevDir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("remove the source pod's /%s/%s: %w", rdmaDevDir, e.Name(), err)
+			return nil, rdmaEntryError("remove the source pod's", e.Name(), err)
 		}
 	}
 	names := make([]string, 0, len(want))
@@ -79,10 +79,28 @@ func installPlaceholderRDMA(procBase string, placeholderPID, nestedPID int) ([]s
 	made := make([]string, 0, len(names))
 	for _, n := range names {
 		st := want[n]
-		if err := mknodIn(dst, filepath.Join(rdmaDevDir, n), st.Mode, st.Rdev); err != nil {
-			return made, fmt.Errorf("create /%s/%s: %w", rdmaDevDir, n, err)
+		rel := filepath.Join(rdmaDevDir, n)
+		// The pod's own node, already in place (a node the runtime bind-mounts,
+		// say): left as it is.
+		var cur syscall.Stat_t
+		if err := syscall.Lstat(filepath.Join(procBase, strconv.Itoa(nestedPID), "root", rel), &cur); err == nil &&
+			cur.Mode == st.Mode && cur.Rdev == st.Rdev {
+			continue
 		}
-		made = append(made, "/"+rdmaDevDir+"/"+n)
+		if err := mknodIn(dst, rel, st.Mode, st.Rdev); err != nil {
+			return made, rdmaEntryError("create the pod's", n, err)
+		}
+		made = append(made, "/"+rel)
 	}
 	return made, nil
+}
+
+// rdmaEntryError says why /dev/infiniband/name could not be changed in the
+// restored tree. A mount point (EBUSY) is refused by name: the restore does
+// not unmount what the container mounted there.
+func rdmaEntryError(what, name string, err error) error {
+	if errors.Is(err, syscall.EBUSY) {
+		return fmt.Errorf("%s /%s/%s: it is a mount point holding another device than the pod's; not replaced: %w", what, rdmaDevDir, name, err)
+	}
+	return fmt.Errorf("%s /%s/%s: %w", what, rdmaDevDir, name, err)
 }

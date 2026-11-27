@@ -6,6 +6,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -74,8 +75,9 @@ func TestInstallPlaceholderRDMAReplacesTheSourcePods(t *testing.T) {
 	mk(tree, "uverbs6", 198)
 	mk(tree, "rdma_cm", 64)
 	made, err := installPlaceholderRDMA(proc, 1, 2)
-	if err != nil || len(made) != 3 {
-		t.Fatalf("made %v, %v; want the pod's 3 nodes", made, err)
+	// rdma_cm is already the pod's (same device and mode): left in place.
+	if err != nil || len(made) != 2 {
+		t.Fatalf("made %v, %v; want the pod's 2 missing nodes", made, err)
 	}
 	ents, _ := os.ReadDir(filepath.Join(tree, rdmaDevDir))
 	var got []string
@@ -93,5 +95,81 @@ func TestInstallPlaceholderRDMAReplacesTheSourcePods(t *testing.T) {
 	// not root must be able to open its NICs.
 	if st.Mode&0o777 != 0o666 {
 		t.Errorf("uverbs7 mode %o, want 666", st.Mode&0o777)
+	}
+}
+
+// A symlink put where the node was made is not followed: the file it
+// points at keeps its mode. Root only.
+func TestChmodNodeAtDoesNotFollowALink(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	tree, outside := t.TempDir(), t.TempDir()
+	target := filepath.Join(outside, "victim")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tree, rdmaDevDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(tree, rdmaDevDir, "uverbs4")); err != nil {
+		t.Fatal(err)
+	}
+	d, err := openConfinedDir(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := chmodNodeAt(d, filepath.Join(rdmaDevDir, "uverbs4"), 231<<8|196, 0o666); err == nil {
+		t.Error("a symlink in the node's place was changed")
+	}
+	if st, _ := os.Stat(target); st.Mode().Perm() != 0o600 {
+		t.Errorf("the link's target became %o", st.Mode().Perm())
+	}
+}
+
+// A node bind-mounted into the restored /dev that is already the pod's is
+// left in place; a mount point holding another device fails with a clear
+// error, not a bare EBUSY. Root only (mount).
+func TestInstallPlaceholderRDMAMountPoints(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	proc, placeholder, tree := rdmaFixture(t)
+	mk := func(p string, minor int) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mknod(p, syscall.S_IFCHR|0o666, 231<<8|minor); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bind := func(src, dst string) {
+		if err := os.WriteFile(dst, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mount(src, dst, "", syscall.MS_BIND, ""); err != nil {
+			t.Skipf("bind mount: %v", err)
+		}
+		t.Cleanup(func() { _ = syscall.Unmount(dst, syscall.MNT_DETACH) })
+	}
+	mk(filepath.Join(placeholder, rdmaDevDir, "uverbs4"), 196)
+	src := t.TempDir()
+	mk(filepath.Join(src, "uverbs4"), 196)
+	if err := os.MkdirAll(filepath.Join(tree, rdmaDevDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bind(filepath.Join(src, "uverbs4"), filepath.Join(tree, rdmaDevDir, "uverbs4"))
+	made, err := installPlaceholderRDMA(proc, 1, 2)
+	if err != nil || len(made) != 0 {
+		t.Fatalf("the pod's own node, bind-mounted: made %v, %v; want it left in place", made, err)
+	}
+	mk(filepath.Join(src, "uverbs9"), 201)
+	bind(filepath.Join(src, "uverbs9"), filepath.Join(tree, rdmaDevDir, "uverbs9"))
+	if _, err := installPlaceholderRDMA(proc, 1, 2); err == nil || !strings.Contains(err.Error(), "mount point") {
+		t.Errorf("another device mounted in the restored /dev: %v; want a mount-point error", err)
 	}
 }

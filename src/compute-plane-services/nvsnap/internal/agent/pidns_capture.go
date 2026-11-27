@@ -1031,18 +1031,34 @@ func mknodIn(d *confinedDir, rel string, mode uint32, rdev uint64) error {
 	if err := mknodAt(d, rel, mode, rdev); err != nil {
 		return err
 	}
-	return chmodAt(d, rel, mode&0o7777)
+	return chmodNodeAt(d, rel, rdev, mode&0o7777)
 }
 
-// chmodAt sets name's permission bits under d, through its parent opened
-// under d's root.
-func chmodAt(d *confinedDir, name string, perm uint32) error {
-	parent, err := d.root.Open(path.Dir(name))
+// chmodNodeAt sets the permission bits of the character device rel under
+// d, which must be device rdev: the entry itself, never what a symlink put
+// in its place points at (a restored task may run while the tree's /dev is
+// made). It is opened without following a link (O_PATH|O_NOFOLLOW), checked
+// to be that device, and changed through its descriptor's /proc link, which
+// names that inode.
+func chmodNodeAt(d *confinedDir, rel string, rdev uint64, perm uint32) error {
+	parent, err := d.root.Open(path.Dir(rel))
 	if err != nil {
 		return err
 	}
 	defer func() { _ = parent.Close() }()
-	return unix.Fchmodat(int(parent.Fd()), path.Base(name), perm, 0)
+	fd, err := unix.Openat(int(parent.Fd()), path.Base(rel), unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFCHR || st.Rdev != rdev {
+		return fmt.Errorf("%s is no longer the device just made", rel)
+	}
+	return unix.Fchmodat(unix.AT_FDCWD, "/proc/self/fd/"+strconv.Itoa(fd), perm, 0)
 }
 
 // deletedMount returns a mountpoint whose source was deleted on the node
