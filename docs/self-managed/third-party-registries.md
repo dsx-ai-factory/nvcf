@@ -126,7 +126,7 @@ kubectl -n nvcf rollout restart deployment/nvct-api
 
 An ECR registry credential requires permanent IAM credentials (Access Key ID + Secret Access Key). Temporary SSO/STS credentials will not work.
 
-If your organization does not allow long-lived IAM user keys, do not add an ECR credential. Instead, [pull from ECR with the EKS node IAM role](./registry-validation.md#pull-from-ecr-with-the-eks-node-iam-role).
+If your organization does not allow long-lived IAM user keys, do not add an ECR credential. Instead, give the cluster its own access to ECR and turn off ECR validation in NVCF. See [Turn off validation for a supported registry](./registry-validation.md), which uses the EKS node IAM role as an example.
 
 <Info>
 **Why SSO credentials don't work:** AWS SSO and assumed role credentials include a session token that must be passed alongside the access key and secret. The NVCF registry credential format (`ACCESS_KEY_ID:SECRET_ACCESS_KEY`) does not support session tokens, so temporary credentials will fail with `UnrecognizedClientException`.

@@ -783,8 +783,9 @@ You must first create a dedicated IAM user with ECR permissions. See
 instructions.
 
 If your organization does not allow long-lived IAM user keys, leave ECR out of
-the bootstrap list. Instead,
-[pull from ECR with the EKS node IAM role](./registry-validation.md#pull-from-ecr-with-the-eks-node-iam-role).
+the bootstrap list. Instead, give the cluster its own access to ECR and turn off
+ECR validation in NVCF. See
+[Turn off validation for a supported registry](./registry-validation.md).
 
 Once you have created the IAM user and obtained the access keys:
 

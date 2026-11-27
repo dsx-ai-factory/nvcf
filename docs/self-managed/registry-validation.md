@@ -17,7 +17,7 @@ Each supported registry has two checks in the NVCF API. Both checks are on by de
 
 Turn off a check only in one of these cases:
 
-- If the cluster pulls images with its own identity, turn off `artifact-validation` and store no credential for the registry. For example, EKS nodes pull from ECR with the node IAM role, and AKS nodes with an attached ACR pull with the kubelet managed identity.
+- If the cluster has its own access to the registry, turn off `artifact-validation` and store no credential for the registry. You choose how the cluster gets that access. For example, EKS nodes can pull from ECR with the node IAM role.
 - If the GPU cluster can reach the registry but the NVCF API cannot, turn off `artifact-validation`. Keep the stored credential, because NVCF still sends it to the cluster for the image pull.
 - If the NVCF API cannot check a credential that you want to store, turn off `credential-validation`. NVCF then stores the credential without a call to the registry.
 
@@ -79,9 +79,9 @@ The `harbor` and `artifactory` entries have no default. The NVCF API requires `n
 
 For container tasks, set `artifact-validation` for the NVCT API under `nvctApi.remoteConfig.configData.nvct.registries.recognized.container.<key>`.
 
-## Pull from ECR with the EKS node IAM role
+## ECR example with the EKS node IAM role
 
-Use this example if your organization does not allow long-lived IAM user keys. NVCF stores no ECR credential, and the kubelet on each EKS GPU node pulls the image with the node IAM role.
+This example shows one way to pull from ECR without long-lived IAM user keys. The kubelet on each EKS GPU node pulls the image with the node IAM role, and NVCF stores no ECR credential. If you give the cluster access to ECR in another way, replace step 1 with your own setup. Steps 2 to 6 stay the same.
 
 1. Give the node IAM role of the GPU nodes that run function pods read access to your ECR repositories. The AWS managed policy `AmazonEC2ContainerRegistryReadOnly` grants this access. For a least-privilege policy, attach the private ECR policy from [Step 2: Create and Attach ECR Policy](./third-party-registries.md#step-2-create-and-attach-ecr-policy) to the node role.
 
