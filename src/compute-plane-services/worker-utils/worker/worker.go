@@ -19,6 +19,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -26,9 +27,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -119,6 +122,9 @@ type Config struct {
 	V3BackwardsCompatibilityDisabled bool   `mapstructure:"V3_BACKWARDS_COMPATIBILITY_DISABLED"`
 	InferenceServiceName             string `mapstructure:"INFERENCE_SERVICE_NAME"`
 	InferenceNamespace               string `mapstructure:"INFERENCE_NAMESPACE"`
+	// NATSWaitForRecovery keeps the worker waiting for NATS through an outage instead of exiting after about 2
+	// minutes: the NATS connection reconnects without a limit and consumer setup retries until it succeeds.
+	NATSWaitForRecovery bool `mapstructure:"NVCF_NATS_WAIT_FOR_RECOVERY"`
 }
 
 type NVCFWorker struct {
@@ -138,6 +144,10 @@ type NVCFWorker struct {
 	sharedProxyClient       httpstream.ProxyClient
 	shutdownCtx             context.Context
 	shutdownCancel          context.CancelFunc
+
+	// set while NATS consumer setup keeps failing, so the worker reports not ready instead of looking able to
+	// receive work
+	natsConsumerSetupFailing atomic.Bool
 
 	// in-flight requests keyed by request id; looked up on a NATS
 	// cancel broadcast to fire the matching per-request cancel.
@@ -283,7 +293,8 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 
 	shutdownCtx, shutdownCancel := context.WithCancel(ctx)
 
-	w := &NVCFWorker{
+	var w *NVCFWorker
+	w = &NVCFWorker{
 		globalCtx:               ctx,
 		shutdownCtx:             shutdownCtx,
 		shutdownCancel:          shutdownCancel,
@@ -347,7 +358,9 @@ func NewNVCFWorker(ctx context.Context, zapLogger *logs.ZapLogger, config Config
 			// only running a healthcheck server
 			servers.WithRegisterServer(func(*grpc.Server) {}),
 			servers.WithHttpHealthEndpoints("/v1/health/live"),
-			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": h.Handler()}),
+			servers.WithAdditionalHTTPHandlers(map[string]http.Handler{"/v1/health/ready": http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				w.serveReady(rw, r, h.Measure)
+			})}),
 		),
 	}
 	return w, nil
@@ -432,7 +445,8 @@ func (w *NVCFWorker) Run(withHttpServer bool) error {
 		w.config.FunctionVersionId,
 		w.config.SharedConfigDir,
 		nvcf.DefaultNvcfClientTimeout,
-		nvcf.WithNatsAccount(w.config.NVCFNatsAccount))
+		nvcf.WithNatsAccount(w.config.NVCFNatsAccount),
+		nvcf.WithNatsReconnectForever(w.config.NATSWaitForRecovery))
 	if err != nil {
 		return types.NewInternalError(err)
 	}
@@ -557,9 +571,10 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 		// stop retrying setup when the worker starts shutting down
 		setupCtx, cancelSetup := context.WithCancel(ctx)
 		stopSetupAfterFunc := context.AfterFunc(w.shutdownCtx, cancelSetup)
-		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, natsConsumerSetupTimeout, func() (*consumer.GlobalNatsConsumer, error) {
-			connectedRegion := *w.nvcfClient.ConnectedRegions.Load()
-			return consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
+		var connectedRegion *nvcf.ConnectionRegions
+		globalNatsConsumer, err := newNatsConsumerWithRetry(setupCtx, newNatsConsumerSetupBackOff(w.config.NATSWaitForRecovery), func() (*consumer.GlobalNatsConsumer, error) {
+			connectedRegion = w.nvcfClient.ConnectedRegions.Load()
+			c, err := consumer.NewNatsConsumer(setupCtx, w.nvcfClient.JetStream, func(ctx context.Context, region string) error {
 				_, err := w.nvcfClient.Client.ProvisionRegionalWorker(ctx, &pb.ProvisionWorkerRequest{
 					InstanceId:        w.config.InstanceId,
 					FunctionId:        w.config.FunctionId,
@@ -568,6 +583,10 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 				}, auth.GrpcTokenFromSource(w.nvcfClient.NvcfTokenProvider))
 				return err
 			}, w.config.FunctionVersionId, connectedRegion.Primary, connectedRegion.Secondaries, w.config.MaxRequestConcurrency)
+			if err != nil {
+				w.natsConsumerSetupFailing.Store(true)
+			}
+			return c, err
 		}, zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
 		stopSetupAfterFunc()
 		cancelSetup()
@@ -577,8 +596,6 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 			}
 			return types.NewInternalError(err)
 		}
-		w.nvcfClient.CurrentNatsConsumer.Store(globalNatsConsumer)
-
 		// close FetchWorkStream's ctx when region list changes to gracefully end the work stream and loop to fetch another
 		fetchCtx, cancelFetch := context.WithCancel(ctx)
 		stopAfterFunc := context.AfterFunc(w.shutdownCtx, cancelFetch)
@@ -589,7 +606,12 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 			cancelFetch()
 		}
 
-		w.nvcfClient.TriggerNewNatsConsumer.Store((*func())(&wrappedCancelFetch))
+		if !w.publishNatsConsumer(globalNatsConsumer, connectedRegion, &wrappedCancelFetch) {
+			zap.L().Info("connected regions changed during nats consumer setup, setting it up again",
+				zap.String("function_id", w.config.FunctionId), zap.String("nca_id", w.config.NcaId))
+			wrappedCancelFetch()
+			continue
+		}
 		inferenceHealth.CallBackFn.Store((*func())(&wrappedCancelFetch))
 
 		zap.L().Info("waiting until inference container is healthy")
@@ -644,23 +666,89 @@ func (w *NVCFWorker) workSession(ctx context.Context) error {
 	}
 }
 
-// natsConsumerSetupTimeout bounds how long the worker waits for NATS to come
-// back before giving up on consumer setup and exiting. It covers a rolling
-// restart of the NATS cluster, where a member can be unreachable for tens of
-// seconds, and roughly matches how long the NATS client keeps reconnecting.
+// Consumer setup retries quickly at first, so the worker resumes within seconds after a short outage such as a
+// rolling restart of the NATS cluster. After natsConsumerFastRetryPeriod it retries less often, so workers that
+// wait out a long outage do not keep calling NVCF every few seconds.
+const (
+	natsConsumerFastRetryPeriod  = 2 * time.Minute
+	natsConsumerFastRetryMaxWait = 4 * time.Second
+	natsConsumerSlowRetryMaxWait = 30 * time.Second
+)
+
+// natsConsumerSetupTimeout bounds how long the worker waits for NATS to come back before giving up on consumer
+// setup and exiting, unless NATSWaitForRecovery is set. It covers a rolling restart of the NATS cluster, where a
+// member can be unreachable for tens of seconds, and roughly matches how long the NATS client keeps reconnecting.
 const natsConsumerSetupTimeout = 2 * time.Minute
 
-// newNatsConsumerWithRetry retries consumer setup until it succeeds, ctx ends,
-// maxElapsed passes, or setup fails with an error that retrying cannot fix.
-// Without it, a NATS disconnect longer than the consumer lookup's own short
-// retry window exits the worker process.
-func newNatsConsumerWithRetry(ctx context.Context, maxElapsed time.Duration, create func() (*consumer.GlobalNatsConsumer, error), logFields ...zap.Field) (*consumer.GlobalNatsConsumer, error) {
-	// 4s +/- 25% jitter keeps every wait at or under 5s
-	b := backoff.NewExponentialBackOff(
-		backoff.WithMaxInterval(4*time.Second),
+// newNatsConsumerSetupBackOff returns the retry schedule for consumer setup. With waitForRecovery it never stops on
+// its own: the worker keeps waiting for NATS instead of exiting, because a restart does not bring an unreachable
+// NATS back and each restart counts toward replacing the whole instance. Otherwise it stops after
+// natsConsumerSetupTimeout. The 25% jitter keeps fast waits at or under 5s.
+func newNatsConsumerSetupBackOff(waitForRecovery bool) backoff.BackOff {
+	if !waitForRecovery {
+		return newBoundedNatsConsumerSetupBackOffWithClock(backoff.SystemClock)
+	}
+	return newNatsConsumerSetupBackOffWithClock(backoff.SystemClock)
+}
+
+func newBoundedNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *backoff.ExponentialBackOff {
+	return backoff.NewExponentialBackOff(
+		backoff.WithMaxInterval(natsConsumerFastRetryMaxWait),
 		backoff.WithRandomizationFactor(0.25),
-		backoff.WithMaxElapsedTime(maxElapsed),
+		backoff.WithMaxElapsedTime(natsConsumerSetupTimeout),
+		backoff.WithClockProvider(clock),
 	)
+}
+
+func newNatsConsumerSetupBackOffWithClock(clock backoff.Clock) *phasedBackOff {
+	newExp := func(firstWait, maxWait time.Duration) *backoff.ExponentialBackOff {
+		return backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(firstWait),
+			backoff.WithMaxInterval(maxWait),
+			backoff.WithRandomizationFactor(0.25),
+			backoff.WithMaxElapsedTime(0),
+			backoff.WithClockProvider(clock),
+		)
+	}
+	return &phasedBackOff{
+		fast: newExp(backoff.DefaultInitialInterval, natsConsumerFastRetryMaxWait),
+		// The slow phase starts where the fast phase capped, so waits do not shrink at the switch.
+		slow:    newExp(natsConsumerFastRetryMaxWait, natsConsumerSlowRetryMaxWait),
+		fastFor: natsConsumerFastRetryPeriod,
+		now:     clock.Now,
+	}
+}
+
+// phasedBackOff uses fast until fastFor has passed since the first wait, then slow.
+type phasedBackOff struct {
+	fast, slow backoff.BackOff
+	fastFor    time.Duration
+	now        func() time.Time
+	start      time.Time
+}
+
+func (b *phasedBackOff) NextBackOff() time.Duration {
+	if b.start.IsZero() {
+		b.start = b.now()
+	}
+	if b.now().Sub(b.start) < b.fastFor {
+		return b.fast.NextBackOff()
+	}
+	return b.slow.NextBackOff()
+}
+
+func (b *phasedBackOff) Reset() {
+	b.start = time.Time{}
+	b.fast.Reset()
+	b.slow.Reset()
+}
+
+// newNatsConsumerWithRetry retries consumer setup with b until it succeeds, ctx ends, b stops, or setup fails with
+// an error that retrying cannot fix. Without it, a NATS disconnect longer than the consumer lookup's own short
+// retry window exits the worker process.
+func newNatsConsumerWithRetry(ctx context.Context, b backoff.BackOff, create func() (*consumer.GlobalNatsConsumer, error), logFields ...zap.Field) (*consumer.GlobalNatsConsumer, error) {
+	start := time.Now()
+	failures := 0
 	attempt := func() (*consumer.GlobalNatsConsumer, error) {
 		c, err := create()
 		if err != nil && isPermanentSetupError(err) {
@@ -668,10 +756,73 @@ func newNatsConsumerWithRetry(ctx context.Context, maxElapsed time.Duration, cre
 		}
 		return c, err
 	}
-	return backoff.RetryNotifyWithData(attempt, backoff.WithContext(b, ctx), func(err error, next time.Duration) {
-		fields := append([]zap.Field{zap.Error(err), zap.Duration("retryIn", next)}, logFields...)
+	c, err := backoff.RetryNotifyWithData(attempt, backoff.WithContext(b, ctx), func(err error, next time.Duration) {
+		failures++
+		fields := append([]zap.Field{
+			zap.Error(err),
+			zap.Duration("retryIn", next),
+			zap.Int("failedAttempts", failures),
+			zap.Duration("failingFor", time.Since(start)),
+		}, logFields...)
 		zap.L().Warn("failed to set up nats consumer, retrying", fields...)
 	})
+	if err == nil && failures > 0 {
+		fields := append([]zap.Field{
+			zap.Int("failedAttempts", failures),
+			zap.Duration("failingFor", time.Since(start)),
+		}, logFields...)
+		zap.L().Info("set up nats consumer after retrying", fields...)
+	}
+	return c, err
+}
+
+// publishNatsConsumer stores the consumer and the trigger that ends its work stream, then reports whether the
+// regions it was built for are still the connected regions. The region reload stores the new regions before it
+// loads the consumer and trigger, so a region change is either seen here or triggers this consumer. A consumer setup
+// failure stops being reported for readiness only once a consumer is accepted.
+func (w *NVCFWorker) publishNatsConsumer(c *consumer.GlobalNatsConsumer, builtFor *nvcf.ConnectionRegions,
+	trigger *func(),
+) bool {
+	w.nvcfClient.CurrentNatsConsumer.Store(c)
+	w.nvcfClient.TriggerNewNatsConsumer.Store(trigger)
+	if !sameRegions(builtFor, w.nvcfClient.ConnectedRegions.Load()) {
+		return false
+	}
+	w.natsConsumerSetupFailing.Store(false)
+	return true
+}
+
+func sameRegions(a, b *nvcf.ConnectionRegions) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Primary == b.Primary && slices.Equal(slices.Sorted(slices.Values(a.Secondaries)), slices.Sorted(slices.Values(b.Secondaries)))
+}
+
+// serveReady serves the health checks, and also reports not ready while NATS consumer setup keeps failing, for
+// example when NATS is connected but the consumer cannot be attached, so the worker does not look able to receive
+// work. The consumer state is kept out of w.health because the inference health loop also gates fetching on it.
+func (w *NVCFWorker) serveReady(rw http.ResponseWriter, r *http.Request, measure func(context.Context) health.Check) {
+	c := measure(r.Context())
+	if w.natsConsumerSetupFailing.Load() {
+		c.Status = health.StatusUnavailable
+		if c.Failures == nil {
+			c.Failures = map[string]string{}
+		}
+		c.Failures["nats-consumer"] = "nats consumer setup is failing"
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	code := http.StatusOK
+	if c.Status == health.StatusUnavailable {
+		code = http.StatusServiceUnavailable
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(code)
+	_, _ = rw.Write(data)
 }
 
 // isPermanentSetupError reports whether worker provisioning rejected the

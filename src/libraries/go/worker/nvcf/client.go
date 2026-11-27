@@ -98,7 +98,8 @@ type Client struct {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	natsAccount string
+	natsAccount          string
+	natsReconnectForever bool
 }
 
 // WithNatsAccount names the NATS account the worker asks for when it logs in with its worker
@@ -106,6 +107,14 @@ type clientOptions struct {
 func WithNatsAccount(account string) ClientOption {
 	return func(o *clientOptions) {
 		o.natsAccount = account
+	}
+}
+
+// WithNatsReconnectForever keeps the NATS connection reconnecting without a limit, including after repeated auth
+// errors, instead of closing it for good after maxNatsReconnects attempts.
+func WithNatsReconnectForever(enabled bool) ClientOption {
+	return func(o *clientOptions) {
+		o.natsReconnectForever = enabled
 	}
 }
 
@@ -166,7 +175,7 @@ func CreateClient(nvcfFqdn string, nvcfFqdnNats *string, nvcfWorkerToken string,
 	}
 
 	if nvcfFqdnNats != nil {
-		nc, err := newNatsConnection(*nvcfFqdnNats, nkeySeed, options.natsAccount, tokenProvider, instanceId, functionVersionId)
+		nc, err := newNatsConnection(*nvcfFqdnNats, nkeySeed, options.natsAccount, tokenProvider, instanceId, functionVersionId, options.natsReconnectForever)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to nats: %w", err)
 		}
@@ -398,9 +407,23 @@ func createWorkerClient(nvcfFqdn string, timeout time.Duration) (pb.WorkerClient
 	return workerClient, nil
 }
 
-func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string) (*nats.Conn, error) {
+// maxNatsReconnects is how many reconnect attempts the NATS connection makes before it closes for good, unless
+// WithNatsReconnectForever is set.
+const maxNatsReconnects = 12
+
+// natsReconnectLimitOptions returns the reconnect limit for the NATS connection. A closed connection is never
+// re-created, so with a limit a long NATS outage leaves the worker disconnected for good. Reconnecting forever also
+// ignores repeated auth errors, since the token can be rejected while the NVCF token refresh is failing during the
+// same outage.
+func natsReconnectLimitOptions(reconnectForever bool) []nats.Option {
+	if !reconnectForever {
+		return []nats.Option{nats.MaxReconnects(maxNatsReconnects)}
+	}
+	return []nats.Option{nats.MaxReconnects(-1), nats.IgnoreAuthErrorAbort()}
+}
+
+func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string, nvcfTokenProvider *auth.SettableTokenSource, instanceId string, functionVersionId string, reconnectForever bool) (*nats.Conn, error) {
 	const maxNatsReconnectDelay = 15 * time.Second
-	const maxNatsReconnects = 12
 	// backoff is not thread-safe, so we need to lock it
 	expBackoffMutex := sync.Mutex{}
 	expBackoff := backoff.NewExponentialBackOff(
@@ -411,10 +434,12 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string
 		return nil, err
 	}
 	logger := zap.L().With(zap.String("function version id", functionVersionId), zap.String("instance id", instanceId))
-	return nats.Connect(nvcfFqdnNats, nats.PingInterval(10*time.Second),
+	opts := append([]nats.Option{
+		nats.PingInterval(10 * time.Second),
 		nats.RetryOnFailedConnect(true),
-		nats.Timeout(5*time.Second),
-		nats.MaxReconnects(maxNatsReconnects),
+		nats.Timeout(5 * time.Second),
+	}, natsReconnectLimitOptions(reconnectForever)...)
+	return nats.Connect(nvcfFqdnNats, append(opts,
 		nats.Name("worker_"+functionVersionId+"_"+instanceId),
 		nats.CustomReconnectDelay(func(attempt int) time.Duration {
 			expBackoffMutex.Lock()
@@ -487,7 +512,7 @@ func newNatsConnection(nvcfFqdnNats string, nkeySeed *string, natsAccount string
 			}
 			logger.Info("nats connection closed.")
 		}),
-	)
+	)...)
 }
 
 // natsAuthOption will use the nkey if provided, else will use the worker token to ask for
