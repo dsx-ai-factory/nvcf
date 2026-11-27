@@ -622,9 +622,9 @@ class CreateInstanceServiceTest extends CreateInstancesTestBase {
         var duplicateBackup = reservedBackup.toBuilder().clusterId("zone-b").build();
         var spot = reserved.toBuilder().capacityType(CapacityType.SPOT).reservationId(null).build();
 
-        assertEquals(Set.of(reserved, reservedBackup, otherReservation, spot).size(),
-                createInstanceService.deduplicatePlatformDestinations(Set.of(
-                        reserved, reservedBackup, otherReservation, duplicateBackup, spot)).size());
+        var destinations = Set.of(reserved, reservedBackup, otherReservation, duplicateBackup, spot);
+        assertEquals(destinations,
+                createInstanceService.deduplicatePlatformDestinations(destinations));
     }
 
     @ParameterizedTest

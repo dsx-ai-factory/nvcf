@@ -875,7 +875,7 @@ class InternalInstanceServiceTest {
 
         // Assert
         verify(instanceRequestV2Repository).findRequestById(DUMMY_REQUEST_ID);
-        verify(instanceRequestV2Repository).update(instanceRequestEntity1);
+        verifyNoMoreInteractions(instanceRequestV2Repository);
         verify(telemetryEventClient).triggerEvent(Mockito.anyList());
         verify(sqsMessageRepository).findByRequestId(DUMMY_REQUEST_ID);
         verify(sqsMessageRepository).insert(Mockito.any());
@@ -887,7 +887,7 @@ class InternalInstanceServiceTest {
         assertThat(instanceRequestEntity1.getStatusCode()).isEqualTo(
                 PENDING_FULFILLMENT.toString());
         assertThat(instanceRequestEntity1.getStatusMessage()).isEqualTo("dummy_message");
-        assertThat(instanceRequestEntity1.getCheckBatchwiseInfo()).isTrue();
+        assertThat(instanceRequestEntity1.getCheckBatchwiseInfo()).isNull();
         assertThat(instanceRequestEntity1.getStatusUpdateTime()).isNotNull();
     }
 

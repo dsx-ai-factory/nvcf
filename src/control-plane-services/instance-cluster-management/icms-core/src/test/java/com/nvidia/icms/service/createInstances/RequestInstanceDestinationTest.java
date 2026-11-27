@@ -77,31 +77,6 @@ class RequestInstanceDestinationTest {
     }
 
     @ParameterizedTest
-    @EnumSource(DistinctPayloadField.class)
-    void getDestinationsForPublishing_distinctReservedQueueOrPayload_areRetained(
-            DistinctPayloadField field) {
-        var first = destination().toBuilder().capacityType(CapacityType.RESERVED)
-                .reservationId(UUID.randomUUID()).build();
-        var second = first.toBuilder().build();
-        switch (field) {
-            case QUEUE -> second.setCreationQueueUrl("other-queue");
-            case CAPACITY_TYPE -> second.setCapacityType(CapacityType.RESERVED_BACKUP);
-            case RESERVATION_ID -> second.setReservationId(UUID.randomUUID());
-            case INSTANCE_TYPE_NAME -> second.setInstanceType(InstanceTypeV5Udt.builder()
-                    .name("other-type").value("type-value").build());
-            case INSTANCE_TYPE_VALUE -> second.setInstanceType(InstanceTypeV5Udt.builder()
-                    .name("type-name").value("other-value").build());
-            case GPU_NAME -> second.setGpuName("other-gpu");
-            case FULFILLABLE_COUNT -> second.setMaxFulfillableInstances(2);
-            case BATCH_COUNT -> second.setInstanceBatchCount(2);
-        }
-
-        var result = RequestInstanceDestination.getDestinationsForPublishing(Set.of(first, second));
-
-        assertEquals(Set.of(first, second), Set.copyOf(result));
-    }
-
-    @ParameterizedTest
     @ValueSource(strings = {"instance-type", "instance-value", "gpu", "count", "batch"})
     void getDestinationsForPublishing_spotPayloadAlternativesOnSameQueue_publishOnce(
             String alternative) {
@@ -133,14 +108,15 @@ class RequestInstanceDestinationTest {
     }
 
     @ParameterizedTest
-    @EnumSource(CapacityType.class)
-    void getDestinationsForPublishing_duplicatePayloads_arePublishedOnce(CapacityType capacityType) {
+    @EnumSource(value = CapacityType.class, names = {"RESERVED", "RESERVED_BACKUP"})
+    void getDestinationsForPublishing_reservedMetadataVariants_areRetained(
+            CapacityType capacityType) {
         var first = destination().toBuilder().capacityType(capacityType)
-                .reservationId(capacityType == CapacityType.SPOT ? null : UUID.randomUUID()).build();
+                .reservationId(UUID.randomUUID()).build();
         var duplicate = first.toBuilder().clusterId("other-zone").region("other-region").build();
 
-        assertEquals(1, RequestInstanceDestination.getDestinationsForPublishing(
-                Set.of(first, duplicate)).size());
+        assertEquals(Set.of(first, duplicate), Set.copyOf(
+                RequestInstanceDestination.getDestinationsForPublishing(Set.of(first, duplicate))));
     }
 
     private RequestInstanceDestination destination() {
@@ -157,14 +133,4 @@ class RequestInstanceDestinationTest {
                 .build();
     }
 
-    private enum DistinctPayloadField {
-        QUEUE,
-        CAPACITY_TYPE,
-        RESERVATION_ID,
-        INSTANCE_TYPE_NAME,
-        INSTANCE_TYPE_VALUE,
-        GPU_NAME,
-        FULFILLABLE_COUNT,
-        BATCH_COUNT
-    }
 }

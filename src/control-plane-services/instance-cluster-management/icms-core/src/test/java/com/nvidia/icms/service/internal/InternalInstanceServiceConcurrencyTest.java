@@ -169,21 +169,6 @@ class InternalInstanceServiceConcurrencyTest {
         verify(messageRepository).insert(any());
     }
 
-    @Test
-    void winningZoneRetry_repairsMissingBatchTrackingFlag() {
-        when(requestRepository.findRequestById(DUMMY_REQUEST_ID)).thenAnswer(invocation ->
-                Optional.of(requestEntity(PENDING_FULFILLMENT, false)));
-        var winner = terminalBatch(PENDING_FULFILLMENT);
-        claimedBatches.put("batch-1", winner);
-        when(messageRepository.findByRequestId(DUMMY_REQUEST_ID)).thenReturn(List.of(winner));
-
-        assertThat(tryClaim(firstService, "batch-1", 2, "zone-a")).isEqualTo(1);
-
-        verify(requestRepository).update(argThat(
-                entity -> Boolean.TRUE.equals(entity.getCheckBatchwiseInfo())));
-        verify(messageRepository, never()).insert(any());
-    }
-
     @ParameterizedTest
     @EnumSource(value = SpotRequestStatusCode.class,
             names = {"PENDING_FULFILLMENT", "CANNOT_FULFILL", "SCHEDULE_EXPIRED"})

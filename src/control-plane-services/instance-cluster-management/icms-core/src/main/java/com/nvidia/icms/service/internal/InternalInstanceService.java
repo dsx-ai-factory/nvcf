@@ -278,8 +278,8 @@ public class InternalInstanceService {
         SqsMessageEntity sqsMessageEntity = optionalSqsMessageEntity.get();
         validateMessageBatchOwner(sqsMessageEntity, instanceRequestEntity, updateRequest,
                 cloudProvider, clusterName);
-        sqsMessageRepository.update(sqsMessageEntity.toBuilder()
-                .status(updateRequest.getStatus()).build());
+        sqsMessageEntity.setStatus(updateRequest.getStatus());
+        sqsMessageRepository.update(sqsMessageEntity);
 
         sendTelemetryEventForCannotFulfill(instanceRequestEntity, updateRequest, genericMetric);
     }
@@ -307,8 +307,8 @@ public class InternalInstanceService {
                 SqsMessageEntity sqsMessageEntity = optionalSqsMessageEntity.get();
                 validateMessageBatchOwner(sqsMessageEntity, instanceRequestEntity, updateRequest,
                         cloudProvider, clusterName);
-                sqsMessageRepository.update(sqsMessageEntity.toBuilder()
-                        .status(updateRequest.getStatus()).build());
+                sqsMessageEntity.setStatus(updateRequest.getStatus());
+                sqsMessageRepository.update(sqsMessageEntity);
             }
         }
 
@@ -493,13 +493,6 @@ public class InternalInstanceService {
                         SpotRequestStatusCode.PENDING_EVALUATION.toString())) {
             updateRequestStateUpdateInDb(updateRequest, instanceRequestEntity,
                     clientId, auditProps, genericMetric);
-        } else if (!isBatchWiseInfoFetchingEnabled(instanceRequestEntity)) {
-            var entityBefore = AuditUtils.deepCopyInstanceRequestEntity(instanceRequestEntity);
-            instanceRequestEntity.setCheckBatchwiseInfo(true);
-            instanceRequestV2Repository.update(instanceRequestEntity);
-            populateAuditValuesForUpdateInstanceRequest(auditProps, instanceRequestEntity.getRequestId());
-            auditService.sendAuditEventForInstanceRequest(auditProps, entityBefore,
-                    AuditUtils.deepCopyInstanceRequestEntity(instanceRequestEntity));
         }
     }
 
@@ -789,11 +782,6 @@ public class InternalInstanceService {
     private boolean isMessageBatchIdProvided(@NotNull SpotInstanceRequestStatusUpdateRequest updateRequest) {
         return !StringUtils.isEmpty(updateRequest.getMessageBatchId()) &&
                 updateRequest.getInstanceCount() != null && updateRequest.getInstanceCount() != 0;
-    }
-
-    private boolean isBatchWiseInfoFetchingEnabled(@NotNull InstanceRequestV2Entity instanceRequestEntity) {
-        return instanceRequestEntity.getCheckBatchwiseInfo() != null &&
-                instanceRequestEntity.getCheckBatchwiseInfo();
     }
 
     @Nullable
