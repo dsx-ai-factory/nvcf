@@ -229,6 +229,9 @@ navigation:
     - page: Third-Party Registries
       path: ../docs/self-managed/third-party-registries.md
       slug: third-party-registries
+    - page: Registry Validation
+      path: ../docs/self-managed/registry-validation.md
+      slug: registry-validation
     - page: Registry Allowlist
       path: ../docs/self-managed/registry-allowlist.md
       slug: registry-allowlist
