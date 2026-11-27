@@ -32,19 +32,23 @@ import com.nimbusds.jwt.SignedJWT;
 import com.nvidia.nvcf.configuration.TrustedJwtIssuerProperties.TrustedIssuer;
 import com.nvidia.nvcf.service.apikeys.ApiKeyValidationResult;
 import com.nvidia.nvcf.service.apikeys.ApiKeysService;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.authentication.AuthenticationManagerResolver;
-import org.springframework.security.authentication.AuthenticationServiceException;
 import org.springframework.security.core.Authentication;
+import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
 import org.springframework.security.oauth2.server.resource.InvalidBearerTokenException;
 import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
 
-// Closed JWKS ports: AuthenticationServiceException = routed, InvalidBearerTokenException = not.
+// Closed JWKS ports must produce temporarily_unavailable after issuer routing.
 class JwtAuthManagerConfigurationTest {
 
     private static final String PRIMARY_ISS = "http://api.nvcf.svc.cluster.local";
@@ -77,7 +81,9 @@ class JwtAuthManagerConfigurationTest {
         var resolver = resolver(properties());
 
         assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
-                .isInstanceOf(AuthenticationServiceException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
     }
 
     @Test
@@ -85,9 +91,32 @@ class JwtAuthManagerConfigurationTest {
         var resolver = resolver(properties(trustedIssuer(EXTERNAL_ISS, EXTERNAL_JWKS)));
 
         assertThatThrownBy(() -> authenticate(resolver, EXTERNAL_ISS))
-                .isInstanceOf(AuthenticationServiceException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
         assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
-                .isInstanceOf(AuthenticationServiceException.class);
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
+    }
+
+    @Test
+    void duplicatePrimaryIssuerNeverCreatesTheIgnoredDecoder() {
+        var resolver = resolver(properties(trustedIssuer(PRIMARY_ISS, "not a valid URI")));
+        assertThatThrownBy(() -> authenticate(resolver, PRIMARY_ISS))
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
+    }
+
+    @Test
+    void duplicateTrustedIssuerKeepsTheFirstDecoder() {
+        var resolver = resolver(properties(trustedIssuer(EXTERNAL_ISS, EXTERNAL_JWKS),
+                trustedIssuer(EXTERNAL_ISS, "not a valid URI")));
+        assertThatThrownBy(() -> authenticate(resolver, EXTERNAL_ISS))
+                .isInstanceOfSatisfying(OAuth2AuthenticationException.class,
+                        ex -> assertThat(ex.getError().getErrorCode())
+                                .isEqualTo("temporarily_unavailable"));
     }
 
     @Test
@@ -173,4 +202,19 @@ class JwtAuthManagerConfigurationTest {
         entry.setJwkSetUri(jwkSetUri);
         return entry;
     }
+    @Test
+    void productionDecoderUsesTheApplicationMetricRegistryBeforeItsFirstFetch() {
+        var metrics = new SimpleMeterRegistry();
+        try (var context = new AnnotationConfigApplicationContext()) {
+            context.registerBean(OpenTelemetry.class, OpenTelemetry::noop);
+            context.registerBean(MeterRegistry.class, () -> metrics);
+            context.registerBean(JwtAuthManagerConfiguration.class, () ->
+                    new JwtAuthManagerConfiguration(PRIMARY_ISS, PRIMARY_JWKS, "ES256"));
+            context.refresh();
+            assertThat(metrics.find("nvcf_jwks_fetch_requests").counters()).hasSize(3);
+            assertThat(metrics.find("nvcf_jwks_fetch_requests").counters().stream()
+                    .mapToDouble(counter -> counter.count()).sum()).isZero();
+        }
+    }
+
 }

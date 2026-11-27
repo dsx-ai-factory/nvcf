@@ -19,13 +19,19 @@ package com.nvidia.nvcf.configuration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.nimbusds.jose.jwk.source.JWKSetRetrievalException;
 import com.nvidia.boot.exceptions.ServiceUnavailableException;
+import com.nvidia.boot.jwt.jwks.JwksJwtDecoder;
 import com.nvidia.nvcf.configuration.exceptions.ExceptionTracingExceptionHandler;
 import io.grpc.Status;
+import java.io.IOException;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.cassandra.CassandraReadTimeoutException;
 import org.springframework.grpc.server.advice.GrpcExceptionHandler;
+import org.springframework.security.authentication.AuthenticationServiceException;
+import org.springframework.security.oauth2.jwt.JwtException;
+import org.springframework.security.oauth2.server.resource.InvalidBearerTokenException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.context.request.WebRequest;
 
@@ -65,4 +71,22 @@ class GrpcConfigurationTest {
 
         assertThat(grpcTypes).isNotEmpty().containsExactlyInAnyOrder(mvcTypes);
     }
+    @Test
+    void keyRetrievalFailureIsUnavailableRatherThanUnauthenticated() {
+        var source = new JWKSetRetrievalException("key fetch failed", new IOException("refused"));
+        var failure = new AuthenticationServiceException("key fetch failed",
+                new JwtException("key fetch failed", source));
+        assertThat(grpcConfiguration.handleException(failure).getCode())
+                .isEqualTo(Status.Code.UNAVAILABLE);
+        assertThat(grpcConfiguration.handleException(failure).getDescription())
+                .isEqualTo(JwksJwtDecoder.UNAVAILABLE);
+    }
+
+    @Test
+    void invalidTokenIsStillUnauthenticated() {
+        assertThat(grpcConfiguration.handleException(
+                new InvalidBearerTokenException("bad signature")).getCode())
+                .isEqualTo(Status.Code.UNAUTHENTICATED);
+    }
+
 }

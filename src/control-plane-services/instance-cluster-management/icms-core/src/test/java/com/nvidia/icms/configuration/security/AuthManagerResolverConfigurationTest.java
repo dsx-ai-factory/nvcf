@@ -23,15 +23,21 @@ import com.nvidia.icms.outbound.cassandra.byoc.ClusterRepository;
 import com.nvidia.icms.outbound.cassandra.byoc.entity.ClusterEntity;
 import com.nvidia.icms.configuration.nvca.NvcaConfigurationProperties;
 import com.nvidia.icms.outbound.apikeys.ApiKeysService;
+import com.nvidia.icms.outbound.apikeys.model.ApiKeyValidationResult;
+import com.sun.net.httpserver.HttpServer;
 import jakarta.servlet.http.HttpServletRequest;
+import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -50,9 +56,12 @@ import java.security.interfaces.RSAPublicKey;
 import java.util.Date;
 import org.springframework.security.oauth2.core.OAuth2TokenValidator;
 import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
+import org.springframework.security.oauth2.core.OAuth2AuthenticationException;
 import org.springframework.security.oauth2.jwt.BadJwtException;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.server.resource.BearerTokenError;
+import org.springframework.security.oauth2.server.resource.authentication.BearerTokenAuthenticationToken;
 
 @ExtendWith(MockitoExtension.class)
 class AuthManagerResolverConfigurationTest {
@@ -600,6 +609,45 @@ class AuthManagerResolverConfigurationTest {
 
     // --- Multi-issuer support (admin-issuer-uri) tests ---
 
+    @ParameterizedTest
+    @ValueSource(strings = {"primary", "admin", "trusted"})
+    void authenticationManagerResolver_staticIssuerJwksOutage_isTemporarilyUnavailable(
+            String issuerName) throws Exception {
+        var attempts = new AtomicInteger();
+        var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/jwks", exchange -> {
+            attempts.incrementAndGet();
+            exchange.sendResponseHeaders(503, -1);
+            exchange.close();
+        });
+        server.start();
+        try {
+            String jwks = "http://127.0.0.1:" + server.getAddress().getPort() + "/jwks";
+            var config = new AuthManagerResolverConfiguration(
+                    apiKeysService, clusterRepository, new NvcaConfigurationProperties(), "RS256",
+                    "https://primary.example.com", jwks,
+                    "https://admin.example.com", jwks,
+                    trustedIssuers("https://trusted.example.com", jwks), true);
+            String issuer = "https://" + issuerName + ".example.com";
+            var key = generateRsaJwk("static-issuer");
+            String token = signJwt(key, key.getKeyID(), issuer, "alice");
+            var request = mock(HttpServletRequest.class);
+            when(request.getHeader("Authorization")).thenReturn("Bearer " + token);
+            var manager = config.authenticationManagerResolver().resolve(request);
+
+            var failure = assertThrows(OAuth2AuthenticationException.class,
+                    () -> manager.authenticate(new BearerTokenAuthenticationToken(token)));
+
+            assertEquals("temporarily_unavailable", failure.getError().getErrorCode());
+            var error = assertInstanceOf(BearerTokenError.class, failure.getError());
+            assertEquals(503, error.getHttpStatus().value());
+            assertEquals(3, attempts.get());
+            verifyNoInteractions(apiKeysService, clusterRepository);
+        } finally {
+            server.stop(0);
+        }
+    }
+
     /** Build a Bearer header string whose unverified payload carries the given issuer. */
     private static String bearerWithIssuer(String issuer, String sub) {
         return bearerWithIssuerAndAudience(issuer, sub, "x");
@@ -903,6 +951,18 @@ class AuthManagerResolverConfigurationTest {
         AuthenticationManager mgr = authResolver.resolve(req);
         assertNotNull(mgr,
                 "apiKeyAuthEnabled=true must route Bearer nvapi-* to a ApiKey specific AuthenticationManager");
+        when(apiKeysService.fetchValidationResult("nvapi-fakekey"))
+                .thenReturn(new ApiKeyValidationResult(true, "nca-id", "owner-id",
+                        new ApiKeyValidationResult.Policy(List.of(), List.of("nvca-cluster"),
+                                "nvcf")));
+
+        var authentication = mgr.authenticate(new BearerTokenAuthenticationToken("nvapi-fakekey"));
+
+        assertEquals("owner-id", authentication.getName());
+        assertEquals(List.of("apikey:nvca-cluster"), authentication.getAuthorities().stream()
+                .map(org.springframework.security.core.GrantedAuthority::getAuthority).toList());
+        verify(apiKeysService).fetchValidationResult("nvapi-fakekey");
+        verifyNoInteractions(clusterRepository);
     }
 
     @Test

@@ -16,7 +16,14 @@
  */
 package com.nvidia.nvcf.configuration;
 
+import com.nvidia.boot.jwt.jwks.JwksAuthenticationManager;
+import com.nvidia.boot.jwt.jwks.JwksJwtDecoder;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
 import java.util.Collections;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -26,7 +33,6 @@ import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtValidators;
-import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationProvider;
 import org.springframework.util.CollectionUtils;
@@ -37,6 +43,15 @@ public class JwtAuthManagerConfiguration {
     private final String issuerUri;
     private final String jwkSetUri;
     private final SignatureAlgorithm jwsAlgorithm;
+    private OpenTelemetry jwksTelemetry = OpenTelemetry.noop();
+    private MeterRegistry jwksMetrics = new SimpleMeterRegistry();
+
+    @Autowired
+    void configureJwksObservability(ObjectProvider<OpenTelemetry> telemetry,
+            ObjectProvider<MeterRegistry> metrics) {
+        jwksTelemetry = telemetry.getIfAvailable(OpenTelemetry::noop);
+        jwksMetrics = metrics.getIfAvailable(SimpleMeterRegistry::new);
+    }
 
     public JwtAuthManagerConfiguration(
             @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}") String issuerUri,
@@ -57,14 +72,11 @@ public class JwtAuthManagerConfiguration {
     AuthenticationManager jwtAuthenticationManager(String issuer, String jwkSet) {
         var provider = new JwtAuthenticationProvider(jwtDecoder(issuer, jwkSet));
         provider.setJwtAuthenticationConverter(jwtAuthenticationConverter());
-        return provider::authenticate;
+        return new JwksAuthenticationManager(provider::authenticate);
     }
 
     private JwtDecoder jwtDecoder(String issuer, String jwkSet) {
-        var decoder = NimbusJwtDecoder
-                .withJwkSetUri(jwkSet)
-                .jwsAlgorithm(jwsAlgorithm)
-                .build();
+        var decoder = JwksJwtDecoder.create(jwkSet, jwsAlgorithm, jwksTelemetry, jwksMetrics);
         decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(issuer));
         return decoder;
     }

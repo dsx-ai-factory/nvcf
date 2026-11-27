@@ -16,6 +16,8 @@
  */
 package com.nvidia.icms.configuration.security;
 
+import com.nvidia.boot.exceptions.ServiceUnavailableException;
+import com.nvidia.boot.jwt.jwks.JwksJwtDecoder;
 import com.nvidia.icms.errors.IcmsAuthenticationException;
 import com.nvidia.icms.outbound.exception.ApiKeysException;
 import jakarta.servlet.ServletException;
@@ -59,6 +61,12 @@ public class AuthEntryPoint implements AuthenticationEntryPoint {
                   request.getMethod(),
                   request.getRequestURI(),
                   authException);
+
+        if (JwksJwtDecoder.isUnavailable(authException)) {
+            exceptionResolver.resolveException(request, response, null,
+                    new ServiceUnavailableException(JwksJwtDecoder.UNAVAILABLE, authException));
+            return;
+        }
 
         String errorDetails = authException.getMessage();
 

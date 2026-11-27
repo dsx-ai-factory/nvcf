@@ -21,6 +21,7 @@ import com.amazonaws.services.sqs.model.AmazonSQSException;
 import com.amazonaws.services.sqs.model.QueueDeletedRecentlyException;
 import com.datastax.oss.driver.api.core.DriverException;
 import com.datastax.oss.driver.api.core.DriverTimeoutException;
+import com.nvidia.boot.exceptions.ServiceUnavailableException;
 import com.nvidia.icms.inbound.rest.exception.OptimisticLockException;
 import com.nvidia.icms.outbound.exception.SnsPublishException;
 import com.nvidia.icms.outbound.exception.SqsMessageSenderClientException;
@@ -356,6 +357,15 @@ public class GlobalErrorHandler {
         sendTelemetryEvent(exception, Events.ERROR_EVENT.toString());
         error.setError(exception.getMessage());
         return new ResponseEntity<>(error, HttpStatus.FORBIDDEN);
+    }
+
+    @ExceptionHandler(ServiceUnavailableException.class)
+    public ResponseEntity<Object> handleServiceUnavailableException(
+            ServiceUnavailableException exception) {
+        sendTelemetryEvent(exception, Events.ERROR_EVENT.toString());
+        CustomErrorResponse error = new CustomErrorResponse();
+        error.setError(exception.getBody().getDetail());
+        return new ResponseEntity<>(error, exception.getHeaders(), exception.getStatusCode());
     }
 
     // Generic error handler for all exceptions
