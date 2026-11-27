@@ -26,7 +26,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -1018,11 +1020,29 @@ func installPlaceholderGPUs(procBase string, placeholderPID, nestedPID int) ([]s
 
 // mknodIn creates character device rel under d, replacing what is there
 // (mknodAt, through its parent opened under d's root).
+//
+// The node gets mode's permission bits exactly: mknod applies the agent's
+// umask, which would leave a 0666 device (the pod's NICs, its GPUs) writable
+// by root only, and a workload running as another user could not open it.
 func mknodIn(d *confinedDir, rel string, mode uint32, rdev uint64) error {
 	if err := d.root.Remove(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return mknodAt(d, rel, mode, rdev)
+	if err := mknodAt(d, rel, mode, rdev); err != nil {
+		return err
+	}
+	return chmodAt(d, rel, mode&0o7777)
+}
+
+// chmodAt sets name's permission bits under d, through its parent opened
+// under d's root.
+func chmodAt(d *confinedDir, name string, perm uint32) error {
+	parent, err := d.root.Open(path.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	return unix.Fchmodat(int(parent.Fd()), path.Base(name), perm, 0)
 }
 
 // deletedMount returns a mountpoint whose source was deleted on the node

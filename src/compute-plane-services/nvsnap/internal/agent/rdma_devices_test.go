@@ -53,12 +53,17 @@ func TestInstallPlaceholderRDMAReplacesTheSourcePods(t *testing.T) {
 		t.Skip("needs root to create device nodes")
 	}
 	proc, placeholder, tree := rdmaFixture(t)
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
 	mk := func(root, name string, minor int) {
 		p := filepath.Join(root, rdmaDevDir, name)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if err := syscall.Mknod(p, syscall.S_IFCHR|0o666, 231<<8|minor); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o666); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -83,5 +88,10 @@ func TestInstallPlaceholderRDMAReplacesTheSourcePods(t *testing.T) {
 	var st syscall.Stat_t
 	if err := syscall.Stat(filepath.Join(tree, rdmaDevDir, "uverbs7"), &st); err != nil || st.Rdev != 231<<8|199 {
 		t.Errorf("uverbs7 rdev %x, %v; want the pod's", st.Rdev, err)
+	}
+	// The pod's permissions, whatever the agent's umask: a workload that is
+	// not root must be able to open its NICs.
+	if st.Mode&0o777 != 0o666 {
+		t.Errorf("uverbs7 mode %o, want 666", st.Mode&0o777)
 	}
 }
