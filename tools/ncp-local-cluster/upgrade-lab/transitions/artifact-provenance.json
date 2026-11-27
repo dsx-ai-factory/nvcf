@@ -1,0 +1,249 @@
+{
+  "schema_version": 2,
+  "evidence_type": "release-inventory-comparison",
+  "version_scope": "umbrella-release",
+  "qualification": "unqualified",
+  "supported_execution_enabled": false,
+  "artifact_lock_sha256": "sha256:cc80f91a1a1b758665576a12e38f38a2545df0fc4f9d09d8475a67f0677e0914",
+  "scope": "Verified original manifest, asset index, bundle and inventory identities for the two lab contracts. No live upgrade or WorkloadGate qualification.",
+  "reports": [
+    {
+      "route": "umbrella-1.0.1-to-1.0.4",
+      "summary": {
+        "route": "umbrella-1.0.1-to-1.0.4",
+        "qualification": "unqualified",
+        "changed": 55,
+        "added": 9,
+        "removed": 0,
+        "backward": 0,
+        "unordered": 0
+      },
+      "contract_sha256": "sha256:6f928142cc4ed67928b66da06f7f843454a7eb6492377c415e807807138843b7",
+      "component_report_sha256": "sha256:b51d204bc4ce460ae4dfe70990373f7ae4b41a5e95e23573ed40095b19922997",
+      "selections": [
+        {
+          "version": "1.0.1",
+          "kind": "legacy-baseline",
+          "stacks": {
+            "compute-plane": {
+              "version": "1.0.0",
+              "source_tag": "deploy/stacks/nvcf-compute-plane/v1.0.0",
+              "source_commit": "63ac4456d3422508f2ff4b219c7dff8fba1c21c0",
+              "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
+              "inventory_sha256": "sha256:4417012d41bd09dd2b4076c28b1bb38b27199e1f8473b050d16d6a4011fba2a6",
+              "inventory_asset_id": 571339411
+            },
+            "control-plane": {
+              "version": "1.0.1",
+              "source_tag": "deploy/stacks/self-managed/v1.0.1",
+              "source_commit": "67c010f24304b5c06d0493fa1b976a69b6ee8dea",
+              "inventory_asset": "nvcf-self-managed-stack-inventory.json",
+              "inventory_sha256": "sha256:126c831f631da5e7fccce9f26131cefba2c06b485e4a1985d707b9ba6166d614",
+              "inventory_asset_id": 580531331
+            },
+            "observability": {
+              "version": "1.0.0",
+              "source_tag": "deploy/stacks/observability/v1.0.0",
+              "source_commit": "b77e96a3f8c18e9318b93e697e33e596c4ede7d7",
+              "inventory_asset": "nvcf-observability-stack-inventory.json",
+              "inventory_sha256": "sha256:28ff55447c9223be0472ce9157fa9f4eb6dc7c5092a7c4281e29826e9f3df6de",
+              "inventory_asset_id": 571334027
+            }
+          },
+          "peer_matrix_edition": "1.0.1"
+        },
+        {
+          "version": "1.0.4",
+          "kind": "umbrella-release",
+          "stacks": {
+            "compute-plane": {
+              "version": "1.0.5",
+              "source_tag": "deploy/stacks/nvcf-compute-plane/v1.0.5",
+              "source_commit": "e6d55edf173c622f3e925cb4650051e3abc9ddfb",
+              "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
+              "inventory_sha256": "sha256:cd6a9081fc4777073a437fdfbd343e0cd365502a4478143896e73d5d79a74e33",
+              "inventory_asset_id": 712252677
+            },
+            "control-plane": {
+              "version": "1.0.10",
+              "source_tag": "deploy/stacks/self-managed/v1.0.10",
+              "source_commit": "e4b11e6db4ec8ff2af228579493685eca391447f",
+              "inventory_asset": "nvcf-self-managed-stack-inventory.json",
+              "inventory_sha256": "sha256:aedbabdde512c3956bf716033a2d0d8ea08c2fbb1c7992e8e018f9ce2c2a81db",
+              "inventory_asset_id": 712646490
+            },
+            "observability": {
+              "version": "1.0.0",
+              "source_tag": "deploy/stacks/observability/v1.0.0",
+              "source_commit": "b77e96a3f8c18e9318b93e697e33e596c4ede7d7",
+              "inventory_asset": "nvcf-observability-stack-inventory.json",
+              "inventory_sha256": "sha256:28ff55447c9223be0472ce9157fa9f4eb6dc7c5092a7c4281e29826e9f3df6de",
+              "inventory_asset_id": 571334027
+            }
+          },
+          "peer_matrix_edition": "1.0.4",
+          "manifest": {
+            "path": "manifests/1.0.4.json",
+            "source_commit": "d46842d66fac896b7f7b9e8190a8f767f4db48cf",
+            "sha256": "sha256:20656169ea9d017d9168df668ae3632e5dde3699c3e1737d4142ec73bcaf1421"
+          },
+          "release": {
+            "source_tag": "nvcf/1.0.4",
+            "source_commit": "d46842d66fac896b7f7b9e8190a8f767f4db48cf",
+            "manifest": {
+              "name": "manifest.json",
+              "sha256": "sha256:20656169ea9d017d9168df668ae3632e5dde3699c3e1737d4142ec73bcaf1421",
+              "asset_id": 719112845
+            },
+            "asset_index": {
+              "name": "release-assets.json",
+              "sha256": "sha256:ec157404fd0a8550532a9f5afb4ca05619902a5a1aa61c0d1cfbad6126c75c5d",
+              "asset_id": 719113023
+            },
+            "bundle": {
+              "name": "nvcf-1.0.4.tar.gz",
+              "sha256": "sha256:980a1c53818efce5afc01b7354819578c9449ee2350a1c9762a05878840239f1",
+              "asset_id": 719112881
+            }
+          }
+        }
+      ]
+    },
+    {
+      "route": "umbrella-1.0.4-to-1.1.1",
+      "summary": {
+        "route": "umbrella-1.0.4-to-1.1.1",
+        "qualification": "unqualified",
+        "changed": 58,
+        "added": 6,
+        "removed": 3,
+        "backward": 0,
+        "unordered": 3
+      },
+      "contract_sha256": "sha256:63772835a40420415875b4c89607be9dcdf2fd7b4725f01ffc37113c0986f65b",
+      "component_report_sha256": "sha256:4ceb0831588270b2d7da4c81adaafa45f9a87338e2f86969ce3a0b4dbb28f249",
+      "selections": [
+        {
+          "version": "1.0.4",
+          "kind": "umbrella-release",
+          "stacks": {
+            "compute-plane": {
+              "version": "1.0.5",
+              "source_tag": "deploy/stacks/nvcf-compute-plane/v1.0.5",
+              "source_commit": "e6d55edf173c622f3e925cb4650051e3abc9ddfb",
+              "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
+              "inventory_sha256": "sha256:cd6a9081fc4777073a437fdfbd343e0cd365502a4478143896e73d5d79a74e33",
+              "inventory_asset_id": 712252677
+            },
+            "control-plane": {
+              "version": "1.0.10",
+              "source_tag": "deploy/stacks/self-managed/v1.0.10",
+              "source_commit": "e4b11e6db4ec8ff2af228579493685eca391447f",
+              "inventory_asset": "nvcf-self-managed-stack-inventory.json",
+              "inventory_sha256": "sha256:aedbabdde512c3956bf716033a2d0d8ea08c2fbb1c7992e8e018f9ce2c2a81db",
+              "inventory_asset_id": 712646490
+            },
+            "observability": {
+              "version": "1.0.0",
+              "source_tag": "deploy/stacks/observability/v1.0.0",
+              "source_commit": "b77e96a3f8c18e9318b93e697e33e596c4ede7d7",
+              "inventory_asset": "nvcf-observability-stack-inventory.json",
+              "inventory_sha256": "sha256:28ff55447c9223be0472ce9157fa9f4eb6dc7c5092a7c4281e29826e9f3df6de",
+              "inventory_asset_id": 571334027
+            }
+          },
+          "peer_matrix_edition": "1.0.4",
+          "manifest": {
+            "path": "manifests/1.0.4.json",
+            "source_commit": "d46842d66fac896b7f7b9e8190a8f767f4db48cf",
+            "sha256": "sha256:20656169ea9d017d9168df668ae3632e5dde3699c3e1737d4142ec73bcaf1421"
+          },
+          "release": {
+            "source_tag": "nvcf/1.0.4",
+            "source_commit": "d46842d66fac896b7f7b9e8190a8f767f4db48cf",
+            "manifest": {
+              "name": "manifest.json",
+              "sha256": "sha256:20656169ea9d017d9168df668ae3632e5dde3699c3e1737d4142ec73bcaf1421",
+              "asset_id": 719112845
+            },
+            "asset_index": {
+              "name": "release-assets.json",
+              "sha256": "sha256:ec157404fd0a8550532a9f5afb4ca05619902a5a1aa61c0d1cfbad6126c75c5d",
+              "asset_id": 719113023
+            },
+            "bundle": {
+              "name": "nvcf-1.0.4.tar.gz",
+              "sha256": "sha256:980a1c53818efce5afc01b7354819578c9449ee2350a1c9762a05878840239f1",
+              "asset_id": 719112881
+            }
+          }
+        },
+        {
+          "version": "1.1.1",
+          "kind": "umbrella-release",
+          "stacks": {
+            "compute-plane": {
+              "version": "1.1.1",
+              "source_tag": "deploy/stacks/nvcf-compute-plane/v1.1.1",
+              "source_commit": "daf87d512a7980e3124a4d69d5e449458a5bb5e9",
+              "inventory_asset": "nvcf-compute-plane-stack-inventory.json",
+              "inventory_sha256": "sha256:c522c360cba885ae1136905d47b30033dd14b9800df84058f0a5b0f0ea9ffbdb",
+              "inventory_asset_id": 753917372
+            },
+            "control-plane": {
+              "version": "1.1.9",
+              "source_tag": "deploy/stacks/self-managed/v1.1.9",
+              "source_commit": "859ad9e45d45f0503ea3759d7b2d07f5a5eb75df",
+              "inventory_asset": "nvcf-self-managed-stack-inventory.json",
+              "inventory_sha256": "sha256:db0872dce895352cbd2df6049ff25e9b5a21927b6f69c2fba59bf14a43be2446",
+              "inventory_asset_id": 755169744
+            },
+            "observability": {
+              "version": "1.1.0",
+              "source_tag": "deploy/stacks/observability/v1.1.0",
+              "source_commit": "d1918a811df7e7bc6be7d6cc625844b6f5e30b42",
+              "inventory_asset": "nvcf-observability-stack-inventory.json",
+              "inventory_sha256": "sha256:3833771ad85f14af832fcd60b9de95a48dd05af2f5e666c5a5d6324a5af91c82",
+              "inventory_asset_id": 710762568
+            }
+          },
+          "peer_matrix_edition": "1.1.1",
+          "manifest": {
+            "path": "manifests/1.1.1.json",
+            "source_commit": "2034fdcabd36f9119d4be9ff1ecd4ca9dd3e06b6",
+            "sha256": "sha256:e05095b005c18c091655a5f37fb796cd20ca420d48f0f7875c1f8f4f318fe9ec"
+          },
+          "release": {
+            "source_tag": "nvcf/1.1.1",
+            "source_commit": "2034fdcabd36f9119d4be9ff1ecd4ca9dd3e06b6",
+            "manifest": {
+              "name": "manifest.json",
+              "sha256": "sha256:e05095b005c18c091655a5f37fb796cd20ca420d48f0f7875c1f8f4f318fe9ec",
+              "asset_id": 788345898
+            },
+            "asset_index": {
+              "name": "release-assets.json",
+              "sha256": "sha256:2f843f53d9bc9e344153667adfed1984b8a55a008241bd9f540039698aad8438",
+              "asset_id": 788346212
+            },
+            "bundle": {
+              "name": "nvcf-1.1.1.tar.gz",
+              "sha256": "sha256:8f122ad03f329d62cd06eb7f3aebac3c019e4e44b0a5105b0c7b0cf20a3e2f15",
+              "asset_id": 788345966
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "published_guidance": {
+    "release_notes": "https://github.com/dsx-ai-factory/nvcf/blob/2034fdcabd36f9119d4be9ff1ecd4ca9dd3e06b6/deploy/releases/1.1.1/notes.md",
+    "upgrade_guide": "https://github.com/dsx-ai-factory/nvcf/blob/517ebf322e217adfb274a34ea5c5ed03ff74b34e/docs/overview/release-notes/1.0.4-to-1.1.1-upgrade.md",
+    "scope": "Release notes report single-cluster and multi-cluster AWS validation of the published guides. This is separate from the lab contracts and WorkloadGate acceptance.",
+    "known_limits": [
+      "The guide did not live-test control 1.1.9 with compute 1.0.5 during the upgrade window.",
+      "Single-member OpenBao is not covered by the guide.",
+      "Cross-cluster AWS compute metrics remain experimental."
+    ]
+  }
+}

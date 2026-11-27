@@ -1,0 +1,411 @@
+{
+  "schema_version": 2,
+  "id": "umbrella-1.0.1-to-1.0.4",
+  "from": "1.0.1",
+  "to": "1.0.4",
+  "qualification": "unqualified",
+  "supported_execution_enabled": false,
+  "topology": {
+    "cassandra_members": 3,
+    "openbao_members": 3,
+    "nats_members": 3,
+    "compute_clusters": 2,
+    "preserve": [
+      "replicas",
+      "Cassandra RF/DC",
+      "NATS stream replication",
+      "storage",
+      "placement",
+      "registration",
+      "workload identities"
+    ]
+  },
+  "profile": {
+    "functions": true,
+    "tasks": true,
+    "secrets": true,
+    "llm": false,
+    "lls": false,
+    "ui": false,
+    "vanity_gateway": false,
+    "event_ledger": false
+  },
+  "disabled_releases": [
+    "control-plane/llm-api-gateway",
+    "control-plane/llm-request-router",
+    "control-plane/nvcf-pki",
+    "control-plane/nvcf-ui",
+    "control-plane/vanity-gateway",
+    "control-plane/worker-callback-proxy"
+  ],
+  "availability": {
+    "expectation": "Measure existing invocation success and outage intervals per action. No zero-downtime guarantee or universal maintenance-window requirement.",
+    "external_callers": "explicit manual pause/resume checkpoint",
+    "drain": "Never purge, cancel or delete workloads to force completion."
+  },
+  "temporary_combinations": {
+    "status": "candidates-requiring-live-evidence",
+    "combinations": [
+      {
+        "control-plane": "1.0.1",
+        "compute-plane": [
+          "1.0.0"
+        ],
+        "observability": "1.0.0"
+      },
+      {
+        "control-plane": "1.0.1",
+        "compute-plane": [
+          "1.0.0",
+          "1.0.5"
+        ],
+        "observability": "1.0.0"
+      },
+      {
+        "control-plane": "1.0.1",
+        "compute-plane": [
+          "1.0.5"
+        ],
+        "observability": "1.0.0"
+      },
+      {
+        "control-plane": "1.0.10",
+        "compute-plane": [
+          "1.0.5"
+        ],
+        "observability": "1.0.0"
+      }
+    ],
+    "mixed_compute_fleet": "Keep one source compute cluster and one target cluster at the mixed state. Verify original and new workloads, JWTs, credentials and registrations on both before advancing."
+  },
+  "unsupported": [
+    "HA conversion",
+    "single-member deployments",
+    "multi-DC Cassandra",
+    "Argo CD execution",
+    "automatic multi-hop execution",
+    "physical GPU and cross-host failure qualification",
+    "recovery of nonempty NATS memory streams or undrained invocation, session and task state"
+  ],
+  "interruption_checkpoints": [
+    "compute",
+    "dependencies",
+    "openbao",
+    "core"
+  ],
+  "actions": [
+    {
+      "id": "inventory",
+      "owner": "release-owner",
+      "phase": "before-hop",
+      "needs": [],
+      "preconditions": [
+        "Umbrella source/target selections and all three stack identities are locked.",
+        "Required chart/image access and selected package/image inspection pass.",
+        "All route-specific execution blockers have explicit reviewed resolution."
+      ],
+      "postconditions": [
+        "Release inventories match exact tags, source commits and digests.",
+        "Private three-way render diff preserves topology, identities and credentials.",
+        "Each endpoint matches its umbrella manifest or the frozen legacy baseline matrix.",
+        "Workload-created helpers and inline hook images have separate effective references, immutable digests and provenance checks, including entries absent from original inventories."
+      ],
+      "evidence": [
+        "artifact-lock digest",
+        "contract digest",
+        "verified stack inventories",
+        "private effective configuration and render diff",
+        "reviewed blocker resolutions"
+      ],
+      "timeout_seconds": 900,
+      "recovery": "No application mutation. Fix access or configuration, then use a new run identity."
+    },
+    {
+      "id": "baseline",
+      "owner": "operator",
+      "phase": "before-hop",
+      "needs": [
+        "inventory"
+      ],
+      "preconditions": [
+        "Inventory action passed; source HA topology, both existing compute clusters at 1.0.0 and observability 1.0.0 are healthy."
+      ],
+      "postconditions": [
+        "Existing HTTP, gRPC, secret-reading functions and a task pass; original identities and credentials are saved."
+      ],
+      "evidence": [
+        "source runtime image digests",
+        "replicas and placement",
+        "Cassandra RF/DC and migration ledger",
+        "NATS streams and consumers",
+        "OpenBao cluster ID, mounts, JWKS and canary",
+        "registration and workload identity snapshot"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Do not start the hop. Retain the failed baseline and its private diagnostics."
+    },
+    {
+      "id": "drain",
+      "owner": "operator",
+      "phase": "before-hop",
+      "needs": [
+        "baseline"
+      ],
+      "preconditions": [
+        "External callers are paused through an explicit operator checkpoint; every affected function/version and task is inventoried."
+      ],
+      "postconditions": [
+        "No pending/in-flight invocations or running tasks remain before disruptive operations; timeouts retain workloads.",
+        "Affected source data writers remain paused through the final data gate and consistent backup; retain every original workload and terminal task record."
+      ],
+      "evidence": [
+        "pause acknowledgement",
+        "queue and task observations",
+        "availability probe timestamps"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Resume callers only after checking source health. Never purge queues or cancel tasks to satisfy drain."
+    },
+    {
+      "id": "source-data-prerequisites",
+      "owner": "sis-owner",
+      "phase": "before-hop",
+      "needs": [
+        "drain"
+      ],
+      "preconditions": [
+        "The source baseline, retained workload identities and installation history are recorded.",
+        "Source service image versions and actual migration-task availability are verified independently of Helm chart versions.",
+        "SIS 0.7.2 does not contain InstanceLookupBackfillTask. Compare every retained sis_api.instances row with its referenced request for deployment_id and gpu_specification_id before the hop."
+      ],
+      "postconditions": [
+        "Source lookup comparisons report no conflicting fields, missing live requests or failed reads. Null legacy fields that need repair block this exact route until a reviewed migration procedure exists.",
+        "Verify backfill availability in the actual target SIS 0.7.7 image. Any target repair requires an explicit during-hop boundary and does not replace source prerequisites.",
+        "Every retained instance that requires target lookup has matching non-null IDs in the instance and authoritative request. Two null values do not satisfy a required lookup; record independent null counts and any reviewed terminal exclusions."
+      ],
+      "evidence": [
+        "source service tag and runtime image digest",
+        "installation-history and retained instance/request cohort",
+        "private lookup comparison or final VALIDATE summary with all counters",
+        "task mode, pod UID, scan timestamps and affected-writer pause record",
+        "independent required-lookup null counts and authoritative request comparison"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Stop before backup or the hop on incomplete, stale, null or conflicting lookup evidence. Preserve source row and workload identities. This source has no lookup backfill task; the migration owner must define any required repair. A successful schema Job does not replace this data check."
+    },
+    {
+      "id": "backup",
+      "owner": "operator",
+      "phase": "before-hop",
+      "needs": [
+        "source-data-prerequisites"
+      ],
+      "preconditions": [
+        "The source is healthy; writers can be quiesced for a consistent snapshot without deleting or canceling workloads.",
+        "The declared drained-memory-cold-restore profile applies: all native stream messages/bytes and consumer pending/acknowledgement/redelivery counts are zero in two stable observations after the caller/writer pause.",
+        "A complete frozen stream and durable-consumer inventory matches both observations. Unknown streams, changed configurations, nonterminal tasks or nonempty state block this profile."
+      ],
+      "postconditions": [
+        "Cassandra data/schema, NATS streams/configuration, OpenBao Raft and Kubernetes configuration restore successfully in isolated storage.",
+        "The isolated full-stack restore preserves stream and consumer names/configurations, original storage/replication, workload IDs, registrations and credentials. Native memory sequence/cursor resets are recorded explicitly; original/new application behavior passes with no lost pending work because the captured cohort was drained."
+      ],
+      "evidence": [
+        "backup checksums",
+        "restore report",
+        "durable-data and identity comparisons",
+        "per-stream storage, replicas, configuration, messages and consumer-state inventory",
+        "drained-memory checkpoint and isolated full-stack recovery proof"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Keep the source unchanged. Resolve backup or restore failures before proceeding."
+    },
+    {
+      "id": "compute",
+      "owner": "compute-owner",
+      "needs": [
+        "backup"
+      ],
+      "phase": "during-hop",
+      "preconditions": [
+        "Recorded source and target compute inventories, exact artifacts and effective values are verified.",
+        "Pause/drain, consistent restore and applicable control-plane/JWT prerequisites passed.",
+        "The candidate temporary combinations are reviewed for this exact control plane; admission and hostname policies required by the selected packages are satisfied."
+      ],
+      "postconditions": [
+        "Each existing compute cluster advances from 1.0.0 to 1.0.5 without re-registration, identity loss or topology changes.",
+        "After the first cluster update, original and new function/task invocations and secret injection pass on both source and target compute clusters.",
+        "Final invocations and deployments pass on both target compute clusters before advancing."
+      ],
+      "evidence": [
+        "per-cluster source/target runtime digests and revisions",
+        "original registration IDs and files",
+        "mixed-fleet original/new HTTP and gRPC invocation results",
+        "task and secret-injection results on both cluster versions"
+      ],
+      "timeout_seconds": 1800,
+      "recovery": "Stop on the first failure and retain partial fleet state. Revalidate current postconditions before resuming. Do not re-register clusters or blindly replay uncertain operations; use the tested recovery boundary."
+    },
+    {
+      "id": "dependencies",
+      "owner": "operator",
+      "phase": "during-hop",
+      "needs": [
+        "compute"
+      ],
+      "preconditions": [
+        "Pause/drain and tested restore gates passed.",
+        "Exact migration images and their schemas are reviewed.",
+        "OpenBao/JWT and NATS transition ordering is verified against selected packages before mutation."
+      ],
+      "postconditions": [
+        "Cassandra source records, clean ledgers and RF/DC are preserved.",
+        "NATS streams, consumers, identities and replication remain valid.",
+        "No core consumer rollout starts before the applicable data postconditions pass."
+      ],
+      "evidence": [
+        "Job UID and exact image digest",
+        "live migration ledgers/schema/data checks",
+        "NATS stream/consumer checks",
+        "HA quorum and original topology snapshot"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Stop consumers and retain evidence on unknown migration outcome. Restore the consistent backup after a data boundary; Helm rollback alone is insufficient."
+    },
+    {
+      "id": "openbao",
+      "owner": "openbao-owner",
+      "phase": "during-hop",
+      "needs": [
+        "dependencies"
+      ],
+      "preconditions": [
+        "Selected chart hook order and migration-helper interactions are reviewed.",
+        "Source catalog SHA, plugin bytes, mounts, credentials and Raft recovery material are recorded."
+      ],
+      "postconditions": [
+        "Existing mounts and old/new JWT canaries pass without catalog SHA rewriting.",
+        "Target migration data postconditions pass and all HA members preserve the original cluster identity."
+      ],
+      "evidence": [
+        "selected hook/render diff",
+        "runtime image digests/revisions",
+        "catalog and mount snapshot",
+        "Raft quorum/failover results",
+        "JWT and secret-injection canaries"
+      ],
+      "timeout_seconds": 1800,
+      "recovery": "Stop rotation on failed quorum or canary. Do not initialize a new cluster. Use the tested Raft restore procedure when required."
+    },
+    {
+      "id": "core",
+      "owner": "operator",
+      "phase": "during-hop",
+      "needs": [
+        "openbao"
+      ],
+      "preconditions": [
+        "Migration postconditions and OpenBao canaries pass before new consumers start.",
+        "Source lookup prerequisites passed before backup; target schema Job completion does not replace service-level data checks."
+      ],
+      "postconditions": [
+        "Core and remaining enabled control-plane stages become ready without changing HA topology or identities.",
+        "Original and new workloads work against compute 1.0.5 before the next action.",
+        "Target SIS 0.7.7 passes matching lookup validation with zero missing live requests, mismatches and failures. Verify actual task availability before using VALIDATE. Any target repair requires its own recovery boundary."
+      ],
+      "evidence": [
+        "rollout and runtime images",
+        "readiness checks",
+        "existing and new HTTP/gRPC/secret/task results",
+        "receipt comparison",
+        "target SIS backfill task mode and final VALIDATE counters"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Stop further rollouts. Determine whether data remains backward compatible before restoring binaries; otherwise restore the consistent backup."
+    },
+    {
+      "id": "acceptance",
+      "owner": "operator",
+      "phase": "acceptance",
+      "needs": [
+        "core"
+      ],
+      "preconditions": [
+        "All preceding actions have current matching evidence."
+      ],
+      "postconditions": [
+        "Original and new function/task invocations work on both target compute clusters.",
+        "Credentials, registrations, workload IDs and durable data are preserved.",
+        "Final control/compute/observability versions match the locked endpoint.",
+        "Mixed-fleet checkpoints, availability and hands-on effort are recorded; callers resume only after acceptance."
+      ],
+      "evidence": [
+        "original/new HTTP and gRPC canary results",
+        "secret injection and task results",
+        "identity/data comparison",
+        "availability and effort record",
+        "manual caller-resume checkpoint"
+      ],
+      "timeout_seconds": 3600,
+      "recovery": "Do not resume production callers or claim qualification on a failed acceptance. Follow the tested recovery boundary."
+    }
+  ],
+  "configuration_checks": [
+    "Three-way merge source defaults, source site values and target defaults; retain secrets without putting them in reports.",
+    "Keep the source service replica counts, Cassandra RF/DC, NATS stream replicas, storage and placement. Do not select target HA defaults that silently resize existing services.",
+    "Retain upstream or mirrored cert-manager repository overrides; these images do not inherit global.image.",
+    "Do not reuse source chart/image pins as site overrides; verify every effective pin against the selected inventory.",
+    "Use exact selected chart packages rather than current source defaults. Record differences between packaged defaults, inventory references and stack source.",
+    "Resolve umbrella endpoints through their pinned released manifests. Verify each selected stack tag, source commit and inventory digest. Version 1.0.1 uses its frozen legacy matrix without a synthetic manifest.",
+    "Select source and target peer versions from their separate recorded matrices. Preserve registration files, credentials and topology while changing the selected compute/observability releases."
+  ],
+  "migration_checks": [
+    "Compare actual Cassandra migration images, SQL trees and upgrade tasks for these umbrella selections. Preserve clean ledgers, source data and RF/DC mappings.",
+    "Check source installation history and service backfill availability before target rollout. Missing source tasks require an explicit bridge or blocker, not inferred completion.",
+    "Compare selected OpenBao hooks, migration helpers and JWT plugin lifecycle. Preserve Raft identity, catalog entries, mounts and old/new JWT behavior.",
+    "Review NATS persistence, stream and consumer configuration, and reloader behavior for the exact source/target artifacts. A higher umbrella version does not prove forward component selection.",
+    "Review cert-manager CRDs, webhook behavior, certificates and retained fixes against actual source/target selections.",
+    "Recheck historical init SQL and explicit upgrade migrations independently. Do not replay old init files or infer data backfills from Job completion."
+  ],
+  "version_scope": "umbrella-release",
+  "comparison_scope": {
+    "control_plane": "1.0.1 to 1.0.10",
+    "compute_plane": "1.0.0 to 1.0.5",
+    "observability": "1.0.0 to 1.0.0",
+    "peer_selection": "Use released umbrella manifests. Use the frozen legacy matrix only for baseline 1.0.1.",
+    "mixed_compute_fleet": "Candidate states requiring independent live acceptance; no supported execution is enabled."
+  },
+  "execution_blockers": [
+    "The umbrella scope changes the control-plane endpoint to stack 1.0.10. Recheck action ordering, effective configuration, migration/runtime behavior and recovery for these exact inputs. Prior stack 1.0.4 rehearsals do not satisfy this gate.",
+    "Before supported execution, bind enabled-profile artifact coverage and migration/runtime acceptance to the exact artifacts, configuration, topology and current run.",
+    "Require matching HA preservation, mixed-fleet, consistent restore and end-to-end workload evidence for the intended profile. Scoped laboratory acceptance does not qualify broader configurations or failure recovery.",
+    "Require native NATS stream/consumer configuration, storage-permission and replication checks across the repository change. Equal server binaries do not establish whole-image identity.",
+    "Before backup or any hop action, require source-data-prerequisites with zero missing live requests, mismatches or failures; preserve the validated data epoch through the backup.",
+    "Require original-reference identity for legacy NVCT helpers omitted from the source inventory before supported execution. Diagnostic repository access does not establish original byte equivalence.",
+    "For drained-memory-cold-restore, require matching paused-source observations and consistent isolated full-cohort restore acceptance. Nonempty or in-flight memory recovery remains unsupported; an earlier restore does not establish recovery from a later migration failure."
+  ],
+  "matrix_references": {
+    "source_edition": "1.0.1",
+    "target_reference_edition": "1.0.4",
+    "interpretation": "All three endpoint stacks match the released umbrella manifest, except legacy baseline 1.0.1. Final versions do not qualify temporary or mixed-fleet states."
+  },
+  "runtime_artifact_checks": [
+    "Resolve function/task launch helpers and inline receipt-hook images from effective configuration and live Pod specifications. An absent inventory entry does not establish runtime absence.",
+    "Stack 1.0.1 NVCT remote configuration selects nvcf_worker_init:2.107.0, nvcf_worker_task:2.107.0 and ess-agent:1.1.0, omitted from its NVCT inventory entries. Original-reference access and actual payload identity require separate checks."
+  ],
+  "recovery_mode": "drained-memory-cold-restore",
+  "recovery_profile": {
+    "scope": "Caller-paused, fully drained function/task cohort with every selected memory stream empty and no consumer pending, acknowledgement or redelivery state.",
+    "native_counter_reset": "Cold restore resets memory stream sequences and consumer delivery/ack counters. This is accepted only for the verified drained cohort; durable names, full configurations, storage, replicas, application identities and persistent data must survive.",
+    "required_evidence": [
+      "two stable complete native observations after the caller/writer pause, bound to the frozen stream/consumer inventory",
+      "no native task in a nonterminal state and no outstanding invocation or session lookup state",
+      "isolated full-stack restore using new storage, original Kubernetes trust material, registrations and credentials",
+      "original and new HTTP, gRPC, secret-injection and task acceptance after restore"
+    ],
+    "unsupported": [
+      "nonempty memory-stream recovery",
+      "in-flight invocation, asynchronous result, session or task recovery",
+      "purging, cancellation, manual consumer reset or message replay to obtain a passing drain"
+    ]
+  }
+}
