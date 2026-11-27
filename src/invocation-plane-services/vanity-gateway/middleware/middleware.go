@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -81,7 +82,8 @@ func TracedRoundTripper(rt http.RoundTripper) http.RoundTripper {
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
-	traced := otelhttp.NewTransport(clientMetricsRoundTripper{rt}, spanNameFormatter, otelhttp.WithMetricAttributesFn(shadowMetricAttributes))
+	metrics := clientMetricsRoundTripper{RoundTripper: rt, complete: newResponseCompleteHistogram(otel.GetMeterProvider())}
+	traced := otelhttp.NewTransport(metrics, spanNameFormatter, otelhttp.WithMetricAttributesFn(shadowMetricAttributes))
 	return dispatchRoundTripper{traced}
 }
 
