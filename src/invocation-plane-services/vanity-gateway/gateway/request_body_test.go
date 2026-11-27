@@ -314,9 +314,6 @@ func TestLLMGatewayRejectsLenientJSONBodiesWithBadRequest(t *testing.T) {
 
 	for name, body := range lenientJSONBodies(publicModel) {
 		t.Run(name, func(t *testing.T) {
-			_, err := extractOpenAIJSONBody(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body)))
-			require.NoError(t, err, "the model extractor must accept this body for the test to cover the rewrite path")
-
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, openAIRequest(t, "/v1/chat/completions", body))
 			require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())

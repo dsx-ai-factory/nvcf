@@ -1279,6 +1279,7 @@ func TestOpenAIRoutesRejectInvalidJSONAsClientError(t *testing.T) {
 	}
 	bodies := []struct{ name, body string }{
 		{"malformed", `{not json`},
+		{"malformed array value", `{"model":[1,]}`},
 		{"truncated", `{"model":`},
 		{"type mismatch before malformed tail", `{"model":1,`},
 		{"array", `[{"model":"m"}]`},
@@ -1322,6 +1323,7 @@ func TestOpenAIRoutesReportInvalidFieldTypes(t *testing.T) {
 		name, body, param, expectedType string
 	}{
 		{"model must be a string", `{"model":1}`, "model", "string"},
+		{"model array is a valid JSON value but not a string", `{"model":[]}`, "model", "string"},
 		{"stream must be a boolean", `{"model":"llm","stream":"true"}`, "stream", "boolean"},
 	}
 	mux := openAIMux(t, llmMappings(llmModelEntry()), "http://nvcf.invalid", "http://llm.invalid")

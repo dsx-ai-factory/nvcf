@@ -1184,6 +1184,10 @@ func (e *openAIFieldTypeError) Unwrap() error {
 // forwarding a request. RawMessage lets it distinguish explicit null values
 // and avoids relying on decoder-specific errors for scalar type mismatches.
 func decodeOpenAIRequestFields(body []byte) (openAIRequestBody, error) {
+	if !stdjson.Valid(body) {
+		return openAIRequestBody{}, errInvalidJSONBody
+	}
+
 	var fields struct {
 		Model  json.RawMessage `json:"model"`
 		Stream json.RawMessage `json:"stream"`
