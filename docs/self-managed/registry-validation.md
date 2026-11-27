@@ -18,7 +18,7 @@ Each supported registry has two checks in the NVCF API. Both checks are on by de
 Turn off a check only in one of these cases:
 
 - If the cluster has its own access to the registry, turn off `artifact-validation` and store no credential for the registry. You choose how the cluster gets that access. For example, EKS nodes can pull from ECR with the node IAM role.
-- If the GPU cluster can reach the registry but the NVCF API cannot, turn off `artifact-validation`. Keep the stored credential, because NVCF still sends it to the cluster for the image pull.
+- If the GPU cluster can reach the registry but the NVCF API cannot, turn off `artifact-validation`. Keep the stored credential, because NVCF still sends it to the cluster for the image pull. To add or update the credential, also turn off `credential-validation`.
 - If the NVCF API cannot check a credential that you want to store, turn off `credential-validation`. NVCF then stores the credential without a call to the registry.
 
 Read these effects before you change a setting:
@@ -116,10 +116,12 @@ This example shows one way to pull from ECR without long-lived IAM user keys. Th
 
    The command returns a function ID and a version ID.
 
-6. Deploy the function:
+6. Deploy the function. Set the GPU and instance type for your cluster. The command uses the function ID and version ID from step 5:
 
    ```bash
-   ./nvcf-cli function deploy create
+   ./nvcf-cli function deploy create \
+     --gpu "<gpu>" \
+     --instance-type "<instance-type>"
    ```
 
    The deployment becomes `ACTIVE` when the GPU node has pulled the image and the function is healthy.
