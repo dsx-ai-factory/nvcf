@@ -158,3 +158,20 @@ func TestSharedNamespaceOnGroupRestorePlaceholder(t *testing.T) {
 		t.Fatalf("placeholder DYN_NAMESPACE %q, want the shared nvcf-nvsnap-dsv41-flash", v)
 	}
 }
+
+// Instances of one graph get different worker suffixes (the operator's hash):
+// for a worker that registers through Kubernetes the suffix is left out of
+// the process configuration, so another instance's capture restores; an etcd
+// worker keeps it (a new suffix captures again, as before).
+func TestProcessConfigWorkerSuffix(t *testing.T) {
+	a := deepseekPod("prefill-0", "2", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "e53409be"})
+	b := deepseekPod("prefill-0", "2", corev1.EnvVar{Name: "DYN_NAMESPACE_WORKER_SUFFIX", Value: "58ac05f4"})
+	if ProcessConfig(a) != ProcessConfig(b) {
+		t.Errorf("Kubernetes-discovery workers differing only in the suffix: %v", ProcessConfigChanges(ProcessConfig(a), ProcessConfig(b)))
+	}
+	ea, eb := a.DeepCopy(), b.DeepCopy()
+	ea.Spec.Containers[0].Env[0].Value, eb.Spec.Containers[0].Env[0].Value = "etcd", "etcd"
+	if ProcessConfig(ea) == ProcessConfig(eb) {
+		t.Error("etcd workers differing in the suffix: same process configuration, want different")
+	}
+}
