@@ -804,7 +804,8 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 	reconfigured := func(data map[string]string) bool {
 		return len(processConfigChanged(data, members0, len(ranks), companionContainers)) > 0
 	}
-	if len(ranks) == 1 && len(companions) == 0 && kubeDiscoveryRank(ranks[0]) {
+	pooled := len(ranks) == 1 && len(companions) == 0 && kubeDiscoveryRank(ranks[0])
+	if pooled {
 		// Into the identity pool's next slot (identity_pool.go).
 		slot, ok := c.poolSlotForCapture(ctx, key, func(d map[string]string) bool {
 			return replaceableRecord(d, time.Now()) && reconfigured(d)
@@ -917,6 +918,13 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		return true
 	}
 	if record == nil {
+		if pooled {
+			// Another replica took this slot at the same moment (replicas
+			// that start together pick the same free slot): this one tries
+			// again on its next event, which picks the next slot.
+			log.Info("CRIU group capture: another replica took this identity-pool slot; trying the next")
+			return true
+		}
 		return false // another agent captures it
 	}
 	// The members' process configurations, now: a capture that then fails
