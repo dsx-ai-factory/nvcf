@@ -135,3 +135,26 @@ func TestNamesOwnInstanceKubeDiscovery(t *testing.T) {
 		t.Errorf("etcd component: %q, want DYN_PARENT_DGD_K8S_NAMESPACE (no exemption)", got)
 	}
 }
+
+// A pod admitted as a group restore's placeholder gets the shared Dynamo
+// namespace too: a placeholder under the original name would read as naming
+// its instance, and would keep the instance's later pods from sharing it.
+func TestSharedNamespaceOnGroupRestorePlaceholder(t *testing.T) {
+	g := CRIUGroup{Checkpoints: []string{"p0__1"}, Nodes: []string{"n0"}, GPUShare: true}
+	m, _ := groupMutator(t, g, "")
+	m.DynamoNamespace = "nvcf-nvsnap"
+	m.Kube = fake.NewSimpleClientset()
+	pod := deepseekPod("prefill-0", "1")
+	pod.Spec.Containers[0].Image, pod.Spec.Containers[0].Command = "vllm", []string{"python3", "-m", "dynamo.vllm"}
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := applyPatches(t, pod, patches)
+	if got.Annotations[CRIURestoreAnnotation] != "p0__1" {
+		t.Fatalf("not admitted as the restore placeholder: %v", got.Annotations)
+	}
+	if v := mainEnv(got, "DYN_NAMESPACE"); v != "nvcf-nvsnap-dsv41-flash" {
+		t.Fatalf("placeholder DYN_NAMESPACE %q, want the shared nvcf-nvsnap-dsv41-flash", v)
+	}
+}

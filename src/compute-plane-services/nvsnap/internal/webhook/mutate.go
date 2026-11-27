@@ -684,7 +684,10 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		// A rank of an instance whose group capture exists becomes its
 		// restore placeholder; that carries the model volume too.
 		if gp := m.criuGroupRestorePatches(ctx, pod); gp != nil {
-			return gp, nil
+			// A placeholder keeps its instance's shared Dynamo namespace in
+			// its spec: nvsnap's own checks read it, and a pod under the
+			// original name would keep later pods from sharing it.
+			return mergePatchPlan(append(gp, m.sharedNamespacePatches(ctx, pod)...)), nil
 		}
 		if vp, err := m.modelVolumePatches(ctx, pod); err != nil {
 			m.logger().WithError(err).WithField("pod", election.PodIdentity(pod)).
