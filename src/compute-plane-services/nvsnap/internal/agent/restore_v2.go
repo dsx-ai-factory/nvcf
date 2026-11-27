@@ -453,6 +453,16 @@ func (a *Agent) restoreV2(ctx context.Context, metadata *CheckpointMetadata, che
 				return fmt.Errorf("gpushare resume: give the restored tree the pod's GPUs: %w", err)
 			}
 			log.WithField("gpuEntries", made).Info("criu-v2: the restored tree has the pod's GPUs")
+			rdma, err := installPlaceholderRDMA(procBase, hostPID, p)
+			if err != nil {
+				gsSpan.RecordError(err)
+				gsSpan.SetStatus(codes.Error, "give the restored tree the pod's RDMA devices")
+				gsSpan.End()
+				return fmt.Errorf("gpushare resume: give the restored tree the pod's RDMA devices: %w", err)
+			}
+			if len(rdma) > 0 {
+				log.WithField("rdmaEntries", rdma).Info("criu-v2: the restored tree has the pod's RDMA devices")
+			}
 		}
 		if sess != nil {
 			// The restored processes write their handle lists into the

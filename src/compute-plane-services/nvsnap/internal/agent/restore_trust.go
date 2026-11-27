@@ -241,8 +241,8 @@ func (c *criuAutoRestorer) groupKeyRefusal(ctx context.Context, pod *corev1.Pod,
 	}
 	for _, drv := range drivers {
 		own := criuGroupKeyDriver(uri, scope, drv)
-		if own == key {
-			return "", nil
+		if _, ok := poolSlotOf(own, key); ok {
+			return "", nil // its configuration's record, or a slot of its identity pool
 		}
 		alias, err := cms.Get(ctx, criuGroupConfigMapName(own), metav1.GetOptions{})
 		if err != nil {

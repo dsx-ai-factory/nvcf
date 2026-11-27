@@ -489,7 +489,9 @@ type Mutator struct {
 	// CRIUGroups returns the complete group capture recorded under a
 	// configuration key (criu_group.go). Nil: multi-pod instances are not
 	// restored with CRIU.
-	CRIUGroups func(ctx context.Context, namespace, cacheURI string) (CRIUGroup, bool)
+	// processConfig is the pod's (ProcessConfig): a configuration with an
+	// identity pool restores only from a slot of the same one.
+	CRIUGroups func(ctx context.Context, namespace, cacheURI, processConfig string) (CRIUGroup, bool)
 	// CRIUFallback returns why a configuration CRIU cannot serve falls
 	// back to the caches, and the cachedir capture of the pod's rank
 	// (criu_fallback.go). Nil: none does.

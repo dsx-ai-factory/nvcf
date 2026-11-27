@@ -26,7 +26,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -994,7 +996,7 @@ func installPlaceholderGPUs(procBase string, placeholderPID, nestedPID int) ([]s
 		}
 		switch st.Mode & syscall.S_IFMT {
 		case syscall.S_IFCHR:
-			if err := mknodIn(dst, rel, st.Mode, st.Rdev); err != nil {
+			if err := mknodIn(dst, rel, st); err != nil {
 				return made, fmt.Errorf("create %s: %w", mp, err)
 			}
 		case syscall.S_IFDIR:
@@ -1016,13 +1018,54 @@ func installPlaceholderGPUs(procBase string, placeholderPID, nestedPID int) ([]s
 	return made, nil
 }
 
-// mknodIn creates character device rel under d, replacing what is there
-// (mknodAt, through its parent opened under d's root).
-func mknodIn(d *confinedDir, rel string, mode uint32, rdev uint64) error {
+// mknodIn creates character device rel under d as the placeholder's st
+// describes it (device number, permission bits, owner and group), replacing
+// what is there (mknodAt, through its parent opened under d's root).
+//
+// mknod applies the agent's umask and makes the node the agent's: a 0666
+// device, or a 0660 one of a group such as rdma, would then be openable by
+// root only, and a workload running as another user could not open its
+// NICs or GPUs. The node gets st's bits and ownership exactly.
+func mknodIn(d *confinedDir, rel string, st syscall.Stat_t) error {
 	if err := d.root.Remove(rel); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return mknodAt(d, rel, mode, rdev)
+	if err := mknodAt(d, rel, st.Mode, st.Rdev); err != nil {
+		return err
+	}
+	return setNodeAttrsAt(d, rel, st.Rdev, st.Mode&0o7777, int(st.Uid), int(st.Gid))
+}
+
+// setNodeAttrsAt sets the permission bits, owner and group of the character
+// device rel under d, which must be device rdev: the entry itself, never what
+// a symlink put in its place points at (a restored task may run while the
+// tree's /dev is made). It is opened without following a link
+// (O_PATH|O_NOFOLLOW), checked to be that device, and changed through its
+// descriptor's /proc link, which names that inode.
+func setNodeAttrsAt(d *confinedDir, rel string, rdev uint64, perm uint32, uid, gid int) error {
+	parent, err := d.root.Open(path.Dir(rel))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	fd, err := unix.Openat(int(parent.Fd()), path.Base(rel), unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFCHR || st.Rdev != rdev {
+		return fmt.Errorf("%s is no longer the device just made", rel)
+	}
+	link := "/proc/self/fd/" + strconv.Itoa(fd)
+	// Owner first: a chown clears the set-id bits a chmod would set.
+	if err := unix.Fchownat(unix.AT_FDCWD, link, uid, gid, 0); err != nil {
+		return err
+	}
+	return unix.Fchmodat(unix.AT_FDCWD, link, perm, 0)
 }
 
 // deletedMount returns a mountpoint whose source was deleted on the node
