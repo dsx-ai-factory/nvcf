@@ -80,6 +80,9 @@ cd path/to/nvcf-self-managed-stack
 HELMFILE_ENV=<env-name> helmfile sync
 ```
 
+With Helmfile 1.3.0 or later, run `HELMFILE_ENV=<env-name> helmfile --sequential-helmfiles sync`
+instead.
+
 ### Make sure every old pod is replaced
 
 During the rollout, a request can reach an old API Keys pod that does not
@@ -105,14 +108,18 @@ over from the old version can be missing from key lists.
 
 After the new pods start, API Keys migrates your existing keys. By default
 this begins 30 minutes after startup, and it records when it is complete.
-Check for the completion record:
+Define a helper that runs one CQL statement. It passes the Cassandra password
+over stdin, so it stays out of the cluster audit log. Then check for the
+completion record:
 
 ```sh
-CASS_PW=$(helm get values cassandra -n cassandra-system -a -o json \
-  | jq -r .cassandra.dbUser.password)
-kubectl -n cassandra-system exec cassandra-0 -c cassandra -- \
-  /opt/cassandra/bin/cqlsh -u cassandra -p "$CASS_PW" localhost -e \
-  "SELECT record_key FROM api_keys_api.row_update_lock WHERE table_name = 'keys_by_account_index_copy' AND record_key = 'completed';"
+cql() {
+  helm get values cassandra -n cassandra-system -a -o json \
+    | jq -r .cassandra.dbUser.password \
+    | kubectl -n cassandra-system exec -i cassandra-0 -c cassandra -- \
+      sh -c '/opt/cassandra/bin/cqlsh -u cassandra -p "$(cat)" localhost -e "$0"' "$1"
+}
+cql "SELECT record_key FROM api_keys_api.row_update_lock WHERE table_name = 'keys_by_account_index_copy' AND record_key = 'completed';"
 ```
 
 The upgrade is complete when the output ends with `(1 rows)`. If it shows
@@ -121,9 +128,7 @@ The upgrade is complete when the output ends with `(1 rows)`. If it shows
 Then confirm the account ID that was assigned:
 
 ```sh
-kubectl -n cassandra-system exec cassandra-0 -c cassandra -- \
-  /opt/cassandra/bin/cqlsh -u cassandra -p "$CASS_PW" localhost -e \
-  "SELECT DISTINCT nca_id, owner_type, owner_id FROM api_keys_api.keys_by_owner_and_account_and_service;"
+cql "SELECT DISTINCT nca_id, owner_type, owner_id FROM api_keys_api.keys_by_owner_and_account_and_service;"
 ```
 
 Every row must show the account ID you expect.
@@ -143,9 +148,7 @@ upgrade and have the migration verify its work again, delete the completion
 record:
 
 ```sh
-kubectl -n cassandra-system exec cassandra-0 -c cassandra -- \
-  /opt/cassandra/bin/cqlsh -u cassandra -p "$CASS_PW" localhost -e \
-  "DELETE FROM api_keys_api.row_update_lock WHERE table_name = 'keys_by_account_index_copy' AND record_key = 'completed';"
+cql "DELETE FROM api_keys_api.row_update_lock WHERE table_name = 'keys_by_account_index_copy' AND record_key = 'completed';"
 ```
 
 Key lists and lookups go back to the data from before the upgrade until the
