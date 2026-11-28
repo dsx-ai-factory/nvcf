@@ -121,8 +121,8 @@ func (m *Mutator) decideSharedNamespace(ctx context.Context, pod *corev1.Pod) ma
 		if p.Name == pod.Name || p.DeletionTimestamp != nil || p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
-		for _, c := range p.Spec.Containers {
-			if originals[literalEnv(&c, dynNamespaceEnv)] {
+		for j := range p.Spec.Containers {
+			if originals[literalEnv(&p.Spec.Containers[j], dynNamespaceEnv)] {
 				m.logger().WithField("pod", pod.Namespace+"/"+pod.Name).WithField("running", p.Name).
 					Info("dynamo: a pod of the instance runs under the original Dynamo namespace; kept, so the instance is not split")
 				return nil

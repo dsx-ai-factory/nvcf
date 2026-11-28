@@ -23,7 +23,7 @@ const deepseekNS = "sr-3d68984c-077b-46d0-9a33-6512f427a612"
 // deepseekPod is a component of a DeepSeek-style graph: Kubernetes
 // discovery, a Dynamo namespace named after the Kubernetes namespace, and
 // the variables the operator and Grove set.
-func deepseekPod(name string, gpus string, extra ...corev1.EnvVar) *corev1.Pod {
+func deepseekPod(name, gpus string, extra ...corev1.EnvVar) *corev1.Pod {
 	env := append([]corev1.EnvVar{
 		{Name: "DYN_DISCOVERY_BACKEND", Value: "kubernetes"},
 		{Name: "DYN_NAMESPACE", Value: deepseekNS + "-dsv41-flash"},
