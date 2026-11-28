@@ -41,6 +41,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
@@ -131,7 +132,7 @@ var verRe = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$`)
 
 type semver struct {
 	major, minor, patch int
-	pre                 string // empty = release; non-empty sorts before release
+	pre                 string // empty = release; see compareSemver for ordering
 	version             string // "X.Y.Z" or "X.Y.Z-pre"
 	tag                 string
 }
@@ -157,26 +158,110 @@ func parseTag(tag, prefix string) (semver, bool) {
 }
 
 func less(a, b semver) bool {
-	if a.major != b.major {
-		return a.major < b.major
+	return compareSemver(a, b) < 0
+}
+
+// compareSemver orders two parsed versions by SemVer 2.0.0 precedence, with
+// the wrapper-release rule that tools/stack-pin-resolver also applies: a
+// pre-release of the form nv-X.Y.Z (as in the collector's 0.160.0-nv-0.4.10)
+// is a wrapper release built on the upstream version in front of it. Wrapper
+// releases compare by their own X.Y.Z and sort above the bare upstream
+// version. Build metadata (+...) is ignored, as SemVer 2.0.0 rule 10 requires.
+func compareSemver(a, b semver) int {
+	if c := cmp.Compare(a.major, b.major); c != 0 {
+		return c
 	}
-	if a.minor != b.minor {
-		return a.minor < b.minor
+	if c := cmp.Compare(a.minor, b.minor); c != 0 {
+		return c
 	}
-	if a.patch != b.patch {
-		return a.patch < b.patch
+	if c := cmp.Compare(a.patch, b.patch); c != 0 {
+		return c
 	}
-	// A prerelease precedes its release (1.0.0-rc.1 < 1.0.0).
-	if a.pre != b.pre {
-		if a.pre == "" {
+	aPre, bPre := withoutBuild(a.pre), withoutBuild(b.pre)
+	aWrapper, aWrapped := wrapperRelease(aPre)
+	bWrapper, bWrapped := wrapperRelease(bPre)
+	switch {
+	case aWrapped && bWrapped:
+		return compareSemver(aWrapper, bWrapper)
+	case aWrapped:
+		return 1
+	case bWrapped:
+		return -1
+	}
+	return comparePrerelease(aPre, bPre)
+}
+
+// withoutBuild drops the build metadata from a pre-release string
+// ("rc.2+build" becomes "rc.2"), since it does not affect precedence.
+func withoutBuild(pre string) string {
+	pre, _, _ = strings.Cut(pre, "+")
+	return pre
+}
+
+// wrapperRelease parses X.Y.Z from a pre-release of the form nv-X.Y.Z.
+func wrapperRelease(pre string) (semver, bool) {
+	rest, ok := strings.CutPrefix(pre, "nv-")
+	if !ok {
+		return semver{}, false
+	}
+	return parseTag(rest, "")
+}
+
+// comparePrerelease applies SemVer 2.0.0 rule 11 to two pre-release strings.
+// A release (empty pre-release) sorts above any pre-release. Identifiers
+// compare one by one: numeric ones by value, others as ASCII text, and
+// numeric below text. When every shared identifier is equal, the longer list
+// sorts higher (1.0.0-rc < 1.0.0-rc.1).
+func comparePrerelease(a, b string) int {
+	switch {
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
+	}
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		aNum, bNum := isNumeric(as[i]), isNumeric(bs[i])
+		var c int
+		switch {
+		case aNum && bNum:
+			c = compareNumeric(as[i], bs[i])
+		case aNum:
+			c = -1
+		case bNum:
+			c = 1
+		default:
+			c = strings.Compare(as[i], bs[i])
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return cmp.Compare(len(as), len(bs))
+}
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
 			return false
 		}
-		if b.pre == "" {
-			return true
-		}
-		return a.pre < b.pre
 	}
-	return false
+	return true
+}
+
+// compareNumeric compares two digit strings by value without parsing them,
+// so no length of number overflows.
+func compareNumeric(a, b string) int {
+	a, b = strings.TrimLeft(a, "0"), strings.TrimLeft(b, "0")
+	if c := cmp.Compare(len(a), len(b)); c != 0 {
+		return c
+	}
+	return strings.Compare(a, b)
 }
 
 // ccRe parses a Conventional Commit subject: type(scope)!: description.

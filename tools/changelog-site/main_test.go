@@ -75,6 +75,110 @@ func TestSortReleasesMergesSources(t *testing.T) {
 	}
 }
 
+func TestSortReleasesOrdersPrereleasesBySemver(t *testing.T) {
+	// Pre-release identifiers compare numerically (rc.10 > rc.2), and an
+	// nv-X.Y.Z wrapper release sorts by its own version, above the bare
+	// upstream version it wraps.
+	rels := []release{
+		{Version: "0.160.0-nv-0.4.10"},
+		{Version: "1.0.0"},
+		{Version: "0.160.0-nv-0.4.2"},
+		{Version: "1.0.0-rc.10"},
+		{Version: "0.160.0"},
+		{Version: "1.0.0-rc.2"},
+		{Version: "0.160.0-nv-0.4.9"},
+		{Version: "1.0.0-rc"},
+		{Version: "0.157.0-nv-0.2.3"},
+		{Version: "1.0.0-beta.11"},
+		{Version: "0.160.0-nv-0.10.0"},
+		{Version: "1.0.0-rc.1"},
+	}
+	sortReleases(rels)
+	want := []string{
+		"0.157.0-nv-0.2.3",
+		"0.160.0",
+		"0.160.0-nv-0.4.2",
+		"0.160.0-nv-0.4.9",
+		"0.160.0-nv-0.4.10",
+		"0.160.0-nv-0.10.0",
+		"1.0.0-beta.11",
+		"1.0.0-rc",
+		"1.0.0-rc.1",
+		"1.0.0-rc.2",
+		"1.0.0-rc.10",
+		"1.0.0",
+	}
+	got := make([]string, len(rels))
+	for i, r := range rels {
+		got[i] = r.Version
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("sortReleases =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+func TestComparePrerelease(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"rc.1", "", -1},
+		{"", "rc.1", 1},
+		{"rc.2", "rc.10", -1},
+		{"rc.10", "rc.2", 1},
+		{"alpha", "alpha.1", -1},
+		{"alpha.1", "alpha.beta", -1}, // numeric sorts below text
+		{"alpha.beta", "beta", -1},
+		{"rc.01", "rc.1", 0},
+	}
+	for _, c := range cases {
+		if got := comparePrerelease(c.a, c.b); got != c.want {
+			t.Errorf("comparePrerelease(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestCompareSemverIgnoresBuildMetadata(t *testing.T) {
+	// SemVer 2.0.0 rule 10: build metadata does not affect precedence. It
+	// must not take part in the pre-release comparison or hide a wrapper
+	// release.
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"1.0.0-rc.2+build", "1.0.0-rc.3", -1},
+		{"1.0.0-rc.10+build.5", "1.0.0-rc.2", 1},
+		{"1.0.0-rc.2+build", "1.0.0-rc.2", 0},
+		{"1.0.0-rc.2+a", "1.0.0-rc.2+b", 0},
+		{"0.160.0-nv-0.4.2+build", "0.160.0", 1},
+		{"0.160.0-nv-0.4.2+build", "0.160.0-nv-0.4.10", -1},
+		{"0.160.0-nv-0.4.10+build", "0.160.0-nv-0.4.9", 1},
+	}
+	for _, c := range cases {
+		a, ok := parseTag(c.a, "")
+		if !ok {
+			t.Fatalf("parseTag(%q) failed", c.a)
+		}
+		b, ok := parseTag(c.b, "")
+		if !ok {
+			t.Fatalf("parseTag(%q) failed", c.b)
+		}
+		if got := compareSemver(a, b); got != c.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+		if got := compareSemver(b, a); got != -c.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", c.b, c.a, got, -c.want)
+		}
+	}
+
+	// The build metadata is still kept in the version and tag.
+	sv, _ := parseTag("v1.0.0-rc.2+build", "v")
+	if sv.version != "1.0.0-rc.2+build" || sv.tag != "v1.0.0-rc.2+build" {
+		t.Errorf("parseTag kept version %q, tag %q", sv.version, sv.tag)
+	}
+}
+
 // runGit runs git in dir with a deterministic identity, failing the test on error.
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
