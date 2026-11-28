@@ -212,7 +212,7 @@ event_ledger_host: "events.<STACK_DOMAIN>"
 # API Keys Service Configuration
 # ==============================================================================
 
-api_keys_service_id: "cloud-functions"
+api_keys_service_id: "nvidia-cloud-functions-ncp-service-id-aketm"
 api_keys_issuer_service: "nvcf-api"
 api_keys_owner_id: "svc@nvcf-api.local"
 
@@ -245,7 +245,7 @@ api_host: "api.a1b2c3d4e5f6.us-west-2.elb.amazonaws.com"
 invoke_host: "invocation.a1b2c3d4e5f6.us-west-2.elb.amazonaws.com"
 
 # API Keys service
-api_keys_service_id: "cloud-functions"
+api_keys_service_id: "nvidia-cloud-functions-ncp-service-id-aketm"
 api_keys_issuer_service: "nvcf-api"
 api_keys_owner_id: "svc@nvcf-api.local"
 
