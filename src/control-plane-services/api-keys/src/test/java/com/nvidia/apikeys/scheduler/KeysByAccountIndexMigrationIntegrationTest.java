@@ -18,6 +18,7 @@
 package com.nvidia.apikeys.scheduler;
 
 import static com.nvidia.apikeys.TestData.KEY_BY_OWNER_AND_SERVICE_VO_1;
+import static com.nvidia.apikeys.TestData.KEY_OWNER_VO_1;
 import static com.nvidia.apikeys.TestData.KEY_VO_1;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -35,6 +36,7 @@ import com.nvidia.apikeys.config.NakProperties;
 import com.nvidia.apikeys.facade.AdminFacade;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao.TimedRow;
 import com.nvidia.apikeys.persistance.dao.KeysByAccountIndexMigrationDao;
+import com.nvidia.apikeys.persistance.dao.KeysDao;
 import com.nvidia.apikeys.persistance.dao.RowUpdateLockDao;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndAccountAndServiceModel;
 import com.nvidia.apikeys.persistance.models.KeyByOwnerAndServiceModel;
@@ -86,6 +88,8 @@ class KeysByAccountIndexMigrationIntegrationTest {
     private CqlSession session;
     @Autowired
     private KeysByAccountIndexMigrationDao dao;
+    @Autowired
+    private KeysDao keysDao;
     @Autowired
     private RowUpdateLockDao markers;
     @Autowired
@@ -367,6 +371,15 @@ class KeysByAccountIndexMigrationIntegrationTest {
         task(dao).runUnchecked(() -> { });
         assertThat(account(second).getKeyId()).isEqualTo("second-key");
         assertThat(completed()).isTrue();
+    }
+
+    @Test
+    void keyCreatedByTheWritePathMatchesWhatTheMigrationExpects() {
+        var key = KEY_VO_1.toBuilder().ncaId(properties.getNcaId()).build();
+        keysDao.create(key, KEY_OWNER_VO_1);
+        var owner = new KeyByOwnerAndServiceVo(key, KEY_OWNER_VO_1);
+
+        assertThat(account(owner)).usingRecursiveComparison().isEqualTo(target(owner));
     }
 
     @Test

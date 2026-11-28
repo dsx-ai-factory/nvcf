@@ -172,6 +172,7 @@ public class KeysDao {
     private KeyByOwnerAndAccountAndServiceModel toAccountModel(KeyByOwnerAndServiceVo key) {
         var ncaId = ncaIdResolver.resolve(key.getNcaId(), key.getNcaIdInDetails());
         var accountKey = new KeyByOwnerAndAccountAndServiceVo(key, ncaId).toBuilder()
+                .ncaIdInDetails(ncaId)
                 .issuerServiceId(servicesService.toCanonicalId(key.getIssuerServiceId()))
                 .audienceServiceIds(key.getAudienceServiceIds().stream()
                         .map(servicesService::toCanonicalId)

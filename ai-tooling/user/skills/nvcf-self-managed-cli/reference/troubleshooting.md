@@ -35,6 +35,13 @@ transcript.
 | `Signed JWT rejected: Another algorithm expected, or no matching key(s) found` | Stale session.json from a different control plane | `rm ~/.nvcf-cli.state` then `nvcf-cli init` again |
 | `403 missing requested authorities` (function invoke) | Admin token doesn't have `invoke_function` scope | `nvcf-cli api-key generate --description=…` then re-run invoke |
 
+## API keys
+
+| Symptom | Cause | Remediation |
+|---|---|---|
+| `api-key generate` returns 503 without a `Retry-After` header | The write may have succeeded before the failure, so a key can exist that you never received | Run `api-key list`. If a key from that attempt is listed, remove it with `api-key delete <id>`, then run `api-key generate` again |
+| `api-key delete` returns 503 without a `Retry-After` header | The delete may be only partly applied | Run `api-key delete <id>` again until it succeeds. Deleting a key that is already gone does no harm |
+
 ## Install / `up`
 
 | Symptom | Cause | Remediation |

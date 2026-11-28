@@ -193,6 +193,9 @@ navigation:
     - page: CSP End-to-End Example
       path: ../docs/self-managed/csp-end-to-end-example-installation.md
       slug: csp-end-to-end-example
+    - page: Upgrading API Keys
+      path: ../docs/self-managed/api-keys-upgrade.md
+      slug: upgrading-api-keys
   - section: Configuration
     skip-slug: true
     contents:

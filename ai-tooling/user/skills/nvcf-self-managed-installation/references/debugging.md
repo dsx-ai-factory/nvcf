@@ -371,6 +371,34 @@ For private registry failures, verify that the pull secret exists in
 broader manual namespace loop. See
 [pull-secrets.md](pull-secrets.md#compute-plane-secret).
 
+## Failure: API Keys After an Upgrade
+
+### Symptoms
+
+- A request fails during the rollout and succeeds when repeated.
+- A key is missing from key lists.
+
+### Diagnosis
+
+```bash
+kubectl -n api-keys rollout status deploy/api-keys
+kubectl -n api-keys get pods \
+  -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
+helm get values cassandra -n cassandra-system -a -o json \
+  | jq -r .cassandra.dbUser.password \
+  | kubectl -n cassandra-system exec -i cassandra-0 -c cassandra -- \
+    sh -c '/opt/cassandra/bin/cqlsh -u cassandra -p "$(cat)" localhost -e "$0"' \
+    "SELECT record_key FROM api_keys_api.row_update_lock WHERE table_name = 'keys_by_account_index_copy' AND record_key = 'completed';"
+```
+
+### Fix
+
+- Failures during the rollout: wait until `rollout status` completes and every
+  pod shows the new image, then repeat the request.
+- Missing keys: a pod from the old version created them. Replace every old pod,
+  then wait for the next migration run (every 5 minutes by default) and list
+  the keys again.
+
 ## Failure: Gateway Endpoint Changed
 
 ### Symptoms

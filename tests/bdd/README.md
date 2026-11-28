@@ -54,6 +54,39 @@ It checks rolling workloads and the upgrade receipt. It does not apply an
 upgrade, replace OnDelete pods, or qualify data preservation across an
 upgrade. Run it alongside the live upgrade rehearsal.
 
+TestAPIKeysUpgrade needs an installation that runs the release before
+multi-tenant API Keys Milestone 0 (M0). On an installation that is already
+upgraded it fails at its first check. The test upgrades the installation to M0
+itself, then checks that a key created before the upgrade still works and that
+new keys carry the account ID. Each run changes the installation, so reinstall
+the release before M0 before running it again.
+
+The upgrade runs `make -C deploy/stacks/self-managed install
+HELMFILE_ENV=$UPGRADE_ENV KUBECONFIG_FILE=$UPGRADE_KUBECONFIG`. The make target
+takes no kube context, so the test first checks that the kubeconfig's current
+context is `UPGRADE_CONTEXT`. Set `UPGRADE_APPLY_COMMAND` to replace the default
+command, for example while the M0 images are not published.
+
+Export these before the run. The harness exports `NVCF_CLI` and `REPO_ROOT`.
+
+| Variable | Meaning |
+|----------|---------|
+| `UPGRADE_CLI_CONFIG` | nvcf-cli config for the installation. |
+| `UPGRADE_KUBECONFIG`, `UPGRADE_CONTEXT` | Kubeconfig and context of the control-plane cluster. |
+| `UPGRADE_NCA_ID` | Account ID API Keys is configured with (`NVCF_NCA_ID`, default `nvcf-default`). |
+| `UPGRADE_ENV` | Helmfile environment, for the default upgrade. |
+| `UPGRADE_APPLY_COMMAND` | Optional. Replaces the default upgrade command. |
+
+The key migration waits 30 minutes by default and the test waits up to 45. On a
+test cluster, lower `APIKEYS_ACCOUNT_INDEX_MIGRATION_INITIAL_DELAY` for the
+upgrade. `helm`, `jq` and `kubectl` must be on the PATH.
+
+```sh
+unset BDD_CLEANUP_MODE
+cd tests/bdd
+go test -count=1 -run '^TestAPIKeysUpgrade$' -timeout 90m -v
+```
+
 Wiring tests use a fake CommandRunner and do not touch a cluster. Safe in
 CI; fast.
 

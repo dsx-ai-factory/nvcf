@@ -1425,7 +1425,7 @@ api_host: "api.<STACK_DOMAIN>"
 icms_host: "sis.<STACK_DOMAIN>"
 invoke_host: "invocation.<STACK_DOMAIN>"
 
-api_keys_service_id: "nvidia-cloud-functions-ncp-service-id-aketm"
+api_keys_service_id: "cloud-functions"
 api_keys_issuer_service: "nvcf-api"
 api_keys_owner_id: "svc@nvcf-api.local"
 client_id: "<nca-id>"

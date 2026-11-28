@@ -199,12 +199,14 @@ See [Event Ledger](./event-ledger.md) for context matching and filtering rules.
 ### Direct API key creation
 
 The CLI calls the API Keys service for you. If you need to call it directly,
-set `expires_at` and the `scopes` array explicitly.
+set `expires_at` and the `scopes` array explicitly. Existing keys and requests
+that use the longer legacy service IDs keep working. To upgrade an existing
+installation, see [Upgrading API Keys](../self-managed/api-keys-upgrade.md).
 
 ```bash
 GATEWAY_ADDR=<your-gateway-address>
 EXPIRES_AT=$(date -u -v+1d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
-SERVICE_ID="nvidia-cloud-functions-ncp-service-id-aketm"
+SERVICE_ID="cloud-functions"
 
 curl -s -X POST "http://${GATEWAY_ADDR}/v1/keys" \
   -H "Host: api-keys.${GATEWAY_ADDR}" \
