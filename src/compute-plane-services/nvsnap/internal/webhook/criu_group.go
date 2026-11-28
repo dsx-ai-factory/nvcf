@@ -189,7 +189,7 @@ func (m *Mutator) criuGroupRestorePatches(ctx context.Context, pod *corev1.Pod) 
 			return nil
 		}
 	} else {
-		if name := NamesOwnInstance(pod); name != "" && !m.dynamoRestorable(pod) {
+		if name := NamesOwnInstance(m.asAdmitted(ctx, pod)); name != "" && !m.dynamoRestorable(pod) {
 			log.WithField("env", name).Info("CRIU group restore: the pod names its own instance in its configuration; it starts from the caches")
 			admit(metrics.AdmitCold, "own-instance")
 			return nil

@@ -621,6 +621,9 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	if m.Backend == nil {
 		return nil, errors.New("webhook: Mutator.Backend is nil")
 	}
+	// One shared-Dynamo-namespace decision for the whole admission
+	// (dynamo_shared_namespace.go).
+	ctx = withSharedNamespaceDecision(ctx, pod)
 	if pod.Labels[InjectLabel] == InjectDisabled {
 		m.logger().WithField("pod", pod.Namespace+"/"+pod.Name).
 			Info("nvsnap.io/inject=false; admitting pod unchanged")
@@ -671,6 +674,7 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 	}
 	injectPatches = append(injectPatches, m.debugEnvPatches(pod)...)
 	injectPatches = append(injectPatches, m.dynamoNamespacePatches(ctx, pod)...)
+	injectPatches = append(injectPatches, m.sharedNamespacePatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.livenessBudgetPatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.companionToolsPatches(ctx, pod)...)
 	injectPatches = append(injectPatches, m.criuIdentityPatches(ctx, pod)...)
@@ -685,7 +689,10 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		// A rank of an instance whose group capture exists becomes its
 		// restore placeholder; that carries the model volume too.
 		if gp := m.criuGroupRestorePatches(ctx, pod); gp != nil {
-			return gp, nil
+			// A placeholder keeps its instance's shared Dynamo namespace in
+			// its spec: nvsnap's own checks read it, and a pod under the
+			// original name would keep later pods from sharing it.
+			return mergePatchPlan(append(gp, m.sharedNamespacePatches(ctx, pod)...)), nil
 		}
 		if vp, err := m.modelVolumePatches(ctx, pod); err != nil {
 			m.logger().WithError(err).WithField("pod", election.PodIdentity(pod)).
@@ -772,6 +779,9 @@ func (m *Mutator) Mutate(ctx context.Context, pod *corev1.Pod) ([]PatchOp, error
 		plog.WithField("checkpoint", id).Info("CRIU restore: pod admitted as the restore placeholder")
 		cp = append(cp, m.processConfigPatches(pod)...)
 		cp = append(cp, m.placeholderModelCachePatches(ctx, pod, cp)...)
+		// The shared Dynamo namespace the restore check judged the pod with
+		// (asAdmitted), so the placeholder's spec matches its process.
+		cp = append(cp, m.sharedNamespacePatches(ctx, pod)...)
 		// Not injectPatches: a gpushare restore mounts the checkpoint's
 		// chunk store, not the pod's own empty one.
 		return mergePatchPlan(withPIDReserve(pod, append(cp, vp...))), nil

@@ -101,7 +101,7 @@ func CRIUCheckpointID(man checkpointstore.Manifest) string {
 func (m *Mutator) criuRestoreFor(ctx context.Context, pod *corev1.Pod, hash string, log logrus.FieldLogger) (string, checkpointstore.Manifest) {
 	var man checkpointstore.Manifest
 	var id string
-	if name := NamesOwnInstance(pod); name != "" {
+	if name := NamesOwnInstance(m.asAdmitted(ctx, pod)); name != "" {
 		log.WithField("env", name).Info("CRIU restore: the pod names its own instance in its configuration; it starts from the caches")
 		return "", man
 	}

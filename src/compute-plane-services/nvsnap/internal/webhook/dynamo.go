@@ -103,8 +103,14 @@ func localHost(endpoint string) bool {
 // own Dynamo namespace would otherwise register under one name and route
 // to each other's workers. A cluster that does not capture with CRIU
 // (CaptureCandidate nil) never sees the rewrite.
+//
+// A component that registers through Kubernetes is left to the shared
+// Dynamo namespace (dynamo_shared_namespace.go), the one decision for its
+// instance: where that keeps the original name (a running pod still has
+// it, or the namespace cannot be read), the fixed name here would split
+// the instance. It keeps no etcd lease either.
 func (m *Mutator) dynamoNamespacePatches(ctx context.Context, pod *corev1.Pod) []PatchOp {
-	if m.DynamoNamespace == "" || m.CaptureCandidate == nil || !dynamoComponent(pod) || !instanceLocalEndpoints(pod) {
+	if m.DynamoNamespace == "" || m.CaptureCandidate == nil || !dynamoComponent(pod) || !instanceLocalEndpoints(pod) || kubeDiscoveryComponent(pod) {
 		return nil
 	}
 	if gpuRequest(pod) == 0 && !m.CaptureCandidate(ctx, pod) {

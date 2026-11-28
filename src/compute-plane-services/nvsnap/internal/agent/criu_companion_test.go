@@ -110,9 +110,20 @@ func TestIdentityBlocksCapture(t *testing.T) {
 	if n := a.identityBlocksCapture(dynamoRank("nvcf-nvsnap", "etcd")); n != "" {
 		t.Errorf("a Dynamo rank under the fixed namespace with etcd discovery is restorable, got blocked by %s", n)
 	}
+	// A single pod that registers through Kubernetes under a shared Dynamo
+	// namespace names its instance only in GROVE_HEADLESS_SERVICE, which it
+	// does not act on: captured (its registration follows the restore,
+	// kube_discovery.go). A pod of a multi-pod gang joins the leader that
+	// variable names: still blocked.
+	if n := a.identityBlocksCapture(dynamoRank("nvcf-nvsnap", "kubernetes")); n != "" {
+		t.Errorf("a single Kubernetes-discovery rank under a shared Dynamo namespace: blocked by %s", n)
+	}
+	gang := dynamoRank("nvcf-nvsnap", "kubernetes")
+	gang.Spec.Containers[0].Env = append(gang.Spec.Containers[0].Env, corev1.EnvVar{Name: "GROVE_PCSG_TEMPLATE_NUM_PODS", Value: "4"})
 	for name, p := range map[string]*corev1.Pod{
-		"instance-derived Dynamo namespace": dynamoRank("sr-abc-graph", "etcd"),
-		"Kubernetes discovery":              dynamoRank("nvcf-nvsnap", "kubernetes"),
+		"instance-derived Dynamo namespace":    dynamoRank("sr-abc-graph", "etcd"),
+		"Kubernetes discovery, 4-pod gang":     gang,
+		"Kubernetes discovery, instance-named": dynamoRank("sr-abc-graph", "kubernetes"),
 	} {
 		if a.identityBlocksCapture(p) == "" {
 			t.Errorf("%s: captured", name)

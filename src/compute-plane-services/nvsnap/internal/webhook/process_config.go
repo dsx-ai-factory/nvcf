@@ -59,6 +59,10 @@ const (
 // differ in it, and restore from each other's checkpoints by design (the
 // restored process keeps its capture's placement either way). The rank a
 // group's pod restores is matched by its ordinal instead.
+// dynWorkerSuffixEnv is the suffix a Dynamo worker appends to its
+// namespace (Dynamo's get_worker_namespace).
+const dynWorkerSuffixEnv = "DYN_NAMESPACE_WORKER_SUFFIX"
+
 var (
 	placementEnvPrefixes = []string{"GROVE_"}
 	placementEnvExact    = map[string]bool{"NODE_RANK": true, "RANK": true, "GROUP_RANK": true, "LOCAL_RANK": true,
@@ -83,6 +87,13 @@ func placementEnv(name string) bool {
 // digest, not the value, so the annotation and the record hold no secret
 // a pod passes as a literal. "" for a pod without containers.
 func ProcessConfig(pod *corev1.Pod) string {
+	// A Dynamo worker that registers through Kubernetes runs under
+	// "<DYN_NAMESPACE>-<DYN_NAMESPACE_WORKER_SUFFIX>", the suffix being the
+	// operator's hash of its graph, which differs between instances of one
+	// graph; frontends find workers by the namespace's prefix, so a worker
+	// restored with another instance's suffix serves the same. It is left out
+	// here, as placement is, so another instance's capture restores.
+	kube := kubeDiscoveryComponent(pod)
 	var ns *regexp.Regexp
 	if pod.Namespace != "" {
 		ns = regexp.MustCompile(`(^|[^a-z0-9])` + regexp.QuoteMeta(pod.Namespace) + `([^a-z0-9]|$)`)
@@ -108,12 +119,13 @@ func ProcessConfig(pod *corev1.Pod) string {
 		var order []string
 		refs := false
 		for _, e := range c.Env {
-			if !placementEnv(e.Name) {
+			skip := placementEnv(e.Name) || (kube && e.Name == dynWorkerSuffixEnv)
+			if !skip {
 				order = append(order, e.Name)
 				refs = refs || strings.Contains(e.Value, "$(")
 			}
 			switch {
-			case placementEnv(e.Name):
+			case skip:
 			case e.ValueFrom != nil:
 				addJSON("env/"+e.Name, e.ValueFrom)
 			default:
