@@ -161,7 +161,7 @@ Function/Version ID Resolution (in order of priority):
 1. Explicit arguments: delete <function-id> <version-id>
 2. CLI flags: --function-id and --version-id  
 3. JSON file: --input-file with functionId and versionId
-4. Current state: Uses function from 'nvcf-cli create' (automatic)
+4. Current state: Uses function from 'nvcf-cli function create' (automatic)
 
 For deployment deletion, use --graceful to allow current tasks to complete before termination.
 Function deletion is permanent and cannot be undone.

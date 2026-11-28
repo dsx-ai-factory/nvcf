@@ -230,7 +230,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   Status: ✅ Ready for operations\n")
 	} else {
 		fmt.Printf("   Status: ❌ No function selected\n")
-		fmt.Printf("   💡 Run 'nvcf-cli create' to create a function\n")
+		fmt.Printf("   💡 Run 'nvcf-cli function create' to create a function\n")
 	}
 
 	// API Endpoints section
@@ -255,14 +255,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if !sm.HasFunction() {
-		fmt.Printf("   • nvcf-cli function create       (create a new function)\n")
+		fmt.Printf("   • nvcf-cli function create        (create a new function)\n")
 	} else {
-		fmt.Printf("   • nvcf-cli function deploy       (deploy current function)\n")
-		fmt.Printf("   • nvcf-cli function invoke       (invoke current function)\n")
-		fmt.Printf("   • nvcf-cli function delete       (delete current function)\n")
+		fmt.Printf("   • nvcf-cli function deploy create (deploy current function)\n")
+		fmt.Printf("   • nvcf-cli function invoke        (invoke current function)\n")
+		fmt.Printf("   • nvcf-cli function delete        (delete current function)\n")
 	}
 
-	fmt.Printf("   • nvcf-cli function list         (list all functions)\n")
+	fmt.Printf("   • nvcf-cli function list          (list all functions)\n")
 
 	// Warnings section
 	warnings := []string{}

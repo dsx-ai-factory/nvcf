@@ -147,7 +147,7 @@ Enable comprehensive HTTP request/response logging for troubleshooting:
 
 ```bash
 # Method 1: Command line flag
-./nvcf-cli create --debug --name test --image nginx --inference-url http://test --inference-port 8000
+./nvcf-cli function create --debug --name test --image nginx --inference-url http://test --inference-port 8000
 
 # Method 2: Environment variable
 export NVCF_DEBUG=true
@@ -203,13 +203,13 @@ Usage:
 
 ```bash
 # Use JSON file only
-./nvcf-cli create --input-file examples/create-function.json
+./nvcf-cli function create --input-file examples/create-function.json
 
 # Combine JSON file with CLI overrides
-./nvcf-cli deploy --input-file examples/deploy-function.json --timeout 1200
+./nvcf-cli function deploy create --input-file examples/deploy-function.json --timeout 1200
 
 # CLI flags override JSON file values
-./nvcf-cli invoke --input-file examples/invoke-function.json --timeout 30
+./nvcf-cli function invoke --input-file examples/invoke-function.json --timeout 30
 ```
 
 ---
@@ -337,11 +337,11 @@ Use different configurations for different environments:
 ```bash
 # Development environment
 nvcf-cli --config dev.yaml init
-nvcf-cli --config dev.yaml create --input-file function.json
+nvcf-cli --config dev.yaml function create --input-file function.json
 
 # Production environment
-nvcf-cli --config prod.yaml list functions
-nvcf-cli --config prod.yaml invoke --request-body '{"input": "test"}'
+nvcf-cli --config prod.yaml function list
+nvcf-cli --config prod.yaml function invoke --request-body '{"input": "test"}'
 
 # Staging environment
 nvcf-cli --config staging.yaml init
@@ -401,15 +401,15 @@ The CLI automatically manages state to eliminate manual ID copying:
 
 ```bash
 # Create function (automatically saves context)
-nvcf-cli create --input-file function.json
+nvcf-cli function create --input-file function.json
 # Function ID: func-abc123 (saved automatically)
 # Version ID: ver-def456 (saved automatically)
 
 # Deploy using saved context (no IDs needed!)
-nvcf-cli deploy
+nvcf-cli function deploy create
 
 # Invoke using saved context
-nvcf-cli invoke --request-body '{"input": "test"}'
+nvcf-cli function invoke --request-body '{"input": "test"}'
 
 # Check current state
 nvcf-cli status
@@ -444,9 +444,10 @@ nvcf-cli status
 #    Status: Ready for operations
 #
 # Quick Actions:
-#    • nvcf-cli deploy            (deploy current function)
-#    • nvcf-cli invoke            (invoke current function)
-#    • nvcf-cli undeploy          (undeploy current function)
+#    • nvcf-cli function deploy create (deploy current function)
+#    • nvcf-cli function invoke        (invoke current function)
+#    • nvcf-cli function delete        (delete current function)
+#    • nvcf-cli function list          (list all functions)
 ```
 
 ### Complete Workflow Example
@@ -459,20 +460,20 @@ nvcf-cli init
 nvcf-cli api-key generate --description "Demo key"
 
 # 3. Create function (context automatically saved)
-nvcf-cli create --input-file examples/create-function.json
+nvcf-cli function create --input-file examples/create-function.json
 
 # 4. Deploy function (uses saved context automatically)
-nvcf-cli deploy
+nvcf-cli function deploy create
 
 # 5. Invoke function (uses saved context and API key automatically)
-nvcf-cli invoke --request-body '{"message": "hello world"}'
+nvcf-cli function invoke --request-body '{"message": "hello world"}'
 
 # 6. Check everything is working
 nvcf-cli status
 
 # 7. Clean up when done
-nvcf-cli undeploy  # New undeploy command!
-nvcf-cli delete    # Uses saved context
+nvcf-cli function deploy remove --function-id func-abc123 --version-id ver-def456  # Remove the deployment (IDs required)
+nvcf-cli function delete         # Delete the function (uses saved context)
 ```
 
 ---
@@ -572,16 +573,13 @@ Displays:
 Remove function deployment while keeping function definition:
 
 ```bash
-# Undeploy current function (from state)
-nvcf-cli undeploy
-
-# Undeploy specific function
-nvcf-cli undeploy --function-id func-123 --version-id ver-456
+# Undeploy a function (both IDs are required; saved context is not used)
+nvcf-cli function deploy remove --function-id func-123 --version-id ver-456
 ```
 
 Key Features:
 
-- Uses saved function context automatically
+- Requires --function-id and --version-id
 - Supports both cluster and direct modes
 - Function definition remains (can be redeployed)
 
@@ -598,7 +596,7 @@ Create a new function with comprehensive configuration:
 export NVCF_TOKEN="nvapi-your-function-creation-token"
 
 # Create function with CLI flags
-./nvcf-cli create \
+./nvcf-cli function create \
   --name "my-function" \
   --image "nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8" \
   --inference-url "/echo" \
@@ -616,7 +614,7 @@ export NVCF_TOKEN="nvapi-your-function-creation-token"
   --secrets "api-key=sk-12345,db-password=mypassword"
 
 # Or create with JSON configuration
-./nvcf-cli create --input-file examples/create-function.json
+./nvcf-cli function create --input-file examples/create-function.json
 
 # Emit the created Function and version IDs as structured JSON
 ./nvcf-cli --json function create --input-file examples/create-function.json
@@ -713,7 +711,7 @@ export NVCF_TOKEN="nvapi-your-function-creation-token"
 export NVCF_API_KEY="nvapi-your-general-operations-token"  # optional fallback
 
 # Deploy with CLI flags
-./nvcf-cli deploy \
+./nvcf-cli function deploy create \
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc" \
   --instance-type "ON-PREM.GPU.H100_1x" \
@@ -723,7 +721,7 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # optional fallback
   --timeout 900
 
 # Or deploy with JSON configuration
-./nvcf-cli deploy --input-file deploy.json
+./nvcf-cli function deploy create --input-file deploy.json
 ```
 
 New JSON format (deploymentSpecifications):
@@ -788,9 +786,10 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # optional fallback
 ./nvcf-cli function deploy update \
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc" \
+  --gpu "H100" \
+  --instance-type "ON-PREM.GPU.H100_1x" \
   --min-instances 2 \
-  --max-instances 5 \
-  --max-request-concurrency 20
+  --max-instances 5
 
 # Or update with JSON configuration
 ./nvcf-cli function update --input-file update-metadata.json
@@ -843,13 +842,13 @@ Execute a function with JSON payload using HTTP or gRPC:
 
 ```bash
 # NEW: Invoke using saved context (no IDs needed!)
-nvcf-cli invoke --request-body '{"input": "Hello, World!"}'
+nvcf-cli function invoke --request-body '{"input": "Hello, World!"}'
 
 # NEW: gRPC invocation
-nvcf-cli invoke --grpc --request-body '{"input": "test"}'
+nvcf-cli function invoke --grpc --request-body '{"input": "test"}'
 
 # Traditional: Invoke with explicit IDs
-./nvcf-cli invoke \
+./nvcf-cli function invoke \
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc" \
   --request-body '{"input": "Hello, World!", "parameters": {"temperature": 0.7}}' \
@@ -857,7 +856,7 @@ nvcf-cli invoke --grpc --request-body '{"input": "test"}'
   --poll-duration 5
 
 # Or invoke with JSON configuration
-./nvcf-cli invoke --input-file invoke.json
+./nvcf-cli function invoke --input-file invoke.json
 ```
 
 Direct HTTP invocation routes through the function-specific invocation host, not function routing headers:
@@ -926,19 +925,19 @@ Delete a function version or deployment:
 export NVCF_TOKEN="nvapi-your-function-creation-token"
 
 # Delete entire function
-./nvcf-cli delete \
+./nvcf-cli function delete \
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc"
 
 # Delete deployment only (keep function)
-./nvcf-cli delete \
+./nvcf-cli function delete \
   --function-id "func-12345678-1234-1234-1234-123456789abc" \
   --version-id "ver-12345678-1234-1234-1234-123456789abc" \
   --deployment-only \
   --graceful
 
 # Or delete with JSON configuration
-./nvcf-cli delete --input-file delete-deployment.json
+./nvcf-cli function delete --input-file delete-deployment.json
 ```
 
 Example JSON file (`delete-deployment.json`):
@@ -974,29 +973,29 @@ Example JSON file (`delete-function.json`):
 export NVCF_API_KEY="nvapi-your-general-operations-token"
 
 # List all functions in your account
-./nvcf-cli list functions
+./nvcf-cli function list
 
 # List only function IDs (lightweight)
-./nvcf-cli list function-ids
+./nvcf-cli function list-ids
 
 # List all versions of a specific function
-./nvcf-cli list versions func-12345678-1234-1234-1234-123456789abc
+./nvcf-cli function list-versions func-12345678-1234-1234-1234-123456789abc
 
 # List available cluster groups and GPUs
-./nvcf-cli list clusters
+./nvcf-cli cluster list
 ```
 
 Example outputs:
 
 ```bash
 # List functions output
-$ ./nvcf-cli list functions
+$ ./nvcf-cli function list
 Functions:
 - ID: func-abc123, Name: my-test-function, Status: ACTIVE, Created: 2023-12-01T10:00:00Z
 - ID: func-def456, Name: ml-model-api, Status: INACTIVE, Created: 2023-12-01T11:00:00Z
 
 # List clusters output
-$ ./nvcf-cli list clusters
+$ ./nvcf-cli cluster list
 Available Cluster Groups:
 - Name: GFN, GPUs: [L40, A100, H100], Regions: [us-west-2, us-east-1]
 - Name: OCI, GPUs: [H100, A100], Regions: [us-phoenix-1]
@@ -1009,10 +1008,10 @@ Available Cluster Groups:
 export NVCF_API_KEY="nvapi-your-general-operations-token"
 
 # Get detailed function information
-./nvcf-cli get function --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc
+./nvcf-cli function get --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc
 
 # Output as JSON for programmatic use
-./nvcf-cli get function --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --json
+./nvcf-cli function get --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --json
 ```
 
 Example get function output:
@@ -1065,24 +1064,21 @@ Monitor function execution and queue status:
 # Set the required token
 export NVCF_API_KEY="nvapi-your-general-operations-token"
 
-# Check queue status for all functions
-./nvcf-cli queue status
-
 # Check queue status for a specific function
-./nvcf-cli queue status func-12345678-1234-1234-1234-123456789abc
+./nvcf-cli function queue status func-12345678-1234-1234-1234-123456789abc
 
 # Check queue status for a specific function version
-./nvcf-cli queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
+./nvcf-cli function queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
 
 # Get position in queue for a specific request
-./nvcf-cli queue position req-abcdef12-3456-7890-abcd-ef1234567890
+./nvcf-cli function queue position req-abcdef12-3456-7890-abcd-ef1234567890
 ```
 
 Example queue monitoring:
 
 ```bash
 # Check queue status
-$ ./nvcf-cli queue status func-12345678-1234-1234-1234-123456789abc
+$ ./nvcf-cli function queue status func-12345678-1234-1234-1234-123456789abc
 Queue Status for Function: func-12345678-1234-1234-1234-123456789abc
   Active Instances: 2
   Queue Size: 5
@@ -1093,7 +1089,7 @@ Version Details:
 - Version: ver-12345678, Queue Size: 2, Processing: 1
 
 # Check request position
-$ ./nvcf-cli queue position req-abcdef12-3456-7890-abcd-ef1234567890
+$ ./nvcf-cli function queue position req-abcdef12-3456-7890-abcd-ef1234567890
 Request Position:
   Request ID: req-abcdef12-3456-7890-abcd-ef1234567890
   Position in Queue: 3
@@ -1121,15 +1117,15 @@ export NVCF_TOKEN="nvapi-your-function-creation-token"        # For create, depl
 export NVCF_API_KEY="nvapi-your-general-operations-token"    # For invoke, list, queue
 
 # Step 2: Discover available GPU resources (uses NVCF_API_KEY)
-./nvcf-cli list clusters
+./nvcf-cli cluster list
 
 # Step 3: Create a function (uses NVCF_TOKEN)
-./nvcf-cli create --input-file examples/create-function.json
+./nvcf-cli function create --input-file examples/create-function.json
 # Returns: Function ID: func-12345678-1234-1234-1234-123456789abc
 #          Version ID: ver-87654321-4321-4321-4321-123456789abc
 
 # Step 4: Deploy the function with H100 GPU (uses NVCF_TOKEN)
-./nvcf-cli deploy \
+./nvcf-cli function deploy create \
   --function-id func-12345678-1234-1234-1234-123456789abc \
   --version-id ver-87654321-4321-4321-4321-123456789abc \
   --gpu H100 \
@@ -1148,7 +1144,7 @@ echo '{
     }
   ]
 }' > deploy.json
-./nvcf-cli deploy --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --input-file deploy.json
+./nvcf-cli function deploy create --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --input-file deploy.json
 
 # Step 5: Update function tags (uses NVCF_TOKEN)
 ./nvcf-cli function update \
@@ -1160,21 +1156,22 @@ echo '{
 ./nvcf-cli function deploy update \
   --function-id func-12345678-1234-1234-1234-123456789abc \
   --version-id ver-87654321-4321-4321-4321-123456789abc \
+  --gpu H100 \
+  --instance-type ON-PREM.GPU.H100_1x \
   --min-instances 2 \
-  --max-instances 4 \
-  --max-request-concurrency 20
+  --max-instances 4
 
 # Step 7: Invoke the function (uses NVCF_API_KEY)
-./nvcf-cli invoke \
-  func-12345678-1234-1234-1234-123456789abc \
-  ver-87654321-4321-4321-4321-123456789abc \
-  '{"input": "Hello from CLI!"}'
+./nvcf-cli function invoke \
+  --function-id func-12345678-1234-1234-1234-123456789abc \
+  --version-id ver-87654321-4321-4321-4321-123456789abc \
+  --request-body '{"input": "Hello from CLI!"}'
 
 # Step 8: Monitor queue status (uses NVCF_API_KEY)
-./nvcf-cli queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
+./nvcf-cli function queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
 
 # Step 9: Clean up (uses NVCF_TOKEN)
-./nvcf-cli delete func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc  # uses NVCF_TOKEN only
+./nvcf-cli function delete func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc  # uses NVCF_TOKEN only
 ```
 
 ### Resource Discovery Workflow *Uses `NVCF_API_KEY`*
@@ -1184,22 +1181,22 @@ echo '{
 export NVCF_API_KEY="nvapi-your-general-operations-token"
 
 # 1. List all functions
-./nvcf-cli list functions
+./nvcf-cli function list
 
 # 2. List function IDs only (lightweight)
-./nvcf-cli list function-ids
+./nvcf-cli function list-ids
 
 # 3. Get detailed information about a specific function
-./nvcf-cli get function --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc
+./nvcf-cli function get --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc
 
 # 4. Check deployment queue status
-./nvcf-cli queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
+./nvcf-cli function queue status func-12345678-1234-1234-1234-123456789abc ver-87654321-4321-4321-4321-123456789abc
 
 # 5. List available GPU cluster groups
-./nvcf-cli list clusters
+./nvcf-cli cluster list
 
 # 6. Export function details as JSON for automation
-./nvcf-cli get function --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --json > function-details.json
+./nvcf-cli function get --function-id func-12345678-1234-1234-1234-123456789abc --version-id ver-87654321-4321-4321-4321-123456789abc --json > function-details.json
 ```
 
 ### Development & Testing Workflow
@@ -1213,7 +1210,7 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # Invoke, list, queue
 export NVCF_CLI_DEBUG=true
 
 # 2. Create test function
-./nvcf-cli create \
+./nvcf-cli function create \
   --name "test-function" \
   --image "nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8" \
   --inference-url "/echo" \
@@ -1222,7 +1219,7 @@ export NVCF_CLI_DEBUG=true
   --debug
 
 # 3. Deploy for testing
-./nvcf-cli deploy \
+./nvcf-cli function deploy create \
   --function-id <function-id-from-step-2> \
   --version-id <version-id-from-step-2> \
   --gpu H100 \
@@ -1232,18 +1229,19 @@ export NVCF_CLI_DEBUG=true
   --debug
 
 # 4. Test invocation
-./nvcf-cli invoke \
-  <function-id> <version-id> \
-  '{"input": "test message"}' \
+./nvcf-cli function invoke \
+  --function-id <function-id> \
+  --version-id <version-id> \
+  --request-body '{"input": "test message"}' \
   --timeout 60 \
   --debug
 
 # 5. Monitor and debug
-./nvcf-cli queue status <function-id> <version-id>
-./nvcf-cli get function --function-id <function-id> --version-id <version-id> --json
+./nvcf-cli function queue status <function-id> <version-id>
+./nvcf-cli function get --function-id <function-id> --version-id <version-id> --json
 
 # 6. Clean up test resources
-./nvcf-cli delete <function-id> <version-id> --debug
+./nvcf-cli function delete <function-id> <version-id> --debug
 ```
 
 ---
@@ -1262,7 +1260,7 @@ Solution: Check `NVCF_TOKEN` is valid for function creation
 
 ```bash
 export NVCF_TOKEN="nvapi-your-function-creation-token"
-./nvcf-cli create --debug --name test --image nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8 --inference-url /echo --inference-port 8000
+./nvcf-cli function create --debug --name test --image nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8 --inference-url /echo --inference-port 8000
 # Look for: "Using FUNCTION TOKEN for POST"
 ```
 
@@ -1276,7 +1274,7 @@ Solution: Delete operations require `NVCF_TOKEN` exclusively
 
 ```bash
 export NVCF_TOKEN="nvapi-your-function-creation-token"
-./nvcf-cli delete --function-id func-123 --version-id ver-456 --debug
+./nvcf-cli function delete --function-id func-123 --version-id ver-456 --debug
 # Look for: "Using FUNCTION TOKEN for DELETE"
 ```
 
@@ -1290,7 +1288,7 @@ Solution: Check `NVCF_API_KEY` is valid for general operations
 
 ```bash
 export NVCF_API_KEY="nvapi-your-general-operations-token"
-./nvcf-cli invoke --debug func-123 ver-456 '{"input": "test"}'
+./nvcf-cli function invoke --debug --function-id func-123 --version-id ver-456 --request-body '{"input": "test"}'
 # Look for: "Using API KEY for"
 ```
 
@@ -1305,7 +1303,7 @@ Solution: Deploy operations prefer `NVCF_TOKEN` but can fallback to `NVCF_API_KE
 ```bash
 export NVCF_TOKEN="nvapi-your-function-creation-token"
 export NVCF_API_KEY="nvapi-your-general-operations-token"  # fallback
-./nvcf-cli deploy --debug --function-id func-123 --version-id ver-456 --gpu H100 --instance-type ON-PREM.GPU.H100_1x
+./nvcf-cli function deploy create --debug --function-id func-123 --version-id ver-456 --gpu H100 --instance-type ON-PREM.GPU.H100_1x
 # Look for: "Using FUNCTION TOKEN for POST" or "Using API KEY for POST"
 ```
 
@@ -1315,15 +1313,15 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # fallback
 # See exactly which token is being used for each command
 
 # Function creation (uses NVCF_TOKEN)
-./nvcf-cli create --debug --name test --image nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8 --inference-url /echo --inference-port 8000
+./nvcf-cli function create --debug --name test --image nvcr.io/0651155215864979/ncp-dev/load_tester_supreme:0.0.8 --inference-url /echo --inference-port 8000
 # Output: DEBUG: Using FUNCTION TOKEN for POST /v2/nvcf/accounts/nvcf-default/functions
 
 # Function deletion (uses NVCF_TOKEN only)
-./nvcf-cli delete --debug --function-id func-123 --version-id ver-456
+./nvcf-cli function delete --debug --function-id func-123 --version-id ver-456
 # Output: DEBUG: Using FUNCTION TOKEN for DELETE /v2/nvcf/functions/func-123/versions/ver-456
 
 # Function invocation (uses NVCF_API_KEY)
-./nvcf-cli invoke --debug func-123 ver-456 '{"input": "test"}'
+./nvcf-cli function invoke --debug --function-id func-123 --version-id ver-456 --request-body '{"input": "test"}'
 # Output: DEBUG: Using API KEY for POST /v2/nvcf/functions/func-123/versions/ver-456/invocations
 
 ```
@@ -1332,11 +1330,11 @@ export NVCF_API_KEY="nvapi-your-general-operations-token"  # fallback
 
 | Operation | Required Token | Fallback | Debug Command |
 |---------------|-------------------|--------------|-------------------|
-| `create` | `NVCF_TOKEN` | `NVCF_API_KEY` | `./nvcf-cli create --debug ...` |
-| `deploy` | `NVCF_TOKEN` | `NVCF_API_KEY` | `./nvcf-cli deploy --debug ...` |
-| `delete` | `NVCF_TOKEN` | None | `./nvcf-cli delete --debug ...` |
-| `invoke` | `NVCF_API_KEY` | `NVCF_TOKEN` | `./nvcf-cli invoke --debug ...` |
-| `list`, `get`, `queue` | `NVCF_API_KEY` | `NVCF_TOKEN` | `./nvcf-cli list --debug ...` |
+| `function create` | `NVCF_TOKEN` | `NVCF_API_KEY` | `./nvcf-cli function create --debug ...` |
+| `function deploy create` | `NVCF_TOKEN` | `NVCF_API_KEY` | `./nvcf-cli function deploy create --debug ...` |
+| `function delete` | `NVCF_TOKEN` | None | `./nvcf-cli function delete --debug ...` |
+| `function invoke` | `NVCF_API_KEY` | `NVCF_TOKEN` | `./nvcf-cli function invoke --debug ...` |
+| `function list`, `function get`, `function queue` | `NVCF_API_KEY` | `NVCF_TOKEN` | `./nvcf-cli function list --debug ...` |
 
 ### Configuration Issues
 
@@ -1470,13 +1468,13 @@ The enhanced CLI is 100% backward compatible with existing workflows. Here's how
 #### Current Users: Keep Using What Works
 
 ```bash
-# Your existing workflows continue to work unchanged
+# Explicit IDs and manually exported tokens keep working
 export NVCF_API_KEY="your-existing-key"
 export NVCF_TOKEN="your-existing-token"
 
-./nvcf-cli create --input-file function.json  # Still works
-./nvcf-cli deploy --function-id func-123 --version-id ver-456  # Still works
-./nvcf-cli invoke --function-id func-123 --version-id ver-456 --request-body '{}'  # Still works
+./nvcf-cli function create --input-file function.json
+./nvcf-cli function deploy create --function-id func-123 --version-id ver-456
+./nvcf-cli function invoke --function-id func-123 --version-id ver-456 --request-body '{}'
 ```
 
 #### Gradual Enhancement Path
@@ -1485,9 +1483,9 @@ export NVCF_TOKEN="your-existing-token"
 
    ```bash
    # After create/deploy, you can now skip IDs
-   ./nvcf-cli create --input-file function.json
-   ./nvcf-cli deploy  # Uses saved context automatically
-   ./nvcf-cli invoke --request-body '{"input": "test"}'  # Uses saved context
+   ./nvcf-cli function create --input-file function.json
+   ./nvcf-cli function deploy create  # Uses saved context automatically
+   ./nvcf-cli function invoke --request-body '{"input": "test"}'  # Uses saved context
    ```
 
 2. Phase 2: Try automatic token generation (optional)
@@ -1502,8 +1500,8 @@ export NVCF_TOKEN="your-existing-token"
 
    ```bash
    # Separate dev/prod environments
-   nvcf-cli --config dev.yaml create --input-file function.json
-   nvcf-cli --config prod.yaml list functions
+   nvcf-cli --config dev.yaml function create --input-file function.json
+   nvcf-cli --config prod.yaml function list
    ```
 
 #### What's New vs What's The Same
@@ -1524,7 +1522,7 @@ New commands you can try (optional):
 - `nvcf-cli refresh` - Refresh token while keeping context
 - `nvcf-cli api-key generate` - Generate API keys
 - `nvcf-cli status` - Check current state
-- `nvcf-cli undeploy` - Undeploy functions
+- `nvcf-cli function deploy remove` - Remove a function deployment
 
 Enhanced existing commands:
 
