@@ -31,11 +31,16 @@ func kimiWorkerNGC(i string) *corev1.Pod {
 func admitPlaceholder(t *testing.T, g CRIUGroup, skip, cache bool) (*corev1.Pod, *corev1.Pod) {
 	t.Helper()
 	m, _ := groupMutator(t, g, "")
-	m.SkipUnusedInits = skip
 	if cache {
 		m.NodeModelCache = &NodeModelCache{Root: "/var/lib/nvsnap-model-cache", Wait: 600, Tenants: fixedTenants{"sr-fn": "tenant:nca=a"}}
 	}
 	pod := kimiWorkerNGC("1")
+	if !skip {
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[KeepInitsAnnotation] = "true"
+	}
 	patches, err := m.Mutate(context.Background(), pod)
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +69,7 @@ func hasVolume(p *corev1.Pod, name string) bool {
 }
 
 // The failure this fixes: a restore placeholder that still ran its model
-// download (skipUnusedInits off) pulled the whole model from the registry
+// download (kept: KeepInitsAnnotation) pulled the whole model from the registry
 // (1.56 TB for one Kimi worker) although the node cache held it, because
 // only cold pods were wrapped. Its download now seeds from the node's copy.
 func TestGroupPlaceholderDownloadSeedsFromTheNodeCache(t *testing.T) {

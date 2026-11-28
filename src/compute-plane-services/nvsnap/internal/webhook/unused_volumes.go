@@ -11,7 +11,7 @@ package webhook
 // takes longer than a cold start. Yet a restored process keeps the files
 // it had open and the mappings it had; it does not read the model again.
 //
-// So, with Mutator.SkipUnusedInits, a group capture records the emptyDir
+// So a group capture records the emptyDir
 // volumes that were too large to copy into the checkpoint and that no
 // restored process of any member uses (CRIUGroup.UnusedVolumes, decided
 // once for the whole group by GroupUnusedVolumes from each member's dump),
@@ -246,7 +246,7 @@ func VolumesAt(pod *corev1.Pod, container string, mountpoints []string) []string
 // Mutator skips setup for unused volumes, the placeholder is a group's,
 // and the pod may drop its setup. Nil otherwise.
 func (m *Mutator) unusedForPlaceholder(pod *corev1.Pod, group bool, man checkpointstore.Manifest) map[string]bool {
-	if !group || !m.SkipUnusedInits || !mayDropSetup(pod) {
+	if !group || !mayDropSetup(pod) {
 		return nil
 	}
 	out := map[string]bool{}

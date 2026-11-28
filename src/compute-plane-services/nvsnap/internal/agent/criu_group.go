@@ -993,9 +993,7 @@ func (c *criuAutoRestorer) captureGroup(ctx context.Context, leader *corev1.Pod,
 		if c.a.gpushareEnabledFor(ranks[0]) {
 			data["gpushare"] = "true"
 		}
-		if c.a.config.Webhook.SkipUnusedInits {
-			recordUnusedVolumes(data, members, len(ranks), companionContainers, results, log)
-		}
+		recordUnusedVolumes(data, members, len(ranks), companionContainers, results, log)
 		if aliases != "" {
 			data["serviceAddrs"] = aliases
 		}
@@ -1554,7 +1552,7 @@ func (c *criuAutoRestorer) checkpointInstance(ctx context.Context, ranks, compan
 	reqs := make([]CheckpointRequest, 0, len(ranks)+len(companions))
 	// Only an instance of several members restores as a group, whose
 	// placeholders may skip setup.
-	use := c.a.config.Webhook.SkipUnusedInits && len(ranks)+len(companions) > 1
+	use := len(ranks)+len(companions) > 1
 	for _, p := range ranks {
 		reqs = append(reqs, CheckpointRequest{Namespace: p.Namespace, PodName: p.Name, ContainerName: gpuContainer(p), CaptureID: capture, VolumeUse: use})
 	}
