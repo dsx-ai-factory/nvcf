@@ -275,6 +275,16 @@ crio:
 monitoring:
   enabled: false
 
+# Per-pod inotify headroom for the cache pods. fs.inotify.max_user_instances
+# is an "unsafe" sysctl: the kubelet admits it only when started with
+# --allowed-unsafe-sysctls fs.inotify.max_user_instances. Set enabled=false on
+# clusters that have not opted in, otherwise the pods are rejected with
+# SysctlForbidden; the pods then share the node's per-uid inotify budget and
+# may need the manual restart described in nvbugs#6471949.
+inotify:
+  enabled: true
+  maxUserInstances: 1024
+
 updateStrategy:
   rollingUpdate:
     maxUnavailable: 1
