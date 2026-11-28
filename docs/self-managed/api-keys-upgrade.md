@@ -161,13 +161,12 @@ unavailable. There is no supported way to restore it.
 
 ## After the upgrade
 
-If a create, update or delete request returns 503 without a Retry-After
-header, the result is unknown. The request may or may not have been applied.
-
-- Create: list your keys before you try again. Repeating a create can produce
-  a second key.
-- Delete: repeat the delete until it succeeds. Deleting a key that is already
-  gone is harmless.
+If something fails during or after the upgrade, see the
+[Troubleshooting](./troubleshooting.md) page. The agent skill references
+[Debugging](https://github.com/NVIDIA/nvcf/blob/main/ai-tooling/user/skills/nvcf-self-managed-installation/references/debugging.md)
+and
+[CLI troubleshooting](https://github.com/NVIDIA/nvcf/blob/main/ai-tooling/user/skills/nvcf-self-managed-cli/reference/troubleshooting.md)
+cover API Keys failures.
 
 <Warning>
 Rolling back to the previous version is not supported once the new pods have
