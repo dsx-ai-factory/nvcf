@@ -135,7 +135,7 @@ class ThreeTableWritesIntegrationTest {
         assertThat(accountConverter.modelToVo(accountRow())).isEqualTo(
                 new KeyByOwnerAndAccountAndServiceVo(
                         new KeyByOwnerAndServiceVo(updated, KEY_OWNER_VO_1),
-                        properties.getNcaId()));
+                        properties.getNcaId()).toBuilder().ncaIdInDetails(properties.getNcaId()).build());
     }
 
     @Test
@@ -147,7 +147,7 @@ class ThreeTableWritesIntegrationTest {
 
         var expected = new KeyByOwnerAndAccountAndServiceVo(
                 KEY_BY_OWNER_AND_SERVICE_VO_1.toBuilder().keyStatus(SUSPENDED).build(),
-                properties.getNcaId());
+                properties.getNcaId()).toBuilder().ncaIdInDetails(properties.getNcaId()).build();
         assertThat(accountConverter.modelToVo(accountRow())).isEqualTo(expected);
     }
 

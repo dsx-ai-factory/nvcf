@@ -86,7 +86,8 @@ class KeysDaoTest {
     private static final long NOW_MICROS = 1_791_965_640_123_456L;
     private static final String NCA_ID = "test-nca-id";
     private static final KeyByOwnerAndAccountAndServiceVo KEY_BY_ACCOUNT_VO_1 =
-            new KeyByOwnerAndAccountAndServiceVo(KEY_BY_OWNER_AND_SERVICE_VO_1, NCA_ID);
+            new KeyByOwnerAndAccountAndServiceVo(KEY_BY_OWNER_AND_SERVICE_VO_1, NCA_ID).toBuilder()
+                    .ncaIdInDetails(NCA_ID).build();
     private static final KeyByOwnerAndAccountAndServiceModel KEY_BY_ACCOUNT_MODEL_1 =
             KeyByOwnerAndAccountAndServiceModel.builder()
                     .ncaId(NCA_ID)
