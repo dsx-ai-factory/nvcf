@@ -251,11 +251,72 @@ func TestSharedNamespaceKeptOverFixedName(t *testing.T) {
 		corev1.EnvVar{Name: "ETCD_ENDPOINTS", Value: "etcd:2379"},
 		corev1.EnvVar{Name: "NATS_SERVER", Value: "nats://nats:4222"})
 	ctx := withSharedNamespaceDecision(context.Background(), pod)
-	var ops []PatchOp
-	ops = append(ops, m.dynamoNamespacePatches(ctx, pod)...)
-	ops = append(ops, m.sharedNamespacePatches(ctx, pod)...)
+	ops := append(m.dynamoNamespacePatches(ctx, pod), m.sharedNamespacePatches(ctx, pod)...)
 	got := applyPatches(t, pod, ops)
 	if v := mainEnv(got, "DYN_NAMESPACE"); v != deepseekNS+"-dsv41-flash" {
 		t.Fatalf("DYN_NAMESPACE %q, want the original %s-dsv41-flash the running pod has", v, deepseekNS)
+	}
+}
+
+// failPodListsAfter makes every list of pods after the first n fail.
+func failPodListsAfter(m *Mutator, n int) *int {
+	lists := 0
+	m.Kube.(*fake.Clientset).PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		lists++
+		if lists > n {
+			return true, nil, errors.New("apiserver unavailable")
+		}
+		return false, nil, nil
+	})
+	return &lists
+}
+
+// Through Mutate: a Kubernetes-discovery pod with instance-local etcd and
+// NATS endpoints, while a running pod of the instance has the original
+// name, is admitted with the original name (not the fixed one).
+func TestMutateKubeDiscoveryKeepsOriginalNameWhileInstanceRuns(t *testing.T) {
+	running := deepseekPod("frontend-0", "")
+	running.Status.Phase = corev1.PodRunning
+	m := sharedMutator(running)
+	m.Backend, m.CaptureCandidate = newBackend(t), criuCandidates
+	pod := deepseekPod("prefill-1", "2",
+		corev1.EnvVar{Name: "ETCD_ENDPOINTS", Value: "etcd:2379"},
+		corev1.EnvVar{Name: "NATS_SERVER", Value: "nats://nats:4222"})
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := mainEnv(applyPatches(t, pod, patches), "DYN_NAMESPACE"); v != deepseekNS+"-dsv41-flash" {
+		t.Fatalf("DYN_NAMESPACE %q, want the original %s-dsv41-flash the running pod has", v, deepseekNS)
+	}
+}
+
+// Through Mutate: the namespace is read once per admission, so a pod whose
+// restore check accepted the shared name is admitted as the placeholder
+// with it even though every later read of the namespace fails.
+func TestMutateSharedNamespaceDecidedOnce(t *testing.T) {
+	man := criuCaptureRecord()
+	man.SourcePodMeta[checkpointstore.CRIUScopeMetaKey] = CRIUNamespaceScope(deepseekNS)
+	m := criuMutator(t, man)
+	m.MainContainer = 0
+	m.DynamoNamespace = "nvcf-nvsnap"
+	m.Kube = fake.NewSimpleClientset()
+	lists := failPodListsAfter(m, 1)
+	pod := deepseekPod("prefill-0", "1")
+	pod.Annotations = map[string]string{RestoreFromAnnotation: "abc123"}
+	pod.Spec.Containers[0].Image, pod.Spec.Containers[0].Command = "vllm", []string{"python3", "-m", "dynamo.vllm"}
+	patches, err := m.Mutate(context.Background(), pod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := applyPatches(t, pod, patches)
+	if got.Annotations[CRIURestoreAnnotation] == "" {
+		t.Fatalf("not admitted as the restore placeholder (a later read of the namespace decided again): %v", got.Annotations)
+	}
+	if v := mainEnv(got, "DYN_NAMESPACE"); v != "nvcf-nvsnap-dsv41-flash" {
+		t.Fatalf("placeholder DYN_NAMESPACE %q, want the shared nvcf-nvsnap-dsv41-flash", v)
+	}
+	if *lists != 1 {
+		t.Errorf("namespace pods listed %d times in one admission, want 1", *lists)
 	}
 }
