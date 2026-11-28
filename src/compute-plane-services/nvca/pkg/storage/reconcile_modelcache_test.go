@@ -18,6 +18,7 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,6 +27,7 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -238,4 +240,60 @@ func TestHelperAPIs(t *testing.T) {
 	}
 	err = r.validateStorageRequest(&stReq, nil)
 	assert.NotNil(t, err)
+}
+
+// namespaceEnforcingClient makes the fake client behave like a real API server
+// on the clusters in nvbugs#7055457: creating a namespaced object whose
+// namespace does not exist is rejected with
+// `namespaces "nvca-modelcache-init" not found`. The fake client otherwise
+// happily creates objects in namespaces that were never created.
+type namespaceEnforcingClient struct {
+	client.Client
+}
+
+func (c namespaceEnforcingClient) Create(ctx context.Context,
+	obj client.Object, opts ...client.CreateOption,
+) error {
+	if ns := obj.GetNamespace(); ns != "" {
+		err := c.Client.Get(ctx, client.ObjectKey{Name: ns}, &corev1.Namespace{})
+		if apierrors.IsNotFound(err) {
+			return apierrors.NewNotFound(corev1.Resource("namespaces"), ns)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+// TestEnsureCacheMountOptionsConfigMapCreatesInitNamespace reproduces
+// nvbugs#7055457 on the model-cache start-up path: on a cluster where nothing
+// has created nvca-modelcache-init, every object NVCA puts in that namespace
+// fails with `namespaces "nvca-modelcache-init" not found`. The agent must
+// provision the namespace it hard-codes rather than assume the platform did.
+func TestEnsureCacheMountOptionsConfigMapCreatesInitNamespace(t *testing.T) {
+	ctx := context.Background()
+	s := newTestScheme()
+	c := namespaceEnforcingClient{Client: newFakeClient(s)}
+
+	// The namespace does not exist, exactly as on gcp-usc1-ct1 /
+	// forge-az31-ct1 / aws-use1-dev1 in the report.
+	nsErr := c.Get(ctx, client.ObjectKey{Name: ModelCacheInitNamespace}, &corev1.Namespace{})
+	assert.True(t, apierrors.IsNotFound(nsErr), "test setup: %s must be absent", ModelCacheInitNamespace)
+
+	err := EnsureCacheMountOptionsConfigMap(ctx, c, DefaultCacheMountOptionsConfigMapName)
+	assert.NoError(t, err,
+		"model cache start-up must create namespace %s before seeding its mount option ConfigMap",
+		ModelCacheInitNamespace)
+
+	cm := &corev1.ConfigMap{}
+	assert.NoError(t, c.Get(ctx, client.ObjectKey{
+		Namespace: ModelCacheInitNamespace,
+		Name:      DefaultCacheMountOptionsConfigMapName,
+	}, cm), "mount option ConfigMap must exist in %s after start-up", ModelCacheInitNamespace)
+
+	ns := &corev1.Namespace{}
+	if assert.NoError(t, c.Get(ctx, client.ObjectKey{Name: ModelCacheInitNamespace}, ns)) {
+		assert.Equal(t, "nvca", ns.Labels["app.kubernetes.io/managed-by"])
+	}
 }
