@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/config"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
@@ -93,9 +94,55 @@ func (u *Uploader) allowPrepare(size int64) (diskguard.Decision, error) {
 
 // updateSpoolGauges reports spool use and the pending segments.
 func (u *Uploader) updateSpoolGauges(pending []diskguard.Candidate) {
+	if err := u.updateOpenFileAge(); err != nil {
+		slog.Warn("read open file metadata", "error", safeError(err))
+	}
 	if err := u.guard.UpdateGauges(u.now(), pending); err != nil {
 		slog.Warn("read spool usage", "error", safeError(err))
 	}
+}
+
+type openFileObservation struct {
+	info  os.FileInfo
+	since time.Time
+}
+
+// updateOpenFileAge only stats active files. A latched mtime cannot move
+// forward on appends, unlike the file's current mtime. After restart it is
+// only a lower estimate of record age because earlier writes are unknown.
+func (u *Uploader) updateOpenFileAge() error {
+	u.openFilesMu.Lock()
+	defer u.openFilesMu.Unlock()
+	scan, err := segment.ScanDir(u.cfg.SourceDir, u.cfg.Prefixes())
+	if err != nil {
+		return err
+	}
+	next := make(map[string]openFileObservation, len(scan.Active))
+	for _, item := range scan.Active {
+		info, err := os.Lstat(item.Path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			continue
+		}
+		since := info.ModTime()
+		if previous, ok := u.openFiles[item.Path]; ok && os.SameFile(previous.info, info) && info.Size() >= previous.info.Size() && !info.ModTime().Before(previous.info.ModTime()) {
+			since = previous.since
+		}
+		next[item.Path] = openFileObservation{info: info, since: since}
+	}
+	now := u.now()
+	age := 0.0
+	for _, observation := range next {
+		age = max(age, now.Sub(observation.since).Seconds())
+	}
+	u.openFiles = next
+	u.metrics.Set(telemetry.OpenFileAge, age, nil)
+	return nil
 }
 
 // spoolGuardConfig is the disk guard configuration for the spool settings. A

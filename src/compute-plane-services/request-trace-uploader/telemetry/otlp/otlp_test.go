@@ -259,6 +259,19 @@ func TestOTLPDeliversEveryKindOverEachProtocol(t *testing.T) {
 			if success == nil || success.GetAsDouble() != 2 || attributes(success)[telemetry.BackendLabel] != "fake" {
 				t.Fatalf("uploads{status=success} = %v, want 2 with backend=fake", success)
 			}
+			openAge := r.metric(MetricPrefix + "open_file_age")
+			if openAge == nil || openAge.GetUnit() != "s" || len(openAge.GetGauge().GetDataPoints()) != 1 {
+				t.Fatalf("open_file_age = %v, want one pre-initialized gauge in seconds", openAge)
+			}
+			point := openAge.GetGauge().GetDataPoints()[0]
+			if point.GetAsDouble() != 0 || attributes(point)[telemetry.BackendLabel] != "fake" {
+				t.Fatalf("initial open_file_age = %v, want zero with backend=fake", point)
+			}
+			for key := range attributes(point) {
+				if key != telemetry.BackendLabel && key != telemetry.PodLabel {
+					t.Fatalf("unexpected open_file_age attribute %q", key)
+				}
+			}
 			pending := r.metric(MetricPrefix + telemetry.PendingSegments)
 			if pending == nil || pending.GetGauge() == nil || pending.GetGauge().GetDataPoints()[0].GetAsDouble() != 7 {
 				t.Fatalf("pending_segments = %v, want a gauge of 7", pending)

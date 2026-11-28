@@ -85,9 +85,12 @@ const (
 	SpoolFreeBytes    = "spool_free_bytes"
 	PendingBytes      = "pending_bytes"
 	OldestPendingAge  = "oldest_pending_age"
-	BatchSegments     = "batch_segments"
-	BatchBytes        = "batch_bytes"
-	BatchSplits       = "batch_splits"
+	// OpenFileAge estimates the oldest wait in nonempty active files from
+	// their first observed modification time, retained across appends.
+	OpenFileAge   = "open_file_age"
+	BatchSegments = "batch_segments"
+	BatchBytes    = "batch_bytes"
+	BatchSplits   = "batch_splits"
 	// RecordsEvaluated counts records checked against suppression rules,
 	// RecordsSuppressed the records a rule acted on, and
 	// SuppressionHeaderPresent the evaluated records that carried a rule's
@@ -237,6 +240,7 @@ var catalog = cloneAll([]Instrument{
 	{Name: SpoolFreeBytes, Kind: Gauge, Unit: "By"},
 	{Name: PendingBytes, Kind: Gauge, Unit: "By"},
 	{Name: OldestPendingAge, Kind: Gauge, Unit: "s"},
+	{Name: OpenFileAge, Kind: Gauge, Unit: "s"},
 	{Name: BatchSegments, Kind: Histogram, Unit: "1", Buckets: countBuckets},
 	{Name: BatchBytes, Kind: Histogram, Unit: "By", Buckets: bytesBuckets},
 	{Name: BatchSplits, Kind: Counter, Unit: "1"},
@@ -383,8 +387,10 @@ func presetLabels(instrument Instrument) []Labels {
 }
 
 // Preset records zero for every counter series known before any traffic, so
-// the first export already shows them.
+// the first export already shows them. OpenFileAge starts at zero until
+// the first successful metadata scan.
 func Preset(m Metrics) {
+	m.Set(OpenFileAge, 0, nil)
 	for _, instrument := range catalog {
 		if instrument.Kind != Counter {
 			continue

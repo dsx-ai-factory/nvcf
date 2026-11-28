@@ -265,3 +265,14 @@ func TestChangingAReturnedInstrumentDoesNotChangeValidation(t *testing.T) {
 		t.Fatal("Validate accepted a request_id label after a returned copy was changed")
 	}
 }
+
+func TestOpenFileAgeIsPresetWithoutExtraLabels(t *testing.T) {
+	m := newMemory(t)
+	instrument, ok := Lookup("open_file_age")
+	if !ok || instrument.Kind != Gauge || instrument.Unit != "s" || len(instrument.Labels) != 0 {
+		t.Fatalf("open_file_age = %+v, %v; want a gauge in seconds without labels", instrument, ok)
+	}
+	if value, ok := m.Value("open_file_age", nil); !ok || value != 0 {
+		t.Fatalf("initial open_file_age = %v, %v; want 0, true", value, ok)
+	}
+}

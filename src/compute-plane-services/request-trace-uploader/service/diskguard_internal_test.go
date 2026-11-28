@@ -17,6 +17,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/diskguard"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/internal/journalfs"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/journal"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/telemetry"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/request-trace-uploader/uploadertest"
 )
 
@@ -223,5 +224,118 @@ func TestAQuarantineRemovalWhoseDirectorySyncFailedIsCountedAndLogsNoPath(t *tes
 	}
 	if logged := safeError(err); strings.Contains(logged, dir) {
 		t.Fatalf("logged error %q names the quarantine directory", logged)
+	}
+}
+
+func TestOpenFileAgeTracksMetadataAcrossAppendsAndRollover(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Unix(1800000000, 0)
+	metrics, err := telemetry.NewMemory("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := diskguard.New(diskguard.DefaultConfig(), diskguard.StatVolume(dir), nil, nil, diskguard.Options{Gauges: gaugesFor(metrics)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{cfg: config.Config{SourceDir: dir, SegmentPrefix: "trace", AuditPrefix: "audit"}, metrics: metrics, guard: guard, now: func() time.Time { return now }}
+	write := func(name, data string, age time.Duration) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		// Deliberately not gzip: measuring this file must never parse content.
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stamp := now.Add(-age)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	check := func(want float64) {
+		t.Helper()
+		u.updateSpoolGauges(nil)
+		got, ok := metrics.Value("open_file_age", nil)
+		if !ok || got != want {
+			t.Fatalf("open_file_age = %v, %v; want %v, true", got, ok, want)
+		}
+		if pending, _ := metrics.Value(telemetry.OldestPendingAge, nil); pending != 0 {
+			t.Fatalf("closed pending age = %v, want 0", pending)
+		}
+	}
+	check(0)
+	active := write("trace.000001.jsonl.gz", "first", time.Hour)
+	check(3600)
+	now = now.Add(time.Minute)
+	write("trace.000001.jsonl.gz", "first plus append", 0)
+	check(3660)
+	write("audit.000004.jsonl.gz", "audit", 2*time.Hour)
+	check(7200)
+	// Both spellings of the highest index remain active.
+	write("audit.0000004.jsonl.gz", "tied", 3*time.Hour)
+	check(10800)
+	write("audit.000005.jsonl.gz", "", 0)
+	check(3660)
+	write("trace.000002.jsonl.gz", "", 0)
+	check(0)
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("metric removed a segment: %v", err)
+	}
+	write("trace.000002.jsonl.gz", "new", time.Minute)
+	check(60)
+	// A new inode at the same path must not inherit the old timestamp.
+	replacement := write("replacement", "replacement", 0)
+	if err := os.Rename(replacement, filepath.Join(dir, "trace.000002.jsonl.gz")); err != nil {
+		t.Fatal(err)
+	}
+	check(0)
+	now = now.Add(time.Minute)
+	check(60)
+	// An observed truncation starts a new estimate.
+	write("trace.000002.jsonl.gz", "x", 0)
+	check(0)
+	now = now.Add(time.Minute)
+	check(60)
+	write("trace.000002.jsonl.gz", "", 0)
+	check(0)
+	write("trace.000002.jsonl.gz", "future", -time.Minute)
+	check(0)
+	now = now.Add(2 * time.Minute)
+	check(60)
+	// A backwards mtime is another indication the content was rewritten.
+	write("trace.000002.jsonl.gz", "rewritten", 2*time.Minute)
+	check(120)
+	// Failed discovery must not clear the previous observation.
+	u.cfg.SourceDir = filepath.Join(dir, "missing")
+	u.updateSpoolGauges(nil)
+	if got, _ := metrics.Value("open_file_age", nil); got != 120 {
+		t.Fatalf("age after failed scan = %v, want 120", got)
+	}
+	u.cfg.SourceDir = dir
+	// A fresh observer starts from the latest mtime, not persisted history.
+	write("trace.000002.jsonl.gz", "rewritten plus append", 0)
+	restarted := &Uploader{cfg: u.cfg, metrics: metrics, guard: guard, now: u.now}
+	restarted.updateSpoolGauges(nil)
+	if got, _ := metrics.Value("open_file_age", nil); got != 0 {
+		t.Fatalf("age after restart = %v, want 0", got)
+	}
+	check(120)
+	// Nonregular active names are ignored without following their target.
+	if err := os.Remove(filepath.Join(dir, "trace.000002.jsonl.gz")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(active, filepath.Join(dir, "trace.000002.jsonl.gz")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "audit.000006.jsonl.gz"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	check(now.Sub(time.Unix(1800000000, 0).Add(time.Minute)).Seconds())
+	if err := os.Remove(active); err != nil {
+		t.Fatal(err)
+	}
+	check(0)
+	if metrics.Dropped() != 0 {
+		t.Fatalf("dropped metrics = %d", metrics.Dropped())
 	}
 }
