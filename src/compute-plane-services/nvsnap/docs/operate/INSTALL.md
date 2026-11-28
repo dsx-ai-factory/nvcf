@@ -35,7 +35,7 @@ is described in [ARCHITECTURE.md](../ARCHITECTURE.md#1-what-nvsnap-is-and-what-a
 |---|---|
 | Kubernetes and Helm 3 | The chart and its subcharts |
 | GPU nodes labelled `nvidia.com/gpu.present=true` (GPU Operator), `cloud.google.com/gke-gpu=true` (GKE) or `feature.node.kubernetes.io/pci-10de.present=true` (Node Feature Discovery) | The agent DaemonSet's node affinity (`agent.nodeAffinity`) |
-| An NVIDIA driver with the CUDA checkpoint driver API (`cuCheckpointProcess*`); 610 or later for multi-GPU capture under gpushare ([GPUSHARE.md](../design/GPUSHARE.md#requirements-and-limits)) | CRIU capture checkpoints GPU state through it |
+| An NVIDIA driver with the CUDA checkpoint driver API (`cuCheckpointProcess*`); for `criu`, major 610 or later and the same major on every GPU node, else every GPU pod gets the cachedir fallback (`agent.criuMinDriverMajor`; `clusterDriver.Gate`, `internal/agent/driver_gate.go`) | CRIU capture checkpoints GPU state through it |
 | containerd (default) or CRI-O | The agent talks to the runtime's socket (`agent.hostPaths.containerdSock`) and reads its storage directory (`agent.hostPaths.containerdStorage`); `agent.runtime` is informational |
 | cgroup v2 | Process discovery and freezing |
 | Credentials for the image registry (`nvsnap.imageRegistry`) | Every nvsnap image is pulled from it |
@@ -92,10 +92,11 @@ pod is prepared for capture or restore, and every pod starts cold.
 
 | Value | Default | What it decides |
 |---|---|---|
-| `agent.captureMethod` | `cachedir` | `cachedir` captures caches and the model; `criu` captures the processes ([ARCHITECTURE.md §2](../ARCHITECTURE.md#2-the-two-capture-methods-and-how-one-is-chosen)) |
+| `agent.captureMethod` | `cachedir` | `cachedir` captures caches and the model, of pods labelled `nvsnap.io/capture: "true"` (or picked by the election); `criu` captures the processes ([ARCHITECTURE.md §2](../ARCHITECTURE.md#2-the-two-capture-methods-and-how-one-is-chosen)) |
+| `agent.image.tag` | `v0.2.70-rminject1` | The agent build. Older than every build in [BENCHMARKS.md](../BENCHMARKS.md) and [SUPPORT.md](../SUPPORT.md), which used pre-release `v0.2.75` to `v0.2.92` builds |
 | `agent.criuCaptureOptIn` | `[]` | Under `criu`, which multi-pod instances are captured, by pod label (for example `function-id`); an entry without `values` opts in every pod carrying the label |
 | `webhook.injectScope` | `all` | `all` namespaces not labelled `nvsnap.io/inject=false`, or `optIn`: only namespaces labelled `nvsnap.io/inject=true` |
-| `agent.modelVolume.enabled` | `false` | One model volume per model per cluster |
+| `agent.modelVolume.enabled` | `false` | One model volume per model artifact and tenant |
 | `agent.election.enabled` | `false` | One downloader per hash when a chart starts many workers (cachedir only) |
 | `agent.l2.storageClass` | | The StorageClass of the per-checkpoint volume pair; empty keeps checkpoints on their nodes |
 | `agent.auth.enabled`, `agent.auth.mode` | `false`, `permissive` | Bearer-token checks on the agent API. Turn on, run `permissive` until no unauthenticated calls are counted, then `required` |

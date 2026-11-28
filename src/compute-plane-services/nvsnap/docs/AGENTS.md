@@ -25,13 +25,14 @@ workflow) enforces the ones a script can check; the rest are for review.
 |---|---|
 | Entry points | [START-HERE.md](START-HERE.md), then [README.md](README.md) (the index), then [GLOSSARY.md](GLOSSARY.md) |
 | How nvsnap works | [ARCHITECTURE.md](ARCHITECTURE.md): the one technical document. A behaviour change updates its section in the same PR |
-| Every number | [RESULTS.md](RESULTS.md), with the record it comes from under `results/` |
+| Every number | [BENCHMARKS.md](BENCHMARKS.md), with the record it comes from under `results/` |
+| What is supported, refused or not tested | [SUPPORT.md](SUPPORT.md), each row with its evidence |
 | Working notes behind an architecture section | `design/`, each opening with a status line |
 | Recipes: install, operate, develop | `operate/` |
 | A dated run: a benchmark, a test campaign | `results/`; a record, not maintained |
-| A superseded document | Nowhere: delete it (git history keeps it), after moving any still-true rule into ARCHITECTURE.md and any result that has no other record into RESULTS.md |
+| A superseded document | Nowhere: delete it (git history keeps it), after moving any still-true rule into ARCHITECTURE.md and any result that has no other record into a record under `results/` |
 
-The top level holds only START-HERE, ARCHITECTURE, RESULTS, GLOSSARY,
+The top level holds only START-HERE, ARCHITECTURE, SUPPORT, BENCHMARKS, GLOSSARY,
 REFERENCE, README and this file. A new document goes into
 [README.md](README.md) in the same commit that adds it, with what it answers
 and its status.
@@ -58,7 +59,7 @@ and its status.
 Every number names the hardware, the date and the nvsnap build ("not
 recorded" when the record does not say), and links the record it comes from.
 A number with no record is left out. A number found wrong is withdrawn in
-[RESULTS.md](RESULTS.md), in place, with the reason; it is not silently
+[BENCHMARKS.md](BENCHMARKS.md), in place, with the reason; it is not silently
 replaced.
 
 ## Figures

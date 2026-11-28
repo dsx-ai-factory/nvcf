@@ -1,31 +1,41 @@
 # NvSnap
 
-**GPU checkpoint/restore for Kubernetes. Start large models warm, not cold.**
+**GPU checkpoint/restore for Kubernetes inference.** NvSnap checkpoints a running inference instance (its processes and
+their GPU memory, across every pod and node of the instance) and restores it into new pods, so a scale-up resumes a
+warm engine instead of downloading the model and starting the engine again. It works on unmodified inference images.
 
-NvSnap captures a warmed GPU inference pod and restores it on any node with
-the expensive work already done: with cache capture, no model download and no
-kernel or graph recompilation; with process capture, no engine
-re-initialization at all. It works on **unmodified** inference containers
-(results recorded for NVIDIA NIM, vLLM and SGLang): no application changes, no
-custom images, no SDK.
+Measured on GB300 with pre-release agent builds (`v0.2.x-rc` tags; the chart's default agent image,
+`v0.2.70-rminject1`, is older), [benchmarks](docs/BENCHMARKS.md):
 
-> **DeepSeek-V4-Flash (SGLang, TP=8): serving in 289 s instead of 1162 s**
-> (8x H100, June 2026). gemma-4-31B 4.5x, gpt-oss-120b 3.2x, NVFP4/FP8 MoE
-> models 1.9-2.6x. [Benchmarks](#benchmarks).
+- **Kimi K3.1 Pro, Dynamo with vLLM, 4 GPU pods (4 GPUs each, per the run notes).** No cold start and restore were
+  measured on the same cluster with the same settings, so the two numbers below are not a speedup.
+  - CRI-O cluster, no cluster storage: a cold start took about 45 to 46 minutes from the first download start
+    (scheduling and image pull not included), 30 to 33 of them downloading 1.56 TB per pod (agent v0.2.91-rc22d,
+    2026-11-22). After a capture, the agent's own group restore time had a median of 123.5 s over 11 runs (agent
+    v0.2.91-rc21 to v0.2.92-rc1); it does not include scheduling the pods or their readiness after the restore.
+  - containerd cluster (GB300 inferred from other runs there) with cluster storage, rails, agent authentication, the
+    election, the model volume and `agent.restoreCapturedAddress` on: deleting the captured instance's 7 pods and
+    restoring them to all Ready took a median of 306.5 s, teardown included, in 30 of 32 cycles (agent v0.2.91-rc9
+    to rc14, 2026-11-12 and 13). A cold start was not timed there.
+
+  [Raw data](docs/results/KIMI-K3-GB300-2026-11.md).
+- **Disaggregated vLLM v0.31.0 with NIXL over RDMA, TinyLlama 1.1B.** The restored prefill pod was Ready 28 s after
+  scheduling; the cold one answered `/health` 131 s after scheduling (agent v0.2.91-rc22w, 2026-11-25, one run).
+  [Raw data](docs/results/DISAGG-NIXL-GB300-2026-11-25.md).
+
+When a CRIU capture or restore of a configuration fails, its pods do not start under gpushare, or the cluster's
+GPU drivers are too old for CRIU, nvsnap falls back to **cachedir**: each rank's model and compile caches are
+captured on its node, and later pods start the engine again with them. No timing of this fallback is on record.
+cachedir is also the chart's default method, where a pod is captured only when labelled `nvsnap.io/capture: "true"`
+(or picked by the opt-in election); its measured runs, on H100 with the election and a cluster storage volume on,
+are in [BENCHMARKS.md](docs/BENCHMARKS.md#cachedir). GPU checkpoint/restore is `agent.captureMethod: criu`.
+
+- What works for your workload, and what is refused: [docs/SUPPORT.md](docs/SUPPORT.md)
+- Every measured number, with its raw data: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+- Install: [docs/operate/INSTALL.md](docs/operate/INSTALL.md) · how it works: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+  · every document: [docs/](docs/README.md)
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-
-New here: [start here](docs/START-HERE.md) · install:
-[docs/operate/INSTALL.md](docs/operate/INSTALL.md) · how it works:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · every number:
-[docs/RESULTS.md](docs/RESULTS.md) · every document: [docs/](docs/README.md)
-
-**Why it works:** GPU cold starts are dominated by repeatable work: weight
-download, model load, CUDA graph capture, JIT and torch.compile. NvSnap does
-that work once, captures the result, and distributes it: same-node cache,
-shared ReadOnlyMany volume, peer-to-peer cascade (every node that restores
-becomes a source), and, for cache captures, an object store for
-cross-cluster.
 
 ---
 
@@ -35,23 +45,24 @@ NvSnap has two capture methods. The cluster operator picks one with the
 chart value `agent.captureMethod` (default `cachedir`); it applies to every
 capture on the cluster:
 
-- **Warm cache restore (`cachedir`), any GPU count.** NvSnap captures the
-  warm pod's model and JIT/compile caches into one canonical cache
-  directory and mounts it read-only on restore. Engines skip the weight
-  download and reuse prebuilt kernels, graphs, and compile caches. This is
-  the path behind the headline numbers above.
-- **Full process checkpoint/restore (`criu`).** CRIU plus NVIDIA
-  `cuda-checkpoint` snapshot the whole process (CPU state, open FDs,
-  io_uring/epoll, and GPU memory). The restored pod resumes a live,
-  already-serving engine with no re-initialization at all. Multi-GPU
-  (tensor-parallel) workloads are captured this way when they run under
-  [gpushare](docs/design/GPUSHARE.md), an `LD_PRELOAD` shim that releases the GPU
-  memory processes share before the checkpoint and re-creates it after
-  restore; without it a multi-GPU CRIU capture is refused. Multi-pod
-  instances (a StatefulSet, LeaderWorkerSet or Grove group, possibly
-  spanning nodes) are captured and restored as one group, but only on
-  request: pods annotated `nvsnap.io/criu-capture: "true"`, or matched by
-  the chart value `agent.criuCaptureOptIn`.
+- **GPU checkpoint/restore (`criu`).** CRIU saves the processes (CPU state,
+  open files, sockets), and [gpushare](docs/design/GPUSHARE.md), an
+  `LD_PRELOAD` library the webhook adds to GPU pods, saves their GPU memory,
+  including memory the processes share, and re-creates it after the restore.
+  Instances are captured only under gpushare
+  (`internal/agent/criu_group.go`). Multi-pod instances (a StatefulSet,
+  LeaderWorkerSet or Grove group, possibly spanning nodes) are captured and
+  restored as one group, but only on request: pods annotated
+  `nvsnap.io/criu-capture: "true"`, or matched by the chart value
+  `agent.criuCaptureOptIn`.
+- **cachedir (`cachedir`), any GPU count.** NvSnap captures the warm pod's
+  model and JIT/compile caches into one cache directory and mounts it on
+  restore. The engine starts again, but skips the weight download and reuses
+  compiled kernels and graphs. Only pods labelled `nvsnap.io/capture: "true"`
+  are captured, unless the admission election (`agent.election.enabled`)
+  picks one. A CRIU cluster uses it as the fallback for a
+  configuration CRIU cannot serve
+  ([SUPPORT.md](docs/SUPPORT.md#capture-method)).
 
 A node-level **agent** (DaemonSet) performs capture/restore: it finds a
 container through the runtime's API (containerd or CRI-O, detected at start,
@@ -66,63 +77,12 @@ Deeper design docs:
 
 ---
 
-## Benchmarks
-
-### Warm cache restore (cachedir)
-
-Measured June 2026 on H100 80GB (GKE, 1-8x H100 per workload). The capture
-records the warmed model plus JIT/compile caches into a canonical cache
-directory; restore mounts it ReadOnlyMany, so engines skip the weight
-download and reuse prebuilt kernels, graphs, and compile caches instead of
-recompiling. "Speedup" is `cold_start / restore` for time-to-ready.
-
-| Model | Engine | Cold | Restore | Speedup |
-|---|---|---:|---:|---:|
-| DeepSeek-V4-Flash | SGLang TP=8 | 1162 s | **289 s** | 4.0x |
-| gemma-4-31B-it | SGLang | 492 s | **109 s** | 4.5x |
-| gpt-oss-120b | vLLM TP=4 | ~550 s | **171 s** | 3.2x |
-| Qwen3.6-35B-A3B (NVFP4) | vLLM TP=4 | 410 s | **218 s** | 1.9x |
-| Nemotron-3-Nano-30B-A3B (FP8) | vLLM TP=2 | 370 s | **144 s** | 2.6x |
-| Qwen-Image-2512 | vLLM | 198 s | **114 s** | 1.7x |
-
-Wins scale with the cold start's download + JIT/compile cost (the full
-measured matrix, including compile-light workloads that see little change,
-is in [docs/results/BENCHMARK.md](docs/results/BENCHMARK.md)). Phase breakdown for
-Qwen3.6-35B-A3B: model download 269 s to ~5 s (loads from the cache volume),
-model init 128 s to ~32 s (torch.compile 53.5 s to 5.8 s on cache hit).
-
-What cachedir compresses is the avoidable disk work: weight download and
-recompilation. Process bring-up (scheduling, framework import, CUDA init,
-tensor-parallel worker spawn) is a fixed floor paid by cold and warm alike.
-
-### Cross-node distribution (peer cascade)
-
-Every node that fetches a checkpoint registers as a source for the next
-(`internal/agent/cascade_fetch.go` `EnsureLocal`), so later fetches are not
-limited to the origin node. No fan-out throughput has been recorded.
-
-### Process checkpoint/restore (CRIU)
-
-The full process-restore path resumes a live, already-serving engine
-(no engine re-init at all). Multi-GPU workloads are checkpointed this way
-under [gpushare](docs/design/GPUSHARE.md).
-
-| Workload | Hardware, date | Result |
-|---|---|---|
-| Qwen2.5-72B-Instruct, vLLM TP=4, gpushare, restored on another node | 4x GB300, October 2026 | 66.7 s to first token from the node's copy, 87.8 s from the store; cold 242 s without the download |
-| Llama-3.1-8B, vLLM, single GPU | H100, July 2026 | 32.4 s agent restore time |
-| Qwen2.5-32B, vLLM, single GPU | H100, July 2026 | 44.3 s agent restore time |
-
-Every number with its date, hardware, build and source is in
-[docs/RESULTS.md](docs/RESULTS.md).
-
----
-
 ## Quickstart
 
 Prerequisites: a Kubernetes cluster with GPU nodes, an NVIDIA driver with the
-CUDA checkpoint driver API (`cuCheckpointProcess*`; multi-GPU capture under
-gpushare needs 610 or later, see [gpushare](docs/design/GPUSHARE.md#requirements-and-limits)),
+CUDA checkpoint driver API (`cuCheckpointProcess*`; every CRIU capture and
+restore needs driver major 610 or later, the same on every GPU node, see
+[SUPPORT.md](docs/SUPPORT.md#platform)),
 containerd or CRI-O, and `kubectl` + `helm` 3.
 
 ```bash
@@ -137,6 +97,8 @@ kubectl create secret docker-registry nvsnap-pull-secret \
 # 2. Install (agent, server, webhook; also cert-manager and the GPU Operator
 #    as subcharts unless you set cert-manager.enabled / gpu-operator.enabled false)
 helm dependency build deploy/helm/nvsnap
+#    agent.image.tag defaults to v0.2.70-rminject1, older than every build in
+#    docs/BENCHMARKS.md and docs/SUPPORT.md; set it to the build you run.
 helm install nvsnap deploy/helm/nvsnap --namespace nvsnap-system
 
 # 3. Verify
@@ -167,7 +129,7 @@ optional webhook). Full guide, options, and troubleshooting:
 │  REST API + UI   │◄───►│  nvsnap-agent (DaemonSet)             │
 │  catalog (SQLite)│     │   ├─ runtime API + /proc discovery    │
 │  metrics + audit │     │   ├─ CRIU orchestration (criu-v2)     │
-└──────────────────┘     │   ├─ cuda-checkpoint integration      │
+└──────────────────┘     │   ├─ gpushare (GPU memory)            │
                          │   ├─ cachedir capture watcher           │
                          │   └─ peer-cascade HTTP server         │
                          │                                       │
@@ -179,7 +141,12 @@ optional webhook). Full guide, options, and troubleshooting:
 ```
 
 A restore fetches a checkpoint from the first tier that has it: the node's
-own copy, then cluster storage, then peer agents. The cross-cluster object
+own copy; with `agent.rails.enabled`, peer nodes over their RDMA NICs (a
+checkpoint smaller than `agent.rails.minSize` goes to the peer agents over
+HTTP instead, before cluster storage); then a shared filesystem, when the
+agent is given one (`--fsstore-path`, not set by the chart); then the L2
+volume; then peer agents over HTTP (`EnsureLocal`,
+`internal/agent/cascade_fetch.go`). The cross-cluster object
 store (L4) is filled and pulled by replication in the background, not tried
 by a restore. Cluster config decides which tiers are present. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#6-where-bytes-live-and-how-they-move).
@@ -187,10 +154,11 @@ by a restore. Cluster config decides which tiers are present. See
 **Why the moving parts exist** (details in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- **In-namespace CRIU (criu-v2)** — the agent stages the CRIU bundle into
-  the workload's mount namespace and runs dump and restore there, so the
-  dump sees the container's own paths. Under process capture, the one
-  library injected into the engine is gpushare, which multi-GPU capture needs.
+- **CRIU from outside the container (criu-v2)** — the agent dumps the
+  container's pid namespace from outside it, with `criu dump --root
+  /proc/<pid>/root` (`dumpPIDNamespace`, `internal/agent/pidns_capture.go`).
+  Under process capture, the webhook preloads gpushare into the engine
+  (and, with `webhook.gpushareIBV`, points NCCL at `libnvsnap_ibv.so`).
 - **Forked CRIU** — io_uring checkpoint and restore, portable ghost files
   and CUDA plugin fixes on top of upstream criu-dev. See [docs/design/THIRD-PARTY-FORKS.md](docs/design/THIRD-PARTY-FORKS.md).
 
@@ -198,15 +166,8 @@ by a restore. Cluster config decides which tiers are present. See
 
 ## Supported platforms
 
-| Component | Supported | Notes |
-|---|---|---|
-| Linux kernel | 6.x recorded | The June 2026 cachedir results ran on 6.x ([results](docs/RESULTS.md#cachedir)). |
-| NVIDIA driver | CUDA checkpoint driver API | Multi-GPU capture under gpushare: 610 or later ([gpushare](docs/design/GPUSHARE.md#requirements-and-limits)). The chart can install it through the GPU Operator subchart. |
-| Container runtime | containerd, CRI-O | The agent talks to the runtime's socket (`internal/runtime`). |
-| Engines with recorded results | NIM, vLLM, SGLang | Unmodified stock images ([results](docs/RESULTS.md)). |
-
-Checkpointing operates at the Linux process level, not at the engine or
-framework level. Only the engines above have recorded results.
+Runtimes, GPUs, drivers, storage and workload shapes, each with its status and evidence:
+[docs/SUPPORT.md](docs/SUPPORT.md).
 
 ---
 
@@ -272,7 +233,8 @@ terraform/              example GKE cluster provisioning
 - [docs/operate/INSTALL.md](docs/operate/INSTALL.md) — full install guide + troubleshooting
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — system architecture
 - [docs/START-HERE.md](docs/START-HERE.md) — what nvsnap is, in five minutes
-- [docs/RESULTS.md](docs/RESULTS.md) — every measured number, with its source
+- [docs/SUPPORT.md](docs/SUPPORT.md) — what nvsnap supports, refuses and has not tested
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — every measured number, with its raw data
 - [docs/GLOSSARY.md](docs/GLOSSARY.md) · [docs/REFERENCE.md](docs/REFERENCE.md) — words; annotations, env vars, agent routes
 - [docs/design/THIRD-PARTY-FORKS.md](docs/design/THIRD-PARTY-FORKS.md) — forked dependencies + patch policy
 - [CONTRIBUTING.md](CONTRIBUTING.md) — developer setup + build-from-source

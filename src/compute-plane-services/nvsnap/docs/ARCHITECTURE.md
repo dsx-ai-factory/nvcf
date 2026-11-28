@@ -55,12 +55,12 @@ built. Anything not listed here is not claimed.
 
 | Capability | Level | Proof |
 |---|---|---|
-| cachedir capture and restore, 1 to 8 GPUs | Measured | [results/BENCHMARK.md](results/BENCHMARK.md#warm-cache-restore-cachedir-june-2026) (H100, June 2026) |
-| Single-GPU CRIU capture and restore | Measured | [results/BENCHMARK.md](results/BENCHMARK.md#faster-criu-v2-restore-levers-a--b-july-2026) (H100, July 2026) |
+| cachedir capture and restore, 1 to 8 GPUs | Measured | [BENCHMARKS.md](BENCHMARKS.md#cachedir) (H100, 2026-09-25) |
+| Single-GPU CRIU capture and restore | Measured | [BENCHMARKS.md](BENCHMARKS.md#disaggregated-vllm-with-nixl-over-rdma-gb300) (GB300, 2026-11-25) |
 | Multi-GPU CRIU capture and restore on one node, under gpushare | Measured | [design/GPUSHARE.md](design/GPUSHARE.md#validation) (4x GB300 TP=4, restored on another node; 4x H100 TP=4) |
 | In-place suspend and resume of a two-node instance under gpushare | Measured | [design/GPUSHARE.md](design/GPUSHARE.md#validation) (2 nodes x 4 GB300) |
-| Group capture and restore of a multi-pod instance, with companions | Exercised | `internal/agent/criu_group_test.go`, `gpushare_group_restore_test.go`, `group_freeze_test.go`; no recorded end-to-end run on hardware |
-| Model volume, one download per model per cluster | Measured | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) results (H100, NVMesh, 2026-09-26) |
+| Group capture and restore of a multi-pod instance, with companions | Measured | [BENCHMARKS.md](BENCHMARKS.md#gpu-checkpointrestore) (Kimi K3.1 Pro, 4 pods × 4 GB300, November 2026); `internal/agent/criu_group_test.go`, `gpushare_group_restore_test.go`, `group_freeze_test.go` |
+| Model volume, one download per model artifact and tenant | Measured | [design/helm-shared-model-volume.md](design/helm-shared-model-volume.md) results (H100, NVMesh, 2026-09-26) |
 | Election, one downloader per hash | Measured | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (H100, NVMesh, 2026-09-25) |
 | Cache-set refresh | Measured once | [results/HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) (GB300, 2026-10-01; off by default) |
 | L2 volume pair and promotion | Exercised | `internal/checkpointstore/*_test.go` (`TestPerCapturePVCBackend_*`) |
@@ -540,19 +540,24 @@ capture-once state machine and its hooks are NVCA's code
 
 | Workload | Hardware | Cold | Restore | Source |
 |---|---|---:|---:|---|
-| DeepSeek-V4-Flash, SGLang TP=8, cachedir | H100, June 2026 | 1162 s | 289 s | [results/BENCHMARK.md](results/BENCHMARK.md#warm-cache-restore-cachedir-june-2026) |
-| Llama-3.1-8B, vLLM, single-GPU CRIU (agent restore time) | H100, July 2026, app v0.2.22 | | 32.4 s | [results/BENCHMARK.md](results/BENCHMARK.md#faster-criu-v2-restore-levers-a--b-july-2026) |
+| Qwen2.5-32B-Instruct, vLLM v0.20.0 TP=4, cachedir | 4x H100, 2026-09-25, agent v0.2.75-election6 | 325 s | 170 s | [BENCHMARKS.md](BENCHMARKS.md#vllm-on-h100-september-2026) |
+| TinyLlama 1.1B, vLLM v0.31.0, disaggregated prefill pod, CRIU with gpushare (cold: scheduled to `/health` 200, as nvsnap holds the cold pod out of Ready until its capture; restore: scheduled to Ready) | 1x GB300, 2026-11-25, agent v0.2.91-rc22w | 131 s | 28 s | [BENCHMARKS.md](BENCHMARKS.md#disaggregated-vllm-with-nixl-over-rdma-gb300) |
 | Qwen2.5-72B-Instruct, vLLM 0.20.0 TP=4, CRIU with gpushare, restored on another node (new pod to first token) | 4x GB300, driver 610.57.04 | 363 s (242 s without the download) | 87.8 s from the store, 66.7 s from the node's copy | [design/GPUSHARE.md](design/GPUSHARE.md#validation) |
 
-These are headline rows; every number is in [RESULTS.md](RESULTS.md), and
-each source holds the full record with its method.
+These are headline rows. Every number whose nvsnap version is recorded is in
+[BENCHMARKS.md](BENCHMARKS.md) (the GPUSHARE.md row's is not), and each source
+holds the full record with its method.
 
 ## 13. Known gaps
 
 In the order they matter for multi-node instances:
 
-1. **End-to-end group restore on hardware has no recorded result.** The
-   mechanism is covered by unit tests only (section 0).
+1. **End-to-end group restore on hardware is recorded for one instance shape
+   only**: Dynamo + vLLM serving Kimi K3.1 Pro on 4 pods × 4 GB300, with its
+   etcd, NATS and frontend (section 0;
+   [results/KIMI-K3-GB300-2026-11.md](results/KIMI-K3-GB300-2026-11.md)).
+   Two scale-from-zero restores on one cluster did not run, cause not
+   verified (section 3 there).
 2. **Checkpoint transfer is bound by cluster storage unless the rails tier is
    on.** L2 and L3 move bytes over the storage network and HTTP; only the
    opt-in rails tier (`agent.rails`) uses the RDMA NICs.

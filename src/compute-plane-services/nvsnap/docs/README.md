@@ -33,16 +33,17 @@ was not re-checked against the code.
 | You are | Read, in order |
 |---|---|
 | New to nvsnap | [START-HERE](START-HERE.md), [glossary](GLOSSARY.md), [architecture](ARCHITECTURE.md), [gpushare](design/GPUSHARE.md) |
-| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), [metrics and history](operate/METRICS.md), [runbook: alerts and following a restore](operate/RUNBOOK.md), [supported workloads](operate/SUPPORTED-WORKLOADS.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
+| Installing or operating it | [Install](operate/INSTALL.md), [pull secrets](operate/PULL-SECRETS.md), [metrics and history](operate/METRICS.md), [runbook: alerts and following a restore](operate/RUNBOOK.md), [what is supported](SUPPORT.md), the chart's [values](../deploy/helm/nvsnap/values.yaml), [reference](REFERENCE.md) |
 | Changing the code | [Developing](operate/DEVELOPING.md), [architecture](ARCHITECTURE.md), the design note for the area you touch, [CONTRIBUTING](../CONTRIBUTING.md) |
-| Reviewing a claim or a number | [RESULTS](RESULTS.md), then [ARCHITECTURE §0](ARCHITECTURE.md#0-evidence-levels) for what each capability's evidence is |
+| Reviewing a claim or a number | [BENCHMARKS](BENCHMARKS.md) and [SUPPORT](SUPPORT.md), then [ARCHITECTURE §0](ARCHITECTURE.md#0-evidence-levels) for what each capability's evidence is |
 
 ## Reference
 
 | Page | Answers | Status |
 |---|---|---|
-| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with three measured numbers | Current, 2026-10-21 |
-| [RESULTS.md](RESULTS.md) | Every measured number, with date, hardware, build and source | Current, 2026-11-07 |
+| [START-HERE.md](START-HERE.md) | What nvsnap is, in five minutes, with links to the measured numbers | Current, 2026-11-25 |
+| [SUPPORT.md](SUPPORT.md) | Will nvsnap work for my workload: every shape, runtime, GPU and storage choice, with its status and evidence | Current, 2026-11-25 |
+| [BENCHMARKS.md](BENCHMARKS.md) | Every measured number, with model, engine, GPUs, storage, nvsnap version, date and raw data | Current, 2026-11-25 |
 | [GLOSSARY.md](GLOSSARY.md) | What each nvsnap word means, including the storage tiers L1–L4, and which words are retired | Current, 2026-10-21 |
 | [REFERENCE.md](REFERENCE.md) | Every `nvsnap.io/*` annotation and label, environment variable and agent route | Generated from the code; CI fails when it is stale |
 | [figures/README.md](figures/README.md) | Every architecture figure, the script that draws it, the style it follows, and how to regenerate it | Current, 2026-10-21 |
@@ -61,7 +62,6 @@ was not re-checked against the code.
 | [PULL-SECRETS.md](operate/PULL-SECRETS.md) | Registry credentials for the agent and the pods it creates | Current, 2026-10-21 |
 | [METRICS.md](operate/METRICS.md) | The capture and restore history: metrics (scale-up, teardown, the cached captures), summary log lines, events, and how to keep them | Current, 2026-11-12 |
 | [RUNBOOK.md](operate/RUNBOOK.md) | What to do when each NvSnap alert fires, and how to follow one capture or restore with kubectl | Current, 2026-11-12 |
-| [SUPPORTED-WORKLOADS.md](operate/SUPPORTED-WORKLOADS.md) | Which multi-node engine shapes are captured and restored, which are refused, and the log line for each | Current, 2026-11-21 |
 | [DEVELOPING.md](operate/DEVELOPING.md) | Build, deploy, capture, validate, merge | Current, 2026-10-21 |
 | [Chart README](../deploy/helm/nvsnap/README.md) | What each chart template renders; chart development | Current, 2026-10-21 |
 
@@ -87,7 +87,7 @@ the column below is that status, corrected where the code disagrees.
 | [VERSIONED-NODE-BUNDLE.md](design/VERSIONED-NODE-BUNDLE.md) | How the node bundle (CRIU, gpushare, helper) is versioned so upgrades do not break running pods | Built (`internal/webhook/bundle_mount.go` `BundleVersionsDir`) |
 | [node-model-cache.md](design/node-model-cache.md) | A cold pod's model download seeded from a copy on its node or a peer node, with no shared volume | Built, behind `agent.nodeModelCache` (`internal/modelcache`, `internal/agent/node_model_cache.go`) |
 | [model-cache-single-flight.md](design/model-cache-single-flight.md) | One registry download per model; the other pods stream it from the downloading node as files land | Built, behind `agent.nodeModelCache.singleFlight` (`internal/agent/model_cache_flight.go`, `internal/agent/model_cache_stream.go`) |
-| [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model per cluster, and the cache set | Built and verified (as the doc states) |
+| [helm-shared-model-volume.md](design/helm-shared-model-volume.md) | One model volume per model artifact and tenant, and the cache set | Built and verified (as the doc states) |
 | [cross-cluster-replication.md](design/cross-cluster-replication.md) | Replicating checkpoints across clusters | Partly built, cachedir captures and GCS only (as the doc states) |
 | [STORAGE-AGNOSTIC-L2-PROMOTION.md](design/STORAGE-AGNOSTIC-L2-PROMOTION.md) | Promoting the L2 volume on any storage | Built (as the doc states) |
 | [THIRD-PARTY-FORKS.md](design/THIRD-PARTY-FORKS.md) | What the CRIU fork carries and why | Current, 2026-10-21 (pin and check in `scripts/versions.sh`, `scripts/build-agent.sh`) |
@@ -96,7 +96,10 @@ the column below is that status, corrected where the code disagrees.
 
 | Page | Answers | Status |
 |---|---|---|
-| [BENCHMARK.md](results/BENCHMARK.md) | Measured restore times with phase breakdowns: single-GPU CRIU (July 2026), cachedir (June 2026), page-cache prewarm (September 2026) | Record |
+| [KIMI-K3-GB300-2026-11.md](results/KIMI-K3-GB300-2026-11.md) | Kimi K3.1 Pro on GB300: cold starts, verification restores, scale-from-zero cycles (November 2026) | Record |
+| [DISAGG-NIXL-GB300-2026-11-25.md](results/DISAGG-NIXL-GB300-2026-11-25.md) | Capture and restore of a disaggregated vLLM prefill pod with NIXL over RDMA | Record |
+| [CONFORMANCE-GB300-2026-11-02.md](results/CONFORMANCE-GB300-2026-11-02.md) | Pass/fail of 13 workload shapes on two GB300 clusters | Record |
+| [PREWARM-2026-09.md](results/PREWARM-2026-09.md) | Page-cache prewarm A/B (September 2026) and the prewarm's file selection | Record |
 | [PDF-BENCH-RESULTS.md](results/PDF-BENCH-RESULTS.md) | Where `scripts/test-bench.sh` appends its cold / warm / restore rows | Empty until the next run |
 | [KIMI-K3-RESTORE-2026-10-24.md](results/KIMI-K3-RESTORE-2026-10-24.md) | How long a Kimi-K3 group restore over 2 GB300 nodes took, step by step: fetch over rails, CRIU, GPU load, clock wait | Record |
 | [HELM-CHART-CACHE-2026-09.md](results/HELM-CHART-CACHE-2026-09.md) | The election (one downloader per hash) on H100 with NVMesh, and the cache-set refresh's one run on GB300 | Record |

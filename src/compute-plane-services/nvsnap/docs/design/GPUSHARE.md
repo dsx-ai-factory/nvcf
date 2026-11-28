@@ -573,7 +573,7 @@ rollback.
   FlashInfer's all-reduce fusion use multicast). On x86 with 580.126.16 (RTX
   PRO 6000), the driver's own restore of processes sharing GPU memory (vLLM
   TP=2) was seen to fail with `CUDA_ERROR_UNKNOWN`; that run is not recorded
-  (no entry in [RESULTS.md](../RESULTS.md); date and nvsnap build unknown), so
+  (no entry in [BENCHMARKS.md](../BENCHMARKS.md); date and nvsnap build unknown), so
   treat it as unverified. The agents enforce the minimum: on a cluster with
   an older driver, or more than one, GPU pods fall back to the cachedir
   (`agent.criuMinDriverMajor`,
