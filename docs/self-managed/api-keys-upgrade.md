@@ -84,7 +84,10 @@ HELMFILE_ENV=<env-name> helmfile sync
 
 During the rollout, a request can reach an old API Keys pod that does not
 recognize keys created by a new one. That request fails, and repeating it
-succeeds once it reaches a new pod. The window is usually a few minutes.
+succeeds once it reaches a new pod. The window is usually a few minutes. If you
+cannot accept it, change the API Keys deployment strategy to `Recreate` before
+you upgrade. All old pods then stop before the new ones start, at the cost of
+a short outage.
 
 Do not create, update or delete keys until the rollout is complete and no old
 pod is left:

@@ -546,7 +546,7 @@ curl -s -X POST "http://${GATEWAY_ADDR}/v2/nvcf/deployments/functions/${FUNCTION
 # Generate an API key for invocation. See the API scope reference for endpoint-specific scope requirements.
 # Set expiration to 1 day from now (required field)
 EXPIRES_AT=$(date -u -v+1d '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '+1 day' '+%Y-%m-%dT%H:%M:%SZ')
-SERVICE_ID="nvidia-cloud-functions-ncp-service-id-aketm"
+SERVICE_ID="cloud-functions"
 
 export API_KEY=$(curl -s -X POST "http://${GATEWAY_ADDR}/v1/keys" \
   -H "Host: api-keys.${GATEWAY_ADDR}" \

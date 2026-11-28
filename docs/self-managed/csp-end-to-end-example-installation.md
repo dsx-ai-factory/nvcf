@@ -413,7 +413,7 @@ derived from `GATEWAY_ADDR`.
 ```bash
 cat > nvcf-cli.yaml <<EOF
 # Admin token issuer config (chart-level defaults; identical across installs)
-api_keys_service_id: "nvidia-cloud-functions-ncp-service-id-aketm"
+api_keys_service_id: "cloud-functions"
 api_keys_issuer_service: "nvcf-api"
 api_keys_owner_id: "svc@nvcf-api.local"
 client_id: "nvcf-default"
