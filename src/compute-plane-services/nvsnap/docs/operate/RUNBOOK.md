@@ -109,8 +109,10 @@ skips the init containers that fill only it.
 - **Did a placeholder skip?** Its annotation `nvsnap.io/skipped-inits`
   names the inits it skipped.
 - **A workload must keep its setup.** Annotate its pods
-  `nvsnap.io/keep-inits: "true"`. Its next placeholders skip no init for
-  unused volumes: they run the same inits a cold pod runs.
+  `nvsnap.io/keep-inits: "true"`. Its next placeholders keep the inits
+  that fill volumes the capture found unused. A placeholder still skips,
+  as before, the inits that write nothing a container reads and are not
+  native sidecars (a wait for a dependency, say).
 - **Why there is no setting.** A restored process keeps the files it had
   open and the mappings it had, so it does not read the model again; only a
   cold start does, and a failed restore's pod is replaced by a fresh one
