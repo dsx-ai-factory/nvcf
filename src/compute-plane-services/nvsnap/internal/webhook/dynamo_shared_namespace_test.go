@@ -237,3 +237,25 @@ func TestSharedNamespaceOnExplicitRestorePlaceholder(t *testing.T) {
 		t.Fatalf("placeholder DYN_NAMESPACE %q, want the shared nvcf-nvsnap-dsv41-flash", v)
 	}
 }
+
+// A component that registers through Kubernetes gets its Dynamo namespace
+// only from the shared decision: when that keeps the original name (here a
+// running pod of the instance has it), the fixed name is not set either,
+// even with instance-local etcd and NATS endpoints.
+func TestSharedNamespaceKeptOverFixedName(t *testing.T) {
+	running := deepseekPod("frontend-0", "")
+	running.Status.Phase = corev1.PodRunning
+	m := sharedMutator(running)
+	m.CaptureCandidate = criuCandidates
+	pod := deepseekPod("prefill-1", "2",
+		corev1.EnvVar{Name: "ETCD_ENDPOINTS", Value: "etcd:2379"},
+		corev1.EnvVar{Name: "NATS_SERVER", Value: "nats://nats:4222"})
+	ctx := withSharedNamespaceDecision(context.Background(), pod)
+	var ops []PatchOp
+	ops = append(ops, m.dynamoNamespacePatches(ctx, pod)...)
+	ops = append(ops, m.sharedNamespacePatches(ctx, pod)...)
+	got := applyPatches(t, pod, ops)
+	if v := mainEnv(got, "DYN_NAMESPACE"); v != deepseekNS+"-dsv41-flash" {
+		t.Fatalf("DYN_NAMESPACE %q, want the original %s-dsv41-flash the running pod has", v, deepseekNS)
+	}
+}
