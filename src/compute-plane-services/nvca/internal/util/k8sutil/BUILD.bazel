@@ -30,6 +30,7 @@ go_library(
         "//src/compute-plane-services/nvca/internal/util/k8serr",
         "//src/compute-plane-services/nvca/pkg/featureflag",
         "//src/compute-plane-services/nvca/pkg/nodefeatures",
+        "//src/compute-plane-services/nvca/pkg/types",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function",
@@ -82,6 +83,7 @@ go_test(
     deps = [
         "//src/compute-plane-services/nvca/pkg/featureflag",
         "//src/compute-plane-services/nvca/pkg/featureflag/mock",
+        "//src/compute-plane-services/nvca/pkg/types",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common",
         "//src/compute-plane-services/nvca/vendor/github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config",

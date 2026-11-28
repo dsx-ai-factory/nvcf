@@ -108,6 +108,9 @@ type BackendK8sCache struct {
 	nvcaRunAsUserID      int64
 	nvcaRunAsGroupID     int64
 
+	// utilsProvenance configures the utils provenance webhook (mode and trusted controller usernames).
+	utilsProvenance UtilsProvenanceSettings
+
 	nvcfBackendLister            nvcabelister.NVCFBackendLister
 	syncedFuncs                  []cache.InformerSynced
 	configMapHandlerRegistration cache.ResourceEventHandlerRegistration
@@ -285,6 +288,13 @@ func (b *BackendK8sCacheBuilder) WithUIDGIDOverride(uid, gid int64) *BackendK8sC
 	return &next
 }
 
+// WithUtilsProvenance sets the utils provenance webhook settings. An empty mode means audit.
+func (b *BackendK8sCacheBuilder) WithUtilsProvenance(s UtilsProvenanceSettings) *BackendK8sCacheBuilder {
+	next := *b
+	next.utilsProvenance = s
+	return &next
+}
+
 func (b *BackendK8sCacheBuilder) WithGXCache(ns string, on bool) *BackendK8sCacheBuilder {
 	next := *b
 	next.gxCacheNamespace = ns
@@ -435,6 +445,7 @@ func (b *BackendK8sCacheBuilder) newCache() *BackendK8sCache {
 		nvcaImageRepo:        b.nvcaImageRepo,
 		nvcaRunAsUserID:      b.nvcaRunAsUserID,
 		nvcaRunAsGroupID:     b.nvcaRunAsGroupID,
+		utilsProvenance:      b.utilsProvenance,
 		httpClient: &http.Client{
 			Timeout: 1 * time.Second,
 		},

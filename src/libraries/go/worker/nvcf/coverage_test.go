@@ -22,9 +22,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -982,4 +984,49 @@ func startEmbeddedNatsRecordingLogins(t *testing.T) (string, <-chan string) {
 	}
 	t.Cleanup(srv.Shutdown)
 	return srv.ClientURL(), recorder.tokens
+}
+
+// TestSharedTokenFilesTolerateConcurrentReplicaWriters covers the files utils writes to volumes shared with the other
+// replicas of an HA instance: the metadata credentials token and the ESS assertion token. Several writers refresh the
+// same file at once. None may fail, and every read must be one complete token.
+func TestSharedTokenFilesTolerateConcurrentReplicaWriters(t *testing.T) {
+	dir := t.TempDir()
+	prev := MetadataCredsTokenFile
+	MetadataCredsTokenFile = filepath.Join(dir, "info", "self")
+	t.Cleanup(func() { MetadataCredsTokenFile = prev })
+
+	c := &Client{assertionTokenPath: filepath.Join(dir, "ess", "assertion.token")}
+	writers := map[string]func(string) error{
+		"metadata credentials": func(v string) error { return c.metadataCredentialsCallback(token.Token{Token: v}) },
+		"assertion token":      func(v string) error { return c.writeAssertionTokenToDisk(token.Token{Token: v}) },
+	}
+	paths := map[string]string{"metadata credentials": MetadataCredsTokenFile, "assertion token": c.assertionTokenPath}
+
+	for name, write := range writers {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, write("tok-seed"))
+			var wg sync.WaitGroup
+			errs := make(chan error, 8*40)
+			for w := 0; w < 8; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					for i := 0; i < 40; i++ {
+						errs <- write(fmt.Sprintf("tok-%d-%03d", w, i))
+					}
+				}(w)
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				require.NoError(t, err)
+			}
+			data, err := os.ReadFile(paths[name])
+			require.NoError(t, err)
+			assert.Regexp(t, `^tok-(seed|\d-\d{3})$`, string(data), "the file holds one complete token")
+			entries, err := os.ReadDir(filepath.Dir(paths[name]))
+			require.NoError(t, err)
+			assert.Len(t, entries, 1, "no temporary files are left behind")
+		})
+	}
 }

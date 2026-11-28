@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	"github.com/stretchr/testify/assert"
@@ -1427,6 +1428,17 @@ func TestIsContainerInRestartLoopWorkerThreshold(t *testing.T) {
 		},
 		Status: corev1.PodStatus{StartTime: startTime},
 	}
+	haUtilsReplicaPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "utils-7dbc56c976-m6l22", Namespace: "sr-helm-fn"},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: common.InitContainerName}},
+			Containers: []corev1.Container{
+				{Name: common.UtilsContainerName, Env: instanceIDEnv},
+				{Name: common.ESSContainerName},
+			},
+		},
+		Status: corev1.PodStatus{StartTime: startTime},
+	}
 	crashed := func(name string, restarts int32) corev1.ContainerStatus {
 		return corev1.ContainerStatus{
 			Name:         name,
@@ -1462,6 +1474,9 @@ func TestIsContainerInRestartLoopWorkerThreshold(t *testing.T) {
 		{name: "inference container keeps three with a raised worker threshold", pod: containerFunctionPod, container: "inference", threshold: 5, restarts: 3, want: true},
 		{name: "inference container keeps three with a lowered worker threshold", pod: containerFunctionPod, container: "inference", threshold: 1, restarts: 2, want: false},
 		{name: "utils container without the instance ID is not the worker", pod: userUtilsPod, container: common.UtilsContainerName, threshold: 5, restarts: 3, want: true},
+		{name: "raised threshold applies to an HA utils replica", pod: haUtilsReplicaPod, container: common.UtilsContainerName, threshold: 5, restarts: 4, want: false},
+		{name: "raised threshold fails an HA utils replica at its limit", pod: haUtilsReplicaPod, container: common.UtilsContainerName, threshold: 5, restarts: 5, want: true},
+		{name: "ESS sidecar in an HA utils replica keeps three", pod: haUtilsReplicaPod, container: common.ESSContainerName, threshold: 5, restarts: 3, want: true},
 	}
 
 	for _, tt := range tests {
@@ -2089,4 +2104,43 @@ func TestWorkerRestartScoreToRecord(t *testing.T) {
 		_, ok := WorkerRestartScoreToRecord(pod, now, (&TimeConfig{CountAllWorkerRestarts: true}).Complete())
 		assert.False(t, ok)
 	})
+}
+
+func TestIsUtilsPodDiscoveredGatesTheLabel(t *testing.T) {
+	labeled := func(ns, name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+			Labels: map[string]string{nvcatypes.PodRoleLabelKey: nvcatypes.PodRoleValueUtils}}}
+	}
+	tests := []struct {
+		name    string
+		pod     *corev1.Pod
+		allowed bool
+		exp     bool
+	}{
+		{"legacy name, gate closed", &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: common.UtilsPodName, Namespace: "sr-abc"}}, false, true},
+		{"label, gate closed", labeled("sr-abc", "utils-7d9f8-x2k4q"), false, false},
+		{"label, gate open", labeled("sr-abc", "utils-7d9f8-x2k4q"), true, true},
+		{"label in a foreign namespace, gate open", labeled("default", "utils-7d9f8-x2k4q"), true, false},
+		{"unlabeled other name, gate open", &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker-0", Namespace: "sr-abc"}}, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.exp, IsUtilsPodDiscovered(tt.pod, tt.allowed))
+		})
+	}
+}
+
+// TestIsUtilsPodRecognizesAnHADeploymentPod documents that a utils pod of an HA instance, named utils-<hash>, is
+// recognized by its utils container and instance id env. That recognition is for infrastructure defaults and metrics
+// only. Trust decisions use verified provenance, not this.
+func TestIsUtilsPodRecognizesAnHADeploymentPod(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "utils-7d9f8-x2k4q", Namespace: "sr-abc"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: common.UtilsContainerName, Env: []corev1.EnvVar{{Name: InstanceIDEnvKey, Value: "sr-abc-miniservice"}},
+		}}},
+	}
+	assert.True(t, IsUtilsPod(pod))
+	pod.Spec.Containers[0].Env = nil
+	assert.False(t, IsUtilsPod(pod), "a utils-named container without the instance id env is not the worker")
 }

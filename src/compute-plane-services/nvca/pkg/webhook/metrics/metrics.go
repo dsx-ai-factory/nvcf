@@ -37,6 +37,7 @@ const (
 	requestInFlightMetricName       = "nvca_webhook_requests_in_flight"
 	readCertificateTotalMetricName  = "nvca_webhook_read_certificate_total"
 	readCertificateErrorsMetricName = "nvca_webhook_read_certificate_errors_total"
+	utilsProvenanceMetricName       = "nvca_webhook_utils_provenance_decisions_total"
 
 	webhookLabel  = "webhook"
 	httpCodeLabel = "code"
@@ -49,6 +50,8 @@ type Metrics struct {
 	RequestInFlight       *prometheus.GaugeVec
 	ReadCertificateTotal  prometheus.Counter
 	ReadCertificateErrors prometheus.Counter
+	// UtilsProvenanceDecisions counts utils provenance decisions by kind, decision and reason.
+	UtilsProvenanceDecisions *prometheus.CounterVec
 
 	registerer prometheus.Registerer
 }
@@ -125,7 +128,24 @@ func newMetrics(opts ...Option) *Metrics {
 		Help: "Total number of certificate read errors",
 	})
 
+	m.UtilsProvenanceDecisions = promFactory.NewCounterVec(prometheus.CounterOpts{
+		Name: utilsProvenanceMetricName,
+		Help: "Total utils provenance admission decisions by object kind, decision and reason.",
+	}, []string{"kind", "decision", "reason"})
+
 	return m
+}
+
+// InitUtilsProvenance pre-initializes every kind, decision and reason series to zero so they exist on the first
+// scrape. Call it with the full, bounded value sets.
+func (m *Metrics) InitUtilsProvenance(kinds, decisions, reasons []string) {
+	for _, k := range kinds {
+		for _, d := range decisions {
+			for _, r := range reasons {
+				m.UtilsProvenanceDecisions.WithLabelValues(k, d, r)
+			}
+		}
+	}
 }
 
 // destroy unregisters all metrics from the registerer. It is intended only for testing purposes.
@@ -135,6 +155,7 @@ func (m *Metrics) destroy() { //nolint:unused
 	m.registerer.Unregister(m.RequestInFlight)
 	m.registerer.Unregister(m.ReadCertificateTotal)
 	m.registerer.Unregister(m.ReadCertificateErrors)
+	m.registerer.Unregister(m.UtilsProvenanceDecisions)
 }
 
 // InstrumentedHook wraps an http.Handler with latency, counter, and in-flight metrics.

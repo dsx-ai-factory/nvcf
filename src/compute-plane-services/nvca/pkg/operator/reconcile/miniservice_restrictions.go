@@ -22,14 +22,17 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/core"
 	nvcaconfig "github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/types/nvca/config"
+	"github.com/sirupsen/logrus"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/utilsprovenance/readiness"
 	nvidiaiov1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvcf/v1"
 	nvcaoptypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/operator/types"
 )
@@ -48,6 +51,10 @@ func (bc *BackendK8sCache) setupNVCAMiniServiceInfra(ctx context.Context, nb *nv
 	err = bc.setupMiniServiceValidatingWebhook(ctx, nb, webhookCert)
 	if err != nil {
 		return fmt.Errorf("failed setupMiniServiceValidatingWebhook, err:%v", err)
+	}
+
+	if err := bc.setupUtilsProvenanceCanary(ctx); err != nil {
+		return fmt.Errorf("failed setupUtilsProvenanceCanary, err: %w", err)
 	}
 	return nil
 }
@@ -159,6 +166,12 @@ func (bc *BackendK8sCache) setupMiniServiceValidatingWebhook(ctx context.Context
 		},
 	}
 
+	// The provenance hooks also apply to the readiness canary namespace, which carries a different value of the same label.
+	provenanceNSSelReqs := makeLabelSelectorRequirements(
+		makeWorkloadNamespaceLabelSelectors(WorkloadInstanceTypeValueMiniService, readiness.CanaryNamespaceLabelValue))
+	vw.Webhooks = append(vw.Webhooks, makeUtilsProvenanceValidatingWebhooks(nb, webhookCert,
+		&metav1.LabelSelector{MatchExpressions: provenanceNSSelReqs}, bc.utilsProvenance)...)
+
 	return bc.createOrUpdateValidatingWebhookConfiguration(ctx, vw)
 }
 
@@ -184,7 +197,20 @@ func (bc *BackendK8sCache) getMiniServiceRBACCmData(ctx context.Context, _ *nvid
 		return nil, fmt.Errorf("get NVCA merge config: %w", err)
 	}
 	if foundCfg && cfg.Cluster.ValidationPolicy != nil {
-		data.AllowedExtraKubernetesTypes = cfg.Cluster.ValidationPolicy.AllowedExtraKubernetesTypes
+		for _, extra := range cfg.Cluster.ValidationPolicy.AllowedExtraKubernetesTypes {
+			if isProtectedExtraKubernetesType(extra) {
+				fields := logrus.Fields{"group": extra.Group, "resource": extra.Resource}
+				if mode, _ := NormalizeUtilsProvenanceMode(bc.utilsProvenance.Mode); mode == UtilsProvenanceModeEnforce {
+					log.WithFields(fields).Warn("Ignoring allowed extra Kubernetes type: it would let chart workloads change " +
+						"the replicas of or attach to utils pods, which only NVCA may do")
+					continue
+				}
+				// Audit mode keeps the configured behavior so existing workloads are not broken before enforcement.
+				log.WithFields(fields).Warn("Allowed extra Kubernetes type grants rights over utils pods that only NVCA may use. " +
+					"It is kept in audit mode and will be dropped when the utils provenance mode is enforce")
+			}
+			data.AllowedExtraKubernetesTypes = append(data.AllowedExtraKubernetesTypes, extra)
+		}
 	}
 
 	t, err := template.ParseFS(manifests, filepath.Join("manifests", "rbacTemplate.yaml"))
@@ -206,4 +232,16 @@ func (bc *BackendK8sCache) getMiniServiceRBACCmData(ctx context.Context, _ *nvid
 	return map[string]string{
 		data.Name: b.String(),
 	}, nil
+}
+
+// isProtectedExtraKubernetesType reports whether an allowed extra type would grant chart workloads a right that only
+// NVCA may use on utils objects: the scale subresources (which change replicas and bypass the Deployment template
+// protection), pod ephemeral containers, or a wildcard that includes them. Role rules written for a resource name do
+// not cover its subresources, so these only appear when configured explicitly or through a wildcard.
+func isProtectedExtraKubernetesType(t nvcaconfig.AllowedExtraKubernetesTypeConfig) bool {
+	if t.Group == "*" || strings.Contains(t.Resource, "*") {
+		return true
+	}
+	_, sub, hasSub := strings.Cut(t.Resource, "/")
+	return hasSub && (sub == "scale" || sub == "ephemeralcontainers")
 }

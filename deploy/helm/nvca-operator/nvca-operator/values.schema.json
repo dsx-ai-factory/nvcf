@@ -758,6 +758,28 @@
                     "pattern": "^$|^0$|^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
                     "default": ""
                 },
+                "utilsProvenance": {
+                    "type": "object",
+                    "description": "Utils provenance webhook settings",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["audit", "enforce"],
+                            "description": "Utils provenance webhook mode, \"audit\" logs and counts what would be refused, \"enforce\" refuses it, strips reserved keys from chart objects, and drops allowed extra types that grant scale or ephemeral container rights",
+                            "default": "audit"
+                        },
+                        "replicaSetControllerUser": {
+                            "type": "string",
+                            "description": "Username of the kube ReplicaSet controller as seen by admission, empty uses the webhook default",
+                            "default": ""
+                        },
+                        "deploymentControllerUser": {
+                            "type": "string",
+                            "description": "Username of the kube Deployment controller as seen by admission, empty uses the webhook default",
+                            "default": ""
+                        }
+                    }
+                },
                 "secretMirrorNamespace": {
                     "type": "string",
                     "description": "Default namespace to mirror custom secrets for nvcf workloads",

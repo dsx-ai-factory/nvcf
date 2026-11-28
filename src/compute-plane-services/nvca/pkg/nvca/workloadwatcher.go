@@ -62,13 +62,24 @@ func GetDefaultWorkloadContainerNamesToWatch() []string {
 
 type workloadWatcher func(ctx context.Context, oldPod, newPod *corev1.Pod)
 
-func watchForPodCrashesRestarts(ctx context.Context, oldPod, newPod *corev1.Pod) {
+// podCrashesReportable reports whether crash and restart metrics are reported for newPod. Pods NVCA tracks (they carry
+// the ICMS request id label) are reported only when they are infrastructure: the utils pod or a utils replica, the SMB
+// server, or anything in the backend namespace. Utils pods of an HA instance are named utils-<hash>, so a utils container
+// with the instance id env also counts. This only feeds metrics, no trust decision depends on it.
+func podCrashesReportable(newPod *corev1.Pod) bool {
 	_, hasICMSRequestLabel := newPod.Labels[nvcatypes.ICMSRequestIDKey]
-	if hasICMSRequestLabel &&
-		(len(newPod.Status.ContainerStatuses) == 0 ||
-			!(newPod.Name == common.UtilsPodName ||
-				newPod.Name == nvcastorage.SMBServerPodName ||
-				newPod.Namespace == "nvcf-backend")) {
+	if !hasICMSRequestLabel {
+		return true
+	}
+	if len(newPod.Status.ContainerStatuses) == 0 {
+		return false
+	}
+	return newPod.Name == common.UtilsPodName || k8sutil.IsUtilsPod(newPod) ||
+		newPod.Name == nvcastorage.SMBServerPodName || newPod.Namespace == "nvcf-backend"
+}
+
+func watchForPodCrashesRestarts(ctx context.Context, oldPod, newPod *corev1.Pod) {
+	if !podCrashesReportable(newPod) {
 		return
 	}
 

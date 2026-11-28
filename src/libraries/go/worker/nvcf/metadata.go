@@ -85,15 +85,7 @@ func (c *Client) metadataCredentialsCallback(newToken token.Token) error {
 	} else if err != nil {
 		return err
 	}
-	tmp := MetadataCredsTokenFile + ".tmp"
-	err = os.WriteFile(tmp, []byte(newToken.Token), 0644)
-	if err != nil {
-		return err
-	}
-	err = os.Rename(tmp, MetadataCredsTokenFile)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	// The file sits on a volume shared with the workload pods and, for an HA instance, with the other utils replicas.
+	// Each writer uses its own temporary file, so concurrent writers never collide.
+	return utils.WriteFileAtomic(MetadataCredsTokenFile, []byte(newToken.Token), 0644)
 }

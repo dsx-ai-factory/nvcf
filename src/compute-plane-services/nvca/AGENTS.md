@@ -411,6 +411,7 @@ Currently initialized metrics:
 | `GCCleanerRunTotal` | `cleaner_name` | `Name()` methods in `internal/gc/*/cleaner.go` |
 | `GCCleanerRunTotal` | `status` | `success`, `failure` |
 | `KataRuntimeIsolationEnabled` | _(default labels only)_ | Initialized to 0; set via `SetKataRuntimeIsolationEnabled()` in `pkg/nvca/agent.go` |
+| `UtilsReplicasDegradedInstances` | _(default labels only)_ | Initialized to 0; set via `SetUtilsReplicasDegradedInstances()` from `internal/miniservice/status_utils_ha.go` |
 | `MaintenanceModeState` | `mode` | `MaintenanceMode` enum in `pkg/types/types.go` (`AllMaintenanceModes`); one-hot, set via `SetMaintenanceModeState()` / `WithMaintenanceMode()` |
 | `BYOOPlatformMetricsFederationState` | `state` | `AllBYOOPlatformMetricsFederationStates` in `internal/metrics/metrics.go`; one-hot, starts at `not_checked`, set by `pkg/nvca/byoofederation` |
 | `WorkloadResultTotal` | `workload_type` | `container`, `helm` (defined in `AllWorkloadTypes`) |

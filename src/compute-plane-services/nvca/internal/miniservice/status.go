@@ -290,7 +290,21 @@ func (r *Reconciler) doStatusAggressive(
 		}
 		utilsPodFound = false
 	}
-	if utilsPodFound {
+	// An HA instance has utils replicas instead of the bare utils pod. Their combined status stands in for the pod's:
+	// the instance is healthy while at least one replica serves. This never consults the rollout gate.
+	var haView *haUtilsView
+	if recordedUtilsHAReplicas(ms) > 0 || !utilsPodFound {
+		v, err := r.haUtilsView(ctx, ms, icmsReq, !utilsPodFound)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		haView = v
+	}
+	switch {
+	case haView != nil:
+		utilsPodFound = true
+		statuses = append(statuses, haView.summary.Status)
+	case utilsPodFound:
 		utilsStatus, err := r.checkPodStatus(ctx, utilsPod, icmsReq)
 		if err != nil {
 			serrs = append(serrs, err)
@@ -439,6 +453,7 @@ func (r *Reconciler) doStatusAggressive(
 	return res, rerr
 }
 
+//nolint:gocyclo // branches by worker state, with an HA view alongside the single utils pod
 func (r *Reconciler) doStatusByWorkerReadiness(
 	ctx context.Context,
 	ms *v1alpha1.MiniService,
@@ -480,10 +495,19 @@ func (r *Reconciler) doStatusByWorkerReadiness(
 	// Below here, only the worker pod's status is checked for MiniService health.
 
 	utilsPod := &corev1.Pod{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ms.Spec.Namespace, Name: common.UtilsPodName}, utilsPod); err != nil {
-		if !apierrors.IsNotFound(err) {
+	var haView *haUtilsView
+	barePodErr := r.Client.Get(ctx, client.ObjectKey{Namespace: ms.Spec.Namespace, Name: common.UtilsPodName}, utilsPod)
+	if barePodErr != nil && !apierrors.IsNotFound(barePodErr) {
+		return reconcile.Result{}, barePodErr
+	}
+	if recordedUtilsHAReplicas(ms) > 0 || barePodErr != nil {
+		v, err := r.haUtilsView(ctx, ms, icmsReq, barePodErr != nil)
+		if err != nil {
 			return reconcile.Result{}, err
 		}
+		haView = v
+	}
+	if haView == nil && barePodErr != nil {
 		// By the time doStatus* functions are called, the utils pod must exist.
 		rerr = reconcile.TerminalError(fmt.Errorf("utils pod not found"))
 		log.Error(rerr, "Workload is unhealthy")
@@ -500,24 +524,44 @@ func (r *Reconciler) doStatusByWorkerReadiness(
 		return reconcile.Result{}, rerr
 	}
 
-	utilsStatus, err := r.checkPodStatus(ctx, utilsPod, icmsReq)
-	if err != nil {
-		return reconcile.Result{}, errors.Join(append(serrs, err)...)
+	var (
+		utilsStatus     ObjectStatus
+		workerReadyNow  bool
+		statusPresent   bool
+		workersReadyMsg string
+	)
+	if haView != nil {
+		// Utils replicas: the instance is ready while at least one replica serves. Only when none serves and all have
+		// failed is the worker in a terminal state.
+		utilsStatus = haView.summary.Status
+		workerReadyNow = haView.summary.Serving > 0
+		statusPresent = haView.summary.WorkerStatusPresent || haView.summary.Failed > 0
+		workersReadyMsg = utilsStatus.Reason
+	} else {
+		var err error
+		utilsStatus, err = r.checkPodStatus(ctx, utilsPod, icmsReq)
+		if err != nil {
+			return reconcile.Result{}, errors.Join(append(serrs, err)...)
+		}
+		workerContainerStatus, present, err := getFunctionWorkerContainerStatus(utilsPod)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		workerReadyNow, statusPresent = workerContainerStatus.Ready, present
 	}
-
-	workerContainerStatus, statusPresent, err := getFunctionWorkerContainerStatus(utilsPod)
-	if err != nil || !statusPresent {
+	if !statusPresent {
 		// Utils pod events will requeue this once container statuses are present.
-		return reconcile.Result{}, err
+		return reconcile.Result{}, nil
 	}
 
-	// If the worker container is ready, then the miniservice is running.
-	if workerContainerStatus.Ready {
+	// If the worker container is ready (for HA, a replica serves), then the miniservice is running.
+	if workerReadyNow {
 		ms.Status.Phase = v1alpha1.MiniServiceRunning
 		meta.SetStatusCondition(&ms.Status.Conditions, metav1.Condition{
-			Type:   v1alpha1.MiniServiceConditionWorkersHealthy,
-			Status: metav1.ConditionTrue,
-			Reason: "WorkersReady",
+			Type:    v1alpha1.MiniServiceConditionWorkersHealthy,
+			Status:  metav1.ConditionTrue,
+			Reason:  "WorkersReady",
+			Message: workersReadyMsg,
 		})
 		return reconcile.Result{}, nil
 	}

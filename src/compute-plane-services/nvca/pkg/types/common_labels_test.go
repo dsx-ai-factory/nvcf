@@ -347,3 +347,10 @@ func (f *mockFFFetcher) IsFeatureFlagEnabled(ff *featureflag.FeatureFlag) bool {
 func (f *mockFFFetcher) IsAttributeEnabled(ff *featureflag.Attribute) bool {
 	return f.attrEnabledFunc(ff)
 }
+
+func TestPodRoleLabelConstants(t *testing.T) {
+	// The wire contract: the key sits under the NVCA label prefix, so it cannot clash with chart labels.
+	assert.Equal(t, labelFQDNPrefix+"/pod-role", PodRoleLabelKey)
+	assert.Equal(t, "utils", PodRoleValueUtils)
+	assert.NotEqual(t, PodRoleLabelKey, WorkloadInstanceTypeLabel)
+}

@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	nvcatypes "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/types"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/common"
 	"github.com/dsx-ai-factory/nvcf/src/libraries/go/lib/pkg/icms-translate/translate/function"
 	corev1 "k8s.io/api/core/v1"
@@ -100,6 +101,18 @@ func isWorkerContainer(pod *corev1.Pod, containerName string) bool {
 		return false
 	}
 	return false
+}
+
+// IsUtilsPodDiscovered is IsUtilsPod for live cluster objects, with label discovery behind a gate. The pod-role label is
+// a hint that a chart could copy, so it is only honored, and only inside a MiniService namespace, when the caller
+// reports that provenance enforcement and the instance RBAC are verified (labelDiscoveryAllowed). Objects rendered from
+// a chart must keep using IsUtilsPod: a label there comes from the chart.
+func IsUtilsPodDiscovered(pod *corev1.Pod, labelDiscoveryAllowed bool) bool {
+	if IsUtilsPod(pod) {
+		return true
+	}
+	return labelDiscoveryAllowed && IsMiniServiceNamespaceName(pod.Namespace) &&
+		pod.Labels[nvcatypes.PodRoleLabelKey] == nvcatypes.PodRoleValueUtils
 }
 
 // IsPodReadyConditionTrue returns true if a pod is ready; false otherwise.

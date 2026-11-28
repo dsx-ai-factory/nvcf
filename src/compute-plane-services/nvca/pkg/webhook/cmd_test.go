@@ -57,6 +57,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	nvcaclientset "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned"
+	nvcafake "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/client/clientset/versioned/fake"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/featureflag"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/nvca/enforce/kata"
 	whmetrics "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/webhook/metrics"
@@ -206,13 +208,19 @@ func TestCmd(t *testing.T) {
 	runReturned := make(chan struct{})
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
-		tmpFunc := newK8sClient
+		tmpFunc, tmpNVCA, tmpSelf := newK8sClient, newNVCAClientset, selfUsername
 		newK8sClient = func(ctx context.Context, path string) (kubernetes.Interface, error) {
 			return k8sfake.NewSimpleClientset(), nil
 		}
+		newNVCAClientset = func(context.Context, string) (nvcaclientset.Interface, error) {
+			return nvcafake.NewSimpleClientset(), nil
+		}
+		selfUsername = func(context.Context, kubernetes.Interface) (string, error) {
+			return "system:serviceaccount:nvca-system:nvca", nil
+		}
 		runErr = cmd.ExecuteContext(ctx)
 		runReturned <- struct{}{}
-		newK8sClient = tmpFunc
+		newK8sClient, newNVCAClientset, selfUsername = tmpFunc, tmpNVCA, tmpSelf
 	}()
 
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {

@@ -93,6 +93,11 @@ rules:
 - apiGroups: ["nvca.nvcf.nvidia.io"]
   resources: ["miniservices", "miniservices/status"]
   verbs: ["get", "list", "watch", "create", "update", "delete", "patch"]
+# The utils provenance readiness check reviews the effective permissions of instance accounts. The operator generates
+# the agent ClusterRole with this rule, and escalation prevention requires the operator to hold it too.
+- apiGroups: ["authorization.k8s.io"]
+  resources: ["subjectaccessreviews"]
+  verbs: ["create"]
 # NvSnapFunctionState is granted unconditionally, NOT behind the NvSnap
 # feature flag. The operator generates the agent ClusterRole with this rule on
 # every reconcile, and Kubernetes escalation prevention rejects a role that

@@ -216,6 +216,22 @@ func NewOperatorCommand() *cli.Command {
 				Usage:   "NVCA Run As User ID",
 				Value:   DefaultNVCARunAsUserID,
 			},
+			&cli.StringFlag{
+				Name:    "utils-provenance-mode",
+				EnvVars: []string{"UTILS_PROVENANCE_MODE"},
+				Usage:   "Utils provenance webhook mode: audit logs and counts what would be refused, enforce refuses it",
+				Value:   UtilsProvenanceModeAudit,
+			},
+			&cli.StringFlag{
+				Name:    "utils-provenance-replicaset-controller-user",
+				EnvVars: []string{"UTILS_PROVENANCE_REPLICASET_CONTROLLER_USER"},
+				Usage:   "Username of the kube ReplicaSet controller as seen by admission. Empty uses the webhook default",
+			},
+			&cli.StringFlag{
+				Name:    "utils-provenance-deployment-controller-user",
+				EnvVars: []string{"UTILS_PROVENANCE_DEPLOYMENT_CONTROLLER_USER"},
+				Usage:   "Username of the kube Deployment controller as seen by admission. Empty uses the webhook default",
+			},
 			&cli.Int64Flag{
 				Name:    "nvca-run-as-groupid",
 				EnvVars: []string{"NVCA_RUN_AS_GROUPID"},
@@ -410,6 +426,11 @@ func doAction(c *cli.Context) error {
 		return err
 	}
 
+	utilsProvenanceMode, err := NormalizeUtilsProvenanceMode(c.String("utils-provenance-mode"))
+	if err != nil {
+		return err
+	}
+
 	tokenFetcher, err := getDefaultNewTokenFetcher(ctx, c.String("ngc-service-key-file"), clusterSource)
 	if err != nil {
 		return err
@@ -527,16 +548,21 @@ func doAction(c *cli.Context) error {
 		NVCAImageRepo:                 c.String("nvca-image-repo"),
 		NVCARunAsUserID:               c.Int64("nvca-run-as-userid"),
 		NVCARunAsGroupID:              c.Int64("nvca-run-as-groupid"),
-		GXCacheNamespace:              c.String("nvca-gxcache-namespace"),
-		HelmRepositoryPrefix:          c.String("nvca-helm-repository-prefix"),
-		EnableGXCache:                 c.Bool("enable-gxcache"),
-		DDCSIPAllowList:               c.StringSlice("ddcs-ip-allowlist"),
-		K8sClusterNetworkCIDRs:        c.StringSlice("k8s-cluster-network-cidrs"),
-		AgentResources:                agentRR,
-		WebhookResources:              webhookRR,
-		NVCACacheMountOptionsEnabled:  c.Bool("nvca-cache-mount-options-enabled"),
-		NVCACacheMountOptions:         c.String("nvca-cache-mount-options"),
-		NVCAWorkerDegradationPeriod:   c.Duration("nvca-worker-degradation-period"),
+		UtilsProvenance: UtilsProvenanceSettings{
+			Mode:                     utilsProvenanceMode,
+			ReplicaSetControllerUser: c.String("utils-provenance-replicaset-controller-user"),
+			DeploymentControllerUser: c.String("utils-provenance-deployment-controller-user"),
+		},
+		GXCacheNamespace:                              c.String("nvca-gxcache-namespace"),
+		HelmRepositoryPrefix:                          c.String("nvca-helm-repository-prefix"),
+		EnableGXCache:                                 c.Bool("enable-gxcache"),
+		DDCSIPAllowList:                               c.StringSlice("ddcs-ip-allowlist"),
+		K8sClusterNetworkCIDRs:                        c.StringSlice("k8s-cluster-network-cidrs"),
+		AgentResources:                                agentRR,
+		WebhookResources:                              webhookRR,
+		NVCACacheMountOptionsEnabled:                  c.Bool("nvca-cache-mount-options-enabled"),
+		NVCACacheMountOptions:                         c.String("nvca-cache-mount-options"),
+		NVCAWorkerDegradationPeriod:                   c.Duration("nvca-worker-degradation-period"),
 		NVCAWorkerContainerRestartCountToFailInstance: int32(restartCountToFailInstance),
 		NVCAWorkerContainerRestartScoreDecayPeriod:    restartScoreDecayPeriod,
 		NVCAWorkloadTolerations:                       workloadTolerations,

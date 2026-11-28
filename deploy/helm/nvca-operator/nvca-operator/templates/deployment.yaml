@@ -283,6 +283,20 @@ spec:
           - --nvca-worker-container-restart-score-decay-period
           - {{ .Values.agent.workerContainerRestartScoreDecayPeriod | quote }}
           {{- end }}
+          {{- with ((.Values.agent).utilsProvenance) }}
+          {{- if and .mode (ne .mode "audit") }}
+          - --utils-provenance-mode
+          - {{ .mode | quote }}
+          {{- end }}
+          {{- if .replicaSetControllerUser }}
+          - --utils-provenance-replicaset-controller-user
+          - {{ .replicaSetControllerUser | quote }}
+          {{- end }}
+          {{- if .deploymentControllerUser }}
+          - --utils-provenance-deployment-controller-user
+          - {{ .deploymentControllerUser | quote }}
+          {{- end }}
+          {{- end }}
           {{- if and ((.Values.agent).secretMirrorLabelSelector) ((.Values.agent).secretMirrorNamespace) }}
           - --nvca-secret-mirror-source-namespace
           - "{{ .Values.agent.secretMirrorNamespace }}"

@@ -89,20 +89,6 @@ func (c *Client) writeAssertionTokenToDisk(token token.Token) error {
 		return err
 	}
 
-	tmpPath := c.assertionTokenPath + ".tmp"
-	// World-readable so the non-root ess-agent can read it; else ESS 401.
-	if err := os.WriteFile(tmpPath, []byte(token.Token), 0644); err != nil {
-		return err
-	}
-
-	// rename keeps the temp file's mode, so force it on a pre-existing temp.
-	if err := os.Chmod(tmpPath, 0644); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tmpPath, c.assertionTokenPath); err != nil {
-		return err
-	}
-
-	return nil
+	// World-readable so the non-root ess-agent can read it; else ESS 401. Each writer uses its own temporary file.
+	return utils.WriteFileAtomic(c.assertionTokenPath, []byte(token.Token), 0644)
 }

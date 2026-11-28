@@ -1013,6 +1013,7 @@ func (bc *BackendK8sCache) setupNVCARBAC(ctx context.Context, nb *nvidiaiov1.NVC
 			}
 		}
 
+		k8sPolicyRuleList = append(k8sPolicyRuleList, bc.utilsProvenance.agentRules()...)
 		cr.Rules = append(cr.Rules, k8sPolicyRuleList...)
 	}
 	err = bc.createOrUpdateClusterRole(ctx, cr)
@@ -2251,6 +2252,7 @@ func (bc *BackendK8sCache) setupNVCADeployment(
 	oauthConfig := getOAuthConfig(nb)
 	oauthEnvVars := getOAuthEnvVars(nb, oauthConfig)
 	nvcaContainer.Env = append(nvcaContainer.Env, oauthEnvVars...)
+	nvcaContainer.Env = append(nvcaContainer.Env, bc.utilsProvenance.agentEnv()...)
 
 	// Apply custom env overrides from spec.agentConfig.overrideEnvironmentVars (last so they take precedence)
 	if overrides := nb.Spec.AgentConfig.DeploymentConfig.OverrideEnvironmentVars; len(overrides) > 0 {
@@ -2359,7 +2361,7 @@ func (bc *BackendK8sCache) setupNVCADeployment(
 		Name:            NVCAWebhookContainerName,
 		Image:           bc.getWebhooksImagePathFromConfig(ctx, nb),
 		ImagePullPolicy: getImagePullPolicyFromConfig(nb.Spec.WebhookConfig.ImageConfig),
-		Args:            []string{"/usr/bin/webhook-server", "--config", agentConfigFilePath},
+		Args:            bc.webhookContainerArgs(),
 		SecurityContext: getDefaultContainerSecurityContext(),
 		Env: []corev1.EnvVar{
 			{
@@ -3107,4 +3109,10 @@ func (bc *BackendK8sCache) getOTelCollectorVolume(nb *nvidiaiov1.NVCFBackend) []
 			},
 		},
 	}
+}
+
+// webhookContainerArgs returns the webhook server command line. The utils provenance flags are only added when they
+// differ from the webhook defaults, so existing installs keep the same container args.
+func (bc *BackendK8sCache) webhookContainerArgs() []string {
+	return append([]string{"/usr/bin/webhook-server", "--config", agentConfigFilePath}, bc.utilsProvenance.webhookArgs()...)
 }

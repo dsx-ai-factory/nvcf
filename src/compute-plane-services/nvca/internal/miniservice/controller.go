@@ -59,6 +59,7 @@ import (
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/miniservice/chartcache"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/otel"
 	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/util/k8sutil"
+	"github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/internal/utilsprovenance/readiness"
 	nvcav1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1"
 	nvcav1alpha1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v1alpha1"
 	nvcav2beta1 "github.com/dsx-ai-factory/nvcf/src/compute-plane-services/nvca/pkg/apis/nvca/v2beta1"
@@ -127,6 +128,21 @@ type ControllerOptions struct {
 	// NsightProfilingAllowlist tracks which functions should have NVIDIA Nsight GPU
 	// profiling enabled. Shared with BackendK8sCache.
 	NsightProfilingAllowlist *profiling.Allowlist
+
+	// UtilsProvenanceGate refuses anything that trusts the utils label or creates more than one utils pod unless the
+	// provenance readiness check reports enforcement and instance RBAC verified and fresh. The zero value refuses.
+	UtilsProvenanceGate readiness.Checkable
+	// UtilsReplicas is the requested number of utils pods per instance: 2 by default when UtilsHAEnabled is set, 1
+	// otherwise. 0 and 1 mean one pod, as today. More than one is only honored when UtilsHAEnabled is set and
+	// UtilsProvenanceGate allows it.
+	UtilsReplicas int32
+	// UtilsHAEnabled turns on the utils Deployment path. Default false. It is also off unless utilsHAImplemented is true:
+	// the status, update and webhook paths are not HA aware yet, so enabling it today would break an instance.
+	UtilsHAEnabled bool
+
+	// UtilsProvenanceMode is audit (default) or enforce. In enforce mode reserved utils metadata is stripped from
+	// chart-originated objects. In audit mode it is only logged.
+	UtilsProvenanceMode string
 
 	// Internal use.
 	cacheDir string

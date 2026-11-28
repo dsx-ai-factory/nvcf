@@ -901,6 +901,35 @@ rate(nvca_miniservice_controller_event_error_total[5m]) > 0.05
 
 ---
 
+### `nvca_utils_replicas_degraded_instances`
+
+**Type:** Gauge
+
+**Description:** Number of HA utils instances that serve fewer utils replicas than desired. Such an instance stays
+healthy while one replica serves, so this gauge and the MiniService condition `UtilsReplicasDegraded` are the signals
+that a lost replica was not replaced. Initialized to 0. Not labeled per instance: use the condition to find which.
+
+**Labels:** default labels only.
+
+**Usage:**
+
+```promql
+# HA instances currently below their desired utils replica count
+nvca_utils_replicas_degraded_instances > 0
+```
+
+Alert on sustained degradation, not on a short replacement:
+
+```yaml
+- alert: NVCAUtilsReplicasDegraded
+  expr: nvca_utils_replicas_degraded_instances > 0
+  for: 15m
+  annotations:
+    summary: "HA utils instances below their desired replica count for 15 minutes; check the UtilsReplicasDegraded condition"
+```
+
+---
+
 ## Garbage Collection (GC) Metrics
 
 ### `nvca_gc_orphaned_resource_cleanup_total`
