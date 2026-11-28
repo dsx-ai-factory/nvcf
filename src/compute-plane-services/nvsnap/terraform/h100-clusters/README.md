@@ -1,11 +1,10 @@
 # NvSnap H100 bench clusters — Terraform
 
-Two GKE clusters (8 × a3-megagpu-8g each, single zone, shared VPC)
-that consume from a cross-project shared H100 reservation
+Two GKE clusters (8 × a3-megagpu-8g each by default, single zone) on one
+primary VPC, with eight GPU networks that the GPU node pools of both
+clusters attach to. The GPU node pools consume a cross-project shared H100
+reservation
 (`reservation_project_id` and `zone` in `variables.tf`).
-
-Used for the 16-node cascade fan-out bench (#97) and cross-cluster
-checkpoint movement tests.
 
 ## Prerequisites
 
@@ -55,12 +54,6 @@ set `gpu_driver_version = "INSTALLATION_DISABLED"`, and the NVIDIA GPU
 Operator, installed separately with Helm, provides the driver and the device
 plugin (`cluster_b.tf`, header comment).
 
-## Cost note
-
-Check current GCP pricing for a3-megagpu-8g. The clusters consume a
-reservation, so the VMs are billed under the reservation's terms whether or
-not they run.
-
 ## Post-apply
 
 Terraform's `next_steps` output shows the `gcloud container clusters
@@ -91,8 +84,7 @@ get-credentials` commands for both clusters. After that:
 terraform destroy
 ```
 
-Reservation continues to bill regardless of whether VMs are running.
-Destroying just frees the VMs back to the reservation pool.
+Destroying frees the VMs back to the reservation.
 
 ## Known gotchas
 
@@ -103,7 +95,6 @@ Destroying just frees the VMs back to the reservation pool.
   have `NVIDIA_H100_GPUS` and `CPUS` quota at the project level even
   if the actual capacity comes from a shared reservation. If
   `terraform apply` fails on quota, request quota in the
-  consumer project (usually fast for reservation-backed asks).
-- **`gpcs-fuse-csi-driver-config`**: GCSFuse CSI lets us mount GCS
-  buckets as PVCs. Enabled here for future cross-cluster testing;
-  no operational cost if unused.
+  consumer project.
+- **`gcs_fuse_csi_driver_config`**: both clusters enable the GCS FUSE CSI
+  driver add-on.
