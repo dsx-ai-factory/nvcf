@@ -177,8 +177,8 @@ func (m *Mutator) nodeModelCachePatches(ctx context.Context, pod *corev1.Pod, bu
 
 // placeholderModelCachePatches is nodeModelCachePatches for a CRIU
 // restore placeholder whose patches are cp. A placeholder that still runs
-// its model download (a lone one, or a group's whose download is kept:
-// skipUnusedInits off, or KeepInitsAnnotation) seeds it from the node's
+// its model download (a lone one, or a group's whose download is kept: a
+// capture that found the model in use, or KeepInitsAnnotation) seeds it from the node's
 // copy as a cold pod does, instead of downloading the whole model again
 // before its restore can start. A download cp skips stays skipped. The
 // cache is mounted into that init only: the restored container keeps the

@@ -12,7 +12,7 @@ records are in `nvsnap-system`.
 **Contents**
 
 - [Following one capture or restore](#following-one-capture-or-restore)
-- [Group restores that skip setup (`webhook.skipUnusedInits`)](#group-restores-that-skip-setup-webhookskipunusedinits)
+- [Group restores that skip setup](#group-restores-that-skip-setup)
 - [NvsnapAgentMetricsMissing](#nvsnapagentmetricsmissing)
 - [NvsnapAgentDown](#nvsnapagentdown)
 - [NvsnapWebhookErrors](#nvsnapwebhookerrors)
@@ -89,12 +89,11 @@ Everything below takes `kubectl` alone.
    (`deploy/helm/nvsnap/files/grafana-dashboard-nvsnap-history.json`) has
    scale-up, restore phases, teardown and the cached captures per cluster.
 
-## Group restores that skip setup (`webhook.skipUnusedInits`)
+## Group restores that skip setup
 
-With `webhook.skipUnusedInits: true` (default off), a group capture reads
-each member's dump for the mounts its processes use. When an emptyDir too
-large to copy into the checkpoint (typically the model download) is used
-by no member, the record lists it, and every placeholder of that group
+A group capture reads each member's dump for the mounts its processes
+use. When an emptyDir too large to copy into the checkpoint (typically the
+model download) is used by no member, the record lists it, and every placeholder of that group
 skips the init containers that fill only it.
 
 - **Did a capture decide to skip?** The leader agent logs
@@ -111,17 +110,23 @@ skips the init containers that fill only it.
   names the inits it skipped.
 - **A workload must keep its setup.** Annotate its pods
   `nvsnap.io/keep-inits: "true"`. Its next placeholders skip no init for
-  unused volumes: they run the same inits as with the flag off.
-- **Turn it off.** Set `webhook.skipUnusedInits: false` and roll the agents.
-  Records that already list volumes are then ignored. Placeholders admitted
-  before the change keep their patches until they are replaced.
+  unused volumes: they run the same inits a cold pod runs.
+- **Why there is no setting.** A restored process keeps the files it had
+  open and the mappings it had, so it does not read the model again; only a
+  cold start does, and a failed restore's pod is replaced by a fresh one
+  that runs every init. The former `webhook.skipUnusedInits` value is gone,
+  and the agent ignores `--webhook-skip-unused-inits` for one release.
+- **A workload that reads its model files again after it starts** (one
+  that loads more files later, say) must keep its setup: annotate its pods
+  `nvsnap.io/keep-inits: "true"`.
 - **Pods with no recreating controller, and Jobs' pods,** never skip: a
   failed restore of them would start cold in place, which needs the
   setup's output.
 - **Known gap.** Verify checks that the pods stay Ready, not that they
-  serve. A workload that reads its model files again after it starts would
-  pass verify and then fail requests. Keep the flag off in production until
-  verify sends inference.
+  serve. A workload that opens model files after the capture (none was
+  open or mapped when it was dumped) would pass verify and then fail
+  requests: annotate it `nvsnap.io/keep-inits: "true"`. Verify sending
+  inference would close this.
 
 ## NvsnapAgentMetricsMissing
 

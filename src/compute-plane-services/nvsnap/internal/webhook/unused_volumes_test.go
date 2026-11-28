@@ -162,7 +162,6 @@ func TestCRIUGroupRestore_KeepsSetupWhereAFailedRestoreNeedsIt(t *testing.T) {
 		"opted out": func(p *corev1.Pod) { p.Annotations[KeepInitsAnnotation] = "true" },
 	} {
 		m, _ := groupMutator(t, g, "")
-		m.SkipUnusedInits = true
 		pod := kimiWorker("1")
 		mutate(pod)
 		patches, err := m.Mutate(context.Background(), pod)
@@ -181,14 +180,17 @@ func TestCRIUGroupRestore_KeepsSetupWhereAFailedRestoreNeedsIt(t *testing.T) {
 	}
 }
 
-// Through admission: with the flag and a recorded decision, a rank's
-// placeholder skips the download; without the flag it does not.
-func TestCRIUGroupRestore_SkipsUnusedSetupOnlyWithTheFlag(t *testing.T) {
+// Through admission: with a recorded decision a rank's placeholder skips
+// the download, with no flag to set; a pod annotated to keep its inits
+// does not.
+func TestCRIUGroupRestore_SkipsUnusedSetup(t *testing.T) {
 	g := CRIUGroup{Checkpoints: []string{"r0__1", "r1__1"}, Nodes: []string{"n0", "n1"}, UnusedVolumes: []string{"ngc-models"}}
 	for _, flag := range []bool{false, true} {
 		m, _ := groupMutator(t, g, "")
-		m.SkipUnusedInits = flag
 		pod := kimiWorker("1")
+		if !flag {
+			pod.Annotations[KeepInitsAnnotation] = "true"
+		}
 		patches, err := m.Mutate(context.Background(), pod)
 		if err != nil {
 			t.Fatal(err)
