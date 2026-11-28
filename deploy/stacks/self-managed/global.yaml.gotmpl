@@ -1894,6 +1894,18 @@ stateMetrics:
   image:
     registry: {{ .Values.global.image.registry }}
     repository: {{ .Values.global.image.repository }}/nvcf-state-metrics-service
+  {{- $stateMetricsNetworkPolicy := deepCopy (dig "stateMetrics" "networkPolicy" dict .Values) }}
+  {{- $stateMetricsProfile := dig "observability" "profile" "disabled" .Values }}
+  {{- if and (has $stateMetricsProfile (list "control" "all")) (dig "enabled" true $stateMetricsNetworkPolicy) }}
+  {{- $namespace := dig "observability" "namespace" "monitoring" .Values }}
+  {{- $collector := dig "collector" "collectorName" "nvcf-observability" .Values }}
+  {{- $peer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $namespace)) "podSelector" (dict "matchLabels" (dict "app.kubernetes.io/component" "opentelemetry-collector" "app.kubernetes.io/instance" (printf "%s.%s" $namespace $collector))) }}
+  {{- $_ := set $stateMetricsNetworkPolicy "additionalIngressPeers" (concat (dig "additionalIngressPeers" list $stateMetricsNetworkPolicy) (list $peer)) }}
+  {{- end }}
+  {{- with $stateMetricsNetworkPolicy }}
+  networkPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with dig "stateMetrics" "resources" dict .Values }}
   resources:
     {{- toYaml . | nindent 4 }}

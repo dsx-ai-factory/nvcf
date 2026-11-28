@@ -119,6 +119,21 @@ Feature: Install local Helmfile observability for both planes
     Then deployment "nvca-operator" in namespace "nvca-operator" using context "k3d-ncp-local" should complete rollout within "10m"
     Then NVCFBackend "ncp-local" in namespace "nvca-operator" using context "k3d-ncp-local" should report agent status "healthy" within "10m"
 
+    Then Kubernetes resource "NetworkPolicy/state-metrics-helm-nvcf-state-metrics" in namespace "nvcf" using context "k3d-ncp-local" should contain:
+      """
+      spec:
+        ingress:
+          - from:
+              - podSelector: {}
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: monitoring
+                podSelector:
+                  matchLabels:
+                    app.kubernetes.io/component: opentelemetry-collector
+                    app.kubernetes.io/instance: monitoring.nvcf-observability
+      """
+
     Then Kubernetes resource "OpenTelemetryCollector/nvcf-observability" in namespace "monitoring" using context "k3d-ncp-local" should contain:
       """
       spec:
@@ -159,6 +174,8 @@ Feature: Install local Helmfile observability for both planes
       | --health-uri     | /health |
       | --health-port    | 8000    |
       | --health-timeout | PT30S   |
+
+    And the function selected by NVCF CLI is undeployed at scenario teardown
 
     And I successfully deploy the function selected by NVCF CLI with options:
       | option          | value               |

@@ -360,6 +360,13 @@ The self-managed control-plane stack defaults to
 VictoriaMetrics, State Metrics, and the Function Autoscaler. Set the
 VictoriaMetrics storage class for the target cluster.
 
+The `control` and `all` profiles append a collector peer through the
+state-metrics chart's `stateMetrics.networkPolicy.additionalIngressPeers` value. The peer
+combines `observability.namespace` with the collector Pod identity from
+`collector.collectorName`. Existing peers, metrics ports, and egress rules
+remain unchanged. Entries in `stateMetrics.networkPolicy.additionalIngressPeers`
+are preserved. Set `stateMetrics.networkPolicy.enabled: false` to omit the policy.
+
 To use a customer-managed backend or change component ownership, see
 [Observability Configuration](../observability/observability.md). For autoscaler health and
 backend checks, see

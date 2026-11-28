@@ -785,16 +785,6 @@ func TestSingleClusterHelmfileFeatureFileWiresToSteps(t *testing.T) {
 	}
 	assertAPIKeyScenariosWiring(t, suite.Runner.(*fakeRunner).runs, clusterGroups)
 	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
-		"api-key generate --for function",
-		"--description bdd-load-tester-supreme") {
-		t.Fatal("HTTP sample function API key was not generated for the function service")
-	}
-	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
-		"api-key generate --for function",
-		"--description bdd-grpc-load-tester-supreme") {
-		t.Fatal("gRPC sample function API key was not generated for the function service")
-	}
-	if !commandRanThatContainsAll(suite.Runner.(*fakeRunner).runs,
 		"function create --name bdd-helm-function",
 		"--helm-chart https://charts.example.test/inference-test.tgz",
 		"--helm-chart-service entrypoint",
@@ -1287,12 +1277,13 @@ func observabilityComputeHelmListJSON() string {
 // local context and verifies that one shared stack serves both monitor sets.
 func TestObservabilityAllFeatureFileWiresToSteps(t *testing.T) {
 	const (
-		registryLoginCommand   = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
-		serviceMonitorCommand  = "kubectl get servicemonitor/nvcf-default-monitors-state-metrics --namespace monitoring --context k3d-ncp-local -o name"
-		podMonitorCommand      = "kubectl get podmonitor/nvcf-default-monitors-worker --namespace monitoring --context k3d-ncp-local -o name"
-		collectorValuesCommand = "helm get values nvca-operator --namespace nvca-operator --kube-context k3d-ncp-local -o yaml"
-		collectorYAMLCommand   = "kubectl get opentelemetrycollector/nvcf-observability --namespace monitoring --context k3d-ncp-local -o yaml"
-		serviceKeyCommand      = `bash -c 'set -eo pipefail; printf %s "$NGC_API_KEY" |` +
+		stateMetricsPolicyCommand = "kubectl get networkpolicy/state-metrics-helm-nvcf-state-metrics --namespace nvcf --context k3d-ncp-local -o yaml"
+		registryLoginCommand      = "helm registry login nvcr.io --username '$oauthtoken' --password-stdin"
+		serviceMonitorCommand     = "kubectl get servicemonitor/nvcf-default-monitors-state-metrics --namespace monitoring --context k3d-ncp-local -o name"
+		podMonitorCommand         = "kubectl get podmonitor/nvcf-default-monitors-worker --namespace monitoring --context k3d-ncp-local -o name"
+		collectorValuesCommand    = "helm get values nvca-operator --namespace nvca-operator --kube-context k3d-ncp-local -o yaml"
+		collectorYAMLCommand      = "kubectl get opentelemetrycollector/nvcf-observability --namespace monitoring --context k3d-ncp-local -o yaml"
+		serviceKeyCommand         = `bash -c 'set -eo pipefail; printf %s "$NGC_API_KEY" |` +
 			` kubectl --context k3d-ncp-local create secret generic ngc-service-api-key` +
 			` --namespace nvca-system --from-file=ngc-service-api-key=/dev/stdin --dry-run=client -o yaml |` +
 			` kubectl --context k3d-ncp-local apply -f -'`
@@ -1318,8 +1309,20 @@ func TestObservabilityAllFeatureFileWiresToSteps(t *testing.T) {
 		serviceMonitorCommand:          {ExitCode: 0},
 		podMonitorCommand:              {ExitCode: 0},
 		collectorValuesCommand:         {ExitCode: 0, Stdout: "selfManaged:\n  otelCollector:\n    enabled: true\n    imageRepository: nvcr.io/test-org/test-team/nvcf-otel-collector\n"},
-		serviceKeyCommand:              {ExitCode: 0},
-		restartNVCACommand:             {ExitCode: 0},
+		stateMetricsPolicyCommand: {ExitCode: 0, Stdout: `spec:
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: opentelemetry-collector
+              app.kubernetes.io/instance: monitoring.nvcf-observability
+`},
+		serviceKeyCommand:  {ExitCode: 0},
+		restartNVCACommand: {ExitCode: 0},
 		"helm list --all-namespaces --kube-context k3d-ncp-local -o json": {
 			ExitCode: 0,
 			Stdout:   observabilityAllHelmListJSON(),
@@ -4812,11 +4815,21 @@ func TestVanityShadowScenarioRejectsBrokenGateway(t *testing.T) {
 	}
 }
 
-// assertAPIKeyScenariosWiring checks the cluster-groups and init key retention
-// scenarios: their keys are generated, the second init runs before the list
-// request, and no command that prints a secret keeps its stdout.
+// assertAPIKeyScenariosWiring checks sample function keys, cluster-groups keys,
+// and init key retention. The second init must precede the list request,
+// and commands that print secrets must discard stdout.
 func assertAPIKeyScenariosWiring(t *testing.T, runs []string, clusterGroups *clusterGroupsHTTPFake) {
 	t.Helper()
+	if !commandRanThatContainsAll(runs,
+		"api-key generate --for function",
+		"--description bdd-load-tester-supreme") {
+		t.Fatal("HTTP sample function API key was not generated for the function service")
+	}
+	if !commandRanThatContainsAll(runs,
+		"api-key generate --for function",
+		"--description bdd-grpc-load-tester-supreme") {
+		t.Fatal("gRPC sample function API key was not generated for the function service")
+	}
 	if !commandRanThatContainsAll(runs, "api-key generate --for function", "--description bdd-init-keeps-api-keys") {
 		t.Fatal("init key retention scenario did not generate its function API key")
 	}

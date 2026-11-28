@@ -631,6 +631,10 @@ addons:
 
 stateMetrics:
   enabled: true
+  networkPolicy:
+    enabled: true
+    # The stack appends its collector peer for control/all profiles.
+    additionalIngressPeers: []
   # Disable ServiceMonitor for environments without Prometheus Operator
   serviceMonitor:
     enabled: false

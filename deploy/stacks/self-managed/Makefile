@@ -3,6 +3,7 @@ include Makefile.dist
 
 .PHONY: test test-published-charts
 test:
+	@tests/state-metrics-network-policy.sh
 	@tests/vanity-request-size.sh
 	@tests/custom-observability-environment.sh
 	@tests/llm-gateway-auth-transport.sh
